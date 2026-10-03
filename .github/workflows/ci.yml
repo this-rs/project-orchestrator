@@ -5,6 +5,22 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Cold run: nothing restored from any cache (see "Cache policy" below).
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      fresh:
+        description: "Cold run: ignore every cache (what a fresh clone costs, and proof nothing depends on a stale one)"
+        type: boolean
+        default: false
+
+# A new push to a PR cancels the run it supersedes: iterating on a branch must not
+# queue 30 minutes of runners behind results nobody will read. `main` is never
+# cancelled (each push to it must finish: it is what fills the caches).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Toolchain: every job pins dtolnay/rust-toolchain@1.95.0, the same version as
 # rust-toolchain.toml (keep the two in sync when bumping). "@stable" was
@@ -13,9 +29,25 @@ on:
 # cargo-deny are installed with --locked under 1.95 on purpose: an unlocked
 # install resolves deps needing rustc >= 1.96 (kstring 2.0.5) and fails to build
 # (see security.yml).
+# Cache policy
+# - One cache per PROFILE, because a profile's dependencies are not another's:
+#   release (Build), clippy/check (Lint), dev test (Unit/Integration/API), and
+#   instrumented (Coverage) each compile the same ~600 crates differently. They used
+#   to share one key written by the release Build only, so every other job restored
+#   artefacts it could not use and recompiled everything.
+# - Written ONLY by pushes to main; PRs restore main's. A PR that saved its own would
+#   evict main's entries (GitHub keeps 10 GB per repo, least recently used first).
+# - Invalidated by itself when Cargo.lock or the compiler changes (rust-cache hashes
+#   both). Bump CACHE_VERSION to drop every cache at once (suspected poisoning).
+# - Cold run: nightly (schedule) and on demand (workflow_dispatch, fresh=true) use a
+#   key nobody has, so they compile from scratch and save nothing. That is the
+#   truth about a fresh clone, and the check that warm runs do not hide a problem.
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CACHE_VERSION: v1
+  CACHE_FRESH: ${{ (github.event_name == 'schedule' || inputs.fresh) && format('-fresh-{0}', github.run_id) || '' }}
+  CACHE_SAVE: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
 
 jobs:
   # ==========================================================================
@@ -33,8 +65,9 @@ jobs:
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "ci-build"
-          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'pull_request' }}
+          shared-key: "ci-release-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
+          save-if: ${{ env.CACHE_SAVE == 'true' && env.CACHE_FRESH == '' }}
+          cache-workspace-crates: true
 
       - name: Build release binaries
         run: cargo build --release
@@ -100,7 +133,6 @@ jobs:
   lint:
     name: Lint & Format
     runs-on: ubuntu-latest
-    needs: [build]
     steps:
       - uses: actions/checkout@v7
 
@@ -112,8 +144,9 @@ jobs:
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "ci-build"
-          save-if: false
+          shared-key: "ci-clippy-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
+          save-if: ${{ env.CACHE_SAVE == 'true' && env.CACHE_FRESH == '' }}
+          cache-workspace-crates: true
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -177,7 +210,6 @@ jobs:
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
-    needs: [build]
     steps:
       - uses: actions/checkout@v7
 
@@ -187,8 +219,9 @@ jobs:
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "ci-build"
-          save-if: false
+          shared-key: "ci-test-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
+          save-if: ${{ env.CACHE_SAVE == 'true' && env.CACHE_FRESH == '' }}
+          cache-workspace-crates: true
 
       - name: Run unit tests (lib)
         # --workspace so member crates' unit tests actually run in CI (the
@@ -217,7 +250,6 @@ jobs:
   integration-tests:
     name: Integration Tests
     runs-on: ubuntu-latest
-    needs: [build]
     services:
       neo4j:
         image: neo4j:5
@@ -256,8 +288,9 @@ jobs:
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "ci-build"
+          shared-key: "ci-test-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
           save-if: false
+          cache-workspace-crates: true
 
       - name: Wait for services to be ready
         run: |
@@ -284,7 +317,7 @@ jobs:
   api-tests:
     name: API Tests
     runs-on: ubuntu-latest
-    needs: [build, lint, unit-tests]
+    needs: [build, lint]
     services:
       neo4j:
         image: neo4j:5
@@ -323,8 +356,9 @@ jobs:
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "ci-build"
+          shared-key: "ci-test-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
           save-if: false
+          cache-workspace-crates: true
 
       - name: Download build artifacts
         uses: actions/download-artifact@v8
@@ -377,7 +411,6 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
-    needs: [build]
     services:
       neo4j:
         image: neo4j:5
@@ -416,8 +449,9 @@ jobs:
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "ci-build"
-          save-if: false
+          shared-key: "ci-cov-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
+          save-if: ${{ env.CACHE_SAVE == 'true' && env.CACHE_FRESH == '' }}
+          cache-workspace-crates: true
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -497,3 +531,54 @@ jobs:
           files: lcov.info
           fail_ci_if_error: false
           verbose: true
+
+  # ==========================================================================
+  # Test timing - which tests make the suite slow (nightly / on demand only)
+  # ==========================================================================
+  # The lib suite is ~6,600 tests and ~16 minutes of EXECUTION (compilation is
+  # the smaller part), and `cargo test` prints no per-test time on stable. This
+  # runs it once with the timing report (RUSTC_BOOTSTRAP enables the libtest flag
+  # on the pinned stable toolchain) and writes the slowest tests to the job
+  # summary, so the next speed-up is chosen from a measure, not from a guess.
+  test-timing:
+    name: Test timing
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-test-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
+          save-if: false
+          cache-workspace-crates: true
+
+      - name: Run the lib suite with per-test times
+        env:
+          RUSTC_BOOTSTRAP: "1"
+        run: |
+          cargo test --workspace --exclude project-orchestrator-desktop --lib -- \
+            -Z unstable-options --report-time 2>&1 | tee timing.log
+
+      - name: Slowest tests
+        if: always()
+        run: |
+          {
+            echo "### Slowest 40 tests"
+            echo '```'
+            grep -aE '^test .* <[0-9.]+s>' timing.log \
+              | sed -E 's/^test (.*) \.\.\. [a-z]+ <([0-9.]+)s>$/\2 \1/' \
+              | sort -rn | head -40
+            echo '```'
+            echo "### Total time by module (top 15)"
+            echo '```'
+            grep -aE '^test .* <[0-9.]+s>' timing.log \
+              | sed -E 's/^test ([^ ]+) \.\.\. [a-z]+ <([0-9.]+)s>$/\2 \1/' \
+              | awk '{ n=split($2,p,"::"); m=p[1]"::"p[2]; t[m]+=$1 } END { for (k in t) printf "%.1f %s\n", t[k], k }' \
+              | sort -rn | head -15
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
