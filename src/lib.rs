@@ -2203,6 +2203,17 @@ mod config_tests {
     use super::*;
     use std::io::Write;
 
+    /// Serialises the tests below that read or write process-global environment
+    /// variables (`SERVER_PORT`, `NEO4J_URI`, `CHAT_PROCESS_PATH`, ...).
+    ///
+    /// `cargo test` runs the tests of one binary on parallel threads of ONE
+    /// process, and the environment is shared by all of them: without a common
+    /// lock, `test_yaml_and_env_lifecycle` setting `SERVER_PORT=7777` while
+    /// `test_explicit_config_path_bypasses_auto_detect` reads it back fails the
+    /// latter with `left: 7777, right: 1111`. Poison-tolerant on purpose: a
+    /// panicking test must not turn every later one into a spurious failure.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_yaml_config_loading() {
         let yaml = r#"
@@ -2423,6 +2434,7 @@ auth:
     /// Runs as a single test to avoid parallel env var race conditions.
     #[test]
     fn test_yaml_and_env_lifecycle() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Helper to clear all config env vars
         fn clear_env() {
             for var in &[
@@ -2524,6 +2536,7 @@ server:
     /// exists in ~/Library/Application Support/.
     #[test]
     fn test_explicit_config_path_bypasses_auto_detect() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fn clear_env() {
             for var in &[
                 "NEO4J_URI",
@@ -2959,6 +2972,7 @@ chat:
 
     #[test]
     fn test_chat_config_env_override_yaml() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // YAML sets process_path, env var overrides it
         let yaml = r#"
 chat:
