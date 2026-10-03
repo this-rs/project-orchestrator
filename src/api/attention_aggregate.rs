@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use axum::extract::{Query, State};
 use axum::Json;
 use chrono::{DateTime, Duration, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::attention::*;
@@ -993,6 +993,182 @@ pub async fn get_attention(
     ))
 }
 
+// ============================================================================
+// Live agents: every session whose CLI is running right now
+// ============================================================================
+//
+// `build_attention` answers "what needs me": it only sees agents that belong to
+// a plan thread or have a pending request. This answers the other question —
+// "who is running?" — for EVERY live CLI, whatever started it (a user chat, a
+// plan run, a delegated task, a protocol), so nothing runs unseen.
+//
+// The set of live sessions comes from the ChatManager snapshot (the CLI is
+// alive); the identity of each (title, project, origin, cost) is read per live
+// session. That is one read per live agent, not per stored session: the number
+// of live CLIs is small (the manager caps it with `max_sessions`) and, unlike
+// the attention bands, no history is scanned.
+
+/// What a live agent is doing right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveAgentState {
+    /// Stopped on the user: a permission or a question is pending.
+    WaitingInput,
+    /// A turn is streaming.
+    Streaming,
+    /// CLI alive, no turn in progress.
+    Idle,
+}
+
+impl LiveAgentState {
+    /// Display order: what needs the user first, then what works, then what rests.
+    fn rank(self) -> u8 {
+        match self {
+            LiveAgentState::WaitingInput => 0,
+            LiveAgentState::Streaming => 1,
+            LiveAgentState::Idle => 2,
+        }
+    }
+}
+
+/// One running agent.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LiveAgent {
+    pub session_id: String,
+    pub title: String,
+    /// First user message, truncated by the store; null when unknown.
+    pub preview: Option<String>,
+    pub project_slug: Option<String>,
+    pub workspace_slug: Option<String>,
+    pub model: String,
+    pub cwd: String,
+    /// Who started it: `user` for a plain chat, else the `spawned_by` type
+    /// (`runner`, `delegate`, `protocol_runner`, ...).
+    pub origin: String,
+    pub run_id: Option<String>,
+    pub plan_id: Option<String>,
+    pub task_id: Option<String>,
+    pub state: LiveAgentState,
+    /// Permissions/questions still waiting (0 unless `waiting_input`).
+    pub pending_requests: usize,
+    pub started_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// Seconds since the session started, computed against `generated_at`.
+    pub age_secs: i64,
+    /// Seconds since the last update, computed against `generated_at`.
+    pub idle_secs: i64,
+    pub message_count: i64,
+    pub total_cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LiveAgentsResponse {
+    pub generated_at: DateTime<Utc>,
+    pub agents: Vec<LiveAgent>,
+    pub total: usize,
+    pub waiting_input: usize,
+    pub streaming: usize,
+    pub idle: usize,
+}
+
+/// `(origin, run_id, plan_id, task_id)` read from a `spawned_by` JSON.
+/// A missing or unreadable JSON is a plain user chat, never an error.
+fn read_origin(
+    spawned_by: Option<&str>,
+) -> (String, Option<String>, Option<String>, Option<String>) {
+    let Some(v) = spawned_by.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()) else {
+        return ("user".to_string(), None, None, None);
+    };
+    let text = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    (
+        text("type").unwrap_or_else(|| "user".to_string()),
+        text("run_id"),
+        text("plan_id"),
+        text("task_id"),
+    )
+}
+
+/// Assemble the live-agents view. Never fails: a session whose node cannot be
+/// read is still listed (it IS running) with what the manager knows of it.
+pub async fn build_live_agents(
+    store: &dyn GraphStore,
+    now: DateTime<Utc>,
+    snap: &crate::chat::manager::LiveSessionSnapshot,
+) -> LiveAgentsResponse {
+    let mut agents = Vec::with_capacity(snap.live.len());
+    for id in &snap.live {
+        let node = store.get_chat_session(*id).await.ok().flatten();
+        let pending = snap.pending_permissions.get(id).map_or(0, |p| p.len());
+        let state = if pending > 0 {
+            LiveAgentState::WaitingInput
+        } else if snap.streaming.contains(id) {
+            LiveAgentState::Streaming
+        } else {
+            LiveAgentState::Idle
+        };
+        let (origin, run_id, plan_id, task_id) =
+            read_origin(node.as_ref().and_then(|n| n.spawned_by.as_deref()));
+        let started_at = node.as_ref().map_or(now, |n| n.created_at);
+        let updated_at = node.as_ref().map_or(now, |n| n.updated_at);
+        agents.push(LiveAgent {
+            session_id: id.to_string(),
+            title: node
+                .as_ref()
+                .and_then(|n| n.title.clone())
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| "Session sans titre".to_string()),
+            preview: node.as_ref().and_then(|n| n.preview.clone()),
+            project_slug: node.as_ref().and_then(|n| n.project_slug.clone()),
+            workspace_slug: node.as_ref().and_then(|n| n.workspace_slug.clone()),
+            model: node.as_ref().map(|n| n.model.clone()).unwrap_or_default(),
+            cwd: node.as_ref().map(|n| n.cwd.clone()).unwrap_or_default(),
+            origin,
+            run_id,
+            plan_id,
+            task_id,
+            state,
+            pending_requests: pending,
+            started_at,
+            updated_at,
+            age_secs: (now - started_at).num_seconds().max(0),
+            idle_secs: (now - updated_at).num_seconds().max(0),
+            message_count: node.as_ref().map_or(0, |n| n.message_count),
+            total_cost_usd: node.as_ref().and_then(|n| n.total_cost_usd),
+        });
+    }
+    // Waiting first, then streaming, then idle; inside a state the most
+    // recently active first, ties by id so the order is stable.
+    agents.sort_by(|a, b| {
+        a.state
+            .rank()
+            .cmp(&b.state.rank())
+            .then(a.idle_secs.cmp(&b.idle_secs))
+            .then(a.session_id.cmp(&b.session_id))
+    });
+    let count = |s: LiveAgentState| agents.iter().filter(|a| a.state == s).count();
+    LiveAgentsResponse {
+        generated_at: now,
+        total: agents.len(),
+        waiting_input: count(LiveAgentState::WaitingInput),
+        streaming: count(LiveAgentState::Streaming),
+        idle: count(LiveAgentState::Idle),
+        agents,
+    }
+}
+
+/// `GET /api/agents/live` — every agent running right now.
+pub async fn get_live_agents(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<LiveAgentsResponse>, AppError> {
+    let snap = match state.chat_manager.as_ref() {
+        Some(cm) => cm.live_session_snapshot().await,
+        None => Default::default(),
+    };
+    Ok(Json(
+        build_live_agents(state.orchestrator.neo4j(), Utc::now(), &snap).await,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1868,5 +2044,184 @@ mod tests {
         assert_eq!(cyc.len(), 2);
         assert_eq!(cyc[1].points.len(), 2, "the cycle closes the summary");
         assert!(summarize_waves(&[], &[], &HashSet::new()).is_empty());
+    }
+
+    // ----- live agents -----
+
+    use crate::chat::manager::LiveSessionSnapshot;
+
+    async fn live_store(sessions: Vec<crate::neo4j::models::ChatSessionNode>) -> MockGraphStore {
+        let store = MockGraphStore::new();
+        for s in &sessions {
+            store.create_chat_session(s).await.unwrap();
+        }
+        store
+    }
+
+    fn snapshot(
+        live: &[Uuid],
+        streaming: &[Uuid],
+        pending: &[(Uuid, &str)],
+    ) -> LiveSessionSnapshot {
+        let mut snap = LiveSessionSnapshot::default();
+        snap.live.extend(live.iter().copied());
+        snap.streaming.extend(streaming.iter().copied());
+        for (id, req) in pending {
+            snap.pending_permissions
+                .entry(*id)
+                .or_default()
+                .insert((*req).to_string());
+        }
+        snap
+    }
+
+    #[tokio::test]
+    async fn no_live_session_is_an_empty_view_not_an_error() {
+        let store = live_store(vec![]).await;
+        let r = build_live_agents(&store, now(), &LiveSessionSnapshot::default()).await;
+        assert_eq!(r.total, 0);
+        assert!(r.agents.is_empty());
+        assert_eq!((r.waiting_input, r.streaming, r.idle), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_session_is_waiting_streaming_or_idle_and_only_live_ones_are_listed() {
+        let (w, s, i, dead) = (
+            test_chat_session(None),
+            test_chat_session(None),
+            test_chat_session(None),
+            test_chat_session(None),
+        );
+        let store = live_store(vec![w.clone(), s.clone(), i.clone(), dead.clone()]).await;
+        let snap = snapshot(&[w.id, s.id, i.id], &[s.id, w.id], &[(w.id, "req-1")]);
+        let r = build_live_agents(&store, now(), &snap).await;
+
+        let state_of = |id: Uuid| {
+            r.agents
+                .iter()
+                .find(|a| a.session_id == id.to_string())
+                .map(|a| a.state)
+        };
+        // A pending request wins over streaming: the agent is stopped on the user.
+        assert_eq!(state_of(w.id), Some(LiveAgentState::WaitingInput));
+        assert_eq!(state_of(s.id), Some(LiveAgentState::Streaming));
+        assert_eq!(state_of(i.id), Some(LiveAgentState::Idle));
+        assert_eq!(state_of(dead.id), None, "a dead CLI is not a running agent");
+        assert_eq!(
+            (r.total, r.waiting_input, r.streaming, r.idle),
+            (3, 1, 1, 1)
+        );
+        assert_eq!(r.agents[0].pending_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn waiting_comes_first_then_streaming_then_idle_most_recent_first() {
+        let mut idle_old = test_chat_session(None);
+        idle_old.updated_at = now() - Duration::seconds(600);
+        let mut idle_new = test_chat_session(None);
+        idle_new.updated_at = now() - Duration::seconds(10);
+        let streaming = test_chat_session(None);
+        let waiting = test_chat_session(None);
+        let store = live_store(vec![
+            idle_old.clone(),
+            idle_new.clone(),
+            streaming.clone(),
+            waiting.clone(),
+        ])
+        .await;
+        let snap = snapshot(
+            &[idle_old.id, idle_new.id, streaming.id, waiting.id],
+            &[streaming.id],
+            &[(waiting.id, "r")],
+        );
+        let r = build_live_agents(&store, now(), &snap).await;
+        let ids: Vec<_> = r.agents.iter().map(|a| a.session_id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                waiting.id.to_string(),
+                streaming.id.to_string(),
+                idle_new.id.to_string(),
+                idle_old.id.to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn origin_comes_from_spawned_by_and_defaults_to_user() {
+        let mut runner = test_chat_session(Some("po"));
+        let (run, plan, task) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        runner.spawned_by =
+            Some(json!({"type":"runner","run_id":run,"plan_id":plan,"task_id":task}).to_string());
+        runner.title = Some("Task 1.2".to_string());
+        let plain = test_chat_session(None);
+        let mut garbled = test_chat_session(None);
+        garbled.spawned_by = Some("not json".to_string());
+        let store = live_store(vec![runner.clone(), plain.clone(), garbled.clone()]).await;
+        let snap = snapshot(&[runner.id, plain.id, garbled.id], &[], &[]);
+        let r = build_live_agents(&store, now(), &snap).await;
+        let by = |id: Uuid| {
+            r.agents
+                .iter()
+                .find(|a| a.session_id == id.to_string())
+                .unwrap()
+                .clone()
+        };
+        let a = by(runner.id);
+        assert_eq!(a.origin, "runner");
+        assert_eq!(a.run_id, Some(run.to_string()));
+        assert_eq!(a.plan_id, Some(plan.to_string()));
+        assert_eq!(a.task_id, Some(task.to_string()));
+        assert_eq!(a.title, "Task 1.2");
+        assert_eq!(a.project_slug.as_deref(), Some("po"));
+        assert_eq!(by(plain.id).origin, "user");
+        assert_eq!(
+            by(garbled.id).origin,
+            "user",
+            "an unreadable origin is a plain chat"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_running_session_missing_from_the_store_is_still_listed() {
+        let ghost = Uuid::new_v4();
+        let store = live_store(vec![]).await;
+        let r = build_live_agents(&store, now(), &snapshot(&[ghost], &[ghost], &[])).await;
+        assert_eq!(r.total, 1);
+        let a = &r.agents[0];
+        assert_eq!(a.state, LiveAgentState::Streaming);
+        assert_eq!(a.title, "Session sans titre");
+        assert_eq!((a.age_secs, a.idle_secs), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn ages_are_computed_against_generated_at_and_never_negative() {
+        let mut s = test_chat_session(None);
+        s.created_at = now() - Duration::seconds(3600);
+        s.updated_at = now() - Duration::seconds(90);
+        let mut future = test_chat_session(None);
+        future.created_at = now() + Duration::seconds(50);
+        future.updated_at = now() + Duration::seconds(50);
+        s.message_count = 7;
+        s.total_cost_usd = Some(1.25);
+        let store = live_store(vec![s.clone(), future.clone()]).await;
+        let r = build_live_agents(&store, now(), &snapshot(&[s.id, future.id], &[], &[])).await;
+        let a = r
+            .agents
+            .iter()
+            .find(|a| a.session_id == s.id.to_string())
+            .unwrap();
+        assert_eq!((a.age_secs, a.idle_secs), (3600, 90));
+        assert_eq!((a.message_count, a.total_cost_usd), (7, Some(1.25)));
+        let f = r
+            .agents
+            .iter()
+            .find(|a| a.session_id == future.id.to_string())
+            .unwrap();
+        assert_eq!(
+            (f.age_secs, f.idle_secs),
+            (0, 0),
+            "clock skew must not give negative ages"
+        );
     }
 }
