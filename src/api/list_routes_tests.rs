@@ -133,6 +133,26 @@ async fn fixture() -> Fx {
     let graph = Arc::new(MockGraphStore::new());
     let a = seed_workspace(&graph, "ws-a").await;
     let b = seed_workspace(&graph, "ws-b").await;
+    let app = router_over(graph).await;
+    Fx {
+        app,
+        project_a: a.0,
+        project_b: b.0,
+        dec_a: a.1,
+        dec_b: b.1,
+        run_a: a.2,
+        run_b: b.2,
+        rfc_a: a.3,
+        rfc_b: b.3,
+        note_a: a.4,
+        note_b: b.4,
+        alert_a: a.5,
+        alert_b: b.5,
+    }
+}
+
+/// The full REST router over a mock graph (shared by the handler tests).
+pub(crate) async fn router_over(graph: Arc<MockGraphStore>) -> axum::Router {
     let app_state = mock_app_state_with_graph(graph);
     let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
     let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
@@ -167,21 +187,7 @@ async fn fixture() -> Fx {
         model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
         vault: crate::vault::VaultService::ephemeral(),
     });
-    Fx {
-        app: create_router(state),
-        project_a: a.0,
-        project_b: b.0,
-        dec_a: a.1,
-        dec_b: b.1,
-        run_a: a.2,
-        run_b: b.2,
-        rfc_a: a.3,
-        rfc_b: b.3,
-        note_a: a.4,
-        note_b: b.4,
-        alert_a: a.5,
-        alert_b: b.5,
-    }
+    create_router(state)
 }
 
 async fn get(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {

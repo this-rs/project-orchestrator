@@ -202,8 +202,197 @@ static VECTOR_COLLECTOR: LazyLock<Arc<RwLock<VectorCollector>>> =
     LazyLock::new(|| Arc::new(RwLock::new(VectorCollector::new())));
 
 // ============================================================================
+// Liveness — which runs does THIS process actually drive?
+// ============================================================================
+
+/// Plan runs driven by this process. A `running` PlanRun that is not in here
+/// (and is not the `RUNNER_STATE` run) has no one executing it: its process is
+/// gone. Registered before the PlanRun is persisted (`start`) or before the
+/// resumed task is spawned (`recover_interrupted_runs`), so the reconciliation
+/// sweep can never see a live run as dead.
+static LIVE_PLAN_RUNS: LazyLock<std::sync::Mutex<std::collections::HashSet<Uuid>>> =
+    LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// RAII proof of life for one plan run: registered on creation, removed on drop
+/// (when the execution task ends, however it ends).
+pub struct LiveRunGuard {
+    run_id: Uuid,
+}
+
+impl LiveRunGuard {
+    pub fn register(run_id: Uuid) -> Self {
+        if let Ok(mut live) = LIVE_PLAN_RUNS.lock() {
+            live.insert(run_id);
+        }
+        Self { run_id }
+    }
+}
+
+impl Drop for LiveRunGuard {
+    fn drop(&mut self) {
+        if let Ok(mut live) = LIVE_PLAN_RUNS.lock() {
+            live.remove(&self.run_id);
+        }
+    }
+}
+
+/// Is `run_id` driven by the current process? True when it holds a
+/// [`LiveRunGuard`] or is the still-running run held in `RUNNER_STATE`.
+pub async fn is_plan_run_live(run_id: Uuid) -> bool {
+    if LIVE_PLAN_RUNS
+        .lock()
+        .map(|live| live.contains(&run_id))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let global = RUNNER_STATE.read().await;
+    global
+        .as_ref()
+        .is_some_and(|s| s.run_id == run_id && s.status == PlanRunStatus::Running)
+}
+
+/// What one [`reconcile_stale_runs`] sweep changed.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// `running` PlanRuns nobody drives, now `interrupted`.
+    pub plan_runs_interrupted: usize,
+    /// `running` AgentExecutions of a dead/terminal/absent run, now `interrupted`.
+    pub agent_executions_interrupted: usize,
+    /// Items that could not be read or written (logged, never fatal).
+    pub errors: usize,
+}
+
+// ============================================================================
 // PlanRunner — the execution engine
 // ============================================================================
+
+/// Close every `running` PlanRun / AgentExecution that has no proof of life in
+/// this process.
+///
+/// Proof of life is [`is_plan_run_live`]: the run is driven by THIS process. Anything
+/// else still `running` was left behind by a process that no longer exists (restart,
+/// crash) or by a run that ended without closing it, and is set to `interrupted`
+/// (neither `completed` nor `failed`: whether it finished is unknown).
+///
+/// - A `running` PlanRun nobody drives becomes `interrupted` (completed_at = now).
+/// - A `running` AgentExecution whose PlanRun is live is left alone. Otherwise it
+///   becomes `interrupted`, with `completed_at` = the end date of its PlanRun when
+///   that exists, else now.
+///
+/// Every element is handled independently: an error on one is logged and counted in
+/// [`ReconcileReport::errors`], never propagated. Idempotent: a second sweep finds
+/// nothing. Tasks and plans are deliberately NOT touched (a task `in_progress` may be
+/// a claim made by hand).
+///
+/// `grace_secs`: an AgentExecution whose PlanRun ended less than this many seconds
+/// ago is skipped, because a detached finalizer may still be writing its result.
+/// Use 0 at boot (no such task can exist yet).
+pub async fn reconcile_stale_runs(graph: &dyn GraphStore, grace_secs: i64) -> ReconcileReport {
+    let mut report = ReconcileReport::default();
+    let now = chrono::Utc::now();
+
+    // (b) PlanRuns `running` that nobody drives.
+    match graph.list_active_plan_runs().await {
+        Ok(active) => {
+            for mut run in active {
+                if is_plan_run_live(run.run_id).await {
+                    continue;
+                }
+                run.finalize(PlanRunStatus::Interrupted);
+                match graph.update_plan_run(&run).await {
+                    Ok(()) => {
+                        warn!(
+                            run_id = %run.run_id,
+                            plan_id = %run.plan_id,
+                            "PlanRun was `running` with no live runner in this process: marked interrupted"
+                        );
+                        report.plan_runs_interrupted += 1;
+                    }
+                    Err(e) => {
+                        error!(run_id = %run.run_id, "Failed to interrupt stale PlanRun: {}", e);
+                        report.errors += 1;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            error!("Reconciliation: cannot list running PlanRuns: {}", e);
+            report.errors += 1;
+        }
+    }
+
+    // (a) AgentExecutions `running` whose PlanRun is terminal, absent, or not alive.
+    let executions = match graph.list_running_agent_executions().await {
+        Ok(v) => v,
+        Err(e) => {
+            error!("Reconciliation: cannot list running AgentExecutions: {}", e);
+            report.errors += 1;
+            return report;
+        }
+    };
+    let mut parents: std::collections::HashMap<Uuid, Option<RunnerState>> =
+        std::collections::HashMap::new();
+    for mut ae in executions {
+        if is_plan_run_live(ae.run_id).await {
+            continue;
+        }
+        if let std::collections::hash_map::Entry::Vacant(slot) = parents.entry(ae.run_id) {
+            match graph.get_plan_run(ae.run_id).await {
+                Ok(parent) => {
+                    slot.insert(parent);
+                }
+                Err(e) => {
+                    error!(execution_id = %ae.id, "Cannot read the PlanRun of an AgentExecution: {}", e);
+                    report.errors += 1;
+                    continue;
+                }
+            }
+        }
+        let parent_ended = parents
+            .get(&ae.run_id)
+            .and_then(|p| p.as_ref())
+            .and_then(|p| p.completed_at);
+        if let Some(ended) = parent_ended {
+            if grace_secs > 0 && (now - ended).num_seconds() < grace_secs {
+                continue;
+            }
+        }
+        let closed_at = parent_ended.unwrap_or(now).max(ae.started_at);
+        let reason = match parents.get(&ae.run_id).and_then(|p| p.as_ref()) {
+            None => "its PlanRun no longer exists",
+            Some(_) if parent_ended.is_some() => "its PlanRun already ended",
+            Some(_) => "its PlanRun has no live runner in this process",
+        };
+        ae.status = crate::neo4j::agent_execution::AgentExecutionStatus::Interrupted;
+        ae.completed_at = Some(closed_at);
+        match graph.update_agent_execution(&ae).await {
+            Ok(()) => {
+                info!(
+                    execution_id = %ae.id,
+                    run_id = %ae.run_id,
+                    "AgentExecution was `running` but {}: marked interrupted",
+                    reason
+                );
+                report.agent_executions_interrupted += 1;
+            }
+            Err(e) => {
+                error!(execution_id = %ae.id, "Failed to interrupt stale AgentExecution: {}", e);
+                report.errors += 1;
+            }
+        }
+    }
+
+    if report.plan_runs_interrupted + report.agent_executions_interrupted > 0 {
+        info!(
+            plan_runs = report.plan_runs_interrupted,
+            agent_executions = report.agent_executions_interrupted,
+            errors = report.errors,
+            "Reconciliation closed stale running states"
+        );
+    }
+    report
+}
 
 /// Tasks of a wave the runner will execute, per the shared eligibility rule
 /// (the resume preview uses the same rule). Logs a warning per skipped blocked task.
@@ -600,10 +789,21 @@ impl PlanRunner {
 
     /// Recover interrupted runs from Neo4j at server boot.
     ///
-    /// Scans for PlanRun nodes with status=running, restores global state,
-    /// re-computes waves, and resumes execution from the last incomplete task.
-    /// Already-completed tasks are skipped by `execute_plan`.
-    pub async fn recover_interrupted_runs(self: Arc<Self>, cwd: String) -> Result<usize> {
+    /// Scans for PlanRun nodes with status=running and resumes AT MOST ONE of them
+    /// (the runner state is a single global: resuming two would overwrite one with
+    /// the other), the most recent resumable one. Resuming re-computes the waves
+    /// and continues from the last incomplete task; already-completed tasks are
+    /// skipped by `execute_plan`.
+    ///
+    /// A run is resumed only in the directory it was started in (`RunnerState::cwd`,
+    /// persisted with the run). If that directory is unknown (run written before the
+    /// field existed) or no longer exists, the run is marked `interrupted` with the
+    /// reason logged; it is NEVER resumed in the server's own directory.
+    ///
+    /// Each run is handled independently: an error on one is logged and the next run
+    /// is still examined (a run left untouched by an error is closed by the
+    /// reconciliation sweep that follows the recovery).
+    pub async fn recover_interrupted_runs(self: Arc<Self>) -> Result<usize> {
         let active_runs = self.graph.list_active_plan_runs().await?;
         if active_runs.is_empty() {
             info!("No interrupted runs to recover");
@@ -615,107 +815,179 @@ impl PlanRunner {
         let mut recovered = 0;
         for saved_state in active_runs {
             let run_id = saved_state.run_id;
-            let plan_id = saved_state.plan_id;
-            info!(
-                "Recovering run {} for plan {} (wave {}, {}/{} tasks done)",
-                run_id,
-                plan_id,
-                saved_state.current_wave,
-                saved_state.completed_tasks.len(),
-                saved_state.total_tasks
-            );
-
-            // Verify the plan still exists
-            let plan = self.graph.get_plan(plan_id).await?;
-            if plan.is_none() {
-                warn!(
-                    "Plan {} no longer exists, marking run {} as failed",
-                    plan_id, run_id
-                );
-                let mut failed_state = saved_state.clone();
-                failed_state.finalize(PlanRunStatus::Failed);
-                self.graph.update_plan_run(&failed_state).await?;
-                // Plan no longer exists, no status to update
-                continue;
+            match self.clone().recover_one(saved_state, recovered > 0).await {
+                Ok(true) => recovered += 1,
+                Ok(false) => {}
+                Err(e) => error!(
+                    "Recovery of run {} failed, going on with the next: {}",
+                    run_id, e
+                ),
             }
-
-            // Re-compute waves (task statuses may have changed)
-            let waves_result = match self.graph.compute_waves(plan_id).await {
-                Ok(w) => w,
-                Err(e) => {
-                    error!("Failed to compute waves for recovery: {}", e);
-                    continue;
-                }
-            };
-
-            if waves_result.waves.is_empty() {
-                info!("Plan {} has no remaining tasks, marking complete", plan_id);
-                let mut done_state = saved_state.clone();
-                done_state.finalize(PlanRunStatus::Completed);
-                self.graph.update_plan_run(&done_state).await?;
-                if let Err(e) = self
-                    .graph
-                    .update_plan_status(plan_id, PlanStatus::Completed)
-                    .await
-                {
-                    warn!(
-                        "Failed to set plan {} status to Completed on recovery: {}",
-                        plan_id, e
-                    );
-                }
-                continue;
-            }
-
-            // Restore global state
-            {
-                let mut global = RUNNER_STATE.write().await;
-                *global = Some(saved_state.clone());
-            }
-            RUNNER_CANCEL.store(false, Ordering::SeqCst);
-
-            // Emit recovery event
-            self.emit_event(RunnerEvent::PlanStarted {
-                run_id,
-                plan_id,
-                plan_title: format!("[Recovery] run {}", run_id),
-                total_tasks: saved_state.total_tasks,
-                total_waves: waves_result.waves.len(),
-                prediction: None,
-            });
-
-            // Spawn execution in background
-            let runner = self.clone();
-            let waves = waves_result.waves;
-            let cwd_clone = cwd.clone();
-            tokio::spawn(async move {
-                if let Err(e) = runner
-                    .execute_plan(run_id, plan_id, waves, cwd_clone, None)
-                    .await
-                {
-                    error!("Recovery execution failed for run {}: {}", run_id, e);
-                    runner.emit_event(RunnerEvent::RunnerError {
-                        run_id,
-                        message: format!("Recovery failed: {}", e),
-                    });
-                    let mut global = RUNNER_STATE.write().await;
-                    if let Some(ref mut s) = *global {
-                        s.finalize(PlanRunStatus::Failed);
-                        let _ = runner.graph.update_plan_run(s).await;
-                        if let Err(e) = runner
-                            .graph
-                            .update_plan_status(s.plan_id, PlanStatus::Cancelled)
-                            .await
-                        {
-                            warn!("Failed to set plan {} status to Cancelled after recovery failure: {}", s.plan_id, e);
-                        }
-                    }
-                }
-            });
-
-            recovered += 1;
         }
 
         Ok(recovered)
+    }
+
+    /// Record the absolute working directory of a run in its persisted state.
+    /// Best effort: without it the run simply cannot be resumed after a restart.
+    async fn persist_run_cwd(&self, run_id: Uuid, cwd: &str) {
+        let Ok(abs) = std::fs::canonicalize(cwd) else {
+            warn!(%run_id, cwd, "Cannot canonicalize the run cwd: it will not be resumable after a restart");
+            return;
+        };
+        let mut global = RUNNER_STATE.write().await;
+        if let Some(ref mut s) = *global {
+            if s.run_id == run_id {
+                s.cwd = Some(abs.to_string_lossy().into_owned());
+                if let Err(e) = self.graph.update_plan_run(s).await {
+                    warn!(%run_id, "Failed to persist the run cwd: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Mark a run `interrupted` and log why. Never resumes anything.
+    async fn interrupt_run(&self, mut state: RunnerState, reason: &str) -> Result<()> {
+        warn!(
+            run_id = %state.run_id,
+            plan_id = %state.plan_id,
+            "Run not resumed, marked interrupted: {}",
+            reason
+        );
+        state.finalize(PlanRunStatus::Interrupted);
+        self.graph.update_plan_run(&state).await
+    }
+
+    /// Recover one run. `Ok(true)` when it was resumed.
+    async fn recover_one(
+        self: Arc<Self>,
+        saved_state: RunnerState,
+        another_run_resumed: bool,
+    ) -> Result<bool> {
+        let run_id = saved_state.run_id;
+        let plan_id = saved_state.plan_id;
+        info!(
+            "Recovering run {} for plan {} (wave {}, {}/{} tasks done)",
+            run_id,
+            plan_id,
+            saved_state.current_wave,
+            saved_state.completed_tasks.len(),
+            saved_state.total_tasks
+        );
+
+        // The directory the run must resume in.
+        let cwd = match saved_state.cwd.clone().filter(|c| !c.trim().is_empty()) {
+            None => {
+                self.interrupt_run(
+                    saved_state,
+                    "its working directory was not recorded (run written before cwd was persisted)",
+                )
+                .await?;
+                return Ok(false);
+            }
+            Some(c) if !std::path::Path::new(&c).is_dir() => {
+                let reason = format!("its working directory no longer exists: {c}");
+                self.interrupt_run(saved_state, &reason).await?;
+                return Ok(false);
+            }
+            Some(c) => c,
+        };
+
+        if another_run_resumed {
+            self.interrupt_run(
+                saved_state,
+                "another run was already resumed (the runner drives one run at a time)",
+            )
+            .await?;
+            return Ok(false);
+        }
+
+        // Verify the plan still exists
+        let plan = self.graph.get_plan(plan_id).await?;
+        if plan.is_none() {
+            warn!(
+                "Plan {} no longer exists, marking run {} as failed",
+                plan_id, run_id
+            );
+            let mut failed_state = saved_state;
+            failed_state.finalize(PlanRunStatus::Failed);
+            self.graph.update_plan_run(&failed_state).await?;
+            // Plan no longer exists, no status to update
+            return Ok(false);
+        }
+
+        // Re-compute waves (task statuses may have changed)
+        let waves_result = self.graph.compute_waves(plan_id).await?;
+
+        if waves_result.waves.is_empty() {
+            info!("Plan {} has no remaining tasks, marking complete", plan_id);
+            let mut done_state = saved_state;
+            done_state.finalize(PlanRunStatus::Completed);
+            self.graph.update_plan_run(&done_state).await?;
+            if let Err(e) = self
+                .graph
+                .update_plan_status(plan_id, PlanStatus::Completed)
+                .await
+            {
+                warn!(
+                    "Failed to set plan {} status to Completed on recovery: {}",
+                    plan_id, e
+                );
+            }
+            return Ok(false);
+        }
+
+        // Proof of life BEFORE the run is spawned, so the reconciliation sweep that
+        // follows the recovery sees this run as driven by this process.
+        let live = LiveRunGuard::register(run_id);
+
+        // Restore global state
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = Some(saved_state.clone());
+        }
+        RUNNER_CANCEL.store(false, Ordering::SeqCst);
+
+        // Emit recovery event
+        self.emit_event(RunnerEvent::PlanStarted {
+            run_id,
+            plan_id,
+            plan_title: format!("[Recovery] run {}", run_id),
+            total_tasks: saved_state.total_tasks,
+            total_waves: waves_result.waves.len(),
+            prediction: None,
+        });
+
+        // Spawn execution in background
+        let runner = self.clone();
+        let waves = waves_result.waves;
+        tokio::spawn(async move {
+            let _live = live;
+            if let Err(e) = runner.execute_plan(run_id, plan_id, waves, cwd, None).await {
+                error!("Recovery execution failed for run {}: {}", run_id, e);
+                runner.emit_event(RunnerEvent::RunnerError {
+                    run_id,
+                    message: format!("Recovery failed: {}", e),
+                });
+                let mut global = RUNNER_STATE.write().await;
+                if let Some(ref mut s) = *global {
+                    s.finalize(PlanRunStatus::Failed);
+                    let _ = runner.graph.update_plan_run(s).await;
+                    if let Err(e) = runner
+                        .graph
+                        .update_plan_status(s.plan_id, PlanStatus::Cancelled)
+                        .await
+                    {
+                        warn!(
+                            "Failed to set plan {} status to Cancelled after recovery failure: {}",
+                            s.plan_id, e
+                        );
+                    }
+                }
+            }
+        });
+
+        Ok(true)
     }
 
     /// Start executing a plan. Returns immediately with the run_id.
@@ -753,6 +1025,9 @@ impl PlanRunner {
         let run_id = Uuid::new_v4();
         let state = RunnerState::new(run_id, plan_id, total_tasks, trigger.clone());
 
+        // Proof of life from before the PlanRun exists in the graph: the
+        // reconciliation sweep must never see this run as abandoned.
+        let live = LiveRunGuard::register(run_id);
         self.graph.create_plan_run(&state).await?;
 
         // 4. Store in global state
@@ -875,6 +1150,7 @@ impl PlanRunner {
         let runner = self.clone();
         let waves = waves_result.waves;
         tokio::spawn(async move {
+            let _live = live;
             if let Err(e) = runner
                 .execute_plan(run_id, plan_id, waves, cwd, project_slug)
                 .await
@@ -1163,6 +1439,10 @@ impl PlanRunner {
                 }
             }
         };
+
+        // Persist the directory the run really executes in, so a resume after a
+        // restart goes back to the SAME place (and refuses to guess otherwise).
+        self.persist_run_cwd(run_id, &cwd).await;
 
         // Create a dedicated git branch for this run
         let branch_name = self.create_git_branch(plan_id, run_id, &cwd).await;
@@ -7854,5 +8134,316 @@ mod tests {
         .unwrap();
         let (_r, metrics) = runner.listen_for_result(rx, Uuid::new_v4(), None).await;
         assert!(metrics.last_error.unwrap().len() <= 500);
+    }
+
+    // ========================================================================
+    // Reconciliation of stale `running` states
+    // ========================================================================
+
+    use crate::neo4j::agent_execution::{AgentExecutionNode, AgentExecutionStatus, ExecutionType};
+    use crate::neo4j::mock::MockGraphStore;
+
+    fn running_agent(run_id: Uuid) -> AgentExecutionNode {
+        AgentExecutionNode {
+            id: Uuid::new_v4(),
+            run_id,
+            task_id: Uuid::new_v4(),
+            session_id: None,
+            started_at: chrono::Utc::now() - chrono::Duration::hours(30),
+            completed_at: None,
+            cost_usd: 0.0,
+            duration_secs: 0.0,
+            status: AgentExecutionStatus::Running,
+            tools_used: String::new(),
+            files_modified: vec![],
+            commits: vec![],
+            persona_profile: String::new(),
+            vector_json: None,
+            report_json: None,
+            execution_type: ExecutionType::TaskAgent,
+        }
+    }
+
+    fn stale_run(status: PlanRunStatus, ended_hours_ago: Option<i64>) -> RunnerState {
+        let mut s = RunnerState::new(Uuid::new_v4(), Uuid::new_v4(), 3, TriggerSource::Manual);
+        s.started_at = chrono::Utc::now() - chrono::Duration::hours(40);
+        s.status = status;
+        s.completed_at = ended_hours_ago.map(|h| chrono::Utc::now() - chrono::Duration::hours(h));
+        s
+    }
+
+    async fn agent_status(g: &MockGraphStore, id: Uuid) -> AgentExecutionNode {
+        g.agent_executions.read().await.get(&id).cloned().unwrap()
+    }
+
+    #[tokio::test]
+    async fn reconcile_closes_running_agents_of_a_terminal_run_at_the_run_end_date() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let g = MockGraphStore::new();
+        let run = stale_run(PlanRunStatus::Completed, Some(20));
+        g.create_plan_run(&run).await.unwrap();
+        let ae = running_agent(run.run_id);
+        g.create_agent_execution(&ae).await.unwrap();
+        let mut done = running_agent(run.run_id);
+        done.status = AgentExecutionStatus::Completed;
+        done.completed_at = Some(chrono::Utc::now());
+        g.create_agent_execution(&done).await.unwrap();
+
+        let report = reconcile_stale_runs(&g, 0).await;
+
+        assert_eq!(report.agent_executions_interrupted, 1);
+        let after = agent_status(&g, ae.id).await;
+        assert_eq!(after.status, AgentExecutionStatus::Interrupted);
+        assert_eq!(after.completed_at, run.completed_at);
+        // a finished execution is not touched
+        assert_eq!(
+            agent_status(&g, done.id).await.status,
+            AgentExecutionStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_closes_running_agents_whose_run_is_absent() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let g = MockGraphStore::new();
+        let ae = running_agent(Uuid::new_v4());
+        g.create_agent_execution(&ae).await.unwrap();
+
+        let before = chrono::Utc::now();
+        let report = reconcile_stale_runs(&g, 0).await;
+
+        assert_eq!(report.agent_executions_interrupted, 1);
+        let after = agent_status(&g, ae.id).await;
+        assert_eq!(after.status, AgentExecutionStatus::Interrupted);
+        assert!(after.completed_at.unwrap() >= before);
+    }
+
+    #[tokio::test]
+    async fn reconcile_interrupts_a_running_run_nobody_drives_and_its_agents() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let g = MockGraphStore::new();
+        let run = stale_run(PlanRunStatus::Running, None);
+        g.create_plan_run(&run).await.unwrap();
+        let ae = running_agent(run.run_id);
+        g.create_agent_execution(&ae).await.unwrap();
+
+        let report = reconcile_stale_runs(&g, 0).await;
+
+        assert_eq!(report.plan_runs_interrupted, 1);
+        assert_eq!(report.agent_executions_interrupted, 1);
+        let r = g.get_plan_run(run.run_id).await.unwrap().unwrap();
+        assert_eq!(r.status, PlanRunStatus::Interrupted);
+        assert!(r.completed_at.is_some());
+        let after = agent_status(&g, ae.id).await;
+        assert_eq!(after.status, AgentExecutionStatus::Interrupted);
+        assert_eq!(after.completed_at, r.completed_at);
+    }
+
+    #[tokio::test]
+    async fn reconcile_never_touches_a_live_run_nor_its_agents() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let g = MockGraphStore::new();
+
+        // Live through its registry guard...
+        let guarded = stale_run(PlanRunStatus::Running, None);
+        g.create_plan_run(&guarded).await.unwrap();
+        let guarded_ae = running_agent(guarded.run_id);
+        g.create_agent_execution(&guarded_ae).await.unwrap();
+        let _live = LiveRunGuard::register(guarded.run_id);
+
+        // ...and live because it is the run held in RUNNER_STATE.
+        let held = stale_run(PlanRunStatus::Running, None);
+        g.create_plan_run(&held).await.unwrap();
+        let held_ae = running_agent(held.run_id);
+        g.create_agent_execution(&held_ae).await.unwrap();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = Some(held.clone());
+        }
+
+        let report = reconcile_stale_runs(&g, 0).await;
+
+        assert_eq!(report, ReconcileReport::default());
+        for run_id in [guarded.run_id, held.run_id] {
+            let r = g.get_plan_run(run_id).await.unwrap().unwrap();
+            assert_eq!(r.status, PlanRunStatus::Running);
+            assert!(r.completed_at.is_none());
+        }
+        for id in [guarded_ae.id, held_ae.id] {
+            assert_eq!(
+                agent_status(&g, id).await.status,
+                AgentExecutionStatus::Running
+            );
+        }
+        reset_globals().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_is_idempotent() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let g = MockGraphStore::new();
+        let run = stale_run(PlanRunStatus::Running, None);
+        g.create_plan_run(&run).await.unwrap();
+        g.create_agent_execution(&running_agent(run.run_id))
+            .await
+            .unwrap();
+
+        let first = reconcile_stale_runs(&g, 0).await;
+        let r1 = g.get_plan_run(run.run_id).await.unwrap().unwrap();
+        let second = reconcile_stale_runs(&g, 0).await;
+        let r2 = g.get_plan_run(run.run_id).await.unwrap().unwrap();
+
+        assert_eq!(first.plan_runs_interrupted, 1);
+        assert_eq!(second, ReconcileReport::default());
+        assert_eq!(r1.completed_at, r2.completed_at);
+    }
+
+    #[tokio::test]
+    async fn reconcile_isolates_a_failing_item_from_the_rest() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let g = MockGraphStore::new();
+        let bad = stale_run(PlanRunStatus::Running, None);
+        let good = stale_run(PlanRunStatus::Running, None);
+        g.create_plan_run(&bad).await.unwrap();
+        g.create_plan_run(&good).await.unwrap();
+        g.fail_plan_run_updates.lock().unwrap().insert(bad.run_id);
+        let bad_ae = running_agent(Uuid::new_v4());
+        let good_ae = running_agent(Uuid::new_v4());
+        g.create_agent_execution(&bad_ae).await.unwrap();
+        g.create_agent_execution(&good_ae).await.unwrap();
+        g.fail_agent_execution_updates
+            .lock()
+            .unwrap()
+            .insert(bad_ae.id);
+
+        let report = reconcile_stale_runs(&g, 0).await;
+
+        assert_eq!(
+            g.get_plan_run(good.run_id).await.unwrap().unwrap().status,
+            PlanRunStatus::Interrupted
+        );
+        assert_eq!(
+            agent_status(&g, good_ae.id).await.status,
+            AgentExecutionStatus::Interrupted
+        );
+        assert!(report.errors >= 2, "failures must be counted: {report:?}");
+    }
+
+    #[tokio::test]
+    async fn reconcile_grace_spares_a_run_that_just_ended_but_not_an_old_one() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let g = MockGraphStore::new();
+        let mut fresh = stale_run(PlanRunStatus::Completed, None);
+        fresh.completed_at = Some(chrono::Utc::now() - chrono::Duration::seconds(10));
+        let old = stale_run(PlanRunStatus::Completed, Some(5));
+        g.create_plan_run(&fresh).await.unwrap();
+        g.create_plan_run(&old).await.unwrap();
+        let fresh_ae = running_agent(fresh.run_id);
+        let old_ae = running_agent(old.run_id);
+        g.create_agent_execution(&fresh_ae).await.unwrap();
+        g.create_agent_execution(&old_ae).await.unwrap();
+
+        // A detached finalizer may still be writing the fresh one's agents.
+        reconcile_stale_runs(&g, 120).await;
+
+        assert_eq!(
+            agent_status(&g, fresh_ae.id).await.status,
+            AgentExecutionStatus::Running
+        );
+        assert_eq!(
+            agent_status(&g, old_ae.id).await.status,
+            AgentExecutionStatus::Interrupted
+        );
+    }
+
+    // ========================================================================
+    // Resuming runs after a restart
+    // ========================================================================
+
+    async fn resumable_candidate(
+        g: &MockGraphStore,
+        cwd: Option<String>,
+        age_hours: i64,
+    ) -> RunnerState {
+        use crate::test_helpers::{test_plan, test_task};
+        let plan = test_plan();
+        g.create_plan(&plan).await.unwrap();
+        g.create_task(plan.id, &test_task()).await.unwrap();
+        let mut s = RunnerState::new(Uuid::new_v4(), plan.id, 1, TriggerSource::Manual);
+        s.started_at = chrono::Utc::now() - chrono::Duration::hours(age_hours);
+        s.cwd = cwd;
+        g.create_plan_run(&s).await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn recovery_never_resumes_a_run_whose_cwd_is_unknown() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (runner, g) = test_plan_runner_with_graph();
+        let run = resumable_candidate(&g, None, 1).await;
+
+        let recovered = Arc::new(runner).recover_interrupted_runs().await.unwrap();
+
+        assert_eq!(recovered, 0, "must not resume in the server directory");
+        let after = g.get_plan_run(run.run_id).await.unwrap().unwrap();
+        assert_eq!(after.status, PlanRunStatus::Interrupted);
+        assert!(RUNNER_STATE.read().await.is_none());
+        reset_globals().await;
+    }
+
+    #[tokio::test]
+    async fn recovery_never_resumes_a_run_whose_cwd_no_longer_exists() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (runner, g) = test_plan_runner_with_graph();
+        let run = resumable_candidate(
+            &g,
+            Some("/nonexistent/po-test/removed-checkout".to_string()),
+            1,
+        )
+        .await;
+
+        let recovered = Arc::new(runner).recover_interrupted_runs().await.unwrap();
+
+        assert_eq!(recovered, 0);
+        let after = g.get_plan_run(run.run_id).await.unwrap().unwrap();
+        assert_eq!(after.status, PlanRunStatus::Interrupted);
+        reset_globals().await;
+    }
+
+    #[tokio::test]
+    async fn recovery_goes_on_with_the_next_run_when_one_run_errors() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (runner, g) = test_plan_runner_with_graph();
+        let here = std::env::temp_dir().to_string_lossy().into_owned();
+        // Newest first (the store lists by started_at DESC): `broken` is hit first
+        // and its plan cannot be read.
+        let broken = resumable_candidate(&g, Some(here.clone()), 1).await;
+        g.fail_get_plan.lock().unwrap().insert(broken.plan_id);
+        // `next` points to a plan that does not exist: it must be closed as failed.
+        let mut next = RunnerState::new(Uuid::new_v4(), Uuid::new_v4(), 1, TriggerSource::Manual);
+        next.started_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        next.cwd = Some(here);
+        g.create_plan_run(&next).await.unwrap();
+
+        let result = Arc::new(runner).recover_interrupted_runs().await;
+
+        assert!(result.is_ok(), "one bad run must not abort the recovery");
+        let after = g.get_plan_run(next.run_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.status,
+            PlanRunStatus::Failed,
+            "the run after the failing one was never examined"
+        );
+        reset_globals().await;
     }
 }

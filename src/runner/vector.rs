@@ -915,6 +915,7 @@ mod tests {
             triggered_by: TriggerSource::Manual,
             project_id: None,
             lifecycle_run_id: None,
+            cwd: None,
         }
     }
 

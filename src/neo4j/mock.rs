@@ -93,6 +93,14 @@ pub struct MockGraphStore {
     pub session_auto_continue: RwLock<HashMap<Uuid, bool>>,
     /// PlanRun states (Runner)
     pub plan_runs: RwLock<HashMap<Uuid, crate::runner::RunnerState>>,
+    /// AgentExecution nodes, by id.
+    pub agent_executions: RwLock<HashMap<Uuid, crate::neo4j::agent_execution::AgentExecutionNode>>,
+    /// Failure injection: AgentExecution ids whose `update_agent_execution` errors.
+    pub fail_agent_execution_updates: std::sync::Mutex<std::collections::HashSet<Uuid>>,
+    /// Failure injection: PlanRun ids whose `update_plan_run` errors.
+    pub fail_plan_run_updates: std::sync::Mutex<std::collections::HashSet<Uuid>>,
+    /// Failure injection: plan ids whose `get_plan` errors.
+    pub fail_get_plan: std::sync::Mutex<std::collections::HashSet<Uuid>>,
     /// Triggers
     pub triggers: RwLock<HashMap<Uuid, crate::runner::Trigger>>,
     /// Trigger firings
@@ -282,6 +290,10 @@ impl MockGraphStore {
             chat_events: RwLock::new(HashMap::new()),
             session_auto_continue: RwLock::new(HashMap::new()),
             plan_runs: RwLock::new(HashMap::new()),
+            agent_executions: RwLock::new(HashMap::new()),
+            fail_agent_execution_updates: std::sync::Mutex::new(std::collections::HashSet::new()),
+            fail_plan_run_updates: std::sync::Mutex::new(std::collections::HashSet::new()),
+            fail_get_plan: std::sync::Mutex::new(std::collections::HashSet::new()),
             triggers: RwLock::new(HashMap::new()),
             trigger_firings: RwLock::new(HashMap::new()),
             plan_tasks: RwLock::new(HashMap::new()),
@@ -3421,6 +3433,9 @@ impl GraphStore for MockGraphStore {
     }
 
     async fn get_plan(&self, id: Uuid) -> Result<Option<PlanNode>> {
+        if self.fail_get_plan.lock().is_ok_and(|f| f.contains(&id)) {
+            anyhow::bail!("mock: get_plan failure injected for {id}");
+        }
         Ok(self.plans.read().await.get(&id).cloned())
     }
 
@@ -11337,6 +11352,16 @@ impl GraphStore for MockGraphStore {
     }
 
     async fn update_plan_run(&self, state: &crate::runner::RunnerState) -> anyhow::Result<()> {
+        if self
+            .fail_plan_run_updates
+            .lock()
+            .is_ok_and(|f| f.contains(&state.run_id))
+        {
+            anyhow::bail!(
+                "mock: update_plan_run failure injected for {}",
+                state.run_id
+            );
+        }
         let mut runs = self.plan_runs.write().await;
         runs.insert(state.run_id, state.clone());
         Ok(())
@@ -11352,11 +11377,14 @@ impl GraphStore for MockGraphStore {
 
     async fn list_active_plan_runs(&self) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
         let runs = self.plan_runs.read().await;
-        Ok(runs
+        let mut active: Vec<_> = runs
             .values()
             .filter(|s| s.status == crate::runner::PlanRunStatus::Running)
             .cloned()
-            .collect())
+            .collect();
+        // Same order as the Cypher (`ORDER BY r.started_at DESC`).
+        active.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        Ok(active)
     }
 
     async fn list_all_plan_runs(
@@ -11511,23 +11539,65 @@ impl GraphStore for MockGraphStore {
 
     async fn create_agent_execution(
         &self,
-        _ae: &crate::neo4j::agent_execution::AgentExecutionNode,
+        ae: &crate::neo4j::agent_execution::AgentExecutionNode,
     ) -> anyhow::Result<()> {
+        self.agent_executions
+            .write()
+            .await
+            .insert(ae.id, ae.clone());
         Ok(())
     }
 
     async fn update_agent_execution(
         &self,
-        _ae: &crate::neo4j::agent_execution::AgentExecutionNode,
+        ae: &crate::neo4j::agent_execution::AgentExecutionNode,
     ) -> anyhow::Result<()> {
+        if self
+            .fail_agent_execution_updates
+            .lock()
+            .is_ok_and(|f| f.contains(&ae.id))
+        {
+            anyhow::bail!(
+                "mock: update_agent_execution failure injected for {}",
+                ae.id
+            );
+        }
+        // Like the Cypher `MATCH ... SET`: updating a node that is absent is a no-op.
+        if let Some(slot) = self.agent_executions.write().await.get_mut(&ae.id) {
+            *slot = ae.clone();
+        }
         Ok(())
     }
 
     async fn get_agent_executions_for_run(
         &self,
-        _run_id: Uuid,
+        run_id: Uuid,
     ) -> anyhow::Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>> {
-        Ok(Vec::new())
+        let mut v: Vec<_> = self
+            .agent_executions
+            .read()
+            .await
+            .values()
+            .filter(|ae| ae.run_id == run_id)
+            .cloned()
+            .collect();
+        v.sort_by_key(|ae| ae.started_at);
+        Ok(v)
+    }
+
+    async fn list_running_agent_executions(
+        &self,
+    ) -> anyhow::Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>> {
+        let mut v: Vec<_> = self
+            .agent_executions
+            .read()
+            .await
+            .values()
+            .filter(|ae| ae.status == crate::neo4j::agent_execution::AgentExecutionStatus::Running)
+            .cloned()
+            .collect();
+        v.sort_by_key(|ae| ae.started_at);
+        Ok(v)
     }
 
     async fn create_used_skill_relation(

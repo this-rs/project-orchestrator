@@ -475,6 +475,9 @@ pub async fn create_protocol(
             .parse::<crate::protocol::TriggerMode>()
             .map_err(AppError::BadRequest)?;
     }
+    if let Some(ref cfg) = body.trigger_config {
+        cfg.validate().map_err(AppError::BadRequest)?;
+    }
     protocol.trigger_config = body.trigger_config.clone();
     protocol.relevance_vector = body.relevance_vector.clone();
 
@@ -696,6 +699,7 @@ pub async fn update_protocol(
             .map_err(AppError::BadRequest)?;
     }
     if let Some(trigger_config) = body.trigger_config {
+        trigger_config.validate().map_err(AppError::BadRequest)?;
         protocol.trigger_config = Some(trigger_config);
     }
     if let Some(relevance_vector) = body.relevance_vector {
@@ -2577,5 +2581,112 @@ mod tests {
         };
         let res = list_runs(State(state), Path(proto_id), axum::extract::Query(q)).await;
         assert!(res.is_ok(), "list_runs failed: {:?}", res.err());
+    }
+
+    // ----------------------------------------------------------------
+    // schedule validation (REST)
+    // ----------------------------------------------------------------
+
+    use crate::neo4j::GraphStore;
+
+    async fn send(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("authorization", crate::test_helpers::test_bearer_token())
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn create_protocol_refuses_an_unknown_schedule_with_a_400_listing_the_values() {
+        let graph = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let app = crate::api::list_routes_tests::router_over(graph.clone()).await;
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/protocols",
+            serde_json::json!({
+                "project_id": Uuid::new_v4(),
+                "name": "fsm-watchdog",
+                "trigger_mode": "scheduled",
+                "trigger_config": {"schedule": "6h"},
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+        let text = body.to_string();
+        assert!(text.contains("6h"), "{text}");
+        for accepted in ["hourly", "daily", "weekly"] {
+            assert!(text.contains(accepted), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_protocol_accepts_a_known_schedule() {
+        let graph = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let app = crate::api::list_routes_tests::router_over(graph.clone()).await;
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/protocols",
+            serde_json::json!({
+                "project_id": Uuid::new_v4(),
+                "name": "nightly",
+                "trigger_mode": "scheduled",
+                "trigger_config": {"schedule": "daily"},
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    }
+
+    #[tokio::test]
+    async fn update_protocol_refuses_an_unknown_schedule_and_keeps_the_stored_one() {
+        let graph = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+        let mut p = Protocol::new(project_id, "nightly", Uuid::new_v4());
+        p.trigger_config = Some(crate::protocol::TriggerConfig {
+            schedule: Some("daily".to_string()),
+            ..Default::default()
+        });
+        graph.upsert_protocol(&p).await.unwrap();
+        let app = crate::api::list_routes_tests::router_over(graph.clone()).await;
+
+        let (status, body) = send(
+            &app,
+            "PUT",
+            &format!("/api/protocols/{}", p.id),
+            serde_json::json!({"trigger_config": {"schedule": "6h"}}),
+        )
+        .await;
+
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+        let stored = graph.get_protocol(p.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.trigger_config.unwrap().schedule.as_deref(),
+            Some("daily")
+        );
     }
 }

@@ -4052,6 +4052,12 @@ impl GraphStore for Neo4jClient {
         self.get_agent_executions_for_run_impl(run_id).await
     }
 
+    async fn list_running_agent_executions(
+        &self,
+    ) -> anyhow::Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>> {
+        self.list_running_agent_executions_impl().await
+    }
+
     async fn create_used_skill_relation(
         &self,
         agent_execution_id: Uuid,

@@ -1616,26 +1616,71 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     }
 
     // Spawn the protocol scheduler (hourly evaluation of scheduled protocols)
+    let protocol_emitter_for_reconcile = protocol_emitter.clone();
     crate::protocol::hooks::spawn_protocol_scheduler(orchestrator.neo4j_arc(), protocol_emitter);
 
-    // Recover interrupted plan runner runs from previous server instance
-    if let Some(ref cm) = chat_manager {
-        let graph = orchestrator.neo4j_arc();
-        let context_builder = orchestrator.context_builder().clone();
-        let runner_config = orchestrator.runner_config();
-        let (event_tx, _) = tokio::sync::broadcast::channel(256);
-        let runner = std::sync::Arc::new(
-            runner::PlanRunner::new(cm.clone(), graph, context_builder, runner_config, event_tx)
-                .with_event_emitter(event_bus.clone() as std::sync::Arc<dyn events::EventEmitter>),
-        );
+    // Name, once per protocol, every protocol whose `schedule` the scheduler ignores.
+    {
+        let store = orchestrator.neo4j_arc();
         tokio::spawn(async move {
-            match runner.recover_interrupted_runs(".".to_string()).await {
-                Ok(0) => {} // no runs to recover, stay silent
-                Ok(count) => {
-                    tracing::info!("PlanRunner recovery: resumed {} interrupted run(s)", count);
+            crate::protocol::hooks::unrecognized_schedules(&*store).await;
+        });
+    }
+
+    // Plan runner: resume what can be resumed, then reconcile. Reconciliation closes
+    // every `running` PlanRun / AgentExecution this process does not drive (boot, then
+    // every RECONCILE_INTERVAL), so a "running" state is always a real one.
+    {
+        let graph = orchestrator.neo4j_arc();
+        let runner = chat_manager.as_ref().map(|cm| {
+            let context_builder = orchestrator.context_builder().clone();
+            let runner_config = orchestrator.runner_config();
+            let (event_tx, _) = tokio::sync::broadcast::channel(256);
+            std::sync::Arc::new(
+                runner::PlanRunner::new(
+                    cm.clone(),
+                    graph.clone(),
+                    context_builder,
+                    runner_config,
+                    event_tx,
+                )
+                .with_event_emitter(event_bus.clone() as std::sync::Arc<dyn events::EventEmitter>),
+            )
+        });
+        let protocol_emitter = protocol_emitter_for_reconcile;
+        tokio::spawn(async move {
+            const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+            // An AgentExecution whose run ended this recently may still be finalized
+            // by a detached task: leave it to that task.
+            const RECONCILE_GRACE_SECS: i64 = 120;
+
+            if let Some(runner) = runner {
+                match runner.recover_interrupted_runs().await {
+                    Ok(0) => {} // no runs to recover, stay silent
+                    Ok(count) => {
+                        tracing::info!("PlanRunner recovery: resumed {} interrupted run(s)", count);
+                    }
+                    Err(e) => {
+                        tracing::warn!("PlanRunner recovery failed (non-fatal): {}", e);
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("PlanRunner recovery failed (non-fatal): {}", e);
+            }
+            // Boot: nothing can be finalizing in the background yet.
+            runner::reconcile_stale_runs(&*graph, 0).await;
+
+            let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
+            interval.tick().await; // the first tick is immediate: boot just did it
+            loop {
+                interval.tick().await;
+                runner::reconcile_stale_runs(&*graph, RECONCILE_GRACE_SECS).await;
+                if let Err(e) = crate::protocol::hooks::recover_orphaned_runs_older_than(
+                    graph.clone(),
+                    protocol_emitter.clone(),
+                    crate::protocol::hooks::ORPHAN_RUN_MAX_AGE_SECS,
+                )
+                .await
+                {
+                    tracing::warn!("Periodic protocol run reconciliation failed: {}", e);
                 }
             }
         });

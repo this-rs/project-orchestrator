@@ -64,6 +64,12 @@ pub struct RunnerState {
     /// None when no lifecycle protocol is available (fallback mode).
     #[serde(default)]
     pub lifecycle_run_id: Option<Uuid>,
+    /// Absolute working directory the run executes in, persisted so that a run
+    /// resumed after a restart goes back to the SAME directory (the server's own
+    /// directory is never a valid substitute). `None` for runs written before
+    /// this field existed: those cannot be resumed safely.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 impl RunnerState {
@@ -93,6 +99,7 @@ impl RunnerState {
             triggered_by,
             project_id: None,
             lifecycle_run_id: None,
+            cwd: None,
         }
     }
 

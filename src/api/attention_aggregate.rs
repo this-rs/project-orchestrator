@@ -108,7 +108,11 @@ fn run_status(s: PlanRunStatus) -> RunStatus {
     match s {
         PlanRunStatus::Running => RunStatus::Running,
         PlanRunStatus::Completed => RunStatus::Completed,
-        PlanRunStatus::CompletedWithErrors | PlanRunStatus::Failed => RunStatus::Failed,
+        // The attention contract has no `interrupted` yet: a run left behind by a
+        // restart reads as a stopped run that needs a decision, like `failed`.
+        PlanRunStatus::CompletedWithErrors | PlanRunStatus::Failed | PlanRunStatus::Interrupted => {
+            RunStatus::Failed
+        }
         PlanRunStatus::Cancelled => RunStatus::Cancelled,
         PlanRunStatus::BudgetExceeded => RunStatus::BudgetExceeded,
     }
@@ -492,6 +496,7 @@ pub async fn build_attention(graph: &dyn GraphStore, p: &AttentionParams) -> Att
             PlanRunStatus::Failed
                 | PlanRunStatus::CompletedWithErrors
                 | PlanRunStatus::BudgetExceeded
+                | PlanRunStatus::Interrupted
         );
         if failed
             && plans
@@ -570,9 +575,9 @@ pub async fn build_attention(graph: &dyn GraphStore, p: &AttentionParams) -> Att
             .filter(|_| open)
             .and_then(|r| match r.status {
                 PlanRunStatus::BudgetExceeded => Some((StuckReason::BudgetExceeded, r)),
-                PlanRunStatus::Failed | PlanRunStatus::CompletedWithErrors => {
-                    Some((StuckReason::Failed, r))
-                }
+                PlanRunStatus::Failed
+                | PlanRunStatus::CompletedWithErrors
+                | PlanRunStatus::Interrupted => Some((StuckReason::Failed, r)),
                 _ => None,
             })
             .map(|(reason, r)| (reason, r.completed_at.unwrap_or(r.started_at)))
@@ -687,6 +692,7 @@ pub async fn build_attention(graph: &dyn GraphStore, p: &AttentionParams) -> Att
                     | PlanRunStatus::CompletedWithErrors
                     | PlanRunStatus::BudgetExceeded
                     | PlanRunStatus::Cancelled
+                    | PlanRunStatus::Interrupted
             )
         }) && plan.is_some_and(|pl| plan_is_open(&pl.status));
         let resume = (resumable && task_graph.is_some() && !tasks.is_empty()).then(|| {
