@@ -13,9 +13,16 @@
 //!
 //! ## User authentication
 //! `/oauth/authorize` identifies the user via the existing HttpOnly
-//! `refresh_token` cookie (same mechanism as the WS upgrade auth). A browser
-//! with an active PO session authorizes silently; otherwise the user is
-//! redirected to the SPA `/login?next=<authorize-url>` to sign in first.
+//! `refresh_token` cookie (same mechanism as the WS upgrade auth). Without a
+//! session the user is redirected to the SPA `/login?next=<authorize-url>`.
+//!
+//! ## Consent
+//! A session is NOT consent. `GET /oauth/authorize` never issues a code: it
+//! renders a consent page naming the client, where the code will be sent and
+//! what the token allows. Only `POST /oauth/authorize` — the user pressing
+//! "Authorize" — issues the code. Registration is open (RFC 7591), so without
+//! this step any site could register a client, have a signed-in user open an
+//! authorize link, and receive a 30-day MCP token for that user.
 //!
 //! ## Stateless clients
 //! Registered clients are PUBLIC clients (no secret) whose only state is
@@ -51,12 +58,15 @@ use uuid::Uuid;
 const AUTH_CODE_TTL: Duration = Duration::from_secs(120);
 
 /// Lifetime of OAuth-issued MCP access tokens (30 days). No refresh_token
-/// grant yet — when the token expires the connector re-runs the (silent,
-/// cookie-backed) authorization flow.
+/// grant yet — when the token expires the connector re-runs the
+/// authorization flow (cookie-backed session, then the consent page).
 const OAUTH_ACCESS_TOKEN_EXPIRY_SECS: u64 = 30 * 86_400;
 
 /// Client-id JWTs are practically non-expiring (10 years).
 const CLIENT_ID_EXPIRY_SECS: i64 = 10 * 365 * 86_400;
+
+/// The consent page stays valid for this long before the user must reload it.
+const CONSENT_TTL_SECS: i64 = 300;
 
 /// Scope granted to OAuth-issued tokens.
 const OAUTH_TOKEN_SCOPE: &str = "mcp:read mcp:write";
@@ -164,15 +174,164 @@ fn validate_client_id(client_id: &str, secret: &str) -> Option<ClientIdClaims> {
 
 /// A redirect_uri is acceptable when it is HTTPS, or plain HTTP on
 /// localhost/127.0.0.1 (native-app loopback, per OAuth 2.1).
+///
+/// A URI carrying userinfo (`user@host`) is refused: `http://127.0.0.1:80@evil`
+/// reads as loopback up to the first `:` while the browser goes to `evil`, and
+/// the consent page would show a host that is not the destination.
 fn redirect_uri_allowed(uri: &str) -> bool {
-    if uri.starts_with("https://") {
+    let (rest, https) = if let Some(rest) = uri.strip_prefix("https://") {
+        (rest, true)
+    } else if let Some(rest) = uri.strip_prefix("http://") {
+        (rest, false)
+    } else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    if https {
         return true;
     }
-    if let Some(rest) = uri.strip_prefix("http://") {
-        let host = rest.split(['/', ':', '?', '#']).next().unwrap_or("");
-        return host == "localhost" || host == "127.0.0.1";
+    let host = authority.split(':').next().unwrap_or("");
+    host == "localhost" || host == "127.0.0.1"
+}
+
+/// `scheme://authority` of a redirect URI — what the consent page shows as the
+/// destination of the code.
+fn redirect_origin(uri: &str) -> &str {
+    let scheme_end = uri.find("://").map(|i| i + 3).unwrap_or(0);
+    let authority_len = uri[scheme_end..]
+        .find(['/', '?', '#'])
+        .unwrap_or(uri.len() - scheme_end);
+    &uri[..scheme_end + authority_len]
+}
+
+// ============================================================================
+// Consent (signed, short-lived, bound to the user and to the exact request)
+// ============================================================================
+
+/// What the user is asked to approve. Carried by the consent page as a signed
+/// JWT so the POST can neither be forged nor repointed at another client,
+/// redirect URI, PKCE challenge or user.
+#[derive(Debug, Serialize, Deserialize)]
+struct ConsentClaims {
+    /// Fixed subject so these JWTs can never be confused with user tokens or
+    /// client ids.
+    sub: String,
+    user_id: Uuid,
+    email: String,
+    name: String,
+    client_id: String,
+    redirect_uri: String,
+    code_challenge: String,
+    state: String,
+    iat: i64,
+    exp: i64,
+}
+
+const CONSENT_SUBJECT: &str = "oauth-consent";
+
+fn mint_consent_token(claims: &ConsentClaims, secret: &str) -> Option<String> {
+    encode(
+        &Header::default(),
+        claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .ok()
+}
+
+fn validate_consent_token(token: &str, secret: &str) -> Option<ConsentClaims> {
+    let data = decode::<ConsentClaims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &Validation::default(),
+    )
+    .ok()?;
+    (data.claims.sub == CONSENT_SUBJECT).then_some(data.claims)
+}
+
+/// Escape text for an HTML text node or a double-quoted attribute.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
     }
-    false
+    out
+}
+
+/// The consent page. No script, no external resource; the client name comes
+/// from an anonymous registration and is escaped like any hostile input.
+fn consent_page(
+    client_name: &str,
+    redirect_uri: &str,
+    email: &str,
+    consent_token: &str,
+) -> Response {
+    let body = format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authorize access — Project Orchestrator</title>
+<style>
+body{{font-family:system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem;line-height:1.5}}
+code{{word-break:break-all}} .warn{{border-left:3px solid #b45309;padding-left:.75rem}}
+button{{font:inherit;padding:.5rem 1rem;margin-right:.5rem}}
+</style></head><body>
+<h1>Authorize access?</h1>
+<p><strong>{client}</strong> is asking for access to Project Orchestrator as <strong>{email}</strong>.</p>
+<p>The authorization will be sent to <code>{origin}</code>.</p>
+<p class="warn">If you approve, this application receives a token valid for 30 days that can
+read and modify everything your account can reach through the MCP tools. Anyone can register
+an application under any name: approve only if you started this connection yourself.</p>
+<form method="post" action="/oauth/authorize">
+<input type="hidden" name="consent_token" value="{token}">
+<button type="submit" name="decision" value="deny">Deny</button>
+<button type="submit" name="decision" value="approve">Authorize</button>
+</form></body></html>"#,
+        client = html_escape(client_name),
+        email = html_escape(email),
+        origin = html_escape(redirect_origin(redirect_uri)),
+        token = html_escape(consent_token),
+    );
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            // Never framed (clickjacking the Authorize button), nothing loaded.
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
+            ),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// `redirect_uri` + one query parameter (+ `state` when present).
+fn redirect_with(redirect_uri: &str, params: &[(&str, &str)], state_param: &str) -> Response {
+    let mut loc = redirect_uri.to_string();
+    let mut sep = if redirect_uri.contains('?') { '&' } else { '?' };
+    for (key, value) in params {
+        loc.push(sep);
+        loc.push_str(&format!("{key}={}", urlencode(value)));
+        sep = '&';
+    }
+    if !state_param.is_empty() {
+        loc.push(sep);
+        loc.push_str(&format!("state={}", urlencode(state_param)));
+    }
+    Redirect::to(&loc).into_response()
 }
 
 // ============================================================================
@@ -335,7 +494,8 @@ pub struct AuthorizeQuery {
 
 /// GET /oauth/authorize — public route; the USER is authenticated via the
 /// HttpOnly `refresh_token` cookie (existing PO session). No session →
-/// redirect to the SPA login with `next=` back here.
+/// redirect to the SPA login with `next=` back here. With a session it
+/// renders the consent page — it never issues a code (see `authorize_consent`).
 pub async fn authorize(
     State(state): State<OrchestratorState>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
@@ -427,27 +587,130 @@ pub async fn authorize(
         return Ok(Redirect::to(&login).into_response());
     };
 
-    // --- Issue the single-use code and bounce back to the client.
+    // --- A session is not consent: show what is being granted and to whom.
+    //     The code is issued by `authorize_consent` (POST), never here.
+    let now = chrono::Utc::now().timestamp();
+    let consent_token = mint_consent_token(
+        &ConsentClaims {
+            sub: CONSENT_SUBJECT.to_string(),
+            user_id,
+            email: email.clone(),
+            name,
+            client_id: client_id.to_string(),
+            redirect_uri: redirect_uri.to_string(),
+            code_challenge: code_challenge.to_string(),
+            state: state_param.to_string(),
+            iat: now,
+            exp: now + CONSENT_TTL_SECS,
+        },
+        &auth_config.jwt_secret,
+    )
+    .ok_or_else(|| AppError::Internal(anyhow::anyhow!("failed to mint consent token")))?;
+
+    Ok(consent_page(
+        &client.client_name,
+        redirect_uri,
+        &email,
+        &consent_token,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConsentForm {
+    #[serde(default)]
+    pub consent_token: Option<String>,
+    #[serde(default)]
+    pub decision: Option<String>,
+}
+
+/// POST /oauth/authorize — the user's answer on the consent page.
+///
+/// Issues the authorization code only when: the consent token is ours and
+/// unexpired, the browser still carries the session of the SAME user the page
+/// was rendered for, and the decision is an explicit `approve`. A cross-site
+/// POST cannot get here: it cannot read the token (same-origin policy) and
+/// does not carry the `SameSite=Lax` session cookie.
+pub async fn authorize_consent(
+    State(state): State<OrchestratorState>,
+    headers: HeaderMap,
+    Form(form): Form<ConsentForm>,
+) -> Result<Response, AppError> {
+    let auth_config = state
+        .auth_config
+        .as_ref()
+        .ok_or_else(|| AppError::Forbidden("Authentication not configured".to_string()))?;
+
+    let Some(consent) = form
+        .consent_token
+        .as_deref()
+        .and_then(|t| validate_consent_token(t, &auth_config.jwt_secret))
+    else {
+        return Ok(oauth_error_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "missing, invalid or expired consent — reload the authorization page",
+        ));
+    };
+
+    // The redirect target was validated when the page was rendered, but the
+    // registration is re-checked: nothing below trusts the token alone.
+    let Some(client) = validate_client_id(&consent.client_id, &auth_config.jwt_secret) else {
+        return Ok(oauth_error_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_client",
+            "unknown client_id",
+        ));
+    };
+    if !client
+        .redirect_uris
+        .iter()
+        .any(|u| u == &consent.redirect_uri)
+    {
+        return Ok(oauth_error_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "redirect_uri not registered for this client",
+        ));
+    }
+
+    let session_user = user_from_refresh_cookie(&state, auth_config, &headers).await;
+    if session_user.as_ref().map(|(id, _, _)| *id) != Some(consent.user_id) {
+        warn!(client = %client.client_name, "OAuth consent refused: no session for the consenting user");
+        return Ok(oauth_error_json(
+            StatusCode::FORBIDDEN,
+            "access_denied",
+            "no active session for the user who was asked to consent",
+        ));
+    }
+
+    if form.decision.as_deref() != Some("approve") {
+        info!(user = %consent.email, client = %client.client_name, "OAuth authorization denied by the user");
+        return Ok(redirect_with(
+            &consent.redirect_uri,
+            &[
+                ("error", "access_denied"),
+                ("error_description", "the user denied the request"),
+            ],
+            &consent.state,
+        ));
+    }
+
     let code = store_auth_code(AuthCodeEntry {
-        client_id: client_id.to_string(),
-        redirect_uri: redirect_uri.to_string(),
-        code_challenge: code_challenge.to_string(),
-        user_id,
-        email: email.clone(),
-        name,
+        client_id: consent.client_id.clone(),
+        redirect_uri: consent.redirect_uri.clone(),
+        code_challenge: consent.code_challenge.clone(),
+        user_id: consent.user_id,
+        email: consent.email.clone(),
+        name: consent.name.clone(),
         created: Instant::now(),
     });
-    info!(user = %email, client = %client.client_name, "OAuth authorization code issued");
+    info!(user = %consent.email, client = %client.client_name, "OAuth authorization code issued after consent");
 
-    let mut loc = format!(
-        "{redirect_uri}{}code={}",
-        if redirect_uri.contains('?') { "&" } else { "?" },
-        urlencode(&code),
-    );
-    if !state_param.is_empty() {
-        loc.push_str(&format!("&state={}", urlencode(state_param)));
-    }
-    Ok(Redirect::to(&loc).into_response())
+    Ok(redirect_with(
+        &consent.redirect_uri,
+        &[("code", &code)],
+        &consent.state,
+    ))
 }
 
 /// Resolve the current user from the HttpOnly refresh cookie (same
@@ -671,6 +934,75 @@ mod tests {
         assert!(!redirect_uri_allowed("http://evil.example/cb"));
         assert!(!redirect_uri_allowed("ftp://claude.ai/cb"));
         assert!(!redirect_uri_allowed("http://localhost.evil.example/cb"));
+        // Userinfo: reads as loopback up to the first ':', goes elsewhere.
+        assert!(!redirect_uri_allowed("http://127.0.0.1:80@evil.example/cb"));
+        assert!(!redirect_uri_allowed("http://localhost@evil.example/cb"));
+        assert!(!redirect_uri_allowed("https://claude.ai@evil.example/cb"));
+        assert!(!redirect_uri_allowed("https:///cb"));
+    }
+
+    #[test]
+    fn test_redirect_origin() {
+        assert_eq!(
+            redirect_origin("https://claude.ai/api/mcp/auth_callback?x=1"),
+            "https://claude.ai"
+        );
+        assert_eq!(
+            redirect_origin("http://localhost:8123/callback"),
+            "http://localhost:8123"
+        );
+        assert_eq!(redirect_origin("https://a.example"), "https://a.example");
+    }
+
+    fn consent_claims(exp_in: i64) -> ConsentClaims {
+        let now = chrono::Utc::now().timestamp();
+        ConsentClaims {
+            sub: CONSENT_SUBJECT.to_string(),
+            user_id: Uuid::new_v4(),
+            email: "user@example.com".into(),
+            name: "User".into(),
+            client_id: "cid".into(),
+            redirect_uri: "https://claude.ai/cb".into(),
+            code_challenge: "ch".into(),
+            state: "st".into(),
+            iat: now,
+            exp: now + exp_in,
+        }
+    }
+
+    #[test]
+    fn test_consent_token_roundtrip_and_confusion() {
+        let claims = consent_claims(CONSENT_TTL_SECS);
+        let token = mint_consent_token(&claims, SECRET).expect("mint");
+        let back = validate_consent_token(&token, SECRET).expect("validate");
+        assert_eq!(back.user_id, claims.user_id);
+        assert_eq!(back.redirect_uri, claims.redirect_uri);
+        assert_eq!(back.code_challenge, claims.code_challenge);
+
+        // Wrong secret, garbage, expired.
+        assert!(validate_consent_token(&token, "another-secret-that-is-32-chars!!").is_none());
+        assert!(validate_consent_token("garbage", SECRET).is_none());
+        let expired = mint_consent_token(&consent_claims(-3600), SECRET).unwrap();
+        assert!(validate_consent_token(&expired, SECRET).is_none());
+
+        // Neither a client id nor a user JWT is a consent — and a consent is
+        // not a client id (same secret, different subject).
+        let client_id =
+            mint_client_id("Claude", &["https://claude.ai/cb".to_string()], SECRET).unwrap();
+        assert!(validate_consent_token(&client_id, SECRET).is_none());
+        let user_jwt =
+            crate::auth::jwt::encode_jwt(Uuid::new_v4(), "user@example.com", "User", SECRET, 3600)
+                .unwrap();
+        assert!(validate_consent_token(&user_jwt, SECRET).is_none());
+        assert!(validate_client_id(&token, SECRET).is_none());
+    }
+
+    #[test]
+    fn test_html_escape() {
+        assert_eq!(
+            html_escape(r#"<script>alert("x")</script> & 'y'"#),
+            "&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; &#39;y&#39;"
+        );
     }
 
     #[test]

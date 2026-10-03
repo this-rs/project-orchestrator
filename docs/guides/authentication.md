@@ -657,8 +657,6 @@ These routes are accessible without a JWT token:
 | `/auth/oidc/callback` | OIDC code exchange |
 | `/ws/events` | Server-sent events WebSocket (auth via first message) |
 | `/ws/chat/{session_id}` | Chat WebSocket (auth via first message) |
-| `/hooks/wake` | Webhook endpoint |
-| `/internal/events` | Internal event receiver (deprecated) |
 
 ### Protected Routes (JWT required)
 
@@ -673,6 +671,7 @@ Everything under `/api/*` requires a valid `Authorization: Bearer <token>` heade
 - `/api/chat/*` -- Chat session management
 - `/auth/me` -- User profile
 - `/auth/refresh` -- Token refresh
+- `/hooks/wake`, `/internal/events` -- agent webhook and (deprecated) event receiver
 
 ### How the Middleware Works
 
