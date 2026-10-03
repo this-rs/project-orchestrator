@@ -738,6 +738,11 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/attention",
             get(super::attention_aggregate::get_attention),
         )
+        // Every agent whose CLI is running right now, whatever started it.
+        .route(
+            "/api/agents/live",
+            get(super::attention_aggregate::get_live_agents),
+        )
         .route("/api/decisions", get(handlers::list_decisions))
         .route(
             "/api/decisions/affecting",
