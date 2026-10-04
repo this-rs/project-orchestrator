@@ -69,6 +69,7 @@ flowchart TD
     subgraph client["Trames clientes — WsChatClientMessage (tag type, snake_case)"]
         direction TB
         USERMSG["✅ user_message : spawn_entity_extraction puis route_user_message ;<br/>re-souscription après Resumed / ResumedAfterSendFailure, abonnement NATS après Remote<br/><i>vérifié : test_client_message_deserialization, test_dormant_resume_lifecycle</i>"]
+        QUEUED["🟠 user_message avec queue: true → route_queued_user_message : session en cours de tour = message RETENU<br/>(pending_messages, held) sans interruption, livré par le drain en fin de tour, même sans client connecté ;<br/>session au repos = envoi normal. queue_op (edit, remove, prioritize, send_now, snapshot) → pending_queue_op ;<br/>chaque changement diffuse pending_queue (liste complète), aussi envoyée à la connexion<br/><i>vérifié : test_client_message_deserialization, chat::pending_queue::tests, manager::tests::queue_user_message_*,<br/>pending_queue_ops_*, send_now_* — non vérifié : relais NATS (queue_op, queued_user_message) vers une autre instance</i>"]
         INTERRUPT["✅ interrupt → ChatManager::interrupt ; cancel_tools → cancel_running_tools<br/><i>vérifié : test_client_message_deserialization</i>"]
         PERMRESP["✅ permission_response (id, allow) : dédoublonnée par connexion,<br/>→ route_permission_response(require_pending = false)<br/><i>vérifié : test_client_message_deserialization</i>"]
         INPUTRESP["🟠 input_response (id, content) : local send_message, sinon try_remote_send,<br/>sinon erreur « Session not active on any instance » — pas de reprise,<br/>contrairement à user_message (asymétrie commentée dans le code)"]
@@ -76,11 +77,13 @@ flowchart TD
     end
 
     SELECT -->|"trame cliente"| USERMSG
+    SELECT --> QUEUED
     SELECT --> INTERRUPT
     SELECT --> PERMRESP
     SELECT --> INPUTRESP
     SELECT --> SETTINGS
     USERMSG --> MANAGER
+    QUEUED --> MANAGER
     INTERRUPT --> MANAGER
     PERMRESP --> MANAGER
     INPUTRESP --> MANAGER

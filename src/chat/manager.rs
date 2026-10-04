@@ -1766,6 +1766,65 @@ impl ChatManager {
                                 success: true,
                                 error: None,
                             }
+                        } else if request.message_type == "queue_op" {
+                            // An action on the held messages, relayed by the
+                            // instance the client is connected to.
+                            match serde_json::from_str::<super::pending_queue::QueueOp>(message) {
+                                Ok(op) => {
+                                    let (outcome, messages) = {
+                                        let mut queue = pending_messages.lock().await;
+                                        let outcome = super::pending_queue::apply(&mut queue, &op);
+                                        (outcome, super::pending_queue::snapshot(&queue))
+                                    };
+                                    let event = ChatEvent::PendingQueue { messages };
+                                    let _ = events_tx.send(event.clone());
+                                    nats.publish_chat_event(&session_id, event);
+                                    if outcome.interrupt && is_streaming.load(Ordering::SeqCst) {
+                                        interrupt_flag.store(true, Ordering::SeqCst);
+                                        interrupt_token.cancel();
+                                        if let Some(ref tx) = stdin_tx {
+                                            let _ =
+                                                tx.try_send(
+                                                    InteractiveClient::build_interrupt_json(),
+                                                );
+                                        }
+                                    }
+                                    crate::events::ChatRpcResponse {
+                                        success: true,
+                                        error: None,
+                                    }
+                                }
+                                Err(e) => crate::events::ChatRpcResponse {
+                                    success: false,
+                                    error: Some(format!("Invalid queue operation: {}", e)),
+                                },
+                            }
+                        } else if request.message_type == "queued_user_message" && {
+                            // Held only while a turn runs — decided under the
+                            // queue lock, like `queue_user_message`. Idle: fall
+                            // through to the ordinary send below.
+                            let mut queue = pending_messages.lock().await;
+                            if is_streaming.load(Ordering::SeqCst) {
+                                queue.push_back(PendingMessage::held_user(message.clone()));
+                                let event = ChatEvent::PendingQueue {
+                                    messages: super::pending_queue::snapshot(&queue),
+                                };
+                                drop(queue);
+                                let _ = events_tx.send(event.clone());
+                                nats.publish_chat_event(&session_id, event);
+                                true
+                            } else {
+                                false
+                            }
+                        } {
+                            info!(
+                                "Holding user message for session {} (via NATS RPC, no interrupt)",
+                                session_id
+                            );
+                            crate::events::ChatRpcResponse {
+                                success: true,
+                                error: None,
+                            }
                         } else if is_streaming.load(Ordering::SeqCst) {
                             // If streaming → queue the message and interrupt so it's processed sooner (T4, Gap 8)
                             info!(
@@ -5228,6 +5287,156 @@ impl ChatManager {
             drop(sessions); // Release read lock before calling send_message
             self.send_message(session_id, message).await
         }
+    }
+
+    /// Hold a user message until the running turn ends — it interrupts nothing.
+    ///
+    /// `send_message` mid-stream queues the message AND interrupts the turn so
+    /// it is read sooner. This is the other choice: the message waits in
+    /// `pending_messages` and the drain delivers it when the turn ends, as its
+    /// own turn (persisted and broadcast as a `user_message` at that moment).
+    /// The session delivers it, not the client: it leaves whether or not a
+    /// client is still looking at this conversation.
+    ///
+    /// `message` is the stored form (attachment block included).
+    ///
+    /// Returns `true` when the message was held, `false` when the session was
+    /// idle and the message was simply sent.
+    pub async fn queue_user_message(&self, session_id: &str, message: &str) -> Result<bool> {
+        {
+            let sessions = self.active_sessions.read().await;
+            let session = sessions
+                .get(session_id)
+                .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
+
+            // `is_streaming` is read under the queue lock, the same lock the end
+            // of a turn holds to decide there is nothing left to drain
+            // (`PostStreamHandler::finalize_streaming_status`). Either the turn
+            // is still running and will see this entry, or it is over and the
+            // message goes out directly below — never queued behind a turn
+            // that has already finished.
+            let mut queue = session.pending_messages.lock().await;
+            if session.is_streaming.load(Ordering::SeqCst) {
+                queue.push_back(PendingMessage::held_user(message.to_string()));
+                let messages = super::pending_queue::snapshot(&queue);
+                drop(queue);
+                info!(
+                    "Holding user message for session {} (no interrupt)",
+                    session_id
+                );
+                self.publish_pending_queue(session_id, &session.events_tx, messages);
+                return Ok(true);
+            }
+        }
+        self.send_message(session_id, message).await?;
+        Ok(false)
+    }
+
+    /// Broadcast the held messages of a session to its clients, here and on
+    /// the other instances.
+    fn publish_pending_queue(
+        &self,
+        session_id: &str,
+        events_tx: &broadcast::Sender<ChatEvent>,
+        messages: Vec<super::types::PendingQueueEntry>,
+    ) {
+        let event = ChatEvent::PendingQueue { messages };
+        let _ = events_tx.send(event.clone());
+        if let Some(ref nats) = self.nats {
+            nats.publish_chat_event(session_id, event);
+        }
+    }
+
+    /// The held messages of a session active on THIS instance (`None` when it
+    /// is not — idle, or running elsewhere).
+    pub async fn pending_queue_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Option<Vec<super::types::PendingQueueEntry>> {
+        let sessions = self.active_sessions.read().await;
+        let session = sessions.get(session_id)?;
+        let queue = session.pending_messages.lock().await;
+        Some(super::pending_queue::snapshot(&queue))
+    }
+
+    /// Edit, drop, move to the front or send now one held message — or just
+    /// publish the list again.
+    ///
+    /// Returns whether the operation reached a session: `false` means no
+    /// instance holds this session any more, so there is no queue to act on.
+    /// An id that no longer names a held message is not an error (it left in
+    /// the meantime): the list is published again and the client catches up.
+    pub async fn pending_queue_op(
+        &self,
+        session_id: &str,
+        op: &super::pending_queue::QueueOp,
+    ) -> Result<bool> {
+        {
+            let sessions = self.active_sessions.read().await;
+            if let Some(session) = sessions.get(session_id) {
+                let (outcome, messages) = {
+                    let mut queue = session.pending_messages.lock().await;
+                    let outcome = super::pending_queue::apply(&mut queue, op);
+                    (outcome, super::pending_queue::snapshot(&queue))
+                };
+                self.publish_pending_queue(session_id, &session.events_tx, messages);
+                if outcome.interrupt && session.is_streaming.load(Ordering::SeqCst) {
+                    // Same three steps as a message sent mid-stream.
+                    session.interrupt_flag.store(true, Ordering::SeqCst);
+                    session.interrupt_token.cancel();
+                    if let Some(ref tx) = session.stdin_tx {
+                        let _ = tx.try_send(InteractiveClient::build_interrupt_json());
+                    }
+                }
+                return Ok(true);
+            }
+        }
+        // Not here: the session may run on another instance.
+        let payload = serde_json::to_string(op)?;
+        self.try_remote_send(session_id, &payload, "queue_op").await
+    }
+
+    /// `route_user_message` for a message that must WAIT for the running turn:
+    /// same three routes (this instance, another instance, resume), but a
+    /// streaming session holds the message instead of being interrupted.
+    /// A session that is not streaming — or not active anywhere — has no turn
+    /// to wait for: the message is sent, or the session resumed, as usual.
+    pub async fn route_queued_user_message(
+        &self,
+        session_id: &str,
+        content: &str,
+        claims: Option<&crate::auth::jwt::Claims>,
+    ) -> std::result::Result<DeliveryRoute, MessageDeliveryError> {
+        if self.is_session_active(session_id).await {
+            match self.queue_user_message(session_id, content).await {
+                Ok(_) => return Ok(DeliveryRoute::Local),
+                Err(send_err) => {
+                    warn!(
+                        session_id = %session_id,
+                        error = %send_err,
+                        "queue_user_message failed, attempting resume_session as fallback"
+                    );
+                    return match self.resume_session(session_id, content, claims).await {
+                        Ok(()) => Ok(DeliveryRoute::ResumedAfterSendFailure),
+                        Err(resume) => Err(MessageDeliveryError::SendAndResume {
+                            send: send_err,
+                            resume,
+                        }),
+                    };
+                }
+            }
+        }
+        if self
+            .try_remote_send(session_id, content, "queued_user_message")
+            .await
+            .unwrap_or(false)
+        {
+            return Ok(DeliveryRoute::Remote);
+        }
+        self.resume_session(session_id, content, claims)
+            .await
+            .map(|()| DeliveryRoute::Resumed)
+            .map_err(MessageDeliveryError::Resume)
     }
 
     /// Send a permission response (allow/deny) to the Claude CLI subprocess.
@@ -10315,6 +10524,230 @@ mod tests {
         let queue = pending_messages.lock().await;
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0], "queued message");
+    }
+
+    // ── Held messages: queued WITHOUT interrupting (chat::pending_queue) ──
+
+    /// A streaming session registered in a fresh manager, with a subscriber on
+    /// its event channel.
+    async fn manager_with_streaming_session() -> (
+        ChatManager,
+        String,
+        Arc<Mutex<VecDeque<PendingMessage>>>,
+        broadcast::Receiver<ChatEvent>,
+        Arc<AtomicBool>,
+    ) {
+        let (session, pending_messages) = create_dummy_session(true, "", vec![]);
+        let events_rx = session.events_tx.subscribe();
+        let interrupt_flag = session.interrupt_flag.clone();
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let session_id = Uuid::new_v4().to_string();
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(session_id.clone(), session);
+        (
+            manager,
+            session_id,
+            pending_messages,
+            events_rx,
+            interrupt_flag,
+        )
+    }
+
+    fn held_texts(event: ChatEvent) -> Vec<String> {
+        match event {
+            ChatEvent::PendingQueue { messages } => {
+                messages.into_iter().map(|m| m.content).collect()
+            }
+            other => panic!("expected pending_queue, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_user_message_holds_without_interrupting_and_publishes_the_list() {
+        let (manager, session_id, pending, mut events, interrupt_flag) =
+            manager_with_streaming_session().await;
+
+        let held = manager
+            .queue_user_message(&session_id, "after you finish")
+            .await
+            .unwrap();
+
+        assert!(held, "a streaming session holds the message");
+        assert!(
+            !interrupt_flag.load(Ordering::SeqCst),
+            "holding a message must not interrupt the running turn"
+        );
+        {
+            let queue = pending.lock().await;
+            assert_eq!(queue.len(), 1);
+            assert!(queue[0].held);
+            assert_eq!(queue[0].kind, crate::chat::types::PendingMessageKind::User);
+        }
+        assert_eq!(
+            held_texts(events.try_recv().unwrap()),
+            vec!["after you finish"]
+        );
+    }
+
+    #[tokio::test]
+    async fn every_device_of_the_session_sees_the_queue_and_its_changes() {
+        // Two devices on one conversation: each holds its own subscription to the
+        // session's event channel. A message queued from the phone must show on
+        // the laptop, and an action from the laptop must show on the phone.
+        let (manager, session_id, _pending, mut phone, _interrupt) =
+            manager_with_streaming_session().await;
+        let mut laptop = manager
+            .active_sessions
+            .read()
+            .await
+            .get(&session_id)
+            .unwrap()
+            .events_tx
+            .subscribe();
+
+        manager
+            .queue_user_message(&session_id, "typed on the phone")
+            .await
+            .unwrap();
+        assert_eq!(
+            held_texts(phone.try_recv().unwrap()),
+            vec!["typed on the phone"]
+        );
+        assert_eq!(
+            held_texts(laptop.try_recv().unwrap()),
+            vec!["typed on the phone"]
+        );
+
+        let id = manager.pending_queue_snapshot(&session_id).await.unwrap()[0].id;
+        manager
+            .pending_queue_op(
+                &session_id,
+                &crate::chat::pending_queue::QueueOp::Edit {
+                    id,
+                    content: "fixed on the laptop".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            held_texts(phone.try_recv().unwrap()),
+            vec!["fixed on the laptop"]
+        );
+        assert_eq!(
+            held_texts(laptop.try_recv().unwrap()),
+            vec!["fixed on the laptop"]
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_mid_stream_still_interrupts_and_is_not_listed_as_held() {
+        // The historical path must keep its meaning: it is what "send now" relies on.
+        let (manager, session_id, _pending, _events, interrupt_flag) =
+            manager_with_streaming_session().await;
+
+        manager
+            .send_message(&session_id, "right now")
+            .await
+            .unwrap();
+
+        assert!(interrupt_flag.load(Ordering::SeqCst));
+        assert_eq!(
+            manager.pending_queue_snapshot(&session_id).await,
+            Some(vec![]),
+            "a message already on its way is not a held message"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_queue_ops_edit_remove_and_prioritize_without_interrupting() {
+        let (manager, session_id, _pending, mut events, interrupt_flag) =
+            manager_with_streaming_session().await;
+        for text in ["a", "b", "c"] {
+            manager.queue_user_message(&session_id, text).await.unwrap();
+            let _ = events.try_recv();
+        }
+        let ids: Vec<Uuid> = manager
+            .pending_queue_snapshot(&session_id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|m| m.id)
+            .collect();
+
+        use crate::chat::pending_queue::QueueOp;
+        assert!(manager
+            .pending_queue_op(&session_id, &QueueOp::Prioritize { id: ids[2] })
+            .await
+            .unwrap());
+        assert_eq!(held_texts(events.try_recv().unwrap()), vec!["c", "a", "b"]);
+
+        manager
+            .pending_queue_op(
+                &session_id,
+                &QueueOp::Edit {
+                    id: ids[0],
+                    content: "A".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(held_texts(events.try_recv().unwrap()), vec!["c", "A", "b"]);
+
+        manager
+            .pending_queue_op(&session_id, &QueueOp::Remove { id: ids[1] })
+            .await
+            .unwrap();
+        assert_eq!(held_texts(events.try_recv().unwrap()), vec!["c", "A"]);
+
+        assert!(
+            !interrupt_flag.load(Ordering::SeqCst),
+            "none of these may cut the running response short"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_now_puts_the_message_first_and_interrupts() {
+        let (manager, session_id, pending, mut events, interrupt_flag) =
+            manager_with_streaming_session().await;
+        for text in ["a", "b"] {
+            manager.queue_user_message(&session_id, text).await.unwrap();
+            let _ = events.try_recv();
+        }
+        let id = manager.pending_queue_snapshot(&session_id).await.unwrap()[1].id;
+
+        manager
+            .pending_queue_op(
+                &session_id,
+                &crate::chat::pending_queue::QueueOp::SendNow { id },
+            )
+            .await
+            .unwrap();
+
+        assert!(interrupt_flag.load(Ordering::SeqCst));
+        assert_eq!(pending.lock().await[0].content, "b", "delivered next");
+        assert_eq!(
+            held_texts(events.try_recv().unwrap()),
+            vec!["a"],
+            "no longer listed: it is on its way"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queue_op_on_a_session_nobody_holds_reaches_nothing() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let reached = manager
+            .pending_queue_op(
+                &Uuid::new_v4().to_string(),
+                &crate::chat::pending_queue::QueueOp::Snapshot,
+            )
+            .await
+            .unwrap();
+        assert!(!reached, "no local session and no NATS: there is no queue");
     }
 
     #[tokio::test]

@@ -47,6 +47,20 @@ pub enum WsChatClientMessage {
         /// Ids of documents already uploaded through `POST /api/documents`.
         #[serde(default)]
         attachments: Vec<Uuid>,
+        /// `true`: if a response is running, WAIT for it to end instead of
+        /// interrupting it. The session holds the message and delivers it —
+        /// see `chat::pending_queue`. Absent or `false`: the historical
+        /// behaviour, a mid-stream message interrupts the running response.
+        #[serde(default)]
+        queue: bool,
+    },
+    /// Act on a message held for this session: `{"type":"queue_op","op":"edit",
+    /// "id":…,"content":…}`, or `remove` / `prioritize` / `send_now` with an
+    /// `id`, or `snapshot`. The answer is a `pending_queue` event carrying the
+    /// new list, sent to every client of the session.
+    QueueOp {
+        #[serde(flatten)]
+        op: crate::chat::pending_queue::QueueOp,
     },
     /// Interrupt the current operation
     Interrupt,
@@ -489,6 +503,34 @@ async fn handle_ws_chat_loop(
         }
     }
 
+    // The messages held for this session, so a client that opens (or comes
+    // back to) the conversation sees what is waiting. Sent even when empty:
+    // the client may still show a list from its previous visit.
+    // A session running on another instance is asked to publish its list —
+    // it arrives through the NATS subscription like any other event.
+    let held = match chat_manager.pending_queue_snapshot(&session_id).await {
+        Some(messages) => Some(messages),
+        None => {
+            let reached = chat_manager
+                .pending_queue_op(&session_id, &crate::chat::pending_queue::QueueOp::Snapshot)
+                .await
+                .unwrap_or(false);
+            // Nobody holds the session: nothing can be waiting.
+            (!reached).then(Vec::new)
+        }
+    };
+    if let Some(messages) = held {
+        let queue_msg = serde_json::json!({ "type": "pending_queue", "messages": messages });
+        if ws_sender
+            .send(Message::Text(queue_msg.to_string().into()))
+            .await
+            .is_err()
+        {
+            debug!("Client disconnected during pending_queue");
+            return;
+        }
+    }
+
     // Fingerprint-based dedup: when we sent a streaming snapshot (Phase 1.5b),
     // events emitted in the tiny window BETWEEN subscribe (Phase 1.5a) and
     // snapshot (Phase 1.5b) may be present in BOTH the snapshot AND the
@@ -723,8 +765,8 @@ async fn handle_ws_chat_loop(
                         match serde_json::from_str::<WsChatClientMessage>(text_str) {
                             Ok(client_msg) => {
                                 match client_msg {
-                                    WsChatClientMessage::UserMessage { content, attachments } => {
-                                        debug!(session_id = %session_id, "WS: Received user_message");
+                                    WsChatClientMessage::UserMessage { content, attachments, queue } => {
+                                        debug!(session_id = %session_id, queue, "WS: Received user_message");
 
                                         // T4.3: Extract code entities and create DISCUSSED relations (non-blocking)
                                         spawn_entity_extraction(&state, &session_id, &content);
@@ -751,9 +793,15 @@ async fn handle_ws_chat_loop(
                                                 continue;
                                             }
                                         };
-                                        let result = chat_manager
-                                            .route_user_message(&session_id, &content, Some(&claims))
-                                            .await;
+                                        let result = if queue {
+                                            chat_manager
+                                                .route_queued_user_message(&session_id, &content, Some(&claims))
+                                                .await
+                                        } else {
+                                            chat_manager
+                                                .route_user_message(&session_id, &content, Some(&claims))
+                                                .await
+                                        };
 
                                         // A message proxied to a remote instance: make sure we
                                         // have a NATS subscription to receive the stream.
@@ -839,6 +887,25 @@ async fn handle_ws_chat_loop(
                                         debug!(session_id = %session_id, "WS: Received interrupt");
                                         if let Err(e) = chat_manager.interrupt(&session_id).await {
                                             warn!(session_id = %session_id, error = %e, "Failed to interrupt");
+                                        }
+                                    }
+
+                                    WsChatClientMessage::QueueOp { op } => {
+                                        debug!(session_id = %session_id, ?op, "WS: Received queue_op");
+                                        // The new list comes back as a `pending_queue`
+                                        // event to every client. Only a session nobody
+                                        // holds any more needs an answer here: there
+                                        // is no queue, so the client must show none.
+                                        let reached = match chat_manager.pending_queue_op(&session_id, &op).await {
+                                            Ok(reached) => reached,
+                                            Err(e) => {
+                                                warn!(session_id = %session_id, error = %e, "WS: queue_op failed");
+                                                false
+                                            }
+                                        };
+                                        if !reached {
+                                            let empty = serde_json::json!({ "type": "pending_queue", "messages": [] });
+                                            let _ = ws_sender.send(Message::Text(empty.to_string().into())).await;
                                         }
                                     }
 
@@ -1411,6 +1478,40 @@ mod tests {
         // user_message — the main one that triggers resume_session
         let msg: WsChatClientMessage =
             serde_json::from_str(r#"{"type":"user_message","content":"hello"}"#).unwrap();
+        // `queue` is opt-in: absent, a mid-stream message interrupts, as it always did.
+        assert!(matches!(
+            msg,
+            WsChatClientMessage::UserMessage { queue: false, .. }
+        ));
+        let queued: WsChatClientMessage =
+            serde_json::from_str(r#"{"type":"user_message","content":"later","queue":true}"#)
+                .unwrap();
+        assert!(matches!(
+            queued,
+            WsChatClientMessage::UserMessage { queue: true, .. }
+        ));
+        // Queue operations travel flat: `type` picks the frame, `op` the action.
+        let id = Uuid::nil();
+        let op: WsChatClientMessage = serde_json::from_str(&format!(
+            r#"{{"type":"queue_op","op":"edit","id":"{id}","content":"x"}}"#
+        ))
+        .unwrap();
+        assert!(matches!(
+            op,
+            WsChatClientMessage::QueueOp {
+                op: crate::chat::pending_queue::QueueOp::Edit { .. }
+            }
+        ));
+        let op: WsChatClientMessage = serde_json::from_str(&format!(
+            r#"{{"type":"queue_op","op":"send_now","id":"{id}"}}"#
+        ))
+        .unwrap();
+        assert!(matches!(
+            op,
+            WsChatClientMessage::QueueOp {
+                op: crate::chat::pending_queue::QueueOp::SendNow { .. }
+            }
+        ));
         assert!(
             matches!(msg, WsChatClientMessage::UserMessage { content, .. } if content == "hello")
         );

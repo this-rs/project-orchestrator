@@ -437,6 +437,14 @@ pub enum ChatEvent {
     },
     /// Streaming status change (broadcast to all connected clients)
     StreamingStatus { is_streaming: bool },
+    /// The user messages held for this session until the running turn ends.
+    ///
+    /// Always the FULL list, never a delta: sent on every change (a message
+    /// queued, edited, dropped, moved to the front, or leaving because its
+    /// turn came) and once when a client connects. Transient — never
+    /// persisted, never replayed: a held message becomes a `user_message`
+    /// event the moment it is actually delivered.
+    PendingQueue { messages: Vec<PendingQueueEntry> },
     /// An error occurred
     Error {
         message: String,
@@ -672,6 +680,7 @@ impl ChatEvent {
             ChatEvent::Result { .. } => "result",
             ChatEvent::StreamDelta { .. } => "stream_delta",
             ChatEvent::StreamingStatus { .. } => "streaming_status",
+            ChatEvent::PendingQueue { .. } => "pending_queue",
             ChatEvent::Error { .. } => "error",
             ChatEvent::PermissionDecision { .. } => "permission_decision",
             ChatEvent::PermissionModeChanged { .. } => "permission_mode_changed",
@@ -852,6 +861,7 @@ impl ChatEvent {
             // useful state changes from the frontend). Plan 754a1379, T4.
             ChatEvent::StreamDelta { .. }
             | ChatEvent::StreamingStatus { .. }
+            | ChatEvent::PendingQueue { .. }
             | ChatEvent::ActiveTasksUpdate { .. }
             | ChatEvent::SecretRequest { .. }
             | ChatEvent::SecretRequestResolved { .. } => None,
@@ -1196,6 +1206,30 @@ pub enum PendingMessageKind {
 pub struct PendingMessage {
     pub kind: PendingMessageKind,
     pub content: String,
+    /// Identity of the entry, so a client can edit or drop one precise row.
+    pub id: Uuid,
+    pub queued_at: chrono::DateTime<chrono::Utc>,
+    /// The user asked for this message to WAIT for the running turn to end
+    /// (`ChatManager::queue_user_message`). Only held entries are shown to
+    /// clients and can be edited: every other entry is already on its way —
+    /// a user message that interrupted the turn, a hint, a background event.
+    pub held: bool,
+    /// The user moved this held message to the front ("next").
+    pub prioritized: bool,
+}
+
+/// One held user message, as clients see it (`ChatEvent::PendingQueue`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingQueueEntry {
+    pub id: Uuid,
+    /// The text the user typed, without the attachment block.
+    pub content: String,
+    /// The documents attached to it (what a chip needs to be drawn).
+    #[serde(default)]
+    pub attachments: Vec<super::message_attachments::MessageAttachment>,
+    pub queued_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub prioritized: bool,
 }
 
 impl PartialEq<&str> for PendingMessage {
@@ -1205,28 +1239,39 @@ impl PartialEq<&str> for PendingMessage {
 }
 
 impl PendingMessage {
-    pub fn user(content: String) -> Self {
+    fn new(kind: PendingMessageKind, content: String) -> Self {
         Self {
-            kind: PendingMessageKind::User,
+            kind,
             content,
+            id: Uuid::new_v4(),
+            queued_at: chrono::Utc::now(),
+            held: false,
+            prioritized: false,
+        }
+    }
+
+    pub fn user(content: String) -> Self {
+        Self::new(PendingMessageKind::User, content)
+    }
+
+    /// A user message that waits for the running turn to end instead of
+    /// interrupting it. `content` is the stored form (attachment block included).
+    pub fn held_user(content: String) -> Self {
+        Self {
+            held: true,
+            ..Self::new(PendingMessageKind::User, content)
         }
     }
 
     pub fn system_hint(content: String) -> Self {
-        Self {
-            kind: PendingMessageKind::SystemHint,
-            content,
-        }
+        Self::new(PendingMessageKind::SystemHint, content)
     }
 
     /// Construct a `BackgroundOutput` pending entry. The OOB listener uses
     /// this when an event arrives while the session is idle and a new
     /// `stream_response` must be triggered to surface it to the LLM.
     pub fn background_output(content: String) -> Self {
-        Self {
-            kind: PendingMessageKind::BackgroundOutput,
-            content,
-        }
+        Self::new(PendingMessageKind::BackgroundOutput, content)
     }
 }
 
