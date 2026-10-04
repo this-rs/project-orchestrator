@@ -192,7 +192,7 @@ mod tests {
         let mut q = VecDeque::new();
         q.push_back(held(&message_attachments::encode(
             "read this",
-            &[att.clone()],
+            std::slice::from_ref(&att),
         )));
         let snap = snapshot(&q);
         assert_eq!(snap[0].content, "read this");
@@ -208,7 +208,10 @@ mod tests {
             size_bytes: 1,
         };
         let mut q = VecDeque::new();
-        q.push_back(held(&message_attachments::encode("before", &[att.clone()])));
+        q.push_back(held(&message_attachments::encode(
+            "before",
+            std::slice::from_ref(&att),
+        )));
         let id = q[0].id;
         let out = apply(
             &mut q,
