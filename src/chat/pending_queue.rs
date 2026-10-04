@@ -190,7 +190,10 @@ mod tests {
             size_bytes: 12,
         };
         let mut q = VecDeque::new();
-        q.push_back(held(&message_attachments::encode("read this", &[att.clone()])));
+        q.push_back(held(&message_attachments::encode(
+            "read this",
+            &[att.clone()],
+        )));
         let snap = snapshot(&q);
         assert_eq!(snap[0].content, "read this");
         assert_eq!(snap[0].attachments, vec![att]);

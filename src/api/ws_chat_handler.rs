@@ -1496,9 +1496,10 @@ mod tests {
                 op: crate::chat::pending_queue::QueueOp::Edit { .. }
             }
         ));
-        let op: WsChatClientMessage =
-            serde_json::from_str(&format!(r#"{{"type":"queue_op","op":"send_now","id":"{id}"}}"#))
-                .unwrap();
+        let op: WsChatClientMessage = serde_json::from_str(&format!(
+            r#"{{"type":"queue_op","op":"send_now","id":"{id}"}}"#
+        ))
+        .unwrap();
         assert!(matches!(
             op,
             WsChatClientMessage::QueueOp {

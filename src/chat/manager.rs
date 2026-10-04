@@ -1783,8 +1783,10 @@ impl ChatManager {
                                         interrupt_flag.store(true, Ordering::SeqCst);
                                         interrupt_token.cancel();
                                         if let Some(ref tx) = stdin_tx {
-                                            let _ = tx
-                                                .try_send(InteractiveClient::build_interrupt_json());
+                                            let _ =
+                                                tx.try_send(
+                                                    InteractiveClient::build_interrupt_json(),
+                                                );
                                         }
                                     }
                                     crate::events::ChatRpcResponse {
@@ -1797,26 +1799,24 @@ impl ChatManager {
                                     error: Some(format!("Invalid queue operation: {}", e)),
                                 },
                             }
-                        } else if request.message_type == "queued_user_message"
-                            && {
-                                // Held only while a turn runs — decided under the
-                                // queue lock, like `queue_user_message`. Idle: fall
-                                // through to the ordinary send below.
-                                let mut queue = pending_messages.lock().await;
-                                if is_streaming.load(Ordering::SeqCst) {
-                                    queue.push_back(PendingMessage::held_user(message.clone()));
-                                    let event = ChatEvent::PendingQueue {
-                                        messages: super::pending_queue::snapshot(&queue),
-                                    };
-                                    drop(queue);
-                                    let _ = events_tx.send(event.clone());
-                                    nats.publish_chat_event(&session_id, event);
-                                    true
-                                } else {
-                                    false
-                                }
+                        } else if request.message_type == "queued_user_message" && {
+                            // Held only while a turn runs — decided under the
+                            // queue lock, like `queue_user_message`. Idle: fall
+                            // through to the ordinary send below.
+                            let mut queue = pending_messages.lock().await;
+                            if is_streaming.load(Ordering::SeqCst) {
+                                queue.push_back(PendingMessage::held_user(message.clone()));
+                                let event = ChatEvent::PendingQueue {
+                                    messages: super::pending_queue::snapshot(&queue),
+                                };
+                                drop(queue);
+                                let _ = events_tx.send(event.clone());
+                                nats.publish_chat_event(&session_id, event);
+                                true
+                            } else {
+                                false
                             }
-                        {
+                        } {
                             info!(
                                 "Holding user message for session {} (via NATS RPC, no interrupt)",
                                 session_id
@@ -5320,7 +5320,10 @@ impl ChatManager {
                 queue.push_back(PendingMessage::held_user(message.to_string()));
                 let messages = super::pending_queue::snapshot(&queue);
                 drop(queue);
-                info!("Holding user message for session {} (no interrupt)", session_id);
+                info!(
+                    "Holding user message for session {} (no interrupt)",
+                    session_id
+                );
                 self.publish_pending_queue(session_id, &session.events_tx, messages);
                 return Ok(true);
             }
@@ -10536,7 +10539,13 @@ mod tests {
             .write()
             .await
             .insert(session_id.clone(), session);
-        (manager, session_id, pending_messages, events_rx, interrupt_flag)
+        (
+            manager,
+            session_id,
+            pending_messages,
+            events_rx,
+            interrupt_flag,
+        )
     }
 
     fn held_texts(event: ChatEvent) -> Vec<String> {
@@ -10567,9 +10576,12 @@ mod tests {
             let queue = pending.lock().await;
             assert_eq!(queue.len(), 1);
             assert!(queue[0].held);
-            assert_eq!(queue[0].kind, PendingMessageKind::User);
+            assert_eq!(queue[0].kind, crate::chat::types::PendingMessageKind::User);
         }
-        assert_eq!(held_texts(events.try_recv().unwrap()), vec!["after you finish"]);
+        assert_eq!(
+            held_texts(events.try_recv().unwrap()),
+            vec!["after you finish"]
+        );
     }
 
     #[tokio::test]
@@ -10592,8 +10604,14 @@ mod tests {
             .queue_user_message(&session_id, "typed on the phone")
             .await
             .unwrap();
-        assert_eq!(held_texts(phone.try_recv().unwrap()), vec!["typed on the phone"]);
-        assert_eq!(held_texts(laptop.try_recv().unwrap()), vec!["typed on the phone"]);
+        assert_eq!(
+            held_texts(phone.try_recv().unwrap()),
+            vec!["typed on the phone"]
+        );
+        assert_eq!(
+            held_texts(laptop.try_recv().unwrap()),
+            vec!["typed on the phone"]
+        );
 
         let id = manager.pending_queue_snapshot(&session_id).await.unwrap()[0].id;
         manager
@@ -10606,8 +10624,14 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(held_texts(phone.try_recv().unwrap()), vec!["fixed on the laptop"]);
-        assert_eq!(held_texts(laptop.try_recv().unwrap()), vec!["fixed on the laptop"]);
+        assert_eq!(
+            held_texts(phone.try_recv().unwrap()),
+            vec!["fixed on the laptop"]
+        );
+        assert_eq!(
+            held_texts(laptop.try_recv().unwrap()),
+            vec!["fixed on the laptop"]
+        );
     }
 
     #[tokio::test]
@@ -10616,7 +10640,10 @@ mod tests {
         let (manager, session_id, _pending, _events, interrupt_flag) =
             manager_with_streaming_session().await;
 
-        manager.send_message(&session_id, "right now").await.unwrap();
+        manager
+            .send_message(&session_id, "right now")
+            .await
+            .unwrap();
 
         assert!(interrupt_flag.load(Ordering::SeqCst));
         assert_eq!(
