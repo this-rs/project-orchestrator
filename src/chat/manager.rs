@@ -12082,9 +12082,8 @@ mod tests {
 
         // `false`: nothing was broadcast (no subscribers), so the WebSocket
         // handler confirms to the asker directly.
-        assert_eq!(
-            result.expect("dormant session model change should persist without error"),
-            false
+        assert!(
+            !result.expect("dormant session model change should persist without error")
         );
     }
 
