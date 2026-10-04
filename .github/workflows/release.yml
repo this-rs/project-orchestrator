@@ -568,35 +568,34 @@ jobs:
             artifact_os: linux
             artifact_arch: x86_64
 
-          # Linux arm64 desktop bundle (AppImage + .deb). Built natively on a
-          # GitHub-hosted ARM runner — produces Project.Orchestrator_*_aarch64.AppImage
-          # and the arm64 .deb so ARM Linux machines (e.g. DGX Spark / aarch64)
-          # get a runnable desktop app instead of the x86_64 AppImage they can't
-          # execute (GNOME falls back to "mount as disk image" → nothing happens).
+          # Linux arm64 desktop bundle (.deb + .rpm). Built natively on a
+          # GitHub-hosted ARM runner so ARM Linux machines (e.g. DGX Spark /
+          # aarch64) get a runnable desktop app instead of the x86_64 AppImage
+          # they can't execute (GNOME falls back to "mount as disk image" →
+          # nothing happens).
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             tauri_target: aarch64-unknown-linux-gnu
             artifact_os: linux
             artifact_arch: arm64
-            # AppImage was disabled here on 2026-06-02 (#329) because
-            # linuxdeploy/appimagetool would not run on this runner even with
-            # APPIMAGE_EXTRACT_AND_RUN (#328). Upstream has since fixed the
-            # aarch64 builds, so the restriction is lifted.
+            # deb + rpm only: no AppImage on arm64.
             #
-            # Re-verified 2026-09-24 on a DGX Spark (aarch64, Ubuntu 24.04.4,
-            # libfuse2 NOT installed — the package no longer exists on 24.04,
-            # it was renamed libfuse2t64 in the time_t transition, which is
-            # probably why the earlier FUSE workaround never took effect):
-            #   appimagetool-aarch64  build 295 (2025-12-04) -> runs
-            #   linuxdeploy-aarch64   build 368 (2026-09-01) -> runs
-            # and packaging a real AppDir succeeded, producing a valid
-            # static-pie aarch64 ELF. Both tools now ship a static runtime and
-            # need no FUSE at all. Note the working linuxdeploy build postdates
-            # the failure by three months.
+            # History, so this is not "fixed" a third time on the same belief:
+            # - 2026-06-02 (#329): AppImage disabled, linuxdeploy would not run
+            #   on this runner even with APPIMAGE_EXTRACT_AND_RUN (#328).
+            # - 2026-09-24 (#428): re-enabled after checking, on a DGX Spark,
+            #   that the UPSTREAM linuxdeploy-aarch64 build 368 runs.
+            # - 2026-10-04, v0.0.16 release (run 37205006144): the job failed
+            #   with "failed to bundle project: `failed to run linuxdeploy`",
+            #   after the .deb and .rpm had been bundled fine.
             #
-            # APPIMAGE_EXTRACT_AND_RUN=1 is kept set below: harmless when
-            # unneeded, and still the no-FUSE escape hatch if a future build
-            # regresses.
+            # The check of #428 did not test what this job runs. The Tauri CLI
+            # does not use upstream's current build: it downloads its own
+            # pinned copy,
+            #   tauri-apps/binary-releases/.../linuxdeploy-07333c6/linuxdeploy-aarch64.AppImage
+            # and that one still fails here. Re-enable only with a release run
+            # (or a dry run of this job) that shows the AppImage bundled.
+            bundles: deb,rpm
 
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
