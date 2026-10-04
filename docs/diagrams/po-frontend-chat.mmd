@@ -19,7 +19,7 @@
 %%   src/hooks/runner/useConversationWs.ts — useConversationWs (lecture seule)
 %%   src/utils/chatAssembly.ts        — historyEventsToMessages, workflowEventToTick,
 %%                                     attachToParentToolUse, appendBackgroundActivity
-%%   src/types/chat.ts                — ChatEvent (32 variantes, discriminant `type`), PermissionMode,
+%%   src/types/chat.ts                — ChatEvent (33 variantes, discriminant `type`), PermissionMode,
 %%                                     WsChatClientMessage, ClientMessage, ContentBlock
 %%   src/atoms/chat.ts                — chatPermissionInteractiveAtom, chatAutoApprovedToolsAtom, …
 %%   src/atoms/modelCatalog.ts, src/constants/models.ts — modelCatalogAtom, parseModelFamily, DEFAULT_MODEL_ID
@@ -81,7 +81,7 @@ flowchart TD
         REPLAY["✅ rejeu : last_event=N, replay_complete → onReplayComplete<br/>SKIP_REPLAY_THRESHOLD (1e12) → pas de rejeu, onResync<br/><i>vérifié : __tests__/chatWebSocket.test (skip-replay fires onResync)</i>"]
         RECONNECT["✅ scheduleReconnect : 1 s → 30 s, 10 essais<br/>forceReconnect sur events_lagged, envoi sur socket mort,<br/>retour au premier plan après 45 s, événement online,<br/>garde-fou 60 s si le serveur streame sans rien envoyer<br/><i>vérifié : chatWebSocket.test (events_lagged, dead socket, foreground)</i>"]
         CONSUMED["✅ trames consommées, jamais transmises à onEvent :<br/>auth_ok, auth_error, replay_complete, events_lagged,<br/>session_dormant (reste connecté), session_closed (arrêt)<br/><i>vérifié : chatWebSocket.test (session_dormant / session_closed)</i>"]
-        SEND["✅ WsChatClientMessage : user_message, interrupt,<br/>permission_response, input_response, set_permission_mode,<br/>set_model, set_auto_continue ; faux si socket mort<br/><i>vérifié : chatWebSocket.test (send on a dead socket returns false)</i>"]
+        SEND["✅ WsChatClientMessage : user_message (queue: true = retenu par la session<br/>jusqu'à la fin du tour), queue_op, interrupt,<br/>permission_response, input_response, set_permission_mode,<br/>set_model, set_auto_continue ; faux si socket mort<br/><i>vérifié : chatWebSocket.test (send on a dead socket returns false)</i>"]
         ADAPTER["🟠 wsAdapter.createWebSocket<br/>BrowserWebSocket ou TauriWebSocket<br/>écrit, sans test"]
         DEADTYPE["✅ types/chat.ts ClientMessage supprimé (type mort, champs divergents<br/>de WsChatClientMessage)<br/><i>vérifié : grep -rn 'ClientMessage\b' src | grep -v WsChatClientMessage → 0 ; tsc propre (frontend#198)</i>"]
         NOCLOSED["🟠 session_closed : branche RÉSERVÉE (le code dit « explicit close — future use »),<br/>testée ici (chatWebSocket.test) mais sans producteur : le backend ferme une session<br/>en supprimant son canal → session_dormant, le client reste connecté (voulu).<br/>Décision : la garder ; l'émettre serait un changement de contrat à part<br/><i>vérifié : grep session_closed backend/src → 0 hors FSM</i>"]
@@ -147,7 +147,7 @@ flowchart TD
         ATOMS["🟠 jotai : chatSessionIdAtom, chatStreamingAtom, chatWsStatusAtom,<br/>chatAutoApprovedToolsAtom, chatSessionModelAtom, chatMessageQueueAtom,<br/>chatBackgroundTasksAtom, chatSecretRequestsAtom…<br/>écrit, sans test"]
         MODES["🟠 ⚓ PermissionMode = default · acceptEdits · plan · bypassPermissions<br/>chatPermissionInteractiveAtom = mode !== bypassPermissions<br/>valeurs du CLI Claude (doc-comment : « supported by Claude CLI via Nexus SDK »)"]
         MODELS["✅ ⚓ constants/models : parseModelFamily, getModelShortLabel<br/>retirent le préfixe claude- ; DEFAULT_MODEL_ID = claude-sonnet-5 ;<br/>familles opus · fable · sonnet · haiku · mythos<br/><i>vérifié : ModelFamilyPicker.test (picker) — parseModelFamily sans test dédié</i>"]
-        EVENTS["🟠 ⚓ ChatEvent : 32 variantes ; propres au CLI Claude :<br/>system_init, compact_boundary, compaction_started, thinking,<br/>tool_use_input_resolved, workflow, background_output (Monitor),<br/>result.subtype error_max_turns — écrit, parse vérifié pour 2 variantes<br/><i>types/chat.test : active_tasks_update, background_output</i>"]
+        EVENTS["🟠 ⚓ ChatEvent : 33 variantes ; propres au CLI Claude :<br/>system_init, compact_boundary, compaction_started, thinking,<br/>tool_use_input_resolved, workflow, background_output (Monitor),<br/>result.subtype error_max_turns — écrit, parse vérifié pour 2 variantes<br/><i>types/chat.test : active_tasks_update, background_output</i>"]
         ATOMS --> MODES
         ATOMS --> MODELS
     end

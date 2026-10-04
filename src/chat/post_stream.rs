@@ -499,10 +499,21 @@ impl PostStreamHandler {
     /// Update streaming status and clear buffers if no pending messages.
     /// Returns whether there are pending messages (caller needs this for drain).
     pub async fn finalize_streaming_status(&self) -> bool {
-        let has_pending = !self.pending_messages.lock().await.is_empty();
+        // "Nothing pending" and "no longer streaming" are decided under the
+        // queue lock, as one step. `queue_user_message` takes the same lock to
+        // read `is_streaming` and push: without that, a message queued between
+        // the emptiness check and the store would sit in a queue nobody drains
+        // until the next turn.
+        let has_pending = {
+            let queue = self.pending_messages.lock().await;
+            let has_pending = !queue.is_empty();
+            if !has_pending {
+                self.is_streaming.store(false, Ordering::SeqCst);
+            }
+            has_pending
+        };
 
         if !has_pending {
-            self.is_streaming.store(false, Ordering::SeqCst);
             self.emit_chat(ChatEvent::StreamingStatus {
                 is_streaming: false,
             });

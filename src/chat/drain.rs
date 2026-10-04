@@ -55,10 +55,24 @@ pub(crate) async fn drain_pending_messages(
     // Pop the next message from the queue, prioritising User > SystemHint
     // > BackgroundOutput so a noisy Monitor cannot starve user messages
     // (plan 806c8f2c, T2). FIFO is preserved within each priority class.
-    let next_message = {
+    let (next_message, held_left) = {
         let mut queue = pending_messages.lock().await;
-        pop_highest_priority(&mut queue)
+        let next = pop_highest_priority(&mut queue);
+        // A held message is leaving: the list clients show must lose it now,
+        // not when the turn it starts is over.
+        let held_left = next
+            .as_ref()
+            .filter(|m| m.held)
+            .map(|_| super::pending_queue::snapshot(&queue));
+        (next, held_left)
     };
+    if let Some(messages) = held_left {
+        let event = ChatEvent::PendingQueue { messages };
+        let _ = events_tx.send(event.clone());
+        if let Some(ref nats) = nats {
+            nats.publish_chat_event(&session_id, event);
+        }
+    }
 
     if let Some(next_msg) = next_message {
         let kind = next_msg.kind.clone();
