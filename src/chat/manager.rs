@@ -10154,22 +10154,22 @@ mod tests {
 
     /// Helper: create a dummy InteractiveClient for tests.
     /// Returns None if the Claude CLI is not installed (e.g., in CI).
-    fn try_create_dummy_client() -> Option<InteractiveClient> {
-        let opts = ClaudeCodeOptions {
-            model: Some("test".into()),
-            ..Default::default()
-        };
-        InteractiveClient::new(opts).ok()
+    /// A client that needs no Claude CLI: it sits on the SDK's in-memory
+    /// transport. `InteractiveClient::new` looks the CLI up on disk, so the
+    /// tests built on it were skipped wherever it is not installed — CI
+    /// included — and passed without running.
+    fn create_dummy_client() -> InteractiveClient {
+        let (transport, _handle) = nexus_claude::transport::mock::MockTransport::pair();
+        InteractiveClient::from_transport(transport)
     }
 
-    /// Helper: create a dummy ActiveSession for testing.
-    /// Returns None if the Claude CLI is not installed.
-    fn try_create_dummy_session(
+    /// Helper: create a dummy ActiveSession for testing (no CLI needed).
+    fn create_dummy_session(
         is_streaming: bool,
         streaming_text: &str,
         streaming_events_data: Vec<ChatEvent>,
-    ) -> Option<(ActiveSession, Arc<Mutex<VecDeque<PendingMessage>>>)> {
-        let client = try_create_dummy_client()?;
+    ) -> (ActiveSession, Arc<Mutex<VecDeque<PendingMessage>>>) {
+        let client = create_dummy_client();
         let (tx, _rx) = broadcast::channel(16);
         let pending_messages = Arc::new(Mutex::new(VecDeque::<PendingMessage>::new()));
 
@@ -10221,15 +10221,12 @@ mod tests {
             cancel_task_window: Duration::from_secs(CANCEL_TASK_WINDOW_SECS),
         };
 
-        Some((session, pending_messages))
+        (session, pending_messages)
     }
 
     #[tokio::test]
     async fn test_get_streaming_snapshot_with_active_session_not_streaming() {
-        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (session, _) = create_dummy_session(false, "", vec![]);
 
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
@@ -10263,10 +10260,7 @@ mod tests {
             },
         ];
 
-        let Some((session, _)) = try_create_dummy_session(true, "Hello world", events_data) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (session, _) = create_dummy_session(true, "Hello world", events_data);
 
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
@@ -10292,10 +10286,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_message_queues_when_streaming() {
-        let Some((session, pending_messages)) = try_create_dummy_session(true, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (session, pending_messages) = create_dummy_session(true, "", vec![]);
 
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
@@ -10319,10 +10310,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_message_queues_multiple_when_streaming() {
-        let Some((session, pending_messages)) = try_create_dummy_session(true, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (session, pending_messages) = create_dummy_session(true, "", vec![]);
 
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
@@ -10454,10 +10442,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_active_session_streaming_events_field() {
-        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (session, _) = create_dummy_session(false, "", vec![]);
 
         // Verify streaming_events starts empty
         assert!(session.streaming_events.lock().await.is_empty());
@@ -13092,31 +13077,25 @@ mod tests {
     // ========================================================================
 
     /// Helper: insert a dummy session under the given id and return the
-    /// active_sessions map ready for the helper. Returns None if Claude
-    /// CLI is not installed (skipping the test).
+    /// active_sessions map ready for the helper. No CLI needed.
     async fn build_sessions_map_for_track_test(
         session_id: &str,
-    ) -> Option<(
+    ) -> (
         Arc<RwLock<HashMap<String, ActiveSession>>>,
         broadcast::Sender<ChatEvent>,
         broadcast::Receiver<ChatEvent>,
-    )> {
-        let (session, _) = try_create_dummy_session(false, "", vec![])?;
+    ) {
+        let (session, _) = create_dummy_session(false, "", vec![]);
         let events_tx = session.events_tx.clone();
         let events_rx = events_tx.subscribe();
         let map = Arc::new(RwLock::new(HashMap::new()));
         map.write().await.insert(session_id.to_string(), session);
-        Some((map, events_tx, events_rx))
+        (map, events_tx, events_rx)
     }
 
     #[tokio::test]
     async fn test_track_background_task_inserts_monitor_on_first_pass() {
-        let Some((sessions, events_tx, mut events_rx)) =
-            build_sessions_map_for_track_test("s-mon").await
-        else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (sessions, events_tx, mut events_rx) = build_sessions_map_for_track_test("s-mon").await;
 
         // First pass: ContentBlockStart with empty input.
         let inserted = ChatManager::track_background_task_start(
@@ -13151,12 +13130,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_track_background_task_updates_description_on_second_pass() {
-        let Some((sessions, events_tx, mut events_rx)) =
-            build_sessions_map_for_track_test("s-mon2").await
-        else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (sessions, events_tx, mut events_rx) =
+            build_sessions_map_for_track_test("s-mon2").await;
 
         // First pass — empty input, placeholder description.
         ChatManager::track_background_task_start(
@@ -13208,12 +13183,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_track_background_task_bash_run_in_background_first_pass_skipped() {
-        let Some((sessions, events_tx, mut events_rx)) =
-            build_sessions_map_for_track_test("s-bash").await
-        else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (sessions, events_tx, mut events_rx) =
+            build_sessions_map_for_track_test("s-bash").await;
 
         // First pass: empty input, run_in_background flag absent → not tracked.
         let inserted = ChatManager::track_background_task_start(
@@ -13266,12 +13237,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_track_background_task_bash_synchronous_not_tracked() {
-        let Some((sessions, events_tx, mut events_rx)) =
-            build_sessions_map_for_track_test("s-bash-sync").await
-        else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (sessions, events_tx, mut events_rx) =
+            build_sessions_map_for_track_test("s-bash-sync").await;
 
         // Synchronous Bash (run_in_background absent or false) — never tracked.
         let inserted_a = ChatManager::track_background_task_start(
@@ -13317,12 +13284,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_track_background_task_other_tools_ignored() {
-        let Some((sessions, events_tx, _events_rx)) =
-            build_sessions_map_for_track_test("s-other").await
-        else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (sessions, events_tx, _events_rx) = build_sessions_map_for_track_test("s-other").await;
 
         for tool in ["Read", "Write", "Edit", "Glob", "Task"] {
             let inserted = ChatManager::track_background_task_start(
@@ -13399,12 +13361,7 @@ mod tests {
         // Give the OS a moment so pgrep can see the first descendant.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let Some((mut session, _)) = try_create_dummy_session(false, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            let _ = bash.kill();
-            let _ = bash.wait();
-            return;
-        };
+        let (mut session, _) = create_dummy_session(false, "", vec![]);
         session.child_pid = Some(bash_pid);
         let events_tx = session.events_tx.clone();
         let mut events_rx = events_tx.subscribe();
@@ -13466,10 +13423,7 @@ mod tests {
     /// or panicking.
     #[tokio::test]
     async fn test_pid_claim_noop_when_entry_removed_before_wakeup() {
-        let Some((mut session, _)) = try_create_dummy_session(false, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (mut session, _) = create_dummy_session(false, "", vec![]);
         // Set a non-None child_pid so the claim task is actually spawned
         // (else it short-circuits in the synchronous track call). We use
         // a guaranteed-nonexistent PID so `pgrep -P` returns instantly
@@ -13534,10 +13488,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_task_marks_for_removal_and_broadcasts() {
-        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (session, _) = create_dummy_session(false, "", vec![]);
         let mut events_rx = session.events_tx.subscribe();
         // Pre-seed a task in the map.
         session.active_background_tasks.lock().await.insert(
@@ -13593,10 +13544,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_task_unknown_task_id_idempotent() {
-        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (session, _) = create_dummy_session(false, "", vec![]);
         let mut events_rx = session.events_tx.subscribe();
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
@@ -13637,10 +13585,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_task_rate_cap_enforced() {
-        let Some((mut session, _)) = try_create_dummy_session(false, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (mut session, _) = create_dummy_session(false, "", vec![]);
         // Tighten the cap so the test runs in milliseconds: 2 cancels /
         // 60s window. Reusing the same window const would make the test
         // either very slow or flaky.
@@ -13677,10 +13622,7 @@ mod tests {
     /// - still broadcast an `ActiveTasksUpdate` (frontend feedback).
     #[tokio::test]
     async fn test_cancel_task_without_pid_falls_back_to_v1() {
-        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (session, _) = create_dummy_session(false, "", vec![]);
         let mut events_rx = session.events_tx.subscribe();
         // Pre-seed a task with pid=None to exercise the fallback branch.
         session.active_background_tasks.lock().await.insert(
@@ -13753,12 +13695,7 @@ mod tests {
         };
         let real_pid = child.id();
 
-        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            let _ = child.kill();
-            let _ = child.wait();
-            return;
-        };
+        let (session, _) = create_dummy_session(false, "", vec![]);
         // Pre-seed a task entry pointing at the real subprocess.
         session.active_background_tasks.lock().await.insert(
             "tool_Real".into(),
@@ -13916,10 +13853,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_recovery_inserts_orphan_monitor() {
-        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (session, _) = create_dummy_session(false, "", vec![]);
         let mut events_rx = session.events_tx.subscribe();
         let events_tx = session.events_tx.clone();
 
@@ -13971,10 +13905,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_recovery_inserts_orphan_bash_background() {
-        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (session, _) = create_dummy_session(false, "", vec![]);
         let events_tx = session.events_tx.clone();
 
         let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
@@ -14007,10 +13938,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_recovery_skips_already_tracked() {
-        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (session, _) = create_dummy_session(false, "", vec![]);
         let mut events_rx = session.events_tx.subscribe();
         let events_tx = session.events_tx.clone();
 
@@ -14062,10 +13990,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_recovery_ignores_unknown_source() {
-        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (session, _) = create_dummy_session(false, "", vec![]);
         let events_tx = session.events_tx.clone();
 
         let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
@@ -14102,10 +14027,7 @@ mod tests {
         // Path 1: known correlation_id → refresh last_seen_at, no broadcast,
         // returns false (no insertion, but the refresh is the silent
         // side-effect that drives idle-death detection).
-        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (session, _) = create_dummy_session(false, "", vec![]);
         let mut events_rx = session.events_tx.subscribe();
         let events_tx = session.events_tx.clone();
 
@@ -14190,11 +14112,11 @@ mod tests {
         sid: &str,
         pid: Option<u32>,
         cli_reported: usize,
-    ) -> Option<(
+    ) -> (
         Arc<RwLock<HashMap<String, ActiveSession>>>,
         broadcast::Sender<ChatEvent>,
-    )> {
-        let (session, _) = try_create_dummy_session(false, "", vec![])?;
+    ) {
+        let (session, _) = create_dummy_session(false, "", vec![]);
         let events_tx = session.events_tx.clone();
         let now = chrono::Utc::now();
         let silent_since =
@@ -14218,7 +14140,7 @@ mod tests {
         let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
             Arc::new(RwLock::new(HashMap::new()));
         map.write().await.insert(sid.into(), session);
-        Some((map, events_tx))
+        (map, events_tx)
     }
 
     async fn silent_task_is_marked(
@@ -14246,12 +14168,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_tick_purge_keeps_a_silent_task_whose_process_is_running() {
-        let Some((map, events_tx)) =
-            session_with_silent_background_task("s-silent-pid", Some(std::process::id()), 0).await
-        else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (map, events_tx) =
+            session_with_silent_background_task("s-silent-pid", Some(std::process::id()), 0).await;
         let mut events_rx = events_tx.subscribe();
 
         ChatManager::tick_purge_background_tasks(
@@ -14277,12 +14195,7 @@ mod tests {
     /// running background task: the entry is kept.
     #[tokio::test]
     async fn test_tick_purge_keeps_a_silent_task_while_the_cli_reports_work() {
-        let Some((map, events_tx)) =
-            session_with_silent_background_task("s-silent-cli", None, 1).await
-        else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (map, events_tx) = session_with_silent_background_task("s-silent-cli", None, 1).await;
 
         ChatManager::tick_purge_background_tasks(
             "s-silent-cli",
@@ -14324,12 +14237,8 @@ mod tests {
         let dead_pid = child.id();
         child.wait().expect("wait for `true`");
 
-        let Some((map, events_tx)) =
-            session_with_silent_background_task("s-silent-dead", Some(dead_pid), 1).await
-        else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (map, events_tx) =
+            session_with_silent_background_task("s-silent-dead", Some(dead_pid), 1).await;
 
         ChatManager::tick_purge_background_tasks(
             "s-silent-dead",
@@ -14348,10 +14257,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tick_purge_removes_stale_pending_entries_and_broadcasts() {
-        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (session, _) = create_dummy_session(false, "", vec![]);
         let mut events_rx = session.events_tx.subscribe();
         let events_tx = session.events_tx.clone();
 
@@ -14431,10 +14337,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tick_purge_marks_idle_entries_as_pending_removal() {
-        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (session, _) = create_dummy_session(false, "", vec![]);
         let mut events_rx = session.events_tx.subscribe();
         let events_tx = session.events_tx.clone();
 
@@ -14520,10 +14423,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tick_purge_within_grace_does_nothing() {
-        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (session, _) = create_dummy_session(false, "", vec![]);
         let mut events_rx = session.events_tx.subscribe();
         let events_tx = session.events_tx.clone();
 
