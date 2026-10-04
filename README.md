@@ -9,9 +9,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.15_aarch64.dmg"><img src="https://img.shields.io/badge/Download_for_macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS" height="40"></a>
+  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.16_aarch64.dmg"><img src="https://img.shields.io/badge/Download_for_macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS" height="40"></a>
   &nbsp;&nbsp;
-  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.15_x64-setup.exe"><img src="https://img.shields.io/badge/Download_for_Windows-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows" height="40"></a>
+  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.16_x64-setup.exe"><img src="https://img.shields.io/badge/Download_for_Windows-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows" height="40"></a>
   &nbsp;&nbsp;
   <a href="#desktop-app"><img src="https://img.shields.io/badge/Download_for_Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Download for Linux" height="40"></a>
 </p>
@@ -66,15 +66,15 @@ Download the desktop app for your platform:
 
 | Platform | Download | Type |
 |----------|----------|------|
-| **macOS** (Apple Silicon) | [Download .dmg](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.15_aarch64.dmg) | M1/M2/M3/M4 |
-| **macOS** (Intel) | [Download .dmg](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.15_x64.dmg) | Intel Mac |
-| **Windows** (64-bit) | [Download .exe](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.15_x64-setup.exe) | Installer |
-| **Windows** (64-bit MSI) | [Download .msi](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.15_x64_en-US.msi) | MSI |
-| **Linux** (x86_64 AppImage) | [Download .AppImage](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.15_amd64.AppImage) | Intel/AMD |
-| **Linux** (Debian/Ubuntu x86_64) | [Download .deb](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.15_amd64.deb) | apt/dpkg |
-| **Linux** (Debian/Ubuntu **arm64**) | [Download .deb](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.15_arm64.deb) | apt/dpkg — ARM64 (DGX Spark, Ampere, RPi…) |
-| **Linux** (Fedora/RHEL x86_64) | [Download .rpm](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.15-1.x86_64.rpm) | dnf/rpm |
-| **Linux** (Fedora/RHEL arm64) | [Download .rpm](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.15-1.aarch64.rpm) | dnf/rpm |
+| **macOS** (Apple Silicon) | [Download .dmg](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.16_aarch64.dmg) | M1/M2/M3/M4 |
+| **macOS** (Intel) | [Download .dmg](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.16_x64.dmg) | Intel Mac |
+| **Windows** (64-bit) | [Download .exe](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.16_x64-setup.exe) | Installer |
+| **Windows** (64-bit MSI) | [Download .msi](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.16_x64_en-US.msi) | MSI |
+| **Linux** (x86_64 AppImage) | [Download .AppImage](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.16_amd64.AppImage) | Intel/AMD |
+| **Linux** (Debian/Ubuntu x86_64) | [Download .deb](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.16_amd64.deb) | apt/dpkg |
+| **Linux** (Debian/Ubuntu **arm64**) | [Download .deb](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.16_arm64.deb) | apt/dpkg — ARM64 (DGX Spark, Ampere, RPi…) |
+| **Linux** (Fedora/RHEL x86_64) | [Download .rpm](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.16-1.x86_64.rpm) | dnf/rpm |
+| **Linux** (Fedora/RHEL arm64) | [Download .rpm](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.16-1.aarch64.rpm) | dnf/rpm |
 
 > All releases are available on the [Releases page](https://github.com/this-rs/project-orchestrator/releases/latest).
 
@@ -100,7 +100,7 @@ Options:
 
 ```bash
 # Install a specific version
-curl -fsSL https://…/install.sh | sh -s -- --version 0.0.15
+curl -fsSL https://…/install.sh | sh -s -- --version 0.0.16
 
 # Install without the embedded frontend (lighter)
 curl -fsSL https://…/install.sh | sh -s -- --no-frontend
@@ -143,8 +143,8 @@ docker compose up -d
 
 ```bash
 # Download and install the .deb package
-curl -LO https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator_0.0.15-1_amd64.deb
-sudo dpkg -i project-orchestrator_0.0.15-1_amd64.deb
+curl -LO https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator_0.0.16-1_amd64.deb
+sudo dpkg -i project-orchestrator_0.0.16-1_amd64.deb
 
 # Start the service
 sudo systemctl enable --now project-orchestrator
@@ -156,8 +156,8 @@ sudo systemctl enable --now project-orchestrator
 
 ```bash
 # Download and install the .rpm package
-curl -LO https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.15-1.x86_64.rpm
-sudo rpm -i project-orchestrator-0.0.15-1.x86_64.rpm
+curl -LO https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.16-1.x86_64.rpm
+sudo rpm -i project-orchestrator-0.0.16-1.x86_64.rpm
 ```
 
 ---
@@ -581,6 +581,11 @@ code(action: "get_node_importance", project_slug: "my-project",
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| **v0.0.16** | 2026-10-02 | Cross-workspace attention API for the Today cockpit, plan-task retry route, per-workspace topology derived from the code, secrets handed to agents without leaking (vault), entity neighborhood endpoint and richer code entities (file path, docstring, signature), XLSX/PPTX extraction and work-profile projects (optional `root_path`), self-update split into version/deployment/service, security hardening (signed tombstones, WS ticket/cookie auth, Cypher/Meilisearch injection fixes, MCP token purge), in-repo living diagrams and bug registry |
+| **v0.0.15** | 2026-07-04 | Remote MCP over Streamable HTTP with an OAuth 2.1 authorization server (opt-in), resume existing sessions via REST/MCP, live Claude model catalog from the Anthropic Models API, session-lifecycle navigation ritual seeded on project creation, note-embedding backfill admin action, semantic anchoring fallback, Witness schema for epistemic discipline |
+| **v0.0.14** | 2026-06-02 | Configurable cap on wave concurrency, Claude Code Dynamic Workflow progress events surfaced in the chat |
+| **v0.0.13** | 2026-05-03 | Task cancellation (V2 `cancel_task` with PID discovery and targeted subprocess kill), background-task tracking with granular control, user-initiated tool-subprocess cancellation, out-of-band SDK event listener |
+| **v0.0.12** | 2026-04-16 | MCP Federation (external MCP servers), Streamable HTTP spec compliance, chat ↔ plan/task/RFC bidirectional linking, Claude Opus 4.7 support, chat-session rename, Dart/Flutter language support |
 | **v0.0.11** | 2026-03-20 | Neural Routing ML Pipeline, Plan Runner with Protocol-Driven Lifecycle (FSM + adaptive feedback), Protocol FSM enhancements (CAS, timeouts, episodes), Event Reactor & Pipeline Quality Gates, 28 mega-tools meta-prompt sync |
 | **v0.0.9** | 2026-03-12 | Episodic Memory, M4 MVP P2P Knowledge Exchange, Intent-Adaptive Retrieval (biomimetic memory routing), RFC REST endpoints with lifecycle FSM, auto-roadmap endpoint, transitive knowledge propagation (FeatureGraph, Protocol, Skill) |
 | **v0.0.8** | 2026-03-10 | Protocol v2 (hierarchical FSM, generator states, RFC lifecycle), Runner v2+v3 (parallel waves, agent personas), Knowledge Scars & biomimicry, streaming WebSocket events, intelligent hooks |
