@@ -56,6 +56,14 @@ RUN apt-get update && apt-get install -y \
 # Copy manifests for dependency caching (Cargo.lock required for reproducible builds)
 COPY Cargo.toml Cargo.lock ./
 
+# The build script is part of the package: it defines PO_GIT_DESCRIBE, which
+# `src/update/version.rs` reads with `env!` — a compile-time requirement.
+# Without this file Cargo builds the crate with no build script at all and
+# compilation stops on "environment variable `PO_GIT_DESCRIBE` not defined".
+# There is no git in this image: the script then emits an empty value, and the
+# release version comes from CARGO_PKG_VERSION.
+COPY build.rs ./
+
 # Remove desktop/src-tauri from workspace members — it's not needed for the
 # backend Docker build and would require copying the full Tauri manifest tree.
 # This keeps the Docker build identical to the pre-workspace behavior.
