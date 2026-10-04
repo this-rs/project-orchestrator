@@ -5604,7 +5604,15 @@ impl ChatManager {
     /// sender — **without** taking the `client` Mutex lock. This is critical because
     /// `stream_response` holds the client lock for the entire duration of streaming.
     /// If we tried to lock the client here, the WS event loop would deadlock.
-    pub async fn set_session_model(&self, session_id: &str, model: &str) -> Result<()> {
+    ///
+    /// Returns `true` when `ChatEvent::ModelChanged` was broadcast to the
+    /// session's subscribers — EVERY connected client of the session, the one
+    /// that asked included, already receives the confirmation that way. The
+    /// caller must then send no confirmation of its own: the asking device used
+    /// to get it twice (one direct, one broadcast) and show "Model changed" twice.
+    /// Returns `false` for a dormant session, which has no subscribers: the
+    /// caller confirms to the asker directly.
+    pub async fn set_session_model(&self, session_id: &str, model: &str) -> Result<bool> {
         // Capture the live session's stdin_tx + events_tx IF the CLI subprocess is still
         // attached. A dormant session (idle-cleaned) won't be present in `active_sessions`
         // — that is NOT an error: we still persist the chosen model to Neo4j below so the
@@ -5672,6 +5680,7 @@ impl ChatManager {
                 let _ = events_tx.send(ChatEvent::ModelChanged {
                     model: model.to_string(),
                 });
+                Ok(true)
             }
             // Session present but CLI not connected yet — persisted; applies on next spawn.
             Some((None, _, events_tx)) => {
@@ -5683,6 +5692,7 @@ impl ChatManager {
                 let _ = events_tx.send(ChatEvent::ModelChanged {
                     model: model.to_string(),
                 });
+                Ok(true)
             }
             // Dormant session (idle-cleaned) — persisted to Neo4j only; applies on resume.
             None => {
@@ -5691,10 +5701,9 @@ impl ChatManager {
                     new_model = %model,
                     "Model persisted for dormant session; applies on resume"
                 );
+                Ok(false)
             }
         }
-
-        Ok(())
     }
 
     /// Toggle auto-continue for an active session.
@@ -11970,10 +11979,14 @@ mod tests {
             .insert(session_id.to_string(), session);
 
         // Change model
-        manager
+        let broadcast = manager
             .set_session_model(session_id, "claude-opus-4-20250514")
             .await
             .unwrap();
+        assert!(
+            broadcast,
+            "a live session broadcasts model_changed itself: the caller must not confirm again"
+        );
 
         // Verify the control request was sent through stdin_tx
         let sent_json = tokio::time::timeout(Duration::from_millis(100), stdin_rx.recv())
@@ -11991,11 +12004,15 @@ mod tests {
         assert_eq!(request["subtype"], "set_model");
         assert_eq!(request["model"], "claude-opus-4-20250514");
 
-        // Verify ModelChanged event was broadcast
+        // Verify ModelChanged event was broadcast — exactly once
         let event = tokio::time::timeout(Duration::from_millis(100), events_rx.recv())
             .await
             .expect("should receive event within timeout")
             .expect("channel should be open");
+        assert!(
+            events_rx.try_recv().is_err(),
+            "one change, one model_changed event: two would show the confirmation twice"
+        );
 
         assert_eq!(event.event_type(), "model_changed");
         if let ChatEvent::ModelChanged { model } = event {
@@ -12027,10 +12044,11 @@ mod tests {
             .await
             .insert(session_id.to_string(), session);
 
-        manager
+        let broadcast = manager
             .set_session_model(session_id, "claude-opus-4-20250514")
             .await
             .expect("model change without live stdin should succeed (persist + broadcast)");
+        assert!(broadcast);
 
         // In-memory model is updated so a respawn from this session uses the new model.
         {
@@ -12062,10 +12080,11 @@ mod tests {
             .set_session_model(&session_id, "claude-opus-4-20250514")
             .await;
 
-        assert!(
-            result.is_ok(),
-            "dormant session model change should persist without error, got {:?}",
-            result
+        // `false`: nothing was broadcast (no subscribers), so the WebSocket
+        // handler confirms to the asker directly.
+        assert_eq!(
+            result.expect("dormant session model change should persist without error"),
+            false
         );
     }
 

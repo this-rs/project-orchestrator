@@ -974,7 +974,13 @@ async fn handle_ws_chat_loop(
                                         // on an idle session was silently rejected and the respawn used the
                                         // create-time model. set_session_model now handles both cases.
                                         match chat_manager.set_session_model(&session_id, &model).await {
-                                            Ok(()) => {
+                                            // The session broadcast `model_changed` to all its clients,
+                                            // this one included: confirming here too made the asking
+                                            // device show "Model changed" twice.
+                                            Ok(true) => {}
+                                            // Dormant session: nobody is subscribed, so nothing was
+                                            // broadcast — confirm to the asker alone.
+                                            Ok(false) => {
                                                 let confirmation = serde_json::json!({
                                                     "type": "model_changed",
                                                     "model": model,
