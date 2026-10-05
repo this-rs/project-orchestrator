@@ -855,6 +855,33 @@ pub(crate) const CHILD_ENV_TOOLING: &[&str] = &[
 /// of variable names (e.g. `GH_TOKEN,AWS_PROFILE`).
 pub(crate) const CHILD_ENV_INHERIT_VAR: &str = "CHAT_CHILD_ENV_INHERIT";
 
+/// Rough size, in tokens, of the tool schemas a third-party session is given
+/// (the restricted profile's tool list, as JSON, at four characters a token).
+pub(crate) fn restricted_tool_schema_tokens() -> u64 {
+    let tools = crate::auth::tool_profile::ToolProfile::Restricted
+        .filter_tools(crate::mcp::tools::all_tools());
+    (serde_json::to_string(&tools).map_or(0, |s| s.len()) / 4) as u64
+}
+
+/// Refuses a model whose context window cannot hold the tool schemas with room
+/// to work: the schemas must take at most half of it. A window that is not known
+/// is not a refusal (nothing is invented).
+pub(crate) fn window_holds_the_tools(
+    caps: &nexus_claude::agent::Capabilities,
+) -> Result<(), nexus_claude::agent::ProviderError> {
+    let Some(window) = caps.context_window.as_ref().map(|w| w.value) else {
+        return Ok(());
+    };
+    let needed = restricted_tool_schema_tokens() * 2;
+    if window < needed {
+        return Err(nexus_claude::agent::ProviderError::ContextTooSmall {
+            needed: Some(needed),
+            available: Some(window),
+        });
+    }
+    Ok(())
+}
+
 /// The environment policy of every agent process this server starts (chat
 /// sessions, runner tasks, the feature-graph one-shot): clean environment,
 /// allowlist only. The server's own secrets are simply not on the list.
@@ -8456,11 +8483,33 @@ impl ChatManager {
             crate::auth::agent_tokens::revoke_session(&sid);
             return Err(e);
         }
+        // Preflight at EVERY opening (A30), not only when the instance was saved:
+        // is the provider reachable and logged in now?
+        if provider_id != super::provider::resolver::CLAUDE_CODE {
+            let health = provider.health().await;
+            if health.status == nexus_claude::agent::HealthStatus::Unavailable {
+                crate::auth::agent_tokens::revoke_session(&sid);
+                return Err(anyhow::Error::new(health.error.unwrap_or(
+                    nexus_claude::agent::ProviderError::EndpointUnreachable {
+                        detail: "the provider reports itself unavailable".to_string(),
+                    },
+                )));
+            }
+        }
         let session = provider.open(spec).await.map_err(|e| {
             // Nothing will ever use this session's token.
             crate::auth::agent_tokens::revoke_session(&sid);
             anyhow::Error::new(e)
         })?;
+        // ... and does the model's window hold the tool schemas the session was
+        // given, with room left to work? (known only once the provider has probed)
+        if provider_id != super::provider::resolver::CLAUDE_CODE {
+            if let Err(e) = window_holds_the_tools(session.capabilities()) {
+                let _ = session.close().await;
+                crate::auth::agent_tokens::revoke_session(&sid);
+                return Err(anyhow::Error::new(e));
+            }
+        }
         self.finish_agent_open(&sid, provider_id, provider.kind(), session, 1, tool_policy)
             .await;
         if !request.message.is_empty() {
@@ -11254,6 +11303,132 @@ mod tests {
         let wire = serde_json::to_value(&events[0]).unwrap();
         assert_eq!(wire["engine"], "legacy", "{wire}");
         assert_eq!(wire["degraded_features"], serde_json::json!([]), "{wire}");
+    }
+
+    fn done_event(
+        is_error: bool,
+        error: Option<nexus_claude::agent::ProviderError>,
+    ) -> nexus_claude::agent::AgentEvent {
+        nexus_claude::agent::AgentEvent::Done {
+            stop_reason: if is_error {
+                nexus_claude::agent::StopReason::Error
+            } else {
+                nexus_claude::agent::StopReason::Completed
+            },
+            subtype: Some(
+                if is_error {
+                    "error_during_execution"
+                } else {
+                    "success"
+                }
+                .into(),
+            ),
+            is_error,
+            result_text: None,
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 1,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: None,
+            provider_session_id: Some("p".into()),
+            structured_output: None,
+            error,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retryable_done_error_before_any_output_is_retried_once_the_provider_says_when() {
+        use nexus_claude::agent::{AgentEvent, ProviderError};
+        let (manager, _graph, fake) = agent_manager();
+        let sid = manager
+            .create_session(&agent_request("go"))
+            .await
+            .unwrap()
+            .session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        fake.state.push(done_event(
+            true,
+            Some(ProviderError::RateLimited {
+                retry_after_ms: Some(10),
+            }),
+        ));
+        let retrying = next_matching(&mut rx, |e| matches!(e, ChatEvent::Retrying { .. })).await;
+        assert!(matches!(
+            retrying,
+            ChatEvent::Retrying {
+                attempt: 1,
+                delay_ms: 10,
+                ..
+            }
+        ));
+        // The same turn is sent again.
+        for _ in 0..200 {
+            if fake.state.turns_started.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            fake.state.turns_started.lock().unwrap().as_slice(),
+            ["go", "go"]
+        );
+        fake.state.push(AgentEvent::Text {
+            text: "ok".into(),
+            seq: None,
+            parent: None,
+        });
+        fake.state.push(done_event(false, None));
+        let result = next_matching(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        // The failed attempt never reached the user: the first Result is the good one.
+        assert!(
+            matches!(
+                result,
+                ChatEvent::Result {
+                    is_error: false,
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_already_showed_output_or_failed_for_good_is_not_retried() {
+        use nexus_claude::agent::{AgentEvent, ProviderError};
+        let (manager, _graph, fake) = agent_manager();
+        let sid = manager
+            .create_session(&agent_request("go"))
+            .await
+            .unwrap()
+            .session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        fake.state.push(AgentEvent::Text {
+            text: "partial".into(),
+            seq: None,
+            parent: None,
+        });
+        fake.state
+            .push(done_event(true, Some(ProviderError::Overloaded)));
+        let result = next_matching(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        assert!(matches!(result, ChatEvent::Result { is_error: true, .. }));
+        assert_eq!(
+            fake.state.turns_started.lock().unwrap().len(),
+            1,
+            "no replay after output"
+        );
+
+        // A non-retryable cause is shown at once.
+        let sid2 = manager
+            .create_session(&agent_request("again"))
+            .await
+            .unwrap()
+            .session_id;
+        let mut rx2 = manager.subscribe(&sid2).await.unwrap();
+        fake.state
+            .push(done_event(true, Some(ProviderError::Unauthorized)));
+        let result = next_matching(&mut rx2, |e| matches!(e, ChatEvent::Result { .. })).await;
+        assert!(matches!(result, ChatEvent::Result { is_error: true, .. }));
     }
 
     #[tokio::test]

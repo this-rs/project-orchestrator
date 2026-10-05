@@ -64,6 +64,53 @@ pub(crate) fn mask_agent_event_with(
     }
 }
 
+/// Retries of a turn that failed before showing anything (`done.error` retryable).
+const MAX_RETRIES: u32 = 3;
+
+/// The failure that ends a turn and is worth trying again: a retryable
+/// `done.error` of an error turn, or a retryable terminal `error`.
+fn retryable_failure(event: &AgentEvent) -> Option<ProviderError> {
+    match event {
+        AgentEvent::Done {
+            is_error: true,
+            error: Some(error),
+            ..
+        }
+        | AgentEvent::Error { error }
+            if error.retryable() =>
+        {
+            Some(error.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Whether an event is something the user has already seen of this turn.
+fn shows_content(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::Text { .. }
+            | AgentEvent::Thinking { .. }
+            | AgentEvent::Delta { .. }
+            | AgentEvent::ToolCall { .. }
+            | AgentEvent::ToolResult { .. }
+            | AgentEvent::PermissionAsk { .. }
+            | AgentEvent::Question { .. }
+    )
+}
+
+/// Delay before attempt `n`: what the provider asked (`retry_after`), else an
+/// exponential backoff from one second, never beyond thirty.
+fn retry_delay_ms(error: &ProviderError, attempt: u32) -> u64 {
+    if let ProviderError::RateLimited {
+        retry_after_ms: Some(ms),
+    } = error
+    {
+        return (*ms).min(30_000);
+    }
+    (1000u64 << attempt.saturating_sub(1).min(5)).min(30_000)
+}
+
 /// What a session on the agent engine does NOT do, as the identifiers the
 /// frontend knows (`hooks`, `message_queue`, `auto_continue`, `retry`,
 /// `compaction`, `nats`, `enrichment`, `images`).
@@ -192,7 +239,8 @@ impl AgentSessionHandle {
             content: text.to_string(),
         })
         .await;
-        let stream = match self.session.send_turn(TurnInput::text(text)).await {
+        let input = TurnInput::text(text);
+        let stream = match self.session.send_turn(input.clone()).await {
             Ok(stream) => stream,
             Err(error) => {
                 self.is_streaming.store(false, Ordering::SeqCst);
@@ -206,17 +254,55 @@ impl AgentSessionHandle {
         let me = Arc::clone(self);
         tokio::spawn(async move {
             let mut stream = stream;
-            while let Some(event) = stream.next().await {
-                // Terminal-ness is read on the original: a withheld terminal event
-                // still ends the turn.
-                let terminal = event.is_terminal();
-                let event = mask_agent_event(event);
-                let chat_events = me.mapper.lock().await.map(&event);
-                for chat_event in chat_events {
-                    me.emit(chat_event).await;
+            let mut attempt = 0u32;
+            loop {
+                // Did the turn already show the user anything? A turn that did is
+                // never replayed: it would repeat text or tool calls.
+                let mut shown = false;
+                let mut retry: Option<ProviderError> = None;
+                while let Some(event) = stream.next().await {
+                    // Terminal-ness is read on the original: a withheld terminal event
+                    // still ends the turn.
+                    let terminal = event.is_terminal();
+                    if !shown {
+                        retry = retryable_failure(&event).filter(|_| attempt < MAX_RETRIES);
+                        if retry.is_some() {
+                            break;
+                        }
+                    }
+                    shown |= shows_content(&event);
+                    let event = mask_agent_event(event);
+                    let chat_events = me.mapper.lock().await.map(&event);
+                    for chat_event in chat_events {
+                        me.emit(chat_event).await;
+                    }
+                    if terminal {
+                        break;
+                    }
                 }
-                if terminal {
-                    break;
+                let Some(error) = retry else { break };
+                attempt += 1;
+                let delay = retry_delay_ms(&error, attempt);
+                me.emit(ChatEvent::Retrying {
+                    attempt,
+                    max_attempts: MAX_RETRIES,
+                    delay_ms: delay,
+                    error_message: format!(
+                        "Error: {}",
+                        super::provider::errors::open_failure(&error, None).message
+                    ),
+                })
+                .await;
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                match me.session.send_turn(input.clone()).await {
+                    Ok(next) => stream = next,
+                    Err(e) => {
+                        let ev = AgentEvent::Error { error: e };
+                        for chat_event in me.mapper.lock().await.map(&ev) {
+                            me.emit(chat_event).await;
+                        }
+                        break;
+                    }
                 }
             }
             me.is_streaming.store(false, Ordering::SeqCst);
@@ -701,5 +787,57 @@ mod mask_tests {
             matches!(&chat[0], crate::chat::types::ChatEvent::Error { message, .. }
             if message == crate::chat::manager::MASKING_FAILED_MESSAGE)
         );
+    }
+
+    #[test]
+    fn the_retry_delay_follows_the_provider_then_backs_off() {
+        assert_eq!(
+            retry_delay_ms(
+                &ProviderError::RateLimited {
+                    retry_after_ms: Some(40)
+                },
+                1
+            ),
+            40
+        );
+        assert_eq!(
+            retry_delay_ms(
+                &ProviderError::RateLimited {
+                    retry_after_ms: Some(900_000)
+                },
+                1
+            ),
+            30_000
+        );
+        assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 1), 1000);
+        assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 3), 4000);
+        assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 20), 30_000);
+    }
+
+    #[test]
+    fn only_a_retryable_failure_of_an_error_turn_is_retried() {
+        let done = |is_error, error| AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Error,
+            subtype: None,
+            is_error,
+            result_text: None,
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 0,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error,
+        };
+        assert!(retryable_failure(&done(true, Some(ProviderError::Overloaded))).is_some());
+        assert!(retryable_failure(&done(true, Some(ProviderError::Unauthorized))).is_none());
+        assert!(retryable_failure(&done(false, Some(ProviderError::Overloaded))).is_none());
+        assert!(retryable_failure(&done(true, None)).is_none());
+        assert!(retryable_failure(&AgentEvent::Error {
+            error: ProviderError::Overloaded
+        })
+        .is_some());
     }
 }

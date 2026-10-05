@@ -752,3 +752,57 @@ async fn changing_the_credential_reference_after_consent_stops_the_sending() {
     assert_eq!(failure(&err), (403, "endpoint_not_allowed"));
     assert!(fake.requests().is_empty());
 }
+
+#[tokio::test]
+async fn a_window_too_small_for_the_tool_schemas_refuses_the_session_after_the_probe() {
+    // The endpoint says the model's window is 1 500 tokens: the tool schemas alone are larger.
+    let mut routes = script().as_array().unwrap().clone();
+    routes[1] = json!({"method": "GET", "path": "/v1/models", "status": 200,
+        "body": {"object": "list", "data": [{"id": "m", "context_length": 1500}]}});
+    let fake = FakeOpenAi::start(Value::Array(routes));
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    let manager = manager(graph.clone(), true);
+    let err = manager
+        .create_session(&request(Some("local"), Some("proj"), "default"))
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&err), (422, "context_too_small"));
+    assert!(
+        manager.agent_runtime.len().await == 0,
+        "the session was closed"
+    );
+    assert!(
+        !fake
+            .chat_requests()
+            .iter()
+            .any(|r| r["body"].to_string().contains("hi there")),
+        "the user's message never reached the model"
+    );
+}
+
+#[test]
+fn the_tool_schemas_have_a_size_and_an_unknown_window_is_not_a_refusal() {
+    use nexus_claude::agent::{Capabilities, ContextWindow, ContextWindowSource};
+    let tokens = super::manager::restricted_tool_schema_tokens();
+    assert!(
+        tokens > 500,
+        "the restricted profile still has tools: {tokens}"
+    );
+    let mut caps = Capabilities::none();
+    assert!(
+        super::manager::window_holds_the_tools(&caps).is_ok(),
+        "unknown window"
+    );
+    caps.context_window = Some(ContextWindow {
+        value: tokens * 2 + 1,
+        source: ContextWindowSource::Probed,
+    });
+    assert!(super::manager::window_holds_the_tools(&caps).is_ok());
+    caps.context_window = Some(ContextWindow {
+        value: tokens,
+        source: ContextWindowSource::Probed,
+    });
+    assert!(super::manager::window_holds_the_tools(&caps).is_err());
+}

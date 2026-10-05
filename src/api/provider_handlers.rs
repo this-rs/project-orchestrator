@@ -198,7 +198,6 @@ pub async fn test_provider(
     // A codex / acp instance is a local process: the test is its health check
     // (version, login), nothing is sent anywhere.
     if st::is_process_kind(&record.kind) {
-        use nexus_claude::agent::AgentProvider;
         let provider = match crate::chat::provider::native_factory::build_native_provider(
             &record,
             Some(state.vault.clone()),
