@@ -77,6 +77,27 @@ const RESTRICTED_ACTIONS: &[(&str, &str)] = &[
     ("plan", "enable_trigger"),
 ];
 
+/// The routes of the withheld `sharing` and `environment` tools that hang under
+/// a project or a note: `/api/projects/{slug}/sharing*`, `/api/projects/{id}/environments*`,
+/// `/api/notes/{id}/sharing*`. Sharing sends project data out: it is closed
+/// to the restricted profile, reads included (the tool is not in the profile).
+fn withheld_project_or_note_route(path: &str) -> bool {
+    let mut segments = path.trim_start_matches('/').split('/');
+    let (Some("api"), Some(root), Some(_id), Some(leaf)) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return false;
+    };
+    match root {
+        "projects" => matches!(leaf, "sharing" | "environments"),
+        "notes" => leaf == "sharing",
+        _ => false,
+    }
+}
+
 impl ToolProfile {
     /// Profile named in a token. Absent → full; unknown → restricted.
     pub fn from_name(name: Option<&str>) -> Self {
@@ -176,6 +197,13 @@ impl ToolProfile {
             || under("/api/mcp-federation")
             || under("/api/lifecycle-hooks")
             || under("/api/vault")
+            // The other withheld tools: `protocol` (starts agents), `environment`,
+            // `neural_routing`, `trajectory`.
+            || under("/api/protocols")
+            || under("/api/environments")
+            || under("/api/neural-routing")
+            || under("/api/trajectories")
+            || withheld_project_or_note_route(path)
         {
             return true;
         }
@@ -383,5 +411,50 @@ mod tests {
         assert!(r.route_forbidden(&Method::GET, "/api/vault"));
         assert!(r.route_forbidden(&Method::POST, "/api/vault/grants"));
         assert!(!ToolProfile::Full.route_forbidden(&Method::GET, "/api/vault"));
+    }
+
+    /// VERIFIER: the module doc and the threat model promise that "the REST routes
+    /// behind withheld tools answer 403". `sharing` and `protocol` are withheld
+    /// from the restricted profile, yet their routes are not closed.
+    #[test]
+    fn verifier_rest_routes_of_every_withheld_tool_are_closed() {
+        use axum::http::Method;
+        let r = ToolProfile::Restricted;
+        for (method, path) in [
+            (Method::POST, "/api/projects/p/sharing/enable"),
+            (Method::PUT, "/api/projects/p/sharing/policy"),
+            (Method::POST, "/api/projects/p/sharing/retract"),
+            (Method::PUT, "/api/notes/n/sharing/consent"),
+            (Method::POST, "/api/protocols/x/runs"),
+            (Method::GET, "/api/projects/p/sharing/history"),
+            (Method::POST, "/api/projects/p/environments"),
+            (Method::POST, "/api/environments/e/deployments"),
+            (Method::POST, "/api/neural-routing/enable"),
+            (Method::GET, "/api/trajectories"),
+        ] {
+            assert!(
+                r.route_forbidden(&method, path),
+                "restricted profile must refuse {method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_routes_of_allowed_tools_stay_open_to_the_restricted_profile() {
+        use axum::http::Method;
+        let r = ToolProfile::Restricted;
+        for (method, path) in [
+            (Method::POST, "/api/projects/p/plans"),
+            (Method::GET, "/api/projects/p"),
+            (Method::PUT, "/api/notes/n"),
+            (Method::POST, "/api/personas/p/protocols/x"),
+            (Method::POST, "/api/episodes/collect"),
+            (Method::POST, "/api/feature-graphs"),
+        ] {
+            assert!(
+                !r.route_forbidden(&method, path),
+                "{method} {path} must stay open"
+            );
+        }
     }
 }
