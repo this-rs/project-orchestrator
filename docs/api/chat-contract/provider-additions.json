@@ -1,0 +1,90 @@
+{
+  "contract_version": 1,
+  "status": "planned",
+  "note": "Champs que le backend AJOUTERA au fil avec le harness multi-provider. Noms FIXÉS ici pour le frontend ; aucun n'est encore émis, sauf ceux marqués \"since\". Tous sont additifs et optionnels : une trame qui ne les porte pas reste valide. Quand un champ est livré, il passe dans server-events.json (généré) et sort d'ici. Les noms suivent nexus docs/agent-contract.md (§4, §5, §6, §7).",
+  "server_events": {
+    "tool_use": {
+      "category": { "type": "string", "required": false, "enum": ["command", "read", "edit", "search", "web", "mcp", "agent", "other"] },
+      "canonical": { "type": "string", "required": false, "doc": "alias canonique de l'outil fourni par l'adaptateur (ex. \"shell\", \"read_file\")" }
+    },
+    "permission_request": {
+      "category": { "type": "string", "required": false, "enum": ["command", "read", "edit", "search", "web", "mcp", "agent", "other"] },
+      "canonical": { "type": "string", "required": false }
+    },
+    "result": {
+      "cost": { "type": "object", "required": false, "fields": { "usd": { "type": "number", "required": false, "doc": "absent = pas de prix connu (jamais 0 ni fictif)" }, "basis": { "type": "string", "required": true, "enum": ["reported", "priced", "free", "subscription", "unknown"] } } },
+      "usage": { "type": "object", "required": false, "fields": { "input_tokens": "number?", "output_tokens": "number?", "cache_read_tokens": "number?", "cache_creation_tokens": "number?", "reasoning_tokens": "number?" } },
+      "model": { "type": "string", "required": false, "doc": "modèle effectif rapporté par le provider" },
+      "stop_reason": { "type": "string", "required": false, "enum": ["completed", "max_turns", "max_tokens", "interrupted", "refusal", "budget_exceeded", "error"] },
+      "cost_usd": { "doc": "CONSERVÉ (hérité) : égal à cost.usd quand basis = reported ; null sinon" }
+    },
+    "ask_user_question": {
+      "synthetic": { "type": "boolean", "required": false, "doc": "true quand le provider n'a pas de question native : la réponse part comme un tour utilisateur (A45)" }
+    },
+    "system_init": {
+      "provider": { "type": "object", "required": false, "fields": { "id": "string", "kind": "string" }, "doc": "absent = claude-code" },
+      "capabilities": { "type": "object", "required": false, "doc": "instantané figé à l'ouverture ; forme = Capabilities de nexus (agent-contract §5) : interactive_permissions, permission_scopes[once|session|always], sandbox(none|workspace|full), secret_isolation, per_session_mcp, hooks, subagents, compaction_signal, thinking, images, tools, context_window{value,source}?, set_model_live, native_question, tool_cancel, background_tasks, resume, cost(basis)" },
+      "tool_policy": { "type": "object", "required": false, "doc": "ToolPolicy de nexus telle quelle (agent-contract §6) : mode, native_mode?, allow[], deny[]" },
+      "policy_mode": { "type": "string", "required": false, "enum": ["ask", "auto_edits", "plan_only", "trust"], "doc": "forme neutre de permission_mode (qui reste émis)" }
+    },
+    "permission_mode_changed": {
+      "policy_mode": { "type": "string", "required": false, "enum": ["ask", "auto_edits", "plan_only", "trust"], "doc": "forme neutre ; `mode` (chaîne héritée) reste émis" }
+    },
+    "session_closed": {
+      "new_event": true,
+      "fields": { "type": "\"session_closed\"", "session_id": "string", "reason": "string? (closed|idle|error)" },
+      "doc": "émis par close_session (A45)"
+    }
+  },
+  "permission_modes": {
+    "doc": "Le backend ACCEPTE en entrée les 11 valeurs et émet les deux formes. Table héritée → neutre (jamais plus permissif) :",
+    "legacy_to_neutral": { "default": "ask", "manual": "ask", "dontAsk": "ask", "acceptEdits": "auto_edits", "auto": "auto_edits", "plan": "plan_only", "bypassPermissions": "trust" },
+    "neutral_to_legacy": { "ask": "default", "auto_edits": "acceptEdits", "plan_only": "plan", "trust": "bypassPermissions" }
+  },
+  "rest": {
+    "ChatSession": {
+      "doc": "DTO de GET /api/chat/sessions et GET /api/chat/sessions/{id}",
+      "provider_id": { "type": "string", "required": false, "doc": "absent = claude-code" },
+      "capabilities": { "type": "object", "required": false, "doc": "même instantané que system_init.capabilities ; présent sur GET /api/chat/sessions/{id}" },
+      "routed_by": { "type": "string", "required": false, "enum": ["session", "request", "task", "persona", "run", "project_rule", "global_rule", "default", "claude_code", "fallback"] }
+    },
+    "CreateSessionRequest": {
+      "provider": { "type": "string", "required": false, "doc": "id d'instance ; sur une session existante, un provider différent → 409 provider_conflict" }
+    },
+    "GET /api/chat/providers": {
+      "query": { "project_slug": "string?" },
+      "response": {
+        "default_provider": "string | null",
+        "providers": [
+          {
+            "id": "string",
+            "kind": "string (claude_code | openai_compatible | codex | acp)",
+            "label": "string",
+            "builtin": "boolean",
+            "is_default": "boolean",
+            "allowed_for_project": "boolean | null (null sans project_slug)",
+            "endpoint_origin": "string | null (jamais d'identifiant ; origine seule)",
+            "credential": "string (vault:<nom> | env:<VAR> | none) — la référence, jamais la valeur",
+            "health": { "state": "ok | auth_required | unreachable | cli_not_found | unknown", "code": "string? (code d'erreur ci-dessous)", "action": "string? (commande à lancer)", "checked_at": "string? (RFC 3339)" },
+            "models": [ { "id": "string", "alias": "string? (fast|default|deep|utility)", "capabilities": "Capabilities (par modèle)" } ]
+          }
+        ]
+      }
+    },
+    "error_body": {
+      "doc": "Corps d'une ouverture refusée (create/resume). LIVRÉ pour claude-code : cli_not_found.",
+      "since": "integration/harness-multi-provider (B27)",
+      "shape": { "error": "string (message court, sans détail interne)", "code": "string", "provider_id": "string?", "action": "string?", "retryable": "boolean", "retry_after_ms": "number?" },
+      "codes": {
+        "cli_not_found": 424, "auth_required": 424, "credentials_locked": 423, "unauthorized": 502, "endpoint_unreachable": 502,
+        "model_no_tools": 422, "context_too_small": 422, "rate_limited": 429, "overloaded": 503, "timeout": 504, "process_exited": 502,
+        "protocol": 502, "unsupported": 422, "turn_in_progress": 409, "invalid_request": 400, "closed": 410, "provider_error": 502,
+        "provider_conflict": 409, "provider_unknown": 404, "endpoint_not_allowed": 403, "provider_unavailable": 503, "no_provider": 409
+      },
+      "forbidden_403_prefixed": {
+        "doc": "403 dont le corps est {\"error\": \"<code>: <message>\"} (pas de champ code séparé) — livrés",
+        "codes": ["envelope_unbound_token", "envelope_parent_not_found", "envelope_depth_exceeded", "envelope_too_many_children", "envelope_cwd_outside_parent", "envelope_add_dir_outside_parent", "envelope_project_mismatch", "envelope_workspace_mismatch", "envelope_not_a_child", "tool_not_in_profile"]
+      }
+    }
+  }
+}

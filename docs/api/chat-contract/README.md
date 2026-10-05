@@ -30,3 +30,12 @@ handler change, mettez à jour `control_frames()` dans le module.
 
 Copiez le dossier tel quel, puis vérifiez la copie depuis le dossier copié : `shasum -a 256 -c SHA256SUMS`.
 Les types TypeScript se comparent ensuite à `fields`, et les exemples servent de trames de test.
+
+## `provider-additions.json` (écrit à la main, statut `planned`)
+
+Les champs que le harness multi-provider AJOUTERA au fil et à l'API (`category`, `canonical`,
+`cost{usd,basis}`, `usage`, `synthetic`, `provider`, `capabilities`, `tool_policy`, `policy_mode`,
+`session_closed`, DTO `ChatSession`, `GET /api/chat/providers`, corps et codes d'erreur). Les noms y
+sont FIXÉS pour que le frontend code contre eux ; rien n'y est encore émis sauf mention `since`.
+Ce fichier n'est pas dans `SHA256SUMS` : il n'est pas généré. Un champ livré passe dans
+`server-events.json` et sort d'ici, dans le même commit.
