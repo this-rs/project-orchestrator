@@ -560,6 +560,22 @@ pub async fn get_session_tree(
     Ok(Json(tree))
 }
 
+/// GET /api/chat/runs/{run_id}/costs — the run's two counters (marginal: real
+/// spend; notional: subscription / free) and the split by model, provider and
+/// task class (A21). An unknown cost is counted apart, never as zero.
+pub async fn get_run_costs(
+    State(state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<crate::chat::cost::CostReport>, AppError> {
+    let executions = state
+        .orchestrator
+        .neo4j()
+        .get_agent_executions_for_run(run_id)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(crate::chat::cost::report(&executions)))
+}
+
 /// GET /api/chat/runs/{run_id}/sessions — Get all sessions for a PlanRun
 pub async fn get_run_sessions(
     State(state): State<OrchestratorState>,
@@ -2076,6 +2092,36 @@ mod tests {
             call_json(&app, auth_json("POST", "/api/chat/providers/test", body)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(resp["ok"].is_boolean(), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn the_run_costs_route_answers_the_two_counters_by_model_provider_and_class() {
+        let h = action_harness(None).await;
+        let run = Uuid::new_v4();
+        let mut rows = Vec::new();
+        for (provider, model, class, usd, basis) in [
+            ("claude-code", "opus", "complex", 2.0, "reported"),
+            ("claude-code", "opus", "simple", 3.0, "subscription"),
+            ("local", "llama", "simple", 0.0, "unknown"),
+        ] {
+            let mut ae =
+                crate::neo4j::agent_execution::AgentExecutionNode::new(run, Uuid::new_v4());
+            ae.provider_id = provider.into();
+            ae.model = Some(model.into());
+            ae.task_class = Some(class.into());
+            ae.cost_usd = usd;
+            ae.cost_basis = Some(basis.into());
+            h.graph.create_agent_execution(&ae).await.unwrap();
+            rows.push(ae);
+        }
+        let (status, body) = call(&h.app, auth_get(&format!("/api/chat/runs/{run}/costs"))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total"]["marginal_usd"], 2.0);
+        assert_eq!(body["total"]["notional_usd"], 3.0);
+        assert_eq!(body["total"]["unknown_cost_executions"], 1);
+        assert_eq!(body["by_provider"]["claude-code"]["executions"], 2);
+        assert_eq!(body["by_task_class"]["simple"]["executions"], 2);
+        assert_eq!(body["by_model"]["llama"]["unknown_cost_executions"], 1);
     }
 
     #[tokio::test]

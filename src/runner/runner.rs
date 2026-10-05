@@ -3330,6 +3330,7 @@ impl PlanRunner {
         let cost_reported = event_metrics.cost_reported;
         let effective_model = event_metrics.model.clone();
         let cost_basis = event_metrics.cost_basis.clone();
+        let basis_for_budget = event_metrics.cost_basis.clone();
         let tokens = (
             event_metrics.tokens_in,
             event_metrics.tokens_out,
@@ -3419,7 +3420,11 @@ impl PlanRunner {
         {
             let mut global = RUNNER_STATE.write().await;
             if let Some(ref mut s) = *global {
-                s.add_cost(cost_usd);
+                // Two counters (A21): only a real spend (reported / priced) goes
+                // toward the budget; a subscription or a free endpoint does not.
+                if crate::chat::cost::counts_toward_budget(basis_for_budget.as_deref()) {
+                    s.add_cost(cost_usd);
+                }
                 if s.is_budget_exceeded(self.effective_budget()) {
                     let result = TaskResult::BudgetExceeded {
                         cumulated_cost_usd: s.cost_usd,

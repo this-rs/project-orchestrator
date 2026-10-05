@@ -17,6 +17,7 @@ pub(crate) mod drain;
 #[cfg(test)]
 mod agent_e2e_tests;
 pub mod agent_runtime;
+pub mod cost;
 pub mod enrichment;
 pub mod entity_extractor;
 pub mod envelope;
