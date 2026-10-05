@@ -223,6 +223,19 @@ jobs:
           save-if: ${{ env.CACHE_SAVE == 'true' && env.CACHE_FRESH == '' }}
           cache-workspace-crates: true
 
+      # src/chat/agent_e2e_tests.rs drives the agent engine against the `fake_openai`
+      # and `fake_mcp` binaries of the nexus repository, at the SAME revision
+      # Cargo.toml pins. They are built here, not skipped: those tests FAIL (with a
+      # message naming this step) when the binaries are missing.
+      - name: Build the nexus fake servers used by the agent e2e tests
+        run: |
+          REV=$(sed -n 's/^nexus-claude = .*rev = "\([0-9a-f]\{40\}\)".*/\1/p' Cargo.toml)
+          test -n "$REV"
+          cargo install --git https://github.com/this-rs/nexus.git --rev "$REV" \
+            --features "provider-native testkit" --root "$RUNNER_TEMP/nexus-fakes" \
+            --bin fake_openai --bin fake_mcp nexus-claude
+          echo "NEXUS_FAKES_DIR=$RUNNER_TEMP/nexus-fakes/bin" >> "$GITHUB_ENV"
+
       - name: Run unit tests (lib)
         # --workspace so member crates' unit tests actually run in CI (the
         # neural-routing-* crates carry their own #[cfg(test)] suites that the
@@ -308,8 +321,10 @@ jobs:
           MEILISEARCH_URL: http://localhost:7700
           MEILISEARCH_KEY: test-master-key
         run: |
-          cargo test --test integration_tests --test data_migrations \
-            --test workspace_tests --test neo4j_store_tests
+          # harness_neo4j: the Cypher of the provider settings; REQUIRED here, so a
+          # missing Neo4j fails instead of passing silently.
+          HARNESS_NEO4J_REQUIRED=1 cargo test --test integration_tests --test data_migrations \
+            --test workspace_tests --test neo4j_store_tests --test harness_neo4j
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch

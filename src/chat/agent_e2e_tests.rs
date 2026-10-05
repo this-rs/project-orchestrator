@@ -44,7 +44,7 @@ fn fake_bin(name: &str) -> PathBuf {
     let path = fakes_dir().join(name);
     assert!(
         path.exists(),
-        "{} is missing: build the nexus fakes (see the module doc)",
+        "{} is missing: build the nexus fakes (see the module doc; CI does it in the step 'Build the nexus fake servers')",
         path.display()
     );
     path
@@ -200,11 +200,13 @@ async fn consent(graph: &MockGraphStore, slug: &str, id: &str, origin: &str) {
 fn manager(graph: Arc<MockGraphStore>, secure: bool) -> ChatManager {
     let state = mock_app_state();
     let dyn_graph: Arc<dyn GraphStore> = graph;
-    let mut config = super::config::ChatConfig::default();
-    config.provider_path = ProviderPath::Agent;
-    config.mcp_server_path = fake_bin("fake_mcp");
-    config.jwt_secret = secure.then(|| "test-secret-test-secret-test-secret".to_string());
-    config.max_sessions = 10;
+    let config = super::config::ChatConfig {
+        provider_path: ProviderPath::Agent,
+        mcp_server_path: fake_bin("fake_mcp"),
+        jwt_secret: secure.then(|| "test-secret-test-secret-test-secret".to_string()),
+        max_sessions: 10,
+        ..Default::default()
+    };
     ChatManager::new_without_memory(dyn_graph, state.meili, config)
 }
 
