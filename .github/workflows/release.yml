@@ -1372,6 +1372,9 @@ jobs:
           REPO="${{ github.repository }}"
           BASE_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}"
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          # Shown by the in-app update banner. The generated changelog does not exist yet
+          # (the release is created after this step), so point at the release page itself.
+          NOTES="Release notes: https://github.com/${REPO}/releases/tag/${RELEASE_TAG}"
 
           # Helper: GitHub Releases replaces spaces with dots in asset names.
           # e.g. "Project Orchestrator_arm64.app.tar.gz" → "Project.Orchestrator_arm64.app.tar.gz"
@@ -1446,7 +1449,7 @@ jobs:
           # Build JSON using jq
           jq -n \
             --arg version "$VERSION" \
-            --arg notes "See full release notes on GitHub" \
+            --arg notes "$NOTES" \
             --arg pub_date "$PUB_DATE" \
             --arg macos_arm64_url "$MACOS_ARM64_URL" \
             --arg macos_arm64_sig "$MACOS_ARM64_SIG" \
