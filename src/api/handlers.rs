@@ -1055,6 +1055,7 @@ pub async fn delegate_task(
             vector_json: None,
             report_json: None,
             execution_type: Default::default(),
+            ..Default::default()
         };
         let graph_clone = graph.clone();
         tokio::spawn(async move {

@@ -1584,6 +1584,7 @@ async fn test_agent_execution_completed_at_is_bound() {
         vector_json: None,
         report_json: None,
         execution_type: Default::default(),
+        ..Default::default()
     };
     client.create_agent_execution_impl(&ae).await.unwrap();
 
