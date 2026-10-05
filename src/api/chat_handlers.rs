@@ -2333,6 +2333,135 @@ mod tests {
         assert!(body.get("cascade").is_none());
     }
 
+    // ====================================================================
+    // An agent session token reaches only the sessions it spawned
+    // ====================================================================
+
+    /// A bound, live agent token for `session` (restricted profile, like a third party's).
+    fn agent_bearer(session: Uuid) -> String {
+        let claims = crate::auth::jwt::Claims::service_account("agent");
+        let binding = crate::auth::jwt::AgentSessionBinding {
+            session_id: session.to_string(),
+            ceiling: Some("default".into()),
+            tool_profile: Some("restricted".into()),
+        };
+        let (token, jti) = crate::auth::jwt::generate_session_token(
+            &claims,
+            Some(&binding),
+            "test-secret-key-minimum-32-chars!!",
+            3600,
+        )
+        .unwrap();
+        crate::auth::agent_tokens::register(&jti, Some(&session.to_string()));
+        format!("Bearer {token}")
+    }
+
+    fn agent_req(token: &str, method: &str, uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", token)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_agent_token_cannot_write_to_a_session_it_did_not_spawn() {
+        let h = action_harness(None).await;
+        let parent = crate::test_helpers::test_chat_session(None);
+        let mut child = crate::test_helpers::test_chat_session(None);
+        child.spawned_by = Some(
+            serde_json::json!({"type": "conversation", "parent_session_id": parent.id.to_string()})
+                .to_string(),
+        );
+        let human = crate::test_helpers::test_chat_session(None);
+        for n in [&parent, &child, &human] {
+            h.graph.create_chat_session(n).await.unwrap();
+        }
+        let token = agent_bearer(parent.id);
+
+        // Every mutating route under /api/chat/sessions/{id}: a stranger is refused.
+        let routes: [(&str, String, &str); 5] = [
+            (
+                "POST",
+                format!("/api/chat/sessions/{}/messages", human.id),
+                r#"{"content":"x"}"#,
+            ),
+            (
+                "POST",
+                format!("/api/chat/sessions/{}/interrupt", human.id),
+                "{}",
+            ),
+            (
+                "POST",
+                format!("/api/chat/sessions/{}/cancel-tools", human.id),
+                "{}",
+            ),
+            (
+                "PATCH",
+                format!("/api/chat/sessions/{}", human.id),
+                r#"{"title":"x"}"#,
+            ),
+            ("DELETE", format!("/api/chat/sessions/{}", human.id), ""),
+        ];
+        for (method, uri, body) in &routes {
+            let (status, _) = call(&h.app, agent_req(&token, method, uri, body)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+        // The session itself is not a child of itself: an agent does not drive its own session through REST either.
+        let own = format!("/api/chat/sessions/{}/interrupt", parent.id);
+        let (status, _) = call(&h.app, agent_req(&token, "POST", &own, "{}")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // Annotating its own session stays possible (what the MCP tools do).
+        let (status, _) = call(
+            &h.app,
+            agent_req(
+                &token,
+                "POST",
+                &format!("/api/chat/sessions/{}/discussed", parent.id),
+                r#"{"entities":[]}"#,
+            ),
+        )
+        .await;
+        assert_ne!(status, StatusCode::FORBIDDEN, "own annotation");
+        // Its own child: not refused by the boundary.
+        let (status, _) = call(
+            &h.app,
+            agent_req(
+                &token,
+                "POST",
+                &format!("/api/chat/sessions/{}/interrupt", child.id),
+                "{}",
+            ),
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a child of the session is reachable"
+        );
+        // Reads stay open (the tree, the session).
+        let (status, _) = call(
+            &h.app,
+            agent_req(
+                &token,
+                "GET",
+                &format!("/api/chat/sessions/{}", human.id),
+                "",
+            ),
+        )
+        .await;
+        assert_ne!(status, StatusCode::FORBIDDEN);
+        // A person is not held to it.
+        let (status, _) = call(
+            &h.app,
+            auth_post(&format!("/api/chat/sessions/{}/interrupt", human.id), "{}"),
+        )
+        .await;
+        assert_ne!(status, StatusCode::FORBIDDEN);
+    }
+
     #[tokio::test]
     async fn providers_answers_null_consent_without_a_project() {
         let app = test_app().await;

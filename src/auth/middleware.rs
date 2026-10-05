@@ -86,6 +86,33 @@ pub async fn require_auth(
         }
     }
 
+    // 4d. An agent session token only acts on the sessions IT spawned. Without
+    //     this, any token (even a restricted one) could feed a human's session
+    //     running in bypass, answer for it, stop it or delete it: the profile
+    //     only withholds `POST /api/chat/sessions`, not the routes of a session.
+    //     A boundary on the path, so a route added later is covered too.
+    if let Some(binding) = crate::auth::jwt::agent_session_binding(&claims) {
+        let read = matches!(
+            *req.method(),
+            axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+        );
+        if !read {
+            let path = req.uri().path();
+            // Annotating its OWN session (the entities it discussed, the plans it
+            // works on) is what the MCP tools do all day; nothing else of its own.
+            let own_annotation = chat_session_target(path) == Some(binding.session_id.as_str())
+                && (path.ends_with("/discussed") || path.ends_with("/associate"));
+            if let Some(target) = chat_session_target(path).filter(|_| !own_annotation) {
+                crate::chat::envelope::ensure_child_of(
+                    state.orchestrator.neo4j(),
+                    &binding.session_id,
+                    target,
+                )
+                .await?;
+            }
+        }
+    }
+
     // 5. Inject claims into request extensions
     req.extensions_mut().insert(claims);
 
@@ -132,6 +159,15 @@ pub fn is_human_only_mutation(method: &axum::http::Method, path: &str) -> bool {
         // Answering a permission prompt IS the human's decision: an agent that
         // could post it would approve its own tool calls.
         || (path.starts_with("/api/chat/sessions/") && path.contains("/permissions/"))
+}
+
+/// The session id a `/api/chat/sessions/{id}[/...]` path acts on, if it is one.
+/// `/api/chat/sessions` itself (opening a session) has no target: the spawn
+/// envelope governs it.
+pub fn chat_session_target(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/api/chat/sessions/")?;
+    let id = rest.split('/').next()?;
+    (!id.is_empty()).then_some(id)
 }
 
 /// Policy every decoded token must satisfy before it is trusted: the email
@@ -218,6 +254,23 @@ pub async fn enforce_token_policy(
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod target_tests {
+    use super::chat_session_target;
+
+    #[test]
+    fn the_target_of_a_chat_session_route_is_its_id() {
+        assert_eq!(
+            chat_session_target("/api/chat/sessions/abc/messages"),
+            Some("abc")
+        );
+        assert_eq!(chat_session_target("/api/chat/sessions/abc"), Some("abc"));
+        assert_eq!(chat_session_target("/api/chat/sessions"), None);
+        assert_eq!(chat_session_target("/api/chat/sessions/"), None);
+        assert_eq!(chat_session_target("/api/chat/providers"), None);
+    }
+}
 
 #[cfg(test)]
 mod tests {
