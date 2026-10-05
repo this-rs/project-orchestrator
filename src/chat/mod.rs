@@ -36,6 +36,8 @@ pub mod stages;
 pub mod types;
 pub mod viz;
 pub mod viz_builder;
+#[cfg(test)]
+mod wire_contract;
 
 pub use config::{ChatConfig, PermissionConfig};
 pub use entity_extractor::{

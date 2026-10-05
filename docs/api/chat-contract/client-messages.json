@@ -1,0 +1,222 @@
+{
+  "contract_version": 1,
+  "messages": {
+    "cancel_tools": {
+      "examples": {
+        "full": {
+          "type": "cancel_tools"
+        },
+        "minimal": {
+          "type": "cancel_tools"
+        }
+      },
+      "fields": {
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "input_response": {
+      "examples": {
+        "full": {
+          "content": "Exponential",
+          "id": "toolu_01Example0000000000000",
+          "type": "input_response"
+        },
+        "minimal": {
+          "content": "Exponential",
+          "type": "input_response"
+        }
+      },
+      "fields": {
+        "content": {
+          "required": true,
+          "type": "string"
+        },
+        "id": {
+          "required": false,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "interrupt": {
+      "examples": {
+        "full": {
+          "type": "interrupt"
+        },
+        "minimal": {
+          "type": "interrupt"
+        }
+      },
+      "fields": {
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "permission_response": {
+      "examples": {
+        "full": {
+          "allow": true,
+          "id": "perm_0001",
+          "type": "permission_response"
+        },
+        "minimal": {
+          "type": "permission_response"
+        }
+      },
+      "fields": {
+        "allow": {
+          "required": false,
+          "type": "boolean"
+        },
+        "id": {
+          "required": false,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "queue_op": {
+      "examples": {
+        "full": {
+          "content": "Then update the changelog and the README.",
+          "id": "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+          "op": "edit",
+          "type": "queue_op"
+        },
+        "minimal": {
+          "op": "snapshot",
+          "type": "queue_op"
+        }
+      },
+      "fields": {
+        "content": {
+          "required": false,
+          "type": "string"
+        },
+        "id": {
+          "required": false,
+          "type": "string"
+        },
+        "op": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "set_auto_continue": {
+      "examples": {
+        "full": {
+          "enabled": true,
+          "type": "set_auto_continue"
+        },
+        "minimal": {
+          "enabled": true,
+          "type": "set_auto_continue"
+        }
+      },
+      "fields": {
+        "enabled": {
+          "required": true,
+          "type": "boolean"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "set_model": {
+      "examples": {
+        "full": {
+          "model": "example-model-large",
+          "type": "set_model"
+        },
+        "minimal": {
+          "model": "example-model-large",
+          "type": "set_model"
+        }
+      },
+      "fields": {
+        "model": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "set_permission_mode": {
+      "examples": {
+        "full": {
+          "mode": "acceptEdits",
+          "type": "set_permission_mode"
+        },
+        "minimal": {
+          "mode": "acceptEdits",
+          "type": "set_permission_mode"
+        }
+      },
+      "fields": {
+        "mode": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "user_message": {
+      "examples": {
+        "full": {
+          "attachments": [
+            "9f8e7d6c-5b4a-4c3d-9e2f-1a0b9c8d7e6f"
+          ],
+          "content": "Add a retry to the upload client.",
+          "queue": true,
+          "type": "user_message"
+        },
+        "minimal": {
+          "content": "Add a retry to the upload client.",
+          "type": "user_message"
+        }
+      },
+      "fields": {
+        "attachments": {
+          "required": false,
+          "type": "array"
+        },
+        "content": {
+          "required": true,
+          "type": "string"
+        },
+        "queue": {
+          "required": false,
+          "type": "boolean"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    }
+  }
+}

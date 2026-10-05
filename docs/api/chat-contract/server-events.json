@@ -1,0 +1,1096 @@
+{
+  "contract_version": 1,
+  "events": {
+    "active_tasks_update": {
+      "examples": {
+        "full": {
+          "tasks": [
+            {
+              "description": "watch deploy.log for errors",
+              "id": "toolu_01Example0000000000000",
+              "kind": "monitor",
+              "last_seen_at": "2026-01-15T10:31:12Z",
+              "parent_tool_use_id": "toolu_01Example0000000000000",
+              "pid": 48300,
+              "started_at": "2026-01-15T10:30:00Z"
+            },
+            {
+              "description": "cargo watch",
+              "id": "recovered-48301",
+              "kind": "bash_background",
+              "last_seen_at": "2026-01-15T10:30:30Z",
+              "parent_tool_use_id": null,
+              "pid": null,
+              "started_at": "2026-01-15T10:30:30Z"
+            }
+          ],
+          "type": "active_tasks_update"
+        },
+        "minimal": {
+          "tasks": [],
+          "type": "active_tasks_update"
+        }
+      },
+      "fields": {
+        "tasks": {
+          "required": true,
+          "type": "array"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "ask_user_question": {
+      "examples": {
+        "full": {
+          "id": "ctrl_0001",
+          "input": {
+            "questions": [
+              {
+                "header": "Backoff",
+                "multiSelect": false,
+                "options": [
+                  {
+                    "description": "Doubles after each attempt",
+                    "label": "Exponential"
+                  },
+                  {
+                    "description": "Same delay every time",
+                    "label": "Fixed"
+                  }
+                ],
+                "question": "Which backoff should the retry use?"
+              }
+            ]
+          },
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "questions": [
+            {
+              "header": "Backoff",
+              "multiSelect": false,
+              "options": [
+                {
+                  "description": "Doubles after each attempt",
+                  "label": "Exponential"
+                },
+                {
+                  "description": "Same delay every time",
+                  "label": "Fixed"
+                }
+              ],
+              "question": "Which backoff should the retry use?"
+            }
+          ],
+          "tool_call_id": "toolu_01Example0000000000000",
+          "type": "ask_user_question"
+        },
+        "minimal": {
+          "id": "ctrl_0001",
+          "input": {},
+          "questions": [],
+          "tool_call_id": "toolu_01Example0000000000000",
+          "type": "ask_user_question"
+        }
+      },
+      "fields": {
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "input": {
+          "required": true,
+          "type": "object"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "questions": {
+          "required": true,
+          "type": "array"
+        },
+        "tool_call_id": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "assistant_text": {
+      "examples": {
+        "full": {
+          "content": "I will start by reading the upload client.",
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "type": "assistant_text"
+        },
+        "minimal": {
+          "content": "I will start by reading the upload client.",
+          "type": "assistant_text"
+        }
+      },
+      "fields": {
+        "content": {
+          "required": true,
+          "type": "string"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "auto_continue": {
+      "examples": {
+        "full": {
+          "delay_ms": 3000,
+          "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "type": "auto_continue"
+        },
+        "minimal": {
+          "delay_ms": 3000,
+          "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "type": "auto_continue"
+        }
+      },
+      "fields": {
+        "delay_ms": {
+          "required": true,
+          "type": "number"
+        },
+        "session_id": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "auto_continue_state_changed": {
+      "examples": {
+        "full": {
+          "enabled": true,
+          "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "type": "auto_continue_state_changed"
+        },
+        "minimal": {
+          "enabled": true,
+          "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "type": "auto_continue_state_changed"
+        }
+      },
+      "fields": {
+        "enabled": {
+          "required": true,
+          "type": "boolean"
+        },
+        "session_id": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "background_output": {
+      "examples": {
+        "full": {
+          "content": "ERROR upload failed: connection reset",
+          "correlation_id": "toolu_01Example0000000000000",
+          "received_at": "2026-01-15T10:31:12Z",
+          "source": "Monitor",
+          "type": "background_output"
+        },
+        "minimal": {
+          "content": "ERROR upload failed: connection reset",
+          "received_at": "2026-01-15T10:31:12Z",
+          "source": "system",
+          "type": "background_output"
+        }
+      },
+      "fields": {
+        "content": {
+          "required": true,
+          "type": "string"
+        },
+        "correlation_id": {
+          "required": false,
+          "type": "string"
+        },
+        "received_at": {
+          "required": true,
+          "type": "string"
+        },
+        "source": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "compact_boundary": {
+      "examples": {
+        "full": {
+          "pre_tokens": 168000,
+          "trigger": "auto",
+          "type": "compact_boundary"
+        },
+        "minimal": {
+          "trigger": "manual",
+          "type": "compact_boundary"
+        }
+      },
+      "fields": {
+        "pre_tokens": {
+          "required": false,
+          "type": "number"
+        },
+        "trigger": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "compaction_recovery": {
+      "examples": {
+        "full": {
+          "build_latency_ms": 240,
+          "hint_tokens": 1850,
+          "recovery_success": true,
+          "type": "compaction_recovery"
+        },
+        "minimal": {
+          "build_latency_ms": 240,
+          "hint_tokens": 1850,
+          "recovery_success": true,
+          "type": "compaction_recovery"
+        }
+      },
+      "fields": {
+        "build_latency_ms": {
+          "required": true,
+          "type": "number"
+        },
+        "hint_tokens": {
+          "required": true,
+          "type": "number"
+        },
+        "recovery_success": {
+          "required": true,
+          "type": "boolean"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "compaction_started": {
+      "examples": {
+        "full": {
+          "trigger": "auto",
+          "type": "compaction_started"
+        },
+        "minimal": {
+          "trigger": "auto",
+          "type": "compaction_started"
+        }
+      },
+      "fields": {
+        "trigger": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "error": {
+      "examples": {
+        "full": {
+          "message": "Tool execution failed: permission denied",
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "type": "error"
+        },
+        "minimal": {
+          "message": "Tool execution failed: permission denied",
+          "type": "error"
+        }
+      },
+      "fields": {
+        "message": {
+          "required": true,
+          "type": "string"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "model_changed": {
+      "examples": {
+        "full": {
+          "model": "example-model-large",
+          "type": "model_changed"
+        },
+        "minimal": {
+          "model": "example-model-large",
+          "type": "model_changed"
+        }
+      },
+      "fields": {
+        "model": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "pending_queue": {
+      "examples": {
+        "full": {
+          "messages": [
+            {
+              "attachments": [
+                {
+                  "filename": "release-notes.pdf",
+                  "id": "9f8e7d6c-5b4a-4c3d-9e2f-1a0b9c8d7e6f",
+                  "mime_type": "application/pdf",
+                  "size_bytes": 182044
+                }
+              ],
+              "content": "Then update the changelog.",
+              "id": "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+              "prioritized": true,
+              "queued_at": "2026-01-15T10:30:00Z"
+            }
+          ],
+          "type": "pending_queue"
+        },
+        "minimal": {
+          "messages": [],
+          "type": "pending_queue"
+        }
+      },
+      "fields": {
+        "messages": {
+          "required": true,
+          "type": "array"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "permission_decision": {
+      "examples": {
+        "full": {
+          "allow": true,
+          "id": "perm_0001",
+          "type": "permission_decision"
+        },
+        "minimal": {
+          "allow": true,
+          "id": "perm_0001",
+          "type": "permission_decision"
+        }
+      },
+      "fields": {
+        "allow": {
+          "required": true,
+          "type": "boolean"
+        },
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "permission_mode_changed": {
+      "examples": {
+        "full": {
+          "mode": "acceptEdits",
+          "type": "permission_mode_changed"
+        },
+        "minimal": {
+          "mode": "acceptEdits",
+          "type": "permission_mode_changed"
+        }
+      },
+      "fields": {
+        "mode": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "permission_request": {
+      "examples": {
+        "full": {
+          "id": "perm_0001",
+          "input": {
+            "command": "cargo fmt",
+            "description": "Format the crate"
+          },
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "tool": "Bash",
+          "type": "permission_request"
+        },
+        "minimal": {
+          "id": "perm_0001",
+          "input": {},
+          "tool": "Bash",
+          "type": "permission_request"
+        }
+      },
+      "fields": {
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "input": {
+          "required": true,
+          "type": "object"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "tool": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "result": {
+      "examples": {
+        "full": {
+          "cost_usd": 0.25,
+          "duration_ms": 48210,
+          "is_error": false,
+          "num_turns": 7,
+          "result_text": "The retry is in place and covered by a test.",
+          "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "subtype": "success",
+          "type": "result"
+        },
+        "minimal": {
+          "cost_usd": null,
+          "duration_ms": 0,
+          "is_error": false,
+          "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "subtype": "",
+          "type": "result"
+        }
+      },
+      "fields": {
+        "cost_usd": {
+          "nullable": true,
+          "required": true,
+          "type": "number"
+        },
+        "duration_ms": {
+          "required": true,
+          "type": "number"
+        },
+        "is_error": {
+          "required": true,
+          "type": "boolean"
+        },
+        "num_turns": {
+          "required": false,
+          "type": "number"
+        },
+        "result_text": {
+          "required": false,
+          "type": "string"
+        },
+        "session_id": {
+          "required": true,
+          "type": "string"
+        },
+        "subtype": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "retrying": {
+      "examples": {
+        "full": {
+          "attempt": 1,
+          "delay_ms": 2000,
+          "error_message": "API Error: 529 Overloaded",
+          "max_attempts": 3,
+          "type": "retrying"
+        },
+        "minimal": {
+          "attempt": 1,
+          "delay_ms": 2000,
+          "error_message": "API Error: 529 Overloaded",
+          "max_attempts": 3,
+          "type": "retrying"
+        }
+      },
+      "fields": {
+        "attempt": {
+          "required": true,
+          "type": "number"
+        },
+        "delay_ms": {
+          "required": true,
+          "type": "number"
+        },
+        "error_message": {
+          "required": true,
+          "type": "string"
+        },
+        "max_attempts": {
+          "required": true,
+          "type": "number"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "secret_request": {
+      "examples": {
+        "full": {
+          "exists": false,
+          "id": "secret_req_0001",
+          "name": "REGISTRY_TOKEN",
+          "reason": "Needed to publish the package.",
+          "type": "secret_request"
+        },
+        "minimal": {
+          "exists": false,
+          "id": "secret_req_0001",
+          "name": "REGISTRY_TOKEN",
+          "reason": "Needed to publish the package.",
+          "type": "secret_request"
+        }
+      },
+      "fields": {
+        "exists": {
+          "required": true,
+          "type": "boolean"
+        },
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "name": {
+          "required": true,
+          "type": "string"
+        },
+        "reason": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "secret_request_resolved": {
+      "examples": {
+        "full": {
+          "id": "secret_req_0001",
+          "outcome": "provided",
+          "type": "secret_request_resolved"
+        },
+        "minimal": {
+          "id": "secret_req_0001",
+          "outcome": "provided",
+          "type": "secret_request_resolved"
+        }
+      },
+      "fields": {
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "outcome": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "session_error": {
+      "examples": {
+        "full": {
+          "message": "The agent process stopped. Send a message to restart the session.",
+          "reason": "subprocess_exited",
+          "received_at": "2026-01-15T10:32:00Z",
+          "type": "session_error"
+        },
+        "minimal": {
+          "message": "The agent process stopped. Send a message to restart the session.",
+          "reason": "subprocess_exited",
+          "received_at": "2026-01-15T10:32:00Z",
+          "type": "session_error"
+        }
+      },
+      "fields": {
+        "message": {
+          "required": true,
+          "type": "string"
+        },
+        "reason": {
+          "required": true,
+          "type": "string"
+        },
+        "received_at": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "stream_delta": {
+      "examples": {
+        "full": {
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "text": "I will ",
+          "type": "stream_delta"
+        },
+        "minimal": {
+          "text": "I will ",
+          "type": "stream_delta"
+        }
+      },
+      "fields": {
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "text": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "streaming_status": {
+      "examples": {
+        "full": {
+          "is_streaming": true,
+          "type": "streaming_status"
+        },
+        "minimal": {
+          "is_streaming": true,
+          "type": "streaming_status"
+        }
+      },
+      "fields": {
+        "is_streaming": {
+          "required": true,
+          "type": "boolean"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "system_hint": {
+      "examples": {
+        "full": {
+          "content": "Context was compacted; the current task is restated below.",
+          "type": "system_hint"
+        },
+        "minimal": {
+          "content": "Context was compacted; the current task is restated below.",
+          "type": "system_hint"
+        }
+      },
+      "fields": {
+        "content": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "system_init": {
+      "examples": {
+        "full": {
+          "cli_session_id": "cli-session-0001",
+          "mcp_servers": [
+            {
+              "name": "project-orchestrator",
+              "status": "connected"
+            }
+          ],
+          "model": "example-model-large",
+          "permission_mode": "default",
+          "tools": [
+            "Bash",
+            "Read",
+            "Edit"
+          ],
+          "type": "system_init"
+        },
+        "minimal": {
+          "cli_session_id": "cli-session-0001",
+          "type": "system_init"
+        }
+      },
+      "fields": {
+        "cli_session_id": {
+          "required": true,
+          "type": "string"
+        },
+        "mcp_servers": {
+          "required": false,
+          "type": "array"
+        },
+        "model": {
+          "required": false,
+          "type": "string"
+        },
+        "permission_mode": {
+          "required": false,
+          "type": "string"
+        },
+        "tools": {
+          "required": false,
+          "type": "array"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "thinking": {
+      "examples": {
+        "full": {
+          "content": "The retry must not replay a non-idempotent request.",
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "type": "thinking"
+        },
+        "minimal": {
+          "content": "The retry must not replay a non-idempotent request.",
+          "type": "thinking"
+        }
+      },
+      "fields": {
+        "content": {
+          "required": true,
+          "type": "string"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "tool_cancelled": {
+      "examples": {
+        "full": {
+          "id": "toolu_01Example0000000000000",
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "type": "tool_cancelled"
+        },
+        "minimal": {
+          "id": "toolu_01Example0000000000000",
+          "type": "tool_cancelled"
+        }
+      },
+      "fields": {
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "tool_result": {
+      "examples": {
+        "full": {
+          "id": "toolu_01Example0000000000000",
+          "is_error": true,
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "result": "pub struct UploadClient { /* ... */ }",
+          "type": "tool_result"
+        },
+        "minimal": {
+          "id": "toolu_01Example0000000000000",
+          "is_error": false,
+          "result": "",
+          "type": "tool_result"
+        }
+      },
+      "fields": {
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "is_error": {
+          "required": true,
+          "type": "boolean"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "result": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "tool_use": {
+      "examples": {
+        "full": {
+          "id": "toolu_01Example0000000000000",
+          "input": {
+            "file_path": "src/upload/client.rs"
+          },
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "tool": "Read",
+          "type": "tool_use"
+        },
+        "minimal": {
+          "id": "toolu_01Example0000000000000",
+          "input": {},
+          "tool": "Read",
+          "type": "tool_use"
+        }
+      },
+      "fields": {
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "input": {
+          "required": true,
+          "type": "object"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "tool": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "tool_use_input_resolved": {
+      "examples": {
+        "full": {
+          "id": "toolu_01Example0000000000000",
+          "input": {
+            "file_path": "src/upload/client.rs"
+          },
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "type": "tool_use_input_resolved"
+        },
+        "minimal": {
+          "id": "toolu_01Example0000000000000",
+          "input": {},
+          "type": "tool_use_input_resolved"
+        }
+      },
+      "fields": {
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "input": {
+          "required": true,
+          "type": "object"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "tools_cancelled": {
+      "examples": {
+        "full": {
+          "cli_pid": 48211,
+          "killed_count": 2,
+          "requested_by": "user",
+          "type": "tools_cancelled"
+        },
+        "minimal": {
+          "killed_count": 0,
+          "requested_by": "user",
+          "type": "tools_cancelled"
+        }
+      },
+      "fields": {
+        "cli_pid": {
+          "required": false,
+          "type": "number"
+        },
+        "killed_count": {
+          "required": true,
+          "type": "number"
+        },
+        "requested_by": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "user_message": {
+      "examples": {
+        "full": {
+          "content": "Add a retry to the upload client.",
+          "type": "user_message"
+        },
+        "minimal": {
+          "content": "Add a retry to the upload client.",
+          "type": "user_message"
+        }
+      },
+      "fields": {
+        "content": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "workflow": {
+      "examples": {
+        "full": {
+          "data": {
+            "status": "running",
+            "task_id": "wf_task_0001",
+            "uuid": "3c2b1a09-8f7e-4d6c-8b5a-4c3d2e1f0a9b",
+            "workflow_name": "review",
+            "workflow_progress": [
+              {
+                "agent": "reviewer-1",
+                "status": "running"
+              },
+              {
+                "agent": "reviewer-2",
+                "status": "completed"
+              }
+            ]
+          },
+          "subtype": "task_progress",
+          "type": "workflow"
+        },
+        "minimal": {
+          "data": {},
+          "subtype": "task_started",
+          "type": "workflow"
+        }
+      },
+      "fields": {
+        "data": {
+          "required": true,
+          "type": "object"
+        },
+        "subtype": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    }
+  }
+}

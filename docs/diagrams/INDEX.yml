@@ -54,6 +54,7 @@ diagrams:
     file: docs/diagrams/po-chat-transport.mmd
     covers:
       - "backend:src/api/ws_chat_handler.rs"
+      - "backend:src/chat/wire_contract.rs"
   - name: po-p2p-transport
     owner: theotime
     status: planned
