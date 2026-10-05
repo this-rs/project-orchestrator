@@ -8635,6 +8635,149 @@ mod tests {
         assert_eq!(after_second.duration_secs, 20.0);
     }
 
+    /// VERIFIER (runner level, not only `counts_toward_budget`): a task whose cost
+    /// is covered by a subscription must not consume the run budget, even when its
+    /// notional amount is far above the limit. Drives `execute_task` through the
+    /// real `ChatManager` agent path against the fake provider.
+    #[tokio::test]
+    async fn verifier_a_subscription_cost_does_not_count_toward_the_run_budget() {
+        use crate::chat::config::{ChatConfig, ProviderPath};
+        use crate::chat::manager::ChatManager;
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::meilisearch::traits::SearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::notes::manager::NoteManager;
+        use crate::orchestrator::context::ContextBuilder;
+        use crate::plan::manager::PlanManager;
+        use nexus_claude::agent::{AgentEvent, Cost, CostBasis, StopReason};
+
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
+        let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+        let search: Arc<dyn SearchStore> = Arc::new(MockSearchStore::new());
+        let chat_config = ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: std::path::PathBuf::from("/dev/null"),
+            default_model: "test".into(),
+            max_sessions: 4,
+            session_timeout: std::time::Duration::from_secs(30),
+            neo4j_uri: "bolt://mock:7687".into(),
+            neo4j_user: "neo4j".into(),
+            neo4j_password: "test".into(),
+            meilisearch_url: "http://mock:7700".into(),
+            meilisearch_key: "test".into(),
+            nats_url: None,
+            max_turns: 5,
+            permission: Default::default(),
+            auto_continue: false,
+            retry: Default::default(),
+            process_path: None,
+            claude_cli_path: None,
+            auto_update_cli: false,
+            auto_update_app: false,
+            jwt_secret: None,
+            server_port: 0,
+            session_token_expiry_secs: 3600,
+        };
+        let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
+        let chat_manager = Arc::new(
+            ChatManager::new_without_memory(graph.clone(), search.clone(), chat_config)
+                .with_provider_source(Arc::new(fake.clone())),
+        );
+        let plan_manager = Arc::new(PlanManager::new(graph.clone(), search.clone()));
+        let note_manager = Arc::new(NoteManager::new(graph.clone(), search.clone()));
+        let context_builder = Arc::new(ContextBuilder::new(
+            graph.clone(),
+            search.clone(),
+            plan_manager,
+            note_manager,
+        ));
+        let (event_tx, _) = broadcast::channel(16);
+        let config = RunnerConfig {
+            max_cost_usd: 1.0,
+            ..RunnerConfig::default()
+        };
+        let runner = PlanRunner::new(
+            chat_manager,
+            graph.clone(),
+            context_builder,
+            config,
+            event_tx,
+        );
+
+        let plan = crate::test_helpers::test_plan();
+        graph.create_plan(&plan).await.unwrap();
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan.id, &task).await.unwrap();
+        let run_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = Some(RunnerState::new(run_id, plan.id, 1, TriggerSource::Manual));
+        }
+
+        // The provider ends the turn with a 5 USD NOTIONAL cost covered by a subscription.
+        let pusher = fake.clone();
+        tokio::spawn(async move {
+            while pusher.state.turns_started.lock().unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            // let the runner subscribe to the session's events
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            pusher.state.push(AgentEvent::Done {
+                stop_reason: StopReason::Completed,
+                subtype: Some("success".into()),
+                is_error: false,
+                result_text: Some("done".into()),
+                usage: Default::default(),
+                cost: Cost {
+                    usd: Some(5.0),
+                    basis: CostBasis::Subscription,
+                },
+                duration_ms: 5,
+                duration_api_ms: None,
+                num_turns: 1,
+                model: Some("m".into()),
+                provider_session_id: Some("p-1".into()),
+                structured_output: None,
+                error: None,
+            });
+        });
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = runner
+            .execute_task(
+                run_id,
+                plan.id,
+                task.id,
+                "verifier task",
+                tmp.path().to_str().unwrap(),
+                None,
+                None,
+                "",
+                1,
+            )
+            .await
+            .expect("the task executes");
+
+        let spent = RUNNER_STATE
+            .read()
+            .await
+            .as_ref()
+            .map(|s| s.cost_usd)
+            .unwrap_or(-1.0);
+        reset_globals().await;
+        assert_eq!(
+            spent, 0.0,
+            "a subscription cost must not be charged to the budget"
+        );
+        assert!(
+            !matches!(out.result, TaskResult::BudgetExceeded { .. }),
+            "a subscription cost must not exhaust a 1 USD budget: {:?}",
+            out.result
+        );
+    }
+
     #[tokio::test]
     async fn listen_for_result_reports_turns_and_whether_a_cost_was_reported() {
         let runner = test_plan_runner();

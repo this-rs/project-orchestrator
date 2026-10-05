@@ -2180,6 +2180,25 @@ mod tests {
         );
     }
 
+    /// VERIFIER: creating a third-party instance while authentication is off is
+    /// refused with 409 `security_gate_closed` (A32, documented in provider-errors.md).
+    #[tokio::test]
+    async fn verifier_creating_a_third_party_instance_without_authentication_is_409() {
+        let mut state = Arc::try_unwrap(mock_server_state().await)
+            .ok()
+            .expect("sole owner of the state");
+        state.auth_config = None;
+        let app = create_router(Arc::new(state));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/chat/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(deepseek("https://8.8.8.8/v1").to_string()))
+            .unwrap();
+        let (status, body) = call_json(&app, req).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    }
+
     #[tokio::test]
     async fn an_env_credential_is_refused_unless_the_variable_is_declared() {
         let app = test_app().await;

@@ -9642,6 +9642,52 @@ mod tests {
 
     // ── agent environment and MCP secrets (decision A33) ───────────────────
 
+    /// VERIFIER: the token minted for a provider other than Claude Code carries the
+    /// restricted tool profile (A35); Claude Code keeps the full one.
+    #[tokio::test]
+    async fn verifier_a_third_party_session_token_carries_the_restricted_profile() {
+        use crate::auth::tool_profile::ToolProfile;
+        use nexus_claude::agent::{McpServerSpec, ProviderKind};
+        let state = mock_app_state();
+        let mut config = test_config();
+        config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let claims = crate::auth::jwt::Claims::service_account("verifier");
+        let token_profile = |third_party: bool, sid: &'static str| {
+            let manager = &manager;
+            let claims = &claims;
+            async move {
+                let spec = manager
+                    .build_agent_spec(AgentSpecInput {
+                        cwd: "/tmp",
+                        model: "m",
+                        system_prompt: "p",
+                        permission_mode: None,
+                        add_dirs: &[],
+                        user_claims: Some(claims),
+                        session_id: sid,
+                        third_party,
+                        max_tokens: None,
+                        kind: ProviderKind::Native,
+                    })
+                    .await
+                    .unwrap();
+                let Some(McpServerSpec::Stdio { env, .. }) =
+                    spec.mcp_servers.get("project-orchestrator")
+                else {
+                    panic!("stdio MCP server expected");
+                };
+                let token = env.get("PO_AUTH_TOKEN").expect("a session token").clone();
+                ToolProfile::from_unverified_token(&token)
+            }
+        };
+        assert_eq!(
+            token_profile(true, "verifier-s1").await,
+            ToolProfile::Restricted
+        );
+        assert_eq!(token_profile(false, "verifier-s2").await, ToolProfile::Full);
+    }
+
     #[tokio::test]
     async fn mcp_config_carries_no_secret() {
         let state = mock_app_state();
