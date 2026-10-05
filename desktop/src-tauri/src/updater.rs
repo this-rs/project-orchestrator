@@ -43,6 +43,18 @@ pub struct UpdateInstallingPayload {
     pub version: String,
 }
 
+/// True when the updater error means "the release exists but `latest.json` carries no
+/// installable bundle" (empty URLs — signing key missing in CI). This is a release
+/// configuration problem, not a failure of the check itself.
+fn is_missing_bundle_error(msg: &str) -> bool {
+    msg.contains("relative URL") || msg.contains("empty")
+}
+
+/// Message shown by the manual check in that case. It must NOT read as "up to date":
+/// a newer release may exist, it just cannot be installed in-app.
+const NO_BUNDLE_MESSAGE: &str =
+    "The latest release has no in-app update package. Download it from the releases page.";
+
 // ============================================================================
 // Update check (called on startup)
 // ============================================================================
@@ -72,7 +84,7 @@ pub fn check_for_updates(app: AppHandle) {
                 // "relative URL without a base" means latest.json has empty URLs — this happens
                 // when TAURI_SIGNING_PRIVATE_KEY is not configured in GitHub Actions secrets,
                 // so the updater bundles (.app.tar.gz, .nsis.zip, etc.) are not generated.
-                if msg.contains("relative URL") || msg.contains("empty") {
+                if is_missing_bundle_error(&msg) {
                     tracing::info!(
                         "Update check skipped — release has no updater bundles ({})",
                         msg
@@ -150,14 +162,14 @@ pub async fn check_update(app: AppHandle) -> Result<Option<UpdateAvailablePayloa
         Ok(None) => Ok(None),
         Err(e) => {
             let msg = e.to_string();
-            // Gracefully handle missing updater bundles (empty URLs in latest.json).
-            // This is a CI configuration issue, not a user-facing error.
-            if msg.contains("relative URL") || msg.contains("empty") {
+            // A release without updater bundles is NOT "up to date": say so, instead of
+            // returning `None` (which the UI renders as "You are up to date").
+            if is_missing_bundle_error(&msg) {
                 tracing::info!(
                     "Manual update check: no updater bundles available ({})",
                     msg
                 );
-                Ok(None)
+                Err(NO_BUNDLE_MESSAGE.to_string())
             } else {
                 Err(format!("Update check failed: {}", e))
             }
@@ -223,4 +235,28 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
 
     // Restart the app to apply the update
     app.restart();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_bundle_errors_are_recognised() {
+        assert!(is_missing_bundle_error("relative URL without a base"));
+        assert!(is_missing_bundle_error("the url is empty"));
+    }
+
+    #[test]
+    fn other_errors_are_not_mistaken_for_missing_bundles() {
+        assert!(!is_missing_bundle_error(
+            "error sending request: connection refused"
+        ));
+        assert!(!is_missing_bundle_error("signature verification failed"));
+    }
+
+    #[test]
+    fn missing_bundle_message_does_not_claim_up_to_date() {
+        assert!(!NO_BUNDLE_MESSAGE.to_lowercase().contains("up to date"));
+    }
 }
