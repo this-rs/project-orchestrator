@@ -672,6 +672,14 @@ impl nexus_claude::HookCallback for CompactionNotifier {
 // Pure helpers (testable without ChatManager)
 // ============================================================================
 
+/// `subtype` of the system message that stands in for a CLI message withheld
+/// because it held a secret that could not be masked (fail closed).
+pub(crate) const MASKING_FAILED_SUBTYPE: &str = "po_masking_failed";
+
+/// What the user sees in place of a withheld message.
+pub(crate) const MASKING_FAILED_MESSAGE: &str =
+    "A message from the agent was withheld: it contained a secret that could not be masked.";
+
 /// Extracted protocol context from a `spawned_by` JSON payload.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SpawnedByContext {
@@ -2632,13 +2640,33 @@ impl ChatManager {
 
     /// Replace every secret value delivered by the vault inside a CLI message,
     /// before anything reads, stores or broadcasts it.
+    ///
+    /// Fails CLOSED: a message that cannot be masked is not passed on. It is
+    /// replaced by a marker ([`MASKING_FAILED_SUBTYPE`]) that surfaces as a
+    /// visible error, never by the original.
     pub(crate) fn mask_cli_message(msg: Message) -> Message {
         let masker = crate::vault::mask::global().snapshot();
-        match crate::vault::mask::mask_serde(&masker, msg) {
+        Self::mask_cli_message_with(&masker, msg)
+    }
+
+    /// [`Self::mask_cli_message`] against an explicit masker (testable).
+    pub(crate) fn mask_cli_message_with(
+        masker: &crate::vault::mask::Masker,
+        msg: Message,
+    ) -> Message {
+        match crate::vault::mask::mask_serde(masker, msg) {
             Ok(m) => m,
-            Err(m) => {
-                tracing::error!("vault: a CLI message could not be masked; passing it unmasked");
-                m
+            // Reached only when a secret value was found AND the masked form no
+            // longer reads back (the value collides with the message structure).
+            // The original holds the secret in clear: drop it.
+            Err(_unmasked) => {
+                tracing::error!(
+                    "vault: a CLI message holding a secret could not be masked; withholding it"
+                );
+                Message::System {
+                    subtype: MASKING_FAILED_SUBTYPE.to_string(),
+                    data: serde_json::Value::Null,
+                }
             }
         }
     }
@@ -2756,6 +2784,10 @@ impl ChatManager {
             },
             Message::System { subtype, data } => {
                 match subtype.as_str() {
+                    MASKING_FAILED_SUBTYPE => vec![ChatEvent::Error {
+                        message: MASKING_FAILED_MESSAGE.to_string(),
+                        parent_tool_use_id: None,
+                    }],
                     "init" => {
                         // Extract session metadata from init system message
                         let cli_session_id = data
@@ -9088,6 +9120,63 @@ mod tests {
 
         let events = ChatManager::message_to_events(&msg);
         assert!(events.is_empty());
+    }
+
+    // ── masking fails closed (decision A36) ────────────────────────────────
+
+    #[test]
+    fn a_message_that_cannot_be_masked_is_withheld_not_passed_in_clear() {
+        // The secret value collides with a key of the message's own JSON form:
+        // once masked, the message no longer reads back.
+        let secret = "duration_api_ms";
+        let masker = crate::vault::mask::Masker::from_values([("TOKEN", secret)]);
+        let msg = Message::Result {
+            subtype: "success".into(),
+            duration_ms: 1,
+            duration_api_ms: 1,
+            is_error: false,
+            num_turns: 1,
+            session_id: "cli-1".into(),
+            total_cost_usd: None,
+            usage: None,
+            result: Some(format!("the value is {secret}")),
+            structured_output: None,
+        };
+
+        let out = ChatManager::mask_cli_message_with(&masker, msg);
+        assert!(
+            matches!(&out, Message::System { subtype, .. } if subtype == MASKING_FAILED_SUBTYPE),
+            "an unmaskable message must be replaced, got {out:?}"
+        );
+        let events = ChatManager::message_to_events(&out);
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], ChatEvent::Error { message, .. } if message == MASKING_FAILED_MESSAGE)
+        );
+        let wire = serde_json::to_string(&events).unwrap();
+        assert!(
+            !wire.contains(secret),
+            "the secret reached the wire: {wire}"
+        );
+    }
+
+    #[test]
+    fn a_maskable_message_is_masked_and_an_unrelated_one_is_untouched() {
+        let masker = crate::vault::mask::Masker::from_values([("TOKEN", "s3cr3t-value")]);
+        let with_secret = Message::System {
+            subtype: "note".into(),
+            data: serde_json::json!({"text": "key=s3cr3t-value"}),
+        };
+        let out = ChatManager::mask_cli_message_with(&masker, with_secret);
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(!json.contains("s3cr3t-value") && json.contains("[secret:TOKEN]"));
+
+        let plain = Message::System {
+            subtype: "note".into(),
+            data: serde_json::json!({"text": "nothing here"}),
+        };
+        let out = ChatManager::mask_cli_message_with(&masker, plain);
+        assert!(matches!(&out, Message::System { subtype, .. } if subtype == "note"));
     }
 
     #[test]
