@@ -6514,6 +6514,24 @@ pub enum AppError {
     /// 410: the thing existed but is permanently gone (e.g. the CLI that asked).
     Gone(String),
     NotImplemented(String),
+    /// A session could not be opened, for a reason the client can act on:
+    /// carries its own status, a stable `code`, the provider concerned and a
+    /// suggested action (decision A29).
+    Provider(Box<crate::chat::provider::errors::OpenFailure>),
+}
+
+impl AppError {
+    /// The error of a failed session opening: typed when the cause is a known
+    /// provider failure (missing CLI, locked credentials, …), internal otherwise.
+    pub fn from_open_error(err: anyhow::Error, provider_id: Option<&str>) -> Self {
+        match crate::chat::provider::errors::classify_open_error(&err, provider_id) {
+            Some(failure) => {
+                tracing::warn!(code = failure.code, error = %err, "session opening failed");
+                AppError::Provider(Box::new(failure))
+            }
+            None => AppError::Internal(err),
+        }
+    }
 }
 
 /// Generic message returned to clients for `AppError::Internal`.
@@ -6526,6 +6544,11 @@ pub(crate) const STEP_FAILED_MESSAGE: &str = "step failed (see server logs)";
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
+            AppError::Provider(failure) => {
+                let status = StatusCode::from_u16(failure.status)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                return (status, Json(failure.to_json())).into_response();
+            }
             AppError::Internal(e) => {
                 // Never leak internal details (DB errors, paths, queries) to the client.
                 tracing::error!(error = ?e, "internal server error");
@@ -6641,6 +6664,29 @@ mod tests {
         .unwrap();
         assert_eq!(req.permission_mode.as_deref(), Some("bypassPermissions"));
         assert_eq!(req.project_slug.as_deref(), Some("p"));
+    }
+
+    #[tokio::test]
+    async fn a_missing_cli_answers_424_with_a_code_instead_of_a_mute_500() {
+        let sdk = nexus_claude::SdkError::CliNotFound {
+            searched_paths: "/secret/path".to_string(),
+        };
+        let err = crate::chat::provider::errors::sdk_open_error("Failed to create", sdk);
+        let resp = AppError::from_open_error(err, Some("claude-code")).into_response();
+        assert_eq!(resp.status(), StatusCode::FAILED_DEPENDENCY);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], "cli_not_found");
+        assert_eq!(body["provider_id"], "claude-code");
+        assert!(body["error"]
+            .as_str()
+            .is_some_and(|m| !m.contains("/secret/path")));
+    }
+
+    #[tokio::test]
+    async fn an_unclassified_opening_error_stays_an_internal_error() {
+        let resp = AppError::from_open_error(anyhow::anyhow!("neo4j down"), None).into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

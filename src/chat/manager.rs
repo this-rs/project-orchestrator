@@ -798,6 +798,71 @@ pub(crate) const SERVER_ONLY_SECRETS: &[&str] = &[
     "PO_JWT_SECRET",
 ];
 
+/// Variables of the server's environment an agent process may inherit, on top
+/// of the SDK's base list (PATH, HOME, locale, temp dir, proxy, certificates)
+/// and the `ANTHROPIC_*` / `CLAUDE_*` the Claude Code CLI authenticates with.
+///
+/// Developer tooling only — what `git`, `cargo`, `node`, … need to behave in
+/// the agent's shell as they do in the operator's. Nothing credential-shaped:
+/// a token the operator wants agents to have goes through the vault, or is
+/// named explicitly in `CHAT_CHILD_ENV_INHERIT`.
+pub(crate) const CHILD_ENV_TOOLING: &[&str] = &[
+    "SSH_AUTH_SOCK",
+    "GIT_SSH_COMMAND",
+    "GIT_EXEC_PATH",
+    "EDITOR",
+    "VISUAL",
+    "PAGER",
+    "COLORTERM",
+    "NO_COLOR",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "GOPATH",
+    "GOROOT",
+    "GOBIN",
+    "JAVA_HOME",
+    "NVM_DIR",
+    "NVM_BIN",
+    "PNPM_HOME",
+    "VOLTA_HOME",
+    "BUN_INSTALL",
+    "PYENV_ROOT",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "HOMEBREW_PREFIX",
+    "DOCKER_HOST",
+];
+
+/// Operator-chosen additions to the agent environment: a comma-separated list
+/// of variable names (e.g. `GH_TOKEN,AWS_PROFILE`).
+pub(crate) const CHILD_ENV_INHERIT_VAR: &str = "CHAT_CHILD_ENV_INHERIT";
+
+/// The environment policy of every agent process this server starts (chat
+/// sessions, runner tasks, the feature-graph one-shot): clean environment,
+/// allowlist only. The server's own secrets are simply not on the list.
+pub(crate) fn child_env_policy() -> nexus_claude::EnvPolicy {
+    let extra = std::env::var(CHILD_ENV_INHERIT_VAR).unwrap_or_default();
+    child_env_policy_with(&extra)
+}
+
+/// [`child_env_policy`] with the operator list given explicitly (testable).
+pub(crate) fn child_env_policy_with(operator_list: &str) -> nexus_claude::EnvPolicy {
+    let operator = operator_list
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        // An operator cannot hand the server's own secrets to agents by listing them.
+        .filter(|name| !SERVER_ONLY_SECRETS.contains(name))
+        .map(str::to_string);
+    nexus_claude::EnvPolicy::claude_code().with_inherited(
+        CHILD_ENV_TOOLING
+            .iter()
+            .map(|name| (*name).to_string())
+            .chain(operator),
+    )
+}
+
 pub(crate) fn server_secrets_to_hide(present: impl Fn(&str) -> bool) -> Vec<&'static str> {
     SERVER_ONLY_SECRETS
         .iter()
@@ -2445,20 +2510,11 @@ impl ChatManager {
         let cwd = expand_tilde(cwd);
         let mcp_path = self.config.mcp_server_path.to_string_lossy().to_string();
 
+        // The MCP server is an HTTP proxy to this server (`McpHttpClient`): it
+        // needs a URL and a token, nothing else. The database and search
+        // credentials used to be copied here "just in case"; they were then
+        // readable by the agent (decision A33).
         let mut env = HashMap::new();
-        // Neo4j/MeiliSearch env vars — kept for non-CRUD processes that still
-        // call the database directly (e.g., sync, code parsing, analytics).
-        env.insert("NEO4J_URI".into(), self.config.neo4j_uri.clone());
-        env.insert("NEO4J_USER".into(), self.config.neo4j_user.clone());
-        env.insert("NEO4J_PASSWORD".into(), self.config.neo4j_password.clone());
-        env.insert(
-            "MEILISEARCH_URL".into(),
-            self.config.meilisearch_url.clone(),
-        );
-        env.insert(
-            "MEILISEARCH_KEY".into(),
-            self.config.meilisearch_key.clone(),
-        );
 
         // PO_SERVER_URL is always injected — mcp_server runs as an HTTP proxy
         // regardless of whether auth is enabled.
@@ -2576,6 +2632,13 @@ impl ChatManager {
             .include_partial_messages(true)
             .permission_prompt_tool_name("stdio")
             .cli_channel_buffer_size(8192)
+            // The agent starts from a CLEAN environment: only an allowlist of
+            // the server's variables reaches the CLI and every shell it opens.
+            .env_policy(child_env_policy())
+            // The MCP config holds the session token: hand it to the CLI in a
+            // 0600 file removed with the session, not on its command line
+            // (where `ps` shows it to any process of the same user).
+            .mcp_config_via_file(true)
             .add_mcp_server("project-orchestrator", mcp_config);
 
         // Wire allowed/disallowed tool patterns from config
@@ -3135,13 +3198,13 @@ impl ChatManager {
                 Some(&sid_str),
             )
             .await;
-        let mut client = InteractiveClient::new(options)
-            .map_err(|e| anyhow!("Failed to create InteractiveClient: {}", e))?;
+        let mut client = InteractiveClient::new(options).map_err(|e| {
+            super::provider::errors::sdk_open_error("Failed to create InteractiveClient", e)
+        })?;
 
-        client
-            .connect()
-            .await
-            .map_err(|e| anyhow!("Failed to connect InteractiveClient: {}", e))?;
+        client.connect().await.map_err(|e| {
+            super::provider::errors::sdk_open_error("Failed to connect InteractiveClient", e)
+        })?;
 
         // Initialize hooks with the CLI (sends PreCompact, etc. registrations).
         // Must be called AFTER connect() and BEFORE take_sdk_control_receiver().
@@ -5790,15 +5853,15 @@ impl ChatManager {
     /// it awaits the lock while stream_response holds it, so broadcast events
     /// can no longer be forwarded to the frontend.
     pub async fn set_session_permission_mode(&self, session_id: &str, mode: &str) -> Result<()> {
-        // Validate mode
-        const VALID_MODES: &[&str] = &["default", "acceptEdits", "bypassPermissions", "plan"];
-        if !VALID_MODES.contains(&mode) {
+        // Validate mode: the Claude strings or the neutral names (A43). The CLI
+        // only understands its own strings, so a neutral name is translated.
+        let Some(mode) = super::provider::policy::to_legacy(mode) else {
             bail!(
                 "Invalid permission mode '{}'. Valid modes: {}",
                 mode,
-                VALID_MODES.join(", ")
+                super::config::PermissionConfig::valid_modes().join(", ")
             );
-        }
+        };
 
         // Get session state and stdin_tx — do NOT extract client (avoids Mutex deadlock)
         let (stdin_tx, old_mode, events_tx) = {
@@ -6208,13 +6271,19 @@ impl ChatManager {
             .await;
 
         // Create new InteractiveClient with --resume
-        let mut client = InteractiveClient::new(options)
-            .map_err(|e| anyhow!("Failed to create InteractiveClient for resume: {}", e))?;
+        let mut client = InteractiveClient::new(options).map_err(|e| {
+            super::provider::errors::sdk_open_error(
+                "Failed to create InteractiveClient for resume",
+                e,
+            )
+        })?;
 
-        client
-            .connect()
-            .await
-            .map_err(|e| anyhow!("Failed to connect resumed InteractiveClient: {}", e))?;
+        client.connect().await.map_err(|e| {
+            super::provider::errors::sdk_open_error(
+                "Failed to connect resumed InteractiveClient",
+                e,
+            )
+        })?;
 
         // Initialize hooks with the CLI (sends PreCompact, etc. registrations).
         // Must be called AFTER connect() and BEFORE take_sdk_control_receiver().
@@ -8647,14 +8716,95 @@ mod tests {
             McpServerConfig::Stdio { command, env, .. } => {
                 assert_eq!(command, "/usr/bin/mcp_server");
                 let env = env.as_ref().unwrap();
-                assert_eq!(env.get("NEO4J_URI").unwrap(), "bolt://localhost:7687");
-                assert_eq!(env.get("NEO4J_USER").unwrap(), "neo4j");
-                assert_eq!(env.get("NEO4J_PASSWORD").unwrap(), "test");
-                assert_eq!(env.get("MEILISEARCH_URL").unwrap(), "http://localhost:7700");
-                assert_eq!(env.get("MEILISEARCH_KEY").unwrap(), "key");
+                assert!(env.contains_key("PO_SERVER_URL"));
             }
             _ => panic!("Expected Stdio MCP config"),
         }
+    }
+
+    // ── agent environment and MCP secrets (decision A33) ───────────────────
+
+    #[tokio::test]
+    async fn mcp_config_carries_no_secret() {
+        let state = mock_app_state();
+        let config = test_config();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let options = manager
+            .build_options("/tmp", "model", "prompt", None, None, None, &[], None, None)
+            .await;
+
+        let Some(McpServerConfig::Stdio { env, .. }) =
+            options.mcp_servers.get("project-orchestrator")
+        else {
+            panic!("Expected Stdio MCP config");
+        };
+        let env = env.as_ref().unwrap();
+        for name in [
+            "NEO4J_PASSWORD",
+            "NEO4J_USER",
+            "NEO4J_URI",
+            "MEILISEARCH_KEY",
+            "MEILISEARCH_URL",
+        ] {
+            assert!(
+                !env.contains_key(name),
+                "the MCP proxy does not need {name}; it must not be handed to the agent"
+            );
+        }
+        let serialized = serde_json::to_string(&env).unwrap();
+        assert!(
+            !serialized.contains("\"test\"") && !serialized.contains("\"key\""),
+            "database/search credentials leaked into the MCP config: {serialized}"
+        );
+        assert!(
+            options.mcp_config_via_file,
+            "the MCP config (session token) must go through a file, not argv"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_env_only_carries_allowlisted_names() {
+        let state = mock_app_state();
+        let config = test_config();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let options = manager
+            .build_options("/tmp", "model", "prompt", None, None, None, &[], None, None)
+            .await;
+
+        let policy = &options.env_policy;
+        assert!(
+            policy.is_isolated(),
+            "the agent must start from a clean environment"
+        );
+        for secret in [
+            "NEO4J_PASSWORD",
+            "MEILISEARCH_KEY",
+            "EMBEDDING_API_KEY",
+            "PO_JWT_SECRET",
+            "GOOGLE_CLIENT_SECRET",
+            "AWS_SECRET_ACCESS_KEY",
+            "SOME_UNKNOWN_SERVER_VARIABLE",
+        ] {
+            assert!(!policy.allows(secret), "{secret} must not reach the agent");
+        }
+        for needed in [
+            "PATH",
+            "HOME",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "SSH_AUTH_SOCK",
+        ] {
+            assert!(policy.allows(needed), "{needed} must reach the agent");
+        }
+    }
+
+    #[test]
+    fn the_operator_list_extends_the_allowlist_but_never_with_server_secrets() {
+        let policy = child_env_policy_with(" GH_TOKEN , PO_JWT_SECRET,,NEO4J_PASSWORD ");
+        assert!(policy.allows("GH_TOKEN"));
+        assert!(!policy.allows("PO_JWT_SECRET"));
+        assert!(!policy.allows("NEO4J_PASSWORD"));
+        assert!(!child_env_policy_with("").allows("GH_TOKEN"));
     }
 
     #[tokio::test]

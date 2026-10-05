@@ -113,10 +113,15 @@ pub async fn create_session(
                 .resume_session(&sid, &request.message, request.user_claims.as_ref())
                 .await
                 .map_err(|e| {
-                    if e.to_string().contains("not found") {
+                    let typed =
+                        crate::chat::provider::errors::classify_open_error(&e, None).is_some();
+                    if !typed && e.to_string().contains("not found") {
                         AppError::NotFound(format!("Session {} not found", sid))
                     } else {
-                        AppError::Internal(e)
+                        AppError::from_open_error(
+                            e,
+                            Some(crate::chat::provider::resolver::CLAUDE_CODE),
+                        )
                     }
                 })?;
         }
@@ -139,10 +144,9 @@ pub async fn create_session(
     }
 
     // ── Create path (no session_id) ────────────────────────────────────────
-    let response = chat_manager
-        .create_session(&request)
-        .await
-        .map_err(AppError::Internal)?;
+    let response = chat_manager.create_session(&request).await.map_err(|e| {
+        AppError::from_open_error(e, Some(crate::chat::provider::resolver::CLAUDE_CODE))
+    })?;
 
     // T4.3: Extract code entities from the first message and create DISCUSSED relations (non-blocking)
     super::ws_chat_handler::spawn_entity_extraction(&state, &response.session_id, &request.message);
