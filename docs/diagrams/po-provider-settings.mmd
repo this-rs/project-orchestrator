@@ -1,0 +1,58 @@
+%% name: po-provider-settings
+%% covers: backend:src/api/provider_handlers.rs
+%% verified: 878281ca
+%% ---
+%% PROUVE : les routes de réglages des providers (A15, A19, A24, A25, A28, A32, A37) : instances, test de
+%%   connexion, consentement, rôles, alias, politique de modèle, journal d'envoi. La logique pure est dans
+%%   po-chat-provider (settings.rs) ; ici, les routes et leurs gardes.
+%% ---
+%% SOURCES LUES :
+%%   src/api/provider_handlers.rs — create/update/delete/test_provider, provider_status, provider_models,
+%%                                   list/allow/revoke consent, roles, aliases, policy, send_journal
+%%   src/api/routes.rs — le montage des routes (/api/chat/providers*, /api/projects/{slug}/llm-*)
+%%   src/auth/middleware.rs — is_human_only_mutation (la garde du middleware)
+%% ---
+%% NON ETABLI :
+%%   aucun essai contre un vrai endpoint ou un vrai Codex ; le test de connexion d'un codex/acp = health du processus ;
+%%   la santé N'EST PAS sondée dans le listing (seulement par /status).
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans test / décidé non écrit  ⚪ amont ou autre domaine
+
+flowchart TD
+    CALLER["⚪ le frontend (ProvidersPage, SettingsPage) ou un appel REST"]
+
+    subgraph guard["Gardes communes"]
+        HUMAN["✅ toute mutation = jeton HUMAIN : le middleware refuse agent_session (403) ET chaque handler revérifie require_human<br/>test : an_agent_token_cannot_manage_the_vault (même règle), the_send_journal_is_readable_by_a_person_only_filtered_and_newest_first"]
+        GATE["✅ porte A32 : créer une instance tierce sans authentification = 409 security_gate_closed<br/>test : a_third_party_is_refused_while_authentication_is_off (ouverture), an_instance_is_created_listed_and_never_carries_a_secret"]
+    end
+
+    subgraph inst["Instances"]
+        CREATE["✅ POST /api/chat/providers : openai_compatible | codex | acp ; références seulement, tout champ inconnu refusé ; URL par la garde d'endpoint (DNS compris) ; claude-code intégré : 403 ; id existant : 409<br/>test : an_instance_is_created_listed_and_never_carries_a_secret, a_secret_in_a_body_or_a_forbidden_endpoint_is_refused, a_codex_instance_is_created_behind_the_gate_with_a_process_identity, an_env_credential_is_refused_unless_the_variable_is_declared"]
+        TEST["✅ POST /providers/test : toujours 200 + verdict ; avec identifiant, seulement pour une instance DÉJÀ enregistrée (même origine et même référence) ; sonde réelle (health, modèles, appel d'outil, fenêtre)<br/>test : the_test_route_always_answers_200_with_a_verdict"]
+        STATUS["✅ GET /providers/{id}/status : santé mesurée<br/>test : a_saved_instances_status_is_its_real_health_not_unknown"]
+        PATCH["✅ PUT|PATCH /providers/{id} : l'id ne change jamais ; changer l'origine OU la référence d'identifiant invalide les consentements (consents_invalidated)<br/>test : consent_is_bound_to_the_origin_and_stops_holding_when_it_changes"]
+    end
+
+    subgraph consent["Consentement par projet"]
+        CONSENT["✅ PUT /api/projects/{slug}/llm-consent[s][/id] : l'origine montrée doit être l'actuelle (409 origin_mismatch) ; enregistre qui, quand, quelle origine ET quelle référence ; DELETE retire<br/>test : consent_is_bound_to_the_origin_and_stops_holding_when_it_changes, changing_the_credential_reference_after_consent_stops_the_sending"]
+    end
+
+    subgraph routing["Rôles, alias, politique"]
+        ROLES["✅ GET/PUT /api/chat/roles et /api/projects/{slug}/llm-roles : instance existante exigée, modèle OU alias<br/>test : roles_aliases_and_policy_round_trip_and_are_validated, a_pilot_role_routes_a_project_to_the_instance_and_consent_still_applies"]
+        POLICY["✅ GET/PUT /api/chat/model-aliases et /model-policy (livrée off) ; lus par le résolveur<br/>test : an_enforced_policy_routes_the_chat_to_the_instance_and_records_the_rule"]
+    end
+
+    JOURNAL["✅ GET /api/chat/send-journal : qui, projet, origine, modèle ; jamais le contenu ; humain seulement<br/>test : the_send_journal_is_readable_by_a_person_only_filtered_and_newest_first"]
+    NOSEC["🟠 sans authentification (auth_config absent), require_human laisse tout passer (écart documenté dans le modèle de menace)"]
+
+    CALLER --> HUMAN
+    HUMAN --> GATE
+    GATE --> CREATE
+    CREATE --> TEST
+    CREATE --> PATCH
+    PATCH --> CONSENT
+    CONSENT --> ROLES
+    ROLES --> POLICY
+    HUMAN --> JOURNAL
+    HUMAN --> NOSEC
