@@ -77,24 +77,123 @@ const RESTRICTED_ACTIONS: &[(&str, &str)] = &[
     ("plan", "enable_trigger"),
 ];
 
-/// The routes of the withheld `sharing` and `environment` tools that hang under
-/// a project or a note: `/api/projects/{slug}/sharing*`, `/api/projects/{id}/environments*`,
-/// `/api/notes/{id}/sharing*`. Sharing sends project data out: it is closed
-/// to the restricted profile, reads included (the tool is not in the profile).
-fn withheld_project_or_note_route(path: &str) -> bool {
-    let mut segments = path.trim_start_matches('/').split('/');
-    let (Some("api"), Some(root), Some(_id), Some(leaf)) = (
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-    ) else {
-        return false;
-    };
-    match root {
-        "projects" => matches!(leaf, "sharing" | "environments"),
-        "notes" => leaf == "sharing",
-        _ => false,
+/// How a REST route is treated by the restricted profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteClass {
+    /// Behind a tool the profile keeps (the method-specific withholdings still apply).
+    Allowed,
+    /// Behind a tool the profile withholds, or not behind any tool a model uses.
+    Closed,
+}
+
+/// Route prefixes the restricted profile may use: exactly what the MCP handlers of
+/// the KEPT tools call (`src/mcp/handlers.rs`). `*` matches one path segment.
+/// A route is matched by its LONGEST prefix across both lists, so a closed
+/// sub-route wins over its allowed parent.
+const ALLOWED_ROUTE_PREFIXES: &[&str] = &[
+    "/api/analysis-profiles",
+    "/api/chat",
+    "/api/code",
+    "/api/commits",
+    "/api/components",
+    "/api/constraints",
+    "/api/decisions",
+    "/api/entities",
+    "/api/episodes",
+    "/api/feature-graphs",
+    "/api/files",
+    "/api/milestones",
+    "/api/notes",
+    "/api/personas",
+    "/api/plans",
+    "/api/projects",
+    "/api/reason",
+    "/api/releases",
+    "/api/resources",
+    "/api/runs",
+    "/api/skills",
+    "/api/steps",
+    "/api/tasks",
+    "/api/workspace-milestones",
+    "/api/workspaces",
+];
+
+/// Route prefixes the restricted profile may NOT use, reads included: the routes
+/// of every withheld tool (admin, mcp_federation, lifecycle_hook, vault,
+/// protocol, sharing, environment, neural_routing, trajectory) and the ones no
+/// kept tool calls (server maintenance, search index, hooks, registry, ...).
+const CLOSED_ROUTE_PREFIXES: &[&str] = &[
+    // withheld tools
+    "/api/admin",
+    "/api/mcp-federation",
+    "/api/lifecycle-hooks",
+    "/api/vault",
+    "/api/protocols",
+    "/api/environments",
+    "/api/deployments",
+    "/api/neural-routing",
+    "/api/trajectories",
+    "/api/triggers",
+    "/api/event-triggers",
+    // server maintenance and indexes (the `admin` tool)
+    "/api/sync",
+    "/api/watch",
+    "/api/meilisearch",
+    // sharing sends project data out; deployments hang under projects
+    "/api/projects/*/sharing",
+    "/api/projects/*/environments",
+    "/api/projects/*/deployment-matrix",
+    "/api/notes/*/sharing",
+    // memory maintenance (admin)
+    "/api/notes/neurons",
+    "/api/notes/consolidate-memory",
+    "/api/notes/update-staleness",
+    "/api/notes/update-energy",
+    // no kept tool calls these
+    "/api/agents",
+    "/api/alerts",
+    "/api/attention",
+    "/api/documents",
+    "/api/feedback",
+    "/api/graph",
+    "/api/hooks",
+    "/api/progress",
+    "/api/reactor",
+    "/api/registry",
+    "/api/rfcs",
+    "/api/setup-status",
+    "/api/version",
+    "/api/wake",
+    "/api/webhooks",
+];
+
+fn prefix_len(pattern: &str, path: &str) -> Option<usize> {
+    let pat: Vec<&str> = pattern.trim_start_matches('/').split('/').collect();
+    let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    if segs.len() < pat.len() {
+        return None;
+    }
+    pat.iter()
+        .zip(&segs)
+        .all(|(p, s)| *p == "*" || p == s)
+        .then_some(pat.len())
+}
+
+/// The class of a REST route for the restricted profile: the LONGEST matching
+/// prefix of the two lists above (a tie is closed). `None` = classified by
+/// nobody: the profile treats it as closed, and the route-table test fails
+/// until someone decides.
+pub fn classify_route(path: &str) -> Option<RouteClass> {
+    let best = |list: &[&str]| list.iter().filter_map(|p| prefix_len(p, path)).max();
+    match (best(ALLOWED_ROUTE_PREFIXES), best(CLOSED_ROUTE_PREFIXES)) {
+        (None, None) => None,
+        (Some(_), None) => Some(RouteClass::Allowed),
+        (None, Some(_)) => Some(RouteClass::Closed),
+        (Some(a), Some(c)) => Some(if a > c {
+            RouteClass::Allowed
+        } else {
+            RouteClass::Closed
+        }),
     }
 }
 
@@ -185,26 +284,11 @@ impl ToolProfile {
             return false;
         }
         let read = matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
-        let under = |prefix: &str| {
-            path == prefix
-                || path
-                    .strip_prefix(prefix)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        };
-        // Whole tools: admin / mcp_federation / lifecycle_hook (reads included —
-        // the tool is not in the profile at all).
-        if under("/api/admin")
-            || under("/api/mcp-federation")
-            || under("/api/lifecycle-hooks")
-            || under("/api/vault")
-            // The other withheld tools: `protocol` (starts agents), `environment`,
-            // `neural_routing`, `trajectory`.
-            || under("/api/protocols")
-            || under("/api/environments")
-            || under("/api/neural-routing")
-            || under("/api/trajectories")
-            || withheld_project_or_note_route(path)
-        {
+        // DEFAULT DENY on /api: only a route explicitly classified `Allowed` passes
+        // (a route nobody classified is closed, and `route_table_is_classified`
+        // fails until someone does). Outside /api (auth, ws, mcp...) this profile
+        // has no say.
+        if path.starts_with("/api/") && classify_route(path) != Some(RouteClass::Allowed) {
             return true;
         }
         if read {
@@ -224,7 +308,7 @@ impl ToolProfile {
                 _ => false,
             };
         }
-        under("/api/triggers")
+        false
     }
 }
 
@@ -456,5 +540,108 @@ mod tests {
                 "{method} {path} must stay open"
             );
         }
+    }
+    #[test]
+    fn verify4_admin_and_environment_routes_outside_api_admin_are_closed() {
+        use axum::http::Method;
+        let r = ToolProfile::Restricted;
+        let mut open = vec![];
+        for (method, path) in [
+            (Method::POST, "/api/sync"),
+            (Method::POST, "/api/watch"),
+            (Method::DELETE, "/api/watch"),
+            (Method::GET, "/api/meilisearch/stats"),
+            (Method::DELETE, "/api/meilisearch/orphans"),
+            (Method::POST, "/api/notes/neurons/reinforce"),
+            (Method::POST, "/api/notes/consolidate-memory"),
+            (Method::POST, "/api/notes/update-staleness"),
+            (Method::PATCH, "/api/deployments/d"),
+            (Method::GET, "/api/projects/p/deployment-matrix"),
+        ] {
+            if !r.route_forbidden(&method, path) {
+                open.push(format!("{method} {path}"));
+            }
+        }
+        assert!(open.is_empty(), "open to the restricted profile: {open:?}");
+    }
+
+    // ── the route table is classified, completely and without dead entries ──
+
+    /// Every `/api` path literal of the router.
+    fn router_paths() -> Vec<String> {
+        let src = include_str!("../api/routes.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let mut paths: Vec<String> = regex::Regex::new(r#""(/api/[^"\s]*)""#)
+            .unwrap()
+            .captures_iter(production)
+            .map(|c| c[1].to_string())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    #[test]
+    fn route_table_is_classified() {
+        let paths = router_paths();
+        assert!(
+            paths.len() > 300,
+            "the scan reads the whole router: {}",
+            paths.len()
+        );
+        let unclassified: Vec<_> = paths
+            .iter()
+            .filter(|p| classify_route(p).is_none())
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "routes with no explicit class for the restricted profile — add each to \
+             ALLOWED_ROUTE_PREFIXES or CLOSED_ROUTE_PREFIXES in auth/tool_profile.rs: {unclassified:?}"
+        );
+    }
+
+    #[test]
+    fn every_classification_entry_matches_a_real_route() {
+        let paths = router_paths();
+        for pattern in ALLOWED_ROUTE_PREFIXES.iter().chain(CLOSED_ROUTE_PREFIXES) {
+            assert!(
+                paths.iter().any(|p| prefix_len(pattern, p).is_some()),
+                "`{pattern}` matches no route of routes.rs: a dead entry"
+            );
+        }
+    }
+
+    #[test]
+    fn the_restricted_profile_follows_the_classification_for_every_route() {
+        use axum::http::Method;
+        let r = ToolProfile::Restricted;
+        for path in router_paths() {
+            let class = classify_route(&path).expect("classified");
+            // A GET on a closed route is refused; on an allowed one it is not
+            // (a read never hits the method-specific withholdings).
+            assert_eq!(
+                r.route_forbidden(&Method::GET, &path),
+                class == RouteClass::Closed,
+                "{path}"
+            );
+        }
+        // An unclassified route is closed (default deny).
+        assert!(r.route_forbidden(&Method::GET, "/api/a-route-added-tomorrow"));
+        // The full profile is never held to it.
+        assert!(!ToolProfile::Full.route_forbidden(&Method::POST, "/api/admin/x"));
+        // Longest prefix wins: a closed sub-route of an allowed parent.
+        assert_eq!(
+            classify_route("/api/notes/n/sharing/consent"),
+            Some(RouteClass::Closed)
+        );
+        assert_eq!(
+            classify_route("/api/notes/search"),
+            Some(RouteClass::Allowed)
+        );
+        assert_eq!(
+            classify_route("/api/projects/p/sharing"),
+            Some(RouteClass::Closed)
+        );
+        assert_eq!(classify_route("/api/projects/p"), Some(RouteClass::Allowed));
     }
 }
