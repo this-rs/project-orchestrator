@@ -81,6 +81,9 @@ pub struct MockGraphStore {
     pub chat_sessions: RwLock<HashMap<Uuid, ChatSessionNode>>,
     /// Provider harness settings, by (scope, key).
     pub llm_settings: RwLock<HashMap<(String, String), String>>,
+    /// Test switch: writes to the `journal` scope (the send journal) fail, to prove
+    /// that an opening is refused when the journal cannot be written (A37).
+    pub fail_journal_writes: std::sync::atomic::AtomicBool,
     /// Stored session links (run relation / associations), seedable by tests
     pub session_link_rows: RwLock<Vec<SessionLinkRow>>,
     /// Chat sessions linked to a task, as `get_task_enrichment_data` reports
@@ -293,6 +296,7 @@ impl MockGraphStore {
             document_links: RwLock::new(HashMap::new()),
             chat_sessions: RwLock::new(HashMap::new()),
             llm_settings: RwLock::new(HashMap::new()),
+            fail_journal_writes: std::sync::atomic::AtomicBool::new(false),
             session_link_rows: RwLock::new(Vec::new()),
             task_sessions: RwLock::new(HashMap::new()),
             session_link_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -7671,6 +7675,13 @@ impl GraphStore for MockGraphStore {
             .cloned())
     }
     async fn put_llm_setting(&self, scope: &str, key: &str, value: &str) -> Result<()> {
+        if scope == "journal"
+            && self
+                .fail_journal_writes
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("mock: the send journal cannot be written");
+        }
         self.llm_settings
             .write()
             .await

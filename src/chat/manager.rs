@@ -452,7 +452,6 @@ pub(crate) struct RuntimeEnvConfig {
     pub auto_update_app: bool,
 }
 
-/// Manages chat sessions and their lifecycle
 /// A built provider and the stored record it was built from.
 pub(crate) type NativeCacheEntry = (
     super::provider::settings::InstanceRecord,
@@ -496,6 +495,7 @@ struct AgentOpen<'a> {
     project_slug: Option<&'a str>,
 }
 
+/// Manages chat sessions and their lifecycle
 pub struct ChatManager {
     pub(crate) graph: Arc<dyn GraphStore>,
     #[allow(dead_code)]

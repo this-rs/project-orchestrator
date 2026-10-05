@@ -808,3 +808,95 @@ fn the_tool_schemas_have_a_size_and_an_unknown_window_is_not_a_refusal() {
     });
     assert!(super::manager::window_holds_the_tools(&caps).is_err());
 }
+
+#[tokio::test]
+async fn verify4_authorize_refuses_a_project_without_consent_even_when_called_directly() {
+    // A resume re-checks consent (it may have been revoked meanwhile): the check
+    // of authorize_provider_use itself, not only the resolver's.
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    let manager = manager(graph.clone(), true);
+    let provider = manager.provider_for("local").await.unwrap();
+    let claims = crate::auth::jwt::Claims::service_account("e2e");
+    let r = manager
+        .authorize_provider_use(super::manager::ProviderUse {
+            provider_id: "local",
+            provider: &provider,
+            model: "m",
+            mode: nexus_claude::agent::PolicyMode::Ask,
+            project_slug: Some("proj"),
+            claims: Some(&claims),
+            session_id: "verify4-sid",
+        })
+        .await;
+    assert!(r.is_err(), "no consent: must be refused");
+}
+
+#[tokio::test]
+async fn verify4_a_refused_opening_revokes_the_session_token() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    let manager = manager(graph.clone(), true);
+    let _ = manager
+        .create_session(&request(Some("local"), Some("proj"), "bypassPermissions"))
+        .await
+        .unwrap_err();
+    let ids: Vec<_> = graph.chat_sessions.read().await.keys().cloned().collect();
+    assert_eq!(
+        ids.len(),
+        1,
+        "the persisted session node is still there: {ids:?}"
+    );
+    assert_eq!(
+        crate::auth::agent_tokens::revoke_session(&ids[0].to_string()),
+        0,
+        "the token of a refused opening was left live"
+    );
+}
+
+#[tokio::test]
+async fn an_opening_is_refused_when_the_send_journal_cannot_be_written() {
+    // A37: no trace of the sending, no sending. The refusal leaves nothing live.
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    graph
+        .fail_journal_writes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let manager = manager(graph.clone(), true);
+    let err = manager
+        .create_session(&request(Some("local"), Some("proj"), "default"))
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&err), (503, "provider_unavailable"));
+    assert!(manager.agent_runtime.is_empty().await, "no live session");
+    assert!(
+        fake.chat_requests().is_empty(),
+        "the model was never called: the content did not leave"
+    );
+    assert!(graph
+        .list_llm_settings("journal", "")
+        .await
+        .unwrap()
+        .is_empty());
+    // The token minted for the refused opening is dead.
+    let ids: Vec<_> = graph.chat_sessions.read().await.keys().cloned().collect();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(
+        crate::auth::agent_tokens::revoke_session(&ids[0].to_string()),
+        0,
+        "the token of a refused opening was left live"
+    );
+    // Once the journal is writable again, the same request opens.
+    graph
+        .fail_journal_writes
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    manager
+        .create_session(&request(Some("local"), Some("proj"), "default"))
+        .await
+        .unwrap_or_else(|e| panic!("opens once the journal works: {e:#}"));
+}
