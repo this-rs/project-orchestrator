@@ -144,6 +144,9 @@ pub fn compute_final_status(tasks: &[crate::neo4j::models::TaskNode]) -> PlanRun
 /// - `valid` = true if at least one file exists (or if affected_files is empty — no constraint)
 /// - `missing` = list of files that don't exist on disk
 ///
+/// Relative paths are looked up under `cwd`, then under its parent (the workspace
+/// root of a multi-repo plan).
+///
 /// Pure function — no side effects.
 pub fn validate_affected_files(affected_files: &[String], cwd: &str) -> (bool, Vec<String>) {
     if affected_files.is_empty() {
@@ -155,13 +158,19 @@ pub fn validate_affected_files(affected_files: &[String], cwd: &str) -> (bool, V
     let mut at_least_one_exists = false;
 
     for file in affected_files {
-        let full_path = if std::path::Path::new(file).is_absolute() {
-            std::path::PathBuf::from(file)
-        } else {
-            cwd_path.join(file)
-        };
+        let file_path = std::path::Path::new(file);
+        // A relative path is resolved from the run's cwd first. Plans spanning
+        // several repositories (backend/, frontend/, nexus/...) write their paths
+        // relative to the WORKSPACE ROOT, i.e. the parent of the repo the run was
+        // started in: without this fallback every such task is wrongly `blocked`.
+        let exists = file_path.is_absolute() && file_path.exists()
+            || !file_path.is_absolute()
+                && (cwd_path.join(file_path).exists()
+                    || cwd_path
+                        .parent()
+                        .is_some_and(|root| root.join(file_path).exists()));
 
-        if full_path.exists() {
+        if exists {
             at_least_one_exists = true;
         } else {
             missing.push(file.clone());
@@ -6234,6 +6243,24 @@ mod tests {
         assert!(valid2);
         assert_eq!(missing2.len(), 1);
         assert_eq!(missing2[0], "nonexistent/bar.rs");
+    }
+
+    #[test]
+    fn test_validate_affected_files_resolves_from_workspace_root() {
+        // Multi-repo plan: run started in <root>/frontend, paths written as
+        // "backend/..." relative to <root>.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("backend/src")).unwrap();
+        std::fs::create_dir_all(root.path().join("frontend")).unwrap();
+        std::fs::write(root.path().join("backend/src/lib.rs"), "").unwrap();
+        let cwd = root.path().join("frontend");
+        let files = vec![
+            "backend/src/lib.rs".to_string(),
+            "backend/ghost.rs".to_string(),
+        ];
+        let (valid, missing) = validate_affected_files(&files, cwd.to_str().unwrap());
+        assert!(valid, "workspace-root-relative path must count as existing");
+        assert_eq!(missing, vec!["backend/ghost.rs".to_string()]);
     }
 
     // === Pure function tests: should_step_guard_trigger ===
