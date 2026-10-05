@@ -858,7 +858,7 @@
           "cli_session_id": "cli-session-0001",
           "degraded_features": [
             "hooks",
-            "retry"
+            "message_queue"
           ],
           "engine": "agent",
           "mcp_servers": [

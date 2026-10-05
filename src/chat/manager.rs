@@ -11255,7 +11255,6 @@ mod tests {
             "hooks",
             "message_queue",
             "auto_continue",
-            "retry",
             "compaction",
             "nats",
             "images",
@@ -11310,7 +11309,6 @@ mod tests {
             "hooks",
             "message_queue",
             "auto_continue",
-            "retry",
             "nats",
             "enrichment",
         ] {

@@ -112,8 +112,8 @@ fn retry_delay_ms(error: &ProviderError, attempt: u32) -> u64 {
 }
 
 /// What a session on the agent engine does NOT do, as the identifiers the
-/// frontend knows (`hooks`, `message_queue`, `auto_continue`, `retry`,
-/// `compaction`, `nats`, `enrichment`, `images`).
+/// frontend knows (`hooks`, `message_queue`, `auto_continue`, `compaction`,
+/// `nats`, `enrichment`, `images`).
 ///
 /// Two sources, kept apart on purpose:
 /// - what THIS ENGINE (the backend) has not ported, whatever the provider can do:
@@ -122,11 +122,11 @@ fn retry_delay_ms(error: &ProviderError, attempt: u32) -> u64 {
 /// - what THE SESSION's capabilities say it cannot do: `images`, and `compaction`
 ///   when the provider emits no compaction signal.
 pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
+    // `retry` is NOT listed: the engine retries a retryable `done.error` (B15).
     let mut missing = vec![
         "hooks",
         "message_queue",
         "auto_continue",
-        "retry",
         "nats",
         "enrichment",
     ];
@@ -817,6 +817,17 @@ mod mask_tests {
         assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 1), 1000);
         assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 3), 4000);
         assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 20), 30_000);
+    }
+
+    /// VERIFIER: the engine retries (B15), so `retry` must not be announced as missing.
+    #[test]
+    fn verifier_degraded_features_does_not_claim_retry_is_missing() {
+        let caps = Capabilities::none();
+        assert!(
+            !degraded_features(&caps).iter().any(|f| f == "retry"),
+            "the agent engine retries a retryable done.error: {:?}",
+            degraded_features(&caps)
+        );
     }
 
     #[test]
