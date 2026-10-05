@@ -235,9 +235,13 @@ pub fn sdk_open_error(context: &str, err: nexus_claude::SdkError) -> anyhow::Err
 /// `resume_session`, when the error chain carries a typed cause. `None` means
 /// "not an opening failure we can name" — the caller answers 500.
 pub fn classify_open_error(err: &anyhow::Error, provider_id: Option<&str>) -> Option<OpenFailure> {
-    err.chain()
-        .find_map(|cause| cause.downcast_ref::<ProviderError>())
-        .map(|typed| open_failure(typed, provider_id))
+    err.chain().find_map(|cause| {
+        if let Some(typed) = cause.downcast_ref::<ProviderError>() {
+            Some(open_failure(typed, provider_id))
+        } else {
+            cause.downcast_ref::<ResolveError>().map(resolve_failure)
+        }
+    })
 }
 
 pub fn resolve_failure(err: &ResolveError) -> OpenFailure {

@@ -352,6 +352,45 @@ pub fn resolve(
     }
 }
 
+/// Catalog used until the instance registry is wired in: the built-in
+/// `claude-code` instance is the only one that exists, and it is always usable
+/// (its health is reported at open time by the typed opening errors).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BuiltinCatalog;
+
+impl InstanceCatalog for BuiltinCatalog {
+    fn exists(&self, provider_id: &str) -> bool {
+        provider_id == CLAUDE_CODE
+    }
+    fn is_healthy(&self, _provider_id: &str) -> bool {
+        true
+    }
+    fn is_allowed_for_project(&self, _provider_id: &str) -> bool {
+        true
+    }
+}
+
+/// Resolves the provider of a pilot session being opened or resumed.
+///
+/// - `stored` is the provider persisted on an existing session (`None` for a
+///   session written before the harness existed, which is `claude-code`).
+/// - `requested` is the explicit `provider` of the request.
+pub fn resolve_for_open(
+    stored: Option<&str>,
+    is_existing_session: bool,
+    requested: Option<&str>,
+    catalog: &dyn InstanceCatalog,
+) -> Result<ProviderChoice, ResolveError> {
+    let session = is_existing_session
+        .then(|| Candidate::new(stored.unwrap_or(CLAUDE_CODE), None));
+    let mut input = ResolveInput::empty(Role::Pilot);
+    input.session = session.as_ref();
+    input.request = requested
+        .filter(|id| !id.is_empty())
+        .map(|id| Candidate::new(id, None));
+    resolve(&input, catalog)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,5 +795,32 @@ mod tests {
             ResolveError::NoProvider.to_string(),
             "no provider is configured"
         );
+    }
+
+    #[test]
+    fn open_without_any_choice_is_claude_code() {
+        let c = resolve_for_open(None, false, None, &BuiltinCatalog).unwrap();
+        assert_eq!(c.provider_id, CLAUDE_CODE);
+        assert_eq!(c.routed_by, RoutedBy::BuiltinClaudeCode);
+    }
+
+    #[test]
+    fn open_names_an_unregistered_provider_is_unknown() {
+        let e = resolve_for_open(None, false, Some("deepseek"), &BuiltinCatalog).unwrap_err();
+        assert_eq!(e.code(), "provider_unknown");
+    }
+
+    #[test]
+    fn an_existing_legacy_session_is_claude_code_and_frozen() {
+        let c = resolve_for_open(None, true, None, &BuiltinCatalog).unwrap();
+        assert_eq!((c.provider_id.as_str(), c.routed_by), (CLAUDE_CODE, RoutedBy::Session));
+        let e = resolve_for_open(None, true, Some("deepseek"), &BuiltinCatalog).unwrap_err();
+        assert_eq!(e.code(), "provider_conflict");
+    }
+
+    #[test]
+    fn naming_claude_code_explicitly_is_a_request_choice() {
+        let c = resolve_for_open(None, false, Some(CLAUDE_CODE), &BuiltinCatalog).unwrap();
+        assert_eq!(c.routed_by, RoutedBy::Request);
     }
 }

@@ -94,6 +94,13 @@ pub async fn create_session(
         Uuid::parse_str(&sid)
             .map_err(|_| AppError::BadRequest("Invalid session_id UUID".to_string()))?;
 
+        chat_manager
+            .check_provider_binding(&sid, request.provider.as_deref())
+            .await
+            .map_err(|e| {
+                AppError::from_open_error(e, Some(crate::chat::provider::resolver::CLAUDE_CODE))
+            })?;
+
         if chat_manager.is_session_active(&sid).await {
             // 1. Session is local — send directly into the running CLI
             chat_manager
@@ -297,6 +304,9 @@ fn session_node_to_response(s: crate::neo4j::models::ChatSessionNode) -> ChatSes
         linked_tasks: Vec::new(),
         linked_rfcs: Vec::new(),
         activity: None,
+        provider_id: s.provider_id,
+        capabilities: None,
+        routed_by: s.routed_by,
     }
 }
 
@@ -482,7 +492,13 @@ pub async fn get_session(
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Session {} not found", session_id)))?;
 
+    // The frozen capability snapshot rides on the single-session read only.
+    let capabilities = node
+        .capabilities
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
     let mut session = session_node_to_response(node);
+    session.capabilities = capabilities;
 
     // Enrich with linked entities (best-effort — don't fail if enrichment fails)
     if let Ok(links) = neo4j.get_session_links(session_id).await {

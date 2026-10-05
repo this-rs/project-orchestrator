@@ -196,6 +196,20 @@ pub struct ChatSessionNode {
     /// None/empty for normal user-initiated sessions.
     #[serde(default)]
     pub spawned_by: Option<String>,
+    /// Provider instance serving this session (`claude-code` when absent, which
+    /// is every session written before the harness existed). Frozen at open.
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    /// Precedence level that chose the provider/model (A16), the serialised
+    /// name of `chat::provider::RoutedBy`. Persisted so a resume never re-resolves.
+    #[serde(default)]
+    pub routed_by: Option<String>,
+    /// Capability snapshot frozen at open (A4), JSON.
+    #[serde(default)]
+    pub capabilities: Option<String>,
+    /// Opaque provider resume token (A3), JSON.
+    #[serde(default)]
+    pub resume_token: Option<String>,
 }
 
 // ============================================================================
@@ -3389,6 +3403,10 @@ mod tests {
             permission_mode: None,
             add_dirs: Some(vec!["/dir/a".to_string(), "/dir/b".to_string()]),
             spawned_by: None,
+            provider_id: None,
+            routed_by: None,
+            capabilities: None,
+            resume_token: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -3417,6 +3435,10 @@ mod tests {
             permission_mode: None,
             add_dirs: None,
             spawned_by: None,
+            provider_id: None,
+            routed_by: None,
+            capabilities: None,
+            resume_token: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();

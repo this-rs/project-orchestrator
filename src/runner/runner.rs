@@ -3013,6 +3013,7 @@ impl PlanRunner {
             cwd: cwd.to_string(),
             project_slug: project_slug.map(|s| s.to_string()),
             model: None,
+            provider: None,
             permission_mode: Some("bypassPermissions".to_string()),
             add_dirs: None,
             workspace_slug: None,
@@ -5191,6 +5192,7 @@ mod tests {
         let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
         let search: Arc<dyn SearchStore> = Arc::new(MockSearchStore::new());
         let chat_config = ChatConfig {
+            provider_path: Default::default(),
             mcp_server_path: std::path::PathBuf::from("/dev/null"),
             default_model: "test".into(),
             max_sessions: 1,
@@ -5753,6 +5755,7 @@ mod tests {
         let graph: Arc<dyn GraphStore> = mock_graph.clone();
         let search: Arc<dyn SearchStore> = Arc::new(MockSearchStore::new());
         let chat_config = ChatConfig {
+            provider_path: Default::default(),
             mcp_server_path: std::path::PathBuf::from("/dev/null"),
             default_model: "test".into(),
             max_sessions: 1,

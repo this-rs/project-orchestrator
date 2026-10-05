@@ -309,6 +309,7 @@ async fn execute_via_agent(
         cwd: cwd.to_string(),
         project_slug: None,
         model: None,
+        provider: None,
         permission_mode: Some("bypassPermissions".to_string()),
         add_dirs: None,
         workspace_slug: None,

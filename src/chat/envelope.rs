@@ -521,6 +521,7 @@ mod tests {
             cwd: cwd.into(),
             project_slug: None,
             model: None,
+            provider: None,
             permission_mode: mode.map(str::to_string),
             add_dirs: None,
             workspace_slug: None,

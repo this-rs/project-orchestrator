@@ -11,16 +11,18 @@
 %%   src/chat/provider/resolver.rs — Role, RoutedBy, Candidate, ResolveInput, InstanceCatalog,
 %%                                   ResolveError, resolve
 %%   src/chat/provider/endpoint_guard.rs — validate_url, classify_ip, validate_resolved, validate_endpoint_with, origin_of, refuse_redirect, redact_error_body
-%%   src/chat/provider/errors.rs   — OpenFailure, open_failure, resolve_failure
+%%   src/chat/provider/errors.rs   — OpenFailure, open_failure, resolve_failure, classify_open_error (ProviderError et ResolveError)
+%%   src/chat/provider/event_map.rs — EventMapper, out_of_band_to_chat_events 
 %%   src/chat/provider/credentials.rs — VaultCredentialResolver ; src/vault/service.rs — read_for_provider
 %%   src/chat/provider/policy.rs   — parse_mode, to_legacy, neutral_name, legacy_name,
 %%                                   tool_policy, wire_tool_policy
 %%   nexus_claude::agent           — ProviderError, PolicyMode, ToolPolicy (contrat nexus)
 %% ---
 %% NON ETABLI :
-%%   resolve / tool_policy / VaultCredentialResolver n'ont AUCUN appelant de production
-%%   (tâches B13a, B32, B33, B25) ; seul open_failure est branché (create_session REST) ;
-%%   InstanceCatalog n'a pas d'implémentation réelle (attend le registre nexus + B25).
+%%   tool_policy / VaultCredentialResolver / EventMapper / endpoint_guard n'ont AUCUN appelant de
+%%   production (tâches B13a, B32, B33, B25) ; open_failure et resolve_for_open (BuiltinCatalog)
+%%   sont branchés ; InstanceCatalog n'a pas d'autre implémentation que BuiltinCatalog
+%%   (attend le registre nexus + B25).
 %% ---
 %% LEGENDE
 %%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans test / décidé non écrit
@@ -53,6 +55,8 @@ flowchart TD
         EXEC -- "chaîne épuisée" --> BUILTIN
     end
 
+    OPENRES["✅ resolve_for_open(stocké, session existante ?, demandé, catalogue) : le chemin d'ouverture d'une session pilote ;<br/>BuiltinCatalog = seule instance claude-code (registre nexus pas encore branché) ;<br/>appelé par ChatManager::create_session / resume_session / check_provider_binding<br/>test : open_without_any_choice_is_claude_code, open_names_an_unregistered_provider_is_unknown,<br/>an_existing_legacy_session_is_claude_code_and_frozen, naming_claude_code_explicitly_is_a_request_choice"]
+    OPENRES --> SESSION
     GUARD["✅ endpoint_guard.rs (A36, B29) : validate_url (https hors boucle locale, http seulement vers un littéral loopback,<br/>jamais d'identifiants dans l'URL, hôte exigé — contrôle sur le texte brut : https:///v1 n'est pas l'hôte v1) ;<br/>classify_ip (privé, lien-local, métadonnées cloud, IPv4 mappée en IPv6) ; validate_resolved : TOUTES les adresses publiques (rebinding) ;<br/>refuse_redirect (3xx refusé) ; redact_error_body ; origin_of = identité du consentement (A28)<br/>test : 39 tests de endpoint_guard (validate_url_refuses_missing_host_and_garbage, validate_url_refuses_other_schemes, ...)<br/>🟠 aucun appelant de production : le CRUD d'instances (B25) et la sonde (B28) l'appelleront"]
     CATALOG["🟠 InstanceCatalog (exists, is_healthy, is_allowed_for_project) :<br/>trait seulement — implémentation avec le registre nexus et le consentement (B25, B3)"]
     CATALOG --> LEVELS
@@ -77,6 +81,10 @@ flowchart TD
 
     WIRED["✅ branché sur le chemin actuel (Claude Code) : ChatManager enveloppe les erreurs SDK d'ouverture<br/>par sdk_open_error (ProviderError dans la chaîne anyhow) ; chat_handlers::create_session →<br/>AppError::from_open_error → AppError::Provider(OpenFailure) : statut + code + provider_id<br/>un CLI absent répond 424 cli_not_found au lieu d'un 500 muet<br/>test : a_missing_cli_answers_424_with_a_code_instead_of_a_mute_500,<br/>a_missing_cli_is_cli_not_found_424_not_a_mute_500<br/>🟠 le chemin WebSocket (reprise par message) n'émet pas encore le code"]
     OPEN --> WIRED
+    subgraph evmap["event_map.rs — AgentEvent → ChatEvent (agent-contract §14)"]
+        EVMAP["✅ EventMapper::map (tour) et out_of_band_to_chat_events (hors tour, regroupés par seq → background_output) ;<br/>tool_call incomplet puis complet → tool_use puis tool_use_input_resolved ; Done sans subtype → sous-type hérité ;<br/>coût inconnu → cost_usd null (jamais 0) ; processus mort → session_error ; autres erreurs : texte écrit dans errors.rs<br/>(aucune URL ni identifiant) ; événement inconnu → rien<br/>test : replay_gives_the_same_chat_events_as_the_legacy_path (21 messages : map_message puis EventMapper == message_to_events),<br/>an_announced_tool_call_completes_as_input_resolved, a_dead_process_is_a_session_error_and_other_failures_leak_nothing,<br/>out_of_turn_messages_regroup_by_message_number<br/>🟠 aucun appelant de production (ChatManager sur AgentSession : tranche suivante)"]
+    end
+    NEXUS -.-> EVMAP
     subgraph creds["credentials.rs — VaultCredentialResolver (CredentialResolver nexus)"]
         CRED["✅ vault:&lt;nom&gt; → VaultService::read_for_provider sous grant Provider(instance) ;<br/>vault verrouillé → credentials_locked (pas de repli) ; pas de grant → auth_required + quoi faire ;<br/>env:&lt;VAR&gt; lu du serveur et enregistré au masqueur, SERVER_ONLY_SECRETS refusés ; none → aucun<br/>test : a_locked_vault_is_credentials_locked_never_no_credential,<br/>the_servers_own_secrets_cannot_be_used_as_a_provider_credential,<br/>the_server_reads_a_provider_key_only_under_a_provider_grant_for_that_instance (vault)"]
     end

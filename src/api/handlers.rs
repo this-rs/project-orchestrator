@@ -1141,6 +1141,7 @@ fn delegation_chat_request(
         cwd,
         project_slug,
         model: None,
+        provider: None,
         permission_mode: Some("bypassPermissions".to_string()),
         add_dirs: None,
         workspace_slug: None,

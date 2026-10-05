@@ -2968,6 +2968,17 @@ impl ChatManager {
             }
         }
 
+        // Which provider serves this session (A16). Until the instance registry
+        // is wired in only the built-in `claude-code` exists; naming another one
+        // is a typed 404 before anything is spawned or persisted.
+        let provider_choice = super::provider::resolver::resolve_for_open(
+            None,
+            false,
+            request.provider.as_deref(),
+            &super::provider::resolver::BuiltinCatalog,
+        )
+        .map_err(anyhow::Error::new)?;
+
         let session_id = Uuid::new_v4();
         let model = self.resolve_model(request.model.as_deref());
 
@@ -3063,6 +3074,10 @@ impl ChatManager {
                 Some(resolved_add_dirs.clone())
             },
             spawned_by: request.spawned_by.clone(),
+            provider_id: Some(provider_choice.provider_id.clone()),
+            routed_by: Some(provider_choice.routed_by.as_str().to_string()),
+            capabilities: None,
+            resume_token: None,
         };
         self.graph
             .create_chat_session(&session_node)
@@ -6155,6 +6170,32 @@ impl ChatManager {
             });
     }
 
+    /// Refuses a request whose `provider` differs from the one the session was
+    /// opened on (409 `provider_conflict`). A session that does not exist yet,
+    /// or a request that names no provider, passes.
+    pub async fn check_provider_binding(
+        &self,
+        session_id: &str,
+        requested: Option<&str>,
+    ) -> Result<()> {
+        let Some(requested) = requested.filter(|p| !p.is_empty()) else {
+            return Ok(());
+        };
+        let Ok(uuid) = Uuid::parse_str(session_id) else {
+            return Ok(());
+        };
+        if let Some(node) = self.graph.get_chat_session(uuid).await? {
+            super::provider::resolver::resolve_for_open(
+                node.provider_id.as_deref(),
+                true,
+                Some(requested),
+                &super::provider::resolver::BuiltinCatalog,
+            )
+            .map_err(anyhow::Error::new)?;
+        }
+        Ok(())
+    }
+
     pub async fn resume_session(
         &self,
         session_id: &str,
@@ -6179,6 +6220,25 @@ impl ChatManager {
                     &session_node.cwd,
                 )
                 .await;
+        }
+
+        // The provider is frozen at open (A16): a resume never re-resolves. The
+        // legacy path only drives Claude Code, so a session bound to another
+        // provider cannot be resumed here.
+        let frozen = super::provider::resolver::resolve_for_open(
+            session_node.provider_id.as_deref(),
+            true,
+            None,
+            &super::provider::resolver::BuiltinCatalog,
+        )
+        .map_err(anyhow::Error::new)?;
+        if frozen.provider_id != super::provider::resolver::CLAUDE_CODE {
+            return Err(anyhow::Error::new(
+                super::provider::resolver::ResolveError::Unavailable {
+                    provider_id: frozen.provider_id,
+                    role: super::provider::resolver::Role::Pilot,
+                },
+            ));
         }
 
         let cli_session_id = session_node.cli_session_id.as_deref();
@@ -8371,6 +8431,7 @@ mod tests {
 
     fn test_config() -> ChatConfig {
         ChatConfig {
+            provider_path: Default::default(),
             mcp_server_path: PathBuf::from("/usr/bin/mcp_server"),
             default_model: "claude-sonnet-4-6".into(),
             max_sessions: 10,
@@ -9750,6 +9811,7 @@ mod tests {
             cwd: "/tmp/test".into(),
             project_slug: None,
             model: None,
+            provider: None,
             permission_mode: Some("bypassPermissions".into()),
             add_dirs: None,
             workspace_slug: None,
@@ -9841,6 +9903,62 @@ mod tests {
         let sessions: Vec<_> = graph.chat_sessions.read().await.values().cloned().collect();
         let a = crate::chat::attachment::attach(&sessions, &[]);
         assert_eq!(a.unattached.len(), sessions.len());
+    }
+
+    #[tokio::test]
+    async fn create_session_persists_the_provider_and_how_it_was_routed() {
+        let (manager, graph) = manager_with_mock();
+        // The CLI is not available in tests: only the persisted side matters.
+        let _ = manager
+            .create_session(&runner_request(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()))
+            .await;
+        let sessions: Vec<_> = graph.chat_sessions.read().await.values().cloned().collect();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].provider_id.as_deref(), Some("claude-code"));
+        assert_eq!(sessions[0].routed_by.as_deref(), Some("claude_code"));
+    }
+
+    #[tokio::test]
+    async fn create_session_naming_an_unknown_provider_is_refused_before_persisting() {
+        let (manager, graph) = manager_with_mock();
+        let mut req = runner_request(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        req.provider = Some("deepseek".into());
+        let err = manager.create_session(&req).await.unwrap_err();
+        let failure = crate::chat::provider::errors::classify_open_error(&err, None)
+            .expect("typed failure");
+        assert_eq!((failure.status, failure.code), (404, "provider_unknown"));
+        assert!(graph.chat_sessions.read().await.is_empty(), "nothing persisted");
+    }
+
+    #[tokio::test]
+    async fn a_request_for_another_provider_on_an_existing_session_is_a_409() {
+        let (manager, graph) = manager_with_mock();
+        let mut s = test_chat_session(None);
+        s.provider_id = Some("claude-code".into());
+        graph.create_chat_session(&s).await.unwrap();
+        let id = s.id.to_string();
+        manager.check_provider_binding(&id, None).await.unwrap();
+        manager.check_provider_binding(&id, Some("claude-code")).await.unwrap();
+        let err = manager
+            .check_provider_binding(&id, Some("deepseek"))
+            .await
+            .unwrap_err();
+        let failure = crate::chat::provider::errors::classify_open_error(&err, None).unwrap();
+        assert_eq!((failure.status, failure.code), (409, "provider_conflict"));
+    }
+
+    #[tokio::test]
+    async fn resuming_a_session_bound_to_a_non_claude_provider_is_unavailable_on_the_legacy_path() {
+        let (manager, graph) = manager_with_mock();
+        let mut s = test_chat_session(None);
+        s.provider_id = Some("deepseek".into());
+        graph.create_chat_session(&s).await.unwrap();
+        let err = manager
+            .resume_session(&s.id.to_string(), "hi", None)
+            .await
+            .unwrap_err();
+        let failure = crate::chat::provider::errors::classify_open_error(&err, None).unwrap();
+        assert_eq!(failure.code, "provider_unavailable");
     }
 
     #[tokio::test]
@@ -10232,6 +10350,10 @@ mod tests {
             permission_mode: None,
             add_dirs: None,
             spawned_by: None,
+            provider_id: None,
+            routed_by: None,
+            capabilities: None,
+            resume_token: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -10591,6 +10713,10 @@ mod tests {
             permission_mode: None,
             add_dirs: None,
             spawned_by: None,
+            provider_id: None,
+            routed_by: None,
+            capabilities: None,
+            resume_token: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -10622,6 +10748,10 @@ mod tests {
             permission_mode: None,
             add_dirs: None,
             spawned_by: None,
+            provider_id: None,
+            routed_by: None,
+            capabilities: None,
+            resume_token: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();

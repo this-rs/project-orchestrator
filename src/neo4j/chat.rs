@@ -67,7 +67,11 @@ impl Neo4jClient {
                     preview: $preview,
                     permission_mode: $permission_mode,
                     add_dirs: $add_dirs,
-                    spawned_by: $spawned_by
+                    spawned_by: $spawned_by,
+                    provider_id: $provider_id,
+                    routed_by: $routed_by,
+                    capabilities: $capabilities,
+                    resume_token: $resume_token
                 })
                 WITH s
                 OPTIONAL MATCH (p:Project {slug: $project_slug})
@@ -95,7 +99,11 @@ impl Neo4jClient {
                     preview: $preview,
                     permission_mode: $permission_mode,
                     add_dirs: $add_dirs,
-                    spawned_by: $spawned_by
+                    spawned_by: $spawned_by,
+                    provider_id: $provider_id,
+                    routed_by: $routed_by,
+                    capabilities: $capabilities,
+                    resume_token: $resume_token
                 })
                 "#,
             )
@@ -137,7 +145,20 @@ impl Neo4jClient {
                         serde_json::to_string(&session.add_dirs.clone().unwrap_or_default())
                             .unwrap_or_else(|_| "[]".to_string()),
                     )
-                    .param("spawned_by", session.spawned_by.clone().unwrap_or_default()),
+                    .param("spawned_by", session.spawned_by.clone().unwrap_or_default())
+                    .param(
+                        "provider_id",
+                        session.provider_id.clone().unwrap_or_default(),
+                    )
+                    .param("routed_by", session.routed_by.clone().unwrap_or_default())
+                    .param(
+                        "capabilities",
+                        session.capabilities.clone().unwrap_or_default(),
+                    )
+                    .param(
+                        "resume_token",
+                        session.resume_token.clone().unwrap_or_default(),
+                    ),
             )
             .await?;
         Ok(())
@@ -800,6 +821,10 @@ impl Neo4jClient {
         let permission_mode: String = node.get("permission_mode").unwrap_or_default();
         let add_dirs_json: String = node.get("add_dirs").unwrap_or_default();
         let spawned_by: String = node.get("spawned_by").unwrap_or_default();
+        // Harness fields: absent on every session written before the harness.
+        let non_empty = |key: &str| -> Option<String> {
+            node.get::<String>(key).ok().filter(|v| !v.is_empty())
+        };
 
         // Deserialize add_dirs from JSON string (backward compat: empty string → None)
         let add_dirs: Option<Vec<String>> = if add_dirs_json.is_empty() {
@@ -868,6 +893,10 @@ impl Neo4jClient {
             } else {
                 Some(spawned_by)
             },
+            provider_id: non_empty("provider_id"),
+            routed_by: non_empty("routed_by"),
+            capabilities: non_empty("capabilities"),
+            resume_token: non_empty("resume_token"),
         })
     }
 

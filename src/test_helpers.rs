@@ -538,6 +538,10 @@ pub fn test_chat_session(project_slug: Option<&str>) -> ChatSessionNode {
         permission_mode: None,
         add_dirs: None,
         spawned_by: None,
+        provider_id: None,
+        routed_by: None,
+        capabilities: None,
+        resume_token: None,
     }
 }
 

@@ -204,6 +204,10 @@ pub struct ChatRequest {
     /// Model override (default: from ChatConfig)
     #[serde(default)]
     pub model: Option<String>,
+    /// Provider instance to open the session on. Absent: resolved (A16). On an
+    /// existing session a different provider is a 409 `provider_conflict`.
+    #[serde(default)]
+    pub provider: Option<String>,
     /// Permission mode override for this session (default: from ChatConfig)
     /// Values: "default", "acceptEdits", "plan", "bypassPermissions"
     #[serde(default)]
@@ -977,6 +981,16 @@ pub struct ChatSession {
     /// stays exactly as small as it was before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<SessionActivity>,
+    /// Provider instance serving the session; absent means `claude-code`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// Capability snapshot frozen at open. Only carried by the single-session
+    /// read, never by listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<serde_json::Value>,
+    /// Which precedence level chose the provider (`session`, `request`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed_by: Option<String>,
 }
 
 /// What a chat session is doing *right now*, read from the live
@@ -2183,6 +2197,9 @@ mod tests {
             linked_tasks: Vec::new(),
             linked_rfcs: Vec::new(),
             activity: None,
+            provider_id: None,
+            capabilities: None,
+            routed_by: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -2401,6 +2418,9 @@ mod tests {
             linked_tasks: Vec::new(),
             linked_rfcs: Vec::new(),
             activity: None,
+            provider_id: None,
+            capabilities: None,
+            routed_by: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
