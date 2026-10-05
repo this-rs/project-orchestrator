@@ -97,6 +97,12 @@ pub struct ProviderChoice {
     pub model: Option<String>,
     /// Level that produced the choice.
     pub routed_by: RoutedBy,
+    /// Policy rule that applied or was shadowed (`chat`, `runner.simple`, ...).
+    #[serde(default)]
+    pub route_rule: Option<String>,
+    /// What a `shadow` policy would have chosen (provider, model); never applied.
+    #[serde(default)]
+    pub shadow: Option<(String, Option<String>)>,
 }
 
 /// A provider (and optional model) proposed by one precedence level.
@@ -278,6 +284,8 @@ pub fn resolve(
             provider_id: session.provider_id.clone(),
             model: session.model.clone(),
             routed_by: RoutedBy::Session,
+            route_rule: None,
+            shadow: None,
         });
     }
 
@@ -314,6 +322,8 @@ pub fn resolve(
                     } else {
                         routed_by
                     },
+                    route_rule: None,
+                    shadow: None,
                 });
             }
             Err(error) => {
@@ -343,6 +353,8 @@ pub fn resolve(
             } else {
                 RoutedBy::BuiltinClaudeCode
             },
+            route_rule: None,
+            shadow: None,
         });
     }
     match first_skip {

@@ -7587,6 +7587,12 @@ impl GraphStore for MockGraphStore {
             task_id: None,
             depth: 0,
             created_at: Some(chrono::Utc::now()),
+            provider_id: None,
+            model: None,
+            cost_usd: None,
+            subtree_cost_usd: None,
+            max_depth: None,
+            max_children: None,
         }])
     }
 

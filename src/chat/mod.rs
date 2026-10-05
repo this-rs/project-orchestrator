@@ -37,6 +37,7 @@ pub mod provider;
 pub mod routing;
 pub(crate) mod skill_hook;
 pub mod stages;
+pub mod tree;
 pub mod types;
 pub mod viz;
 pub mod viz_builder;

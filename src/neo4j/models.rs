@@ -227,6 +227,24 @@ pub struct SessionTreeNode {
     pub task_id: Option<Uuid>,
     pub depth: u32,
     pub created_at: Option<DateTime<Utc>>,
+    /// Provider instance of the session; absent = claude-code. Filled by the API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// Model of the session. Filled by the API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Cost of this session alone; absent = unknown. Filled by the API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// Cost of this session and every descendant, only when ALL are known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtree_cost_usd: Option<f64>,
+    /// Depth limit of a delegation tree (root node only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<u32>,
+    /// Live children limit per session (root node only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_children: Option<u32>,
 }
 
 /// Lightweight session info for run-scoped queries.

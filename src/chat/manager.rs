@@ -3177,6 +3177,24 @@ impl ChatManager {
             .await
             .context("Failed to persist chat session")?;
 
+        // The policy rule that applied, and what a `shadow` policy would have
+        // chosen, are kept for the execution record (A22): the runner reads
+        // them back. A write that fails loses a note, never a session.
+        if provider_choice.route_rule.is_some() || provider_choice.shadow.is_some() {
+            let note = serde_json::json!({
+                "route_rule": provider_choice.route_rule,
+                "shadow_provider": provider_choice.shadow.as_ref().map(|s| &s.0),
+                "shadow_model": provider_choice.shadow.as_ref().and_then(|s| s.1.as_ref()),
+            });
+            if let Err(e) = self
+                .graph
+                .put_llm_setting(&format!("routing:{session_id}"), "note", &note.to_string())
+                .await
+            {
+                warn!(session_id = %session_id, error = %e, "Failed to record the routing note (non-fatal)");
+            }
+        }
+
         // If this session was spawned by another, create the SPAWNED_BY relation in Neo4j
         // and extract protocol FSM context (run_id + state) for trajectory tagging.
         let spawned_ctx = request.spawned_by.as_deref().and_then(parse_spawned_by);
@@ -8080,14 +8098,39 @@ impl ChatManager {
         };
         let store_catalog =
             catalog::StoreCatalog::new(instances, &consents, project_slug.is_some());
-        let input = catalog::resolve_input(
+        let policy: settings::ModelPolicy = self
+            .graph
+            .get_llm_setting(settings::GLOBAL, settings::POLICY_KEY)
+            .await?
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        let pick = catalog::policy_pick(&policy, role, request.task_class.as_deref(), &aliases);
+        let mut input = catalog::resolve_input(
             role,
             request.provider.as_deref(),
+            request.task_alias.as_deref(),
+            request
+                .run_provider
+                .as_deref()
+                .map(|p| (p, request.run_model.as_deref())),
             &global,
             &project,
             &aliases,
         );
-        let choice = resolver::resolve(&input, &store_catalog).map_err(anyhow::Error::new)?;
+        // `enforce` puts the policy's candidate where the global rule would be;
+        // `shadow` changes nothing and is only recorded (A19).
+        if let Some(p) = pick.as_ref().filter(|p| p.enforced) {
+            input.global_rule = Some(p.candidate.clone());
+        }
+        let mut choice = resolver::resolve(&input, &store_catalog).map_err(anyhow::Error::new)?;
+        if let Some(p) = &pick {
+            if p.enforced && choice.routed_by == resolver::RoutedBy::GlobalRule {
+                choice.route_rule = Some(p.rule.clone());
+            } else if !p.enforced {
+                choice.shadow = Some((p.candidate.provider_id.clone(), p.candidate.model.clone()));
+                choice.route_rule = Some(p.rule.clone());
+            }
+        }
         if self.config.provider_path != super::config::ProviderPath::Agent
             && choice.provider_id != resolver::CLAUDE_CODE
         {
@@ -8257,6 +8300,7 @@ impl ChatManager {
         user_claims: Option<&crate::auth::jwt::Claims>,
         session_id: &str,
         third_party: bool,
+        max_tokens: Option<u64>,
     ) -> Result<nexus_claude::agent::SessionSpec> {
         use nexus_claude::agent::{
             EnvSpec, McpServerSpec, SessionSpec, SystemPromptMode, SystemPromptSpec,
@@ -8305,6 +8349,7 @@ impl ChatManager {
         );
         spec.extra_dirs = add_dirs.iter().map(std::path::PathBuf::from).collect();
         spec.max_turns = u32::try_from(self.config.max_turns).ok();
+        spec.limits.max_tokens = max_tokens;
         spec.env = EnvSpec {
             inherit: Self::child_env_inherit_names(),
             set: Default::default(),
@@ -8326,16 +8371,31 @@ impl ChatManager {
     ) -> Result<CreateSessionResponse> {
         let provider = self.provider_for(provider_id).await?;
         let sid = session_id.to_string();
+        // A run (an executor) on a third-party provider never gets `Trust`: it
+        // runs under `ask` with the restricted profile (A35). A pilot asking for
+        // `Trust` is refused instead (authorize_provider_use), never downgraded.
+        let permission_mode = match request.permission_mode.as_deref() {
+            Some(mode)
+                if provider_id != super::provider::resolver::CLAUDE_CODE
+                    && request.spawned_by.is_some()
+                    && super::provider::policy::parse_mode(mode)
+                        .is_some_and(|p| p.neutral == nexus_claude::agent::PolicyMode::Trust) =>
+            {
+                Some("default")
+            }
+            other => other,
+        };
         let spec = self
             .build_agent_spec(
                 &request.cwd,
                 model,
                 system_prompt,
-                request.permission_mode.as_deref(),
+                permission_mode,
                 add_dirs,
                 request.user_claims.as_ref(),
                 &sid,
                 provider_id != super::provider::resolver::CLAUDE_CODE,
+                request.max_tokens,
             )
             .await?;
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
@@ -8444,6 +8504,7 @@ impl ChatManager {
                 user_claims,
                 &sid,
                 provider_id != super::provider::resolver::CLAUDE_CODE,
+                None,
             )
             .await?;
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
@@ -10490,6 +10551,11 @@ mod tests {
             project_slug: None,
             model: None,
             provider: None,
+            task_alias: None,
+            run_provider: None,
+            run_model: None,
+            max_tokens: None,
+            task_class: None,
             permission_mode: Some("bypassPermissions".into()),
             add_dirs: None,
             workspace_slug: None,

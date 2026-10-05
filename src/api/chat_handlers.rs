@@ -533,12 +533,30 @@ pub async fn get_session_tree(
     State(state): State<OrchestratorState>,
     Path(session_id): Path<Uuid>,
 ) -> Result<Json<Vec<crate::neo4j::models::SessionTreeNode>>, AppError> {
-    let tree = state
+    let mut tree = state
         .orchestrator
         .neo4j()
         .get_session_tree(&session_id.to_string())
         .await
         .map_err(AppError::Internal)?;
+    // Which provider and model ran each node and what it cost, read from the
+    // sessions themselves; a session that cannot be read stays unannotated.
+    let mut info = std::collections::HashMap::new();
+    for node in &tree {
+        if let Ok(id) = node.session_id.parse::<Uuid>() {
+            if let Ok(Some(s)) = state.orchestrator.neo4j().get_chat_session(id).await {
+                info.insert(
+                    node.session_id.clone(),
+                    crate::chat::tree::NodeInfo {
+                        provider_id: s.provider_id,
+                        model: Some(s.model),
+                        cost_usd: s.total_cost_usd,
+                    },
+                );
+            }
+        }
+    }
+    crate::chat::tree::annotate(&mut tree, &info);
     Ok(Json(tree))
 }
 
@@ -662,6 +680,10 @@ pub struct InterruptRequest {
     /// background subprocesses (`Bash`/`Monitor`) alive.
     #[serde(default)]
     pub scope: Option<String>,
+    /// Also stop every descendant session (delegations). The answer then
+    /// carries `cascade: { stopped, total }`.
+    #[serde(default)]
+    pub cascade: Option<bool>,
 }
 
 /// POST /api/chat/sessions/{id}/interrupt — End the current turn of a
@@ -700,9 +722,13 @@ pub async fn interrupt_session(
         AppError::NotFound("chat_manager not configured on this server".to_string())
     })?;
 
-    let scope = body
-        .and_then(|Json(b)| b.scope)
-        .unwrap_or_else(|| "turn_and_tools".to_string());
+    let (scope, cascade) = match body {
+        Some(Json(b)) => (
+            b.scope.unwrap_or_else(|| "turn_and_tools".to_string()),
+            b.cascade.unwrap_or(false),
+        ),
+        None => ("turn_and_tools".to_string(), false),
+    };
 
     let kill_tools = match scope.as_str() {
         "turn_and_tools" => true,
@@ -714,12 +740,54 @@ pub async fn interrupt_session(
         }
     };
 
+    // Descendants first (leaves before parents), so a parent never gets the
+    // time to start a new child while its subtree is being stopped.
+    let cascade_report = if cascade {
+        let mut descendants = Vec::new();
+        let mut frontier = vec![session_id];
+        let mut seen = std::collections::HashSet::from([session_id]);
+        while let Some(parent) = frontier.pop() {
+            let children = state
+                .orchestrator
+                .neo4j()
+                .get_session_children(parent)
+                .await
+                .map_err(AppError::Internal)?;
+            for child in children {
+                if seen.insert(child.id) {
+                    descendants.push(child.id);
+                    frontier.push(child.id);
+                }
+            }
+        }
+        let total = descendants.len();
+        let mut stopped = 0usize;
+        for id in descendants.into_iter().rev() {
+            let sid = id.to_string();
+            if chat_manager.is_session_active(&sid).await
+                && chat_manager
+                    .interrupt_scoped(&sid, kill_tools)
+                    .await
+                    .is_ok()
+            {
+                stopped += 1;
+            }
+        }
+        Some(serde_json::json!({ "stopped": stopped, "total": total }))
+    } else {
+        None
+    };
+
     let outcome = chat_manager
         .interrupt_scoped(&session_id.to_string(), kill_tools)
         .await
         .map_err(AppError::Internal)?;
 
-    Ok(Json(serde_json::to_value(&outcome).unwrap_or_default()))
+    let mut body = serde_json::to_value(&outcome).unwrap_or_default();
+    if let (Some(report), Some(obj)) = (cascade_report, body.as_object_mut()) {
+        obj.insert("cascade".to_string(), report);
+    }
+    Ok(Json(body))
 }
 
 // ============================================================================
@@ -2138,6 +2206,121 @@ mod tests {
         let bad = serde_json::json!({"mode": "enforce", "rules": {"chat": "ghost"}, "fallback": [], "caps": {}});
         let (status, _) = call_json(&app, auth_json("PUT", "/api/chat/model-policy", bad)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ====================================================================
+    // Run routing, task alias, interrupt cascade, tree annotation
+    // ====================================================================
+
+    #[tokio::test]
+    async fn a_task_model_alias_must_be_defined_is_stored_and_shown_and_can_be_cleared() {
+        let h = action_harness(None).await;
+        let plan = crate::test_helpers::test_plan();
+        h.graph.create_plan(&plan).await.unwrap();
+        let task = crate::test_helpers::test_task();
+        h.graph.create_task(plan.id, &task).await.unwrap();
+        let uri = format!("/api/tasks/{}", task.id);
+        let patch = |body: serde_json::Value| {
+            Request::builder()
+                .method("PATCH")
+                .uri(uri.clone())
+                .header("content-type", "application/json")
+                .header("authorization", test_bearer_token())
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        // Not defined: refused.
+        let (status, _) = call(&h.app, patch(serde_json::json!({"model_alias": "fast"}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Define it, then set it.
+        h.graph
+            .put_llm_setting(
+                "global",
+                "model_aliases",
+                &serde_json::json!([{"alias": "fast", "provider": "claude-code", "model": "m"}])
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        let (status, _) = call(&h.app, patch(serde_json::json!({"model_alias": "fast"}))).await;
+        assert!(status.is_success(), "{status}");
+        let (_, body) = call(&h.app, auth_get(&uri)).await;
+        assert_eq!(body["task"]["model_alias"], "fast");
+        // Empty clears it.
+        let (status, _) = call(&h.app, patch(serde_json::json!({"model_alias": ""}))).await;
+        assert!(status.is_success());
+        let (_, body) = call(&h.app, auth_get(&uri)).await;
+        assert!(body["task"].get("model_alias").is_none(), "{body}");
+        // An unknown task is a 404, nothing stored.
+        let ghost = Request::builder()
+            .method("PATCH")
+            .uri(format!("/api/tasks/{}", Uuid::new_v4()))
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(r#"{"model_alias":"fast"}"#))
+            .unwrap();
+        let (status, _) = call(&h.app, ghost).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_run_naming_an_unknown_provider_is_refused_before_it_starts() {
+        let h = action_harness(None).await;
+        let plan = crate::test_helpers::test_plan();
+        h.graph.create_plan(&plan).await.unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/plans/{}/run", plan.id))
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(
+                r#"{"cwd": ".", "provider": "ghost", "model": "m", "max_tokens": 1000}"#,
+            ))
+            .unwrap();
+        let (status, body) = call(&h.app, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    #[tokio::test]
+    async fn interrupt_with_cascade_stops_the_descendants_and_reports_the_count() {
+        let h = action_harness(None).await;
+        let parent = crate::test_helpers::test_chat_session(None);
+        let mut child = crate::test_helpers::test_chat_session(None);
+        child.spawned_by = Some(
+            serde_json::json!({"type": "delegation", "parent_session_id": parent.id.to_string()})
+                .to_string(),
+        );
+        let mut idle_child = crate::test_helpers::test_chat_session(None);
+        idle_child.spawned_by = child.spawned_by.clone();
+        for n in [&parent, &child, &idle_child] {
+            h.graph.create_chat_session(n).await.unwrap();
+        }
+        for n in [&parent, &child] {
+            test_support::insert_live_session_without_cli(&h.manager, &n.id.to_string()).await;
+        }
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/chat/sessions/{}/interrupt", parent.id))
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(
+                r#"{"scope": "turn_and_tools", "cascade": true}"#,
+            ))
+            .unwrap();
+        let (status, body) = call(&h.app, req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Two children persisted, one of them live: 1 of 2 stopped.
+        assert_eq!(body["cascade"]["total"], 2, "{body}");
+        assert_eq!(body["cascade"]["stopped"], 1, "{body}");
+        // Without the flag the answer has no cascade part (unchanged shape).
+        let plain = Request::builder()
+            .method("POST")
+            .uri(format!("/api/chat/sessions/{}/interrupt", parent.id))
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap();
+        let (_, body) = call(&h.app, plain).await;
+        assert!(body.get("cascade").is_none());
     }
 
     #[tokio::test]

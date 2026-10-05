@@ -751,6 +751,12 @@ impl Neo4jClient {
                 task_id: task_id_str.and_then(|s| s.parse().ok()),
                 depth: depth as u32,
                 created_at: created_at_str.and_then(|s| s.parse().ok()),
+                provider_id: None,
+                model: None,
+                cost_usd: None,
+                subtree_cost_usd: None,
+                max_depth: None,
+                max_children: None,
             });
         }
         Ok(nodes)

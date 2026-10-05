@@ -596,14 +596,26 @@ pub async fn add_task(
 pub async fn get_task(
     State(state): State<OrchestratorState>,
     Path(task_id): Path<Uuid>,
-) -> Result<Json<TaskDetails>, AppError> {
+) -> Result<Json<serde_json::Value>, AppError> {
     let details = state
         .orchestrator
         .plan_manager()
         .get_task_details(task_id)
         .await?
         .ok_or(AppError::NotFound("Task not found".into()))?;
-    Ok(Json(details))
+    let mut body = serde_json::to_value(&details).map_err(|e| AppError::Internal(e.into()))?;
+    // The alias lives in the provider settings: shown on the task, absent = inherits.
+    if let Ok(Some(alias)) = state
+        .orchestrator
+        .neo4j()
+        .get_llm_setting(&format!("task:{task_id}"), "model_alias")
+        .await
+    {
+        if let Some(task) = body.get_mut("task").and_then(|t| t.as_object_mut()) {
+            task.insert("model_alias".into(), serde_json::Value::String(alias));
+        }
+    }
+    Ok(Json(body))
 }
 
 /// Delete a task and all its related data
@@ -629,6 +641,40 @@ pub async fn update_task(
     Path(task_id): Path<Uuid>,
     Json(req): Json<UpdateTaskRequest>,
 ) -> Result<StatusCode, AppError> {
+    // The task's model alias (A16): it must name a defined alias; an empty
+    // string clears it. Stored in the provider settings, not on the task node.
+    if let Some(alias) = req.model_alias.as_deref() {
+        let graph = state.orchestrator.neo4j();
+        if state
+            .orchestrator
+            .neo4j()
+            .get_task(task_id)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            return Err(AppError::NotFound("Task not found".into()));
+        }
+        if alias.is_empty() {
+            let _ = graph
+                .delete_llm_setting(&format!("task:{task_id}"), "model_alias")
+                .await;
+        } else {
+            let known = crate::chat::provider::store::aliases(graph)
+                .await
+                .map_err(AppError::Internal)?;
+            if !known.iter().any(|a| a.alias == alias) {
+                return Err(AppError::BadRequest(format!(
+                    "model_alias '{alias}' is not defined (see /api/chat/model-aliases)"
+                )));
+            }
+            graph
+                .put_llm_setting(&format!("task:{task_id}"), "model_alias", alias)
+                .await
+                .map_err(AppError::Internal)?;
+        }
+    }
     // Extract auto-linking fields before moving req.
     // Priority: explicit session_id in body > X-Session-Id header (injected by MCP proxy)
     let session_id_for_linking = req.session_id.clone().or_else(|| {
@@ -1142,6 +1188,11 @@ fn delegation_chat_request(
         project_slug,
         model: None,
         provider: None,
+        task_alias: None,
+        run_provider: None,
+        run_model: None,
+        max_tokens: None,
+        task_class: None,
         permission_mode: Some("bypassPermissions".to_string()),
         add_dirs: None,
         workspace_slug: None,
@@ -5421,6 +5472,16 @@ pub struct RunPlanRequest {
     /// Optional budget limit in USD. Overrides the default ($10).
     /// When omitted, falls back to RunnerConfig::default().max_cost_usd.
     pub max_cost_usd: Option<f64>,
+    /// Provider instance of every session of the run (A16 level "run"). Absent:
+    /// the rules decide.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model (or alias) of the run's sessions.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Token budget per session; the only budget a provider without a price can have.
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
 }
 
 /// Response for a successfully started plan run.
@@ -5459,9 +5520,22 @@ pub async fn run_plan(
         req.project_slug,
         req.max_cost_usd,
         trigger_source,
+        RunRouting {
+            provider: req.provider,
+            model: req.model,
+            max_tokens: req.max_tokens,
+        },
     )
     .await?;
     Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+/// Provider, model and token budget named by a run request.
+#[derive(Default)]
+pub(crate) struct RunRouting {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub max_tokens: Option<u64>,
 }
 
 /// Build a `PlanRunner` wired to the server (chat manager, event bus, caller
@@ -5475,7 +5549,22 @@ async fn start_plan_run(
     project_slug: Option<String>,
     max_cost_usd: Option<f64>,
     trigger_source: crate::runner::TriggerSource,
+    routing: RunRouting,
 ) -> Result<RunPlanResponse, AppError> {
+    // A run naming an instance that does not exist is refused before it starts
+    // (consent and the rest are checked per session, at opening).
+    if let Some(provider) = routing.provider.as_deref().filter(|p| !p.is_empty()) {
+        let exists = provider == crate::chat::provider::resolver::CLAUDE_CODE
+            || crate::chat::provider::store::instance(state.orchestrator.neo4j(), provider)
+                .await
+                .map_err(AppError::Internal)?
+                .is_some();
+        if !exists {
+            return Err(AppError::NotFound(format!(
+                "unknown provider instance '{provider}'"
+            )));
+        }
+    }
     let chat_manager = state
         .chat_manager
         .as_ref()
@@ -5502,6 +5591,7 @@ async fn start_plan_run(
 
     // Inherit caller's auth claims so runner agents authenticate as the user
     runner = runner.with_user_claims(caller_claims);
+    runner = runner.with_run_routing(routing.provider, routing.model, routing.max_tokens);
 
     // Bridge RunnerEvents to CrudEvent for WebSocket delivery
     runner =
@@ -5605,6 +5695,7 @@ pub async fn retry_plan_task(
         None,
         None,
         crate::runner::TriggerSource::Manual,
+        RunRouting::default(),
     )
     .await?;
     Ok((StatusCode::ACCEPTED, Json(response)))

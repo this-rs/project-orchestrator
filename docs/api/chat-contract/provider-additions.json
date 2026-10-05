@@ -164,6 +164,15 @@
     "aliases": "GET/PUT /api/chat/model-aliases : [{alias,provider,model}] ; alias = minuscules/chiffres/tirets, uniques ; 404 instance inconnue",
     "policy": "GET/PUT /api/chat/model-policy : {mode: off|shadow|enforce, rules:{role:alias}, fallback:[alias], caps:{per_task_usd?,per_run_usd?,per_task_tokens?,per_run_tokens?}} ; livre `off` ; roles de regle et alias valides (400) ; STOCKEE, pas encore appliquee",
     "GET /api/chat/providers": "liste maintenant aussi les instances stockees (health unknown, allowed_for_project selon le consentement valide) ; default_provider = cible `pilot` des roles si elle existe ; capabilities.images = true pour claude-code tant que le chemin legacy sert (ecart A12 assume : le chemin agent ne porte pas les images)",
-    "NON LIVRE": "POST /plans/{id}/run (provider, model, max_tokens), PATCH /tasks/{id} (model_alias), POST /chat/sessions/{id}/interrupt avec cascade, champs d'arbre/execution (provider_id, subtree_cost_usd, ...) : voir lane-backend-journal"
+    "NON LIVRE": "preflight reel (sonde d'appel d'outil) via l'API de test ; fallback_reason ; sante des instances sondee"
+  },
+  "rest_runs": {
+    "doc": "LIVRE. Champs additifs, tous facultatifs : un corps qui ne les porte pas est inchange.",
+    "POST /api/plans/{id}/run": "corps + {provider?, model?, max_tokens?} ; 404 si l'instance n'existe pas (avant tout demarrage) ; le run est le niveau `run` de A16 ; consentement/garde/journal s'appliquent a CHAQUE session ; un run sur un tiers tourne en ask + profil restreint (jamais de bypass) ; max_tokens = budget de tokens par session",
+    "PATCH /api/tasks/{id}": "corps + {model_alias} : doit nommer un alias defini (400 sinon), chaine vide = efface ; 404 tache inconnue ; GET /api/tasks/{id} renvoie task.model_alias quand il existe",
+    "POST /api/chat/sessions/{id}/interrupt": "corps {scope?, cascade?:true} -> reponse inchangee + cascade:{stopped,total} (total = descendants, stopped = ceux qui etaient vivants et ont ete interrompus ; feuilles d'abord) ; sans cascade : aucune cle cascade",
+    "GET /api/chat/sessions/{id}/tree": "noeuds + provider_id (absent = claude-code), model, cost_usd (absent = inconnu), subtree_cost_usd (SEULEMENT si tous les noeuds du sous-arbre ont un cout), max_depth et max_children sur la racine",
+    "AgentExecution": "provider_id, model_requested, model, model_alias, routed_by, route_rule, fallback_reason (non rempli), shadow_model, shadow_provider, task_class, attempt, cost_basis, input_tokens, output_tokens (noms JSON ; tokens_in/tokens_out acceptes en lecture)",
+    "politique de modele": "off|shadow|enforce lue par le resolveur : enforce = candidat de la regle (chat, runner.*) a la place de la regle globale ; shadow = enregistre shadow_provider/shadow_model sans rien changer"
   }
 }

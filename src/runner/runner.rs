@@ -463,6 +463,10 @@ pub struct PlanRunner {
     /// a synthetic service account — avoids 403 when email domain checks are
     /// configured in the auth middleware.
     user_claims: Option<crate::auth::jwt::Claims>,
+    /// Provider/model/token budget named by the run request (A16 level "run").
+    run_provider: Option<String>,
+    run_model: Option<String>,
+    run_max_tokens: Option<u64>,
 }
 
 /// Result of starting a plan run.
@@ -682,6 +686,9 @@ impl PlanRunner {
             event_tx,
             event_emitter: None,
             user_claims: None,
+            run_provider: None,
+            run_model: None,
+            run_max_tokens: None,
         }
     }
 
@@ -690,6 +697,20 @@ impl PlanRunner {
     /// using a synthetic service account.
     pub fn with_user_claims(mut self, claims: crate::auth::jwt::Claims) -> Self {
         self.user_claims = Some(claims);
+        self
+    }
+
+    /// Names the provider, model and token budget of every session of this run
+    /// (the run level of the resolution order, A16).
+    pub fn with_run_routing(
+        mut self,
+        provider: Option<String>,
+        model: Option<String>,
+        max_tokens: Option<u64>,
+    ) -> Self {
+        self.run_provider = provider.filter(|p| !p.is_empty());
+        self.run_model = model.filter(|m| !m.is_empty());
+        self.run_max_tokens = max_tokens;
         self
     }
 
@@ -3006,6 +3027,15 @@ impl PlanRunner {
                 }
             })
             .unwrap_or_default();
+        // The model alias set on the task (A16 level "task"); a read that fails
+        // is "no alias", never a stop.
+        let task_alias = self
+            .graph
+            .get_llm_setting(&format!("task:{task_id}"), "model_alias")
+            .await
+            .ok()
+            .flatten()
+            .filter(|a| !a.is_empty());
         let request = ChatRequest {
             attachments: Vec::new(),
             message: prompt, // Send the full prompt directly in create_session — avoids the ghost empty message at seq 1
@@ -3014,6 +3044,11 @@ impl PlanRunner {
             project_slug: project_slug.map(|s| s.to_string()),
             model: None,
             provider: None,
+            task_alias: task_alias.clone(),
+            run_provider: self.run_provider.clone(),
+            run_model: self.run_model.clone(),
+            max_tokens: self.run_max_tokens,
+            task_class: Some(task_profile.complexity.to_string()),
             permission_mode: Some("bypassPermissions".to_string()),
             add_dirs: None,
             workspace_slug: None,
@@ -3035,7 +3070,7 @@ impl PlanRunner {
             runner_context: Some(runner_context),
         };
         // What the runner asks for today (None = provider default).
-        let model_requested = request.model.clone();
+        let model_requested = request.model.clone().or_else(|| request.run_model.clone());
 
         let spawning_timeout = Duration::from_secs(self.config.spawning_timeout_secs);
         let session = match tokio::time::timeout(
@@ -3111,6 +3146,32 @@ impl PlanRunner {
             .map(|p| format!("{}:{}", p.persona_name, task_profile.complexity))
             .unwrap_or_else(|| task_profile.complexity.to_string());
 
+        // What the resolver decided for this session, read back from the session
+        // node it persisted: the record says which provider ran and why (A22).
+        let routing = match session_uuid {
+            Some(uuid) => self.graph.get_chat_session(uuid).await.ok().flatten(),
+            None => None,
+        };
+
+        // Policy rule and shadow choice recorded by the resolver, if any.
+        let routing_note: Option<serde_json::Value> = match session_uuid {
+            Some(uuid) => self
+                .graph
+                .get_llm_setting(&format!("routing:{uuid}"), "note")
+                .await
+                .ok()
+                .flatten()
+                .and_then(|raw| serde_json::from_str(&raw).ok()),
+            None => None,
+        };
+        let note_str = |key: &str| {
+            routing_note
+                .as_ref()
+                .and_then(|n| n.get(key))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+
         // Open the AgentExecution node of this attempt (fire-and-forget create).
         // One node per attempt: the caller closes it through `close_attempt`.
         let ae_open = AgentExecutionNode {
@@ -3119,9 +3180,18 @@ impl PlanRunner {
             task_id,
             session_id: session_uuid,
             persona_profile: persona_str.clone(),
-            // No routing yet: the runner always goes to the default provider.
-            provider_id: crate::neo4j::agent_execution::DEFAULT_PROVIDER_ID.to_string(),
-            routed_by: crate::neo4j::agent_execution::DEFAULT_ROUTED_BY.to_string(),
+            provider_id: routing
+                .as_ref()
+                .and_then(|n| n.provider_id.clone())
+                .unwrap_or_else(|| crate::neo4j::agent_execution::DEFAULT_PROVIDER_ID.to_string()),
+            routed_by: routing
+                .as_ref()
+                .and_then(|n| n.routed_by.clone())
+                .unwrap_or_else(|| crate::neo4j::agent_execution::DEFAULT_ROUTED_BY.to_string()),
+            model_alias: task_alias,
+            route_rule: note_str("route_rule"),
+            shadow_provider: note_str("shadow_provider"),
+            shadow_model: note_str("shadow_model"),
             model_requested,
             task_class: Some(task_profile.complexity.to_string()),
             attempt,
@@ -3255,18 +3325,32 @@ impl PlanRunner {
 
         // Helper to wrap TaskResult with session_id, activated skills/personas and
         // the open AgentExecution node carrying what the provider reported.
-        // TODO(B4): effective model and token usage are not on ChatEvent::Result
-        // yet — `model` / `tokens_*` stay None until the event carries them.
         let reported_num_turns = event_metrics.num_turns;
         let cost_reported = event_metrics.cost_reported;
+        let effective_model = event_metrics.model.clone();
+        let cost_basis = event_metrics.cost_basis.clone();
+        let tokens = (
+            event_metrics.tokens_in,
+            event_metrics.tokens_out,
+            event_metrics.tokens_cache_read,
+            event_metrics.tokens_cache_write,
+        );
         let activated_ids = activated_skill_ids.clone();
         let persona_ids_clone = persona_ids_for_feedback.clone();
         let wrap = move |result: TaskResult| -> TaskExecutionResult {
             let mut ae = ae_open.clone();
             ae.num_turns = reported_num_turns;
-            if cost_reported {
-                ae.cost_basis = Some("reported".to_string());
-            }
+            ae.model = effective_model.clone();
+            (
+                ae.tokens_in,
+                ae.tokens_out,
+                ae.tokens_cache_read,
+                ae.tokens_cache_write,
+            ) = tokens;
+            // The provider's own basis wins; a cost with no basis is `reported`.
+            ae.cost_basis = cost_basis
+                .clone()
+                .or_else(|| cost_reported.then(|| "reported".to_string()));
             TaskExecutionResult {
                 result,
                 session_id: session_uuid,
@@ -4660,9 +4744,28 @@ impl PlanRunner {
                             is_error,
                             num_turns,
                             result_text,
+                            cost,
+                            usage,
+                            model,
                             ..
                         } => {
                             metrics.num_turns = (*num_turns).and_then(|n| u32::try_from(n).ok());
+                            metrics.model = model.clone();
+                            metrics.cost_basis = cost
+                                .as_ref()
+                                .and_then(|c| c.get("basis"))
+                                .and_then(|b| b.as_str())
+                                .map(str::to_string);
+                            let token = |k: &str| {
+                                usage
+                                    .as_ref()
+                                    .and_then(|u| u.get(k))
+                                    .and_then(|v| v.as_u64())
+                            };
+                            metrics.tokens_in = token("input_tokens");
+                            metrics.tokens_out = token("output_tokens");
+                            metrics.tokens_cache_read = token("cache_read_tokens");
+                            metrics.tokens_cache_write = token("cache_creation_tokens");
                             if let Some(c) = event_cost {
                                 cost_usd = *c;
                                 metrics.cost_reported = true;
@@ -4738,6 +4841,14 @@ struct EventMetrics {
     num_turns: Option<u32>,
     /// Whether the Result event carried a cost (vs. the 0.0 default)
     cost_reported: bool,
+    /// Model that actually answered, when the provider said.
+    model: Option<String>,
+    /// Basis of the cost (`reported`, `priced`, `free`, `subscription`, `unknown`).
+    cost_basis: Option<String>,
+    tokens_in: Option<u64>,
+    tokens_out: Option<u64>,
+    tokens_cache_read: Option<u64>,
+    tokens_cache_write: Option<u64>,
 }
 
 // ============================================================================
@@ -4819,6 +4930,9 @@ impl Clone for PlanRunner {
             event_tx: self.event_tx.clone(),
             event_emitter: self.event_emitter.clone(),
             user_claims: self.user_claims.clone(),
+            run_provider: self.run_provider.clone(),
+            run_model: self.run_model.clone(),
+            run_max_tokens: self.run_max_tokens,
         }
     }
 }

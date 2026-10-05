@@ -75,9 +75,9 @@ pub struct AgentExecutionNode {
     /// `HEAD` of the task working directory when the attempt started.
     #[serde(default)]
     pub base_sha: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "input_tokens", alias = "tokens_in")]
     pub tokens_in: Option<u64>,
-    #[serde(default)]
+    #[serde(default, rename = "output_tokens", alias = "tokens_out")]
     pub tokens_out: Option<u64>,
     #[serde(default)]
     pub tokens_cache_read: Option<u64>,

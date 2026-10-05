@@ -208,6 +208,11 @@ fn request(provider: Option<&str>, project: Option<&str>, mode: &str) -> ChatReq
         project_slug: project.map(str::to_string),
         model: None,
         provider: provider.map(str::to_string),
+        task_alias: None,
+        run_provider: None,
+        run_model: None,
+        max_tokens: None,
+        task_class: None,
         permission_mode: Some(mode.into()),
         add_dirs: None,
         workspace_slug: None,
@@ -551,4 +556,98 @@ async fn the_legacy_engine_cannot_open_a_registered_instance() {
         .unwrap_err();
     assert_eq!(failure(&err), (503, "provider_unavailable"));
     assert!(fake.requests().is_empty());
+}
+
+async fn put_policy(graph: &MockGraphStore, mode: &str) {
+    graph
+        .put_llm_setting(
+            GLOBAL,
+            "model_aliases",
+            &json!([{"alias": "fast", "provider": "local", "model": "m"}]).to_string(),
+        )
+        .await
+        .unwrap();
+    graph
+        .put_llm_setting(
+            GLOBAL,
+            "model_policy",
+            &json!({"mode": mode, "rules": {"chat": "fast"}, "fallback": [], "caps": {}})
+                .to_string(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_enforced_policy_routes_the_chat_to_the_instance_and_records_the_rule() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    put_policy(&graph, "enforce").await;
+    let manager = manager(graph.clone(), true);
+    let created = manager
+        .create_session(&request(None, Some("proj"), "default"))
+        .await
+        .unwrap_or_else(|e| panic!("open failed: {e:#}"));
+    let node = graph
+        .get_chat_session(Uuid::parse_str(&created.session_id).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(node.provider_id.as_deref(), Some("local"));
+    assert_eq!(node.routed_by.as_deref(), Some("global_rule"));
+    let note: Value = serde_json::from_str(
+        &graph
+            .get_llm_setting(&format!("routing:{}", created.session_id), "note")
+            .await
+            .unwrap()
+            .expect("the rule is recorded"),
+    )
+    .unwrap();
+    assert_eq!(note["route_rule"], "chat");
+    assert!(note["shadow_provider"].is_null());
+}
+
+#[tokio::test]
+async fn a_shadow_policy_changes_nothing_and_only_records_what_it_would_have_done() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    put_policy(&graph, "shadow").await;
+    // Claude Code is not installable here: use the legacy engine's refusal as the
+    // witness that the policy did NOT route to the instance, and read the note
+    // through the resolver directly.
+    let manager = manager(graph.clone(), true);
+    let choice = manager
+        .resolve_provider_choice(&request(None, Some("proj"), "default"), Some("proj"))
+        .await
+        .unwrap();
+    assert_eq!(choice.provider_id, "claude-code", "shadow never applies");
+    assert_eq!(choice.shadow.as_ref().map(|s| s.0.as_str()), Some("local"));
+    assert_eq!(choice.route_rule.as_deref(), Some("chat"));
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn an_off_policy_is_invisible() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    put_policy(&graph, "off").await;
+    let manager = manager(graph.clone(), true);
+    let choice = manager
+        .resolve_provider_choice(&request(None, Some("proj"), "default"), Some("proj"))
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            choice.provider_id.as_str(),
+            choice.route_rule,
+            choice.shadow
+        ),
+        ("claude-code", None, None)
+    );
 }

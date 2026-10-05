@@ -208,6 +208,22 @@ pub struct ChatRequest {
     /// existing session a different provider is a 409 `provider_conflict`.
     #[serde(default)]
     pub provider: Option<String>,
+    /// Model alias set on the task (A16 level "task"). Internal.
+    #[serde(skip)]
+    pub task_alias: Option<String>,
+    /// Provider named by the run (A16 level "run"). Internal.
+    #[serde(skip)]
+    pub run_provider: Option<String>,
+    /// Model named by the run. Internal.
+    #[serde(skip)]
+    pub run_model: Option<String>,
+    /// Token budget of the session (`SessionLimits::max_tokens`). Internal.
+    #[serde(skip)]
+    pub max_tokens: Option<u64>,
+    /// Class of the task being executed (`simple`, `complex`, ...), which the
+    /// model policy reads. Internal.
+    #[serde(skip)]
+    pub task_class: Option<String>,
     /// Permission mode override for this session (default: from ChatConfig)
     /// Values: "default", "acceptEdits", "plan", "bypassPermissions"
     #[serde(default)]
