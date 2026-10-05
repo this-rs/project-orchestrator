@@ -8240,12 +8240,18 @@ impl ChatManager {
                 provider_id.into(),
             )));
         }
-        if let Err(refusal) = endpoint_guard::validate_endpoint(
-            &record.base_url,
-            &endpoint_guard::EndpointPolicy::default(),
-        )
-        .await
-        {
+        // A codex / acp instance is a local process: there is no endpoint to guard.
+        let guard = if super::provider::settings::is_process_kind(&record.kind) {
+            Ok(())
+        } else {
+            endpoint_guard::validate_endpoint(
+                &record.base_url,
+                &endpoint_guard::EndpointPolicy::default(),
+            )
+            .await
+            .map(|_| ())
+        };
+        if let Err(refusal) = guard {
             warn!(
                 provider = provider_id,
                 code = refusal.code(),
@@ -8320,6 +8326,7 @@ impl ChatManager {
         session_id: &str,
         third_party: bool,
         max_tokens: Option<u64>,
+        kind: nexus_claude::agent::ProviderKind,
     ) -> Result<nexus_claude::agent::SessionSpec> {
         use nexus_claude::agent::{
             EnvSpec, McpServerSpec, SessionSpec, SystemPromptMode, SystemPromptSpec,
@@ -8353,10 +8360,21 @@ impl ChatManager {
             .await;
         let mut spec = SessionSpec::new(expand_tilde(cwd));
         spec.model = Some(model.to_string());
-        spec.system_prompt = Some(SystemPromptSpec {
-            text: system_prompt.to_string(),
-            mode: SystemPromptMode::Replace,
-        });
+        // What a provider kind refuses, it is not given (a refusal here would be a
+        // typed `unsupported` at open): ACP has no system prompt and no extra
+        // dirs; Codex and ACP have no turn limits.
+        let is_acp = kind == nexus_claude::agent::ProviderKind::Acp;
+        let has_turn_limits = matches!(
+            kind,
+            nexus_claude::agent::ProviderKind::ClaudeCode
+                | nexus_claude::agent::ProviderKind::Native
+        );
+        if !is_acp {
+            spec.system_prompt = Some(SystemPromptSpec {
+                text: system_prompt.to_string(),
+                mode: SystemPromptMode::Replace,
+            });
+        }
         spec.policy = policy;
         spec.mcp_servers.insert(
             "project-orchestrator".to_string(),
@@ -8366,8 +8384,12 @@ impl ChatManager {
                 env: env.into_iter().collect(),
             },
         );
-        spec.extra_dirs = add_dirs.iter().map(std::path::PathBuf::from).collect();
-        spec.max_turns = u32::try_from(self.config.max_turns).ok();
+        if !is_acp {
+            spec.extra_dirs = add_dirs.iter().map(std::path::PathBuf::from).collect();
+        }
+        if has_turn_limits {
+            spec.max_turns = u32::try_from(self.config.max_turns).ok();
+        }
         spec.limits.max_tokens = max_tokens;
         spec.env = EnvSpec {
             inherit: Self::child_env_inherit_names(),
@@ -8415,6 +8437,7 @@ impl ChatManager {
                 &sid,
                 provider_id != super::provider::resolver::CLAUDE_CODE,
                 request.max_tokens,
+                provider.kind(),
             )
             .await?;
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
@@ -8525,6 +8548,7 @@ impl ChatManager {
                 &sid,
                 provider_id != super::provider::resolver::CLAUDE_CODE,
                 None,
+                provider.kind(),
             )
             .await?;
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);

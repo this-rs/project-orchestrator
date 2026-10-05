@@ -142,12 +142,16 @@ pub async fn stored_entries(
                 .collect();
             ProviderEntry {
                 id: i.id,
-                kind: "openai_compatible",
+                kind: match i.kind.as_str() {
+                    "codex" => "codex",
+                    "acp" => "acp",
+                    _ => "openai_compatible",
+                },
                 label: i.label,
                 builtin: false,
                 is_default: false,
                 allowed_for_project: allowed,
-                endpoint_origin: Some(i.origin),
+                endpoint_origin: (!st::is_process_kind(&i.kind)).then(|| i.origin.clone()),
                 credential: i.credential_ref,
                 health: HealthEntry::unknown(),
                 models,
@@ -186,8 +190,31 @@ pub async fn test_provider(
         Err(SettingsError::Endpoint(e)) => return Ok(Json(verdict("unreachable", e.code()))),
         Err(e) => return Err(map_settings_error(e)),
     };
-    if let Err(e) = validate_endpoint(&record.base_url, &policy).await {
-        return Ok(Json(verdict("unreachable", e.code())));
+    if !st::is_process_kind(&record.kind) {
+        if let Err(e) = validate_endpoint(&record.base_url, &policy).await {
+            return Ok(Json(verdict("unreachable", e.code())));
+        }
+    }
+    // A codex / acp instance is a local process: the test is its health check
+    // (version, login), nothing is sent anywhere.
+    if st::is_process_kind(&record.kind) {
+        use nexus_claude::agent::AgentProvider;
+        let provider = match crate::chat::provider::native_factory::build_native_provider(
+            &record,
+            Some(state.vault.clone()),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                let failure = crate::chat::provider::errors::open_failure(&e, Some(&record.id));
+                return Ok(Json(verdict("unknown", failure.code)));
+            }
+        };
+        let health = HealthEntry::from_nexus(&provider.health().await);
+        return Ok(Json(json!({
+            "ok": health.state == "ok",
+            "health": { "state": health.state, "code": health.code, "action": health.action },
+            "models": [],
+        })));
     }
     // A test that carries a credential sends it to the endpoint: it is only done
     // for an instance that is ALREADY saved, at the origin it was saved with and
@@ -265,9 +292,11 @@ pub async fn create_provider(
     let policy = EndpointPolicy::default();
     let record = st::record_from_draft(&draft, &policy, &st::env_credential_allowlist())
         .map_err(map_settings_error)?;
-    validate_endpoint(&record.base_url, &policy)
-        .await
-        .map_err(|e| AppError::BadRequest(format!("endpoint refused: {e}")))?;
+    if !st::is_process_kind(&record.kind) {
+        validate_endpoint(&record.base_url, &policy)
+            .await
+            .map_err(|e| AppError::BadRequest(format!("endpoint refused: {e}")))?;
+    }
     let graph = graph(&state);
     let key = format!("{INSTANCE_PREFIX}{}", record.id);
     if graph

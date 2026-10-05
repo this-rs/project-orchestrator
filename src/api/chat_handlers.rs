@@ -2023,6 +2023,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_codex_instance_is_created_behind_the_gate_with_a_process_identity() {
+        let app = test_app().await;
+        let body = serde_json::json!({"id": "codex", "kind": "codex", "label": "Codex"});
+        let (status, resp) =
+            call_json(&app, auth_json("POST", "/api/chat/providers", body.clone())).await;
+        assert_eq!(status, StatusCode::CREATED, "{resp}");
+        assert_eq!(resp["origin"], "process:codex");
+        let (_, listing) = call_json(&app, auth_get("/api/chat/providers?project_slug=p")).await;
+        let entry = listing["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "codex")
+            .unwrap()
+            .clone();
+        assert_eq!(entry["kind"], "codex");
+        assert!(
+            entry["endpoint_origin"].is_null(),
+            "a process has no endpoint"
+        );
+        // Consent is tied to the process identity.
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "PUT",
+                "/api/projects/p/llm-consent",
+                serde_json::json!({"provider_id": "codex", "origin": "process:codex"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // A URL or a command line has no place in it.
+        let mut with_url = body.clone();
+        with_url["id"] = serde_json::json!("codex2");
+        with_url["base_url"] = serde_json::json!("https://8.8.8.8/v1");
+        let (status, _) = call_json(&app, auth_json("POST", "/api/chat/providers", with_url)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let cmd = serde_json::json!({"id": "x", "kind": "acp", "command": ["sh", "-c", "evil"]});
+        let (status, _) = call_json(&app, auth_json("POST", "/api/chat/providers", cmd)).await;
+        assert!(status.is_client_error(), "{status}");
+        // ACP names a declared command; none is declared here.
+        let acp = serde_json::json!({"id": "oc", "kind": "acp", "preset": "opencode"});
+        let (status, resp) = call_json(&app, auth_json("POST", "/api/chat/providers", acp)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert!(
+            resp.to_string().contains("CHAT_PROVIDER_ACP_COMMANDS"),
+            "{resp}"
+        );
+        // The test route is a health check of the process: still a 200 verdict.
+        let (status, resp) =
+            call_json(&app, auth_json("POST", "/api/chat/providers/test", body)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(resp["ok"].is_boolean(), "{resp}");
+    }
+
+    #[tokio::test]
     async fn an_env_credential_is_refused_unless_the_variable_is_declared() {
         let app = test_app().await;
         let mut body = deepseek("https://8.8.8.8/v1");

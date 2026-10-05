@@ -127,12 +127,67 @@ fn build_native(
     Ok(Arc::new(NativeProvider::new(config, model_endpoint)))
 }
 
-/// The native provider of a stored instance.
+/// The provider of a stored instance, by kind: the native harness over an
+/// OpenAI-compatible endpoint, Codex (`app-server`) or a declared ACP agent.
 pub fn build_native_provider(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
 ) -> Result<Arc<dyn AgentProvider>, ProviderError> {
-    Ok(build_native(record, vault)? as Arc<dyn AgentProvider>)
+    match record.kind.as_str() {
+        "codex" => build_codex(record, vault),
+        "acp" => build_acp(record),
+        _ => Ok(build_native(record, vault)? as Arc<dyn AgentProvider>),
+    }
+}
+
+fn cost_basis_of(record: &InstanceRecord) -> CostBasis {
+    // Only "free" is known without a price table; the rest stays `unknown`.
+    if record.cost_source == "free" {
+        CostBasis::Free
+    } else {
+        CostBasis::Unknown
+    }
+}
+
+/// Codex: the program is `codex` found on the server's PATH (never a path from an
+/// API body), with its own persistent home per instance.
+fn build_codex(
+    record: &InstanceRecord,
+    vault: Option<Arc<VaultService>>,
+) -> Result<Arc<dyn AgentProvider>, ProviderError> {
+    use nexus_claude::providers::codex::{CodexConfig, CodexProvider};
+    super::settings::parse_credential_ref(
+        &record.credential_ref,
+        &super::settings::env_credential_allowlist(),
+    )
+    .map_err(|_| ProviderError::invalid("credential reference not allowed"))?;
+    let mut config = CodexConfig::new(record.id.clone());
+    config.default_model = record.default_model.clone();
+    config.cost_basis = cost_basis_of(record);
+    config.credential = CredentialRef::from_str(&record.credential_ref)?;
+    let resolver: Arc<dyn CredentialResolver> = match vault {
+        Some(vault) => Arc::new(VaultCredentialResolver::new(vault)),
+        None => Arc::new(EnvCredentialResolver),
+    };
+    Ok(Arc::new(CodexProvider::with_resolver(config, resolver)))
+}
+
+/// ACP: the command is the one DECLARED on the server under the instance's
+/// preset; the agent holds its own login (no credential).
+fn build_acp(record: &InstanceRecord) -> Result<Arc<dyn AgentProvider>, ProviderError> {
+    use nexus_claude::providers::acp::{AcpConfig, AcpProvider};
+    let name = record
+        .preset
+        .as_deref()
+        .ok_or_else(|| ProviderError::invalid("an ACP instance names a declared agent"))?;
+    let command = super::settings::acp_commands()
+        .remove(name)
+        .ok_or_else(|| ProviderError::invalid("that ACP agent is not declared on this server"))?;
+    let mut config = AcpConfig::new(record.id.clone(), command);
+    config.default_model = record.default_model.clone();
+    config.cost_basis = cost_basis_of(record);
+    config.validate()?;
+    Ok(Arc::new(AcpProvider::new(config)))
 }
 
 #[cfg(test)]
@@ -166,5 +221,20 @@ mod tests {
             .err()
             .expect("refused");
         assert!(!format!("{err:?}{err}").contains("sk-live"));
+    }
+
+    #[test]
+    fn codex_and_acp_instances_are_built_without_any_command_from_the_record() {
+        let mut codex = record("none", None);
+        codex.kind = "codex".into();
+        codex.base_url = String::new();
+        codex.origin = "process:codex".into();
+        let p = build_native_provider(&codex, None).unwrap();
+        assert_eq!(p.kind(), nexus_claude::agent::ProviderKind::Codex);
+        // ACP with nothing declared on the server: refused, there is no command to run.
+        let mut acp = record("none", Some("opencode"));
+        acp.kind = "acp".into();
+        let err = build_native_provider(&acp, None).err().expect("refused");
+        assert_eq!(err.kind(), "invalid_request");
     }
 }

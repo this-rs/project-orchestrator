@@ -234,6 +234,40 @@ fn check_url(url: &str, policy: &EndpointPolicy) -> Result<String, SettingsError
     origin_of(url).ok_or_else(|| invalid("base_url: not a URL"))
 }
 
+/// Environment variable declaring the ACP agents an instance may launch: a
+/// JSON object, `{"opencode": ["opencode", "acp"]}`. EMPTY BY DEFAULT: an API
+/// body never carries a command line (that would be remote code execution as
+/// the server's user); it names a declared one by `preset`.
+pub const ACP_COMMANDS_VAR: &str = "CHAT_PROVIDER_ACP_COMMANDS";
+
+/// The declared ACP commands.
+pub fn acp_commands() -> std::collections::BTreeMap<String, Vec<String>> {
+    parse_acp_commands(&std::env::var(ACP_COMMANDS_VAR).unwrap_or_default())
+}
+
+/// Parses the declaration; anything malformed declares nothing.
+pub fn parse_acp_commands(raw: &str) -> std::collections::BTreeMap<String, Vec<String>> {
+    serde_json::from_str::<std::collections::BTreeMap<String, Vec<String>>>(raw)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(name, argv)| valid_id(name) && !argv.is_empty() && !argv[0].trim().is_empty())
+        .collect()
+}
+
+/// Kinds that run a local process instead of calling an endpoint: they have no
+/// URL, their consent is tied to a process identity.
+pub fn is_process_kind(kind: &str) -> bool {
+    matches!(kind, "codex" | "acp")
+}
+
+/// Identity a consent of a process kind is tied to (it plays the role of the origin).
+pub fn process_origin(kind: &str, preset: Option<&str>) -> String {
+    match (kind, preset) {
+        ("acp", Some(name)) => format!("process:acp:{name}"),
+        _ => format!("process:{kind}"),
+    }
+}
+
 /// Validates a draft into a record (syntax only; the DNS check is async and
 /// done by the caller through `validate_endpoint`).
 pub fn record_from_draft(
@@ -252,22 +286,50 @@ pub fn record_from_draft(
         .kind
         .clone()
         .unwrap_or_else(|| "openai_compatible".into());
-    if kind != "openai_compatible" {
-        return Err(invalid(
-            "kind: only openai_compatible instances can be created",
-        ));
+    if !matches!(kind.as_str(), "openai_compatible" | "codex" | "acp") {
+        return Err(invalid("kind: openai_compatible, codex or acp"));
     }
-    let base_url = draft
-        .base_url
-        .clone()
-        .filter(|u| !u.trim().is_empty())
-        .ok_or_else(|| invalid("base_url is required"))?;
-    let origin = check_url(&base_url, policy)?;
+    let (base_url, origin) = if is_process_kind(&kind) {
+        // A process instance has no URL, and an API body never carries a command.
+        if draft
+            .base_url
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty())
+        {
+            return Err(invalid("base_url: not used by a codex or acp instance"));
+        }
+        if kind == "acp" {
+            let name = draft
+                .preset
+                .as_deref()
+                .ok_or_else(|| invalid("preset: names the ACP agent declared on the server"))?;
+            if !acp_commands().contains_key(name) {
+                return Err(invalid(
+                    "preset: that ACP agent is not declared on this server (CHAT_PROVIDER_ACP_COMMANDS)",
+                ));
+            }
+        }
+        (
+            String::new(),
+            process_origin(&kind, draft.preset.as_deref()),
+        )
+    } else {
+        let base_url = draft
+            .base_url
+            .clone()
+            .filter(|u| !u.trim().is_empty())
+            .ok_or_else(|| invalid("base_url is required"))?;
+        let origin = check_url(&base_url, policy)?;
+        (base_url, origin)
+    };
     let credential_ref = draft
         .credential_ref
         .clone()
         .unwrap_or_else(|| "none".into());
     parse_credential_ref(&credential_ref, env_allow)?;
+    if kind == "acp" && credential_ref != "none" {
+        return Err(invalid("credential_ref: an ACP agent holds its own login"));
+    }
     let cost_source = draft
         .cost_source
         .clone()
@@ -308,6 +370,9 @@ pub fn apply_patch(
     }
     if patch.preset.is_some() {
         next.preset = patch.preset.clone();
+    }
+    if patch.base_url.is_some() && is_process_kind(&old.kind) {
+        return Err(invalid("base_url: not used by a codex or acp instance"));
     }
     if let Some(url) = patch.base_url.as_ref() {
         next.origin = check_url(url, policy)?;
@@ -828,5 +893,55 @@ mod tests {
         let mut keyless = old.clone();
         keyless.credential_ref = "none".into();
         assert!(consent_holds(&legacy, &keyless));
+    }
+
+    #[test]
+    fn codex_and_acp_instances_have_a_process_identity_and_never_a_command_line() {
+        let codex = InstanceDraft {
+            id: Some("codex".into()),
+            kind: Some("codex".into()),
+            preset: None,
+            label: None,
+            base_url: None,
+            default_model: None,
+            cost_source: None,
+            credential_ref: None,
+        };
+        let r = record_from_draft(&codex, &EndpointPolicy::default(), &[]).unwrap();
+        assert_eq!(
+            (r.kind.as_str(), r.origin.as_str(), r.base_url.as_str()),
+            ("codex", "process:codex", "")
+        );
+        // A URL makes no sense for it.
+        let mut with_url = codex.clone();
+        with_url.base_url = Some("https://example.com".into());
+        assert!(record_from_draft(&with_url, &EndpointPolicy::default(), &[]).is_err());
+        // ACP: only a command DECLARED on the server can be named; the body has no command field.
+        let declared = parse_acp_commands(
+            r#"{"opencode": ["opencode", "acp"], "bad name": ["x"], "empty": []}"#,
+        );
+        assert_eq!(declared.keys().collect::<Vec<_>>(), vec!["opencode"]);
+        assert!(parse_acp_commands("not json").is_empty());
+        assert!(serde_json::from_value::<InstanceDraft>(
+            serde_json::json!({"id": "a", "kind": "acp", "command": ["sh", "-c", "evil"]})
+        )
+        .is_err());
+        let acp = InstanceDraft {
+            id: Some("oc".into()),
+            kind: Some("acp".into()),
+            preset: Some("opencode".into()),
+            ..codex.clone()
+        };
+        // Nothing is declared in the test environment: refused.
+        assert!(record_from_draft(&acp, &EndpointPolicy::default(), &[]).is_err());
+        assert_eq!(
+            process_origin("acp", Some("opencode")),
+            "process:acp:opencode"
+        );
+        assert!(
+            is_process_kind("acp")
+                && is_process_kind("codex")
+                && !is_process_kind("openai_compatible")
+        );
     }
 }
