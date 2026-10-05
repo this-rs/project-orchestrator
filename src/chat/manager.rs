@@ -10917,6 +10917,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_path_masks_a_vault_secret_before_persisting_and_broadcasting() {
+        use nexus_claude::agent::{AgentEvent, StopReason, ToolOutput};
+        let secret = "sk-vault-secret-in-a-tool-output-5521";
+        crate::vault::mask::global().register("AGENT_PATH_TEST_KEY", secret);
+        let (manager, graph, fake) = agent_manager();
+        let sid = manager
+            .create_session(&agent_request("go"))
+            .await
+            .unwrap()
+            .session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        fake.state.push(AgentEvent::ToolResult {
+            id: "t1".into(),
+            output: Some(ToolOutput::Text(format!("cat .env -> KEY={secret}"))),
+            is_error: false,
+            seq: None,
+            parent: None,
+        });
+        fake.state.push(AgentEvent::Text {
+            text: format!("the key is {secret}"),
+            seq: None,
+            parent: None,
+        });
+        fake.state.push(AgentEvent::Done {
+            stop_reason: StopReason::Completed,
+            subtype: Some("success".into()),
+            is_error: false,
+            result_text: Some(format!("done, {secret}")),
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 1,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        });
+        let mut seen = Vec::new();
+        loop {
+            let ev = next_matching(&mut rx, |_| true).await;
+            let done = matches!(
+                ev,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            );
+            seen.push(serde_json::to_string(&ev).unwrap());
+            if done {
+                break;
+            }
+        }
+        assert!(
+            seen.iter().all(|e| !e.contains(secret)),
+            "broadcast: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|e| e.contains("cat .env")),
+            "the rest of the output is kept"
+        );
+        let stored = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 100)
+            .await
+            .unwrap();
+        assert!(stored.iter().all(|e| !e.data.contains(secret)), "persisted");
+        crate::vault::mask::global().forget("AGENT_PATH_TEST_KEY");
+    }
+
+    #[tokio::test]
     async fn agent_path_open_failure_is_typed_and_revokes_nothing_live() {
         let (manager, _graph, fake) = agent_manager();
         *fake.fail_open.lock().unwrap() = Some(nexus_claude::agent::ProviderError::CliNotFound {

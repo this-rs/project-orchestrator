@@ -19,8 +19,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use nexus_claude::agent::{
-    AgentProvider, AgentSession, Capabilities, InterruptScope, PermissionDecision, PolicyMode,
-    ProviderError, TurnInput,
+    AgentEvent, AgentProvider, AgentSession, Capabilities, InterruptScope, PermissionDecision,
+    PolicyMode, ProviderError, TurnInput,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use uuid::Uuid;
@@ -34,6 +34,35 @@ const BROADCAST_BUFFER: usize = 1024;
 /// How long the out-of-turn pump waits for the rest of a provider message
 /// before it flushes what it has.
 const OOB_FLUSH: Duration = Duration::from_millis(50);
+
+/// Replaces every secret value delivered by the vault inside an event of the
+/// provider, before anything stores or broadcasts it (same rule as the Claude
+/// path: `ChatManager::mask_cli_message`). Fails CLOSED: an event that holds a
+/// secret and cannot be masked is replaced by a marker that surfaces as a
+/// visible error, never passed on in clear.
+pub(crate) fn mask_agent_event(event: AgentEvent) -> AgentEvent {
+    let masker = crate::vault::mask::global().snapshot();
+    mask_agent_event_with(&masker, event)
+}
+
+/// [`mask_agent_event`] against an explicit masker (testable).
+pub(crate) fn mask_agent_event_with(
+    masker: &crate::vault::mask::Masker,
+    event: AgentEvent,
+) -> AgentEvent {
+    match crate::vault::mask::mask_serde(masker, event) {
+        Ok(masked) => masked,
+        Err(_unmasked) => {
+            tracing::error!(
+                "vault: a provider event holding a secret could not be masked; withholding it"
+            );
+            AgentEvent::ProviderNotice {
+                kind: crate::chat::manager::MASKING_FAILED_SUBTYPE.to_string(),
+                data: serde_json::Value::Null,
+            }
+        }
+    }
+}
 
 /// Where the runtime finds a provider instance by identifier. The nexus
 /// registry plugs in here; until then only the built-in instance exists.
@@ -142,7 +171,10 @@ impl AgentSessionHandle {
         tokio::spawn(async move {
             let mut stream = stream;
             while let Some(event) = stream.next().await {
+                // Terminal-ness is read on the original: a withheld terminal event
+                // still ends the turn.
                 let terminal = event.is_terminal();
+                let event = mask_agent_event(event);
                 let chat_events = me.mapper.lock().await.map(&event);
                 for chat_event in chat_events {
                     me.emit(chat_event).await;
@@ -343,7 +375,10 @@ async fn flush(handle: &AgentSessionHandle, batch: &mut Vec<nexus_claude::agent:
     if batch.is_empty() {
         return;
     }
-    let events = std::mem::take(batch);
+    let events: Vec<AgentEvent> = std::mem::take(batch)
+        .into_iter()
+        .map(mask_agent_event)
+        .collect();
     let chat_events = {
         let mut mapper = handle.mapper.lock().await;
         out_of_band_to_chat_events(&events, &mut mapper, chrono::Utc::now())
@@ -570,5 +605,61 @@ pub(crate) mod fake {
         fn get(&self, provider_id: &str) -> Option<Arc<dyn AgentProvider>> {
             (provider_id == "claude-code").then(|| Arc::new(self.clone()) as Arc<dyn AgentProvider>)
         }
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::*;
+    use crate::vault::mask::Masker;
+    use nexus_claude::agent::ToolOutput;
+
+    fn tool_result(text: &str) -> AgentEvent {
+        AgentEvent::ToolResult {
+            id: "t".into(),
+            output: Some(ToolOutput::Text(text.into())),
+            is_error: false,
+            seq: None,
+            parent: None,
+        }
+    }
+
+    #[test]
+    fn a_vault_secret_in_a_provider_event_is_masked() {
+        let masker = Masker::from_values([("KEY", "sk-agent-secret-9876")]);
+        let out = mask_agent_event_with(&masker, tool_result("the key is sk-agent-secret-9876 ok"));
+        let wire = serde_json::to_string(&out).unwrap();
+        assert!(!wire.contains("sk-agent-secret-9876"), "{wire}");
+        assert!(
+            wire.contains("the key is"),
+            "the rest of the text is kept: {wire}"
+        );
+    }
+
+    #[test]
+    fn an_event_that_cannot_be_masked_is_withheld_not_passed_in_clear() {
+        // The secret collides with a key of the event's own JSON form.
+        let secret = "input_complete";
+        let masker = Masker::from_values([("KEY", secret)]);
+        let event = AgentEvent::ToolCall {
+            id: "t".into(),
+            name: "x".into(),
+            input: serde_json::json!({ "note": format!("value {secret}") }),
+            category: Default::default(),
+            canonical: None,
+            input_complete: true,
+            seq: None,
+            parent: None,
+        };
+        let out = mask_agent_event_with(&masker, event);
+        assert!(
+            matches!(&out, AgentEvent::ProviderNotice { kind, .. } if kind == crate::chat::manager::MASKING_FAILED_SUBTYPE),
+            "{out:?}"
+        );
+        let chat = super::super::provider::event_map::EventMapper::new().map(&out);
+        assert!(
+            matches!(&chat[0], crate::chat::types::ChatEvent::Error { message, .. }
+            if message == crate::chat::manager::MASKING_FAILED_MESSAGE)
+        );
     }
 }
