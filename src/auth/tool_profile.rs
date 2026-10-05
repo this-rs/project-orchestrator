@@ -75,6 +75,13 @@ const RESTRICTED_ACTIONS: &[(&str, &str)] = &[
     ("plan", "auto_pr"),
     ("plan", "add_trigger"),
     ("plan", "enable_trigger"),
+    // Shown before but REST-closed (their routes are /api/protocols, /api/triggers
+    // and /api/plans/{id}/run/*): withheld so the model is not offered a 403.
+    ("note", "advance_rfc"),
+    ("note", "get_rfc_status"),
+    ("plan", "cancel_run"),
+    ("plan", "remove_trigger"),
+    ("plan", "disable_trigger"),
 ];
 
 /// How a REST route is treated by the restricted profile.
@@ -146,6 +153,10 @@ const CLOSED_ROUTE_PREFIXES: &[&str] = &[
     "/api/projects/*/sharing",
     "/api/projects/*/environments",
     "/api/projects/*/deployment-matrix",
+    // server maintenance under allowed parents, no kept tool calls them
+    "/api/chat/cli",
+    "/api/chat/detect-path",
+    "/api/projects/*/backfill-touches",
     "/api/notes/*/sharing",
     // memory maintenance (admin)
     "/api/notes/neurons",
@@ -664,5 +675,142 @@ mod tests {
             Some(RouteClass::Closed)
         );
         assert_eq!(classify_route("/api/projects/p"), Some(RouteClass::Allowed));
+    }
+
+    /// verify5: the write routes no kept tool calls, still open under the
+    /// `/api/chat` and `/api/projects` allowed prefixes.
+    #[test]
+    fn verify5_routes_no_kept_tool_calls_are_closed() {
+        use axum::http::Method;
+        let r = ToolProfile::Restricted;
+        let mut open = vec![];
+        for (method, path) in [
+            // installs/upgrades the Claude CLI binary of the server, at a version the body names
+            (Method::POST, "/api/chat/cli/install"),
+            // runs the user's login shell and returns its PATH
+            (Method::GET, "/api/chat/detect-path"),
+            // server-side git maintenance
+            (Method::POST, "/api/projects/p/backfill-touches"),
+        ] {
+            if !r.route_forbidden(&method, path) {
+                open.push(format!("{method} {path}"));
+            }
+        }
+        assert!(open.is_empty(), "open to the restricted profile: {open:?}");
+    }
+
+    /// verify5: every action the restricted profile SHOWS reaches its REST
+    /// routes (otherwise the model is offered an action that answers 403), read
+    /// from what the MCP handlers really call.
+    #[test]
+    fn verify5_every_kept_action_reaches_its_routes() {
+        use axum::http::Method;
+        let src = include_str!("../mcp/handlers.rs");
+        let start = src.find("async fn try_handle_http").expect("dispatcher");
+        let body = &src[start..];
+        let arm =
+            regex::Regex::new(r#"(?m)^ {12}("[a-z_0-9]+"(?:\s*\|\s*"[a-z_0-9]+")*)\s*=>"#).unwrap();
+        let call = regex::Regex::new(
+            r#"http\s*\.\s*(get_with_query|get|post|patch|put|delete)\s*\(\s*(?:&format!\(\s*)?"(/api/[^"]*)""#,
+        )
+        .unwrap();
+        let param = regex::Regex::new(r"\{[^}]*\}").unwrap();
+        let heads: Vec<_> = arm.captures_iter(body).collect();
+        let mut refused = vec![];
+        for (i, h) in heads.iter().enumerate() {
+            let from = h.get(0).unwrap().end();
+            let to = heads
+                .get(i + 1)
+                .map(|n| n.get(0).unwrap().start())
+                .unwrap_or(body.len());
+            let names: Vec<&str> = h[1]
+                .split('|')
+                .map(|n| n.trim().trim_matches('"'))
+                .collect();
+            for (tool, action, legacy) in crate::mcp::handlers::MEGA_TOOL_ACTIONS {
+                if !names.contains(legacy) || !ToolProfile::Restricted.allows_action(tool, action) {
+                    continue;
+                }
+                for c in call.captures_iter(&body[from..to]) {
+                    let method = match &c[1] {
+                        "get" | "get_with_query" => Method::GET,
+                        "post" => Method::POST,
+                        "patch" => Method::PATCH,
+                        "put" => Method::PUT,
+                        _ => Method::DELETE,
+                    };
+                    let path = param.replace_all(&c[2], "x");
+                    let path = path.split('?').next().unwrap();
+                    if ToolProfile::Restricted.route_forbidden(&method, path) {
+                        refused.push(format!("{tool}.{action}: {method} {path}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            refused.is_empty(),
+            "actions shown to the restricted profile whose route answers 403: {refused:?}"
+        );
+    }
+
+    /// verify5: every CLOSED family pinned by one path, independently of the
+    /// list itself, so that moving an entry to the allowed list fails a test.
+    #[test]
+    fn verify5_every_closed_family_stays_closed() {
+        use axum::http::Method;
+        let pinned = [
+            "/api/admin/x",
+            "/api/mcp-federation",
+            "/api/lifecycle-hooks",
+            "/api/vault/x",
+            "/api/protocols",
+            "/api/environments/e",
+            "/api/deployments/d",
+            "/api/neural-routing",
+            "/api/trajectories",
+            "/api/triggers/t",
+            "/api/event-triggers",
+            "/api/sync",
+            "/api/watch",
+            "/api/meilisearch/stats",
+            "/api/update/install",
+            "/api/projects/p/sharing",
+            "/api/projects/p/environments",
+            "/api/projects/p/deployment-matrix",
+            "/api/chat/cli/install",
+            "/api/chat/detect-path",
+            "/api/projects/p/backfill-touches",
+            "/api/notes/n/sharing",
+            "/api/notes/neurons/search",
+            "/api/notes/consolidate-memory",
+            "/api/notes/update-staleness",
+            "/api/notes/update-energy",
+            "/api/agents",
+            "/api/alerts",
+            "/api/attention",
+            "/api/documents",
+            "/api/feedback",
+            "/api/graph",
+            "/api/hooks",
+            "/api/progress",
+            "/api/reactor",
+            "/api/registry",
+            "/api/rfcs",
+            "/api/setup-status",
+            "/api/version",
+            "/api/wake",
+            "/api/webhooks",
+        ];
+        assert_eq!(
+            pinned.len(),
+            CLOSED_ROUTE_PREFIXES.len(),
+            "a closed family was added or removed: pin it here too"
+        );
+        for path in pinned {
+            assert!(
+                ToolProfile::Restricted.route_forbidden(&Method::GET, path),
+                "{path} must stay closed to the restricted profile"
+            );
+        }
     }
 }
