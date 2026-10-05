@@ -144,7 +144,7 @@ pub fn parse_credential_ref(
 pub struct InstanceDraft {
     /// Instance identifier (slug).
     pub id: Option<String>,
-    /// Kind; only `openai_compatible` can be created today.
+    /// Kind: `openai_compatible` (default), `codex` or `acp`.
     pub kind: Option<String>,
     /// Preset (deepseek, vllm, ollama, llama_server, nim), informational.
     #[serde(default)]

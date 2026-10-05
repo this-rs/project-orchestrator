@@ -6,10 +6,11 @@
 //! the rule survives a route being moved. No body carries a secret: instances
 //! name a credential reference, and a body with any other field is refused.
 //!
-//! Instances are stored (Neo4j `LlmSetting` documents) and listed; they cannot
-//! open a session yet: the resolver only knows the built-in instance until the
-//! nexus registry and the native harness land, and the security gate (A32)
-//! refuses to create one on a server running without authentication.
+//! Instances are stored (Neo4j `LlmSetting` documents) and listed; a stored
+//! instance opens sessions on the agent engine (`ChatManager::provider_for`),
+//! once a project has consented to its origin and credential reference. The
+//! security gate (A32) refuses to create one on a server running without
+//! authentication.
 
 use axum::{
     extract::{Path, State},

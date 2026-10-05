@@ -30,6 +30,7 @@ an identifier or a secret.
 | 503 | `provider_unavailable` | The instance cannot open sessions now. |
 | 409 | `engine_unavailable` | The session was opened on the agent engine, now switched off (`CHAT_PROVIDER_PATH`). |
 | 409 | `no_provider` | Nothing usable is configured. |
+| 502 | `provider_error` | The provider failed in a way this server version does not recognise (a provider newer than the backend). Show a generic failure with the status; retrying may help; report it with the provider id if it persists. |
 
 ## Settings routes (not in the typed table)
 

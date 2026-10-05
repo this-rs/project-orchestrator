@@ -588,13 +588,13 @@ pub enum ChatEvent {
         /// Neutral form of `permission_mode`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_mode: Option<String>,
-        /// Engine that drives the session: `agent` (provider-neutral). Absent =
-        /// the historical Claude Code engine, with everything it does.
+        /// Engine that drives the session: `agent` (provider-neutral) or
+        /// `legacy` (the historical Claude Code engine). Absent on an old frame.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         engine: Option<String>,
-        /// What the historical engine does and this session does NOT (hooks,
-        /// message queue, auto-continue, retry, compaction, NATS fan-out,
-        /// images). Present only when Claude Code was forced onto `agent`.
+        /// What this session does NOT do: hooks, message queue, auto-continue,
+        /// compaction, NATS fan-out, enrichment, images (the ones the engine or
+        /// the provider lacks). Empty on the legacy engine.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         degraded_features: Option<Vec<String>>,
     },

@@ -653,4 +653,146 @@ mod tests {
         assert_eq!(f.provider_id.as_deref(), Some("claude-code"));
         assert!(!f.retryable);
     }
+
+    // ── the error-code table of the docs is complete ────────────────────────
+
+    const DOC: &str = include_str!("../../../docs/api/provider-errors.md");
+
+    fn documented(code: &str) -> bool {
+        DOC.contains(&format!("`{code}`"))
+    }
+
+    #[test]
+    fn every_code_of_an_opening_failure_is_in_the_docs_table() {
+        use nexus_claude::agent::ProviderError as E;
+        // Every variant nexus knows today, plus the catch-all of `open_failure`.
+        // (`ProviderError` is non-exhaustive: a new variant lands in `provider_error`.)
+        let errors = [
+            E::CliNotFound {
+                program: "x".into(),
+            },
+            E::AuthRequired { login_hint: None },
+            E::CredentialsLocked,
+            E::Unauthorized,
+            E::EndpointUnreachable { detail: "x".into() },
+            E::ModelNoTools { model: "x".into() },
+            E::ContextTooSmall {
+                needed: None,
+                available: None,
+            },
+            E::RateLimited {
+                retry_after_ms: None,
+            },
+            E::Overloaded,
+            E::Timeout { after_ms: 1 },
+            E::ProcessExited { code: None },
+            E::Protocol { detail: "x".into() },
+            E::unsupported("x"),
+            E::TurnInProgress,
+            E::invalid("x"),
+            E::Closed,
+        ];
+        let mut codes: Vec<&'static str> =
+            errors.iter().map(|e| open_failure(e, None).code).collect();
+        codes.push("provider_error");
+        for r in [
+            ResolveError::ProviderConflict {
+                session: "a".into(),
+                requested: "b".into(),
+            },
+            ResolveError::UnknownProvider("a".into()),
+            ResolveError::NotAllowed("a".into()),
+            ResolveError::Unavailable {
+                provider_id: "a".into(),
+                role: Role::Pilot,
+            },
+            ResolveError::NoProvider,
+            ResolveError::EngineUnavailable {
+                provider_id: "a".into(),
+            },
+        ] {
+            codes.push(resolve_failure(&r).code);
+        }
+        for code in codes {
+            assert!(
+                documented(code),
+                "`{code}` is emitted but missing from docs/api/provider-errors.md"
+            );
+        }
+    }
+
+    #[test]
+    fn every_code_literal_of_the_handlers_is_in_the_docs_table() {
+        // Codes the settings / vault / chat handlers and the middleware put at the
+        // start of an error text (`"security_gate_closed: ..."`), plus the envelope codes.
+        let sources = [
+            (
+                "provider_handlers.rs",
+                include_str!("../../api/provider_handlers.rs"),
+            ),
+            (
+                "vault_handlers.rs",
+                include_str!("../../api/vault_handlers.rs"),
+            ),
+            (
+                "chat_handlers.rs",
+                include_str!("../../api/chat_handlers.rs"),
+            ),
+            ("middleware.rs", include_str!("../../auth/middleware.rs")),
+        ];
+        let literal = regex::Regex::new(r#""([a-z]+(?:_[a-z]+)+): "#).unwrap();
+        let mut found = Vec::new();
+        for (name, text) in sources {
+            // Only the production part of the file.
+            let production = text.split("#[cfg(test)]").next().unwrap_or(text);
+            for c in literal.captures_iter(production) {
+                found.push((name, c[1].to_string()));
+            }
+        }
+        assert!(
+            found.iter().any(|(_, c)| c == "security_gate_closed"),
+            "the scan finds the known code"
+        );
+        for (name, code) in &found {
+            assert!(
+                documented(code),
+                "`{code}` ({name}) is emitted but missing from docs/api/provider-errors.md"
+            );
+        }
+        // The verdict codes of POST /providers/test.
+        for code in [
+            "credential_test_requires_saved_instance",
+            "credentials_locked",
+            "model_no_tools",
+        ] {
+            assert!(documented(code), "`{code}`");
+        }
+        // The envelope codes are documented by suffix under `envelope_*`.
+        let envelope = include_str!("../envelope.rs");
+        let enve = regex::Regex::new(r#""envelope_([a-z_]+)""#).unwrap();
+        let production = envelope.split("#[cfg(test)]").next().unwrap_or(envelope);
+        let mut n = 0;
+        for c in enve.captures_iter(production) {
+            n += 1;
+            assert!(
+                DOC.contains(&c[1]),
+                "envelope code `envelope_{}` missing from the docs",
+                &c[1]
+            );
+        }
+        assert!(n >= 9, "the nine envelope codes were scanned");
+    }
+
+    #[test]
+    fn the_retired_probe_code_is_not_emitted_anywhere() {
+        // `probe_unavailable` was a placeholder before the real probe existed.
+        for text in [
+            include_str!("../../api/provider_handlers.rs"),
+            include_str!("../../chat/manager.rs"),
+            include_str!("native_factory.rs"),
+        ] {
+            let production = text.split("#[cfg(test)]").next().unwrap_or(text);
+            assert!(!production.contains("probe_unavailable"));
+        }
+    }
 }

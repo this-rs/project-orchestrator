@@ -22,11 +22,12 @@
 //! * [`validate_endpoint_with`] / [`validate_endpoint`] — the whole check, with
 //!   an injected or a real (blocking, `ToSocketAddrs`) resolver. Called when
 //!   an instance is created or edited AND before every connection.
-//! * [`http_client_builder_for_endpoints`] — a `reqwest` builder with
-//!   redirects disabled and a bounded connect timeout; a 3xx answer is then
-//!   refused through [`refuse_redirect`].
-//! * [`redact_error_body`] — what may be kept of an upstream error body:
-//!   truncated and with anything that looks like a credential replaced.
+//! * [`http_client_builder_for_endpoints`], [`refuse_redirect`] and
+//!   [`redact_error_body`] — helpers for a host that makes its own requests
+//!   (redirects off, a refused 3xx, a credential-free error body). NOT called
+//!   in production today: the requests of an instance are made by nexus's
+//!   `OpenAiEndpoint`, which pins the validated addresses and refuses
+//!   redirects itself. They stay for a future backend-side probe.
 //!
 //! Refusals never carry the URL. Their [`fmt::Display`] names the rule only;
 //! [`EndpointRefusal::message_for`] prefixes the normalised origin (scheme,
