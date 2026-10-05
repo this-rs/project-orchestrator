@@ -2480,6 +2480,16 @@ impl GraphStore for Neo4jClient {
         self.update_chat_session_model(id, model).await
     }
 
+    async fn update_chat_session_harness(
+        &self,
+        id: Uuid,
+        capabilities: Option<&str>,
+        resume_token: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.update_chat_session_harness(id, capabilities, resume_token)
+            .await
+    }
+
     async fn set_session_auto_continue(&self, id: Uuid, enabled: bool) -> anyhow::Result<()> {
         self.set_session_auto_continue(id, enabled).await
     }

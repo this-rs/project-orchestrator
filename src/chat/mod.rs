@@ -14,6 +14,7 @@ pub mod continuity;
 pub mod control_pump;
 pub(crate) mod drain;
 
+pub mod agent_runtime;
 pub mod enrichment;
 pub mod entity_extractor;
 pub mod envelope;

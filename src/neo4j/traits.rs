@@ -2083,6 +2083,15 @@ pub trait GraphStore: Send + Sync {
     /// survives idle-cleanup and is honored on resume/respawn)
     async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()>;
 
+    /// Record what the provider reported at open: the frozen capability
+    /// snapshot (JSON) and the resume token (wire form). `None` leaves a field as is.
+    async fn update_chat_session_harness(
+        &self,
+        id: Uuid,
+        capabilities: Option<&str>,
+        resume_token: Option<&str>,
+    ) -> Result<()>;
+
     /// Set the auto_continue flag on a chat session node
     async fn set_session_auto_continue(&self, id: Uuid, enabled: bool) -> Result<()>;
 

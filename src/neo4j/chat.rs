@@ -353,6 +353,26 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Record the capability snapshot and the resume token of a harness session.
+    /// A `None` argument leaves the stored value untouched.
+    pub async fn update_chat_session_harness(
+        &self,
+        id: Uuid,
+        capabilities: Option<&str>,
+        resume_token: Option<&str>,
+    ) -> Result<()> {
+        let cypher = "MATCH (s:ChatSession {id: $id}) \
+            SET s.capabilities = coalesce($capabilities, s.capabilities), \
+                s.resume_token = coalesce($resume_token, s.resume_token), \
+                s.updated_at = datetime()";
+        let q = query(cypher)
+            .param("id", id.to_string())
+            .param("capabilities", capabilities.map(str::to_string))
+            .param("resume_token", resume_token.map(str::to_string));
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
     /// Set the auto_continue flag on a chat session node.
     pub async fn set_session_auto_continue(&self, id: Uuid, enabled: bool) -> Result<()> {
         let cypher = "MATCH (s:ChatSession {id: $id}) SET s.auto_continue = $enabled, s.updated_at = datetime()";

@@ -1,5 +1,5 @@
 %% name: po-chat-manager
-%% covers: backend:src/chat/{mod,manager,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments,pending_queue}.rs
+%% covers: backend:src/chat/{mod,manager,agent_runtime,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments,pending_queue}.rs
 %% verified: ff5bb7b0
 %% ---
 %% PROUVE : le harness de chat côté serveur — comment ChatManager lance, pilote et
@@ -90,6 +90,11 @@ flowchart TD
         PROVIDER --> OPTIONS
     end
 
+    subgraph agentpath["Chemin agent — CHAT_PROVIDER_PATH=agent (défaut legacy), agent_runtime.rs"]
+        direction TB
+        AGENT["✅ create_session branche, APRÈS la persistance du nœud et la construction du prompt, sur open_agent_session :<br/>build_agent_spec (cwd, modèle, prompt, ToolPolicy neutre du mode, serveur MCP project-orchestrator avec le MÊME<br/>environnement que le chemin Claude — po_mcp_env, jeton lié à la session —, environnement enfant en liste blanche)<br/>→ provider.open → capacités figées + jeton de reprise persistés (update_chat_session_harness) → AgentRuntime::adopt<br/>un tour = AgentSession::send_turn → EventMapper → ChatEvent diffusés ET persistés (sauf stream_delta/streaming_status),<br/>un second tour pendant le premier = ProviderError turn_in_progress ; flux hors tour regroupé par seq (background_output) ;<br/>permissions, interrupt, set_model, set_policy_mode, close_session (session_closed) délégués à la session ;<br/>resume_session : session portant un instantané de capacités → resume_agent_session (jeton persisté, numéros d'événements continués)<br/><i>vérifié : agent_path_opens_a_session_persists_the_snapshot_and_streams_a_turn, agent_path_refuses_a_second_turn_while_one_runs_and_answers_permissions,<br/>agent_path_interrupt_model_mode_and_close_reach_the_provider, agent_path_open_failure_is_typed_and_revokes_nothing_live,<br/>agent_path_resumes_from_the_persisted_token_and_out_of_turn_output_regroups, legacy_path_never_touches_the_agent_runtime (faux provider)</i><br/>🟠 jamais exercé contre le VRAI CLI ; hooks (PreCompact, skills, PostToolUse), file d'attente de messages, auto-continue, retry, compaction, NATS : NON portés sur ce chemin"]
+    end
+    CREATE -. "provider_path = agent" .-> AGENT
     REST --> CREATE
     REST --> RESUME
     RUNNER --> CREATE
