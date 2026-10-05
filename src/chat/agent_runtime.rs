@@ -64,18 +64,33 @@ pub(crate) fn mask_agent_event_with(
     }
 }
 
-/// What the historical Claude Code engine does and the agent engine does NOT
-/// (yet): listed to the user when Claude Code is forced onto the agent engine.
-pub const DEGRADED_FEATURES: [&str; 8] = [
-    "hooks",
-    "message_queue",
-    "auto_continue",
-    "retry",
-    "compaction",
-    "nats",
-    "images",
-    "entity_enrichment",
-];
+/// What a session on the agent engine does NOT do, as the identifiers the
+/// frontend knows (`hooks`, `message_queue`, `auto_continue`, `retry`,
+/// `compaction`, `nats`, `enrichment`, `images`).
+///
+/// Two sources, kept apart on purpose:
+/// - what THIS ENGINE (the backend) has not ported, whatever the provider can do:
+///   hooks (no relay yet), message queue, auto-continue, retry, NATS fan-out, entity
+///   enrichment;
+/// - what THE SESSION's capabilities say it cannot do: `images`, and `compaction`
+///   when the provider emits no compaction signal.
+pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
+    let mut missing = vec![
+        "hooks",
+        "message_queue",
+        "auto_continue",
+        "retry",
+        "nats",
+        "enrichment",
+    ];
+    if !caps.compaction_signal {
+        missing.push("compaction");
+    }
+    if !caps.images {
+        missing.push("images");
+    }
+    missing.into_iter().map(str::to_string).collect()
+}
 
 /// Where the runtime finds a provider instance by identifier. The nexus
 /// registry plugs in here; until then only the built-in instance exists.
@@ -106,8 +121,8 @@ pub struct AgentSessionHandle {
     provider: serde_json::Value,
     /// Tool policy stamped on `system_init`.
     tool_policy: serde_json::Value,
-    /// Set when Claude Code was FORCED onto this engine: what it lost.
-    degraded: Option<Vec<String>>,
+    /// What this session does not do (see [`degraded_features`]).
+    degraded: Vec<String>,
     next_seq: AtomicI64,
     mapper: Mutex<EventMapper>,
     graph: Arc<dyn GraphStore>,
@@ -130,9 +145,7 @@ impl AgentSessionHandle {
             // The client must be able to tell which engine drives the session,
             // and, when Claude Code was forced here, what it no longer does.
             engine.get_or_insert_with(|| "agent".to_string());
-            if let Some(lost) = &self.degraded {
-                degraded_features.get_or_insert_with(|| lost.clone());
-            }
+            degraded_features.get_or_insert_with(|| self.degraded.clone());
             provider.get_or_insert_with(|| self.provider.clone());
             capabilities.get_or_insert_with(|| {
                 serde_json::to_value(&self.capabilities).unwrap_or_default()
@@ -315,7 +328,6 @@ impl AgentRuntime {
         first_seq: i64,
         provider_kind: &str,
         tool_policy: serde_json::Value,
-        degraded: Option<Vec<String>>,
     ) -> Arc<AgentSessionHandle> {
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let handle = Arc::new(AgentSessionHandle {
@@ -329,7 +341,7 @@ impl AgentRuntime {
             streaming_events: Mutex::new(Vec::new()),
             provider: serde_json::json!({ "id": provider_id, "kind": provider_kind }),
             tool_policy,
-            degraded,
+            degraded: degraded_features(session.capabilities()),
             next_seq: AtomicI64::new(first_seq),
             mapper: Mutex::new(EventMapper::new()),
             graph: Arc::clone(&self.graph),
@@ -571,6 +583,8 @@ pub(crate) mod fake {
     pub struct FakeProvider {
         pub state: Arc<FakeState>,
         pub fail_open: Arc<StdMutex<Option<ProviderError>>>,
+        /// Capabilities the sessions of this provider declare.
+        pub caps: Arc<StdMutex<Capabilities>>,
     }
 
     impl FakeProvider {
@@ -578,6 +592,7 @@ pub(crate) mod fake {
             Self {
                 state: Arc::new(FakeState::default()),
                 fail_open: Arc::new(StdMutex::new(None)),
+                caps: Arc::new(StdMutex::new(Capabilities::none())),
             }
         }
         fn session(&self) -> Arc<FakeSession> {
@@ -585,7 +600,7 @@ pub(crate) mod fake {
             *self.state.oob_tx.lock().unwrap() = Some(tx);
             Arc::new(FakeSession {
                 state: Arc::clone(&self.state),
-                caps: Capabilities::none(),
+                caps: self.caps.lock().unwrap().clone(),
                 oob: StdMutex::new(Some(Box::pin(rx))),
             })
         }

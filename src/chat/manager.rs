@@ -2962,8 +2962,9 @@ impl ChatManager {
                             capabilities: None,
                             tool_policy: None,
                             policy_mode: None,
-                            engine: None,
-                            degraded_features: None,
+                            // The historical engine does everything: nothing is missing.
+                            engine: Some("legacy".to_string()),
+                            degraded_features: Some(Vec::new()),
                         }]
                     }
                     "compact_boundary" => {
@@ -8082,20 +8083,16 @@ impl ChatManager {
             || self.config.provider_path == super::config::ProviderPath::Agent
     }
 
-    /// Features lost when Claude Code runs on the agent engine; `None` for any
-    /// other provider (which never had them).
-    fn degraded_for(&self, provider_id: &str) -> Option<Vec<String>> {
-        (provider_id == super::provider::resolver::CLAUDE_CODE).then(|| {
+    /// The visible warning when Claude Code is FORCED onto the agent engine
+    /// (`CHAT_PROVIDER_PATH=agent`): the server logs what that session loses.
+    fn warn_if_forced(&self, provider_id: &str, session: &dyn nexus_claude::agent::AgentSession) {
+        if provider_id == super::provider::resolver::CLAUDE_CODE {
             warn!(
-                features = ?super::agent_runtime::DEGRADED_FEATURES,
+                features = ?super::agent_runtime::degraded_features(session.capabilities()),
                 "Claude Code is running on the AGENT engine (CHAT_PROVIDER_PATH=agent): \
                  these features are NOT available for this session"
             );
-            super::agent_runtime::DEGRADED_FEATURES
-                .iter()
-                .map(|f| (*f).to_string())
-                .collect()
-        })
+        }
     }
 
     /// Decides which provider instance serves a session being opened (A16).
@@ -8465,7 +8462,7 @@ impl ChatManager {
         first_seq: i64,
         tool_policy: serde_json::Value,
     ) {
-        let degraded = self.degraded_for(provider_id);
+        self.warn_if_forced(provider_id, session.as_ref());
         let capabilities = serde_json::to_string(session.capabilities()).unwrap_or_default();
         let token = session.resume_token().map(|t| t.to_wire());
         if let Ok(uuid) = Uuid::parse_str(session_id) {
@@ -8489,7 +8486,6 @@ impl ChatManager {
                 first_seq,
                 &kind_name,
                 tool_policy,
-                degraded,
             )
             .await;
     }
@@ -11156,6 +11152,84 @@ mod tests {
                 "{lost} must be listed: {degraded:?}"
             );
         }
+    }
+
+    /// The `system_init` a live agent session REALLY emits (not a fixture).
+    async fn real_agent_system_init(
+        manager: &ChatManager,
+        fake: &super::super::agent_runtime::fake::FakeProvider,
+    ) -> serde_json::Value {
+        use nexus_claude::agent::AgentEvent;
+        let sid = manager
+            .create_session(&agent_request("go"))
+            .await
+            .unwrap()
+            .session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        fake.state.push(AgentEvent::SessionStarted {
+            provider_session_id: Some("p1".into()),
+            model: Some("m".into()),
+            policy_mode: None,
+            native_mode: None,
+            tools: vec![],
+            mcp_servers: vec![],
+            cwd: None,
+        });
+        let init = next_matching(&mut rx, |e| matches!(e, ChatEvent::SystemInit { .. })).await;
+        serde_json::to_value(&init).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_agent_system_init_lists_what_the_session_capabilities_do_not_cover() {
+        // A provider that declares images and a compaction signal: those two are not missing.
+        let (manager, _graph, fake) = agent_manager();
+        {
+            let mut caps = fake.caps.lock().unwrap();
+            caps.images = true;
+            caps.compaction_signal = true;
+        }
+        let wire = real_agent_system_init(&manager, &fake).await;
+        assert_eq!(wire["engine"], "agent", "{wire}");
+        let degraded: Vec<String> =
+            serde_json::from_value(wire["degraded_features"].clone()).expect("a list");
+        // What the backend does not do on this engine, whatever the provider says...
+        for lost in [
+            "hooks",
+            "message_queue",
+            "auto_continue",
+            "retry",
+            "nats",
+            "enrichment",
+        ] {
+            assert!(degraded.iter().any(|d| d == lost), "{lost}: {degraded:?}");
+        }
+        // ...and what the provider covers is not claimed missing.
+        assert!(
+            !degraded.iter().any(|d| d == "images" || d == "compaction"),
+            "{degraded:?}"
+        );
+
+        // A provider that declares neither: both are listed.
+        let (manager, _graph, fake) = agent_manager();
+        let wire = real_agent_system_init(&manager, &fake).await;
+        let degraded: Vec<String> =
+            serde_json::from_value(wire["degraded_features"].clone()).unwrap();
+        assert!(
+            degraded.iter().any(|d| d == "images") && degraded.iter().any(|d| d == "compaction")
+        );
+    }
+
+    #[test]
+    fn the_legacy_system_init_says_legacy_with_nothing_missing() {
+        // `message_to_events` is what the legacy stream loop emits for the CLI's init.
+        let msg = Message::System {
+            subtype: "init".into(),
+            data: serde_json::json!({"session_id": "cli-1", "model": "m"}),
+        };
+        let events = ChatManager::message_to_events(&msg);
+        let wire = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(wire["engine"], "legacy", "{wire}");
+        assert_eq!(wire["degraded_features"], serde_json::json!([]), "{wire}");
     }
 
     #[tokio::test]

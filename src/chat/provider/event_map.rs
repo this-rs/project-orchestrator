@@ -766,6 +766,8 @@ mod tests {
         "stop_reason",
         "policy_mode",
         "synthetic",
+        "engine",
+        "degraded_features",
     ];
 
     #[test]
@@ -847,9 +849,18 @@ mod tests {
         let mut state = MapState::new();
         let mut mapper = EventMapper::new();
         for (name, msg) in corpus() {
+            // The legacy init says which engine it is; the mapper leaves that to the
+            // session owner (the runtime stamps `engine` and `degraded_features`).
             let legacy: Vec<Value> = ChatManager::message_to_events(&msg)
                 .iter()
-                .map(|e| serde_json::to_value(e).unwrap())
+                .map(|e| {
+                    let mut v = serde_json::to_value(e).unwrap();
+                    if let Some(o) = v.as_object_mut() {
+                        o.remove("engine");
+                        o.remove("degraded_features");
+                    }
+                    v
+                })
                 .collect();
             let via_contract = mapped(&msg, &mut state, &mut mapper);
             assert_eq!(via_contract, legacy, "message `{name}` maps differently");
