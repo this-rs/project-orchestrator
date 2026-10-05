@@ -31,6 +31,7 @@ pub mod sharing_handlers;
 pub mod skill_handlers;
 pub mod trajectory_handlers;
 pub mod trigger_handlers;
+pub mod update_handlers;
 pub mod vault_handlers;
 pub mod workspace_handlers;
 pub mod ws_auth;

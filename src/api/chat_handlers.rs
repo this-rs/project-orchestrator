@@ -1261,6 +1261,9 @@ pub async fn update_chat_config(
     }
     if let Some(auto_update_app) = body.auto_update_app {
         chat_manager.update_auto_update_app(auto_update_app).await;
+        // The update service reads its own flag: without this the toggle was
+        // persisted and echoed back but only took effect after a restart.
+        crate::update::service::apply_auto_update(auto_update_app);
     }
 
     // Persist to config.yaml if path is known

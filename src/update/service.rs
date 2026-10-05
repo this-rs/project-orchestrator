@@ -340,6 +340,19 @@ pub fn global() -> Option<&'static Arc<UpdateService>> {
     GLOBAL.get()
 }
 
+/// Apply a runtime change of `chat.auto_update_app` to the running service.
+/// Returns whether a service was reached (false when the checker is disabled
+/// or failed to start, in which case there is nothing to toggle).
+pub fn apply_auto_update(enabled: bool) -> bool {
+    match global() {
+        Some(svc) => {
+            svc.set_auto_update(enabled);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Whether release checks are enabled (`PO_UPDATE_CHECK` not set to off).
 pub fn check_enabled_from_env() -> bool {
     !matches!(
@@ -611,6 +624,13 @@ mod tests {
                 Err(InstallError::NotSupported(..))
             ));
         }
+    }
+
+    #[test]
+    fn apply_auto_update_without_a_running_service_is_a_reported_noop() {
+        // No `start_global` in unit tests: nothing to toggle, and the caller is told.
+        assert!(global().is_none());
+        assert!(!apply_auto_update(true));
     }
 
     #[tokio::test]
