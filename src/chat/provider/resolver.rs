@@ -197,6 +197,12 @@ pub enum ResolveError {
     },
     /// Nothing is configured and Claude Code is not usable.
     NoProvider,
+    /// The session was opened on the agent engine, which is not switched on
+    /// any more (`CHAT_PROVIDER_PATH`): it cannot be resumed as it is.
+    EngineUnavailable {
+        /// Provider of the session.
+        provider_id: String,
+    },
 }
 
 impl ResolveError {
@@ -208,6 +214,7 @@ impl ResolveError {
             Self::NotAllowed(_) => "endpoint_not_allowed",
             Self::Unavailable { .. } => "provider_unavailable",
             Self::NoProvider => "no_provider",
+            Self::EngineUnavailable { .. } => "engine_unavailable",
         }
     }
 }
@@ -229,6 +236,10 @@ impl fmt::Display for ResolveError {
                 role.as_str()
             ),
             Self::NoProvider => f.write_str("no provider is configured"),
+            Self::EngineUnavailable { provider_id } => write!(
+                f,
+                "session of provider '{provider_id}' was opened on the agent engine, which is switched off"
+            ),
         }
     }
 }

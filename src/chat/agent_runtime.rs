@@ -64,6 +64,19 @@ pub(crate) fn mask_agent_event_with(
     }
 }
 
+/// What the historical Claude Code engine does and the agent engine does NOT
+/// (yet): listed to the user when Claude Code is forced onto the agent engine.
+pub const DEGRADED_FEATURES: [&str; 8] = [
+    "hooks",
+    "message_queue",
+    "auto_continue",
+    "retry",
+    "compaction",
+    "nats",
+    "images",
+    "entity_enrichment",
+];
+
 /// Where the runtime finds a provider instance by identifier. The nexus
 /// registry plugs in here; until then only the built-in instance exists.
 pub trait ProviderSource: Send + Sync {
@@ -93,6 +106,8 @@ pub struct AgentSessionHandle {
     provider: serde_json::Value,
     /// Tool policy stamped on `system_init`.
     tool_policy: serde_json::Value,
+    /// Set when Claude Code was FORCED onto this engine: what it lost.
+    degraded: Option<Vec<String>>,
     next_seq: AtomicI64,
     mapper: Mutex<EventMapper>,
     graph: Arc<dyn GraphStore>,
@@ -107,9 +122,17 @@ impl AgentSessionHandle {
             provider,
             capabilities,
             tool_policy,
+            engine,
+            degraded_features,
             ..
         } = &mut event
         {
+            // The client must be able to tell which engine drives the session,
+            // and, when Claude Code was forced here, what it no longer does.
+            engine.get_or_insert_with(|| "agent".to_string());
+            if let Some(lost) = &self.degraded {
+                degraded_features.get_or_insert_with(|| lost.clone());
+            }
             provider.get_or_insert_with(|| self.provider.clone());
             capabilities.get_or_insert_with(|| {
                 serde_json::to_value(&self.capabilities).unwrap_or_default()
@@ -292,6 +315,7 @@ impl AgentRuntime {
         first_seq: i64,
         provider_kind: &str,
         tool_policy: serde_json::Value,
+        degraded: Option<Vec<String>>,
     ) -> Arc<AgentSessionHandle> {
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let handle = Arc::new(AgentSessionHandle {
@@ -305,6 +329,7 @@ impl AgentRuntime {
             streaming_events: Mutex::new(Vec::new()),
             provider: serde_json::json!({ "id": provider_id, "kind": provider_kind }),
             tool_policy,
+            degraded,
             next_seq: AtomicI64::new(first_seq),
             mapper: Mutex::new(EventMapper::new()),
             graph: Arc::clone(&self.graph),

@@ -271,6 +271,15 @@ pub fn resolve_failure(err: &ResolveError) -> OpenFailure {
             Some(provider_id.clone()),
             true,
         ),
+        ResolveError::EngineUnavailable { provider_id } => (
+            409,
+            "This session was opened on the agent engine (CHAT_PROVIDER_PATH=agent), which is \
+             switched off on this server. Switch it back on to resume it; the session was not \
+             changed."
+                .to_string(),
+            Some(provider_id.clone()),
+            false,
+        ),
         ResolveError::NoProvider => (
             409,
             "No provider is configured. Configure one to start a session.".to_string(),
@@ -632,5 +641,16 @@ mod tests {
         let failure = assert_resolved(ResolveError::NoProvider, 409, "no_provider", None);
         assert!(!failure.retryable);
         assert!(failure.to_json().get("provider_id").is_none());
+    }
+
+    #[test]
+    fn a_switched_off_engine_is_a_typed_409_that_names_the_flag() {
+        let f = resolve_failure(&ResolveError::EngineUnavailable {
+            provider_id: "claude-code".into(),
+        });
+        assert_eq!((f.status, f.code), (409, "engine_unavailable"));
+        assert!(f.message.contains("CHAT_PROVIDER_PATH"));
+        assert_eq!(f.provider_id.as_deref(), Some("claude-code"));
+        assert!(!f.retryable);
     }
 }

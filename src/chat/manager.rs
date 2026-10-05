@@ -2962,6 +2962,8 @@ impl ChatManager {
                             capabilities: None,
                             tool_policy: None,
                             policy_mode: None,
+                            engine: None,
+                            degraded_features: None,
                         }]
                     }
                     "compact_boundary" => {
@@ -3253,7 +3255,10 @@ impl ChatManager {
 
         // The provider-neutral path takes over here: the session is persisted
         // and the system prompt built; what follows is the Claude CLI engine.
-        if self.config.provider_path == super::config::ProviderPath::Agent {
+        // Hybrid routing: Claude Code stays on the historical engine (hooks,
+        // queue, retry, compaction, NATS, images) unless the operator FORCES it
+        // onto the agent engine; every other provider is served by the agent engine.
+        if self.engine_is_agent(&provider_choice.provider_id) {
             return self
                 .open_agent_session(
                     request,
@@ -6400,11 +6405,13 @@ impl ChatManager {
         // A session opened by the agent engine carries its capability snapshot:
         // it resumes on that engine, and only when that engine is switched on.
         if session_node.capabilities.is_some() {
-            if self.config.provider_path != super::config::ProviderPath::Agent {
+            // A third-party session always resumes on the agent engine. A Claude
+            // Code session that was forced onto it needs the flag still on:
+            // otherwise a typed, explicit error (not a mute `provider_unavailable`).
+            if !self.engine_is_agent(&frozen.provider_id) {
                 return Err(anyhow::Error::new(
-                    super::provider::resolver::ResolveError::Unavailable {
+                    super::provider::resolver::ResolveError::EngineUnavailable {
                         provider_id: frozen.provider_id,
-                        role: super::provider::resolver::Role::Pilot,
                     },
                 ));
             }
@@ -8068,6 +8075,29 @@ impl ChatManager {
         }
     }
 
+    /// Whether a provider is served by the agent engine: every provider but
+    /// Claude Code, and Claude Code itself only when `CHAT_PROVIDER_PATH=agent`.
+    pub(crate) fn engine_is_agent(&self, provider_id: &str) -> bool {
+        provider_id != super::provider::resolver::CLAUDE_CODE
+            || self.config.provider_path == super::config::ProviderPath::Agent
+    }
+
+    /// Features lost when Claude Code runs on the agent engine; `None` for any
+    /// other provider (which never had them).
+    fn degraded_for(&self, provider_id: &str) -> Option<Vec<String>> {
+        (provider_id == super::provider::resolver::CLAUDE_CODE).then(|| {
+            warn!(
+                features = ?super::agent_runtime::DEGRADED_FEATURES,
+                "Claude Code is running on the AGENT engine (CHAT_PROVIDER_PATH=agent): \
+                 these features are NOT available for this session"
+            );
+            super::agent_runtime::DEGRADED_FEATURES
+                .iter()
+                .map(|f| (*f).to_string())
+                .collect()
+        })
+    }
+
     /// Decides which provider instance serves a session being opened (A16).
     ///
     /// Reads the stored instances, the consent of the project (tied to the
@@ -8130,14 +8160,6 @@ impl ChatManager {
                 choice.shadow = Some((p.candidate.provider_id.clone(), p.candidate.model.clone()));
                 choice.route_rule = Some(p.rule.clone());
             }
-        }
-        if self.config.provider_path != super::config::ProviderPath::Agent
-            && choice.provider_id != resolver::CLAUDE_CODE
-        {
-            return Err(anyhow::Error::new(resolver::ResolveError::Unavailable {
-                provider_id: choice.provider_id,
-                role,
-            }));
         }
         Ok(choice)
     }
@@ -8443,6 +8465,7 @@ impl ChatManager {
         first_seq: i64,
         tool_policy: serde_json::Value,
     ) {
+        let degraded = self.degraded_for(provider_id);
         let capabilities = serde_json::to_string(session.capabilities()).unwrap_or_default();
         let token = session.resume_token().map(|t| t.to_wire());
         if let Ok(uuid) = Uuid::parse_str(session_id) {
@@ -8466,6 +8489,7 @@ impl ChatManager {
                 first_seq,
                 &kind_name,
                 tool_policy,
+                degraded,
             )
             .await;
     }
@@ -8565,7 +8589,18 @@ impl ChatManager {
     pub async fn close_session(&self, session_id: &str) -> Result<()> {
         if self.agent_runtime.owns(session_id).await {
             crate::auth::agent_tokens::revoke_session(session_id);
-            return self.agent_runtime.close(session_id).await;
+            self.agent_runtime.close(session_id).await?;
+            // Every instance learns the session is gone, as on the legacy path.
+            if let Some(ref nats) = self.nats {
+                nats.publish_chat_event(
+                    session_id,
+                    ChatEvent::SessionClosed {
+                        session_id: session_id.to_string(),
+                        reason: Some("closed".to_string()),
+                    },
+                );
+            }
+            return Ok(());
         }
         // 0. The session's MCP token dies with it — before anything that can
         //    fail, so a half-closed session never leaves a usable token behind.
@@ -11051,6 +11086,99 @@ mod tests {
         let bg = next_matching(&mut rx, |e| matches!(e, ChatEvent::BackgroundOutput { .. })).await;
         assert!(
             matches!(bg, ChatEvent::BackgroundOutput { ref source, ref content, .. } if source == "assistant" && content == "background line")
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_code_stays_on_the_legacy_engine_by_default_hooks_included() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let state = mock_app_state();
+        let config = test_config();
+        assert_eq!(
+            config.provider_path,
+            crate::chat::config::ProviderPath::Legacy
+        );
+        let fake = super::super::agent_runtime::fake::FakeProvider::new();
+        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
+            .with_provider_source(Arc::new(fake.clone()));
+        // The Claude CLI is not there in tests: the call may fail, but it must
+        // NOT have gone through the agent engine (which has no hooks, queue, retry...).
+        let _ = manager.create_session(&agent_request("hello")).await;
+        assert_eq!(manager.agent_runtime.len().await, 0);
+        assert!(
+            fake.state.opened_specs.lock().unwrap().is_empty(),
+            "the agent provider was never asked"
+        );
+        let nodes: Vec<_> = graph.chat_sessions.read().await.values().cloned().collect();
+        assert_eq!(nodes.len(), 1);
+        assert!(
+            nodes[0].capabilities.is_none(),
+            "no agent snapshot: it is a legacy session"
+        );
+    }
+
+    #[tokio::test]
+    async fn forcing_claude_code_onto_the_agent_engine_says_what_is_missing() {
+        use nexus_claude::agent::AgentEvent;
+        let (manager, _graph, fake) = agent_manager(); // CHAT_PROVIDER_PATH=agent
+        let sid = manager
+            .create_session(&agent_request("go"))
+            .await
+            .unwrap()
+            .session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        fake.state.push(AgentEvent::SessionStarted {
+            provider_session_id: Some("p1".into()),
+            model: Some("m".into()),
+            policy_mode: None,
+            native_mode: None,
+            tools: vec![],
+            mcp_servers: vec![],
+            cwd: None,
+        });
+        let init = next_matching(&mut rx, |e| matches!(e, ChatEvent::SystemInit { .. })).await;
+        let wire = serde_json::to_value(&init).unwrap();
+        assert_eq!(wire["engine"], "agent", "{wire}");
+        let degraded: Vec<String> = serde_json::from_value(wire["degraded_features"].clone())
+            .unwrap_or_else(|_| panic!("degraded_features missing: {wire}"));
+        for lost in [
+            "hooks",
+            "message_queue",
+            "auto_continue",
+            "retry",
+            "compaction",
+            "nats",
+            "images",
+        ] {
+            assert!(
+                degraded.iter().any(|d| d == lost),
+                "{lost} must be listed: {degraded:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_agent_session_of_claude_code_resumed_without_the_engine_is_a_typed_engine_error() {
+        let (manager, graph, _fake) = agent_manager();
+        let sid = manager
+            .create_session(&agent_request("one"))
+            .await
+            .unwrap()
+            .session_id;
+        manager.agent_runtime.close(&sid).await.unwrap();
+        // The flag is back to its default: the engine of that session is not available.
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let legacy = ChatManager::new_without_memory(dyn_graph, state.meili, test_config());
+        let err = legacy.resume_session(&sid, "two", None).await.unwrap_err();
+        let failure =
+            crate::chat::provider::errors::classify_open_error(&err, None).expect("typed");
+        assert_eq!((failure.status, failure.code), (409, "engine_unavailable"));
+        assert!(
+            failure.message.contains("CHAT_PROVIDER_PATH"),
+            "{}",
+            failure.message
         );
     }
 

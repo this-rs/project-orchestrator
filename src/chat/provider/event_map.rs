@@ -69,6 +69,8 @@ impl EventMapper {
                 capabilities: None,
                 tool_policy: None,
                 policy_mode: policy_mode.map(|m| neutral_name(m).to_string()),
+                engine: None,
+                degraded_features: None,
             }],
             // In a turn the echo of the user's own message is not an event
             // (the backend already emitted `user_message`).

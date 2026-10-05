@@ -454,6 +454,8 @@ fn server_examples() -> Vec<ServerExample> {
                     json!({ "mode": "ask", "native_mode": "default", "allow": [], "deny": [] }),
                 ),
                 policy_mode: Some(s("ask")),
+                engine: Some(s("agent")),
+                degraded_features: Some(vec![s("hooks"), s("retry")]),
             },
             ChatEvent::SystemInit {
                 cli_session_id: s("cli-session-0001"),
@@ -465,6 +467,8 @@ fn server_examples() -> Vec<ServerExample> {
                 capabilities: None,
                 tool_policy: None,
                 policy_mode: None,
+                engine: None,
+                degraded_features: None,
             },
         ),
         ServerExample::new(

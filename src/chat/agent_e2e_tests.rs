@@ -549,7 +549,9 @@ async fn a_pilot_role_routes_a_project_to_the_instance_and_consent_still_applies
 }
 
 #[tokio::test]
-async fn the_legacy_engine_cannot_open_a_registered_instance() {
+async fn a_third_party_runs_on_the_agent_engine_without_any_flag() {
+    // CHAT_PROVIDER_PATH is at its default (`legacy`): a registered instance still opens,
+    // because the agent engine serves third parties by design; only claude-code stays on legacy.
     let fake = FakeOpenAi::start(script());
     let graph = Arc::new(MockGraphStore::new());
     store_instance(&graph, &instance(&fake, "none")).await;
@@ -557,14 +559,17 @@ async fn the_legacy_engine_cannot_open_a_registered_instance() {
     let state = mock_app_state();
     let dyn_graph: Arc<dyn GraphStore> = graph.clone();
     let mut config = super::config::ChatConfig::default();
-    config.provider_path = ProviderPath::Legacy;
+    assert_eq!(config.provider_path, ProviderPath::Legacy, "the default");
+    config.mcp_server_path = fake_bin("fake_mcp");
+    config.jwt_secret = Some("test-secret-test-secret-test-secret".to_string());
     let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config);
-    let err = manager
+    let created = manager
         .create_session(&request(Some("local"), Some("proj"), "default"))
         .await
-        .unwrap_err();
-    assert_eq!(failure(&err), (503, "provider_unavailable"));
-    assert!(fake.requests().is_empty());
+        .unwrap_or_else(|e| panic!("a third party must open on the agent engine: {e:#}"));
+    assert!(manager.agent_runtime.owns(&created.session_id).await);
+    let mut rx = manager.subscribe(&created.session_id).await.unwrap();
+    next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
 }
 
 async fn put_policy(graph: &MockGraphStore, mode: &str) {

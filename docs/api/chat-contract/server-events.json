@@ -856,6 +856,11 @@
             "interactive_permissions": true
           },
           "cli_session_id": "cli-session-0001",
+          "degraded_features": [
+            "hooks",
+            "retry"
+          ],
+          "engine": "agent",
           "mcp_servers": [
             {
               "name": "project-orchestrator",
@@ -894,6 +899,14 @@
         },
         "cli_session_id": {
           "required": true,
+          "type": "string"
+        },
+        "degraded_features": {
+          "required": false,
+          "type": "array"
+        },
+        "engine": {
+          "required": false,
           "type": "string"
         },
         "mcp_servers": {

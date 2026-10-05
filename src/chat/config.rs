@@ -206,7 +206,13 @@ pub struct ChatConfig {
 /// Environment variable selecting the [`ProviderPath`].
 pub const PROVIDER_PATH_VAR: &str = "CHAT_PROVIDER_PATH";
 
-/// Engine that drives chat sessions (decision A18 / task B38).
+/// Engine that drives Claude Code sessions (decision A18 / task B38).
+///
+/// Routing is HYBRID: Claude Code stays on the historical engine (hooks, message
+/// queue, auto-continue, retry, compaction, NATS, images) by default, and every
+/// third-party provider is served by the agent engine whatever this says.
+/// `Agent` only FORCES Claude Code onto the agent engine, to try it: the session
+/// then says what it lost (`system_init.degraded_features`) and the server logs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProviderPath {
     /// The historical path: `InteractiveClient` straight on the Claude CLI.

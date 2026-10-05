@@ -588,6 +588,15 @@ pub enum ChatEvent {
         /// Neutral form of `permission_mode`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_mode: Option<String>,
+        /// Engine that drives the session: `agent` (provider-neutral). Absent =
+        /// the historical Claude Code engine, with everything it does.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        engine: Option<String>,
+        /// What the historical engine does and this session does NOT (hooks,
+        /// message queue, auto-continue, retry, compaction, NATS fan-out,
+        /// images). Present only when Claude Code was forced onto `agent`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        degraded_features: Option<Vec<String>>,
     },
     /// Claude Code Dynamic Workflow lifecycle event (intra-task sub-agent fan-out).
     ///
@@ -1891,6 +1900,8 @@ mod tests {
                 capabilities: None,
                 tool_policy: None,
                 policy_mode: None,
+                engine: None,
+                degraded_features: None,
             },
             ChatEvent::SystemInit {
                 cli_session_id: "cli-init-456".into(),
@@ -1902,6 +1913,8 @@ mod tests {
                 capabilities: None,
                 tool_policy: None,
                 policy_mode: None,
+                engine: None,
+                degraded_features: None,
             },
             ChatEvent::AutoContinue {
                 session_id: "sess-auto-1".into(),
