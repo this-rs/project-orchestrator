@@ -34,12 +34,6 @@ pub struct UpdateProgressPayload {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UpdateErrorPayload {
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct UpdateInstallingPayload {
     pub version: String,
 }
