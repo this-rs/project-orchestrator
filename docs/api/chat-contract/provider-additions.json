@@ -147,7 +147,7 @@
     "doc": "LIVRE (backend ... settings). Toutes les mutations exigent un jeton HUMAIN (403 sinon). Aucun corps ne porte de secret : `credential_ref` = none | vault:<nom> | env:<VAR> ; tout autre champ (api_key...) est refuse (422), une valeur collee dans credential_ref est refusee (400) sans etre renvoyee.",
     "ecarts_vs_message_coordinateur": "Le frontend appelle PUT /chat/providers/{id} et /projects/{slug}/llm-consent (singulier) ; le message du coordinateur disait PATCH et llm-consents (pluriel). Le backend accepte LES DEUX (PUT et PATCH ; llm-consent et llm-consents).",
     "instances": {
-      "POST /api/chat/providers/test": "corps ProviderDraft -> 200 {ok:false, health:{state,code}} ; code = endpoint_* (refus de la garde) ou probe_unavailable (le harness natif n'est pas la : AUCUNE sonde reelle) ; ok n'est jamais true pour l'instant",
+      "POST /api/chat/providers/test": "corps ProviderDraft -> 200 {ok:false, health:{state,code}} ; code = endpoint_* (refus de la garde), credentials_locked, credential_test_requires_saved_instance, model_no_tools ; sonde reelle (health, liste des modeles, appel d'outil, fenetre) ; ok = sante ok ET outils ok",
       "POST /api/chat/providers": "201 {id,kind,preset,label,base_url,origin,default_model,cost_source,credential_ref,builtin:false} ; 409 id existant ; 409 security_gate_closed sans authentification ; 400 URL refusee ; 403 id claude-code",
       "PUT|PATCH /api/chat/providers/{id}": "corps ProviderPatch -> 200 meme forme + consents_invalidated (true si l'origine change) ; 403 claude-code ; 404",
       "DELETE /api/chat/providers/{id}": "204 ; 403 claude-code ; 404",
