@@ -10,5 +10,6 @@ pub mod credentials;
 pub mod endpoint_guard;
 pub mod errors;
 pub mod event_map;
+pub mod listing;
 pub mod policy;
 pub mod resolver;

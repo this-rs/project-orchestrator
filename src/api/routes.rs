@@ -1939,6 +1939,7 @@ fn protected_routes() -> Router<OrchestratorState> {
         // Detect user PATH from login shell
         .route("/api/chat/detect-path", get(chat_handlers::detect_path))
         // CLI version management (check + install/upgrade)
+        .route("/api/chat/providers", get(chat_handlers::list_providers))
         .route("/api/chat/cli/status", get(chat_handlers::get_cli_status))
         .route("/api/chat/cli/install", post(chat_handlers::install_cli))
         // CLI auth status

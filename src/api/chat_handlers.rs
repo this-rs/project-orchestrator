@@ -1372,6 +1372,63 @@ pub async fn get_cli_status() -> Json<crate::chat::cli_version::CliVersionStatus
     Json(crate::chat::cli_version::check_cli_status().await)
 }
 
+/// Query of `GET /api/chat/providers`.
+#[derive(Debug, Deserialize)]
+pub struct ListProvidersQuery {
+    /// When given, `allowed_for_project` is answered for this project.
+    pub project_slug: Option<String>,
+}
+
+/// GET /api/chat/providers — the provider instances, their health and the
+/// capabilities of each model, before any session exists (A42).
+///
+/// Never answers a secret: an instance carries a credential reference and the
+/// origin of its endpoint, nothing more.
+pub async fn list_providers(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<ListProvidersQuery>,
+) -> Result<Json<crate::chat::provider::listing::ProviderListing>, AppError> {
+    use crate::chat::provider::listing::{self, HealthEntry, ModelEntry};
+    use nexus_claude::agent::AgentProvider;
+    use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
+
+    let default_model = state
+        .chat_manager
+        .as_ref()
+        .map(|m| m.resolve_model(None))
+        .unwrap_or_else(|| crate::chat::ChatConfig::from_env().default_model);
+
+    let provider = ClaudeCodeProvider::new(ClaudeCodeConfig::default());
+    let health = HealthEntry::from_nexus(&provider.health().await);
+    let mut models: Vec<ModelEntry> = provider
+        .catalog()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|m| {
+            ModelEntry::new(
+                m.id.clone(),
+                m.is_default.then(|| "default".to_string()),
+                &provider.capabilities(Some(&m.id)),
+            )
+        })
+        .collect();
+    if models.is_empty() {
+        models.push(ModelEntry::new(
+            default_model.clone(),
+            Some("default".to_string()),
+            &provider.capabilities(Some(&default_model)),
+        ));
+    }
+
+    let entries = vec![listing::builtin_claude_code(
+        health,
+        models,
+        query.project_slug.is_some(),
+    )];
+    Ok(Json(listing::assemble(entries, None)))
+}
+
 /// Request body for POST /api/chat/cli/install
 #[derive(Debug, Deserialize)]
 pub struct InstallCliRequest {
@@ -1702,6 +1759,45 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["total"], 0);
         assert_eq!(json["items"].as_array().unwrap().len(), 0);
+    }
+
+    // ====================================================================
+    // GET /api/chat/providers
+    // ====================================================================
+
+    #[tokio::test]
+    async fn providers_lists_the_builtin_instance_with_the_documented_fields() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/chat/providers?project_slug=p"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["default_provider"], "claude-code");
+        let p = &json["providers"][0];
+        assert_eq!(p["id"], "claude-code");
+        assert_eq!(p["kind"], "claude_code");
+        assert_eq!(p["builtin"], true);
+        assert_eq!(p["allowed_for_project"], true);
+        assert_eq!(p["credential"], "none");
+        assert!(p["health"]["state"].is_string());
+        assert!(p["models"][0]["capabilities"].is_object());
+    }
+
+    #[tokio::test]
+    async fn providers_answers_null_consent_without_a_project() {
+        let app = test_app().await;
+        let resp = app.oneshot(auth_get("/api/chat/providers")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["providers"][0]["allowed_for_project"].is_null());
     }
 
     #[tokio::test]
