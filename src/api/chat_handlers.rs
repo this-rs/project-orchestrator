@@ -2046,7 +2046,17 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(body["health"]["code"], "probe_unavailable");
+        // The key lives in a vault nobody unlocked: a verdict, and no connection.
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["health"]["code"], "credentials_locked");
+        assert_eq!(body["health"]["state"], "auth_required");
+        // A closed local port with no credential: unreachable, still a 200.
+        let mut local = deepseek("http://127.0.0.1:9/v1");
+        local["credential_ref"] = serde_json::json!("none");
+        let (status, body) =
+            call_json(&app, auth_json("POST", "/api/chat/providers/test", local)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], false, "{body}");
     }
 
     #[tokio::test]

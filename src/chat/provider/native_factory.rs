@@ -20,11 +20,78 @@ use super::credentials::VaultCredentialResolver;
 use super::settings::InstanceRecord;
 use crate::vault::VaultService;
 
-/// The native provider of a stored instance.
-pub fn build_native_provider(
+/// What a connection test found out about an instance (A30): can it be
+/// reached, which models it lists, can the chosen model call a tool, and how
+/// large its context window is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbeReport {
+    /// Health as nexus reports it.
+    pub health: nexus_claude::agent::ProviderHealth,
+    /// Models the endpoint lists.
+    pub models: Vec<String>,
+    /// Model that was probed, if any.
+    pub model: Option<String>,
+    /// Whether that model called a tool.
+    pub tools: Option<bool>,
+    /// Its context window, when known.
+    pub context_window: Option<u64>,
+    /// Why the tool probe failed (typed), when it did.
+    pub probe_error: Option<ProviderError>,
+}
+
+/// Connection test of an instance, run BEFORE it is saved or used: health, the
+/// model listing, and a real tool-call probe of one model. Reads nothing but
+/// the credential reference's secret, per request, through the resolver.
+pub async fn probe_instance(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
-) -> Result<Arc<dyn AgentProvider>, ProviderError> {
+    model: Option<&str>,
+) -> Result<ProbeReport, ProviderError> {
+    let provider = build_native(record, vault)?;
+    let health = provider.health().await;
+    if health.status == nexus_claude::agent::HealthStatus::Unavailable {
+        return Ok(ProbeReport {
+            health,
+            models: Vec::new(),
+            model: None,
+            tools: None,
+            context_window: None,
+            probe_error: None,
+        });
+    }
+    let models: Vec<String> = provider
+        .catalog()
+        .await
+        .map(|c| c.into_iter().map(|m| m.id).collect())
+        .unwrap_or_default();
+    let chosen = model
+        .map(str::to_string)
+        .or_else(|| record.default_model.clone())
+        .or_else(|| models.first().cloned());
+    let (mut tools, mut context_window, mut probe_error) = (None, None, None);
+    if let Some(m) = chosen.as_deref() {
+        match provider.refresh_capabilities(m).await {
+            Ok(caps) => {
+                tools = Some(caps.tools);
+                context_window = caps.context_window.map(|w| w.value);
+            }
+            Err(e) => probe_error = Some(e),
+        }
+    }
+    Ok(ProbeReport {
+        health,
+        models,
+        model: chosen,
+        tools,
+        context_window,
+        probe_error,
+    })
+}
+
+fn build_native(
+    record: &InstanceRecord,
+    vault: Option<Arc<VaultService>>,
+) -> Result<Arc<NativeProvider>, ProviderError> {
     let credential = CredentialRef::from_str(&record.credential_ref)?;
     let mut endpoint = OpenAiEndpointConfig::new(record.id.clone(), record.base_url.clone());
     endpoint.credential = credential;
@@ -51,6 +118,14 @@ pub fn build_native_provider(
         config.cost_basis = CostBasis::Free;
     }
     Ok(Arc::new(NativeProvider::new(config, model_endpoint)))
+}
+
+/// The native provider of a stored instance.
+pub fn build_native_provider(
+    record: &InstanceRecord,
+    vault: Option<Arc<VaultService>>,
+) -> Result<Arc<dyn AgentProvider>, ProviderError> {
+    Ok(build_native(record, vault)? as Arc<dyn AgentProvider>)
 }
 
 #[cfg(test)]

@@ -651,3 +651,73 @@ async fn an_off_policy_is_invisible() {
         ("claude-code", None, None)
     );
 }
+
+fn draft_record(fake: &FakeOpenAi, credential_ref: &str) -> InstanceRecord {
+    instance(fake, credential_ref)
+}
+
+#[tokio::test]
+async fn the_connection_test_really_probes_a_tool_call_and_reads_the_window() {
+    let fake = FakeOpenAi::start(script());
+    let report = super::provider::native_factory::probe_instance(
+        &draft_record(&fake, "none"),
+        None,
+        Some("m"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.tools, Some(true), "{report:?}");
+    assert_eq!(report.context_window, Some(32_000));
+    assert!(report.models.contains(&"m".to_string()));
+    // The probe really called the endpoint with the ping tool.
+    assert!(fake
+        .chat_requests()
+        .iter()
+        .any(|r| r["body"].to_string().contains("Call the ping tool now")));
+}
+
+#[tokio::test]
+async fn a_model_that_cannot_call_tools_is_reported_not_swallowed() {
+    // The probe answers with plain text: no tool call.
+    let fake = FakeOpenAi::start(json!([
+        sse_route("Call the ping tool now", vec![
+            delta(json!({"content": "I cannot"})),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            json!("[DONE]"),
+        ]),
+        {"method": "GET", "path": "/v1/models", "status": 200,
+         "body": {"object": "list", "data": [{"id": "m"}]}},
+    ]));
+    let report = super::provider::native_factory::probe_instance(
+        &draft_record(&fake, "none"),
+        None,
+        Some("m"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.tools, Some(false), "{report:?}");
+}
+
+#[tokio::test]
+async fn a_probe_with_a_locked_vault_is_credentials_locked() {
+    let fake = FakeOpenAi::start(script());
+    let err = super::provider::native_factory::probe_instance(
+        &draft_record(&fake, "vault:endpoint-key"),
+        Some(VaultService::ephemeral()),
+        Some("m"),
+    )
+    .await;
+    // Either the health check or the probe surfaces it; nothing is sent unauthenticated.
+    match err {
+        Err(e) => assert_eq!(e.kind(), "credentials_locked"),
+        Ok(report) => {
+            let locked = report
+                .probe_error
+                .as_ref()
+                .is_some_and(|e| e.kind() == "credentials_locked")
+                || matches!(report.health.error, Some(ref e) if e.kind() == "credentials_locked");
+            assert!(locked, "{report:?}");
+        }
+    }
+    assert!(fake.chat_requests().is_empty());
+}

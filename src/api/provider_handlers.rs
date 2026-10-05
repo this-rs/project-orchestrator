@@ -189,9 +189,49 @@ pub async fn test_provider(
     if let Err(e) = validate_endpoint(&record.base_url, &policy).await {
         return Ok(Json(verdict("unreachable", e.code())));
     }
-    // The endpoint is allowed, but nothing here can speak to it yet: the native
-    // harness (nexus) is not wired in. Say so instead of pretending to probe.
-    Ok(Json(verdict("unknown", "probe_unavailable")))
+    let report = match crate::chat::provider::native_factory::probe_instance(
+        &record,
+        Some(state.vault.clone()),
+        record.default_model.as_deref(),
+    )
+    .await
+    {
+        Ok(report) => report,
+        // A credential problem (locked vault, no grant) is a verdict, not a 500.
+        Err(e) => {
+            let failure = crate::chat::provider::errors::open_failure(&e, Some(&record.id));
+            return Ok(Json(verdict(
+                if failure.code == "credentials_locked" || failure.code == "auth_required" {
+                    "auth_required"
+                } else {
+                    "unknown"
+                },
+                failure.code,
+            )));
+        }
+    };
+    let health = HealthEntry::from_nexus(&report.health);
+    let probe_failure = report
+        .probe_error
+        .as_ref()
+        .map(|e| crate::chat::provider::errors::open_failure(e, Some(&record.id)).code);
+    let tools_ok = report.tools == Some(true);
+    let ok = health.state == "ok" && tools_ok;
+    let mut body = json!({
+        "ok": ok,
+        "health": {
+            "state": health.state,
+            "code": health.code.or(probe_failure).or((report.tools == Some(false)).then_some("model_no_tools")),
+        },
+        "models": report.models.iter().map(|m| json!({ "id": m })).collect::<Vec<_>>(),
+    });
+    if report.tools.is_some() || report.context_window.is_some() {
+        body["probe"] = json!({
+            "tools": tools_ok,
+            "context_window": report.context_window,
+        });
+    }
+    Ok(Json(body))
 }
 
 /// POST /api/chat/providers — create an instance.
