@@ -576,12 +576,6 @@ pub fn get_config_path() -> String {
     config_path().display().to_string()
 }
 
-/// Generate a config.yaml from the wizard configuration.
-///
-/// - Generates random secrets (JWT, MeiliSearch key) if not provided
-/// - Creates parent directories if needed
-/// - Writes the YAML file
-#[tauri::command]
 /// The wizard step "chat" was skipped: no provider, so nothing about Claude
 /// Code (model, CLI path) is written, checked or installed.
 fn chat_provider_is_none(config: &SetupConfig) -> bool {
@@ -591,6 +585,12 @@ fn chat_provider_is_none(config: &SetupConfig) -> bool {
         .is_some_and(|p| p.trim().eq_ignore_ascii_case("none"))
 }
 
+/// Generate a config.yaml from the wizard configuration.
+///
+/// - Generates random secrets (JWT, MeiliSearch key) if not provided
+/// - Creates parent directories if needed
+/// - Writes the YAML file
+#[tauri::command]
 pub fn generate_config(config: SetupConfig) -> Result<String, String> {
     let path = config_path();
     tracing::info!("Generating config at: {}", path.display());
