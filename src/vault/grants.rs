@@ -35,6 +35,11 @@ pub enum GrantScope {
     /// Every session. The widest grant; the unlock duration is then the only
     /// bound, so the UI must say so.
     Anywhere,
+    /// A provider instance (its id): the SERVER reads the secret to authenticate
+    /// to that instance's endpoint. Never covers an agent's request, and no
+    /// session/project/anywhere grant covers a provider read — a key granted
+    /// to agents is not thereby sent to an endpoint, and the reverse.
+    Provider(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,7 +100,17 @@ impl Grant {
             GrantScope::Anywhere => true,
             GrantScope::Session(id) => id == req.session_id,
             GrantScope::Project(slug) => req.project_slug == Some(slug.as_str()),
+            GrantScope::Provider(_) => false,
         }
+    }
+
+    /// Whether this grant lets the server read `secret` for the provider
+    /// instance `instance`. Only a [`GrantScope::Provider`] grant for that
+    /// exact instance does.
+    fn covers_provider(&self, secret: &str, instance: &str, now: DateTime<Utc>) -> bool {
+        now < self.expires_at
+            && self.secrets.includes(secret)
+            && matches!(&self.scope, GrantScope::Provider(id) if id == instance)
     }
 }
 
@@ -176,6 +191,18 @@ impl GrantBook {
         self.grants.iter().find(|g| g.covers(req, now))
     }
 
+    /// The grant that lets the server read `secret` for a provider instance.
+    pub fn covering_provider(
+        &self,
+        secret: &str,
+        instance: &str,
+        now: DateTime<Utc>,
+    ) -> Option<&Grant> {
+        self.grants
+            .iter()
+            .find(|g| g.covers_provider(secret, instance, now))
+    }
+
     fn persist(&mut self, grants: Vec<Grant>) -> Result<(), std::io::Error> {
         let bytes = serde_json::to_vec_pretty(&GrantFile {
             grants: grants.clone(),
@@ -185,6 +212,28 @@ impl GrantBook {
         self.grants = grants;
         Ok(())
     }
+}
+
+/// The decision point for the SERVER reading a provider credential. Same
+/// order as [`authorize`]: a locked vault first — and the caller must then
+/// stop, not try another provider.
+pub fn authorize_provider(
+    vault_unlocked: bool,
+    secret_exists: bool,
+    book: &GrantBook,
+    secret: &str,
+    instance: &str,
+    now: DateTime<Utc>,
+) -> Result<Uuid, Denied> {
+    if !vault_unlocked {
+        return Err(Denied::VaultLocked);
+    }
+    if !secret_exists {
+        return Err(Denied::UnknownSecret);
+    }
+    book.covering_provider(secret, instance, now)
+        .map(|g| g.id)
+        .ok_or(Denied::NoGrant)
 }
 
 /// The single decision point for an agent reading a secret. Order matters for

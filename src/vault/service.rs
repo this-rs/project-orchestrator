@@ -416,6 +416,38 @@ impl VaultService {
         Ok(value)
     }
 
+    /// Read a secret as the credential of a provider instance (decision A26).
+    ///
+    /// Called by the server itself, never on behalf of an agent: there is no
+    /// REST route to it. Needs a grant of scope [`GrantScope::Provider`] for
+    /// this exact instance — grants made to sessions or projects do not count.
+    /// A locked vault is [`Denied::VaultLocked`]; the caller refuses to open
+    /// the session and does NOT fall back to another provider.
+    ///
+    /// The value is registered with the masker before it is returned, so an
+    /// endpoint that echoes it back cannot put it on the wire or in the store.
+    pub fn read_for_provider(
+        &self,
+        name: &str,
+        instance_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<zeroize::Zeroizing<String>, ServiceError> {
+        let mut vault = lock(&self.vault);
+        let unlocked = vault.is_unlocked(now);
+        let exists = vault.contains(name);
+        super::grants::authorize_provider(
+            unlocked,
+            exists,
+            &lock(&self.grants),
+            name,
+            instance_id,
+            now,
+        )?;
+        let value = vault.get(name, now)?;
+        self.masker.register(name, &value);
+        Ok(value)
+    }
+
     /// Whether `read_for_agent` would succeed — without delivering anything.
     pub fn read_for_agent_check(
         &self,
@@ -570,6 +602,110 @@ mod tests {
         let svc = VaultService::ephemeral();
         svc.init(PASS.into(), Duration::hours(1)).await.unwrap();
         svc
+    }
+
+    // ── provider credentials (decision A26) ────────────────────────────────
+
+    #[tokio::test]
+    async fn the_server_reads_a_provider_key_only_under_a_provider_grant_for_that_instance() {
+        let svc = open_vault().await;
+        let now = Utc::now();
+        svc.put("deepseek-key", "sk-provider-value-1234", None, now)
+            .unwrap();
+        let names = || SecretSelector::Names(["deepseek-key".to_string()].into());
+
+        // No grant at all.
+        assert_eq!(
+            svc.read_for_provider("deepseek-key", "deepseek", now)
+                .unwrap_err(),
+            ServiceError::Denied(Denied::NoGrant)
+        );
+
+        // A grant made to agents (anywhere, even) is NOT a provider grant.
+        svc.grant(names(), GrantScope::Anywhere, Duration::hours(1), None, now)
+            .unwrap();
+        assert_eq!(
+            svc.read_for_provider("deepseek-key", "deepseek", now)
+                .unwrap_err(),
+            ServiceError::Denied(Denied::NoGrant)
+        );
+
+        // A provider grant for ANOTHER instance does not count either.
+        svc.grant(
+            names(),
+            GrantScope::Provider("other".into()),
+            Duration::hours(1),
+            None,
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            svc.read_for_provider("deepseek-key", "deepseek", now)
+                .unwrap_err(),
+            ServiceError::Denied(Denied::NoGrant)
+        );
+
+        svc.grant(
+            names(),
+            GrantScope::Provider("deepseek".into()),
+            Duration::hours(1),
+            None,
+            now,
+        )
+        .unwrap();
+        let value = svc
+            .read_for_provider("deepseek-key", "deepseek", now)
+            .unwrap();
+        assert_eq!(value.as_str(), "sk-provider-value-1234");
+        // Registered with the masker before it left the vault.
+        assert_eq!(
+            svc.masker().mask("echo sk-provider-value-1234"),
+            "echo [secret:deepseek-key]"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_grant_gives_agents_nothing() {
+        let svc = open_vault().await;
+        let now = Utc::now();
+        svc.put("deepseek-key", "sk-provider-value-5678", None, now)
+            .unwrap();
+        svc.grant(
+            SecretSelector::All,
+            GrantScope::Provider("deepseek".into()),
+            Duration::hours(1),
+            None,
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            svc.read_for_agent("deepseek-key", "s1", Some("p"), now)
+                .unwrap_err(),
+            ServiceError::Denied(Denied::NoGrant),
+            "a key granted to a provider must not be readable by a session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_locked_vault_refuses_a_provider_read_as_locked() {
+        let svc = open_vault().await;
+        let now = Utc::now();
+        svc.put("deepseek-key", "sk-provider-value-9012", None, now)
+            .unwrap();
+        svc.grant(
+            SecretSelector::All,
+            GrantScope::Provider("deepseek".into()),
+            Duration::hours(1),
+            None,
+            now,
+        )
+        .unwrap();
+        svc.lock_now();
+        assert_eq!(
+            svc.read_for_provider("deepseek-key", "deepseek", now)
+                .unwrap_err(),
+            ServiceError::Denied(Denied::VaultLocked)
+        );
     }
 
     #[tokio::test]

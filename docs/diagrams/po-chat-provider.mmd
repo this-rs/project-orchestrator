@@ -1,0 +1,85 @@
+%% name: po-chat-provider
+%% covers: backend:src/chat/provider/**
+%% verified: 2220adff
+%% ---
+%% PROUVE : le RÉSOLVEUR backend de provider (décisions A1, A16, A18, A29, A43) : quel
+%%   provider/modèle pour une demande, comment une erreur d'ouverture devient un statut HTTP
+%%   et un code, comment les modes de permission neutres cohabitent avec les chaînes héritées.
+%%   Le registre des providers et la table de prix sont dans nexus (A1) : rien de cela ici.
+%% ---
+%% SOURCES LUES :
+%%   src/chat/provider/resolver.rs — Role, RoutedBy, Candidate, ResolveInput, InstanceCatalog,
+%%                                   ResolveError, resolve
+%%   src/chat/provider/errors.rs   — OpenFailure, open_failure, resolve_failure
+%%   src/chat/provider/credentials.rs — VaultCredentialResolver ; src/vault/service.rs — read_for_provider
+%%   src/chat/provider/policy.rs   — parse_mode, to_legacy, neutral_name, legacy_name,
+%%                                   tool_policy, wire_tool_policy
+%%   nexus_claude::agent           — ProviderError, PolicyMode, ToolPolicy (contrat nexus)
+%% ---
+%% NON ETABLI :
+%%   resolve / tool_policy / VaultCredentialResolver n'ont AUCUN appelant de production
+%%   (tâches B13a, B32, B33, B25) ; seul open_failure est branché (create_session REST) ;
+%%   InstanceCatalog n'a pas d'implémentation réelle (attend le registre nexus + B25).
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans test / décidé non écrit
+%%   🔴 défaut constaté (raison dans le nœud)  ⚪ amont ou autre domaine
+
+flowchart TD
+    subgraph legend["Légende"]
+        direction LR
+        L1["✅ vérifié par test"]
+        L2["🟠 écrit, non branché"]
+        L3["⚪ autre domaine"]
+    end
+
+    NEXUS["⚪ nexus_claude::agent — ProviderRegistry (à venir), ProviderError,<br/>PolicyMode, ToolPolicy, Capabilities (docs/agent-contract.md)"]
+
+    subgraph resolver["resolver.rs — resolve(ResolveInput, InstanceCatalog)"]
+        SESSION{"✅ session existante ?"}
+        FROZEN["✅ provider de la session, routed_by = session, jamais re-résolu<br/>requête nommant un AUTRE provider → provider_conflict (409)<br/>test : session_wins_over_every_level_and_is_never_re_resolved"]
+        LEVELS["✅ premier niveau présent :<br/>requête &gt; tâche &gt; persona &gt; run &gt; règle projet &gt; règle globale &gt; défaut configuré<br/>test : level_*_wins_* (7 tests)"]
+        EXPLICIT["✅ choix explicite (requête, tâche, persona) jamais substitué :<br/>inconnu → provider_unknown, interdit → endpoint_not_allowed,<br/>malsain → provider_unavailable<br/>test : explicit_choice_is_never_substituted"]
+        PILOT["✅ rôle pilot : aucune bascule, à aucun niveau<br/>test : pilot_never_falls_back_at_any_level"]
+        EXEC["✅ rôle executor : un niveau non explicite malsain ou interdit passe au suivant,<br/>routed_by = fallback ; jamais vers une instance interdite<br/>test : executor_falls_back_to_the_next_level_and_records_it,<br/>executor_fallback_skips_a_not_allowed_instance"]
+        BUILTIN["✅ rien de configuré : claude-code s'il existe, est sain et autorisé<br/>(routed_by = claude_code), sinon no_provider<br/>test : builtin_claude_code_when_nothing_is_configured"]
+        SESSION -- oui --> FROZEN
+        SESSION -- non --> LEVELS
+        LEVELS --> EXPLICIT
+        LEVELS --> PILOT
+        LEVELS --> EXEC
+        LEVELS -- "aucun niveau" --> BUILTIN
+        EXEC -- "chaîne épuisée" --> BUILTIN
+    end
+
+    CATALOG["🟠 InstanceCatalog (exists, is_healthy, is_allowed_for_project) :<br/>trait seulement — implémentation avec le registre nexus et le consentement (B25, B3)"]
+    CATALOG --> LEVELS
+    NEXUS -.-> CATALOG
+
+    subgraph errors["errors.rs — erreurs d'ouverture typées"]
+        OPEN["✅ open_failure(ProviderError) → OpenFailure {status, code, message, provider_id, action,<br/>retryable, retry_after_ms}<br/>cli_not_found 424, auth_required 424 (+ commande de login), credentials_locked 423,<br/>unauthorized 502 (jamais 401), endpoint_unreachable 502, model_no_tools 422,<br/>context_too_small 422, rate_limited 429, overloaded 503, timeout 504,<br/>process_exited 502, protocol 502, unsupported 422, turn_in_progress 409,<br/>invalid_request 400, closed 410 ; variante inconnue → 502 provider_error<br/>aucun détail interne dans le message<br/>test : un par code (17 tests)"]
+        RFAIL["✅ resolve_failure(ResolveError) → provider_conflict 409, provider_unknown 404,<br/>endpoint_not_allowed 403, provider_unavailable 503, no_provider 409<br/>test : un par code (5 tests)"]
+    end
+    NEXUS -.-> OPEN
+    FROZEN -.-> RFAIL
+    EXPLICIT -.-> RFAIL
+
+    subgraph policy["policy.rs — modes neutres EN PLUS des chaînes héritées"]
+        PARSE["✅ parse_mode : default, acceptEdits, plan, bypassPermissions, auto, dontAsk, manual<br/>+ ask, auto_edits, plan_only, trust ; inconnu → None<br/>test : the_eleven_values_parse_and_round_trip"]
+        LEGACY["✅ to_legacy : une chaîne héritée reste elle-même (auto, dontAsk, manual non aplaties),<br/>une neutre devient sa correspondante Claude<br/>test : to_legacy_keeps_legacy_strings_and_maps_neutral_ones"]
+        TP["✅ tool_policy(mode, allowed, disallowed) → ToolPolicy nexus (native_mode = chaîne héritée) ;<br/>wire_tool_policy = forme JSON de system_init.tool_policy<br/>test : tool_policy_decides_allow_and_deny_as_configured, deny_still_wins_in_trust_mode"]
+        PARSE --> LEGACY
+        PARSE --> TP
+    end
+    NEXUS -.-> TP
+
+    WIRED["✅ branché sur le chemin actuel (Claude Code) : ChatManager enveloppe les erreurs SDK d'ouverture<br/>par sdk_open_error (ProviderError dans la chaîne anyhow) ; chat_handlers::create_session →<br/>AppError::from_open_error → AppError::Provider(OpenFailure) : statut + code + provider_id<br/>un CLI absent répond 424 cli_not_found au lieu d'un 500 muet<br/>test : a_missing_cli_answers_424_with_a_code_instead_of_a_mute_500,<br/>a_missing_cli_is_cli_not_found_424_not_a_mute_500<br/>🟠 le chemin WebSocket (reprise par message) n'émet pas encore le code"]
+    OPEN --> WIRED
+    subgraph creds["credentials.rs — VaultCredentialResolver (CredentialResolver nexus)"]
+        CRED["✅ vault:&lt;nom&gt; → VaultService::read_for_provider sous grant Provider(instance) ;<br/>vault verrouillé → credentials_locked (pas de repli) ; pas de grant → auth_required + quoi faire ;<br/>env:&lt;VAR&gt; lu du serveur et enregistré au masqueur, SERVER_ONLY_SECRETS refusés ; none → aucun<br/>test : a_locked_vault_is_credentials_locked_never_no_credential,<br/>the_servers_own_secrets_cannot_be_used_as_a_provider_credential,<br/>the_server_reads_a_provider_key_only_under_a_provider_grant_for_that_instance (vault)"]
+    end
+    NEXUS -.-> CRED
+    TODO["🟠 non branché : create_session / resume_session / runner n'appellent pas encore resolve ;<br/>system_init ne porte pas tool_policy ; VaultCredentialResolver n'est passé à aucun registre"]
+    BUILTIN -.-> TODO
+    OPEN -.-> TODO
+    TP -.-> TODO

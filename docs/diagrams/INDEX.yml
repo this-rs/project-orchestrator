@@ -48,6 +48,13 @@ diagrams:
     covers:
       - "backend:src/chat/envelope.rs"
       - "backend:src/auth/{agent_tokens,jwt,tool_profile}.rs"
+  - name: po-chat-provider
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-chat-provider.mmd
+    # Resolveur backend seulement : le registre des providers et la table de prix sont dans nexus (A1).
+    covers:
+      - "backend:src/chat/provider/**"
   - name: po-chat-transport
     owner: theotime
     status: verified
