@@ -2575,6 +2575,8 @@ mod tests {
                 tool: "Bash".to_string(),
                 input: serde_json::json!({"command": "ls"}),
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             },
         )
         .await;

@@ -83,6 +83,7 @@
               "question": "Which backoff should the retry use?"
             }
           ],
+          "synthetic": true,
           "tool_call_id": "toolu_01Example0000000000000",
           "type": "ask_user_question"
         },
@@ -110,6 +111,10 @@
         "questions": {
           "required": true,
           "type": "array"
+        },
+        "synthetic": {
+          "required": false,
+          "type": "boolean"
         },
         "tool_call_id": {
           "required": true,
@@ -444,6 +449,7 @@
       "examples": {
         "full": {
           "mode": "acceptEdits",
+          "policy_mode": "auto_edits",
           "type": "permission_mode_changed"
         },
         "minimal": {
@@ -456,6 +462,10 @@
           "required": true,
           "type": "string"
         },
+        "policy_mode": {
+          "required": false,
+          "type": "string"
+        },
         "type": {
           "required": true,
           "type": "string"
@@ -465,6 +475,8 @@
     "permission_request": {
       "examples": {
         "full": {
+          "canonical": "read_file",
+          "category": "read",
           "id": "perm_0001",
           "input": {
             "command": "cargo fmt",
@@ -482,6 +494,14 @@
         }
       },
       "fields": {
+        "canonical": {
+          "required": false,
+          "type": "string"
+        },
+        "category": {
+          "required": false,
+          "type": "string"
+        },
         "id": {
           "required": true,
           "type": "string"
@@ -507,14 +527,25 @@
     "result": {
       "examples": {
         "full": {
+          "cost": {
+            "basis": "reported",
+            "usd": 0.25
+          },
           "cost_usd": 0.25,
           "duration_ms": 48210,
           "is_error": false,
+          "model": "example-model-large",
           "num_turns": 7,
           "result_text": "The retry is in place and covered by a test.",
           "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "stop_reason": "completed",
           "subtype": "success",
-          "type": "result"
+          "type": "result",
+          "usage": {
+            "cache_read_tokens": 800,
+            "input_tokens": 1200,
+            "output_tokens": 340
+          }
         },
         "minimal": {
           "cost_usd": null,
@@ -526,6 +557,10 @@
         }
       },
       "fields": {
+        "cost": {
+          "required": false,
+          "type": "object"
+        },
         "cost_usd": {
           "nullable": true,
           "required": true,
@@ -539,6 +574,10 @@
           "required": true,
           "type": "boolean"
         },
+        "model": {
+          "required": false,
+          "type": "string"
+        },
         "num_turns": {
           "required": false,
           "type": "number"
@@ -551,6 +590,10 @@
           "required": true,
           "type": "string"
         },
+        "stop_reason": {
+          "required": false,
+          "type": "string"
+        },
         "subtype": {
           "required": true,
           "type": "string"
@@ -558,6 +601,10 @@
         "type": {
           "required": true,
           "type": "string"
+        },
+        "usage": {
+          "required": false,
+          "type": "object"
         }
       }
     },
@@ -660,6 +707,33 @@
           "type": "string"
         },
         "outcome": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "session_closed": {
+      "examples": {
+        "full": {
+          "reason": "closed",
+          "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "type": "session_closed"
+        },
+        "minimal": {
+          "session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "type": "session_closed"
+        }
+      },
+      "fields": {
+        "reason": {
+          "required": false,
+          "type": "string"
+        },
+        "session_id": {
           "required": true,
           "type": "string"
         },
@@ -777,6 +851,10 @@
     "system_init": {
       "examples": {
         "full": {
+          "capabilities": {
+            "images": false,
+            "interactive_permissions": true
+          },
           "cli_session_id": "cli-session-0001",
           "mcp_servers": [
             {
@@ -786,6 +864,17 @@
           ],
           "model": "example-model-large",
           "permission_mode": "default",
+          "policy_mode": "ask",
+          "provider": {
+            "id": "claude-code",
+            "kind": "claude_code"
+          },
+          "tool_policy": {
+            "allow": [],
+            "deny": [],
+            "mode": "ask",
+            "native_mode": "default"
+          },
           "tools": [
             "Bash",
             "Read",
@@ -799,6 +888,10 @@
         }
       },
       "fields": {
+        "capabilities": {
+          "required": false,
+          "type": "object"
+        },
         "cli_session_id": {
           "required": true,
           "type": "string"
@@ -814,6 +907,18 @@
         "permission_mode": {
           "required": false,
           "type": "string"
+        },
+        "policy_mode": {
+          "required": false,
+          "type": "string"
+        },
+        "provider": {
+          "required": false,
+          "type": "object"
+        },
+        "tool_policy": {
+          "required": false,
+          "type": "object"
         },
         "tools": {
           "required": false,
@@ -921,6 +1026,8 @@
     "tool_use": {
       "examples": {
         "full": {
+          "canonical": "read_file",
+          "category": "read",
           "id": "toolu_01Example0000000000000",
           "input": {
             "file_path": "src/upload/client.rs"
@@ -937,6 +1044,14 @@
         }
       },
       "fields": {
+        "canonical": {
+          "required": false,
+          "type": "string"
+        },
+        "category": {
+          "required": false,
+          "type": "string"
+        },
         "id": {
           "required": true,
           "type": "string"

@@ -15,12 +15,13 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use nexus_claude::agent::{
-    AgentEvent, CompactionPhase, DeltaKind, ProviderError, StopReason, ToolOutput,
+    AgentEvent, CompactionPhase, Cost, DeltaKind, ProviderError, QuestionReply, StopReason,
+    ToolCategory, ToolOutput, Usage,
 };
 use serde_json::{json, Value};
 
 use super::errors::open_failure;
-use super::policy::legacy_name;
+use super::policy::{legacy_name, neutral_name};
 use crate::chat::manager::{MASKING_FAILED_MESSAGE, MASKING_FAILED_SUBTYPE};
 use crate::chat::types::ChatEvent;
 
@@ -63,6 +64,11 @@ impl EventMapper {
                 permission_mode: native_mode
                     .clone()
                     .or_else(|| policy_mode.map(|m| legacy_name(m).to_string())),
+                // Added by the session owner, who knows the instance and the policy.
+                provider: None,
+                capabilities: None,
+                tool_policy: None,
+                policy_mode: policy_mode.map(|m| neutral_name(m).to_string()),
             }],
             // In a turn the echo of the user's own message is not an event
             // (the backend already emitted `user_message`).
@@ -92,8 +98,11 @@ impl EventMapper {
                 input,
                 input_complete,
                 parent,
+                category,
+                canonical,
                 ..
             } => {
+                let (category, canonical) = (Some(category_name(*category)), canonical.clone());
                 if *input_complete && self.announced_tools.remove(id) {
                     vec![ChatEvent::ToolUseInputResolved {
                         id: id.clone(),
@@ -109,6 +118,8 @@ impl EventMapper {
                         tool: name.clone(),
                         input: input.clone(),
                         parent_tool_use_id: parent.clone(),
+                        category,
+                        canonical,
                     }]
                 }
             }
@@ -129,12 +140,16 @@ impl EventMapper {
                 tool_name,
                 input,
                 parent,
+                category,
+                canonical,
                 ..
             } => vec![ChatEvent::PermissionRequest {
                 id: request_id.clone(),
                 tool: tool_name.clone(),
                 input: input.clone(),
                 parent_tool_use_id: parent.clone(),
+                category: Some(category_name(*category)),
+                canonical: canonical.clone(),
             }],
             AgentEvent::Question {
                 question_id,
@@ -142,7 +157,7 @@ impl EventMapper {
                 questions,
                 input,
                 parent,
-                ..
+                reply,
             } => vec![ChatEvent::AskUserQuestion {
                 id: question_id.clone(),
                 tool_call_id: tool_call_id.clone().unwrap_or_default(),
@@ -154,6 +169,8 @@ impl EventMapper {
                     .unwrap_or_else(|| serde_json::to_value(questions).unwrap_or(json!([]))),
                 input: input.clone(),
                 parent_tool_use_id: parent.clone(),
+                // A provider without a native question: the answer is a user turn (A45).
+                synthetic: (*reply == QuestionReply::Turn).then_some(true),
             }],
             AgentEvent::Compaction {
                 phase,
@@ -196,6 +213,7 @@ impl EventMapper {
                     mode: native_mode
                         .clone()
                         .unwrap_or_else(|| legacy_name(*mode).to_string()),
+                    policy_mode: Some(neutral_name(*mode).to_string()),
                 }]
             }
             AgentEvent::Done {
@@ -203,10 +221,12 @@ impl EventMapper {
                 subtype,
                 is_error,
                 result_text,
+                usage,
                 cost,
                 duration_ms,
                 num_turns,
                 provider_session_id,
+                model,
                 ..
             } => vec![ChatEvent::Result {
                 session_id: provider_session_id.clone().unwrap_or_default(),
@@ -218,6 +238,10 @@ impl EventMapper {
                 is_error: *is_error,
                 num_turns: Some(i32::try_from(*num_turns).unwrap_or(i32::MAX)),
                 result_text: result_text.clone(),
+                cost: Some(cost_value(cost)),
+                usage: usage_value(usage),
+                model: model.clone(),
+                stop_reason: Some(stop_reason_name(*stop_reason).to_string()),
             }],
             AgentEvent::Error { error } => vec![error_event(error)],
             AgentEvent::ProviderNotice { kind, .. } if kind == MASKING_FAILED_SUBTYPE => {
@@ -237,6 +261,43 @@ impl EventMapper {
 /// One-shot form of [`EventMapper::map`] for a stateless caller (tests, replay).
 pub fn agent_event_to_chat_event(event: &AgentEvent, mapper: &mut EventMapper) -> Vec<ChatEvent> {
     mapper.map(event)
+}
+
+fn category_name(c: ToolCategory) -> String {
+    serde_json::to_value(c)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "other".to_string())
+}
+
+fn stop_reason_name(s: StopReason) -> String {
+    serde_json::to_value(s)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "error".to_string())
+}
+
+/// `{ usd?, basis }`: an unknown price carries no `usd` (never 0).
+fn cost_value(cost: &Cost) -> Value {
+    serde_json::to_value(cost).unwrap_or(Value::Null)
+}
+
+/// The token counts of the turn, `None` when the provider reported none.
+fn usage_value(usage: &Usage) -> Option<Value> {
+    let counts = json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_read_tokens": usage.cache_read_tokens,
+        "cache_creation_tokens": usage.cache_creation_tokens,
+        "reasoning_tokens": usage.reasoning_tokens,
+    });
+    let map: serde_json::Map<String, Value> = counts
+        .as_object()?
+        .iter()
+        .filter(|(_, v)| !v.is_null())
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    (!map.is_empty()).then(|| Value::Object(map))
 }
 
 /// `subtype` of a `result` when the provider gave none.
@@ -348,20 +409,38 @@ pub fn out_of_band_to_chat_events(
             } => Some((*seq, parent.clone(), text.clone(), false, false)),
             AgentEvent::Thinking {
                 text, seq, parent, ..
-            } => Some((*seq, parent.clone(), format!("[thinking] {text}"), false, false)),
+            } => Some((
+                *seq,
+                parent.clone(),
+                format!("[thinking] {text}"),
+                false,
+                false,
+            )),
             AgentEvent::ToolCall {
                 name,
                 seq,
                 parent,
                 input_complete: true,
                 ..
-            } => Some((*seq, parent.clone(), format!("[tool_use: {name}]"), false, false)),
+            } => Some((
+                *seq,
+                parent.clone(),
+                format!("[tool_use: {name}]"),
+                false,
+                false,
+            )),
             AgentEvent::ToolResult {
                 output,
                 seq,
                 parent,
                 ..
-            } => Some((*seq, parent.clone(), result_line(output.as_ref()), false, true)),
+            } => Some((
+                *seq,
+                parent.clone(),
+                result_line(output.as_ref()),
+                false,
+                true,
+            )),
             AgentEvent::UserEcho {
                 text, seq, parent, ..
             } => Some((*seq, parent.clone(), text.clone(), true, false)),
@@ -458,7 +537,11 @@ mod tests {
         }
     }
 
-    fn tool_result(id: &str, content: Option<ContentValue>, is_error: Option<bool>) -> ContentBlock {
+    fn tool_result(
+        id: &str,
+        content: Option<ContentValue>,
+        is_error: Option<bool>,
+    ) -> ContentBlock {
         ContentBlock::ToolResult(ToolResultContent {
             tool_use_id: id.into(),
             content,
@@ -504,7 +587,9 @@ mod tests {
                             thinking: "hmm".into(),
                             signature: "sig".into(),
                         }),
-                        ContentBlock::Text(TextContent { text: "Hello!".into() }),
+                        ContentBlock::Text(TextContent {
+                            text: "Hello!".into(),
+                        }),
                         ContentBlock::ToolUse(ToolUseContent {
                             id: "toolu_1".into(),
                             name: "mcp__po__plan".into(),
@@ -517,14 +602,20 @@ mod tests {
             (
                 "sub_agent_text",
                 assistant(
-                    vec![ContentBlock::Text(TextContent { text: "from a sub-agent".into() })],
+                    vec![ContentBlock::Text(TextContent {
+                        text: "from a sub-agent".into(),
+                    })],
                     Some("toolu_parent"),
                 ),
             ),
             (
                 "assistant_tool_result_text",
                 assistant(
-                    vec![tool_result("t", Some(ContentValue::Text("ok".into())), Some(false))],
+                    vec![tool_result(
+                        "t",
+                        Some(ContentValue::Text("ok".into())),
+                        Some(false),
+                    )],
                     None,
                 ),
             ),
@@ -532,7 +623,9 @@ mod tests {
                 "user_tool_result_structured_error",
                 user_blocks(vec![tool_result(
                     "t2",
-                    Some(ContentValue::Structured(vec![json!({"type": "text", "text": "boom"})])),
+                    Some(ContentValue::Structured(vec![
+                        json!({"type": "text", "text": "boom"}),
+                    ])),
                     Some(true),
                 )]),
             ),
@@ -565,7 +658,9 @@ mod tests {
                 stream(
                     StreamEventData::ContentBlockDelta {
                         index: 0,
-                        delta: StreamDelta::ThinkingDelta { thinking: "hm".into() },
+                        delta: StreamDelta::ThinkingDelta {
+                            thinking: "hm".into(),
+                        },
                     },
                     None,
                 ),
@@ -590,10 +685,7 @@ mod tests {
                     None,
                 ),
             ),
-            (
-                "message_stop",
-                stream(StreamEventData::MessageStop, None),
-            ),
+            ("message_stop", stream(StreamEventData::MessageStop, None)),
             (
                 "compact_boundary",
                 Message::System {
@@ -622,9 +714,18 @@ mod tests {
                     data: json!({}),
                 },
             ),
-            ("result_success", result_msg("success", false, Some(0.15), Some("done"))),
-            ("result_without_cost", result_msg("success", false, None, None)),
-            ("result_max_turns", result_msg("error_max_turns", true, Some(1.0), None)),
+            (
+                "result_success",
+                result_msg("success", false, Some(0.15), Some("done")),
+            ),
+            (
+                "result_without_cost",
+                result_msg("success", false, None, None),
+            ),
+            (
+                "result_max_turns",
+                result_msg("error_max_turns", true, Some(1.0), None),
+            ),
             (
                 "result_during_execution",
                 result_msg("error_during_execution", true, None, Some("oops")),
@@ -636,8 +737,107 @@ mod tests {
         map_message(msg, state)
             .iter()
             .flat_map(|e| mapper.map(e))
-            .map(|e| serde_json::to_value(e).unwrap())
+            .map(|e| {
+                // The legacy path knows none of the additive fields.
+                let mut v = serde_json::to_value(e).unwrap();
+                if let Some(o) = v.as_object_mut() {
+                    let is_result = o.get("type").and_then(Value::as_str) == Some("result");
+                    for k in ADDITIVE {
+                        // `model` is a legacy field of system_init, additive only on result.
+                        if *k != "model" || is_result {
+                            o.remove(*k);
+                        }
+                    }
+                }
+                v
+            })
             .collect()
+    }
+
+    /// Fields the contract adds to the legacy frames (always optional).
+    const ADDITIVE: &[&str] = &[
+        "category",
+        "canonical",
+        "cost",
+        "usage",
+        "model",
+        "stop_reason",
+        "policy_mode",
+        "synthetic",
+    ];
+
+    #[test]
+    fn the_additive_fields_carry_what_the_provider_reported() {
+        use nexus_claude::agent::{Cost, CostBasis, ToolCategory, Usage};
+        let mut mapper = EventMapper::new();
+        let call = AgentEvent::ToolCall {
+            id: "t".into(),
+            name: "Bash".into(),
+            input: json!({}),
+            category: ToolCategory::Command,
+            canonical: Some("shell".into()),
+            input_complete: true,
+            seq: None,
+            parent: None,
+        };
+        match &mapper.map(&call)[0] {
+            ChatEvent::ToolUse {
+                category,
+                canonical,
+                ..
+            } => {
+                assert_eq!(category.as_deref(), Some("command"));
+                assert_eq!(canonical.as_deref(), Some("shell"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let done = AgentEvent::Done {
+            stop_reason: StopReason::MaxTurns,
+            subtype: None,
+            is_error: true,
+            result_text: None,
+            usage: Usage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                ..Default::default()
+            },
+            cost: Cost {
+                usd: None,
+                basis: CostBasis::Unknown,
+            },
+            duration_ms: 1,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: Some("m-1".into()),
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        };
+        let v = serde_json::to_value(&mapper.map(&done)[0]).unwrap();
+        assert_eq!(v["stop_reason"], "max_turns");
+        assert_eq!(v["model"], "m-1");
+        assert_eq!(v["usage"], json!({"input_tokens": 10, "output_tokens": 5}));
+        assert_eq!(v["cost"], json!({"basis": "unknown"}));
+        assert!(v["cost_usd"].is_null(), "an unknown price is not a zero");
+        let q = AgentEvent::Question {
+            question_id: "q".into(),
+            tool_call_id: None,
+            reply: QuestionReply::Turn,
+            questions: vec![],
+            input: json!({}),
+            parent: None,
+        };
+        let v = serde_json::to_value(&mapper.map(&q)[0]).unwrap();
+        assert_eq!(v["synthetic"], true);
+        let m = AgentEvent::PolicyModeChanged {
+            mode: nexus_claude::agent::PolicyMode::AutoEdits,
+            native_mode: Some("acceptEdits".into()),
+        };
+        let v = serde_json::to_value(&mapper.map(&m)[0]).unwrap();
+        assert_eq!(
+            (v["mode"].as_str(), v["policy_mode"].as_str()),
+            (Some("acceptEdits"), Some("auto_edits"))
+        );
     }
 
     #[test]
@@ -673,7 +873,10 @@ mod tests {
         assert!(matches!(second[0], ChatEvent::ToolUseInputResolved { .. }));
         // A call never announced is a plain tool_use.
         let mut fresh = EventMapper::new();
-        assert!(matches!(fresh.map(&call(true))[0], ChatEvent::ToolUse { .. }));
+        assert!(matches!(
+            fresh.map(&call(true))[0],
+            ChatEvent::ToolUse { .. }
+        ));
     }
 
     #[test]
@@ -699,7 +902,10 @@ mod tests {
         };
         assert_eq!(subtype(StopReason::Completed, false), "success");
         assert_eq!(subtype(StopReason::MaxTurns, true), "error_max_turns");
-        assert_eq!(subtype(StopReason::BudgetExceeded, true), "error_max_budget_usd");
+        assert_eq!(
+            subtype(StopReason::BudgetExceeded, true),
+            "error_max_budget_usd"
+        );
         assert_eq!(subtype(StopReason::Error, true), "error_during_execution");
     }
 
@@ -742,7 +948,10 @@ mod tests {
         };
         match &EventMapper::new().map(&unreachable)[0] {
             ChatEvent::Error { message, .. } => {
-                assert!(!message.contains("hunter2") && !message.contains("10.0.0.5"), "{message}");
+                assert!(
+                    !message.contains("hunter2") && !message.contains("10.0.0.5"),
+                    "{message}"
+                );
             }
             other => panic!("not an error: {other:?}"),
         }
@@ -769,7 +978,11 @@ mod tests {
     fn out_of_turn_messages_regroup_by_message_number() {
         let at = Utc::now();
         let events = vec![
-            AgentEvent::Text { text: "a".into(), seq: Some(1), parent: None },
+            AgentEvent::Text {
+                text: "a".into(),
+                seq: Some(1),
+                parent: None,
+            },
             AgentEvent::ToolCall {
                 id: "t".into(),
                 name: "Monitor".into(),
@@ -787,7 +1000,11 @@ mod tests {
                 seq: Some(2),
                 parent: Some("p".into()),
             },
-            AgentEvent::UserEcho { text: "hello".into(), seq: Some(3), parent: None },
+            AgentEvent::UserEcho {
+                text: "hello".into(),
+                seq: Some(3),
+                parent: None,
+            },
             AgentEvent::ProviderNotice {
                 kind: "status".into(),
                 data: json!({"s": 1}),
@@ -797,14 +1014,27 @@ mod tests {
         let rows: Vec<(String, String, Option<String>)> = out
             .into_iter()
             .map(|e| match e {
-                ChatEvent::BackgroundOutput { source, content, correlation_id, .. } => {
-                    (source, content, correlation_id)
-                }
+                ChatEvent::BackgroundOutput {
+                    source,
+                    content,
+                    correlation_id,
+                    ..
+                } => (source, content, correlation_id),
                 other => panic!("unexpected {other:?}"),
             })
             .collect();
-        assert_eq!(rows[0], ("assistant".into(), "a\n[tool_use: Monitor]".into(), None));
-        assert_eq!(rows[1], ("tool_result".into(), "[tool_result] line".into(), Some("p".into())));
+        assert_eq!(
+            rows[0],
+            ("assistant".into(), "a\n[tool_use: Monitor]".into(), None)
+        );
+        assert_eq!(
+            rows[1],
+            (
+                "tool_result".into(),
+                "[tool_result] line".into(),
+                Some("p".into())
+            )
+        );
         assert_eq!(rows[2], ("user".into(), "hello".into(), None));
         assert_eq!(rows[3].0, "system:status");
         assert_eq!(rows.len(), 4);
@@ -818,7 +1048,10 @@ mod tests {
         for tag in AgentEvent::TYPE_NAMES {
             assert!(!tag.is_empty());
         }
-        let notice = AgentEvent::ProviderNotice { kind: "x".into(), data: Value::Null };
+        let notice = AgentEvent::ProviderNotice {
+            kind: "x".into(),
+            data: Value::Null,
+        };
         assert!(mapper.map(&notice).is_empty());
     }
 }

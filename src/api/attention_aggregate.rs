@@ -1288,6 +1288,8 @@ mod tests {
                 tool: "Bash".into(),
                 input: json!({"command": "cargo publish"}),
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             };
             self.store(session, 1, ev, age).await;
         }
@@ -1299,6 +1301,7 @@ mod tests {
                 questions: json!([{"question": "Which database?", "options": [{"label": "pg"}]}]),
                 input: json!({}),
                 parent_tool_use_id: None,
+                synthetic: None,
             };
             self.store(session, 2, ev, age).await;
         }

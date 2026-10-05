@@ -5288,6 +5288,8 @@ mod tests {
             tool: "Edit".into(),
             input: serde_json::json!({}),
             parent_tool_use_id: None,
+            category: None,
+            canonical: None,
         })
         .unwrap();
 
@@ -5296,6 +5298,8 @@ mod tests {
             tool: "Bash".into(),
             input: serde_json::json!({}),
             parent_tool_use_id: None,
+            category: None,
+            canonical: None,
         })
         .unwrap();
 
@@ -5304,6 +5308,8 @@ mod tests {
             tool: "Edit".into(),
             input: serde_json::json!({}),
             parent_tool_use_id: None,
+            category: None,
+            canonical: None,
         })
         .unwrap();
 
@@ -5315,6 +5321,10 @@ mod tests {
             is_error: false,
             num_turns: Some(3),
             result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
         })
         .unwrap();
 
@@ -5372,6 +5382,10 @@ mod tests {
             is_error: false,
             num_turns: None,
             result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
         })
         .unwrap();
 
@@ -5406,6 +5420,10 @@ mod tests {
             is_error: false,
             num_turns: None,
             result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
         })
         .unwrap();
 
@@ -8271,6 +8289,10 @@ mod tests {
             is_error: false,
             num_turns: None,
             result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
         })
         .unwrap();
         let (_r, metrics) = runner.listen_for_result(rx, Uuid::new_v4(), None).await;
@@ -8506,6 +8528,10 @@ mod tests {
             is_error: false,
             num_turns: Some(3),
             result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
         })
         .unwrap();
         let (_r, metrics) = runner.listen_for_result(rx, Uuid::new_v4(), None).await;
@@ -8521,6 +8547,10 @@ mod tests {
             is_error: false,
             num_turns: None,
             result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
         })
         .unwrap();
         let (_r, metrics) = runner.listen_for_result(rx, Uuid::new_v4(), None).await;

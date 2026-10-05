@@ -71,7 +71,9 @@ impl HealthEntry {
         let (state, code) = match (&health.status, &health.error) {
             (HealthStatus::Ok, _) => ("ok", None),
             (HealthStatus::Degraded, _) => ("ok", None),
-            (_, Some(ProviderError::CliNotFound { .. })) => ("cli_not_found", Some("cli_not_found")),
+            (_, Some(ProviderError::CliNotFound { .. })) => {
+                ("cli_not_found", Some("cli_not_found"))
+            }
             (_, Some(ProviderError::AuthRequired { .. })) => {
                 ("auth_required", Some("auth_required"))
             }
@@ -150,11 +152,19 @@ pub fn builtin_claude_code(
 
 /// Assembles the listing; the default is the first instance when none is
 /// configured (Claude Code, A16: "claude-code when healthy").
-pub fn assemble(mut providers: Vec<ProviderEntry>, configured_default: Option<&str>) -> ProviderListing {
+pub fn assemble(
+    mut providers: Vec<ProviderEntry>,
+    configured_default: Option<&str>,
+) -> ProviderListing {
     let default = configured_default
         .filter(|d| providers.iter().any(|p| p.id == *d))
         .map(str::to_string)
-        .or_else(|| providers.iter().find(|p| p.id == CLAUDE_CODE).map(|p| p.id.clone()));
+        .or_else(|| {
+            providers
+                .iter()
+                .find(|p| p.id == CLAUDE_CODE)
+                .map(|p| p.id.clone())
+        });
     for p in &mut providers {
         p.is_default = default.as_deref() == Some(p.id.as_str());
     }
@@ -199,15 +209,20 @@ mod tests {
     fn health_maps_to_the_frontend_states() {
         let ok = HealthEntry::from_nexus(&ProviderHealth::ok(Some("2.1".into())));
         assert_eq!((ok.state, ok.code), ("ok", None));
-        let missing = HealthEntry::from_nexus(&ProviderHealth::unavailable(
-            ProviderError::CliNotFound { program: "/secret/path/claude".into() },
-        ));
-        assert_eq!((missing.state, missing.code), ("cli_not_found", Some("cli_not_found")));
+        let missing =
+            HealthEntry::from_nexus(&ProviderHealth::unavailable(ProviderError::CliNotFound {
+                program: "/secret/path/claude".into(),
+            }));
+        assert_eq!(
+            (missing.state, missing.code),
+            ("cli_not_found", Some("cli_not_found"))
+        );
         let body = serde_json::to_string(&missing).unwrap();
         assert!(!body.contains("/secret/path"), "{body}");
-        let auth = HealthEntry::from_nexus(&ProviderHealth::unavailable(
-            ProviderError::AuthRequired { login_hint: Some("claude login".into()) },
-        ));
+        let auth =
+            HealthEntry::from_nexus(&ProviderHealth::unavailable(ProviderError::AuthRequired {
+                login_hint: Some("claude login".into()),
+            }));
         assert_eq!(auth.state, "auth_required");
     }
 
@@ -217,7 +232,10 @@ mod tests {
             origin_of("https://user:hunter2@api.example.com:8443/v1/chat?key=abc").as_deref(),
             Some("https://api.example.com:8443")
         );
-        assert_eq!(origin_of("http://localhost:8080/v1").as_deref(), Some("http://localhost:8080"));
+        assert_eq!(
+            origin_of("http://localhost:8080/v1").as_deref(),
+            Some("http://localhost:8080")
+        );
         assert_eq!(origin_of("not a url"), None);
     }
 
@@ -225,13 +243,27 @@ mod tests {
     fn the_listing_body_has_the_documented_field_names() {
         let entry = builtin_claude_code(
             HealthEntry::unknown(),
-            vec![ModelEntry::new("claude-sonnet-5", Some("default".into()), &caps())],
+            vec![ModelEntry::new(
+                "claude-sonnet-5",
+                Some("default".into()),
+                &caps(),
+            )],
             true,
         );
         let v = serde_json::to_value(assemble(vec![entry], None)).unwrap();
         let p = &v["providers"][0];
-        for k in ["id", "kind", "label", "builtin", "is_default", "allowed_for_project",
-                  "endpoint_origin", "credential", "health", "models"] {
+        for k in [
+            "id",
+            "kind",
+            "label",
+            "builtin",
+            "is_default",
+            "allowed_for_project",
+            "endpoint_origin",
+            "credential",
+            "health",
+            "models",
+        ] {
             assert!(p.get(k).is_some(), "missing {k}");
         }
         assert_eq!(p["models"][0]["alias"], "default");

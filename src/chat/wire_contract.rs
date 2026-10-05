@@ -44,7 +44,7 @@ const UPDATE_COMMAND: &str = "UPDATE_CHAT_CONTRACT=1 cargo test --lib chat::wire
 
 /// Every `ChatEvent` tag the examples must cover. Adding a variant means
 /// adding its tag here AND its examples in [`server_examples`].
-const EXPECTED_SERVER_TAGS: [&str; 32] = [
+const EXPECTED_SERVER_TAGS: [&str; 33] = [
     "active_tasks_update",
     "ask_user_question",
     "assistant_text",
@@ -64,6 +64,7 @@ const EXPECTED_SERVER_TAGS: [&str; 32] = [
     "retrying",
     "secret_request",
     "secret_request_resolved",
+    "session_closed",
     "session_error",
     "stream_delta",
     "streaming_status",
@@ -135,6 +136,7 @@ fn variant_tag(e: &ChatEvent) -> &'static str {
         ChatEvent::ActiveTasksUpdate { .. } => "active_tasks_update",
         ChatEvent::SecretRequest { .. } => "secret_request",
         ChatEvent::SecretRequestResolved { .. } => "secret_request_resolved",
+        ChatEvent::SessionClosed { .. } => "session_closed",
     }
 }
 
@@ -236,12 +238,16 @@ fn server_examples() -> Vec<ServerExample> {
                 tool: s("Read"),
                 input: json!({ "file_path": "src/upload/client.rs" }),
                 parent_tool_use_id: parent(),
+                category: Some(s("read")),
+                canonical: Some(s("read_file")),
             },
             ChatEvent::ToolUse {
                 id: s(TOOL_USE_ID),
                 tool: s("Read"),
                 input: json!({}),
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             },
         ),
         ServerExample::new(
@@ -286,12 +292,16 @@ fn server_examples() -> Vec<ServerExample> {
                 tool: s("Bash"),
                 input: json!({ "command": "cargo fmt", "description": "Format the crate" }),
                 parent_tool_use_id: parent(),
+                category: Some(s("read")),
+                canonical: Some(s("read_file")),
             },
             ChatEvent::PermissionRequest {
                 id: s("perm_0001"),
                 tool: s("Bash"),
                 input: json!({}),
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             },
         ),
         ServerExample::new(
@@ -319,6 +329,7 @@ fn server_examples() -> Vec<ServerExample> {
                     }]
                 }),
                 parent_tool_use_id: parent(),
+                synthetic: Some(true),
             },
             ChatEvent::AskUserQuestion {
                 id: s("ctrl_0001"),
@@ -326,6 +337,7 @@ fn server_examples() -> Vec<ServerExample> {
                 questions: json!([]),
                 input: json!({}),
                 parent_tool_use_id: None,
+                synthetic: None,
             },
         ),
         ServerExample::new(
@@ -337,6 +349,12 @@ fn server_examples() -> Vec<ServerExample> {
                 is_error: false,
                 num_turns: Some(7),
                 result_text: Some(s("The retry is in place and covered by a test.")),
+                cost: Some(json!({ "usd": 0.25, "basis": "reported" })),
+                usage: Some(
+                    json!({ "input_tokens": 1200, "output_tokens": 340, "cache_read_tokens": 800 }),
+                ),
+                model: Some(s("example-model-large")),
+                stop_reason: Some(s("completed")),
             },
             ChatEvent::Result {
                 session_id: s(SESSION_ID),
@@ -346,6 +364,10 @@ fn server_examples() -> Vec<ServerExample> {
                 is_error: false,
                 num_turns: None,
                 result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             },
         ),
         ServerExample::new(
@@ -390,9 +412,16 @@ fn server_examples() -> Vec<ServerExample> {
             id: s("perm_0001"),
             allow: true,
         }),
-        ServerExample::same(ChatEvent::PermissionModeChanged {
-            mode: s("acceptEdits"),
-        }),
+        ServerExample::new(
+            ChatEvent::PermissionModeChanged {
+                mode: s("acceptEdits"),
+                policy_mode: Some(s("auto_edits")),
+            },
+            ChatEvent::PermissionModeChanged {
+                mode: s("acceptEdits"),
+                policy_mode: None,
+            },
+        ),
         ServerExample::same(ChatEvent::ModelChanged {
             model: s("example-model-large"),
         }),
@@ -419,6 +448,12 @@ fn server_examples() -> Vec<ServerExample> {
                 tools: vec![s("Bash"), s("Read"), s("Edit")],
                 mcp_servers: vec![json!({ "name": "project-orchestrator", "status": "connected" })],
                 permission_mode: Some(s("default")),
+                provider: Some(json!({ "id": "claude-code", "kind": "claude_code" })),
+                capabilities: Some(json!({ "interactive_permissions": true, "images": false })),
+                tool_policy: Some(
+                    json!({ "mode": "ask", "native_mode": "default", "allow": [], "deny": [] }),
+                ),
+                policy_mode: Some(s("ask")),
             },
             ChatEvent::SystemInit {
                 cli_session_id: s("cli-session-0001"),
@@ -426,6 +461,10 @@ fn server_examples() -> Vec<ServerExample> {
                 tools: vec![],
                 mcp_servers: vec![],
                 permission_mode: None,
+                provider: None,
+                capabilities: None,
+                tool_policy: None,
+                policy_mode: None,
             },
         ),
         ServerExample::new(
@@ -529,6 +568,16 @@ fn server_examples() -> Vec<ServerExample> {
             id: s("secret_req_0001"),
             outcome: s("provided"),
         }),
+        ServerExample::new(
+            ChatEvent::SessionClosed {
+                session_id: s(SESSION_ID),
+                reason: Some(s("closed")),
+            },
+            ChatEvent::SessionClosed {
+                session_id: s(SESSION_ID),
+                reason: None,
+            },
+        ),
     ]
 }
 

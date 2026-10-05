@@ -2763,6 +2763,8 @@ impl ChatManager {
                                 tool: t.name.clone(),
                                 input: t.input.clone(),
                                 parent_tool_use_id: parent.clone(),
+                                category: None,
+                                canonical: None,
                             });
                         }
                         ContentBlock::ToolResult(t) => {
@@ -2802,6 +2804,10 @@ impl ChatManager {
                     is_error: *is_error,
                     num_turns: Some(*num_turns),
                     result_text: result.clone(),
+                    cost: None,
+                    usage: None,
+                    model: None,
+                    stop_reason: None,
                 }]
             }
             Message::StreamEvent { event, .. } => match event {
@@ -2838,6 +2844,8 @@ impl ChatManager {
                             tool: name,
                             input,
                             parent_tool_use_id: parent,
+                            category: None,
+                            canonical: None,
                         }]
                     } else {
                         vec![]
@@ -2886,6 +2894,10 @@ impl ChatManager {
                             tools,
                             mcp_servers,
                             permission_mode,
+                            provider: None,
+                            capabilities: None,
+                            tool_policy: None,
+                            policy_mode: None,
                         }]
                     }
                     "compact_boundary" => {
@@ -4816,6 +4828,7 @@ impl ChatManager {
                                         ref tool,
                                         ref input,
                                         ref parent_tool_use_id,
+                                        ..
                                     } = event
                                     {
                                         // Plan 754a1379, T3 — INSERT side of the
@@ -5940,6 +5953,7 @@ impl ChatManager {
         // Broadcast event to WebSocket clients
         let _ = events_tx.send(ChatEvent::PermissionModeChanged {
             mode: mode.to_string(),
+            policy_mode: None,
         });
 
         Ok(())
@@ -7879,7 +7893,7 @@ impl ChatManager {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // 3. Remove session from active map
-        let (client, protocol_run_id, protocol_state) = {
+        let (client, protocol_run_id, protocol_state, events_tx) = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
                 .remove(session_id)
@@ -7888,9 +7902,20 @@ impl ChatManager {
                 session.client,
                 session.protocol_run_id,
                 session.protocol_state,
+                session.events_tx,
             )
         };
         self.notify_attention(session_id, AttentionReason::SessionInactive);
+
+        // A45: tell every client (and every instance) the session is gone.
+        let closed = ChatEvent::SessionClosed {
+            session_id: session_id.to_string(),
+            reason: Some("closed".to_string()),
+        };
+        let _ = events_tx.send(closed.clone());
+        if let Some(ref nats) = self.nats {
+            nats.publish_chat_event(session_id, closed);
+        }
 
         // 4. Finalize trajectory — fire-and-forget (non-blocking)
         //    Uses end_session_auto() so the collector computes the reward from
@@ -8340,6 +8365,7 @@ fn parse_permission_control_msg(
             questions,
             input,
             parent_tool_use_id: current_parent,
+            synthetic: None,
         });
     }
 
@@ -8348,6 +8374,8 @@ fn parse_permission_control_msg(
         tool: tool_name,
         input,
         parent_tool_use_id: current_parent,
+        category: None,
+        canonical: None,
     })
 }
 
@@ -9209,7 +9237,7 @@ mod tests {
         let events = ChatManager::message_to_events(&msg);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], ChatEvent::Result {
-            session_id, duration_ms, cost_usd, subtype, is_error, num_turns, result_text,
+            session_id, duration_ms, cost_usd, subtype, is_error, num_turns, result_text, ..
         } if session_id == "cli-abc-123"
             && *duration_ms == 5000
             && *cost_usd == Some(0.15)
@@ -9312,7 +9340,7 @@ mod tests {
         let events = ChatManager::message_to_events(&msg);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], ChatEvent::SystemInit {
-            cli_session_id, model, tools, mcp_servers, permission_mode,
+            cli_session_id, model, tools, mcp_servers, permission_mode, ..
         } if cli_session_id == "cli-sess-abc"
             && model.as_deref() == Some("claude-sonnet-4-6")
             && tools.len() == 4
@@ -9739,6 +9767,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closing_a_session_broadcasts_session_closed() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        test_support::insert_live_session_without_cli(&manager, "sess-close").await;
+        let mut rx = manager
+            .active_sessions
+            .read()
+            .await
+            .get("sess-close")
+            .expect("registered")
+            .events_tx
+            .subscribe();
+        manager.close_session("sess-close").await.unwrap();
+        let mut seen = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let ChatEvent::SessionClosed { session_id, reason } = ev {
+                seen = Some((session_id, reason));
+            }
+        }
+        assert_eq!(
+            seen,
+            Some(("sess-close".to_string(), Some("closed".to_string())))
+        );
+    }
+
+    #[tokio::test]
     async fn test_send_message_nonexistent_session() {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
@@ -9910,7 +9964,11 @@ mod tests {
         let (manager, graph) = manager_with_mock();
         // The CLI is not available in tests: only the persisted side matters.
         let _ = manager
-            .create_session(&runner_request(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()))
+            .create_session(&runner_request(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+            ))
             .await;
         let sessions: Vec<_> = graph.chat_sessions.read().await.values().cloned().collect();
         assert_eq!(sessions.len(), 1);
@@ -9924,10 +9982,13 @@ mod tests {
         let mut req = runner_request(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         req.provider = Some("deepseek".into());
         let err = manager.create_session(&req).await.unwrap_err();
-        let failure = crate::chat::provider::errors::classify_open_error(&err, None)
-            .expect("typed failure");
+        let failure =
+            crate::chat::provider::errors::classify_open_error(&err, None).expect("typed failure");
         assert_eq!((failure.status, failure.code), (404, "provider_unknown"));
-        assert!(graph.chat_sessions.read().await.is_empty(), "nothing persisted");
+        assert!(
+            graph.chat_sessions.read().await.is_empty(),
+            "nothing persisted"
+        );
     }
 
     #[tokio::test]
@@ -9938,7 +9999,10 @@ mod tests {
         graph.create_chat_session(&s).await.unwrap();
         let id = s.id.to_string();
         manager.check_provider_binding(&id, None).await.unwrap();
-        manager.check_provider_binding(&id, Some("claude-code")).await.unwrap();
+        manager
+            .check_provider_binding(&id, Some("claude-code"))
+            .await
+            .unwrap();
         let err = manager
             .check_provider_binding(&id, Some("deepseek"))
             .await
@@ -10449,6 +10513,8 @@ mod tests {
                     tool: "list_plans".into(),
                     input: serde_json::json!({"status": "in_progress"}),
                     parent_tool_use_id: None,
+                    category: None,
+                    canonical: None,
                 })
                 .unwrap(),
                 created_at: chrono::Utc::now(),
@@ -10873,6 +10939,8 @@ mod tests {
                 tool: "list_plans".into(),
                 input: serde_json::json!({}),
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             },
             ChatEvent::ToolResult {
                 id: "t1".into(),
@@ -11232,6 +11300,8 @@ mod tests {
                 tool: "create_plan".into(),
                 input: serde_json::json!({"title": "Plan"}),
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             },
             ChatEvent::ToolResult {
                 id: "t1".into(),
@@ -11248,6 +11318,8 @@ mod tests {
                 tool: "bash".into(),
                 input: serde_json::json!({"command": "ls"}),
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             },
             ChatEvent::Error {
                 message: "Something went wrong".into(),
@@ -11261,6 +11333,10 @@ mod tests {
                 is_error: false,
                 num_turns: None,
                 result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             },
             ChatEvent::UserMessage {
                 content: "Hello".into(),
@@ -12103,6 +12179,7 @@ mod tests {
                 tool,
                 input,
                 parent_tool_use_id,
+                ..
             } => {
                 assert_eq!(id, "req_abc");
                 assert_eq!(tool, "Bash");
@@ -12134,6 +12211,7 @@ mod tests {
                 tool,
                 input,
                 parent_tool_use_id,
+                ..
             } => {
                 assert_eq!(id, "req_xyz");
                 assert_eq!(tool, "Read");
@@ -12304,6 +12382,7 @@ mod tests {
                 questions,
                 input,
                 parent_tool_use_id,
+                ..
             } => {
                 assert_eq!(id, "req_ask_001");
                 assert_eq!(tool_call_id, "toolu_ask_123");

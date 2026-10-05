@@ -381,8 +381,7 @@ pub fn resolve_for_open(
     requested: Option<&str>,
     catalog: &dyn InstanceCatalog,
 ) -> Result<ProviderChoice, ResolveError> {
-    let session = is_existing_session
-        .then(|| Candidate::new(stored.unwrap_or(CLAUDE_CODE), None));
+    let session = is_existing_session.then(|| Candidate::new(stored.unwrap_or(CLAUDE_CODE), None));
     let mut input = ResolveInput::empty(Role::Pilot);
     input.session = session.as_ref();
     input.request = requested
@@ -813,7 +812,10 @@ mod tests {
     #[test]
     fn an_existing_legacy_session_is_claude_code_and_frozen() {
         let c = resolve_for_open(None, true, None, &BuiltinCatalog).unwrap();
-        assert_eq!((c.provider_id.as_str(), c.routed_by), (CLAUDE_CODE, RoutedBy::Session));
+        assert_eq!(
+            (c.provider_id.as_str(), c.routed_by),
+            (CLAUDE_CODE, RoutedBy::Session)
+        );
         let e = resolve_for_open(None, true, Some("deepseek"), &BuiltinCatalog).unwrap_err();
         assert_eq!(e.code(), "provider_conflict");
     }
