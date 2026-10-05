@@ -27,6 +27,7 @@ use super::sharing_handlers;
 use super::skill_handlers;
 use super::trajectory_handlers;
 use super::trigger_handlers;
+use super::update_handlers;
 use super::vault_handlers;
 use super::workspace_handlers;
 use super::ws_chat_handler;
@@ -461,6 +462,11 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/projects/{project_id}/releases",
             get(handlers::list_releases).post(handlers::create_release),
         )
+        // Self-update actions (status is public, in GET /api/version → `update`).
+        // Human sessions only: install swaps the binary, restart ends every session.
+        .route("/api/update/check", post(update_handlers::check_update))
+        .route("/api/update/install", post(update_handlers::install_update))
+        .route("/api/update/restart", post(update_handlers::restart_update))
         // Secrets vault (user side: a person's token; agent side: vault token)
         .route("/api/vault", get(vault_handlers::get_vault))
         .route("/api/vault/init", post(vault_handlers::init_vault))
