@@ -7,6 +7,7 @@
 //! so that it stays pure and testable until the nexus registry is wired in.
 
 pub mod credentials;
+pub mod endpoint_guard;
 pub mod errors;
 pub mod policy;
 pub mod resolver;

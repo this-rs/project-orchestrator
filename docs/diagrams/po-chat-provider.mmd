@@ -10,6 +10,7 @@
 %% SOURCES LUES :
 %%   src/chat/provider/resolver.rs — Role, RoutedBy, Candidate, ResolveInput, InstanceCatalog,
 %%                                   ResolveError, resolve
+%%   src/chat/provider/endpoint_guard.rs — validate_url, classify_ip, validate_resolved, validate_endpoint_with, origin_of, refuse_redirect, redact_error_body
 %%   src/chat/provider/errors.rs   — OpenFailure, open_failure, resolve_failure
 %%   src/chat/provider/credentials.rs — VaultCredentialResolver ; src/vault/service.rs — read_for_provider
 %%   src/chat/provider/policy.rs   — parse_mode, to_legacy, neutral_name, legacy_name,
@@ -52,6 +53,7 @@ flowchart TD
         EXEC -- "chaîne épuisée" --> BUILTIN
     end
 
+    GUARD["✅ endpoint_guard.rs (A36, B29) : validate_url (https hors boucle locale, http seulement vers un littéral loopback,<br/>jamais d'identifiants dans l'URL, hôte exigé — contrôle sur le texte brut : https:///v1 n'est pas l'hôte v1) ;<br/>classify_ip (privé, lien-local, métadonnées cloud, IPv4 mappée en IPv6) ; validate_resolved : TOUTES les adresses publiques (rebinding) ;<br/>refuse_redirect (3xx refusé) ; redact_error_body ; origin_of = identité du consentement (A28)<br/>test : 39 tests de endpoint_guard (validate_url_refuses_missing_host_and_garbage, validate_url_refuses_other_schemes, ...)<br/>🟠 aucun appelant de production : le CRUD d'instances (B25) et la sonde (B28) l'appelleront"]
     CATALOG["🟠 InstanceCatalog (exists, is_healthy, is_allowed_for_project) :<br/>trait seulement — implémentation avec le registre nexus et le consentement (B25, B3)"]
     CATALOG --> LEVELS
     NEXUS -.-> CATALOG
