@@ -172,11 +172,20 @@ async fn store_instance(graph: &MockGraphStore, record: &InstanceRecord) {
 }
 
 async fn consent(graph: &MockGraphStore, slug: &str, id: &str, origin: &str) {
+    // The consent names the credential reference the instance has NOW.
+    let credential_ref = graph
+        .get_llm_setting(GLOBAL, &format!("{INSTANCE_PREFIX}{id}"))
+        .await
+        .unwrap()
+        .and_then(|raw| serde_json::from_str::<InstanceRecord>(&raw).ok())
+        .map(|i| i.credential_ref)
+        .unwrap_or_else(|| "none".to_string());
     let record = ConsentRecord {
         provider_id: id.into(),
         origin: origin.into(),
         consented_by: "me@example.com".into(),
         consented_at: Utc::now().to_rfc3339(),
+        credential_ref: Some(credential_ref.to_string()),
     };
     graph
         .put_llm_setting(
@@ -720,4 +729,21 @@ async fn a_probe_with_a_locked_vault_is_credentials_locked() {
         }
     }
     assert!(fake.chat_requests().is_empty());
+}
+
+#[tokio::test]
+async fn changing_the_credential_reference_after_consent_stops_the_sending() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    // The same instance is now pointed at a vault key the project never agreed to.
+    store_instance(&graph, &instance(&fake, "vault:another-key")).await;
+    let manager = manager(graph.clone(), true);
+    let err = manager
+        .create_session(&request(Some("local"), Some("proj"), "default"))
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&err), (403, "endpoint_not_allowed"));
+    assert!(fake.requests().is_empty());
 }

@@ -72,9 +72,34 @@ pub enum CredentialSource {
     Env(String),
 }
 
-/// Parses `none`, `vault:<name>` or `env:<VAR>`. A server's own secret
-/// variable cannot be named (a provider could then be pointed at it).
-pub fn parse_credential_ref(raw: &str) -> Result<CredentialSource, SettingsError> {
+/// Environment variable naming the server variables an instance may use as a
+/// credential (`env:<VAR>`): a comma-separated list. EMPTY BY DEFAULT: with no
+/// list, `env:` references are refused, so a provider cannot be pointed at a
+/// variable of the server that nobody declared (deny by default, not a
+/// block-list of the secrets we thought of).
+pub const ENV_CREDENTIALS_VAR: &str = "CHAT_PROVIDER_ENV_CREDENTIALS";
+
+/// The declared list of `env:` credential variables.
+pub fn env_credential_allowlist() -> Vec<String> {
+    parse_allowlist(&std::env::var(ENV_CREDENTIALS_VAR).unwrap_or_default())
+}
+
+/// Parses a comma-separated list of variable names.
+pub fn parse_allowlist(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Parses `none`, `vault:<name>` or `env:<VAR>`. `env:` is accepted only for a
+/// variable declared in `env_allow` (and never one of the server's own secrets,
+/// even if declared).
+pub fn parse_credential_ref(
+    raw: &str,
+    env_allow: &[String],
+) -> Result<CredentialSource, SettingsError> {
     let raw = raw.trim();
     if raw == "none" || raw.is_empty() {
         return Ok(CredentialSource::None);
@@ -96,9 +121,12 @@ pub fn parse_credential_ref(raw: &str) -> Result<CredentialSource, SettingsError
         if !name_ok(var) {
             return Err(invalid("credential_ref: malformed variable name"));
         }
-        if crate::chat::manager::SERVER_ONLY_SECRETS.contains(&var) {
+        if crate::chat::manager::SERVER_ONLY_SECRETS.contains(&var)
+            || !env_allow.iter().any(|a| a == var)
+        {
             return Err(invalid(
-                "credential_ref: that variable holds a secret of the server itself",
+                "credential_ref: that variable is not declared for provider credentials \
+                 (CHAT_PROVIDER_ENV_CREDENTIALS); use vault:<name>",
             ));
         }
         return Ok(CredentialSource::Env(var.to_string()));
@@ -211,6 +239,7 @@ fn check_url(url: &str, policy: &EndpointPolicy) -> Result<String, SettingsError
 pub fn record_from_draft(
     draft: &InstanceDraft,
     policy: &EndpointPolicy,
+    env_allow: &[String],
 ) -> Result<InstanceRecord, SettingsError> {
     let id = draft.id.clone().ok_or_else(|| invalid("id is required"))?;
     if id == CLAUDE_CODE {
@@ -238,7 +267,7 @@ pub fn record_from_draft(
         .credential_ref
         .clone()
         .unwrap_or_else(|| "none".into());
-    parse_credential_ref(&credential_ref)?;
+    parse_credential_ref(&credential_ref, env_allow)?;
     let cost_source = draft
         .cost_source
         .clone()
@@ -271,6 +300,7 @@ pub fn apply_patch(
     old: &InstanceRecord,
     patch: &InstancePatch,
     policy: &EndpointPolicy,
+    env_allow: &[String],
 ) -> Result<(InstanceRecord, bool), SettingsError> {
     let mut next = old.clone();
     if let Some(label) = patch.label.as_ref().filter(|l| !l.trim().is_empty()) {
@@ -295,10 +325,13 @@ pub fn apply_patch(
         next.cost_source = cost.clone();
     }
     if let Some(cred) = patch.credential_ref.as_ref() {
-        parse_credential_ref(cred)?;
+        parse_credential_ref(cred, env_allow)?;
         next.credential_ref = cred.clone();
     }
-    let origin_changed = next.origin != old.origin;
+    // A consent is tied to the origin AND to the credential reference: changing
+    // either sends the project's content somewhere or with something it did not
+    // agree to.
+    let origin_changed = next.origin != old.origin || next.credential_ref != old.credential_ref;
     Ok((next, origin_changed))
 }
 
@@ -313,6 +346,19 @@ pub struct ConsentRecord {
     pub consented_by: String,
     /// RFC 3339 time.
     pub consented_at: String,
+    /// Credential reference the consent was given for. A consent recorded
+    /// before this field existed has none and holds only for an instance with
+    /// no credential.
+    #[serde(default)]
+    pub credential_ref: Option<String>,
+}
+
+/// Whether a consent still holds for the instance as it is now: same origin
+/// AND same credential reference (A28).
+pub fn consent_holds(consent: &ConsentRecord, instance: &InstanceRecord) -> bool {
+    consent.provider_id == instance.id
+        && consent.origin == instance.origin
+        && consent.credential_ref.as_deref().unwrap_or("none") == instance.credential_ref
 }
 
 /// A consent row as the API answers it: `valid` is false when the instance's
@@ -327,18 +373,25 @@ pub struct ConsentView {
     pub consented_by: String,
     /// When.
     pub consented_at: String,
-    /// The consent still holds for the instance's current origin.
+    /// Credential reference consented to (`none` when none was recorded).
+    pub credential_ref: String,
+    /// The consent still holds for the instance's current origin and credential.
     pub valid: bool,
 }
 
-/// Evaluates a consent against the instance's current origin (A28).
-pub fn consent_view(record: &ConsentRecord, current_origin: Option<&str>) -> ConsentView {
+/// Evaluates a consent against the instance as it is now (A28); `None` = the
+/// instance no longer exists.
+pub fn consent_view(record: &ConsentRecord, instance: Option<&InstanceRecord>) -> ConsentView {
     ConsentView {
         provider_id: record.provider_id.clone(),
         origin: record.origin.clone(),
         consented_by: record.consented_by.clone(),
         consented_at: record.consented_at.clone(),
-        valid: current_origin == Some(record.origin.as_str()),
+        credential_ref: record
+            .credential_ref
+            .clone()
+            .unwrap_or_else(|| "none".to_string()),
+        valid: instance.is_some_and(|i| consent_holds(record, i)),
     }
 }
 
@@ -527,7 +580,7 @@ mod tests {
 
     #[test]
     fn a_valid_draft_becomes_a_record_with_its_origin() {
-        let r = record_from_draft(&draft(), &EndpointPolicy::default()).unwrap();
+        let r = record_from_draft(&draft(), &EndpointPolicy::default(), &[]).unwrap();
         assert_eq!(r.origin, "https://api.deepseek.com");
         assert_eq!(r.credential_ref, "vault:deepseek");
     }
@@ -538,8 +591,8 @@ mod tests {
         assert!(serde_json::from_value::<InstanceDraft>(body).is_err());
         let body = serde_json::json!({"credential_ref": "sk-live-abcdef"});
         let patch: InstancePatch = serde_json::from_value(body).unwrap();
-        let old = record_from_draft(&draft(), &EndpointPolicy::default()).unwrap();
-        let err = apply_patch(&old, &patch, &EndpointPolicy::default()).unwrap_err();
+        let old = record_from_draft(&draft(), &EndpointPolicy::default(), &[]).unwrap();
+        let err = apply_patch(&old, &patch, &EndpointPolicy::default(), &[]).unwrap_err();
         assert!(
             !err.to_string().contains("sk-live"),
             "never echoes the value"
@@ -548,24 +601,47 @@ mod tests {
 
     #[test]
     fn credential_refs_are_references_only() {
+        let allow = vec!["DEEPSEEK_API_KEY".to_string(), "NEO4J_PASSWORD".to_string()];
         assert_eq!(
-            parse_credential_ref("none").unwrap(),
+            parse_credential_ref("none", &[]).unwrap(),
             CredentialSource::None
         );
         assert_eq!(
-            parse_credential_ref("vault:deepseek").unwrap(),
+            parse_credential_ref("vault:deepseek", &[]).unwrap(),
             CredentialSource::Vault("deepseek".into())
         );
         assert_eq!(
-            parse_credential_ref("env:DEEPSEEK_API_KEY").unwrap(),
+            parse_credential_ref("env:DEEPSEEK_API_KEY", &allow).unwrap(),
             CredentialSource::Env("DEEPSEEK_API_KEY".into())
         );
-        assert!(parse_credential_ref("sk-abcdef").is_err());
+        assert!(parse_credential_ref("sk-abcdef", &allow).is_err());
         assert!(
-            parse_credential_ref("env:NEO4J_PASSWORD").is_err(),
-            "server secret"
+            parse_credential_ref("env:NEO4J_PASSWORD", &allow).is_err(),
+            "a server secret stays refused even when someone declared it"
         );
-        assert!(parse_credential_ref("vault:").is_err());
+        assert!(parse_credential_ref("vault:", &allow).is_err());
+    }
+
+    #[test]
+    fn env_credentials_are_refused_unless_declared() {
+        // Deny by default: an undeclared variable is refused whatever its name.
+        for var in [
+            "env:HOME",
+            "env:AWS_SECRET_ACCESS_KEY",
+            "env:ANYTHING_ELSE",
+            "env:DEEPSEEK_API_KEY",
+        ] {
+            assert!(parse_credential_ref(var, &[]).is_err(), "{var}");
+        }
+        let declared = parse_allowlist(" DEEPSEEK_API_KEY , ,OTHER_KEY ");
+        assert_eq!(declared, vec!["DEEPSEEK_API_KEY", "OTHER_KEY"]);
+        assert!(parse_credential_ref("env:DEEPSEEK_API_KEY", &declared).is_ok());
+        assert!(parse_credential_ref("env:HOME", &declared).is_err());
+        // The message never echoes a value, only says what to do.
+        let msg = parse_credential_ref("env:HOME", &declared)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("CHAT_PROVIDER_ENV_CREDENTIALS"));
     }
 
     #[test]
@@ -573,33 +649,34 @@ mod tests {
         let mut d = draft();
         d.id = Some("claude-code".into());
         assert_eq!(
-            record_from_draft(&d, &EndpointPolicy::default()).unwrap_err(),
+            record_from_draft(&d, &EndpointPolicy::default(), &[]).unwrap_err(),
             SettingsError::Builtin
         );
         let mut d = draft();
         d.base_url = Some("http://example.com/v1".into());
         assert!(matches!(
-            record_from_draft(&d, &EndpointPolicy::default()).unwrap_err(),
+            record_from_draft(&d, &EndpointPolicy::default(), &[]).unwrap_err(),
             SettingsError::Endpoint(_)
         ));
         let mut d = draft();
         d.base_url = Some("https://user:pw@api.example.com".into());
-        assert!(record_from_draft(&d, &EndpointPolicy::default()).is_err());
+        assert!(record_from_draft(&d, &EndpointPolicy::default(), &[]).is_err());
         let mut d = draft();
         d.kind = Some("codex".into());
-        assert!(record_from_draft(&d, &EndpointPolicy::default()).is_err());
+        assert!(record_from_draft(&d, &EndpointPolicy::default(), &[]).is_err());
     }
 
     #[test]
     fn changing_the_url_changes_the_origin_and_invalidates_consent() {
-        let old = record_from_draft(&draft(), &EndpointPolicy::default()).unwrap();
+        let old = record_from_draft(&draft(), &EndpointPolicy::default(), &[]).unwrap();
         let consent = ConsentRecord {
             provider_id: old.id.clone(),
             origin: old.origin.clone(),
             consented_by: "me@example.com".into(),
             consented_at: "2026-10-05T10:00:00Z".into(),
+            credential_ref: Some(old.credential_ref.clone()),
         };
-        assert!(consent_view(&consent, Some(&old.origin)).valid);
+        assert!(consent_view(&consent, Some(&old)).valid);
         let patch = InstancePatch {
             preset: None,
             label: None,
@@ -608,9 +685,9 @@ mod tests {
             cost_source: None,
             credential_ref: None,
         };
-        let (next, changed) = apply_patch(&old, &patch, &EndpointPolicy::default()).unwrap();
+        let (next, changed) = apply_patch(&old, &patch, &EndpointPolicy::default(), &[]).unwrap();
         assert!(changed);
-        assert!(!consent_view(&consent, Some(&next.origin)).valid);
+        assert!(!consent_view(&consent, Some(&next)).valid);
         assert!(
             !consent_view(&consent, None).valid,
             "a deleted instance holds no consent"
@@ -620,7 +697,7 @@ mod tests {
             base_url: Some("https://api.deepseek.com/v2".into()),
             ..patch
         };
-        let (_, changed) = apply_patch(&old, &patch, &EndpointPolicy::default()).unwrap();
+        let (_, changed) = apply_patch(&old, &patch, &EndpointPolicy::default(), &[]).unwrap();
         assert!(!changed);
     }
 
@@ -715,5 +792,41 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_policy(&unknown_alias, &known).is_err());
+    }
+
+    #[test]
+    fn changing_the_credential_reference_invalidates_the_consent_too() {
+        let old = record_from_draft(&draft(), &EndpointPolicy::default(), &[]).unwrap();
+        let consent = ConsentRecord {
+            provider_id: old.id.clone(),
+            origin: old.origin.clone(),
+            consented_by: "me".into(),
+            consented_at: "t".into(),
+            credential_ref: Some(old.credential_ref.clone()),
+        };
+        assert!(consent_holds(&consent, &old));
+        let patch = InstancePatch {
+            preset: None,
+            label: None,
+            base_url: None,
+            default_model: None,
+            cost_source: None,
+            credential_ref: Some("vault:another-key".into()),
+        };
+        let (next, changed) = apply_patch(&old, &patch, &EndpointPolicy::default(), &[]).unwrap();
+        assert!(changed, "the API reports the consent as invalidated");
+        assert!(
+            !consent_holds(&consent, &next),
+            "same origin, other key: no longer consented"
+        );
+        // A consent recorded before the field existed holds only without credential.
+        let legacy = ConsentRecord {
+            credential_ref: None,
+            ..consent
+        };
+        assert!(!consent_holds(&legacy, &old));
+        let mut keyless = old.clone();
+        keyless.credential_ref = "none".into();
+        assert!(consent_holds(&legacy, &keyless));
     }
 }

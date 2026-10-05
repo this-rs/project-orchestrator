@@ -126,10 +126,9 @@ pub async fn stored_entries(
         .await?
         .into_iter()
         .map(|i| {
-            let allowed = consents.as_ref().map(|cs| {
-                cs.iter()
-                    .any(|c| c.provider_id == i.id && c.origin == i.origin)
-            });
+            let allowed = consents
+                .as_ref()
+                .map(|cs| cs.iter().any(|c| st::consent_holds(c, &i)));
             let models = i
                 .default_model
                 .iter()
@@ -181,13 +180,34 @@ pub async fn test_provider(
     let policy = EndpointPolicy::default();
     let verdict =
         |state: &str, code: &str| json!({"ok": false, "health": {"state": state, "code": code}});
-    let record = match st::record_from_draft(&draft, &policy) {
+    let env_allow = st::env_credential_allowlist();
+    let record = match st::record_from_draft(&draft, &policy, &env_allow) {
         Ok(r) => r,
         Err(SettingsError::Endpoint(e)) => return Ok(Json(verdict("unreachable", e.code()))),
         Err(e) => return Err(map_settings_error(e)),
     };
     if let Err(e) = validate_endpoint(&record.base_url, &policy).await {
         return Ok(Json(verdict("unreachable", e.code())));
+    }
+    // A test that carries a credential sends it to the endpoint: it is only done
+    // for an instance that is ALREADY saved, at the origin it was saved with and
+    // with the credential reference it was saved with. A draft with a key is
+    // saved first (it cannot serve a session until a project consents anyway).
+    if record.credential_ref != "none" {
+        let saved = graph(&state)
+            .get_llm_setting(GLOBAL, &format!("{INSTANCE_PREFIX}{}", record.id))
+            .await
+            .map_err(AppError::Internal)?
+            .and_then(|raw| parse::<InstanceRecord>(&raw));
+        let same = saved.is_some_and(|s| {
+            s.origin == record.origin && s.credential_ref == record.credential_ref
+        });
+        if !same {
+            return Ok(Json(verdict(
+                "unknown",
+                "credential_test_requires_saved_instance",
+            )));
+        }
     }
     let report = match crate::chat::provider::native_factory::probe_instance(
         &record,
@@ -243,7 +263,8 @@ pub async fn create_provider(
     require_human(&state, &claims)?;
     security_gate(&state)?;
     let policy = EndpointPolicy::default();
-    let record = st::record_from_draft(&draft, &policy).map_err(map_settings_error)?;
+    let record = st::record_from_draft(&draft, &policy, &st::env_credential_allowlist())
+        .map_err(map_settings_error)?;
     validate_endpoint(&record.base_url, &policy)
         .await
         .map_err(|e| AppError::BadRequest(format!("endpoint refused: {e}")))?;
@@ -289,7 +310,8 @@ pub async fn update_provider(
         .ok_or_else(|| AppError::NotFound(format!("unknown provider instance '{id}'")))?;
     let policy = EndpointPolicy::default();
     let (next, origin_changed) =
-        st::apply_patch(&old, &patch, &policy).map_err(map_settings_error)?;
+        st::apply_patch(&old, &patch, &policy, &st::env_credential_allowlist())
+            .map_err(map_settings_error)?;
     if patch.base_url.is_some() {
         validate_endpoint(&next.base_url, &policy)
             .await
@@ -403,10 +425,7 @@ pub async fn list_consents(
         .await?
         .iter()
         .map(|c| {
-            let current = instances
-                .iter()
-                .find(|i| i.id == c.provider_id)
-                .map(|i| i.origin.as_str());
+            let current = instances.iter().find(|i| i.id == c.provider_id);
             st::consent_view(c, current)
         })
         .collect();
@@ -445,6 +464,7 @@ async fn put_consent(
         origin: instance.origin.clone(),
         consented_by: claims.email.clone(),
         consented_at: chrono::Utc::now().to_rfc3339(),
+        credential_ref: Some(instance.credential_ref.clone()),
     };
     let body = serde_json::to_string(&record).map_err(|e| AppError::Internal(e.into()))?;
     graph
@@ -455,7 +475,7 @@ async fn put_consent(
         )
         .await
         .map_err(AppError::Internal)?;
-    Ok(Json(st::consent_view(&record, Some(&instance.origin))))
+    Ok(Json(st::consent_view(&record, Some(&instance))))
 }
 
 /// PUT /api/projects/{slug}/llm-consent — body `{ provider_id, origin }`.

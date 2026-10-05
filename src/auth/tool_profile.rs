@@ -37,8 +37,35 @@ pub enum ToolProfile {
     Restricted,
 }
 
-/// Tools the restricted profile does not see at all.
-const RESTRICTED_TOOLS: &[&str] = &["admin", "mcp_federation", "lifecycle_hook"];
+/// The ONLY tools the restricted profile sees. An allow-list: a tool added
+/// tomorrow is withheld until someone decides it is safe for a third-party model.
+/// Withheld on purpose: `vault` (secrets), `admin`, `mcp_federation`,
+/// `lifecycle_hook`, `protocol` (starts agents), `sharing` (sends data out),
+/// `environment`, `neural_routing`, `trajectory`.
+const RESTRICTED_ALLOWED_TOOLS: &[&str] = &[
+    "project",
+    "plan",
+    "task",
+    "step",
+    "decision",
+    "constraint",
+    "release",
+    "milestone",
+    "commit",
+    "note",
+    "workspace",
+    "workspace_milestone",
+    "resource",
+    "component",
+    "chat",
+    "feature_graph",
+    "code",
+    "episode",
+    "reasoning",
+    "analysis_profile",
+    "skill",
+    "persona",
+];
 
 /// `(tool, action)` pairs the restricted profile does not see.
 const RESTRICTED_ACTIONS: &[(&str, &str)] = &[
@@ -91,7 +118,7 @@ impl ToolProfile {
     pub fn allows_tool(self, tool: &str) -> bool {
         match self {
             Self::Full => true,
-            Self::Restricted => !RESTRICTED_TOOLS.contains(&tool),
+            Self::Restricted => RESTRICTED_ALLOWED_TOOLS.contains(&tool),
         }
     }
 
@@ -145,7 +172,11 @@ impl ToolProfile {
         };
         // Whole tools: admin / mcp_federation / lifecycle_hook (reads included —
         // the tool is not in the profile at all).
-        if under("/api/admin") || under("/api/mcp-federation") || under("/api/lifecycle-hooks") {
+        if under("/api/admin")
+            || under("/api/mcp-federation")
+            || under("/api/lifecycle-hooks")
+            || under("/api/vault")
+        {
             return true;
         }
         if read {
@@ -202,9 +233,19 @@ mod tests {
     fn the_restricted_profile_has_no_way_to_open_a_session_or_run_a_plan() {
         let seen = ToolProfile::Restricted.filter_tools(all_tools());
         let names: Vec<_> = seen.iter().map(|t| t.name.as_str()).collect();
-        for withheld in RESTRICTED_TOOLS {
-            assert!(!names.contains(withheld), "{withheld} must be withheld");
+        for withheld in [
+            "vault",
+            "admin",
+            "mcp_federation",
+            "lifecycle_hook",
+            "protocol",
+            "sharing",
+            "environment",
+        ] {
+            assert!(!names.contains(&withheld), "{withheld} must be withheld");
         }
+        // Allow-list: nothing outside it is visible, whatever else exists.
+        assert!(names.iter().all(|n| RESTRICTED_ALLOWED_TOOLS.contains(n)));
         assert!(names.contains(&"plan") && names.contains(&"chat") && names.contains(&"note"));
 
         let plan = actions_of(&seen, "plan");
@@ -222,7 +263,7 @@ mod tests {
     fn every_withheld_name_exists_in_the_real_tool_list() {
         // A typo here would silently withhold nothing.
         let all = all_tools();
-        for tool in RESTRICTED_TOOLS {
+        for tool in RESTRICTED_ALLOWED_TOOLS {
             assert!(all.iter().any(|t| t.name == *tool), "unknown tool {tool}");
         }
         for (tool, action) in RESTRICTED_ACTIONS {
@@ -240,6 +281,14 @@ mod tests {
         assert!(!r.allows_action("plan", "delegate_task"));
         assert!(!r.allows_action("chat", "send_message"));
         assert!(!r.allows_action("admin", "anything"));
+        assert!(
+            !r.allows_action("vault", "list"),
+            "the vault tool is not for third parties"
+        );
+        assert!(
+            !r.allows_action("a_tool_added_tomorrow", "x"),
+            "unknown = withheld"
+        );
         assert!(r.allows_action("plan", "get"));
         assert!(r.allows_action("note", "create"));
         assert!(ToolProfile::Full.allows_action("plan", "run"));
@@ -325,5 +374,14 @@ mod tests {
                 "{method} {path} must stay open"
             );
         }
+    }
+
+    #[test]
+    fn the_vault_routes_are_closed_to_a_restricted_token_reads_included() {
+        use axum::http::Method;
+        let r = ToolProfile::Restricted;
+        assert!(r.route_forbidden(&Method::GET, "/api/vault"));
+        assert!(r.route_forbidden(&Method::POST, "/api/vault/grants"));
+        assert!(!ToolProfile::Full.route_forbidden(&Method::GET, "/api/vault"));
     }
 }

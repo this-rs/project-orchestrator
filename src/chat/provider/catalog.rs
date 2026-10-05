@@ -35,7 +35,7 @@ impl StoreCatalog {
                 .filter(|i| {
                     consents
                         .iter()
-                        .any(|c| c.provider_id == i.id && c.origin == i.origin)
+                        .any(|c| super::settings::consent_holds(c, i))
                 })
                 .map(|i| i.id.clone())
                 .collect()
@@ -198,6 +198,7 @@ mod tests {
             origin: origin.into(),
             consented_by: "me".into(),
             consented_at: "t".into(),
+            credential_ref: Some("none".into()),
         }
     }
 

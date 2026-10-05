@@ -8215,7 +8215,7 @@ impl ChatManager {
         let consented = store::consents(self.graph.as_ref(), slug)
             .await?
             .iter()
-            .any(|c| c.provider_id == provider_id && c.origin == record.origin);
+            .any(|c| super::provider::settings::consent_holds(c, &record));
         if !consented {
             return Err(refuse(resolver::ResolveError::NotAllowed(
                 provider_id.into(),

@@ -92,6 +92,13 @@ fn build_native(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
 ) -> Result<Arc<NativeProvider>, ProviderError> {
+    // A stored record is checked again here: an `env:` reference must name a
+    // variable declared for provider credentials, whenever it was stored.
+    super::settings::parse_credential_ref(
+        &record.credential_ref,
+        &super::settings::env_credential_allowlist(),
+    )
+    .map_err(|_| ProviderError::invalid("credential reference not allowed"))?;
     let credential = CredentialRef::from_str(&record.credential_ref)?;
     let mut endpoint = OpenAiEndpointConfig::new(record.id.clone(), record.base_url.clone());
     endpoint.credential = credential;

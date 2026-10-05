@@ -2023,6 +2023,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_env_credential_is_refused_unless_the_variable_is_declared() {
+        let app = test_app().await;
+        let mut body = deepseek("https://8.8.8.8/v1");
+        body["credential_ref"] = serde_json::json!("env:HOME");
+        let (status, resp) = call_json(&app, auth_json("POST", "/api/chat/providers", body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert!(
+            resp.to_string().contains("CHAT_PROVIDER_ENV_CREDENTIALS"),
+            "{resp}"
+        );
+    }
+
+    #[tokio::test]
     async fn the_test_route_always_answers_200_with_a_verdict() {
         let app = test_app().await;
         let (status, body) = call_json(
@@ -2046,7 +2059,32 @@ mod tests {
             ),
         )
         .await;
-        // The key lives in a vault nobody unlocked: a verdict, and no connection.
+        // A draft with a key is not tried: the key would go to an endpoint nobody saved.
+        assert_eq!(body["ok"], false);
+        assert_eq!(
+            body["health"]["code"],
+            "credential_test_requires_saved_instance"
+        );
+        // Saved, then tried: the key lives in a vault nobody unlocked: a verdict, no connection.
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (_, body) = call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers/test",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
         assert_eq!(body["ok"], false);
         assert_eq!(body["health"]["code"], "credentials_locked");
         assert_eq!(body["health"]["state"], "auth_required");
