@@ -5,6 +5,7 @@
 //! - Handles download + install with progress reporting
 
 use serde::Serialize;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::UpdaterExt;
 
@@ -33,12 +34,6 @@ pub struct UpdateProgressPayload {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UpdateErrorPayload {
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct UpdateInstallingPayload {
     pub version: String,
 }
@@ -56,59 +51,123 @@ const NO_BUNDLE_MESSAGE: &str =
     "The latest release has no in-app update package. Download it from the releases page.";
 
 // ============================================================================
-// Update check (called on startup)
+// Update check (startup + periodic)
 // ============================================================================
 
-/// Check for updates in the background and emit events to the frontend.
-pub fn check_for_updates(app: AppHandle) {
+/// How often a long-running app (it lives in the tray for days) looks again.
+const RECHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
+/// Version the user was last told about: the periodic check must not re-show a
+/// banner they already saw (and maybe dismissed with "Later").
+static LAST_NOTIFIED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// `chat.auto_update_app` from a config.yaml body. Defaults to true when the
+/// file, the section or the key is missing or unreadable.
+pub fn parse_auto_update_app(yaml: &str) -> bool {
+    serde_yaml::from_str::<serde_yaml::Value>(yaml)
+        .ok()
+        .and_then(|v| {
+            v.get("chat")
+                .and_then(|c| c.get("auto_update_app"))
+                .and_then(|v| v.as_bool())
+        })
+        .unwrap_or(true)
+}
+
+/// Read live from disk so a change made in Settings applies without a restart.
+fn auto_update_enabled() -> bool {
+    std::fs::read_to_string(crate::setup::config_path())
+        .map(|c| parse_auto_update_app(&c))
+        .unwrap_or(true)
+}
+
+/// Whether `version` still has to be announced, remembering it if so.
+fn should_notify(last: &mut Option<String>, version: &str) -> bool {
+    if last.as_deref() == Some(version) {
+        false
+    } else {
+        *last = Some(version.to_string());
+        true
+    }
+}
+
+/// Keep the update for `install_update`. A newer find replaces an older one:
+/// `manage` alone would silently keep the first value forever.
+fn store_update(app: &AppHandle, update: tauri_plugin_updater::Update) {
+    if let Some(state) = app.try_state::<AvailableUpdate>() {
+        if let Ok(mut guard) = state.0.lock() {
+            *guard = Some(update);
+        }
+    } else {
+        app.manage(AvailableUpdate(std::sync::Mutex::new(Some(update))));
+    }
+}
+
+/// Check at startup, then every [`RECHECK_INTERVAL`], for as long as
+/// `chat.auto_update_app` is on (re-read each time). Emits events to the frontend.
+pub fn start_periodic_checks(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        tracing::info!("Checking for updates...");
-
-        let updater = match app.updater() {
-            Ok(u) => u,
-            Err(e) => {
-                tracing::warn!("Failed to initialize updater: {}", e);
-                return;
+        loop {
+            if auto_update_enabled() {
+                check_once(&app).await;
+            } else {
+                tracing::info!("Auto-update disabled in config — skipping update check");
             }
-        };
+            tokio::time::sleep(RECHECK_INTERVAL).await;
+        }
+    });
+}
 
-        let update = match updater.check().await {
-            Ok(Some(update)) => update,
-            Ok(None) => {
-                tracing::info!("No update available — already on latest version");
-                return;
+async fn check_once(app: &AppHandle) {
+    tracing::info!("Checking for updates...");
+
+    let updater = match app.updater() {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!("Failed to initialize updater: {}", e);
+            return;
+        }
+    };
+
+    let update = match updater.check().await {
+        Ok(Some(update)) => update,
+        Ok(None) => {
+            tracing::info!("No update available — already on latest version");
+            return;
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            // Don't emit user-visible errors for known CI/release configuration issues.
+            // "relative URL without a base" means latest.json has empty URLs — this happens
+            // when TAURI_SIGNING_PRIVATE_KEY is not configured in GitHub Actions secrets,
+            // so the updater bundles (.app.tar.gz, .nsis.zip, etc.) are not generated.
+            if is_missing_bundle_error(&msg) {
+                tracing::info!(
+                    "Update check skipped — release has no updater bundles ({})",
+                    msg
+                );
+            } else {
+                // A failed periodic check (offline laptop) is not worth a banner.
+                tracing::warn!("Update check failed: {}", e);
             }
-            Err(e) => {
-                let msg = e.to_string();
-                // Don't emit user-visible errors for known CI/release configuration issues.
-                // "relative URL without a base" means latest.json has empty URLs — this happens
-                // when TAURI_SIGNING_PRIVATE_KEY is not configured in GitHub Actions secrets,
-                // so the updater bundles (.app.tar.gz, .nsis.zip, etc.) are not generated.
-                if is_missing_bundle_error(&msg) {
-                    tracing::info!(
-                        "Update check skipped — release has no updater bundles ({})",
-                        msg
-                    );
-                } else {
-                    tracing::warn!("Update check failed: {}", e);
-                    let _ = app.emit(
-                        "update-error",
-                        UpdateErrorPayload {
-                            message: format!("Update check failed: {}", e),
-                        },
-                    );
-                }
-                return;
-            }
-        };
+            return;
+        }
+    };
 
-        let version = update.version.clone();
-        let body = update.body.clone();
-        let date = update.date.map(|d| d.to_string());
+    let version = update.version.clone();
+    let body = update.body.clone();
+    let date = update.date.map(|d| d.to_string());
 
-        tracing::info!("Update available: v{}", version);
+    tracing::info!("Update available: v{}", version);
 
-        // Emit update-available event for the frontend
+    // Store first so "Update now" works as soon as the banner is visible.
+    store_update(app, update);
+
+    let announce = LAST_NOTIFIED
+        .lock()
+        .map(|mut last| should_notify(&mut last, &version))
+        .unwrap_or(true);
+    if announce {
         let _ = app.emit(
             "update-available",
             UpdateAvailablePayload {
@@ -117,10 +176,7 @@ pub fn check_for_updates(app: AppHandle) {
                 date,
             },
         );
-
-        // Store the update in app state so the install command can access it
-        app.manage(AvailableUpdate(std::sync::Mutex::new(Some(update))));
-    });
+    }
 }
 
 // ============================================================================
@@ -149,13 +205,7 @@ pub async fn check_update(app: AppHandle) -> Result<Option<UpdateAvailablePayloa
             };
 
             // Store for later install
-            if let Some(state) = app.try_state::<AvailableUpdate>() {
-                if let Ok(mut guard) = state.0.lock() {
-                    *guard = Some(update);
-                }
-            } else {
-                app.manage(AvailableUpdate(std::sync::Mutex::new(Some(update))));
-            }
+            store_update(&app, update);
 
             Ok(Some(payload))
         }
@@ -258,5 +308,28 @@ mod tests {
     #[test]
     fn missing_bundle_message_does_not_claim_up_to_date() {
         assert!(!NO_BUNDLE_MESSAGE.to_lowercase().contains("up to date"));
+    }
+
+    #[test]
+    fn auto_update_defaults_to_on() {
+        assert!(parse_auto_update_app(""));
+        assert!(parse_auto_update_app("server:\n  port: 6600\n"));
+        assert!(parse_auto_update_app("chat:\n  mode: default\n"));
+        assert!(parse_auto_update_app("not: [valid"));
+    }
+
+    #[test]
+    fn auto_update_follows_the_config_value() {
+        assert!(!parse_auto_update_app("chat:\n  auto_update_app: false\n"));
+        assert!(parse_auto_update_app("chat:\n  auto_update_app: true\n"));
+    }
+
+    #[test]
+    fn a_version_is_announced_once_until_a_newer_one_appears() {
+        let mut last = None;
+        assert!(should_notify(&mut last, "0.0.17"));
+        assert!(!should_notify(&mut last, "0.0.17"));
+        assert!(should_notify(&mut last, "0.0.18"));
+        assert!(!should_notify(&mut last, "0.0.18"));
     }
 }
