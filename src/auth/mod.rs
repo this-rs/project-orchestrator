@@ -15,3 +15,4 @@ pub mod middleware;
 pub mod oauth_server;
 pub mod oidc;
 pub mod refresh;
+pub mod tool_profile;

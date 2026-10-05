@@ -47,7 +47,7 @@ diagrams:
     # (jwt.rs, agent_tokens.rs) et l'enveloppe d'une session enfant (chat/envelope.rs).
     covers:
       - "backend:src/chat/envelope.rs"
-      - "backend:src/auth/{agent_tokens,jwt}.rs"
+      - "backend:src/auth/{agent_tokens,jwt,tool_profile}.rs"
   - name: po-chat-transport
     owner: theotime
     status: verified

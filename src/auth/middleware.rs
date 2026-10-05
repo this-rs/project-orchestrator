@@ -72,6 +72,20 @@ pub async fn require_auth(
         ));
     }
 
+    // 4c. The session's MCP tool profile is a boundary here, not in the MCP
+    //     subprocess: the routes behind the tools a profile withholds answer
+    //     403 whatever the agent sends (the profile is signed into the token).
+    if let Some(binding) = crate::auth::jwt::agent_session_binding(&claims) {
+        let profile =
+            crate::auth::tool_profile::ToolProfile::from_name(binding.tool_profile.as_deref());
+        if profile.route_forbidden(req.method(), req.uri().path()) {
+            return Err(AppError::Forbidden(format!(
+                "tool_not_in_profile: this route is not available to this session (tool profile: {})",
+                profile.name()
+            )));
+        }
+    }
+
     // 5. Inject claims into request extensions
     req.extensions_mut().insert(claims);
 
@@ -638,6 +652,68 @@ mod tests {
             );
         }
         crate::auth::agent_tokens::revoke_session(&sid);
+    }
+
+    #[tokio::test]
+    async fn a_restricted_profile_token_is_refused_the_routes_behind_withheld_tools() {
+        let state = make_server_state(Some(test_auth_config())).await;
+        async fn ok_handler() -> &'static str {
+            "ok"
+        }
+        use axum::routing::post;
+        let app = Router::new()
+            .route("/api/chat/sessions", get(ok_handler).post(ok_handler))
+            .route("/api/plans/{id}/run", post(ok_handler))
+            .route("/api/plans/{id}/tasks/{tid}/delegate", post(ok_handler))
+            .route("/api/admin/backfill-synapses", post(ok_handler))
+            .route("/api/notes", post(ok_handler))
+            .layer(from_fn_with_state(state.clone(), require_auth))
+            .with_state(state);
+
+        let mint = |profile: Option<&str>| {
+            let sid = uuid::Uuid::new_v4().to_string();
+            let binding = crate::auth::jwt::AgentSessionBinding {
+                session_id: sid.clone(),
+                ceiling: Some("default".to_string()),
+                tool_profile: profile.map(str::to_string),
+            };
+            let (token, jti) = crate::auth::jwt::generate_session_token(
+                &Claims::service_account("runner:t"),
+                Some(&binding),
+                TEST_SECRET,
+                3600,
+            )
+            .unwrap();
+            crate::auth::agent_tokens::register(&jti, Some(&sid));
+            token
+        };
+        let restricted = mint(Some("restricted"));
+        let full = mint(None);
+
+        for (method, uri) in [
+            ("POST", "/api/chat/sessions"),
+            ("POST", "/api/plans/p1/run"),
+            ("POST", "/api/plans/p1/tasks/t1/delegate"),
+            ("POST", "/api/admin/backfill-synapses"),
+        ] {
+            assert_eq!(
+                status_of(app.clone(), method, uri, &restricted).await,
+                StatusCode::FORBIDDEN,
+                "restricted profile must get 403 on {method} {uri}"
+            );
+            assert_eq!(
+                status_of(app.clone(), method, uri, &full).await,
+                StatusCode::OK,
+                "a session without a profile keeps {method} {uri}"
+            );
+        }
+        for (method, uri) in [("GET", "/api/chat/sessions"), ("POST", "/api/notes")] {
+            assert_eq!(
+                status_of(app.clone(), method, uri, &restricted).await,
+                StatusCode::OK,
+                "restricted profile keeps {method} {uri}"
+            );
+        }
     }
 
     #[test]
