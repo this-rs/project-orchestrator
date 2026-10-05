@@ -13,3 +13,4 @@ pub mod event_map;
 pub mod listing;
 pub mod policy;
 pub mod resolver;
+pub mod settings;

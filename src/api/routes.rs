@@ -20,6 +20,7 @@ use super::persona_handlers;
 use super::profile_handlers;
 use super::project_handlers;
 use super::protocol_handlers;
+use super::provider_handlers;
 use super::reason_handlers;
 use super::registry_handlers;
 use super::rfc_handlers;
@@ -38,7 +39,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::{header, Method};
 use axum::{
     middleware::from_fn_with_state,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use tower_http::cors::CorsLayer;
@@ -1939,7 +1940,60 @@ fn protected_routes() -> Router<OrchestratorState> {
         // Detect user PATH from login shell
         .route("/api/chat/detect-path", get(chat_handlers::detect_path))
         // CLI version management (check + install/upgrade)
-        .route("/api/chat/providers", get(chat_handlers::list_providers))
+        .route(
+            "/api/chat/providers",
+            get(chat_handlers::list_providers).post(provider_handlers::create_provider),
+        )
+        .route(
+            "/api/chat/providers/test",
+            post(provider_handlers::test_provider),
+        )
+        .route(
+            "/api/chat/providers/{id}",
+            put(provider_handlers::update_provider)
+                .patch(provider_handlers::update_provider)
+                .delete(provider_handlers::delete_provider),
+        )
+        .route(
+            "/api/chat/providers/{id}/status",
+            get(provider_handlers::provider_status),
+        )
+        .route(
+            "/api/chat/providers/{id}/models",
+            get(provider_handlers::provider_models),
+        )
+        .route(
+            "/api/chat/roles",
+            get(provider_handlers::get_roles).put(provider_handlers::put_roles),
+        )
+        .route(
+            "/api/chat/model-aliases",
+            get(provider_handlers::get_aliases).put(provider_handlers::put_aliases),
+        )
+        .route(
+            "/api/chat/model-policy",
+            get(provider_handlers::get_policy).put(provider_handlers::put_policy),
+        )
+        .route(
+            "/api/projects/{slug}/llm-consent",
+            get(provider_handlers::list_consents).put(provider_handlers::allow_consent),
+        )
+        .route(
+            "/api/projects/{slug}/llm-consents",
+            get(provider_handlers::list_consents).put(provider_handlers::allow_consent),
+        )
+        .route(
+            "/api/projects/{slug}/llm-consent/{provider_id}",
+            put(provider_handlers::allow_consent_for).delete(provider_handlers::revoke_consent),
+        )
+        .route(
+            "/api/projects/{slug}/llm-consents/{provider_id}",
+            put(provider_handlers::allow_consent_for).delete(provider_handlers::revoke_consent),
+        )
+        .route(
+            "/api/projects/{slug}/llm-roles",
+            get(provider_handlers::get_project_roles).put(provider_handlers::put_project_roles),
+        )
         .route("/api/chat/cli/status", get(chat_handlers::get_cli_status))
         .route("/api/chat/cli/install", post(chat_handlers::install_cli))
         // CLI auth status

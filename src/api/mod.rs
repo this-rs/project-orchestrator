@@ -22,6 +22,7 @@ pub mod persona_handlers;
 pub mod profile_handlers;
 pub mod project_handlers;
 pub mod protocol_handlers;
+pub mod provider_handlers;
 pub mod query;
 pub mod reason_handlers;
 pub mod registry_handlers;

@@ -1421,12 +1421,52 @@ pub async fn list_providers(
         ));
     }
 
-    let entries = vec![listing::builtin_claude_code(
+    // The historical engine sends images to Claude Code today; the neutral
+    // contract (A12) declares `images: false` because the agent path does not
+    // carry them yet. The listing tells the truth of the engine that will serve
+    // the session, so the UI keeps its attachments on the legacy path.
+    let legacy = state
+        .chat_manager
+        .as_ref()
+        .map(|m| m.config.provider_path == crate::chat::config::ProviderPath::Legacy)
+        .unwrap_or(true);
+    if legacy {
+        for m in &mut models {
+            if let Some(caps) = m.capabilities.as_object_mut() {
+                caps.insert("images".to_string(), serde_json::Value::Bool(true));
+            }
+        }
+    }
+
+    let mut entries = vec![listing::builtin_claude_code(
         health,
         models,
         query.project_slug.is_some(),
     )];
-    Ok(Json(listing::assemble(entries, None)))
+    // The stored instances, with the consent of the asked project.
+    entries.extend(
+        super::provider_handlers::stored_entries(
+            state.orchestrator.neo4j(),
+            query.project_slug.as_deref(),
+        )
+        .await?,
+    );
+    // The pilot's configured target is the default when it names an instance.
+    let configured = state
+        .orchestrator
+        .neo4j()
+        .get_llm_setting(
+            crate::chat::provider::settings::GLOBAL,
+            crate::chat::provider::settings::ROLES_KEY,
+        )
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| {
+            serde_json::from_str::<crate::chat::provider::settings::RoleAssignments>(&raw).ok()
+        })
+        .and_then(|roles| roles.pilot.map(|p| p.provider));
+    Ok(Json(listing::assemble(entries, configured.as_deref())))
 }
 
 /// Request body for POST /api/chat/cli/install
@@ -1786,6 +1826,318 @@ mod tests {
         assert_eq!(p["credential"], "none");
         assert!(p["health"]["state"].is_string());
         assert!(p["models"][0]["capabilities"].is_object());
+    }
+
+    #[tokio::test]
+    async fn providers_reports_images_for_claude_code_on_the_legacy_engine() {
+        let app = test_app().await;
+        let resp = app.oneshot(auth_get("/api/chat/providers")).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["providers"][0]["models"][0]["capabilities"]["images"],
+            true
+        );
+    }
+
+    // ====================================================================
+    // Provider settings: instances, consent, roles, aliases, policy
+    // ====================================================================
+
+    fn auth_json(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn call_json(app: &axum::Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    fn deepseek(url: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "deepseek", "kind": "openai_compatible", "label": "DeepSeek",
+            "base_url": url, "default_model": "deepseek-chat",
+            "cost_source": "priced", "credential_ref": "vault:deepseek"
+        })
+    }
+
+    #[tokio::test]
+    async fn an_instance_is_created_listed_and_never_carries_a_secret() {
+        let app = test_app().await;
+        let (status, body) = call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["origin"], "https://8.8.8.8");
+        assert_eq!(body["credential_ref"], "vault:deepseek");
+
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (_, listing) = call_json(&app, auth_get("/api/chat/providers?project_slug=p")).await;
+        let providers = listing["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 2);
+        let entry = providers.iter().find(|p| p["id"] == "deepseek").unwrap();
+        assert_eq!(entry["endpoint_origin"], "https://8.8.8.8");
+        assert_eq!(entry["credential"], "vault:deepseek");
+        assert_eq!(entry["allowed_for_project"], false);
+        assert_eq!(entry["builtin"], false);
+    }
+
+    #[tokio::test]
+    async fn a_secret_in_a_body_or_a_forbidden_endpoint_is_refused() {
+        let app = test_app().await;
+        let mut with_key = deepseek("https://8.8.8.8/v1");
+        with_key["api_key"] = serde_json::json!("sk-live-123");
+        let (status, _) = call_json(&app, auth_json("POST", "/api/chat/providers", with_key)).await;
+        assert!(status.is_client_error(), "{status}");
+
+        let mut bare = deepseek("https://8.8.8.8/v1");
+        bare["credential_ref"] = serde_json::json!("sk-live-123");
+        let (status, body) = call_json(&app, auth_json("POST", "/api/chat/providers", bare)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!body.to_string().contains("sk-live"), "{body}");
+
+        for url in [
+            "http://8.8.8.8/v1",
+            "https://169.254.169.254/latest",
+            "https://10.0.0.5/v1",
+            "https://u:p@8.8.8.8/v1",
+        ] {
+            let (status, _) = call_json(
+                &app,
+                auth_json("POST", "/api/chat/providers", deepseek(url)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}");
+        }
+        let mut builtin = deepseek("https://8.8.8.8/v1");
+        builtin["id"] = serde_json::json!("claude-code");
+        let (status, _) = call_json(&app, auth_json("POST", "/api/chat/providers", builtin)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "DELETE",
+                "/api/chat/providers/claude-code",
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn the_test_route_always_answers_200_with_a_verdict() {
+        let app = test_app().await;
+        let (status, body) = call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers/test",
+                deepseek("https://10.1.2.3/v1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["health"]["code"], "endpoint_private_address");
+        let (_, body) = call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers/test",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+        assert_eq!(body["health"]["code"], "probe_unavailable");
+    }
+
+    #[tokio::test]
+    async fn consent_is_bound_to_the_origin_and_stops_holding_when_it_changes() {
+        let app = test_app().await;
+        call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+
+        let (status, body) = call_json(
+            &app,
+            auth_json(
+                "PUT",
+                "/api/projects/p/llm-consent",
+                serde_json::json!({"provider_id": "deepseek", "origin": "https://1.1.1.1"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+        let (status, body) = call_json(
+            &app,
+            auth_json(
+                "PUT",
+                "/api/projects/p/llm-consent",
+                serde_json::json!({"provider_id": "deepseek", "origin": "https://8.8.8.8"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["valid"], true);
+        assert!(body["consented_by"].is_string() && body["consented_at"].is_string());
+
+        let (_, listing) = call_json(&app, auth_get("/api/chat/providers?project_slug=p")).await;
+        let entry = listing["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "deepseek")
+            .unwrap()
+            .clone();
+        assert_eq!(entry["allowed_for_project"], true);
+
+        // The instance moves to another origin: the consent no longer holds.
+        let (status, patched) = call_json(
+            &app,
+            auth_json(
+                "PATCH",
+                "/api/chat/providers/deepseek",
+                serde_json::json!({"base_url": "https://1.1.1.1/v1"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{patched}");
+        assert_eq!(patched["consents_invalidated"], true);
+        let (_, rows) = call_json(&app, auth_get("/api/projects/p/llm-consents")).await;
+        assert_eq!(rows[0]["valid"], false);
+        let (_, listing) = call_json(&app, auth_get("/api/chat/providers?project_slug=p")).await;
+        let entry = listing["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "deepseek")
+            .unwrap()
+            .clone();
+        assert_eq!(entry["allowed_for_project"], false);
+
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "DELETE",
+                "/api/projects/p/llm-consent/deepseek",
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "DELETE",
+                "/api/projects/p/llm-consent/deepseek",
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn roles_aliases_and_policy_round_trip_and_are_validated() {
+        let app = test_app().await;
+        call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+
+        let (_, roles) = call_json(&app, auth_get("/api/chat/roles")).await;
+        assert_eq!(roles, serde_json::json!({}), "absent = single provider");
+        let want = serde_json::json!({"pilot": {"provider": "claude-code"}, "executor": {"provider": "deepseek", "alias": "fast"}});
+        let (status, _) = call_json(&app, auth_json("PUT", "/api/chat/roles", want.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, got) = call_json(&app, auth_get("/api/chat/roles")).await;
+        assert_eq!(got, want);
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "PUT",
+                "/api/chat/roles",
+                serde_json::json!({"pilot": {"provider": "ghost"}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "PUT",
+                "/api/projects/p/llm-roles",
+                serde_json::json!({"executor": {"provider": "claude-code"}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, project_roles) = call_json(&app, auth_get("/api/projects/p/llm-roles")).await;
+        assert_eq!(
+            project_roles,
+            serde_json::json!({"executor": {"provider": "claude-code"}})
+        );
+
+        let aliases = serde_json::json!([{"alias": "fast", "provider": "deepseek", "model": "deepseek-chat"}]);
+        let (status, _) = call_json(
+            &app,
+            auth_json("PUT", "/api/chat/model-aliases", aliases.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, got) = call_json(&app, auth_get("/api/chat/model-aliases")).await;
+        assert_eq!(got, aliases);
+
+        let (_, policy) = call_json(&app, auth_get("/api/chat/model-policy")).await;
+        assert_eq!(policy["mode"], "off", "ships off");
+        let ok = serde_json::json!({"mode": "shadow", "rules": {"runner.simple": "fast"}, "fallback": ["fast"], "caps": {"per_run_usd": 5.0}});
+        let (status, _) = call_json(&app, auth_json("PUT", "/api/chat/model-policy", ok)).await;
+        assert_eq!(status, StatusCode::OK);
+        let bad = serde_json::json!({"mode": "enforce", "rules": {"chat": "ghost"}, "fallback": [], "caps": {}});
+        let (status, _) = call_json(&app, auth_json("PUT", "/api/chat/model-policy", bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

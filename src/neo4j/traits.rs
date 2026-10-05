@@ -2083,6 +2083,17 @@ pub trait GraphStore: Send + Sync {
     /// survives idle-cleanup and is honored on resume/respawn)
     async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()>;
 
+    /// Settings of the provider harness (instances, consents, roles, aliases,
+    /// policy), one JSON document per (scope, key). Scope is `global` or
+    /// `project:<slug>`.
+    async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>>;
+    /// Creates or replaces a setting document.
+    async fn put_llm_setting(&self, scope: &str, key: &str, value: &str) -> Result<()>;
+    /// Deletes a setting document; `true` when it existed.
+    async fn delete_llm_setting(&self, scope: &str, key: &str) -> Result<bool>;
+    /// All documents of a scope whose key starts with `prefix`, as (key, value).
+    async fn list_llm_settings(&self, scope: &str, prefix: &str) -> Result<Vec<(String, String)>>;
+
     /// Record what the provider reported at open: the frozen capability
     /// snapshot (JSON) and the resume token (wire form). `None` leaves a field as is.
     async fn update_chat_session_harness(

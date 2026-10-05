@@ -353,6 +353,63 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// One setting document of the provider harness.
+    pub async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>> {
+        let q = query("MATCH (s:LlmSetting {scope: $scope, key: $key}) RETURN s.value AS value")
+            .param("scope", scope.to_string())
+            .param("key", key.to_string());
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => Ok(Some(row.get::<String>("value")?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Creates or replaces a setting document.
+    pub async fn put_llm_setting(&self, scope: &str, key: &str, value: &str) -> Result<()> {
+        let q = query(
+            "MERGE (s:LlmSetting {scope: $scope, key: $key}) \
+             SET s.value = $value, s.updated_at = datetime()",
+        )
+        .param("scope", scope.to_string())
+        .param("key", key.to_string())
+        .param("value", value.to_string());
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Deletes a setting document; `true` when it existed.
+    pub async fn delete_llm_setting(&self, scope: &str, key: &str) -> Result<bool> {
+        let q = query(
+            "MATCH (s:LlmSetting {scope: $scope, key: $key}) \
+             WITH s, count(s) AS n DELETE s RETURN n",
+        )
+        .param("scope", scope.to_string())
+        .param("key", key.to_string());
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
+    /// All documents of a scope whose key starts with `prefix`.
+    pub async fn list_llm_settings(
+        &self,
+        scope: &str,
+        prefix: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let q = query(
+            "MATCH (s:LlmSetting {scope: $scope}) WHERE s.key STARTS WITH $prefix \
+             RETURN s.key AS key, s.value AS value ORDER BY s.key",
+        )
+        .param("scope", scope.to_string())
+        .param("prefix", prefix.to_string());
+        let mut result = self.graph.execute(q).await?;
+        let mut out = Vec::new();
+        while let Some(row) = result.next().await? {
+            out.push((row.get::<String>("key")?, row.get::<String>("value")?));
+        }
+        Ok(out)
+    }
+
     /// Record the capability snapshot and the resume token of a harness session.
     /// A `None` argument leaves the stored value untouched.
     pub async fn update_chat_session_harness(

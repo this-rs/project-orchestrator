@@ -79,6 +79,8 @@ pub struct MockGraphStore {
     /// undirected the way the Cypher reads them
     pub document_links: RwLock<HashMap<Uuid, Vec<(EntityType, String)>>>,
     pub chat_sessions: RwLock<HashMap<Uuid, ChatSessionNode>>,
+    /// Provider harness settings, by (scope, key).
+    pub llm_settings: RwLock<HashMap<(String, String), String>>,
     /// Stored session links (run relation / associations), seedable by tests
     pub session_link_rows: RwLock<Vec<SessionLinkRow>>,
     /// Chat sessions linked to a task, as `get_task_enrichment_data` reports
@@ -290,6 +292,7 @@ impl MockGraphStore {
             document_chunks: RwLock::new(HashMap::new()),
             document_links: RwLock::new(HashMap::new()),
             chat_sessions: RwLock::new(HashMap::new()),
+            llm_settings: RwLock::new(HashMap::new()),
             session_link_rows: RwLock::new(Vec::new()),
             task_sessions: RwLock::new(HashMap::new()),
             session_link_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -7651,6 +7654,42 @@ impl GraphStore for MockGraphStore {
             session.updated_at = Utc::now();
         }
         Ok(())
+    }
+
+    async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .llm_settings
+            .read()
+            .await
+            .get(&(scope.to_string(), key.to_string()))
+            .cloned())
+    }
+    async fn put_llm_setting(&self, scope: &str, key: &str, value: &str) -> Result<()> {
+        self.llm_settings
+            .write()
+            .await
+            .insert((scope.to_string(), key.to_string()), value.to_string());
+        Ok(())
+    }
+    async fn delete_llm_setting(&self, scope: &str, key: &str) -> Result<bool> {
+        Ok(self
+            .llm_settings
+            .write()
+            .await
+            .remove(&(scope.to_string(), key.to_string()))
+            .is_some())
+    }
+    async fn list_llm_settings(&self, scope: &str, prefix: &str) -> Result<Vec<(String, String)>> {
+        let mut rows: Vec<(String, String)> = self
+            .llm_settings
+            .read()
+            .await
+            .iter()
+            .filter(|((s, k), _)| s == scope && k.starts_with(prefix))
+            .map(|((_, k), v)| (k.clone(), v.clone()))
+            .collect();
+        rows.sort();
+        Ok(rows)
     }
 
     async fn update_chat_session_harness(
