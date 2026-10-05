@@ -737,6 +737,14 @@ pub async fn build_attention(graph: &dyn GraphStore, p: &AttentionParams) -> Att
                 started_at: r.started_at,
                 duration_secs: secs_since(r.completed_at.unwrap_or(now), r.started_at),
                 cost_usd: r.cost_usd,
+                cost_basis: Some(
+                    if r.cost_usd > 0.0 {
+                        "reported"
+                    } else {
+                        "unknown"
+                    }
+                    .to_string(),
+                ),
             }),
             session_ids: Vec::new(),
             sessions: atts

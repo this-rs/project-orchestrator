@@ -87,6 +87,10 @@ pub struct SetupConfig {
     /// Explicit path to the Claude CLI binary (optional, auto-detected by default).
     #[serde(default)]
     pub chat_claude_cli_path: String,
+    /// Chat provider chosen in the wizard. `None` or absent keeps the historical
+    /// behaviour (Claude Code); `"none"` writes no model and no CLI path.
+    #[serde(default)]
+    pub chat_provider: Option<String>,
     /// Enable automatic CLI version updates on startup (default: false).
     #[serde(default)]
     pub chat_auto_update_cli: bool,
@@ -300,7 +304,10 @@ struct MeilisearchSection {
 
 #[derive(Debug, Serialize)]
 struct ChatSection {
-    default_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_model: Option<String>,
     max_sessions: u32,
     max_turns: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -575,6 +582,15 @@ pub fn get_config_path() -> String {
 /// - Creates parent directories if needed
 /// - Writes the YAML file
 #[tauri::command]
+/// The wizard step "chat" was skipped: no provider, so nothing about Claude
+/// Code (model, CLI path) is written, checked or installed.
+fn chat_provider_is_none(config: &SetupConfig) -> bool {
+    config
+        .chat_provider
+        .as_deref()
+        .is_some_and(|p| p.trim().eq_ignore_ascii_case("none"))
+}
+
 pub fn generate_config(config: SetupConfig) -> Result<String, String> {
     let path = config_path();
     tracing::info!("Generating config at: {}", path.display());
@@ -794,7 +810,17 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
         },
         nats,
         chat: Some(ChatSection {
-            default_model: config.chat_model.clone(),
+            provider: config
+                .chat_provider
+                .clone()
+                .filter(|p| !p.trim().is_empty()),
+            // Without a chat provider there is no model to default to.
+            default_model: if chat_provider_is_none(&config) || config.chat_model.trim().is_empty()
+            {
+                None
+            } else {
+                Some(config.chat_model.clone())
+            },
             max_sessions: config.chat_max_sessions,
             max_turns: config.chat_max_turns,
             permissions: if config.chat_permission_mode != "default" {
@@ -810,7 +836,9 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
             } else {
                 Some(config.chat_process_path.trim().to_string())
             },
-            claude_cli_path: if config.chat_claude_cli_path.trim().is_empty() {
+            claude_cli_path: if chat_provider_is_none(&config)
+                || config.chat_claude_cli_path.trim().is_empty()
+            {
                 None
             } else {
                 Some(config.chat_claude_cli_path.trim().to_string())
@@ -1198,12 +1226,18 @@ pub fn read_config() -> Result<ReadConfigResponse, String> {
         allowed_emails,
         nats_url,
         nats_enabled,
-        chat_model: normalize_model_id(
-            &yaml
-                .chat
-                .default_model
-                .unwrap_or_else(|| "claude-sonnet-4-6".into()),
-        ),
+        chat_provider: yaml.chat.provider.clone(),
+        // A config written with `provider: none` has no model: it stays empty.
+        chat_model: if yaml.chat.provider.as_deref() == Some("none") {
+            yaml.chat.default_model.clone().unwrap_or_default()
+        } else {
+            normalize_model_id(
+                &yaml
+                    .chat
+                    .default_model
+                    .unwrap_or_else(|| "claude-sonnet-4-6".into()),
+            )
+        },
         chat_max_sessions: yaml.chat.max_sessions.unwrap_or(3) as u32,
         chat_max_turns: yaml.chat.max_turns.unwrap_or(50) as u32,
         chat_permission_mode: yaml
@@ -1289,6 +1323,8 @@ pub struct ReadConfigResponse {
     // Desktop-only settings
     pub chat_process_path: String,
     pub chat_claude_cli_path: String,
+    /// Provider chosen in the wizard (absent on configs written before it existed).
+    pub chat_provider: Option<String>,
     pub chat_auto_update_cli: bool,
     pub chat_auto_update_app: bool,
     // Embedding settings
