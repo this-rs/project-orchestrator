@@ -136,6 +136,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Embedded frontend carries the frames the backend uses
+        run: scripts/check-dist-contract.sh dist
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
         with:
