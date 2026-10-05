@@ -223,18 +223,9 @@ jobs:
           save-if: ${{ env.CACHE_SAVE == 'true' && env.CACHE_FRESH == '' }}
           cache-workspace-crates: true
 
-      # src/chat/agent_e2e_tests.rs drives the agent engine against the `fake_openai`
-      # and `fake_mcp` binaries of the nexus repository, at the SAME revision
-      # Cargo.toml pins. They are built here, not skipped: those tests FAIL (with a
-      # message naming this step) when the binaries are missing.
+      # src/chat/agent_e2e_tests.rs needs the nexus fake servers (see the action).
       - name: Build the nexus fake servers used by the agent e2e tests
-        run: |
-          REV=$(sed -n 's/^nexus-claude = .*rev = "\([0-9a-f]\{40\}\)".*/\1/p' Cargo.toml)
-          test -n "$REV"
-          cargo install --git https://github.com/this-rs/nexus.git --rev "$REV" \
-            --features "provider-native testkit" --root "$RUNNER_TEMP/nexus-fakes" \
-            --bin fake_openai --bin fake_mcp nexus-claude
-          echo "NEXUS_FAKES_DIR=$RUNNER_TEMP/nexus-fakes/bin" >> "$GITHUB_ENV"
+        uses: ./.github/actions/nexus-fakes
 
       - name: Run unit tests (lib)
         # --workspace so member crates' unit tests actually run in CI (the
@@ -492,6 +483,9 @@ jobs:
       # `test_large_index_performance` is a wall-clock assertion that does not
       # hold under llvm-cov instrumentation — skipped here, still run by the
       # Unit Tests job. See docs/COVERAGE.md.
+      - name: Build the nexus fake servers used by the agent e2e tests
+        uses: ./.github/actions/nexus-fakes
+
       - name: Collect coverage — unit tests (workspace)
         run: |
           cargo llvm-cov --no-report --no-fail-fast \
@@ -571,6 +565,9 @@ jobs:
           shared-key: "ci-test-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
           save-if: false
           cache-workspace-crates: true
+
+      - name: Build the nexus fake servers used by the agent e2e tests
+        uses: ./.github/actions/nexus-fakes
 
       - name: Run the lib suite with per-test times
         env:
