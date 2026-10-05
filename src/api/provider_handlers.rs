@@ -103,15 +103,6 @@ async fn load_consents(graph: &dyn GraphStore, slug: &str) -> Result<Vec<Consent
         .collect())
 }
 
-async fn instance_exists(graph: &dyn GraphStore, id: &str) -> Result<bool, AppError> {
-    Ok(id == CLAUDE_CODE
-        || graph
-            .get_llm_setting(GLOBAL, &format!("{INSTANCE_PREFIX}{id}"))
-            .await
-            .map_err(AppError::Internal)?
-            .is_some())
-}
-
 /// The stored instances as listing entries, consent evaluated for a project.
 pub async fn stored_entries(
     graph: &dyn GraphStore,
@@ -392,12 +383,58 @@ pub async fn provider_status(
         );
         return Ok(Json(HealthEntry::from_nexus(&provider.health().await)));
     }
-    if !instance_exists(graph(&state).as_ref(), &id).await? {
-        return Err(AppError::NotFound(format!(
-            "unknown provider instance '{id}'"
-        )));
-    }
-    Ok(Json(HealthEntry::unknown()))
+    let record = crate::chat::provider::store::instance(graph(&state).as_ref(), &id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("unknown provider instance '{id}'")))?;
+    // The REAL health of the instance now (reachable? logged in? a locked vault is
+    // `auth_required`), checked by the provider itself. Nothing is sent but the
+    // provider's own health request.
+    let health = match crate::chat::provider::native_factory::build_native_provider(
+        &record,
+        Some(state.vault.clone()),
+    ) {
+        Ok(provider) => HealthEntry::from_nexus(&provider.health().await),
+        Err(_) => HealthEntry::unknown(),
+    };
+    Ok(Json(health))
+}
+
+/// Query of `GET /api/chat/send-journal`.
+#[derive(Debug, Deserialize)]
+pub struct JournalQuery {
+    /// Only the sendings of this project.
+    pub project_slug: Option<String>,
+    /// Most recent first, at most this many (default 100, max 500).
+    pub limit: Option<usize>,
+}
+
+/// GET /api/chat/send-journal — who sent which project's content to which origin
+/// (A37), most recent first. A person only: the journal is the user's own audit
+/// trail, an agent has no business reading it. It never holds the content sent.
+pub async fn send_journal(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Query(query): axum::extract::Query<JournalQuery>,
+) -> Result<Json<Value>, AppError> {
+    require_human(&state, &claims)?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let mut rows = graph(&state)
+        .list_llm_settings("journal", "send:")
+        .await
+        .map_err(AppError::Internal)?;
+    // Keys are `send:<epoch ms>:<session>`: newest last.
+    rows.reverse();
+    let entries: Vec<Value> = rows
+        .iter()
+        .filter_map(|(_, v)| serde_json::from_str::<Value>(v).ok())
+        .filter(|e| match &query.project_slug {
+            Some(p) => e["project"] == p.as_str(),
+            None => true,
+        })
+        .take(limit)
+        .collect();
+    Ok(Json(json!({ "entries": entries })))
 }
 
 /// GET /api/chat/providers/{id}/models — models of one instance.

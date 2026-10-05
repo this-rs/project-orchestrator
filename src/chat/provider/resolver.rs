@@ -103,6 +103,10 @@ pub struct ProviderChoice {
     /// What a `shadow` policy would have chosen (provider, model); never applied.
     #[serde(default)]
     pub shadow: Option<(String, Option<String>)>,
+    /// Why a higher level was skipped (`routed_by = fallback`): the code of the
+    /// first refusal (`provider_unavailable`, `endpoint_not_allowed`, ...).
+    #[serde(default)]
+    pub fallback_reason: Option<String>,
 }
 
 /// A provider (and optional model) proposed by one precedence level.
@@ -297,6 +301,7 @@ pub fn resolve(
             routed_by: RoutedBy::Session,
             route_rule: None,
             shadow: None,
+            fallback_reason: None,
         });
     }
 
@@ -335,6 +340,7 @@ pub fn resolve(
                     },
                     route_rule: None,
                     shadow: None,
+                    fallback_reason: first_skip.as_ref().map(|e| e.code().to_string()),
                 });
             }
             Err(error) => {
@@ -366,6 +372,7 @@ pub fn resolve(
             },
             route_rule: None,
             shadow: None,
+            fallback_reason: first_skip.as_ref().map(|e| e.code().to_string()),
         });
     }
     match first_skip {
@@ -692,6 +699,10 @@ mod tests {
         assert_eq!(choice.provider_id, "p-global");
         assert_eq!(choice.model, Some("p-global-model".to_string()));
         assert_eq!(choice.routed_by, RoutedBy::Fallback);
+        assert_eq!(
+            choice.fallback_reason.as_deref(),
+            Some("provider_unavailable")
+        );
     }
 
     #[test]

@@ -3210,9 +3210,13 @@ impl ChatManager {
         // The policy rule that applied, and what a `shadow` policy would have
         // chosen, are kept for the execution record (A22): the runner reads
         // them back. A write that fails loses a note, never a session.
-        if provider_choice.route_rule.is_some() || provider_choice.shadow.is_some() {
+        if provider_choice.route_rule.is_some()
+            || provider_choice.shadow.is_some()
+            || provider_choice.fallback_reason.is_some()
+        {
             let note = serde_json::json!({
                 "route_rule": provider_choice.route_rule,
+                "fallback_reason": provider_choice.fallback_reason,
                 "shadow_provider": provider_choice.shadow.as_ref().map(|s| &s.0),
                 "shadow_model": provider_choice.shadow.as_ref().and_then(|s| s.1.as_ref()),
             });

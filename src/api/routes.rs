@@ -1963,6 +1963,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(provider_handlers::provider_models),
         )
         .route(
+            "/api/chat/send-journal",
+            get(provider_handlers::send_journal),
+        )
+        .route(
             "/api/chat/roles",
             get(provider_handlers::get_roles).put(provider_handlers::put_roles),
         )

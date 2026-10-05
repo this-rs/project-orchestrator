@@ -2079,6 +2079,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_send_journal_is_readable_by_a_person_only_filtered_and_newest_first() {
+        let h = action_harness(None).await;
+        for (ms, project) in [(1_000, "a"), (2_000, "b"), (3_000, "a")] {
+            h.graph
+                .put_llm_setting(
+                    "journal",
+                    &format!("send:{ms}:sess-{ms}"),
+                    &serde_json::json!({"session_id": format!("sess-{ms}"), "project": project, "provider": "local", "origin": "https://x"}).to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        let (status, body) = call(&h.app, auth_get("/api/chat/send-journal")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<_> = body["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["session_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, ["sess-3000", "sess-2000", "sess-1000"]);
+        let (_, body) = call(
+            &h.app,
+            auth_get("/api/chat/send-journal?project_slug=a&limit=1"),
+        )
+        .await;
+        assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(body["entries"][0]["session_id"], "sess-3000");
+        // An agent token has no business reading it.
+        let token = agent_bearer(Uuid::new_v4());
+        let (status, _) = call(
+            &h.app,
+            agent_req(&token, "GET", "/api/chat/send-journal", ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_saved_instances_status_is_its_real_health_not_unknown() {
+        let app = test_app().await;
+        let mut body = deepseek("http://127.0.0.1:9/v1");
+        body["credential_ref"] = serde_json::json!("none");
+        let (status, _) = call_json(&app, auth_json("POST", "/api/chat/providers", body)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, health) =
+            call_json(&app, auth_get("/api/chat/providers/deepseek/status")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(health["state"], "ok", "{health}");
+        assert_ne!(
+            health["state"], "unknown",
+            "a closed port is measured: {health}"
+        );
+    }
+
+    #[tokio::test]
     async fn an_env_credential_is_refused_unless_the_variable_is_declared() {
         let app = test_app().await;
         let mut body = deepseek("https://8.8.8.8/v1");

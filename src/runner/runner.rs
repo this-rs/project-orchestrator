@@ -3190,6 +3190,7 @@ impl PlanRunner {
                 .unwrap_or_else(|| crate::neo4j::agent_execution::DEFAULT_ROUTED_BY.to_string()),
             model_alias: task_alias,
             route_rule: note_str("route_rule"),
+            fallback_reason: note_str("fallback_reason"),
             shadow_provider: note_str("shadow_provider"),
             shadow_model: note_str("shadow_model"),
             model_requested,
