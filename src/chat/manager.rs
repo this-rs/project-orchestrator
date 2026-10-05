@@ -463,6 +463,19 @@ pub struct ChatManager {
     pub(crate) agent_runtime: Arc<super::agent_runtime::AgentRuntime>,
     /// Where the agent path finds a provider instance.
     pub(crate) provider_source: Arc<dyn super::agent_runtime::ProviderSource>,
+    /// Native providers built for stored instances, by instance id; an entry is
+    /// reused while the stored record is unchanged.
+    pub(crate) native_cache: Arc<
+        RwLock<
+            HashMap<
+                String,
+                (
+                    super::provider::settings::InstanceRecord,
+                    Arc<dyn nexus_claude::agent::AgentProvider>,
+                ),
+            >,
+        >,
+    >,
     /// Nexus memory injector for conversation persistence
     pub(crate) context_injector: Option<Arc<ContextInjector>>,
     /// Memory config (for creating ConversationMemoryManagers)
@@ -960,6 +973,7 @@ impl ChatManager {
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             agent_runtime,
             provider_source,
+            native_cache: Arc::new(RwLock::new(HashMap::new())),
             context_injector: None,
             memory_config: None,
             event_emitter: None,
@@ -1022,6 +1036,7 @@ impl ChatManager {
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             agent_runtime,
             provider_source,
+            native_cache: Arc::new(RwLock::new(HashMap::new())),
             context_injector,
             memory_config: Some(memory_config),
             event_emitter: None,
@@ -2528,6 +2543,7 @@ impl ChatManager {
         permission_mode_override: Option<&str>,
         user_claims: Option<&crate::auth::jwt::Claims>,
         session_id: Option<&str>,
+        tool_profile: Option<&str>,
     ) -> HashMap<String, String> {
         let mut env = HashMap::new();
 
@@ -2552,7 +2568,7 @@ impl ChatManager {
             let binding = session_id.map(|sid| crate::auth::jwt::AgentSessionBinding {
                 session_id: sid.to_string(),
                 ceiling: Some(ceiling),
-                tool_profile: None,
+                tool_profile: tool_profile.map(str::to_string),
             });
             match crate::auth::jwt::generate_session_token(
                 claims,
@@ -2645,7 +2661,7 @@ impl ChatManager {
         // credentials used to be copied here "just in case"; they were then
         // readable by the agent (decision A33).
         let env = self
-            .po_mcp_env(permission_mode_override, user_claims, session_id)
+            .po_mcp_env(permission_mode_override, user_claims, session_id, None)
             .await;
 
         let vault_token = env.get("PO_VAULT_TOKEN").cloned();
@@ -3028,19 +3044,7 @@ impl ChatManager {
             }
         }
 
-        // Which provider serves this session (A16). Until the instance registry
-        // is wired in only the built-in `claude-code` exists; naming another one
-        // is a typed 404 before anything is spawned or persisted.
-        let provider_choice = super::provider::resolver::resolve_for_open(
-            None,
-            false,
-            request.provider.as_deref(),
-            &super::provider::resolver::BuiltinCatalog,
-        )
-        .map_err(anyhow::Error::new)?;
-
         let session_id = Uuid::new_v4();
-        let model = self.resolve_model(request.model.as_deref());
 
         // Resolve scaffolding override: explicit field takes priority,
         // fallback to spawned_by JSON if present (for MCP callers)
@@ -3070,6 +3074,35 @@ impl ChatManager {
                 }
                 inferred
             }
+        };
+
+        // Which provider serves this session (A16), decided from what is stored
+        // (instances, the project's consent, roles, aliases) BEFORE anything is
+        // spawned or persisted: a refusal costs nothing.
+        let provider_choice = self
+            .resolve_provider_choice(request, project_slug.as_deref())
+            .await?;
+        let model = match request.model.as_deref().filter(|m| !m.is_empty()) {
+            Some(explicit) => explicit.to_string(),
+            None => match provider_choice.model.as_deref() {
+                Some(chosen) => chosen.to_string(),
+                None if provider_choice.provider_id == super::provider::resolver::CLAUDE_CODE => {
+                    self.resolve_model(None)
+                }
+                // Another provider never gets Claude's default model: its own
+                // default, or a clear refusal.
+                None => super::provider::store::instance(
+                    self.graph.as_ref(),
+                    &provider_choice.provider_id,
+                )
+                .await?
+                .and_then(|i| i.default_model)
+                .ok_or_else(|| {
+                    anyhow::Error::new(nexus_claude::agent::ProviderError::invalid(
+                        "this provider instance has no default model: name one",
+                    ))
+                })?,
+            },
         };
 
         // Build system prompt — runner-spawned agents get a dedicated autonomous
@@ -3211,6 +3244,7 @@ impl ChatManager {
                     &model,
                     &system_prompt,
                     &resolved_add_dirs,
+                    project_slug.as_deref(),
                 )
                 .await;
         }
@@ -6334,7 +6368,9 @@ impl ChatManager {
             &super::provider::resolver::BuiltinCatalog,
         )
         .map_err(anyhow::Error::new)?;
-        if frozen.provider_id != super::provider::resolver::CLAUDE_CODE {
+        if frozen.provider_id != super::provider::resolver::CLAUDE_CODE
+            && session_node.capabilities.is_none()
+        {
             return Err(anyhow::Error::new(
                 super::provider::resolver::ResolveError::Unavailable {
                     provider_id: frozen.provider_id,
@@ -8014,6 +8050,182 @@ impl ChatManager {
         }
     }
 
+    /// Decides which provider instance serves a session being opened (A16).
+    ///
+    /// Reads the stored instances, the consent of the project (tied to the
+    /// instance's current origin), the roles (project before global) and the
+    /// aliases. The legacy engine can only drive Claude Code: a choice of any
+    /// other instance is `provider_unavailable` there.
+    pub(crate) async fn resolve_provider_choice(
+        &self,
+        request: &ChatRequest,
+        project_slug: Option<&str>,
+    ) -> Result<super::provider::resolver::ProviderChoice> {
+        use super::provider::{catalog, resolver, settings, store};
+        let instances = store::instances(self.graph.as_ref()).await?;
+        let consents = match project_slug {
+            Some(slug) => store::consents(self.graph.as_ref(), slug).await?,
+            None => Vec::new(),
+        };
+        let global = store::roles(self.graph.as_ref(), settings::GLOBAL).await?;
+        let project = match project_slug {
+            Some(slug) => store::roles(self.graph.as_ref(), &settings::project_scope(slug)).await?,
+            None => Default::default(),
+        };
+        let aliases = store::aliases(self.graph.as_ref()).await?;
+        let role = if request.spawned_by.is_some() || request.runner_context.is_some() {
+            resolver::Role::Executor
+        } else {
+            resolver::Role::Pilot
+        };
+        let store_catalog =
+            catalog::StoreCatalog::new(instances, &consents, project_slug.is_some());
+        let input = catalog::resolve_input(
+            role,
+            request.provider.as_deref(),
+            &global,
+            &project,
+            &aliases,
+        );
+        let choice = resolver::resolve(&input, &store_catalog).map_err(anyhow::Error::new)?;
+        if self.config.provider_path != super::config::ProviderPath::Agent
+            && choice.provider_id != resolver::CLAUDE_CODE
+        {
+            return Err(anyhow::Error::new(resolver::ResolveError::Unavailable {
+                provider_id: choice.provider_id,
+                role,
+            }));
+        }
+        Ok(choice)
+    }
+
+    /// The provider instance, built-in or stored. A stored instance becomes a
+    /// native harness over its OpenAI-compatible endpoint; the result is kept
+    /// until the stored record changes.
+    pub(crate) async fn provider_for(
+        &self,
+        provider_id: &str,
+    ) -> Result<Arc<dyn nexus_claude::agent::AgentProvider>> {
+        use super::provider::{native_factory, resolver, store};
+        if let Some(provider) = self.provider_source.get(provider_id) {
+            return Ok(provider);
+        }
+        let record = store::instance(self.graph.as_ref(), provider_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::Error::new(resolver::ResolveError::UnknownProvider(
+                    provider_id.to_string(),
+                ))
+            })?;
+        {
+            let cache = self.native_cache.read().await;
+            if let Some((cached, provider)) = cache.get(provider_id) {
+                if *cached == record {
+                    return Ok(Arc::clone(provider));
+                }
+            }
+        }
+        let provider = native_factory::build_native_provider(&record, self.vault.clone())
+            .map_err(anyhow::Error::new)?;
+        self.native_cache
+            .write()
+            .await
+            .insert(provider_id.to_string(), (record, Arc::clone(&provider)));
+        Ok(provider)
+    }
+
+    /// Everything that must hold before a session's content is sent to a
+    /// provider other than Claude Code. Claude Code (the historical path) is
+    /// not subject to it.
+    ///
+    /// 1. the security gate: bound session tokens need a signing key (A32);
+    /// 2. the project's consent, tied to the instance's CURRENT origin (A28);
+    /// 3. the endpoint guard (A36), before any connection;
+    /// 4. `Trust` is refused when the provider declares no sandbox (A35);
+    /// 5. the sending is journaled; a failed write refuses the opening (A37).
+    pub(crate) async fn authorize_provider_use(
+        &self,
+        provider_id: &str,
+        provider: &Arc<dyn nexus_claude::agent::AgentProvider>,
+        model: &str,
+        mode: nexus_claude::agent::PolicyMode,
+        project_slug: Option<&str>,
+        claims: Option<&crate::auth::jwt::Claims>,
+        session_id: &str,
+    ) -> Result<()> {
+        use super::provider::{endpoint_guard, resolver, store};
+        use nexus_claude::agent::{PolicyMode, ProviderError, SandboxLevel};
+        if provider_id == resolver::CLAUDE_CODE {
+            return Ok(());
+        }
+        let refuse = |e: resolver::ResolveError| anyhow::Error::new(e);
+        if self.config.jwt_secret.is_none() {
+            return Err(anyhow::Error::new(ProviderError::unsupported(
+                "security_gate",
+            )));
+        }
+        let record = store::instance(self.graph.as_ref(), provider_id)
+            .await?
+            .ok_or_else(|| refuse(resolver::ResolveError::UnknownProvider(provider_id.into())))?;
+        let slug = project_slug
+            .ok_or_else(|| refuse(resolver::ResolveError::NotAllowed(provider_id.into())))?;
+        let consented = store::consents(self.graph.as_ref(), slug)
+            .await?
+            .iter()
+            .any(|c| c.provider_id == provider_id && c.origin == record.origin);
+        if !consented {
+            return Err(refuse(resolver::ResolveError::NotAllowed(
+                provider_id.into(),
+            )));
+        }
+        if let Err(refusal) = endpoint_guard::validate_endpoint(
+            &record.base_url,
+            &endpoint_guard::EndpointPolicy::default(),
+        )
+        .await
+        {
+            warn!(
+                provider = provider_id,
+                code = refusal.code(),
+                "endpoint refused by the guard"
+            );
+            return Err(refuse(resolver::ResolveError::NotAllowed(
+                provider_id.into(),
+            )));
+        }
+        if mode == PolicyMode::Trust
+            && provider.capabilities(Some(model)).sandbox == SandboxLevel::None
+        {
+            return Err(anyhow::Error::new(ProviderError::unsupported("sandbox")));
+        }
+        let entry = serde_json::json!({
+            "session_id": session_id,
+            "project": slug,
+            "provider": provider_id,
+            "origin": record.origin,
+            "model": model,
+            "by": claims.map(|c| c.email.as_str()),
+            "at": chrono::Utc::now().to_rfc3339(),
+        });
+        let key = format!(
+            "send:{}:{}",
+            chrono::Utc::now().timestamp_millis(),
+            session_id
+        );
+        if let Err(e) = self
+            .graph
+            .put_llm_setting("journal", &key, &entry.to_string())
+            .await
+        {
+            error!(error = %e, "send journal write failed: refusing to open");
+            return Err(refuse(resolver::ResolveError::Unavailable {
+                provider_id: provider_id.into(),
+                role: resolver::Role::Pilot,
+            }));
+        }
+        Ok(())
+    }
+
     /// Names of the server variables handed to an agent besides the base
     /// allowlist: the tooling list and the operator's, never a server secret.
     fn child_env_inherit_names() -> Vec<String> {
@@ -8044,6 +8256,7 @@ impl ChatManager {
         add_dirs: &[String],
         user_claims: Option<&crate::auth::jwt::Claims>,
         session_id: &str,
+        third_party: bool,
     ) -> Result<nexus_claude::agent::SessionSpec> {
         use nexus_claude::agent::{
             EnvSpec, McpServerSpec, SessionSpec, SystemPromptMode, SystemPromptSpec,
@@ -8065,7 +8278,15 @@ impl ChatManager {
                 ))
             })?;
         let env = self
-            .po_mcp_env(Some(&mode), user_claims, Some(session_id))
+            .po_mcp_env(
+                Some(&mode),
+                user_claims,
+                Some(session_id),
+                // A provider other than Claude Code sees the restricted
+                // profile: no tool that opens a session or reconfigures the
+                // server (A35). The profile is signed into the token.
+                third_party.then_some(crate::auth::tool_profile::RESTRICTED),
+            )
             .await;
         let mut spec = SessionSpec::new(expand_tilde(cwd));
         spec.model = Some(model.to_string());
@@ -8101,12 +8322,9 @@ impl ChatManager {
         model: &str,
         system_prompt: &str,
         add_dirs: &[String],
+        project_slug: Option<&str>,
     ) -> Result<CreateSessionResponse> {
-        let provider = self.provider_source.get(provider_id).ok_or_else(|| {
-            anyhow::Error::new(super::provider::resolver::ResolveError::UnknownProvider(
-                provider_id.to_string(),
-            ))
-        })?;
+        let provider = self.provider_for(provider_id).await?;
         let sid = session_id.to_string();
         let spec = self
             .build_agent_spec(
@@ -8117,9 +8335,25 @@ impl ChatManager {
                 add_dirs,
                 request.user_claims.as_ref(),
                 &sid,
+                provider_id != super::provider::resolver::CLAUDE_CODE,
             )
             .await?;
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
+        if let Err(e) = self
+            .authorize_provider_use(
+                provider_id,
+                &provider,
+                spec.model.as_deref().unwrap_or(model),
+                spec.policy.mode,
+                project_slug,
+                request.user_claims.as_ref(),
+                &sid,
+            )
+            .await
+        {
+            crate::auth::agent_tokens::revoke_session(&sid);
+            return Err(e);
+        }
         let session = provider.open(spec).await.map_err(|e| {
             // Nothing will ever use this session's token.
             crate::auth::agent_tokens::revoke_session(&sid);
@@ -8189,11 +8423,7 @@ impl ChatManager {
             .provider_id
             .clone()
             .unwrap_or_else(|| super::provider::resolver::CLAUDE_CODE.to_string());
-        let provider = self.provider_source.get(&provider_id).ok_or_else(|| {
-            anyhow::Error::new(super::provider::resolver::ResolveError::UnknownProvider(
-                provider_id.clone(),
-            ))
-        })?;
+        let provider = self.provider_for(&provider_id).await?;
         let sid = node.id.to_string();
         let (system_prompt, _) = self
             .build_system_prompt(
@@ -8213,9 +8443,27 @@ impl ChatManager {
                 node.add_dirs.as_deref().unwrap_or(&[]),
                 user_claims,
                 &sid,
+                provider_id != super::provider::resolver::CLAUDE_CODE,
             )
             .await?;
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
+        // A resume is a new sending of the project's content: consent, guard
+        // and journal apply again (a consent may have been revoked meanwhile).
+        if let Err(e) = self
+            .authorize_provider_use(
+                &provider_id,
+                &provider,
+                &node.model,
+                spec.policy.mode,
+                node.project_slug.as_deref(),
+                user_claims,
+                &sid,
+            )
+            .await
+        {
+            crate::auth::agent_tokens::revoke_session(&sid);
+            return Err(e);
+        }
         let token = node
             .resume_token
             .as_deref()

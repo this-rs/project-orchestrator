@@ -14,6 +14,8 @@ pub mod continuity;
 pub mod control_pump;
 pub(crate) mod drain;
 
+#[cfg(test)]
+mod agent_e2e_tests;
 pub mod agent_runtime;
 pub mod enrichment;
 pub mod entity_extractor;
