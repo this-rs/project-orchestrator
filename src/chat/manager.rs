@@ -453,6 +453,49 @@ pub(crate) struct RuntimeEnvConfig {
 }
 
 /// Manages chat sessions and their lifecycle
+/// A built provider and the stored record it was built from.
+pub(crate) type NativeCacheEntry = (
+    super::provider::settings::InstanceRecord,
+    Arc<dyn nexus_claude::agent::AgentProvider>,
+);
+
+/// What `build_agent_spec` needs to know about a session being opened or resumed.
+pub(crate) struct AgentSpecInput<'a> {
+    pub cwd: &'a str,
+    pub model: &'a str,
+    pub system_prompt: &'a str,
+    pub permission_mode: Option<&'a str>,
+    pub add_dirs: &'a [String],
+    pub user_claims: Option<&'a crate::auth::jwt::Claims>,
+    pub session_id: &'a str,
+    /// A provider other than Claude Code: restricted tool profile in the token.
+    pub third_party: bool,
+    pub max_tokens: Option<u64>,
+    pub kind: nexus_claude::agent::ProviderKind,
+}
+
+/// What `authorize_provider_use` checks before a session's content is sent.
+pub(crate) struct ProviderUse<'a> {
+    pub provider_id: &'a str,
+    pub provider: &'a Arc<dyn nexus_claude::agent::AgentProvider>,
+    pub model: &'a str,
+    pub mode: nexus_claude::agent::PolicyMode,
+    pub project_slug: Option<&'a str>,
+    pub claims: Option<&'a crate::auth::jwt::Claims>,
+    pub session_id: &'a str,
+}
+
+/// What `open_agent_session` opens.
+struct AgentOpen<'a> {
+    request: &'a ChatRequest,
+    session_id: Uuid,
+    provider_id: &'a str,
+    model: &'a str,
+    system_prompt: &'a str,
+    add_dirs: &'a [String],
+    project_slug: Option<&'a str>,
+}
+
 pub struct ChatManager {
     pub(crate) graph: Arc<dyn GraphStore>,
     #[allow(dead_code)]
@@ -465,17 +508,7 @@ pub struct ChatManager {
     pub(crate) provider_source: Arc<dyn super::agent_runtime::ProviderSource>,
     /// Native providers built for stored instances, by instance id; an entry is
     /// reused while the stored record is unchanged.
-    pub(crate) native_cache: Arc<
-        RwLock<
-            HashMap<
-                String,
-                (
-                    super::provider::settings::InstanceRecord,
-                    Arc<dyn nexus_claude::agent::AgentProvider>,
-                ),
-            >,
-        >,
-    >,
+    pub(crate) native_cache: Arc<RwLock<HashMap<String, NativeCacheEntry>>>,
     /// Nexus memory injector for conversation persistence
     pub(crate) context_injector: Option<Arc<ContextInjector>>,
     /// Memory config (for creating ConversationMemoryManagers)
@@ -3292,15 +3325,15 @@ impl ChatManager {
         // onto the agent engine; every other provider is served by the agent engine.
         if self.engine_is_agent(&provider_choice.provider_id) {
             return self
-                .open_agent_session(
+                .open_agent_session(AgentOpen {
                     request,
                     session_id,
-                    &provider_choice.provider_id,
-                    &model,
-                    &system_prompt,
-                    &resolved_add_dirs,
-                    project_slug.as_deref(),
-                )
+                    provider_id: &provider_choice.provider_id,
+                    model: &model,
+                    system_prompt: &system_prompt,
+                    add_dirs: &resolved_add_dirs,
+                    project_slug: project_slug.as_deref(),
+                })
                 .await;
         }
 
@@ -8236,16 +8269,16 @@ impl ChatManager {
     /// 3. the endpoint guard (A36), before any connection;
     /// 4. `Trust` is refused when the provider declares no sandbox (A35);
     /// 5. the sending is journaled; a failed write refuses the opening (A37).
-    pub(crate) async fn authorize_provider_use(
-        &self,
-        provider_id: &str,
-        provider: &Arc<dyn nexus_claude::agent::AgentProvider>,
-        model: &str,
-        mode: nexus_claude::agent::PolicyMode,
-        project_slug: Option<&str>,
-        claims: Option<&crate::auth::jwt::Claims>,
-        session_id: &str,
-    ) -> Result<()> {
+    pub(crate) async fn authorize_provider_use(&self, u: ProviderUse<'_>) -> Result<()> {
+        let ProviderUse {
+            provider_id,
+            provider,
+            model,
+            mode,
+            project_slug,
+            claims,
+            session_id,
+        } = u;
         use super::provider::{endpoint_guard, resolver, store};
         use nexus_claude::agent::{PolicyMode, ProviderError, SandboxLevel};
         if provider_id == resolver::CLAUDE_CODE {
@@ -8348,17 +8381,20 @@ impl ChatManager {
     /// path, session-bound token included) and the clean child environment.
     pub(crate) async fn build_agent_spec(
         &self,
-        cwd: &str,
-        model: &str,
-        system_prompt: &str,
-        permission_mode: Option<&str>,
-        add_dirs: &[String],
-        user_claims: Option<&crate::auth::jwt::Claims>,
-        session_id: &str,
-        third_party: bool,
-        max_tokens: Option<u64>,
-        kind: nexus_claude::agent::ProviderKind,
+        i: AgentSpecInput<'_>,
     ) -> Result<nexus_claude::agent::SessionSpec> {
+        let AgentSpecInput {
+            cwd,
+            model,
+            system_prompt,
+            permission_mode,
+            add_dirs,
+            user_claims,
+            session_id,
+            third_party,
+            max_tokens,
+            kind,
+        } = i;
         use nexus_claude::agent::{
             EnvSpec, McpServerSpec, SessionSpec, SystemPromptMode, SystemPromptSpec,
         };
@@ -8431,16 +8467,16 @@ impl ChatManager {
 
     /// Opens a session on the provider-neutral engine and sends the first
     /// message. The `ChatSession` node is already persisted by `create_session`.
-    async fn open_agent_session(
-        &self,
-        request: &ChatRequest,
-        session_id: Uuid,
-        provider_id: &str,
-        model: &str,
-        system_prompt: &str,
-        add_dirs: &[String],
-        project_slug: Option<&str>,
-    ) -> Result<CreateSessionResponse> {
+    async fn open_agent_session(&self, o: AgentOpen<'_>) -> Result<CreateSessionResponse> {
+        let AgentOpen {
+            request,
+            session_id,
+            provider_id,
+            model,
+            system_prompt,
+            add_dirs,
+            project_slug,
+        } = o;
         let provider = self.provider_for(provider_id).await?;
         let sid = session_id.to_string();
         // A run (an executor) on a third-party provider never gets `Trust`: it
@@ -8458,30 +8494,30 @@ impl ChatManager {
             other => other,
         };
         let spec = self
-            .build_agent_spec(
-                &request.cwd,
+            .build_agent_spec(AgentSpecInput {
+                cwd: &request.cwd,
                 model,
                 system_prompt,
                 permission_mode,
                 add_dirs,
-                request.user_claims.as_ref(),
-                &sid,
-                provider_id != super::provider::resolver::CLAUDE_CODE,
-                request.max_tokens,
-                provider.kind(),
-            )
+                user_claims: request.user_claims.as_ref(),
+                session_id: &sid,
+                third_party: provider_id != super::provider::resolver::CLAUDE_CODE,
+                max_tokens: request.max_tokens,
+                kind: provider.kind(),
+            })
             .await?;
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
         if let Err(e) = self
-            .authorize_provider_use(
+            .authorize_provider_use(ProviderUse {
                 provider_id,
-                &provider,
-                spec.model.as_deref().unwrap_or(model),
-                spec.policy.mode,
+                provider: &provider,
+                model: spec.model.as_deref().unwrap_or(model),
+                mode: spec.policy.mode,
                 project_slug,
-                request.user_claims.as_ref(),
-                &sid,
-            )
+                claims: request.user_claims.as_ref(),
+                session_id: &sid,
+            })
             .await
         {
             crate::auth::agent_tokens::revoke_session(&sid);
@@ -8591,32 +8627,32 @@ impl ChatManager {
             )
             .await;
         let spec = self
-            .build_agent_spec(
-                &node.cwd,
-                &node.model,
-                &system_prompt,
-                node.permission_mode.as_deref(),
-                node.add_dirs.as_deref().unwrap_or(&[]),
+            .build_agent_spec(AgentSpecInput {
+                cwd: &node.cwd,
+                model: &node.model,
+                system_prompt: &system_prompt,
+                permission_mode: node.permission_mode.as_deref(),
+                add_dirs: node.add_dirs.as_deref().unwrap_or(&[]),
                 user_claims,
-                &sid,
-                provider_id != super::provider::resolver::CLAUDE_CODE,
-                None,
-                provider.kind(),
-            )
+                session_id: &sid,
+                third_party: provider_id != super::provider::resolver::CLAUDE_CODE,
+                max_tokens: None,
+                kind: provider.kind(),
+            })
             .await?;
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
         // A resume is a new sending of the project's content: consent, guard
         // and journal apply again (a consent may have been revoked meanwhile).
         if let Err(e) = self
-            .authorize_provider_use(
-                &provider_id,
-                &provider,
-                &node.model,
-                spec.policy.mode,
-                node.project_slug.as_deref(),
-                user_claims,
-                &sid,
-            )
+            .authorize_provider_use(ProviderUse {
+                provider_id: &provider_id,
+                provider: &provider,
+                model: &node.model,
+                mode: spec.policy.mode,
+                project_slug: node.project_slug.as_deref(),
+                claims: user_claims,
+                session_id: &sid,
+            })
             .await
         {
             crate::auth::agent_tokens::revoke_session(&sid);

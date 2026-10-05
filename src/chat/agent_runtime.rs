@@ -404,6 +404,11 @@ impl AgentRuntime {
         self.sessions.read().await.len()
     }
 
+    /// Whether no session is live.
+    pub async fn is_empty(&self) -> bool {
+        self.sessions.read().await.is_empty()
+    }
+
     /// Registers a session just opened by a provider and starts its
     /// out-of-turn pump. `first_seq` is the next event number to persist.
     pub async fn adopt(

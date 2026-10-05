@@ -281,9 +281,7 @@ fn authority_is_empty(raw: &str) -> bool {
         return false;
     };
     let rest = &raw[idx + 3..];
-    let end = rest
-        .find(|c: char| matches!(c, '/' | '?' | '#'))
-        .unwrap_or(rest.len());
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..end];
     let host_port = authority
         .rsplit_once('@')

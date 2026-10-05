@@ -5518,9 +5518,9 @@ pub async fn run_plan(
         caller_claims,
         req.cwd,
         req.project_slug,
-        req.max_cost_usd,
         trigger_source,
         RunRouting {
+            max_cost_usd: req.max_cost_usd,
             provider: req.provider,
             model: req.model,
             max_tokens: req.max_tokens,
@@ -5533,6 +5533,8 @@ pub async fn run_plan(
 /// Provider, model and token budget named by a run request.
 #[derive(Default)]
 pub(crate) struct RunRouting {
+    /// Budget in USD of the run; absent: the runner's default.
+    pub max_cost_usd: Option<f64>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub max_tokens: Option<u64>,
@@ -5547,10 +5549,10 @@ async fn start_plan_run(
     caller_claims: crate::auth::jwt::Claims,
     cwd: String,
     project_slug: Option<String>,
-    max_cost_usd: Option<f64>,
     trigger_source: crate::runner::TriggerSource,
     routing: RunRouting,
 ) -> Result<RunPlanResponse, AppError> {
+    let max_cost_usd = routing.max_cost_usd;
     // A run naming an instance that does not exist is refused before it starts
     // (consent and the rest are checked per session, at opening).
     if let Some(provider) = routing.provider.as_deref().filter(|p| !p.is_empty()) {
@@ -5692,7 +5694,6 @@ pub async fn retry_plan_task(
         plan_id,
         caller_claims,
         ".".to_string(),
-        None,
         None,
         crate::runner::TriggerSource::Manual,
         RunRouting::default(),

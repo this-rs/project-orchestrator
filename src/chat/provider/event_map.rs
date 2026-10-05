@@ -299,7 +299,7 @@ fn usage_value(usage: &Usage) -> Option<Value> {
         .filter(|(_, v)| !v.is_null())
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    (!map.is_empty()).then(|| Value::Object(map))
+    (!map.is_empty()).then_some(Value::Object(map))
 }
 
 /// `subtype` of a `result` when the provider gave none.
@@ -391,6 +391,9 @@ fn result_line(output: Option<&ToolOutput>) -> String {
     }
 }
 
+/// One text-like out-of-turn event: (seq, parent, line, is_user, is_result).
+type TextLine = (Option<u64>, Option<String>, String, bool, bool);
+
 /// Maps the events received out of turn. Text-like events are regrouped by
 /// provider message number into one `background_output` per message; a
 /// `provider_notice` becomes `background_output { source: "system:<kind>" }`;
@@ -405,7 +408,7 @@ pub fn out_of_band_to_chat_events(
 
     for event in events {
         // (seq, parent, line, is_user, is_result) of a text-like event.
-        let line: Option<(Option<u64>, Option<String>, String, bool, bool)> = match event {
+        let line: Option<TextLine> = match event {
             AgentEvent::Text {
                 text, seq, parent, ..
             } => Some((*seq, parent.clone(), text.clone(), false, false)),

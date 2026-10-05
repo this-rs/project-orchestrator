@@ -36,7 +36,7 @@ impl VaultCredentialResolver {
         Self { vault }
     }
 
-    fn from_vault(&self, instance: &str, name: &str) -> Result<Option<Secret>, ProviderError> {
+    fn read_vault(&self, instance: &str, name: &str) -> Result<Option<Secret>, ProviderError> {
         match self
             .vault
             .read_for_provider(name, instance, chrono::Utc::now())
@@ -59,7 +59,7 @@ impl VaultCredentialResolver {
         }
     }
 
-    fn from_env(&self, var: &str) -> Result<Option<Secret>, ProviderError> {
+    fn read_env(&self, var: &str) -> Result<Option<Secret>, ProviderError> {
         // An instance config pointing at the server's own secrets would send
         // the signing key or a database password to an endpoint.
         if crate::chat::manager::SERVER_ONLY_SECRETS.contains(&var) {
@@ -89,8 +89,8 @@ impl CredentialResolver for VaultCredentialResolver {
     ) -> Result<Option<Secret>, ProviderError> {
         match reference {
             CredentialRef::None => Ok(None),
-            CredentialRef::Vault(name) => self.from_vault(instance, name),
-            CredentialRef::Env(var) => self.from_env(var),
+            CredentialRef::Vault(name) => self.read_vault(instance, name),
+            CredentialRef::Env(var) => self.read_env(var),
             // A reference kind this backend does not know: refuse, never "no credential".
             _ => Err(ProviderError::InvalidRequest {
                 detail: "unsupported credential reference kind".to_string(),
