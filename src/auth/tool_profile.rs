@@ -139,6 +139,9 @@ const CLOSED_ROUTE_PREFIXES: &[&str] = &[
     "/api/sync",
     "/api/watch",
     "/api/meilisearch",
+    // self-update: install and restart replace and relaunch the server binary,
+    // and even `check` talks to the release server on the caller's behalf
+    "/api/update",
     // sharing sends project data out; deployments hang under projects
     "/api/projects/*/sharing",
     "/api/projects/*/environments",
@@ -579,6 +582,24 @@ mod tests {
         paths.sort();
         paths.dedup();
         paths
+    }
+
+    #[test]
+    fn the_self_update_routes_are_closed_to_a_restricted_token_reads_included() {
+        let restricted = ToolProfile::Restricted;
+        for path in [
+            "/api/update/check",
+            "/api/update/install",
+            "/api/update/restart",
+        ] {
+            for method in [Method::GET, Method::POST, Method::PUT, Method::DELETE] {
+                assert!(
+                    restricted.route_forbidden(&method, path),
+                    "{method} {path} must be closed to a restricted token"
+                );
+            }
+            assert!(!ToolProfile::Full.route_forbidden(&Method::POST, path));
+        }
     }
 
     #[test]
