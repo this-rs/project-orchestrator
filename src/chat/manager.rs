@@ -2336,6 +2336,21 @@ impl ChatManager {
         self.active_sessions.read().await.contains_key(session_id)
     }
 
+    /// The live permission mode of an active session (`None` when the session
+    /// is not active or runs on the global default).
+    pub async fn live_session_permission_mode(&self, session_id: &str) -> Option<String> {
+        self.active_sessions
+            .read()
+            .await
+            .get(session_id)
+            .and_then(|s| s.permission_mode.clone())
+    }
+
+    /// The permission mode a session gets when its request names none.
+    pub async fn default_permission_mode(&self) -> String {
+        self.permission_config.read().await.mode.clone()
+    }
+
     // ========================================================================
     // ClaudeCodeOptions builder
     // ========================================================================
@@ -2447,17 +2462,33 @@ impl ChatManager {
         // Inject session token only when auth is enabled (jwt_secret present)
         // AND user claims are available.
         if let (Some(ref secret), Some(claims)) = (&self.config.jwt_secret, user_claims) {
+            // The token is BOUND to the session (id + policy ceiling signed in)
+            // and registered as live; `close_session` revokes it. The ceiling is
+            // the session's effective permission mode at spawn: anything this
+            // session spawns can only be as permissive or less.
+            let ceiling = match permission_mode_override {
+                Some(mode) => mode.to_string(),
+                None => self.permission_config.read().await.mode.clone(),
+            };
+            let binding = session_id.map(|sid| crate::auth::jwt::AgentSessionBinding {
+                session_id: sid.to_string(),
+                ceiling: Some(ceiling),
+                tool_profile: None,
+            });
             match crate::auth::jwt::generate_session_token(
                 claims,
+                binding.as_ref(),
                 secret,
                 self.config.session_token_expiry_secs,
             ) {
-                Ok(token) => {
+                Ok((token, jti)) => {
+                    crate::auth::agent_tokens::register(&jti, session_id);
                     env.insert("PO_AUTH_TOKEN".into(), token);
                     tracing::debug!(
                         user = %claims.email,
                         expiry_secs = self.config.session_token_expiry_secs,
                         server_port = self.config.server_port,
+                        bound_session = ?session_id,
                         "Injected PO_AUTH_TOKEN into MCP env"
                     );
                 }
@@ -7676,6 +7707,10 @@ impl ChatManager {
     /// disconnect with a 5s timeout — if the CLI hangs, drop the client to
     /// trigger SIGKILL via the Drop impl.
     pub async fn close_session(&self, session_id: &str) -> Result<()> {
+        // 0. The session's MCP token dies with it — before anything that can
+        //    fail, so a half-closed session never leaves a usable token behind.
+        crate::auth::agent_tokens::revoke_session(session_id);
+
         // 1. Interrupt first (session still in map so interrupt() can find it)
         self.interrupt(session_id).await.ok();
 

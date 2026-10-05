@@ -15,6 +15,7 @@ pub mod control_pump;
 pub(crate) mod drain;
 
 pub mod enrichment;
+pub mod envelope;
 pub mod entity_extractor;
 pub mod feedback;
 pub(crate) mod hook_ledger;

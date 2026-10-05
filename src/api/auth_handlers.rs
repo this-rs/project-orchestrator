@@ -879,7 +879,7 @@ pub async fn ws_ticket(
             &state,
             auth_config,
             &claims,
-            "/auth/ws-ticket",
+            crate::auth::middleware::WS_TICKET_PATH,
         )
         .await?;
         tracing::info!(email = %claims.email, "WS ticket issued via Bearer token");
@@ -2344,9 +2344,10 @@ mod tests {
     async fn test_create_mcp_token_refuses_agent_session_token() {
         let cfg = test_auth_config();
         let state = make_server_state(Some(cfg.clone())).await;
-        let token =
-            crate::auth::jwt::generate_session_token(&sample_claims(), &cfg.jwt_secret, 600)
+        let (token, jti) =
+            crate::auth::jwt::generate_session_token(&sample_claims(), None, &cfg.jwt_secret, 600)
                 .unwrap();
+        crate::auth::agent_tokens::register(&jti, None);
         let status = post_status(
             router_with(state),
             "/auth/mcp-tokens",

@@ -1106,7 +1106,7 @@ When an active plan has **actionable tasks** (pending with all dependencies sati
 **How to delegate:**
 1. Use `task(action: "get_next", plan_id)` to find the next actionable task
 2. Use `plan(action: "delegate_task", plan_id, task_id)` to spawn a sub-agent
-3. The sub-agent inherits the project context, persona, and routing from the parent session
+3. The sub-agent works inside this session's envelope: same project, a directory this session can see, a permission mode no wider than this session's. A sub-agent cannot delegate further, and at most 4 run at once
 4. Monitor progress via `plan(action: "run_status", plan_id)` or task status updates
 
 **Delegation hints:**

@@ -33,8 +33,19 @@ use uuid::Uuid;
 pub async fn create_session(
     State(state): State<OrchestratorState>,
     claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    headers: axum::http::HeaderMap,
     Json(mut request): Json<ChatRequest>,
 ) -> Result<Json<CreateSessionResponse>, AppError> {
+    use crate::chat::envelope;
+
+    // Who is asking? A chat session calling through its MCP server is held to
+    // its spawn envelope (decision A17); a person is not.
+    let caller = envelope::identify_caller(
+        claims.as_ref().map(|c| &c.0),
+        envelope::session_header(&headers),
+        state.auth_config.is_some(),
+    )?;
+
     // Inject authenticated user claims into the request so ChatManager
     // can generate a session token for the MCP subprocess.
     if let Some(axum::Extension(c)) = claims {
@@ -45,6 +56,25 @@ pub async fn create_session(
         .chat_manager
         .as_ref()
         .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
+
+    if let envelope::SpawnCaller::Agent { session_id, .. } = &caller {
+        let graph = state.orchestrator.neo4j_arc();
+        match request.session_id.as_deref() {
+            // Sending to an existing session: only one this session spawned.
+            Some(target) => envelope::ensure_child_of(graph.as_ref(), session_id, target).await?,
+            // Opening a session: inside the caller's envelope, parent recorded
+            // from the token.
+            None => {
+                let env =
+                    envelope::envelope_for_caller(graph.as_ref(), chat_manager.as_ref(), &caller)
+                        .await?
+                        .expect("an agent caller always has an envelope");
+                let default_mode = chat_manager.default_permission_mode().await;
+                env.apply(&mut request, &default_mode)?;
+                request.spawned_by = Some(envelope::conversation_spawned_by(env.parent_session_id));
+            }
+        }
+    }
 
     // Fold attached documents into the message once, before either path: both
     // persist and broadcast `request.message`, so the chips survive replay.

@@ -53,6 +53,17 @@ pub enum SpawnedBy {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_use_id: Option<String>,
     },
+    /// A task delegated by a session (`plan(delegate_task)`) or by a person.
+    /// `parent_session_id` is the calling session as read from its signed
+    /// token — never a value taken from the request body of an agent.
+    Delegation {
+        plan_id: Uuid,
+        task_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_session_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scaffolding_level: Option<u8>,
+    },
 }
 
 impl SpawnedBy {
@@ -85,6 +96,9 @@ impl SpawnedBy {
             Self::Conversation {
                 parent_session_id, ..
             } => Some(*parent_session_id),
+            Self::Delegation {
+                parent_session_id, ..
+            } => *parent_session_id,
         }
     }
 
@@ -96,6 +110,7 @@ impl SpawnedBy {
             Self::Gate { .. } => "gate",
             Self::Trigger { .. } => "trigger",
             Self::Conversation { .. } => "conversation",
+            Self::Delegation { .. } => "delegation",
         }
     }
 
@@ -106,7 +121,7 @@ impl SpawnedBy {
             Self::Pipeline { run_id, .. } => Some(*run_id),
             Self::Gate { run_id, .. } => Some(*run_id),
             Self::Trigger { run_id, .. } => *run_id,
-            Self::Conversation { .. } => None,
+            Self::Conversation { .. } | Self::Delegation { .. } => None,
         }
     }
 
@@ -118,6 +133,7 @@ impl SpawnedBy {
             Self::Gate { task_id, .. } => Some(*task_id),
             Self::Trigger { task_id, .. } => *task_id,
             Self::Conversation { .. } => None,
+            Self::Delegation { task_id, .. } => Some(*task_id),
         }
     }
 }

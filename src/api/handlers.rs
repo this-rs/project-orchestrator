@@ -914,9 +914,13 @@ pub struct DelegateTaskResponse {
 /// Retrieve results from the AgentExecution node after completion.
 pub async fn delegate_task(
     State(state): State<OrchestratorState>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    headers: axum::http::HeaderMap,
     Path((plan_id, task_id)): Path<(Uuid, Uuid)>,
     Json(req): Json<DelegateTaskRequest>,
 ) -> Result<(StatusCode, Json<DelegateTaskResponse>), AppError> {
+    use crate::chat::envelope;
+
     let chat_manager = state
         .chat_manager
         .as_ref()
@@ -935,6 +939,38 @@ pub async fn delegate_task(
         .clone()
         .unwrap_or_else(|| "Untitled task".to_string());
 
+    // Step 0: the spawn envelope (decision A17). When the caller is a chat
+    // session, the parent is read from its signed token and the child stays
+    // inside it: same project, a directory the parent can see, a permission
+    // mode no wider than the parent's, no grandchild, at most 4 live children.
+    // Resolved BEFORE the prompt is built so a refused delegation costs nothing
+    // and the prompt is built for the parent's project.
+    let caller = envelope::identify_caller(
+        claims.as_ref().map(|c| &c.0),
+        envelope::session_header(&headers),
+        state.auth_config.is_some(),
+    )?;
+    let parent_envelope =
+        envelope::envelope_for_caller(graph.as_ref(), chat_manager.as_ref(), &caller).await?;
+    let default_mode = chat_manager.default_permission_mode().await;
+    let mut chat_request = delegation_chat_request(
+        req.cwd,
+        req.project_slug,
+        task_id,
+        &task_title,
+        parent_envelope.as_ref(),
+        &default_mode,
+    )?;
+    // A person may name the parent in the body; an agent's parent is its token's.
+    let parent_session_id = match &parent_envelope {
+        Some(env) => Some(env.parent_session_id),
+        None => req
+            .parent_session_id
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok()),
+    };
+    let project_slug = chat_request.project_slug.clone();
+
     // Step 1: Build enriched prompt via ContextBuilder + EnrichmentPipeline
     let pipeline = chat_manager.enrichment_pipeline.clone();
     let structured = state
@@ -944,7 +980,7 @@ pub async fn delegate_task(
             task_id,
             plan_id,
             Some(&pipeline),
-            req.project_slug.as_deref(),
+            project_slug.as_deref(),
             None, // project_id resolved from slug if needed
             req.custom_sections,
         )
@@ -962,7 +998,7 @@ pub async fn delegate_task(
     };
 
     // Step 2: Resolve scaffolding level from project for inheritance
-    let scaffolding_override = if let Some(ref slug) = req.project_slug {
+    let scaffolding_override = if let Some(ref slug) = project_slug {
         match graph.get_project_by_slug(slug).await {
             Ok(Some(project)) => {
                 match graph
@@ -980,34 +1016,17 @@ pub async fn delegate_task(
     };
 
     // Step 3: Spawn sub-agent via ChatManager
-    let spawned_by_json = serde_json::json!({
-        "type": "delegation",
-        "plan_id": plan_id.to_string(),
-        "task_id": task_id.to_string(),
-        "parent_session_id": req.parent_session_id,
-        "scaffolding_level": scaffolding_override,
-    });
-
-    let chat_request_cwd = req.cwd.clone();
-    let chat_request = crate::chat::types::ChatRequest {
-        attachments: Vec::new(),
-        message: String::new(), // prompt sent via send_message
-        session_id: None,
-        cwd: req.cwd,
-        project_slug: req.project_slug,
-        model: None,
-        permission_mode: Some("bypassPermissions".to_string()),
-        add_dirs: None,
-        workspace_slug: None,
-        user_claims: Some(crate::auth::jwt::Claims::service_account(&format!(
-            "delegate-agent:{}",
-            task_id
-        ))),
-        spawned_by: Some(spawned_by_json.to_string()),
-        task_context: Some(task_title.clone()),
-        scaffolding_override,
-        runner_context: None, // TODO: populate for delegate_task
-    };
+    chat_request.spawned_by = Some(
+        crate::chat::types::SpawnedBy::Delegation {
+            plan_id,
+            task_id,
+            parent_session_id,
+            scaffolding_level: scaffolding_override,
+        }
+        .to_json_string(),
+    );
+    chat_request.scaffolding_override = scaffolding_override;
+    let chat_request_cwd = chat_request.cwd.clone();
 
     let session = chat_manager
         .create_session(&chat_request)
@@ -1098,6 +1117,45 @@ pub async fn delegate_task(
             prompt_preview,
         }),
     ))
+}
+
+/// The session request of a delegated task.
+///
+/// A delegation asks for `bypassPermissions` (nobody watches a sub-agent's
+/// prompts). When a chat session delegates, `envelope` clamps that to the
+/// session's own mode and refuses a directory or project outside it — a
+/// session in Ask mode gets a child in Ask mode, not a full-shell one.
+fn delegation_chat_request(
+    cwd: String,
+    project_slug: Option<String>,
+    task_id: Uuid,
+    task_title: &str,
+    envelope: Option<&crate::chat::envelope::ParentEnvelope>,
+    default_mode: &str,
+) -> Result<crate::chat::types::ChatRequest, crate::chat::envelope::EnvelopeError> {
+    let mut request = crate::chat::types::ChatRequest {
+        attachments: Vec::new(),
+        message: String::new(), // prompt sent via send_message
+        session_id: None,
+        cwd,
+        project_slug,
+        model: None,
+        permission_mode: Some("bypassPermissions".to_string()),
+        add_dirs: None,
+        workspace_slug: None,
+        user_claims: Some(crate::auth::jwt::Claims::service_account(&format!(
+            "delegate-agent:{}",
+            task_id
+        ))),
+        spawned_by: None,
+        task_context: Some(task_title.to_string()),
+        scaffolding_override: None,
+        runner_context: None, // TODO: populate for delegate_task
+    };
+    if let Some(env) = envelope {
+        env.apply(&mut request, default_mode)?;
+    }
+    Ok(request)
 }
 
 /// Listen for a delegated sub-agent's Result event and emit a RunnerEvent-compatible
@@ -6501,6 +6559,88 @@ impl From<anyhow::Error> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── delegate_task: the spawn envelope (decision A17) ───────────────────
+
+    fn parent_envelope(ceiling: &str) -> crate::chat::envelope::ParentEnvelope {
+        crate::chat::envelope::ParentEnvelope {
+            parent_session_id: Uuid::new_v4(),
+            ceiling: ceiling.to_string(),
+            roots: vec!["/work/repo".to_string()],
+            project_slug: Some("demo".to_string()),
+            workspace_slug: None,
+        }
+    }
+
+    #[test]
+    fn a_session_in_ask_mode_cannot_delegate_to_a_bypass_child() {
+        let env = parent_envelope("default");
+        let req = delegation_chat_request(
+            "/work/repo".into(),
+            None,
+            Uuid::new_v4(),
+            "t",
+            Some(&env),
+            "default",
+        )
+        .unwrap();
+        assert_eq!(
+            req.permission_mode.as_deref(),
+            Some("default"),
+            "the child of an Ask-mode session must stay in Ask mode"
+        );
+        assert_eq!(req.project_slug.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn a_bypass_parent_still_delegates_in_bypass() {
+        let env = parent_envelope("bypassPermissions");
+        let req = delegation_chat_request(
+            "/work/repo/sub".into(),
+            Some("demo".into()),
+            Uuid::new_v4(),
+            "t",
+            Some(&env),
+            "default",
+        )
+        .unwrap();
+        assert_eq!(req.permission_mode.as_deref(), Some("bypassPermissions"));
+    }
+
+    #[test]
+    fn a_delegation_outside_the_parents_directory_or_project_is_refused() {
+        let env = parent_envelope("bypassPermissions");
+        let err =
+            delegation_chat_request("/".into(), None, Uuid::new_v4(), "t", Some(&env), "default")
+                .unwrap_err();
+        assert_eq!(err.code(), "envelope_cwd_outside_parent");
+
+        let err = delegation_chat_request(
+            "/work/repo".into(),
+            Some("other".into()),
+            Uuid::new_v4(),
+            "t",
+            Some(&env),
+            "default",
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "envelope_project_mismatch");
+    }
+
+    #[test]
+    fn a_person_delegating_keeps_the_previous_behaviour() {
+        let req = delegation_chat_request(
+            "/anywhere".into(),
+            Some("p".into()),
+            Uuid::new_v4(),
+            "t",
+            None,
+            "default",
+        )
+        .unwrap();
+        assert_eq!(req.permission_mode.as_deref(), Some("bypassPermissions"));
+        assert_eq!(req.project_slug.as_deref(), Some("p"));
+    }
 
     #[tokio::test]
     async fn test_internal_error_does_not_leak_detail() {

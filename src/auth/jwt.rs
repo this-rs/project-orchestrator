@@ -87,6 +87,11 @@ impl Claims {
         self.token_type.as_deref() == Some(TOKEN_TYPE_MCP)
     }
 
+    /// True for the token a chat session's MCP subprocess presents.
+    pub fn is_agent_session(&self) -> bool {
+        self.token_type.as_deref() == Some(TOKEN_TYPE_AGENT_SESSION)
+    }
+
     /// Whether a person is behind this token — as opposed to an agent: a chat
     /// session's MCP (`agent_session`), a vault token, an MCP access token, or
     /// the standalone MCP server (which signs as the nil system user).
@@ -128,16 +133,53 @@ pub fn encode_jwt(
     .context("Failed to encode JWT")
 }
 
-/// Generate a session token for MCP subprocess authentication.
+/// What an `agent_session` token is bound to. Everything here is covered by
+/// the signature: an agent can read its own token but cannot edit it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSessionBinding {
+    /// The chat session the token was minted for.
+    pub session_id: String,
+    /// Permission mode of that session when the token was minted — the policy
+    /// ceiling of anything the session spawns.
+    pub ceiling: Option<String>,
+    /// MCP tool profile of the session (`None` = the default, full profile).
+    pub tool_profile: Option<String>,
+}
+
+const AGENT_SCOPE_SESSION: &str = "session:";
+const AGENT_SCOPE_CEILING: &str = "ceiling:";
+const AGENT_SCOPE_TOOLS: &str = "tools:";
+
+/// Generate the session token handed to a chat session's MCP subprocess
+/// (`PO_AUTH_TOKEN`).
 ///
-/// Creates a JWT with the user's identity (sub, email, name) and a custom
-/// expiration duration. Used by ChatManager to inject `PO_AUTH_TOKEN` into
-/// the MCP server's env vars.
+/// The token carries the user's identity and is BOUND to the session: the
+/// session id, its policy ceiling and its tool profile are signed into `scope`
+/// (`session:<id> ceiling:<mode> tools:<profile>`), and it carries a `jti` that
+/// [`crate::auth::agent_tokens`] must still know — closing the session revokes
+/// it. Returns `(token, jti)`; the caller registers the `jti`.
 ///
-/// The token is validated by the same `require_auth` middleware — no new
-/// auth mechanism needed.
-pub fn generate_session_token(claims: &Claims, secret: &str, expiry_secs: u64) -> Result<String> {
+/// `binding` is `None` only for callers that have no session (tests, one-shot
+/// tools): such a token authenticates but can neither be traced to a session
+/// nor spawn one.
+pub fn generate_session_token(
+    claims: &Claims,
+    binding: Option<&AgentSessionBinding>,
+    secret: &str,
+    expiry_secs: u64,
+) -> Result<(String, String)> {
     let now = chrono::Utc::now().timestamp();
+    let jti = Uuid::new_v4().to_string();
+    let scope = binding.map(|b| {
+        let mut parts = vec![format!("{AGENT_SCOPE_SESSION}{}", b.session_id)];
+        if let Some(c) = b.ceiling.as_deref().filter(|c| !c.is_empty()) {
+            parts.push(format!("{AGENT_SCOPE_CEILING}{c}"));
+        }
+        if let Some(t) = b.tool_profile.as_deref().filter(|t| !t.is_empty()) {
+            parts.push(format!("{AGENT_SCOPE_TOOLS}{t}"));
+        }
+        parts.join(" ")
+    });
     let session_claims = Claims {
         sub: claims.sub.clone(),
         email: claims.email.clone(),
@@ -145,16 +187,43 @@ pub fn generate_session_token(claims: &Claims, secret: &str, expiry_secs: u64) -
         iat: now,
         exp: now + expiry_secs as i64,
         token_type: Some(TOKEN_TYPE_AGENT_SESSION.to_string()),
-        scope: None,
-        jti: None,
+        scope,
+        jti: Some(jti.clone()),
     };
 
-    encode(
+    let token = encode(
         &Header::default(),
         &session_claims,
         &EncodingKey::from_secret(secret.as_bytes()),
     )
-    .context("Failed to encode session token")
+    .context("Failed to encode session token")?;
+    Ok((token, jti))
+}
+
+/// The session an `agent_session` token is bound to — `None` for any other
+/// token type, and for an agent token minted without a session.
+pub fn agent_session_binding(claims: &Claims) -> Option<AgentSessionBinding> {
+    if !claims.is_agent_session() {
+        return None;
+    }
+    let scope = claims.scope.as_deref()?;
+    let mut session_id = None;
+    let mut ceiling = None;
+    let mut tool_profile = None;
+    for part in scope.split_whitespace() {
+        if let Some(v) = part.strip_prefix(AGENT_SCOPE_SESSION) {
+            session_id = Some(v.to_string());
+        } else if let Some(v) = part.strip_prefix(AGENT_SCOPE_CEILING) {
+            ceiling = Some(v.to_string());
+        } else if let Some(v) = part.strip_prefix(AGENT_SCOPE_TOOLS) {
+            tool_profile = Some(v.to_string());
+        }
+    }
+    Some(AgentSessionBinding {
+        session_id: session_id.filter(|s| !s.is_empty())?,
+        ceiling,
+        tool_profile,
+    })
 }
 
 /// Token type of the session token given to a chat session's MCP server.
@@ -352,7 +421,8 @@ mod tests {
             jti: None,
         };
 
-        let token = generate_session_token(&original, TEST_SECRET, 86400).expect("should succeed");
+        let (token, _jti) =
+            generate_session_token(&original, None, TEST_SECRET, 86400).expect("should succeed");
         let decoded = decode_jwt(&token, TEST_SECRET).expect("should decode");
 
         assert_eq!(decoded.sub, original.sub);
@@ -375,7 +445,8 @@ mod tests {
             jti: None,
         };
 
-        let token = generate_session_token(&claims, TEST_SECRET, 3600).expect("should succeed");
+        let (token, _jti) =
+            generate_session_token(&claims, None, TEST_SECRET, 3600).expect("should succeed");
         // Same decode function used by require_auth middleware
         let result = decode_jwt(&token, TEST_SECRET);
         assert!(
@@ -393,5 +464,35 @@ mod tests {
         let claims = decode_jwt(&token, TEST_SECRET).expect("decode should succeed");
         let parsed: Uuid = claims.sub.parse().expect("sub should be a valid UUID");
         assert_eq!(parsed, user_id);
+    }
+
+    #[test]
+    fn session_token_is_bound_to_its_session_and_carries_a_jti() {
+        let human = Claims::service_account("runner:t");
+        let binding = AgentSessionBinding {
+            session_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            ceiling: Some("acceptEdits".to_string()),
+            tool_profile: Some("restricted".to_string()),
+        };
+        let (token, jti) =
+            generate_session_token(&human, Some(&binding), TEST_SECRET, 600).unwrap();
+        let decoded = decode_jwt(&token, TEST_SECRET).unwrap();
+        assert_eq!(decoded.jti.as_deref(), Some(jti.as_str()));
+        assert!(decoded.is_agent_session());
+        assert!(!decoded.is_human());
+        assert_eq!(agent_session_binding(&decoded), Some(binding));
+    }
+
+    #[test]
+    fn only_an_agent_session_token_yields_a_binding() {
+        // A human token whose scope imitates the agent format binds nothing.
+        let mut human = Claims::service_account("someone");
+        human.scope = Some("session:abc ceiling:bypassPermissions".to_string());
+        assert_eq!(agent_session_binding(&human), None);
+
+        // An agent token minted without a session binds nothing either.
+        let (token, _) = generate_session_token(&human, None, TEST_SECRET, 600).unwrap();
+        let decoded = decode_jwt(&token, TEST_SECRET).unwrap();
+        assert_eq!(agent_session_binding(&decoded), None);
     }
 }

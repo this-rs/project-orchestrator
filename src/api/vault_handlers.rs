@@ -595,8 +595,10 @@ mod tests {
     fn tokens() -> Tokens {
         let human = encode_jwt(Uuid::new_v4(), "t@example.com", "T", SECRET, 3600).unwrap();
         let claims = decode_jwt(&human, SECRET).unwrap();
+        let (agent_session, jti) = generate_session_token(&claims, None, SECRET, 3600).unwrap();
+        crate::auth::agent_tokens::register(&jti, None);
         Tokens {
-            agent_session: generate_session_token(&claims, SECRET, 3600).unwrap(),
+            agent_session,
             vault_s1: generate_vault_token(&claims, "session-1", SECRET, 3600).unwrap(),
             vault_s2: generate_vault_token(&claims, "session-2", SECRET, 3600).unwrap(),
             human,

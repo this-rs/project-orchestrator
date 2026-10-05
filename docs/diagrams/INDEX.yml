@@ -39,6 +39,15 @@ diagrams:
     file: docs/diagrams/po-chat-manager.mmd
     covers:
       - "backend:src/chat/{mod,manager,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments,pending_queue}.rs"
+  - name: po-spawn-envelope
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-spawn-envelope.mmd
+    # Arbitrage : auth/middleware.rs reste a po-api ; ici le jeton de session lie
+    # (jwt.rs, agent_tokens.rs) et l'enveloppe d'une session enfant (chat/envelope.rs).
+    covers:
+      - "backend:src/chat/envelope.rs"
+      - "backend:src/auth/{agent_tokens,jwt}.rs"
   - name: po-chat-transport
     owner: theotime
     status: verified
