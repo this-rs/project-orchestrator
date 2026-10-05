@@ -67,6 +67,14 @@ diagrams:
     supersedes: po-code-intelligence-2
     covers:
       - "backend:src/architecture/**"
+  - name: po-ci-release
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-ci-release.mmd
+    # Arbitrage : les trois workflows quittent po-crates-tests (qui garde Cargo.toml, crates/, deny.toml,
+    # codecov.yml...) : un fichier de workflow a UN propriétaire, et c'est cette carte.
+    covers:
+      - "backend:.github/workflows/{ci,security,release}.yml"
   - name: po-crates-tests
     owner: theotime
     status: planned
@@ -74,7 +82,6 @@ diagrams:
       - "backend:Cargo.toml"
       - "backend:crates/**"
       - "backend:tests/*.rs"
-      - "backend:.github/workflows/{ci,security,release}.yml"
       - "backend:.github/dependabot.yml"
       - "backend:deny.toml"
       - "backend:codecov.yml"

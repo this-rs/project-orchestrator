@@ -1,0 +1,138 @@
+%% name: po-ci-release
+%% covers: backend:.github/workflows/{ci,security,release}.yml
+%% verified: 84804df0
+%% ---
+%% PROUVE : la vue d'ensemble de la CI et du processus de release tels que les trois
+%%   workflows les définissent au sha 84804df0 (relus le 2026-10-05) : qui déclenche quoi,
+%%   l'ordre des jobs (needs), ce qui bloque et ce qui est seulement consultatif, et le
+%%   chemin d'un tag vN jusqu'aux binaires, aux installeurs, à l'image Docker et au tap Homebrew.
+%% ---
+%% SOURCES LUES (backend@84804df0) :
+%%   .github/workflows/ci.yml       — jobs build, security-audit, lint, unit-tests, integration-tests,
+%%                                    api-tests, coverage, test-timing ; concurrency ; cron 03:17
+%%   .github/workflows/security.yml — jobs cargo-deny, cargo-audit ; cron 06:30
+%%   .github/workflows/release.yml  — jobs build-frontend, build-backend, package-deb, package-rpm,
+%%                                    build-tauri, release, docker-publish, update-homebrew
+%%   Commandes : grep -rn workflow_run .github/workflows → 0 (aucun lien entre CI et Release) ;
+%%               ruby -ryaml sur les trois fichiers pour les needs / if / matrices.
+%%   Mesure d'incident : run Release 37219528593 (tag v0.0.16), étape « Notarize macOS .dmg » :
+%%               « HTTP status code: 403. A required agreement is missing or has expired ».
+%%               spctl sur l'app publiée : « rejected — Unnotarized Developer ID » ; après relance
+%%               des jobs Tauri macOS (accords Apple acceptés) : « accepted — Notarized Developer ID »
+%%               pour arm64 et x86_64, stapler validate OK sur les deux .dmg.
+%% ---
+%% NON ETABLI :
+%%   - aucun job de ces workflows n'a été exécuté par ce diagramme : le graphe est lu dans le YAML,
+%%     seul l'incident v0.0.16 est mesuré sur un run réel ;
+%%   - le contenu des scripts shell des étapes n'est relu que là où un nœud le cite ;
+%%   - la protection de branche de main (GitHub, hors dépôt) n'est pas lisible ici : « CI requise
+%%     avant fusion » n'est donc ni affirmé ni nié ;
+%%   - le hook local pre-push (fmt + clippy) vit dans .git/hooks, hors périmètre de ce diagramme.
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quelle lecture ou quelle mesure)  🟠 écrit, sans preuve / consultatif
+%%   🔴 défaut constaté (raison dans le nœud)  ⚪ amont ou autre domaine
+
+flowchart TD
+    subgraph legend["Légende"]
+        direction LR
+        L1["✅ vérifié : lecture ou mesure nommée"]
+        L2["🟠 consultatif / sans preuve"]
+        L3["🔴 défaut constaté"]
+        L4["⚪ amont / autre domaine"]
+    end
+
+    PR["⚪ pull_request vers main"]
+    PUSHMAIN["⚪ push sur main"]
+    CRON["⚪ schedule : CI à 03:17 UTC, Security à 06:30 UTC"]
+    DISPATCH["⚪ workflow_dispatch : CI (option fresh = run à froid, sans cache)<br/>Release (input tag, qui doit exister déjà)"]
+    TAG["⚪ push d'un tag v*"]
+
+    subgraph ci["CI — ci.yml (8 jobs)"]
+        direction TB
+        CONC["✅ concurrency : une PR annule son run précédent ; un push sur main n'est JAMAIS annulé<br/>(il remplit les caches)<br/><i>vérifié : lu ci.yml l.20-23, cancel-in-progress = event_name == pull_request</i>"]
+        BUILD["✅ build : cargo build --release, publie l'artefact build-artifacts<br/><i>vérifié : lu ci.yml job build</i>"]
+        LINT["✅ lint : cargo fmt --check, clippy -D warnings (hors desktop), index des diagrammes,<br/>tests du vérificateur d'index, jetons interdits + ses tests<br/><i>vérifié : lu ci.yml job lint</i>"]
+        UNIT["✅ unit-tests : lib, parseur, tests d'intégration sans service<br/><i>vérifié : lu ci.yml job unit-tests</i>"]
+        INTEG["✅ integration-tests : avec services Neo4j + Meilisearch (attente de santé avant les tests)<br/><i>vérifié : lu ci.yml job integration-tests</i>"]
+        API["✅ api-tests : needs build ET lint ; démarre le serveur avec une config CI puis lance les tests d'API<br/><i>vérifié : lu ci.yml, needs: [build, lint]</i>"]
+        COV["🟠 coverage : fusion lcov unitaires + parseur + suites Neo4j, assertion que src/neo4j est couvert,<br/>envoi à Codecov avec fail_ci_if_error: false — l'envoi ne peut pas faire échouer le job<br/><i>lu ci.yml job coverage ; seuil de couverture : aucun dans ce fichier</i>"]
+        SECAUDIT["🟠 security-audit : cargo audit échoue sur une vulnérabilité connue ;<br/>cargo deny est continue-on-error (« advisory until deny.toml is fully tuned »)<br/><i>lu ci.yml l.111-128</i>"]
+        TIMING["⚪ test-timing : seulement schedule ou workflow_dispatch — jamais sur PR ni push<br/><i>lu ci.yml, if: event_name == schedule || workflow_dispatch</i>"]
+        BUILD --> API
+        LINT --> API
+    end
+
+    subgraph sec["Security — security.yml (2 jobs)"]
+        direction TB
+        DENY["🟠 cargo-deny"]
+        AUDIT["🟠 cargo-audit"]
+        DUP["🟠 cargo audit et cargo deny tournent DEUX fois : dans ci.yml (job security-audit)<br/>et dans security.yml — deux verdicts pour la même question, sur les mêmes déclencheurs<br/><i>lu : mêmes outils dans les deux fichiers ; lequel fait foi n'est écrit nulle part</i>"]
+    end
+
+    PR --> ci
+    PUSHMAIN --> ci
+    CRON --> ci
+    DISPATCH --> ci
+    PR --> sec
+    PUSHMAIN --> sec
+    CRON --> sec
+
+    NOLINK["🔴 aucun lien entre CI et Release : Release ne se déclenche que sur tag v* ou dispatch,<br/>aucun workflow_run, aucun needs vers un check de CI. Un tag peut donc publier<br/>un commit dont la CI est rouge ou n'a pas tourné.<br/><i>mesuré : grep -rn workflow_run .github/workflows → 0 ; release.yml on: push tags / workflow_dispatch seuls</i>"]
+    TAG --> NOLINK
+    DISPATCH --> NOLINK
+
+    subgraph rel["Release — release.yml (8 jobs)"]
+        direction TB
+        FRONT["🟠 build-frontend : clone le frontend sur sa branche main la plus récente<br/>(étape « Clone frontend (latest main) », git clone --depth=1) puis injecte la version du tag.<br/>Le frontend publié n'est PAS épinglé au tag : relancer une release plus tard<br/>reconstruit avec un autre frontend (le sha est seulement affiché dans le log)<br/><i>lu release.yml l.28-45</i>"]
+        BACK["✅ build-backend (needs build-frontend) : matrice de 5 cibles — macOS arm64 et x86_64,<br/>Linux x86_64 et aarch64, Windows x86_64 ; deux variantes (light et full) → archives orchestrator-*<br/><i>vérifié : 5 cibles lues dans la matrice ; les 5 sont dans les assets de v0.0.16</i>"]
+        DEB["✅ package-deb (x86_64, aarch64) : needs build-backend, if: always()<br/><i>vérifié : lu release.yml ; project-orchestrator_0.0.16-1_amd64.deb dans les assets</i>"]
+        RPM["✅ package-rpm (x86_64, aarch64) : needs build-backend, if: always()<br/><i>vérifié : lu release.yml ; .rpm x86_64 et aarch64 dans les assets de v0.0.16</i>"]
+        TAURI["✅ build-tauri (needs build-frontend, build-backend) : bureau signé pour les 5 cibles<br/><i>vérifié : lu release.yml ; .dmg, .AppImage, .deb, .msi, setup.exe dans les assets de v0.0.16</i>"]
+        BACK --> DEB
+        BACK --> RPM
+        BACK --> TAURI
+    end
+
+    TAG --> FRONT
+    DISPATCH --> FRONT
+    FRONT --> BACK
+
+    subgraph mac["build-tauri sur macOS — l'ordre des étapes"]
+        direction TB
+        CERT["✅ importer le certificat Developer ID dans un trousseau temporaire"]
+        RESIGN["✅ build Tauri, puis re-signature --timestamp (requise par la notarisation)"]
+        DMG["✅ recréer le .dmg avec l'app re-signée, signer le .dmg"]
+        UPD["✅ reconstruire .app.tar.gz et sa signature de mise à jour"]
+        NOTAR["✅ notariser le .dmg avec notarytool --wait puis stapler : tout résultat autre que<br/>status: Accepted FAIT ÉCHOUER le job (avec le log Apple et un message sur le 403)<br/><i>vérifié : commit 84804df0 ; run 37219528593 relancé : « status: Accepted », spctl accepted, stapler validate OK</i>"]
+        NOTARHIST["🔴 AVANT 84804df0 : l'étape avalait l'échec (|| true, aucune branche pour un résultat non Accepted).<br/>Apple répondait 403 « agreement missing or has expired » et la v0.0.16 est sortie avec une app signée mais<br/>NON notarisée, rejetée par Gatekeeper sur tout Mac. Corrigé : l'échec est fatal.<br/><i>mesuré : run 37219528593, spctl « Unnotarized Developer ID » sur l'app publiée</i>"]
+        CERT --> RESIGN --> DMG --> UPD --> NOTAR
+        NOTARHIST -.->|"corrigé par"| NOTAR
+    end
+
+    TAURI --> CERT
+
+    PUB["🔴 release (Publish Release) : needs build-backend, build-tauri, package-deb, package-rpm<br/>mais if: always() — elle s'exécute même si un de ces jobs a échoué, et les téléchargements deb/rpm/tauri<br/>sont continue-on-error. Une release peut donc partir INCOMPLÈTE (commentaire du fichier :<br/>« publish everything that built successfully »). Seul le téléchargement des archives natives est bloquant.<br/><i>lu release.yml l.1308-1337</i>"]
+    DEB --> PUB
+    RPM --> PUB
+    BACK --> PUB
+    TAURI --> PUB
+
+    LATEST["🔴 latest.json (mises à jour automatiques) : si le paquet de mise à jour macOS arm64 manque,<br/>le script écrit un AVERTISSEMENT et utilise le paquet x86_64 pour les deux plateformes darwin<br/>(et inversement) — une architecture absente pointe silencieusement vers l'autre<br/><i>lu release.yml l.1404-1409 (::warning::, pas d'échec)</i>"]
+    CHK["✅ checksums-sha256.txt calculé sur les fichiers collectés<br/><i>vérifié : le fichier est dans les assets de v0.0.16 et liste les archives macOS</i>"]
+    CREATE["🟠 supprimer la release existante (--cleanup-tag=false : le tag reste) puis la recréer<br/>avec les notes générées : pendant l'intervalle, la release n'existe pas<br/><i>lu release.yml l.1477-1493 ; utilisé le 2026-10-05 pour corriger v0.0.16 sans changer de tag</i>"]
+    PUB --> LATEST --> CHK --> CREATE
+
+    DOCKER["🟠 docker-publish : needs build-frontend SEULEMENT — il ne dépend ni de release ni du build backend.<br/>Deux variantes (full avec frontend et tag latest, api-only), linux/amd64 + linux/arm64, ghcr.io,<br/>paquet rendu public pour full. Les images peuvent donc être poussées alors que la release a échoué.<br/><i>lu release.yml l.1495-1580</i>"]
+    FRONT --> DOCKER
+
+    BREW["🟠 update-homebrew : needs release ; ignoré si le tag contient « - » (préversion) ;<br/>calcule les sha256 depuis checksums-sha256.txt, génère la formule, l'envoie au tap this-rs/homebrew-tap<br/>avec le secret HOMEBREW_TAP_TOKEN. Sur le run 37219528593, tentative 1 : « Invalid username or token » ;<br/>après relance : succès. Cause de l'échec initial non établie.<br/><i>mesuré : run 37219528593, tentatives 1 et 2</i>"]
+    CREATE --> BREW
+
+    TESTBREW["🔴 la formule teste « orchestrator --version », option que le binaire refuse<br/>(« error: unexpected argument '--version' found ») : brew test échouerait<br/><i>mesuré : orchestrator --version sur l'archive macos-arm64 de v0.0.16</i>"]
+    BREW -.-> TESTBREW
+
+    OUT["⚪ sortie : GitHub Release (archives, installeurs, checksums, latest.json), image ghcr.io, formule Homebrew"]
+    CREATE --> OUT
+    DOCKER --> OUT
+    BREW --> OUT
