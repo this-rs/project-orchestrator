@@ -2039,6 +2039,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_provider_returns_the_full_instance_to_a_human() {
+        let app = test_app().await;
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // A human gets the detail the edit form pre-fills, path included.
+        let (status, body) = call_json(&app, auth_get("/api/chat/providers/deepseek")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["id"], "deepseek");
+        assert_eq!(body["base_url"], "https://8.8.8.8/v1");
+        assert_eq!(body["origin"], "https://8.8.8.8");
+        assert_eq!(body["default_model"], "deepseek-chat");
+        assert_eq!(body["cost_source"], "priced");
+        assert_eq!(body["credential_ref"], "vault:deepseek");
+        assert_eq!(body["builtin"], false);
+        assert!(body.get("preset").is_some(), "{body}");
+
+        // Unknown instance: 404. The built-in one is refused like update/delete.
+        let (status, _) = call_json(&app, auth_get("/api/chat/providers/nope")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = call_json(&app, auth_get("/api/chat/providers/claude-code")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // The listing still never carries a URL or a path.
+        let (status, listing) = call_json(&app, auth_get("/api/chat/providers")).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = listing.to_string();
+        assert!(!text.contains("base_url"), "{text}");
+        assert!(!text.contains("/v1"), "{text}");
+        let entry = listing["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "deepseek")
+            .unwrap();
+        assert_eq!(entry["endpoint_origin"], "https://8.8.8.8");
+    }
+
+    #[tokio::test]
+    async fn get_provider_is_refused_to_an_agent_token() {
+        use crate::api::provider_handlers::get_provider;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let state = mock_server_state().await;
+        let record = serde_json::json!({
+            "id": "deepseek", "kind": "openai_compatible", "preset": "deepseek",
+            "label": "DeepSeek", "base_url": "https://api.deepseek.com/v1",
+            "origin": "https://api.deepseek.com", "default_model": "deepseek-chat",
+            "cost_source": "priced", "credential_ref": "vault:deepseek"
+        });
+        state
+            .orchestrator
+            .neo4j_arc()
+            .put_llm_setting("global", "instance:deepseek", &record.to_string())
+            .await
+            .unwrap();
+
+        // An agent_session token (unbound: the claims are what the handler reads).
+        let human = crate::auth::jwt::Claims::service_account("agent");
+        let (token, _) = crate::auth::jwt::generate_session_token(
+            &human,
+            None,
+            &crate::test_helpers::test_auth_config().jwt_secret,
+            600,
+        )
+        .unwrap();
+        let agent = crate::auth::jwt::decode_jwt(
+            &token,
+            &crate::test_helpers::test_auth_config().jwt_secret,
+        )
+        .unwrap();
+        assert!(!agent.is_human());
+        let err = get_provider(
+            State(state.clone()),
+            Extension(agent),
+            Path("deepseek".into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)), "{err:?}");
+
+        // The same record, read by a person, carries the full URL and the preset.
+        let person = crate::auth::jwt::Claims {
+            token_type: None,
+            ..crate::auth::jwt::Claims::service_account("person")
+        };
+        let axum::Json(view) =
+            get_provider(State(state), Extension(person), Path("deepseek".into()))
+                .await
+                .unwrap();
+        assert_eq!(view["base_url"], "https://api.deepseek.com/v1");
+        assert_eq!(view["preset"], "deepseek");
+        assert_eq!(view["credential_ref"], "vault:deepseek");
+    }
+
+    #[tokio::test]
     async fn a_codex_instance_is_created_behind_the_gate_with_a_process_identity() {
         let app = test_app().await;
         let body = serde_json::json!({"id": "codex", "kind": "codex", "label": "Codex"});

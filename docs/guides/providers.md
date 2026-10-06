@@ -47,6 +47,11 @@ the answer is `409 engine_unavailable`.
 6. **Open a session** with `provider: "deepseek"`, or set a role (`/api/chat/roles`,
    `/api/projects/{slug}/llm-roles`) so the project uses it by default.
 
+To edit an instance, `GET /api/chat/providers/{id}` returns what was stored: the full `base_url`
+(path included), `default_model`, `preset`, `cost_source` and the `credential_ref` reference, never a
+secret value. It is for a signed-in person only (an agent token gets `403`, an unknown id `404`).
+`GET /api/chat/providers` stays the safe listing: it shows the origin, never a path.
+
 What was sent where is readable at `GET /api/chat/send-journal` (who, project, origin, model; never the content).
 
 ## Routing, roles, aliases, policy
