@@ -14,7 +14,9 @@
 %% ---
 %% NON ETABLI :
 %%   aucun essai contre un vrai endpoint ou un vrai Codex ; le test de connexion d'un codex/acp = health du processus ;
-%%   la santé N'EST PAS sondée dans le listing (seulement par /status).
+%%   la santé N'EST PAS sondée dans le listing (seulement par /status) ;
+%%   claude_code_remote : jamais exercé contre une vraie machine SSH (seulement un port local fermé et des faux ssh-keyscan) ;
+%%   le serveur ouvre une connexion vers l'hôte que le corps nomme (humain seulement, authentification exigée) : pas de garde d'adresse privée, les machines visées sont souvent sur un LAN.
 %% ---
 %% LEGENDE
 %%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans test / décidé non écrit  ⚪ amont ou autre domaine
@@ -31,6 +33,8 @@ flowchart TD
         CREATE["✅ POST /api/chat/providers : openai_compatible | codex | acp ; références seulement, tout champ inconnu refusé ; URL par la garde d'endpoint (DNS compris) ; claude-code intégré : 403 ; id existant : 409<br/>test : an_instance_is_created_listed_and_never_carries_a_secret, a_secret_in_a_body_or_a_forbidden_endpoint_is_refused, a_codex_instance_is_created_behind_the_gate_with_a_process_identity, an_env_credential_is_refused_unless_the_variable_is_declared"]
         TEST["✅ POST /providers/test : toujours 200 + verdict ; avec identifiant, seulement pour une instance DÉJÀ enregistrée (même origine et même référence) ; sonde réelle (health, modèles, appel d'outil, fenêtre)<br/>test : the_test_route_always_answers_200_with_a_verdict"]
         GETI["✅ GET /providers/{id} : détail stocké pour le formulaire d'édition (base_url complet, modèle, preset, coût, référence d'identifiant) ; humain seulement (jeton d'agent : 403), inconnu : 404, claude-code : 403 ; le listing ne montre toujours que l'origine<br/>test : get_provider_returns_the_full_instance_to_a_human, get_provider_is_refused_to_an_agent_token"]
+        REMOTE["✅ kind claude_code_remote (Claude Code sur une AUTRE machine par SSH) : POST /providers avec host, ssh_user?, ssh_port?, host_key épinglée '&lt;type&gt; &lt;base64&gt;', remote_cwd, credential_ref vault:&lt;nom&gt; OBLIGATOIRE (la clé privée SSH vit dans le coffre ; env:, none et valeur collée refusés) ; id forcé claude-code@&lt;slug du label&gt; (claude-code seul reste réservé : 403) ; origine ssh:[user@]host:port ; empreinte SHA256 calculée et exposée (record, listing, détail), jamais une clé ; changer host, port, user ou clé d'hôte invalide les consentements ; santé = sonde ssh réelle avec phrase fixe (reason), sans chemin ni sortie brute de ssh<br/>test : a_remote_instance_goes_from_the_route_to_a_provider_and_never_to_the_local_claude, every_bad_remote_draft_is_refused, a_remote_credential_is_a_vault_reference_and_nothing_else, a_change_of_machine_revokes_consent, the_fingerprint_is_the_openssh_one, an_unreachable_machine_is_unavailable_with_a_readable_reason_and_no_path"]
+        HOSTKEY["✅ POST /providers/ssh-host-key {host, ssh_port?} : ssh-keyscan (arguments explicites, `--` avant l'hôte, jamais un shell), hôte validé par la même charset que le transport, 10 s au total, sortie plafonnée à 64 Ko, kill_on_drop ; renvoie la première clé valide et son empreinte pour qu'une PERSONNE la confirme (TOFU rendu explicite, rien n'est stocké) ; humain seulement, porte A32<br/>test : the_host_key_route_refuses_hostile_hosts_before_any_process_starts, the_first_valid_key_line_is_parsed_and_noise_is_skipped, a_scan_that_hangs_is_cut_at_the_deadline, a_scan_that_never_stops_writing_is_capped"]
         STATUS["✅ GET /providers/{id}/status : santé mesurée<br/>test : a_saved_instances_status_is_its_real_health_not_unknown"]
         PATCH["✅ PUT|PATCH /providers/{id} : l'id ne change jamais ; changer l'origine OU la référence d'identifiant invalide les consentements (consents_invalidated)<br/>test : consent_is_bound_to_the_origin_and_stops_holding_when_it_changes"]
     end
@@ -53,6 +57,8 @@ flowchart TD
     CREATE --> TEST
     CREATE --> PATCH
     CREATE --> GETI
+    CREATE --> REMOTE
+    REMOTE --> HOSTKEY
     PATCH --> CONSENT
     CONSENT --> ROLES
     ROLES --> POLICY

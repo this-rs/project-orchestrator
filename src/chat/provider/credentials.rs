@@ -36,7 +36,11 @@ impl VaultCredentialResolver {
         Self { vault }
     }
 
-    fn read_vault(&self, instance: &str, name: &str) -> Result<Option<Secret>, ProviderError> {
+    pub(super) fn read_vault(
+        &self,
+        instance: &str,
+        name: &str,
+    ) -> Result<Option<Secret>, ProviderError> {
         match self
             .vault
             .read_for_provider(name, instance, chrono::Utc::now())

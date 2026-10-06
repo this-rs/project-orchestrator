@@ -67,13 +67,14 @@
         "providers": [
           {
             "id": "string",
-            "kind": "string (claude_code | openai_compatible | codex | acp)",
+            "kind": "string (claude_code | openai_compatible | codex | acp | claude_code_remote)",
             "label": "string",
             "builtin": "boolean",
             "is_default": "boolean",
             "allowed_for_project": "boolean | null (null sans project_slug)",
             "endpoint_origin": "string | null (jamais d'identifiant ; origine seule)",
             "credential": "string (vault:<nom> | env:<VAR> | none) — la référence, jamais la valeur",
+            "remote": "object? (claude_code_remote seulement) {host, ssh_user?, ssh_port, host_key_fingerprint ('SHA256:...'), remote_cwd?, allow_trust} — jamais la clé privée ni la clé d'hôte brute",
             "health": {
               "state": "ok | auth_required | unreachable | cli_not_found | unknown",
               "code": "string? (code d'erreur ci-dessous)",
@@ -152,7 +153,9 @@
       "GET /api/chat/providers/{id}": "200 {id,kind,preset,label,base_url,origin,default_model,cost_source,credential_ref,builtin:false} (base_url COMPLET, chemin compris : pour prereplir le formulaire d'edition ; jamais une valeur de secret) ; humain seulement : 403 pour un jeton d'agent ; 403 claude-code ; 404 inconnu. Le listing GET /api/chat/providers, lui, ne donne toujours que endpoint_origin",
       "PUT|PATCH /api/chat/providers/{id}": "corps ProviderPatch -> 200 meme forme + consents_invalidated (true si l'origine change) ; 403 claude-code ; 404",
       "DELETE /api/chat/providers/{id}": "204 ; 403 claude-code ; 404",
-      "GET /api/chat/providers/{id}/status": "HealthEntry {state, code?, action?, checked_at?}",
+      "GET /api/chat/providers/{id}/status": "HealthEntry {state, code?, action?, checked_at?, reason?} ; reason = phrase fixe lisible, seulement pour claude_code_remote (jamais la sortie brute de ssh ni un chemin)",
+      "claude_code_remote": "POST /api/chat/providers avec kind=claude_code_remote : corps {kind, label, host, ssh_user?, ssh_port?, host_key ('<type> <base64>', epinglee), remote_cwd, credential_ref (vault:<nom> OBLIGATOIRE : la cle privee SSH vit dans le coffre), allow_trust?, default_model?}. L'id est force : claude-code@<slug du label> (claude-code seul reste le local, 403). Origine = ssh:[user@]host:port ; changer host/port/user/host_key invalide les consentements. 201/GET renvoient en plus host, ssh_user, ssh_port, host_key, host_key_fingerprint, remote_cwd, allow_trust. Pas de serveur MCP PO dans la session (degraded_features contient project_orchestrator_tools) ; Trust refuse (422 unsupported) sauf allow_trust ; machine injoignable = 502 endpoint_unreachable a l'ouverture, jamais de repli sur le claude local.",
+      "POST /api/chat/providers/ssh-host-key": "corps {host, ssh_port?} -> 200 {host_key, host_key_fingerprint} (ssh-keyscan, 10 s max, sortie plafonnee) ; 400 hote invalide / aucune cle lisible ; 501 ssh-keyscan absent. Humain seulement. A confirmer PAR UNE PERSONNE en comparant l'empreinte avec celle de la machine (ssh-keygen -lf) avant d'epingler : c'est le TOFU, rendu explicite.",
       "GET /api/chat/providers/{id}/models": "[{id}]"
     },
     "consentement": {

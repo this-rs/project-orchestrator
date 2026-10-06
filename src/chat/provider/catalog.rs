@@ -189,6 +189,7 @@ mod tests {
             default_model: Some("m".into()),
             cost_source: "unknown".into(),
             credential_ref: "none".into(),
+            ..Default::default()
         }
     }
 
@@ -199,6 +200,7 @@ mod tests {
             consented_by: "me".into(),
             consented_at: "t".into(),
             credential_ref: Some("none".into()),
+            ..Default::default()
         }
     }
 

@@ -125,6 +125,7 @@ chrono = { workspace = true }
 walkdir = "2.5"
 glob = "0.3"
 sha2 = "0.11"
+base64 = "0.22"
 hmac = "0.13"
 hex = "0.4"
 # Vault (src/vault): Argon2id derives a key from the user's passphrase,
@@ -142,7 +143,7 @@ async-trait = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Chat / Claude Code SDK
-nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "4010f7406e13567ae80df5a6340576642557ded1", features = ["memory", "auto-download", "provider-native", "provider-codex", "provider-acp"] }
+nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "35acfbfc36b84981fd900b8fe489a320a12d6f0c", features = ["memory", "auto-download", "provider-native", "provider-codex", "provider-acp"] }
 tokio-stream = { workspace = true }
 
 # Auth

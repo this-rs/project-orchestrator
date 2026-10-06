@@ -136,6 +136,11 @@ pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
     if !caps.images {
         missing.push("images");
     }
+    // A session that cannot carry an MCP server (a remote Claude Code) has none
+    // of the project-orchestrator tools.
+    if !caps.per_session_mcp {
+        missing.push("project_orchestrator_tools");
+    }
     missing.into_iter().map(str::to_string).collect()
 }
 
