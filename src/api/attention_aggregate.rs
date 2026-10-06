@@ -133,7 +133,10 @@ fn point_status(s: &TaskStatus, waiting: bool) -> WavePointStatus {
         TaskStatus::InProgress => WavePointStatus::Running,
         TaskStatus::Pending => WavePointStatus::Pending,
         TaskStatus::Failed => WavePointStatus::Failed,
-        TaskStatus::Blocked => WavePointStatus::Blocked,
+        // Until the contract carries `interrupted` (it is shared with the frontend, see S10),
+        // an interrupted task is shown as blocked: it will not run until somebody acts, which is
+        // exactly what "blocked" tells the user.
+        TaskStatus::Blocked | TaskStatus::Interrupted => WavePointStatus::Blocked,
     }
 }
 

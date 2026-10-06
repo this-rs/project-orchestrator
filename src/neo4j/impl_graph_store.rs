@@ -1021,6 +1021,10 @@ impl GraphStore for Neo4jClient {
         self.update_task_status(task_id, status).await
     }
 
+    async fn interrupt_task(&self, task_id: Uuid, reason: &str) -> anyhow::Result<bool> {
+        self.interrupt_task(task_id, reason).await
+    }
+
     async fn assign_task(&self, task_id: Uuid, agent_id: &str) -> anyhow::Result<()> {
         self.assign_task(task_id, agent_id).await
     }

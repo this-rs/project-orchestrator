@@ -471,6 +471,8 @@ fn make_task(title: &str, status: TaskStatus) -> TaskNode {
         description: format!("description for {title}"),
         status,
         assigned_to: None,
+        interrupted_at: None,
+        interrupted_reason: None,
         priority: Some(5),
         tags: vec!["test".to_string()],
         acceptance_criteria: vec![],
@@ -569,6 +571,88 @@ async fn test_neo4j_task_update_status_and_assign() {
     assert_eq!(got.status, TaskStatus::Completed);
 
     state.neo4j.delete_task(task.id).await.ok();
+    state.neo4j.delete_plan(plan_id).await.ok();
+}
+
+#[tokio::test]
+async fn test_neo4j_task_interrupt_cycle() {
+    // The Cypher of `interrupt_task` and of leaving the status, against a real Neo4j. Runs in CI
+    // (which has one); the mock cannot prove a query.
+    if !backends_available().await {
+        return;
+    }
+    let state = AppState::new(test_config()).await.unwrap();
+    let plan_id = setup_plan(&state).await;
+    let working = make_task("interrupt-me", TaskStatus::InProgress);
+    let done = make_task("already-done", TaskStatus::Completed);
+    let failed = make_task("already-failed", TaskStatus::Failed);
+    for t in [&working, &done, &failed] {
+        state.neo4j.create_task(plan_id, t).await.unwrap();
+    }
+
+    // Finished work is left alone, and the answer says so.
+    assert!(!state.neo4j.interrupt_task(done.id, "x").await.unwrap());
+    assert!(!state.neo4j.interrupt_task(failed.id, "x").await.unwrap());
+    assert_eq!(
+        state.neo4j.get_task(done.id).await.unwrap().unwrap().status,
+        TaskStatus::Completed
+    );
+    assert!(!state
+        .neo4j
+        .interrupt_task(Uuid::new_v4(), "x")
+        .await
+        .unwrap());
+
+    // Interrupting records when and why, and the status reads back.
+    assert!(state
+        .neo4j
+        .interrupt_task(working.id, "owner session ended")
+        .await
+        .unwrap());
+    let got = state.neo4j.get_task(working.id).await.unwrap().unwrap();
+    assert_eq!(got.status, TaskStatus::Interrupted);
+    assert_eq!(
+        got.interrupted_reason.as_deref(),
+        Some("owner session ended")
+    );
+    let first = got
+        .interrupted_at
+        .expect("interrupted_at is stored and read back");
+
+    // Again: the FIRST moment is kept, the reason is the new one.
+    assert!(state
+        .neo4j
+        .interrupt_task(working.id, "server restarted")
+        .await
+        .unwrap());
+    let again = state.neo4j.get_task(working.id).await.unwrap().unwrap();
+    assert_eq!(again.interrupted_at, Some(first));
+    assert_eq!(
+        again.interrupted_reason.as_deref(),
+        Some("server restarted")
+    );
+
+    // Not runnable on its own: the only pending-free plan has nothing to offer.
+    assert!(state
+        .neo4j
+        .get_next_available_task(plan_id)
+        .await
+        .unwrap()
+        .is_none());
+
+    // Any other status ends the interruption.
+    state
+        .neo4j
+        .update_task_status(working.id, TaskStatus::InProgress)
+        .await
+        .unwrap();
+    let resumed = state.neo4j.get_task(working.id).await.unwrap().unwrap();
+    assert_eq!(resumed.status, TaskStatus::InProgress);
+    assert!(resumed.interrupted_at.is_none() && resumed.interrupted_reason.is_none());
+
+    for t in [&working, &done, &failed] {
+        state.neo4j.delete_task(t.id).await.ok();
+    }
     state.neo4j.delete_plan(plan_id).await.ok();
 }
 

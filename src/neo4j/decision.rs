@@ -1006,6 +1006,8 @@ mod parent_existence_tests {
             description: String::new(),
             status: TaskStatus::Pending,
             assigned_to: None,
+            interrupted_at: None,
+            interrupted_reason: None,
             priority: None,
             tags: vec![],
             acceptance_criteria: vec![],

@@ -3777,8 +3777,29 @@ impl GraphStore for MockGraphStore {
             if status == TaskStatus::Completed {
                 t.completed_at = Some(Utc::now());
             }
+            // Leaving `Interrupted` ends the interruption, as in the real store.
+            if status != TaskStatus::Interrupted {
+                t.interrupted_at = None;
+                t.interrupted_reason = None;
+            }
         }
         Ok(())
+    }
+
+    async fn interrupt_task(&self, task_id: Uuid, reason: &str) -> Result<bool> {
+        let mut tasks = self.tasks.write().await;
+        let Some(t) = tasks.get_mut(&task_id) else {
+            return Ok(false);
+        };
+        // Same rule as the real store: finished work is not interrupted.
+        if matches!(t.status, TaskStatus::Completed | TaskStatus::Failed) {
+            return Ok(false);
+        }
+        t.status = TaskStatus::Interrupted;
+        t.interrupted_at.get_or_insert_with(Utc::now);
+        t.interrupted_reason = Some(reason.to_owned());
+        t.updated_at = Some(Utc::now());
+        Ok(true)
     }
 
     async fn assign_task(&self, task_id: Uuid, agent_id: &str) -> Result<()> {
@@ -16416,5 +16437,122 @@ mod tests {
             .collect();
         statuses.sort();
         assert_eq!(statuses, vec!["completed", "failed", "in_progress"]);
+    }
+
+    // ----- interrupted tasks ---------------------------------------------------------------
+
+    async fn plan_with(store: &MockGraphStore, statuses: &[TaskStatus]) -> (Uuid, Vec<Uuid>) {
+        let plan = crate::test_helpers::test_plan();
+        store.create_plan(&plan).await.unwrap();
+        let mut ids = Vec::new();
+        for status in statuses {
+            let mut task = crate::test_helpers::test_task();
+            task.status = status.clone();
+            store.create_task(plan.id, &task).await.unwrap();
+            ids.push(task.id);
+        }
+        (plan.id, ids)
+    }
+
+    #[tokio::test]
+    async fn interrupting_a_task_records_when_and_why_and_resuming_it_clears_that() {
+        let store = MockGraphStore::new();
+        let (_, ids) = plan_with(&store, &[TaskStatus::InProgress]).await;
+
+        assert!(store
+            .interrupt_task(ids[0], "owner session ended")
+            .await
+            .unwrap());
+        let t = store.get_task(ids[0]).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Interrupted);
+        assert_eq!(t.interrupted_reason.as_deref(), Some("owner session ended"));
+        let first = t.interrupted_at.expect("when it was interrupted");
+
+        // Interrupting again keeps the FIRST moment (the work has been waiting since then) and
+        // takes the new reason.
+        assert!(store
+            .interrupt_task(ids[0], "server restarted")
+            .await
+            .unwrap());
+        let t = store.get_task(ids[0]).await.unwrap().unwrap();
+        assert_eq!(t.interrupted_at, Some(first));
+        assert_eq!(t.interrupted_reason.as_deref(), Some("server restarted"));
+
+        // Resuming ends the interruption.
+        store
+            .update_task_status(ids[0], TaskStatus::InProgress)
+            .await
+            .unwrap();
+        let t = store.get_task(ids[0]).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::InProgress);
+        assert!(t.interrupted_at.is_none() && t.interrupted_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn finished_work_and_unknown_tasks_are_not_interrupted() {
+        let store = MockGraphStore::new();
+        let (_, ids) = plan_with(
+            &store,
+            &[
+                TaskStatus::Completed,
+                TaskStatus::Failed,
+                TaskStatus::Pending,
+            ],
+        )
+        .await;
+
+        assert!(
+            !store.interrupt_task(ids[0], "x").await.unwrap(),
+            "completed stays completed"
+        );
+        assert!(
+            !store.interrupt_task(ids[1], "x").await.unwrap(),
+            "failed stays failed"
+        );
+        assert!(
+            !store.interrupt_task(Uuid::new_v4(), "x").await.unwrap(),
+            "no such task"
+        );
+        assert_eq!(
+            store.get_task(ids[0]).await.unwrap().unwrap().status,
+            TaskStatus::Completed
+        );
+        // Pending work CAN be interrupted (it was claimed, then lost): the answer says it changed.
+        assert!(store.interrupt_task(ids[2], "x").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_task_is_not_next_and_does_not_unblock_what_depends_on_it() {
+        let store = MockGraphStore::new();
+        let (plan_id, ids) =
+            plan_with(&store, &[TaskStatus::InProgress, TaskStatus::Pending]).await;
+        let (interrupted, dependent) = (ids[0], ids[1]);
+        store
+            .add_task_dependency(dependent, interrupted)
+            .await
+            .unwrap();
+        store
+            .interrupt_task(interrupted, "owner lost")
+            .await
+            .unwrap();
+
+        // Not runnable itself, and the task that waits for it keeps waiting.
+        assert!(store
+            .get_next_available_task(plan_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Once somebody resumes it AND it is completed, the dependent becomes available.
+        store
+            .update_task_status(interrupted, TaskStatus::Completed)
+            .await
+            .unwrap();
+        let next = store
+            .get_next_available_task(plan_id)
+            .await
+            .unwrap()
+            .expect("unblocked");
+        assert_eq!(next.id, dependent);
     }
 }

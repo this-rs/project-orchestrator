@@ -973,6 +973,8 @@ mod tests {
             description: "A test task description".to_string(),
             status: TaskStatus::Pending,
             assigned_to: None,
+            interrupted_at: None,
+            interrupted_reason: None,
             priority: None,
             tags: tags.into_iter().map(String::from).collect(),
             acceptance_criteria: vec![],

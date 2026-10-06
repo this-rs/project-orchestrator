@@ -728,7 +728,7 @@ Manage tasks. Actions: list, create, get, update, delete, get_next, add_dependen
 | list | `plan_id`, `search`, `limit`, `offset` | List tasks |
 | create | `plan_id` (req), `title` (req), `description`, `priority`, `tags`, `acceptance_criteria`, `affected_files` | Create task |
 | get | `task_id` (req) | Get task by UUID |
-| update | `task_id` (req), `status` (pending/in_progress/blocked/completed/failed), `assigned_to`, `priority`, `tags` | Update task |
+| update | `task_id` (req), `status` (pending/in_progress/blocked/completed/failed/interrupted), `assigned_to`, `priority`, `tags` | Update task |
 | delete | `task_id` (req) | Delete a task |
 | get_next | `plan_id` (req) | Get next actionable task |
 | add_dependencies | `task_id` (req), `dependency_ids` (req, array) | Add task dependencies |

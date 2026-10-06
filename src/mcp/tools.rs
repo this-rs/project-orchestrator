@@ -451,7 +451,7 @@ fn task_tool() -> ToolDefinition {
                 "title": {"type": "string", "description": "Task title (create)"},
                 "description": {"type": "string", "description": "Task description (create)"},
                 "priority": {"type": "integer", "description": "Priority (create/update)"},
-                "status": {"type": "string", "description": "Status (update, list filter): pending, in_progress, blocked, completed, failed"},
+                "status": {"type": "string", "description": "Status (update, list filter): pending, in_progress, blocked, completed, failed, interrupted (work left without an owner; never run again on its own)"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags (create/update)"},
                 "assigned_to": {"type": "string", "description": "Assignee (update)"},
                 "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "Criteria (create)"},

@@ -440,6 +440,14 @@ pub(crate) fn eligible_wave_tasks(
                 );
                 false
             }
+            Eligibility::SkipInterrupted => {
+                warn!(
+                    "Skipping interrupted task {}: {} (resume it explicitly to run it)",
+                    t.id,
+                    t.title.as_deref().unwrap_or("untitled")
+                );
+                false
+            }
         })
         .collect()
 }
@@ -2745,6 +2753,8 @@ impl PlanRunner {
                         description: String::new(),
                         status: crate::neo4j::models::TaskStatus::InProgress,
                         assigned_to: None,
+                        interrupted_at: None,
+                        interrupted_reason: None,
                         priority: None,
                         tags: vec![],
                         acceptance_criteria: vec![],

@@ -628,6 +628,12 @@ pub struct TaskNode {
     pub description: String,
     pub status: TaskStatus,
     pub assigned_to: Option<String>,
+    /// When the task became [`TaskStatus::Interrupted`]; cleared when it is resumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_at: Option<DateTime<Utc>>,
+    /// Why it was interrupted ("server restarted", "owner session ended", "plan completed").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_reason: Option<String>,
     /// Priority (higher = more important)
     pub priority: Option<i32>,
     /// Labels/tags for categorization
@@ -669,6 +675,11 @@ pub enum TaskStatus {
     Blocked,
     Completed,
     Failed,
+    /// Work that was under way when whatever was driving it disappeared (the server stopped, a
+    /// session ended). Neither `Pending` (the information that something was started would be
+    /// lost) nor `Failed` (nothing failed). Never picked up by the scheduler on its own and never
+    /// counted as done for the tasks that depend on it: it waits for somebody to resume it.
+    Interrupted,
 }
 
 impl fmt::Display for TaskStatus {
@@ -679,6 +690,7 @@ impl fmt::Display for TaskStatus {
             Self::Blocked => "blocked",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
         })
     }
 }
@@ -695,6 +707,9 @@ pub struct TaskCounts {
     pub blocked: u32,
     pub pending: u32,
     pub failed: u32,
+    /// Work started and then left without an owner (see [`TaskStatus::Interrupted`]).
+    #[serde(default)]
+    pub interrupted: u32,
 }
 
 impl TaskCounts {
@@ -711,6 +726,7 @@ impl TaskCounts {
                 TaskStatus::Blocked => c.blocked += 1,
                 TaskStatus::Pending => c.pending += 1,
                 TaskStatus::Failed => c.failed += 1,
+                TaskStatus::Interrupted => c.interrupted += 1,
             }
         }
         c
@@ -4105,6 +4121,7 @@ mod status_display_tests {
     #[test]
     fn task_status_display_matches_serde() {
         for s in [
+            TaskStatus::Interrupted,
             TaskStatus::Pending,
             TaskStatus::InProgress,
             TaskStatus::Blocked,
@@ -4122,5 +4139,56 @@ mod status_display_tests {
                 "Display and serde disagree for {s:?}: Display={s}, serde={serde_str}"
             );
         }
+    }
+
+    #[test]
+    fn interrupted_has_its_own_counter_and_is_not_counted_as_anything_else() {
+        let mut tasks: Vec<TaskNode> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|d| TaskNode::new((*d).to_owned()))
+            .collect();
+        tasks[0].status = TaskStatus::Interrupted;
+        tasks[1].status = TaskStatus::Interrupted;
+        tasks[2].status = TaskStatus::Completed;
+        let c = TaskCounts::from_tasks(&tasks);
+        assert_eq!(
+            (c.total, c.interrupted, c.completed, c.pending),
+            (4, 2, 1, 1)
+        );
+        assert_eq!(c.in_progress + c.blocked + c.failed, 0);
+    }
+
+    #[test]
+    fn task_data_written_before_the_status_existed_still_reads_and_does_not_grow_new_fields() {
+        // An older server, a stored payload or a fixture without the new fields.
+        let mut json = serde_json::to_value(TaskNode::new("x".into())).unwrap();
+        let object = json.as_object_mut().unwrap();
+        assert!(
+            !object.contains_key("interrupted_at"),
+            "absent while not interrupted"
+        );
+        assert!(!object.contains_key("interrupted_reason"));
+        let back: TaskNode = serde_json::from_value(json).unwrap();
+        assert_eq!(back.status, TaskStatus::Pending);
+        assert!(back.interrupted_at.is_none() && back.interrupted_reason.is_none());
+
+        // And counters written before the new one.
+        let counts: TaskCounts = serde_json::from_str(
+            r#"{"total":3,"completed":1,"in_progress":1,"blocked":0,"pending":1,"failed":0}"#,
+        )
+        .unwrap();
+        assert_eq!(counts.interrupted, 0);
+    }
+
+    #[test]
+    fn the_status_round_trips_through_the_wire_forms_the_store_uses() {
+        // The store writes the Debug form ("Interrupted") and reads it back through snake_case.
+        assert_eq!(format!("{:?}", TaskStatus::Interrupted), "Interrupted");
+        let read: TaskStatus = serde_json::from_str("\"interrupted\"").unwrap();
+        assert_eq!(read, TaskStatus::Interrupted);
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Interrupted).unwrap(),
+            "\"interrupted\""
+        );
     }
 }

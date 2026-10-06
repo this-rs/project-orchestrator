@@ -137,7 +137,7 @@ enum TaskAction {
         /// Task ID
         id: Uuid,
 
-        /// New status (pending, in_progress, blocked, completed, failed)
+        /// New status (pending, in_progress, blocked, completed, failed, interrupted)
         status: String,
 
         /// Assign to agent

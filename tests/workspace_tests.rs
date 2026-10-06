@@ -818,6 +818,8 @@ async fn test_workspace_milestone_task_association() {
         completed_at: None,
         priority: Some(5),
         assigned_to: None,
+        interrupted_at: None,
+        interrupted_reason: None,
         tags: vec![],
         estimated_complexity: None,
         actual_complexity: None,
