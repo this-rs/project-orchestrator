@@ -153,6 +153,11 @@ pub struct ProviderEntry {
     pub health: HealthEntry,
     /// Models and their capabilities.
     pub models: Vec<ModelEntry>,
+    /// What the instance does whatever the model (permission prompts, sandbox,
+    /// live model switch...), as its provider declares it. Used by the interface
+    /// when a model carries none, and for an instance that lists no model yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Value>,
     /// Where a `claude_code_remote` instance runs; absent for every other kind.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteEntry>,
@@ -205,6 +210,7 @@ pub fn builtin_claude_code(
         credential: "none".to_string(),
         health,
         models,
+        capabilities: None,
         remote: None,
     }
 }

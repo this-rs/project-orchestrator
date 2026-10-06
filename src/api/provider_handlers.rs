@@ -121,6 +121,10 @@ pub async fn stored_entries(
             let allowed = consents
                 .as_ref()
                 .map(|cs| cs.iter().any(|c| st::consent_holds(c, &i)));
+            // What the provider of this instance declares, before any session: an
+            // instance listed with EMPTY capabilities made the interface claim it
+            // could not ask for approval ("policy only") when it can.
+            let caps = crate::chat::provider::native_factory::declared_capabilities(&i);
             let models = i
                 .default_model
                 .iter()
@@ -129,7 +133,7 @@ pub async fn stored_entries(
                         .iter()
                         .find(|a| a.provider == i.id && &a.model == m)
                         .map(|a| a.alias.clone());
-                    ModelEntry::new(m.clone(), alias, &nexus_claude::agent::Capabilities::none())
+                    ModelEntry::new(m.clone(), alias, &caps)
                 })
                 .collect();
             let remote = remote_entry(&i);
@@ -149,6 +153,7 @@ pub async fn stored_entries(
                 credential: i.credential_ref,
                 health: HealthEntry::unknown(),
                 models,
+                capabilities: serde_json::to_value(&caps).ok(),
                 remote,
             }
         })

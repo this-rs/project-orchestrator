@@ -103,6 +103,19 @@ pub async fn list_models(
         .collect())
 }
 
+/// Capabilities an instance declares without touching the network: its provider
+/// is built from the stored record and asked (`capabilities` is static, and
+/// `tools` stays false until a probe has run). A remote Claude Code, or a record
+/// that does not build, declares none.
+pub fn declared_capabilities(record: &InstanceRecord) -> nexus_claude::agent::Capabilities {
+    if record.kind == super::settings::KIND_CLAUDE_CODE_REMOTE {
+        return nexus_claude::agent::Capabilities::none();
+    }
+    build_native_provider(record, None)
+        .map(|p| p.capabilities(record.default_model.as_deref()))
+        .unwrap_or_else(|_| nexus_claude::agent::Capabilities::none())
+}
+
 fn build_native(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
@@ -438,6 +451,24 @@ mod tests {
         let p = build_native_provider(&record("none", Some("llama_server")), None).unwrap();
         assert_eq!(p.id(), "local");
         assert_eq!(p.kind(), nexus_claude::agent::ProviderKind::Native);
+    }
+
+    #[test]
+    fn a_native_instance_declares_permission_prompts_and_no_sandbox_before_any_session() {
+        // Listed with EMPTY capabilities, the interface said such an instance
+        // "cannot pause a tool call to ask you" (policy only) before the first message.
+        let caps = declared_capabilities(&record("none", Some("deepseek")));
+        assert!(caps.interactive_permissions);
+        assert!(caps.set_model_live);
+        assert_eq!(caps.sandbox, nexus_claude::agent::SandboxLevel::None);
+        // Nothing is claimed about tools before a probe has run.
+        assert!(!caps.tools);
+    }
+
+    #[test]
+    fn a_record_that_does_not_build_declares_nothing() {
+        let caps = declared_capabilities(&record("sk-live-abcdef", None));
+        assert_eq!(caps, nexus_claude::agent::Capabilities::none());
     }
 
     #[test]
