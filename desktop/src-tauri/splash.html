@@ -309,6 +309,17 @@
 
     let platformOs = 'macos';
     let globalStartTime = Date.now();
+
+    // A splash that is gone before its animations have played looks like a glitch, not a start.
+    // The entrance (logo, title, rows one after the other, footer) takes about 1.4 s; the last tick
+    // needs its stroke and its particles (about 0.9 s) to be seen before the exit begins. So the
+    // splash is never left sooner than MIN_SPLASH_MS after it opened, nor sooner than
+    // MIN_SETTLE_MS after the last row changed state. A user who asks to continue is not made to wait.
+    const MIN_SPLASH_MS = 1800;
+    const MIN_SETTLE_MS = 900;
+    const splashOpenedAt = Date.now();
+    let lastSettledAt = splashOpenedAt;
+    const reducedMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     const GLOBAL_TIMEOUT = 120000; // 120s
 
     // ========================================================================
@@ -324,6 +335,9 @@
       // Update state class
       const prevState = el.className.replace('check-item', '').trim();
       el.className = 'check-item ' + state;
+      if (state !== prevState && ['success', 'error', 'warning', 'skipped'].includes(state)) {
+        lastSettledAt = Date.now();
+      }
       if (state !== prevState && window.__fxBurst && ['success', 'error', 'warning'].includes(state)) {
         window.__fxBurst(icon, state);
       }
@@ -833,10 +847,18 @@
     // ========================================================================
 
     let leaving = false;
-    async function transitionToMain() {
+    async function transitionToMain(options) {
       if (leaving) return;
       leaving = true;
       document.getElementById('progress-fill').style.width = '100%';
+      if (!(options && options.immediate) && !reducedMotion) {
+        const now = Date.now();
+        const wait = Math.max(MIN_SPLASH_MS - (now - splashOpenedAt), MIN_SETTLE_MS - (now - lastSettledAt), 0);
+        if (wait > 0) {
+          report('info', 'holding the splash ' + wait + ' ms so its animations can play');
+          await sleep(wait);
+        }
+      }
       document.body.classList.add('leaving');
       await sleep(320);   // let the exit animation play before the window closes
       // Signal the Rust backend thread to close the splash and show the main window.
@@ -869,7 +891,7 @@
     function continueAnyway() {
       setStatus('Opening app...');
       document.getElementById('btn-continue').classList.remove('visible');
-      transitionToMain();
+      transitionToMain({ immediate: true });
     }
 
     function sleep(ms) {
