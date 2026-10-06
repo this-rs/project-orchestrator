@@ -88,6 +88,21 @@ pub async fn probe_instance(
     })
 }
 
+/// Models an OpenAI-compatible instance lists (`GET /models`), in the order the
+/// endpoint gives them. Nothing is stored; the key is read for this request only.
+pub async fn list_models(
+    record: &InstanceRecord,
+    vault: Option<Arc<VaultService>>,
+) -> Result<Vec<String>, ProviderError> {
+    let provider = build_native(record, vault)?;
+    Ok(provider
+        .catalog()
+        .await?
+        .into_iter()
+        .map(|m| m.id)
+        .collect())
+}
+
 fn build_native(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
@@ -446,6 +461,49 @@ mod tests {
         acp.kind = "acp".into();
         let err = build_native_provider(&acp, None).err().expect("refused");
         assert_eq!(err.kind(), "invalid_request");
+    }
+
+    // ── list_models ───────────────────────────────────────────────────────
+
+    async fn endpoint_listing(body: serde_json::Value, status: u16) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_the_ids_the_endpoint_gives_in_its_order() {
+        let server = endpoint_listing(
+            serde_json::json!({"object": "list", "data": [{"id": "zeta"}, {"id": "alpha"}]}),
+            200,
+        )
+        .await;
+        let mut r = record("none", Some("llama_server"));
+        r.base_url = format!("{}/v1", server.uri());
+        let ids = list_models(&r, None).await.expect("a listing");
+        assert_eq!(ids, ["zeta", "alpha"]);
+    }
+
+    #[tokio::test]
+    async fn list_models_reports_an_endpoint_that_refuses() {
+        let server = endpoint_listing(serde_json::json!({"error": "no"}), 500).await;
+        let mut r = record("none", Some("llama_server"));
+        r.base_url = format!("{}/v1", server.uri());
+        assert!(list_models(&r, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn list_models_refuses_an_instance_it_cannot_build_without_echoing_a_pasted_key() {
+        let err = list_models(&record("sk-live-abcdef", None), None)
+            .await
+            .expect_err("refused");
+        assert!(!format!("{err:?}{err}").contains("sk-live"));
     }
 
     // ── claude_code_remote ────────────────────────────────────────────────

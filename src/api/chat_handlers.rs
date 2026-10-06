@@ -2085,6 +2085,155 @@ mod tests {
         assert_eq!(entry["endpoint_origin"], "https://8.8.8.8");
     }
 
+    // ── GET /api/chat/providers/{id}/models ─────────────────────────────────
+
+    /// An instance stored straight into the mock graph. The API refuses a private
+    /// address on creation, which is not what these tests are about: they point the
+    /// instance at a local fake endpoint.
+    async fn models_app(kind: &str, base_url: &str, default_model: Option<&str>) -> axum::Router {
+        use crate::chat::provider::settings::{InstanceRecord, GLOBAL, INSTANCE_PREFIX};
+        let state = mock_server_state().await;
+        let record = InstanceRecord {
+            id: "local".into(),
+            kind: kind.into(),
+            preset: (kind == "openai_compatible").then(|| "llama_server".to_string()),
+            label: "Local".into(),
+            base_url: base_url.into(),
+            origin: "http://127.0.0.1".into(),
+            default_model: default_model.map(str::to_string),
+            cost_source: "free".into(),
+            credential_ref: "none".into(),
+            ..Default::default()
+        };
+        state
+            .orchestrator
+            .neo4j_arc()
+            .put_llm_setting(
+                GLOBAL,
+                &format!("{INSTANCE_PREFIX}local"),
+                &serde_json::to_string(&record).unwrap(),
+            )
+            .await
+            .unwrap();
+        create_router(state)
+    }
+
+    /// A fake endpoint answering `GET /v1/models` with `status` and `body`.
+    async fn fake_models_endpoint(body: serde_json::Value, status: u16) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn model_ids(body: &serde_json::Value) -> Vec<String> {
+        body.as_array()
+            .expect("an array of models")
+            .iter()
+            .map(|m| m["id"].as_str().expect("an id").to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_models_of_an_openai_compatible_instance_are_the_ones_its_endpoint_lists() {
+        let server = fake_models_endpoint(
+            serde_json::json!({"object": "list", "data": [{"id": "b"}, {"id": "a"}, {"id": "c"}, {"id": "b"}]}),
+            200,
+        )
+        .await;
+        let app = models_app(
+            "openai_compatible",
+            &format!("{}/v1", server.uri()),
+            Some("a"),
+        )
+        .await;
+        let (status, body) = call_json(&app, auth_get("/api/chat/providers/local/models")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The stored default first, the endpoint's order after it, duplicates collapsed.
+        assert_eq!(model_ids(&body), ["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn an_instance_saved_without_a_default_still_gets_a_picker() {
+        let server = fake_models_endpoint(
+            serde_json::json!({"object": "list", "data": [{"id": "deepseek-chat"}, {"id": "deepseek-reasoner"}]}),
+            200,
+        )
+        .await;
+        let app = models_app("openai_compatible", &format!("{}/v1", server.uri()), None).await;
+        let (status, body) = call_json(&app, auth_get("/api/chat/providers/local/models")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(model_ids(&body), ["deepseek-chat", "deepseek-reasoner"]);
+    }
+
+    #[tokio::test]
+    async fn a_default_the_endpoint_does_not_list_is_kept_first() {
+        let server = fake_models_endpoint(
+            serde_json::json!({"object": "list", "data": [{"id": "a"}]}),
+            200,
+        )
+        .await;
+        let app = models_app(
+            "openai_compatible",
+            &format!("{}/v1", server.uri()),
+            Some("z"),
+        )
+        .await;
+        let (_, body) = call_json(&app, auth_get("/api/chat/providers/local/models")).await;
+        assert_eq!(model_ids(&body), ["z", "a"]);
+    }
+
+    #[tokio::test]
+    async fn a_refusing_endpoint_falls_back_to_the_stored_default() {
+        let server = fake_models_endpoint(serde_json::json!({"error": "nope"}), 500).await;
+        let app = models_app(
+            "openai_compatible",
+            &format!("{}/v1", server.uri()),
+            Some("kept"),
+        )
+        .await;
+        let (status, body) = call_json(&app, auth_get("/api/chat/providers/local/models")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(model_ids(&body), ["kept"]);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_endpoint_or_an_empty_list_falls_back_to_the_stored_default() {
+        // Nothing listens on this port: the listing fails, the picker is not left empty.
+        let app = models_app("openai_compatible", "http://127.0.0.1:9/v1", Some("kept")).await;
+        let (status, body) = call_json(&app, auth_get("/api/chat/providers/local/models")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(model_ids(&body), ["kept"]);
+
+        let server =
+            fake_models_endpoint(serde_json::json!({"object": "list", "data": []}), 200).await;
+        let app = models_app(
+            "openai_compatible",
+            &format!("{}/v1", server.uri()),
+            Some("kept"),
+        )
+        .await;
+        let (_, body) = call_json(&app, auth_get("/api/chat/providers/local/models")).await;
+        assert_eq!(model_ids(&body), ["kept"]);
+    }
+
+    #[tokio::test]
+    async fn a_process_instance_answers_with_its_stored_default_without_any_network() {
+        // codex chooses its own models: no endpoint is asked (this one would refuse).
+        let app = models_app("codex", "", Some("gpt-x")).await;
+        let (status, body) = call_json(&app, auth_get("/api/chat/providers/local/models")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(model_ids(&body), ["gpt-x"]);
+        // And an unknown instance is a 404, not an empty list.
+        let (status, _) = call_json(&app, auth_get("/api/chat/providers/nope/models")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn get_provider_is_refused_to_an_agent_token() {
         use crate::api::provider_handlers::get_provider;
