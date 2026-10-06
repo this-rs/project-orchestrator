@@ -1953,6 +1953,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(provider_handlers::test_provider),
         )
         .route(
+            "/api/chat/providers/ssh-host-key",
+            post(provider_handlers::scan_ssh_host_key),
+        )
+        .route(
             "/api/chat/providers/{id}",
             get(provider_handlers::get_provider)
                 .put(provider_handlers::update_provider)

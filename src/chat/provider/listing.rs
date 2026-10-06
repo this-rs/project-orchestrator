@@ -49,6 +49,11 @@ pub struct HealthEntry {
     /// RFC 3339 time of the check.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checked_at: Option<String>,
+    /// A fixed readable sentence saying why the instance cannot be used (set for
+    /// a remote machine only: "the host key does not match the pinned key"...).
+    /// Never the raw output of a client, never a path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl HealthEntry {
@@ -59,7 +64,36 @@ impl HealthEntry {
             code: None,
             action: None,
             checked_at: None,
+            reason: None,
         }
+    }
+
+    /// The reason a REMOTE machine is unavailable, from what nexus reported.
+    /// Nexus answers fixed sentences; anything that looks like a path is dropped
+    /// anyway (defence in depth: an identity file path must never leave).
+    pub fn with_remote_reason(mut self, health: &ProviderHealth) -> Self {
+        if health.status != HealthStatus::Unavailable {
+            return self;
+        }
+        let text = match &health.error {
+            Some(ProviderError::EndpointUnreachable { detail }) => detail.clone(),
+            Some(ProviderError::CliNotFound { program }) => {
+                format!("the CLI is not installed on the machine ({program})")
+            }
+            Some(ProviderError::CredentialsLocked) => {
+                "the vault is locked: the SSH key cannot be read".to_string()
+            }
+            Some(ProviderError::AuthRequired { .. }) => {
+                "the SSH key is not granted to this instance in the vault".to_string()
+            }
+            _ => return self,
+        };
+        self.reason = Some(if text.contains(['/', '\\']) || text.len() > 300 {
+            "the machine cannot be used".to_string()
+        } else {
+            text
+        });
+        self
     }
 
     /// From the health nexus reports.
@@ -91,6 +125,7 @@ impl HealthEntry {
             code,
             action: health.login_hint.clone(),
             checked_at,
+            reason: None,
         }
     }
 }
@@ -100,7 +135,7 @@ impl HealthEntry {
 pub struct ProviderEntry {
     /// Instance identifier.
     pub id: String,
-    /// `claude_code | openai_compatible | codex | acp`.
+    /// `claude_code | openai_compatible | codex | acp | claude_code_remote`.
     pub kind: &'static str,
     /// Display label.
     pub label: String,
@@ -118,6 +153,29 @@ pub struct ProviderEntry {
     pub health: HealthEntry,
     /// Models and their capabilities.
     pub models: Vec<ModelEntry>,
+    /// Where a `claude_code_remote` instance runs; absent for every other kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteEntry>,
+}
+
+/// The machine of a `claude_code_remote` instance, as the listing shows it:
+/// the pinned key's FINGERPRINT (public), never the key file or its vault name.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RemoteEntry {
+    /// Host name or address.
+    pub host: String,
+    /// Remote user, when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_user: Option<String>,
+    /// ssh port (22 when none was set).
+    pub ssh_port: u16,
+    /// `SHA256:...` fingerprint of the pinned host key.
+    pub host_key_fingerprint: Option<String>,
+    /// Working directory on the machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_cwd: Option<String>,
+    /// The no-confirmation mode is allowed on that machine.
+    pub allow_trust: bool,
 }
 
 /// The listing.
@@ -147,6 +205,7 @@ pub fn builtin_claude_code(
         credential: "none".to_string(),
         health,
         models,
+        remote: None,
     }
 }
 
@@ -269,5 +328,38 @@ mod tests {
         assert_eq!(p["models"][0]["alias"], "default");
         assert!(p["models"][0]["capabilities"].is_object());
         assert_eq!(v["default_provider"], "claude-code");
+    }
+
+    #[test]
+    fn a_remote_reason_is_a_fixed_sentence_and_a_path_never_leaves() {
+        let unreachable = |detail: &str| {
+            let h = ProviderHealth::unavailable(ProviderError::unreachable(detail));
+            HealthEntry::from_nexus(&h).with_remote_reason(&h)
+        };
+        let ok = unreachable("deploy@box:22: the host key does not match the pinned key");
+        assert_eq!(
+            ok.reason.as_deref(),
+            Some("deploy@box:22: the host key does not match the pinned key")
+        );
+        // Whatever a lower layer puts in the text, a path is replaced.
+        let leaked = unreachable("identity file /tmp/nexus-1234/id_ssh must be owner-only");
+        assert_eq!(leaked.reason.as_deref(), Some("the machine cannot be used"));
+        let long = unreachable(&"x".repeat(400));
+        assert_eq!(long.reason.as_deref(), Some("the machine cannot be used"));
+        // A healthy instance has no reason, and no other kind gets one from the plain mapping.
+        let h = ProviderHealth::ok(None);
+        assert!(HealthEntry::from_nexus(&h)
+            .with_remote_reason(&h)
+            .reason
+            .is_none());
+        assert!(
+            HealthEntry::from_nexus(&ProviderHealth::unavailable(ProviderError::unreachable(
+                "x"
+            )))
+            .reason
+            .is_none()
+        );
+        let json = serde_json::to_value(HealthEntry::unknown()).unwrap();
+        assert!(json.get("reason").is_none(), "additive: absent unless set");
     }
 }

@@ -42,6 +42,7 @@ an identifier or a secret.
 | 403 | `tool_not_in_profile` | The route is behind a tool the restricted profile withholds. |
 | 403 | `envelope_*` | A delegated session left its envelope (`unbound_token`, `parent_not_found`, `depth_exceeded`, `too_many_children`, `cwd_outside_parent`, `add_dir_outside_parent`, `project_mismatch`, `workspace_mismatch`, `not_a_child`). |
 | 400 | `credential_ref ...` | A malformed reference, a pasted secret, or an undeclared `env:` variable. |
+| 400 | `host`, `ssh_user`, `ssh_port`, `host_key`, `remote_cwd` | A `claude_code_remote` instance with a malformed machine: host or user not a plain name (never a leading `-`), port outside 1-65535, key not exactly `<type> <base64>`, no working directory, or a credential that is not `vault:<name>`. |
 | 400 | `endpoint refused: ...` | The endpoint guard: scheme, credentials in the URL, host missing, private address, unresolvable, redirects. |
 | 404 | `unknown provider instance` | No such instance (also for a vault grant and for a run's provider). |
 | 400 | `a provider grant ...` | A provider grant must name exactly the instance's key. |

@@ -881,6 +881,7 @@ mod tests {
             default_model: Some("m".into()),
             cost_source: "unknown".into(),
             credential_ref: credential_ref.into(),
+            ..Default::default()
         };
         state
             .orchestrator

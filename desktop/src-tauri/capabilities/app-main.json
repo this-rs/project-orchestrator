@@ -1,0 +1,32 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "app-main",
+  "description": "Application commands the web app calls from the main window while it is served from the app protocol (tauri://localhost, before it navigates to the embedded backend). Same list as remote.json; tests/desktop_acl.rs keeps them equal.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "allow-get-server-port",
+    "allow-test-connection-detailed",
+    "allow-open-url",
+    "allow-pick-directory",
+    "allow-restart-app",
+    "allow-generate-config",
+    "allow-read-config",
+    "allow-detect-shell-path",
+    "allow-check-cli-status",
+    "allow-install-cli",
+    "allow-setup-claude-code",
+    "allow-verify-oidc-discovery",
+    "allow-check-embedding-model",
+    "allow-download-embedding-model",
+    "allow-test-embedding-endpoint",
+    "allow-check-docker",
+    "allow-open-docker-desktop",
+    "allow-test-connection",
+    "allow-check-update",
+    "allow-install-update",
+    "allow-enable-modern-window-style",
+    "allow-webview-log"
+  ]
+}

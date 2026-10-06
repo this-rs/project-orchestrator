@@ -139,7 +139,7 @@ pub fn parse_credential_ref(
 
 /// Body of `POST /chat/providers[/test]`. Unknown fields (an `api_key`, a
 /// `token`...) are refused: no secret is accepted in these bodies.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstanceDraft {
     /// Instance identifier (slug).
@@ -164,10 +164,28 @@ pub struct InstanceDraft {
     /// Credential reference.
     #[serde(default)]
     pub credential_ref: Option<String>,
+    /// `claude_code_remote`: host name or address of the machine.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// `claude_code_remote`: remote user (the ssh default when absent).
+    #[serde(default)]
+    pub ssh_user: Option<String>,
+    /// `claude_code_remote`: ssh port (22 when absent).
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+    /// `claude_code_remote`: the PINNED public key of the host, `<type> <base64>`.
+    #[serde(default)]
+    pub host_key: Option<String>,
+    /// `claude_code_remote`: working directory ON THE REMOTE machine.
+    #[serde(default)]
+    pub remote_cwd: Option<String>,
+    /// `claude_code_remote`: allow the no-confirmation mode on that machine.
+    #[serde(default)]
+    pub allow_trust: Option<bool>,
 }
 
 /// Body of `PUT|PATCH /chat/providers/{id}`: the id and the kind never change.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstancePatch {
     /// Preset.
@@ -188,10 +206,28 @@ pub struct InstancePatch {
     /// Credential reference.
     #[serde(default)]
     pub credential_ref: Option<String>,
+    /// `claude_code_remote`: host name or address of the machine.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// `claude_code_remote`: remote user (the ssh default when absent).
+    #[serde(default)]
+    pub ssh_user: Option<String>,
+    /// `claude_code_remote`: ssh port (22 when absent).
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+    /// `claude_code_remote`: the PINNED public key of the host, `<type> <base64>`.
+    #[serde(default)]
+    pub host_key: Option<String>,
+    /// `claude_code_remote`: working directory ON THE REMOTE machine.
+    #[serde(default)]
+    pub remote_cwd: Option<String>,
+    /// `claude_code_remote`: allow the no-confirmation mode on that machine.
+    #[serde(default)]
+    pub allow_trust: Option<bool>,
 }
 
 /// A stored provider instance.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct InstanceRecord {
     /// Identifier.
     pub id: String,
@@ -213,6 +249,109 @@ pub struct InstanceRecord {
     pub cost_source: String,
     /// Credential reference.
     pub credential_ref: String,
+    /// `claude_code_remote`: host of the machine.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// `claude_code_remote`: remote user.
+    #[serde(default)]
+    pub ssh_user: Option<String>,
+    /// `claude_code_remote`: ssh port.
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+    /// `claude_code_remote`: the pinned public key, `<type> <base64>`.
+    #[serde(default)]
+    pub host_key: Option<String>,
+    /// `claude_code_remote`: working directory on the remote machine.
+    #[serde(default)]
+    pub remote_cwd: Option<String>,
+    /// `claude_code_remote`: the no-confirmation mode is allowed on that machine.
+    #[serde(default)]
+    pub allow_trust: bool,
+}
+
+impl InstanceRecord {
+    /// OpenSSH fingerprint (`SHA256:...`) of the pinned host key, when there is one.
+    pub fn host_key_fingerprint(&self) -> Option<String> {
+        self.host_key.as_deref().and_then(host_key_fingerprint)
+    }
+}
+
+/// The kind of an instance that runs Claude Code on another machine over SSH.
+pub const KIND_CLAUDE_CODE_REMOTE: &str = "claude_code_remote";
+
+/// OpenSSH fingerprint of a `<type> <base64>` public key: `SHA256:` and the
+/// unpadded base64 of the SHA-256 of the decoded key blob (what `ssh-keygen -lf`
+/// prints). `None` when the text is not a well-formed key.
+pub fn host_key_fingerprint(host_key: &str) -> Option<String> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let (_, blob) = parse_host_key(host_key).ok()?;
+    let raw = STANDARD.decode(blob).ok()?;
+    Some(format!(
+        "SHA256:{}",
+        STANDARD_NO_PAD.encode(Sha256::digest(raw))
+    ))
+}
+
+/// Splits `<type> <base64>`: exactly two words, a key type and a base64 blob.
+pub fn parse_host_key(raw: &str) -> Result<(&str, &str), SettingsError> {
+    let mut parts = raw.split_whitespace();
+    let (kind, blob, rest) = (parts.next(), parts.next(), parts.next());
+    match (kind, blob, rest) {
+        (Some(k), Some(b), None)
+            if (k.starts_with("ssh-") || k.starts_with("ecdsa-") || k.starts_with("sk-"))
+                && k.len() <= 64
+                && b.len() >= 16
+                && b.len() <= 8192
+                && b.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"+/=".contains(&c)) =>
+        {
+            Ok((k, b))
+        }
+        _ => Err(invalid(
+            "host_key: exactly '<type> <base64>' (the key is pinned, never learned)",
+        )),
+    }
+}
+
+/// A host or user name, same rule as the transport: letters, digits and
+/// `. _ - : @ [ ] %`, never starting with `-` (ssh would read an option).
+pub fn valid_ssh_word(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && !value.starts_with('-')
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._-:@[]%".contains(&c))
+}
+
+fn valid_remote_cwd(cwd: &str) -> bool {
+    !cwd.trim().is_empty() && cwd.len() <= 1024 && !cwd.contains(['\0', '\n', '\r'])
+}
+
+/// Identity a consent of the remote kind is tied to: where the session's
+/// content goes, `ssh:[user@]host:port`.
+pub fn ssh_origin(host: &str, user: Option<&str>, port: Option<u16>) -> String {
+    format!(
+        "ssh:{}{}:{}",
+        user.map(|u| format!("{u}@")).unwrap_or_default(),
+        host,
+        port.unwrap_or(22)
+    )
+}
+
+/// Slug of a label for an instance id: lowercase letters, digits and dashes.
+fn slugify(label: &str) -> String {
+    let mut out = String::new();
+    for c in label.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+    }
+    out.trim_end_matches('-').to_string()
 }
 
 const COST_SOURCES: [&str; 5] = ["reported", "priced", "free", "subscription", "unknown"];
@@ -257,7 +396,7 @@ pub fn parse_acp_commands(raw: &str) -> std::collections::BTreeMap<String, Vec<S
 /// Kinds that run a local process instead of calling an endpoint: they have no
 /// URL, their consent is tied to a process identity.
 pub fn is_process_kind(kind: &str) -> bool {
-    matches!(kind, "codex" | "acp")
+    matches!(kind, "codex" | "acp" | KIND_CLAUDE_CODE_REMOTE)
 }
 
 /// Identity a consent of a process kind is tied to (it plays the role of the origin).
@@ -275,21 +414,88 @@ pub fn record_from_draft(
     policy: &EndpointPolicy,
     env_allow: &[String],
 ) -> Result<InstanceRecord, SettingsError> {
-    let id = draft.id.clone().ok_or_else(|| invalid("id is required"))?;
-    if id == CLAUDE_CODE {
-        return Err(SettingsError::Builtin);
-    }
-    if !valid_id(&id) {
-        return Err(invalid("id: lowercase letters, digits and dashes only"));
-    }
     let kind = draft
         .kind
         .clone()
         .unwrap_or_else(|| "openai_compatible".into());
-    if !matches!(kind.as_str(), "openai_compatible" | "codex" | "acp") {
-        return Err(invalid("kind: openai_compatible, codex or acp"));
+    let remote = kind == KIND_CLAUDE_CODE_REMOTE;
+    // A remote instance has no free-form id: `claude-code@<slug of the label>`.
+    // `claude-code` alone stays the built-in local instance and is refused for
+    // every user instance, whatever its kind.
+    let id = if remote {
+        if draft.id.as_deref() == Some(CLAUDE_CODE) {
+            return Err(SettingsError::Builtin);
+        }
+        let name = slugify(draft.label.as_deref().unwrap_or_default());
+        if name.is_empty() {
+            return Err(invalid(
+                "label: a name is required (it makes the instance id)",
+            ));
+        }
+        let name: String = name.chars().take(36).collect();
+        format!("{CLAUDE_CODE}@{}", name.trim_end_matches('-'))
+    } else {
+        draft.id.clone().ok_or_else(|| invalid("id is required"))?
+    };
+    if id == CLAUDE_CODE {
+        return Err(SettingsError::Builtin);
     }
-    let (base_url, origin) = if is_process_kind(&kind) {
+    if !remote && !valid_id(&id) {
+        return Err(invalid("id: lowercase letters, digits and dashes only"));
+    }
+    if !matches!(
+        kind.as_str(),
+        "openai_compatible" | "codex" | "acp" | KIND_CLAUDE_CODE_REMOTE
+    ) {
+        return Err(invalid(
+            "kind: openai_compatible, codex, acp or claude_code_remote",
+        ));
+    }
+    if !remote && draft_has_remote_fields(draft) {
+        return Err(invalid(
+            "host, ssh_user, ssh_port, host_key, remote_cwd and allow_trust belong to claude_code_remote",
+        ));
+    }
+    let (base_url, origin) = if remote {
+        if draft
+            .base_url
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty())
+        {
+            return Err(invalid(
+                "base_url: not used by a claude_code_remote instance",
+            ));
+        }
+        let host = draft.host.as_deref().unwrap_or_default();
+        if !valid_ssh_word(host) {
+            return Err(invalid(
+                "host: a plain name or address (letters, digits and . _ - : [ ] % @, not starting with '-')",
+            ));
+        }
+        if draft
+            .ssh_user
+            .as_deref()
+            .is_some_and(|u| !valid_ssh_word(u))
+        {
+            return Err(invalid("ssh_user: a plain user name"));
+        }
+        if draft.ssh_port == Some(0) {
+            return Err(invalid("ssh_port: between 1 and 65535"));
+        }
+        parse_host_key(draft.host_key.as_deref().unwrap_or_default())?;
+        if host_key_fingerprint(draft.host_key.as_deref().unwrap_or_default()).is_none() {
+            return Err(invalid("host_key: the key is not valid base64"));
+        }
+        if !draft.remote_cwd.as_deref().is_some_and(valid_remote_cwd) {
+            return Err(invalid(
+                "remote_cwd: the working directory on the remote machine is required",
+            ));
+        }
+        (
+            String::new(),
+            ssh_origin(host, draft.ssh_user.as_deref(), draft.ssh_port),
+        )
+    } else if is_process_kind(&kind) {
         // A process instance has no URL, and an API body never carries a command.
         if draft
             .base_url
@@ -326,7 +532,13 @@ pub fn record_from_draft(
         .credential_ref
         .clone()
         .unwrap_or_else(|| "none".into());
-    parse_credential_ref(&credential_ref, env_allow)?;
+    if remote {
+        // The SSH private key lives in the vault: never an `env:` variable of the
+        // server, never a value, never nothing (a remote machine needs a key).
+        require_vault_ref(&credential_ref)?;
+    } else {
+        parse_credential_ref(&credential_ref, env_allow)?;
+    }
     if kind == "acp" && credential_ref != "none" {
         return Err(invalid("credential_ref: an ACP agent holds its own login"));
     }
@@ -353,7 +565,48 @@ pub fn record_from_draft(
         default_model: draft.default_model.clone().filter(|m| !m.trim().is_empty()),
         cost_source,
         credential_ref,
+        host: remote.then(|| draft.host.clone()).flatten(),
+        ssh_user: remote.then(|| draft.ssh_user.clone()).flatten(),
+        ssh_port: remote.then_some(draft.ssh_port).flatten(),
+        host_key: remote
+            .then(|| draft.host_key.as_deref().map(normalize_host_key))
+            .flatten(),
+        remote_cwd: remote.then(|| draft.remote_cwd.clone()).flatten(),
+        allow_trust: remote && draft.allow_trust.unwrap_or(false),
     })
+}
+
+fn draft_has_remote_fields(d: &InstanceDraft) -> bool {
+    d.host.is_some()
+        || d.ssh_user.is_some()
+        || d.ssh_port.is_some()
+        || d.host_key.is_some()
+        || d.remote_cwd.is_some()
+        || d.allow_trust.is_some()
+}
+
+fn patch_has_remote_fields(p: &InstancePatch) -> bool {
+    p.host.is_some()
+        || p.ssh_user.is_some()
+        || p.ssh_port.is_some()
+        || p.host_key.is_some()
+        || p.remote_cwd.is_some()
+        || p.allow_trust.is_some()
+}
+
+/// One space between the two words, nothing around them.
+fn normalize_host_key(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The credential of a remote instance: `vault:<name>`, nothing else.
+fn require_vault_ref(raw: &str) -> Result<(), SettingsError> {
+    match parse_credential_ref(raw, &[])? {
+        CredentialSource::Vault(_) => Ok(()),
+        _ => Err(invalid(
+            "credential_ref: a remote instance needs `vault:<name>` (the SSH private key, stored in the vault)",
+        )),
+    }
 }
 
 /// Applies a patch to a record; returns the new record and whether the ORIGIN
@@ -372,7 +625,58 @@ pub fn apply_patch(
         next.preset = patch.preset.clone();
     }
     if patch.base_url.is_some() && is_process_kind(&old.kind) {
-        return Err(invalid("base_url: not used by a codex or acp instance"));
+        return Err(invalid("base_url: not used by a process instance"));
+    }
+    let remote = old.kind == KIND_CLAUDE_CODE_REMOTE;
+    if !remote && patch_has_remote_fields(patch) {
+        return Err(invalid(
+            "host, ssh_user, ssh_port, host_key, remote_cwd and allow_trust belong to claude_code_remote",
+        ));
+    }
+    if remote {
+        if let Some(host) = patch.host.as_ref() {
+            if !valid_ssh_word(host) {
+                return Err(invalid("host: a plain name or address"));
+            }
+            next.host = Some(host.clone());
+        }
+        if let Some(user) = patch.ssh_user.as_ref() {
+            // An empty string clears the user (the ssh default).
+            if user.is_empty() {
+                next.ssh_user = None;
+            } else if valid_ssh_word(user) {
+                next.ssh_user = Some(user.clone());
+            } else {
+                return Err(invalid("ssh_user: a plain user name"));
+            }
+        }
+        if let Some(port) = patch.ssh_port {
+            if port == 0 {
+                return Err(invalid("ssh_port: between 1 and 65535"));
+            }
+            next.ssh_port = Some(port);
+        }
+        if let Some(key) = patch.host_key.as_ref() {
+            parse_host_key(key)?;
+            if host_key_fingerprint(key).is_none() {
+                return Err(invalid("host_key: the key is not valid base64"));
+            }
+            next.host_key = Some(normalize_host_key(key));
+        }
+        if let Some(cwd) = patch.remote_cwd.as_ref() {
+            if !valid_remote_cwd(cwd) {
+                return Err(invalid("remote_cwd: a directory on the remote machine"));
+            }
+            next.remote_cwd = Some(cwd.clone());
+        }
+        if let Some(trust) = patch.allow_trust {
+            next.allow_trust = trust;
+        }
+        next.origin = ssh_origin(
+            next.host.as_deref().unwrap_or_default(),
+            next.ssh_user.as_deref(),
+            next.ssh_port,
+        );
     }
     if let Some(url) = patch.base_url.as_ref() {
         next.origin = check_url(url, policy)?;
@@ -390,18 +694,26 @@ pub fn apply_patch(
         next.cost_source = cost.clone();
     }
     if let Some(cred) = patch.credential_ref.as_ref() {
-        parse_credential_ref(cred, env_allow)?;
+        if remote {
+            require_vault_ref(cred)?;
+        } else {
+            parse_credential_ref(cred, env_allow)?;
+        }
         next.credential_ref = cred.clone();
     }
     // A consent is tied to the origin AND to the credential reference: changing
     // either sends the project's content somewhere or with something it did not
     // agree to.
-    let origin_changed = next.origin != old.origin || next.credential_ref != old.credential_ref;
+    // For a remote machine the pinned host key is part of who receives the
+    // content: a new key is a new machine.
+    let origin_changed = next.origin != old.origin
+        || next.credential_ref != old.credential_ref
+        || next.host_key != old.host_key;
     Ok((next, origin_changed))
 }
 
 /// A stored consent: who allowed which origin for a project, and when.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ConsentRecord {
     /// Instance.
     pub provider_id: String,
@@ -416,14 +728,20 @@ pub struct ConsentRecord {
     /// no credential.
     #[serde(default)]
     pub credential_ref: Option<String>,
+    /// Fingerprint of the pinned host key the consent was given for (a remote
+    /// machine only): the same host name with another key is another machine.
+    #[serde(default)]
+    pub host_key_fingerprint: Option<String>,
 }
 
 /// Whether a consent still holds for the instance as it is now: same origin
-/// AND same credential reference (A28).
+/// AND same credential reference (A28), and for a remote machine the same
+/// pinned host key.
 pub fn consent_holds(consent: &ConsentRecord, instance: &InstanceRecord) -> bool {
     consent.provider_id == instance.id
         && consent.origin == instance.origin
         && consent.credential_ref.as_deref().unwrap_or("none") == instance.credential_ref
+        && consent.host_key_fingerprint == instance.host_key_fingerprint()
 }
 
 /// A consent row as the API answers it: `valid` is false when the instance's
@@ -640,6 +958,7 @@ mod tests {
             default_model: Some("deepseek-chat".into()),
             cost_source: Some("priced".into()),
             credential_ref: Some("vault:deepseek".into()),
+            ..Default::default()
         }
     }
 
@@ -740,6 +1059,7 @@ mod tests {
             consented_by: "me@example.com".into(),
             consented_at: "2026-10-05T10:00:00Z".into(),
             credential_ref: Some(old.credential_ref.clone()),
+            ..Default::default()
         };
         assert!(consent_view(&consent, Some(&old)).valid);
         let patch = InstancePatch {
@@ -749,6 +1069,7 @@ mod tests {
             default_model: None,
             cost_source: None,
             credential_ref: None,
+            ..Default::default()
         };
         let (next, changed) = apply_patch(&old, &patch, &EndpointPolicy::default(), &[]).unwrap();
         assert!(changed);
@@ -868,6 +1189,7 @@ mod tests {
             consented_by: "me".into(),
             consented_at: "t".into(),
             credential_ref: Some(old.credential_ref.clone()),
+            host_key_fingerprint: old.host_key_fingerprint(),
         };
         assert!(consent_holds(&consent, &old));
         let patch = InstancePatch {
@@ -877,6 +1199,7 @@ mod tests {
             default_model: None,
             cost_source: None,
             credential_ref: Some("vault:another-key".into()),
+            ..Default::default()
         };
         let (next, changed) = apply_patch(&old, &patch, &EndpointPolicy::default(), &[]).unwrap();
         assert!(changed, "the API reports the consent as invalidated");
@@ -906,6 +1229,7 @@ mod tests {
             default_model: None,
             cost_source: None,
             credential_ref: None,
+            ..Default::default()
         };
         let r = record_from_draft(&codex, &EndpointPolicy::default(), &[]).unwrap();
         assert_eq!(
@@ -943,5 +1267,268 @@ mod tests {
                 && is_process_kind("codex")
                 && !is_process_kind("openai_compatible")
         );
+    }
+
+    // ── claude_code_remote ────────────────────────────────────────────────
+
+    /// A real ed25519 host key and its `ssh-keygen -lf` fingerprint.
+    const KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXTCY3J636nEyMNqNrVj6HXnIXUnXL8sk4c5J6tek3N";
+    const KEY_FP: &str = "SHA256:lP63ZdLutNnRU0/59cDaFw2mPoJzdasi0I3zFrtS3Ak";
+    const OTHER_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl";
+
+    fn remote_draft() -> InstanceDraft {
+        InstanceDraft {
+            kind: Some(KIND_CLAUDE_CODE_REMOTE.into()),
+            label: Some("Build box 1".into()),
+            host: Some("build-1.example.net".into()),
+            ssh_user: Some("deploy".into()),
+            ssh_port: Some(2222),
+            host_key: Some(KEY.into()),
+            remote_cwd: Some("/srv/work".into()),
+            credential_ref: Some("vault:ssh-build-1".into()),
+            default_model: Some("sonnet".into()),
+            ..Default::default()
+        }
+    }
+
+    fn remote_record() -> InstanceRecord {
+        record_from_draft(&remote_draft(), &EndpointPolicy::default(), &[]).unwrap()
+    }
+
+    fn refused(d: InstanceDraft) -> String {
+        match record_from_draft(&d, &EndpointPolicy::default(), &[]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected a refusal"),
+        }
+    }
+
+    #[test]
+    fn a_remote_draft_becomes_a_record_with_a_forced_id_and_an_ssh_origin() {
+        let r = remote_record();
+        assert_eq!(r.id, "claude-code@build-box-1");
+        assert_eq!(r.kind, "claude_code_remote");
+        assert_eq!(r.origin, "ssh:deploy@build-1.example.net:2222");
+        assert!(r.base_url.is_empty());
+        assert!(is_process_kind(&r.kind));
+        assert_eq!(r.host_key_fingerprint().as_deref(), Some(KEY_FP));
+        assert!(!r.allow_trust);
+        // The id a caller sent is not honoured (only the label makes it).
+        let mut d = remote_draft();
+        d.id = Some("anything".into());
+        assert_eq!(
+            record_from_draft(&d, &EndpointPolicy::default(), &[])
+                .unwrap()
+                .id,
+            "claude-code@build-box-1"
+        );
+    }
+
+    #[test]
+    fn the_origin_defaults_to_port_22_and_no_user() {
+        let mut d = remote_draft();
+        d.ssh_user = None;
+        d.ssh_port = None;
+        let r = record_from_draft(&d, &EndpointPolicy::default(), &[]).unwrap();
+        assert_eq!(r.origin, "ssh:build-1.example.net:22");
+    }
+
+    #[test]
+    fn the_fingerprint_is_the_openssh_one() {
+        assert_eq!(host_key_fingerprint(KEY).as_deref(), Some(KEY_FP));
+        assert_eq!(
+            host_key_fingerprint("ssh-ed25519 not*base64*at-all-xx"),
+            None
+        );
+        assert_eq!(host_key_fingerprint("garbage"), None);
+    }
+
+    #[test]
+    fn the_reserved_id_stays_reserved_for_every_kind() {
+        let mut d = remote_draft();
+        d.id = Some("claude-code".into());
+        assert!(matches!(
+            record_from_draft(&d, &EndpointPolicy::default(), &[]),
+            Err(SettingsError::Builtin)
+        ));
+        let mut local = draft();
+        local.id = Some("claude-code".into());
+        assert!(matches!(
+            record_from_draft(&local, &EndpointPolicy::default(), &[]),
+            Err(SettingsError::Builtin)
+        ));
+        // A label that makes no slug cannot make an id.
+        let mut d = remote_draft();
+        d.label = Some("!!!".into());
+        assert!(refused(d).contains("label"));
+    }
+
+    #[test]
+    fn every_bad_remote_draft_is_refused() {
+        for bad_host in [
+            "",
+            "-oProxyCommand=evil",
+            "host name",
+            "host;rm",
+            "host\nx",
+            "a$(b)",
+            "host'x",
+        ] {
+            let mut d = remote_draft();
+            d.host = Some(bad_host.into());
+            assert!(refused(d).contains("host"), "{bad_host:?}");
+        }
+        let mut d = remote_draft();
+        d.host = None;
+        assert!(refused(d).contains("host"));
+        let mut d = remote_draft();
+        d.ssh_user = Some("-lroot".into());
+        assert!(refused(d).contains("ssh_user"));
+        let mut d = remote_draft();
+        d.ssh_port = Some(0);
+        assert!(refused(d).contains("ssh_port"));
+        for bad_key in [
+            "",
+            "ssh-ed25519",
+            "ssh-ed25519 AAAA",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXTCY3J636nEyMNqNrVj6HXnIXUnXL8sk4c5J6tek3N extra",
+            "rsa AAAAC3NzaC1lZDI1NTE5AAAAIEXTCY3J636nEyMNqNrVj6HXnIXUnXL8sk4c5J6tek3N",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXTCY3J636nEyMNq$(id)",
+        ] {
+            let mut d = remote_draft();
+            d.host_key = Some(bad_key.into());
+            assert!(refused(d).contains("host_key"), "{bad_key:?}");
+        }
+        let mut d = remote_draft();
+        d.host_key = None;
+        assert!(refused(d).contains("host_key"));
+        let mut d = remote_draft();
+        d.remote_cwd = None;
+        assert!(refused(d).contains("remote_cwd"));
+        let mut d = remote_draft();
+        d.base_url = Some("https://example.com".into());
+        assert!(refused(d).contains("base_url"));
+    }
+
+    #[test]
+    fn a_remote_credential_is_a_vault_reference_and_nothing_else() {
+        for bad in [
+            None,
+            Some("none"),
+            Some(""),
+            Some("env:HOME"),
+            Some("-----BEGIN OPENSSH PRIVATE KEY-----"),
+            Some("vault:bad name"),
+        ] {
+            let mut d = remote_draft();
+            d.credential_ref = bad.map(str::to_string);
+            assert!(refused(d).contains("credential_ref"), "{bad:?}");
+        }
+        // Even an env var the operator declared is not accepted for this kind.
+        let mut d = remote_draft();
+        d.credential_ref = Some("env:MY_SSH".into());
+        assert!(
+            record_from_draft(&d, &EndpointPolicy::default(), &["MY_SSH".to_string()]).is_err()
+        );
+    }
+
+    #[test]
+    fn remote_fields_on_another_kind_are_refused() {
+        let mut d = draft();
+        d.host = Some("example.net".into());
+        assert!(refused(d).contains("claude_code_remote"));
+        let patch = InstancePatch {
+            host: Some("example.net".into()),
+            ..Default::default()
+        };
+        let old = record_from_draft(&draft(), &EndpointPolicy::default(), &[]).unwrap();
+        assert!(apply_patch(&old, &patch, &EndpointPolicy::default(), &[]).is_err());
+    }
+
+    #[test]
+    fn a_change_of_machine_revokes_consent() {
+        let old = remote_record();
+        let consent = ConsentRecord {
+            provider_id: old.id.clone(),
+            origin: old.origin.clone(),
+            consented_by: "me".into(),
+            consented_at: "t".into(),
+            credential_ref: Some(old.credential_ref.clone()),
+            host_key_fingerprint: old.host_key_fingerprint(),
+        };
+        assert!(consent_holds(&consent, &old));
+        let patches = [
+            InstancePatch {
+                host: Some("other.example.net".into()),
+                ..Default::default()
+            },
+            InstancePatch {
+                ssh_port: Some(22),
+                ..Default::default()
+            },
+            InstancePatch {
+                ssh_user: Some("root".into()),
+                ..Default::default()
+            },
+            InstancePatch {
+                host_key: Some(OTHER_KEY.into()),
+                ..Default::default()
+            },
+        ];
+        for patch in patches {
+            let (next, changed) =
+                apply_patch(&old, &patch, &EndpointPolicy::default(), &[]).unwrap();
+            assert!(changed, "{patch:?}");
+            assert!(!consent_holds(&consent, &next), "{patch:?}");
+        }
+        // A working-directory or label change is not a new destination.
+        let patch = InstancePatch {
+            remote_cwd: Some("/other".into()),
+            label: Some("renamed".into()),
+            ..Default::default()
+        };
+        let (next, changed) = apply_patch(&old, &patch, &EndpointPolicy::default(), &[]).unwrap();
+        assert!(!changed && consent_holds(&consent, &next));
+        // The patch keeps the same rules as the draft.
+        for bad in [
+            InstancePatch {
+                host: Some("-oProxyCommand=x".into()),
+                ..Default::default()
+            },
+            InstancePatch {
+                ssh_port: Some(0),
+                ..Default::default()
+            },
+            InstancePatch {
+                host_key: Some("ssh-ed25519 AAAA".into()),
+                ..Default::default()
+            },
+            InstancePatch {
+                credential_ref: Some("env:HOME".into()),
+                ..Default::default()
+            },
+            InstancePatch {
+                credential_ref: Some("none".into()),
+                ..Default::default()
+            },
+            InstancePatch {
+                base_url: Some("https://x.example.com".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                apply_patch(&old, &bad, &EndpointPolicy::default(), &[]).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_old_record_without_the_remote_fields_still_reads() {
+        let raw = r#"{"id":"x","kind":"codex","label":"x","base_url":"","origin":"process:codex","cost_source":"unknown","credential_ref":"none"}"#;
+        let r: InstanceRecord = serde_json::from_str(raw).unwrap();
+        assert!(r.host.is_none() && !r.allow_trust);
+        assert_eq!(r.host_key_fingerprint(), None);
     }
 }
