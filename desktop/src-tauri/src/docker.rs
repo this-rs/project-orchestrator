@@ -132,10 +132,23 @@ impl DockerManager {
     }
 
     fn candidates(&self) -> Vec<String> {
-        match &self.endpoints_override {
+        let list = match &self.endpoints_override {
             Some(list) => list.clone(),
             None => docker_endpoints(),
-        }
+        };
+        // `/var/run/docker.sock` is usually a symlink to `~/.docker/run/docker.sock`: the same
+        // socket listed twice made a frozen daemon cost two timeouts instead of one.
+        let mut seen = std::collections::HashSet::new();
+        list.into_iter()
+            .filter(|endpoint| {
+                let key = endpoint
+                    .strip_prefix("unix://")
+                    .and_then(|path| std::fs::canonicalize(path).ok())
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| endpoint.clone());
+                seen.insert(key)
+            })
+            .collect()
     }
 
     /// A connection to a Docker that answers right now, or `None`.
@@ -798,6 +811,9 @@ pub struct CheckDockerResponse {
     pub available: bool,
     /// Fine-grained status: "running", "unresponsive", "installed", or "not_installed".
     pub status: String,
+    /// Docker's API does not answer but every configured service does (the containers run on):
+    /// only ever true with `unresponsive`.
+    pub services_reachable: bool,
 }
 
 /// Check if Docker is installed and accessible.
@@ -811,9 +827,17 @@ pub async fn check_docker(
 ) -> Result<CheckDockerResponse, String> {
     let mgr = docker.read().await;
     let status = mgr.status().await;
+    let services_reachable = status == DockerStatus::Unresponsive
+        && tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            crate::net::configured_services_up(),
+        )
+        .await
+        .unwrap_or(false);
     Ok(CheckDockerResponse {
         available: status == DockerStatus::Running,
         status: status.to_string(),
+        services_reachable,
     })
 }
 
@@ -1075,6 +1099,25 @@ mod tests {
         assert_eq!(status.to_string(), "unresponsive");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(6),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn one_socket_reached_by_two_paths_is_pinged_once() {
+        let dir = scratch("alias");
+        let real = dir.join("real.sock");
+        let link = dir.join("link.sock");
+        let _daemon = serve_frozen(&real);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let manager = DockerManager::with_endpoints(vec![unix(&link), unix(&real)]);
+        assert_eq!(manager.candidates().len(), 1);
+        let started = std::time::Instant::now();
+        assert_eq!(manager.status().await, DockerStatus::Unresponsive);
+        // One timeout (2 s), not two.
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(3500),
             "{:?}",
             started.elapsed()
         );

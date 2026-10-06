@@ -550,9 +550,22 @@
         setCheck('check-docker', 'success');
         await startServices(deps);
 
+      } else if (dockerStatus === 'unresponsive' && deps.dockerServicesReachable) {
+        // Docker's control socket does not answer, but Neo4j, Meilisearch and NATS do (each
+        // checked with its own protocol): Docker Desktop is running, only its API is stuck.
+        // The services are what the app needs, so go on exactly as in external mode, and say
+        // why Docker shows a warning. Asking the user to restart Docker would stop them.
+        setCheck('check-docker', 'warning', 'Docker Desktop is not answering its API, but your services are running');
+        setCheck('check-neo4j', '', 'Checking connectivity...');
+        setCheck('check-meilisearch', '', 'Checking connectivity...');
+        setCheck('check-nats', '', 'Checking connectivity...');
+        setStatus('Checking services...');
+        await pollBackendHealthWithServices();
+
       } else if (dockerStatus === 'unresponsive') {
-        // Something holds Docker's socket and takes connections but never answers: Docker
-        // Desktop is frozen (or its VM is still booting). "Open" cannot help a frozen one.
+        // Something holds Docker's socket and takes connections but never answers, and the
+        // services do not answer either: Docker Desktop is frozen (or its VM is still
+        // booting). "Open" cannot help a frozen one.
         showDockerUnresponsive();
         setCheck('check-neo4j', '', 'Waiting for Docker...');
         setCheck('check-meilisearch', '', 'Waiting for Docker...');
