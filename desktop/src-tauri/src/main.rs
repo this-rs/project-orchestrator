@@ -60,7 +60,8 @@ async fn check_health(port: u16) -> Result<Option<serde_json::Value>, String> {
         },
         Err(e) => {
             // The splash polls every 200 ms: say why once, not 600 times.
-            static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            static REPORTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
             if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 tracing::warn!("check_health {} failed: {}", url, e);
             }
