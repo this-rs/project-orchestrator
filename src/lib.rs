@@ -14,6 +14,7 @@ pub mod analytics;
 pub mod api;
 pub mod architecture;
 pub mod auth;
+pub mod boot;
 pub mod chat;
 pub mod documents;
 pub mod embeddings;
@@ -1098,6 +1099,27 @@ impl AppState {
 /// and binds to the configured port.
 ///
 /// Returns when the server shuts down (or an error occurs during startup).
+/// The phases of a normal startup, in order (see [`boot`]). Each id is started and ended in
+/// `start_server`; `boot::tests` reads this file and fails on one that is declared but never driven,
+/// because a record that shows a phase nobody updates is worse than none.
+pub const BOOT_PHASES: &[(&str, &str)] = &[
+    ("bind", "Reserving the port"),
+    ("databases", "Connecting to Neo4j and Meilisearch"),
+    ("events", "Event bus"),
+    ("orchestrator", "Starting the orchestrator"),
+    ("watchers", "Watching projects"),
+    ("chat", "Chat manager"),
+    ("claude_mcp", "Claude Code MCP setup"),
+    ("protocol_recovery", "Recovering interrupted protocols"),
+    ("runs", "Reconciling plan runs"),
+    ("triggers", "Plan triggers"),
+    ("migrations", "Data migrations"),
+    ("identity", "Instance identity"),
+    ("reactor", "Event reactions"),
+    ("frontend", "Web interface"),
+    ("listening", "Accepting connections"),
+];
+
 pub async fn start_server(mut config: Config) -> Result<()> {
     use std::net::SocketAddr;
 
@@ -1112,12 +1134,16 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             "Setup not completed — starting minimal setup-only server on port {}",
             config.server_port
         );
+        boot::tracker().finish();
         return start_setup_server(config.server_port).await;
     }
 
     // ────────────────────────────────────────────────────────────────────
     // Normal (fully configured) server
     // ────────────────────────────────────────────────────────────────────
+
+    let boot = boot::tracker();
+    boot.declare(BOOT_PHASES);
 
     // Bind the port FIRST, before any initialization that has side effects.
     //
@@ -1136,13 +1162,17 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // backlog and are served once `axum::serve` starts, instead of being
     // refused.
     let addr = SocketAddr::from(([0, 0, 0, 0], config.server_port));
+    boot.start("bind");
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-        anyhow::anyhow!(
+        let error = anyhow::anyhow!(
             "cannot bind {addr}: {e} — another orchestrator instance is probably \
              already serving this port (check `lsof -nP -iTCP:{} -sTCP:LISTEN`)",
             config.server_port
-        )
+        );
+        boot.fail("bind", &error);
+        error
     })?;
+    boot.done("bind");
 
     use api::handlers::ServerState;
     use tokio::sync::RwLock;
@@ -1172,18 +1202,24 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     tracing::info!("Connecting to Neo4j at {}...", config.neo4j_uri);
     tracing::info!("Connecting to Meilisearch at {}...", config.meilisearch_url);
 
-    let state = AppState::new(config.clone()).await?;
+    boot.start("databases");
+    let state = AppState::new(config.clone()).await.inspect_err(|e| {
+        boot.fail("databases", e);
+    })?;
+    boot.done("databases");
     tracing::info!("Connected to databases");
 
     // Create local event bus for intra-process broadcast
     let local_bus = Arc::new(events::EventBus::default());
 
     // Connect to NATS if configured (inter-process event sync)
+    boot.start("events");
     let nats_emitter = if let Some(ref nats_url) = config.nats_url {
         match events::connect_nats(nats_url).await {
             Ok(client) => {
                 let emitter = Arc::new(events::NatsEmitter::new(client, "events"));
                 tracing::info!("NATS connected — inter-process event sync enabled");
+                boot.done("events");
                 Some(emitter)
             }
             Err(e) => {
@@ -1191,11 +1227,13 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                     "Failed to connect to NATS: {} — running in local-only mode",
                     e
                 );
+                boot.fail("events", format!("NATS: {e} (running in local-only mode)"));
                 None
             }
         }
     } else {
         tracing::info!("NATS not configured — running in local-only mode");
+        boot.skip("events", "NATS not configured: local-only mode");
         None
     };
 
@@ -1226,10 +1264,18 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     let mcp_registry = state.mcp_registry.clone();
 
     // Create orchestrator with hybrid emitter
-    let orchestrator =
-        Arc::new(orchestrator::Orchestrator::with_event_bus(state, event_bus.clone()).await?);
+    boot.start("orchestrator");
+    let orchestrator = Arc::new(
+        orchestrator::Orchestrator::with_event_bus(state, event_bus.clone())
+            .await
+            .inspect_err(|e| {
+                boot.fail("orchestrator", e);
+            })?,
+    );
+    boot.done("orchestrator");
 
     // Create file watcher and auto-register projects with watch_enabled=true
+    boot.start("watchers");
     let watcher = {
         let mut w = orchestrator::FileWatcher::new(orchestrator.clone());
 
@@ -1447,10 +1493,12 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             }
             Err(e) => {
                 tracing::warn!("Auto-watch: failed to list projects: {}", e);
+                boot.detail("watchers", format!("could not list projects: {e}"));
             }
         }
         w
     };
+    boot.done("watchers");
 
     // Secrets vault — always LOCKED at start: the server cannot open it alone.
     let vault = match vault::VaultService::open(
@@ -1468,6 +1516,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     };
 
     // Create chat manager (optional — requires Claude CLI)
+    boot.start("chat");
     let chat_manager = {
         let mut chat_config = chat::ChatConfig::from_env();
         // Ensure NATS URL from config.yaml is forwarded to the MCP server env.
@@ -1543,12 +1592,14 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         let cm = Arc::new(cm);
         cm.start_cleanup_task();
         tracing::info!("Chat manager initialized");
+        boot.done("chat");
         Some(cm)
     };
 
     // Auto-configure Claude Code MCP integration (idempotent — safe to call on every start).
     // Configures ~/.claude/mcp.json with stdio mode pointing to this instance,
     // and updates it if the config is stale (e.g., was SSE mode from an older version).
+    boot.start("claude_mcp");
     {
         let setup_config = setup_claude::SetupConfig {
             mcp_server_path: chat::ChatConfig::detect_mcp_server_path_public(),
@@ -1558,18 +1609,22 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         match setup_claude::setup_claude_code(&setup_config) {
             Ok(setup_claude::SetupResult::AlreadyConfigured { .. }) => {
                 tracing::debug!("Claude Code MCP: already configured");
+                boot.done_with("claude_mcp", "already configured");
             }
             Ok(setup_claude::SetupResult::Updated { path, .. }) => {
                 tracing::info!(
                     "Claude Code MCP: updated stale config → stdio mode ({})",
                     path.display()
                 );
+                boot.done_with("claude_mcp", "updated a stale configuration");
             }
             Ok(result) => {
                 tracing::info!("Claude Code MCP: {:?}", result);
+                boot.done_with("claude_mcp", format!("{result:?}"));
             }
             Err(e) => {
                 tracing::warn!("Claude Code MCP auto-setup failed (non-fatal): {}", e);
+                boot.fail("claude_mcp", &e);
             }
         }
     }
@@ -1602,6 +1657,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Recover orphaned protocol runs from previous server instance
     let protocol_emitter: Option<Arc<dyn events::EventEmitter>> =
         Some(event_bus.clone() as Arc<dyn events::EventEmitter>);
+    boot.start("protocol_recovery");
     match crate::protocol::hooks::recover_orphaned_runs(
         orchestrator.neo4j_arc(),
         protocol_emitter.clone(),
@@ -1612,9 +1668,14 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             if count > 0 {
                 tracing::info!("Protocol recovery: marked {count} orphaned run(s) as failed");
             }
+            boot.done_with(
+                "protocol_recovery",
+                format!("{count} orphaned run(s) closed"),
+            );
         }
         Err(e) => {
             tracing::warn!("Protocol recovery failed (non-fatal): {}", e);
+            boot.fail("protocol_recovery", &e);
         }
     }
 
@@ -1651,25 +1712,34 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             )
         });
         let protocol_emitter = protocol_emitter_for_reconcile;
+        boot.start("runs");
         tokio::spawn(async move {
             const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
             // An AgentExecution whose run ended this recently may still be finalized
             // by a detached task: leave it to that task.
             const RECONCILE_GRACE_SECS: i64 = 120;
 
+            let mut resumed = 0usize;
+            let mut recovery_failure: Option<String> = None;
             if let Some(runner) = runner {
                 match runner.recover_interrupted_runs().await {
                     Ok(0) => {} // no runs to recover, stay silent
                     Ok(count) => {
+                        resumed = count;
                         tracing::info!("PlanRunner recovery: resumed {} interrupted run(s)", count);
                     }
                     Err(e) => {
                         tracing::warn!("PlanRunner recovery failed (non-fatal): {}", e);
+                        recovery_failure = Some(e.to_string());
                     }
                 }
             }
             // Boot: nothing can be finalizing in the background yet.
             runner::reconcile_stale_runs(&*graph, 0).await;
+            match recovery_failure {
+                Some(error) => boot::tracker().fail("runs", error),
+                None => boot::tracker().done_with("runs", format!("{resumed} run(s) resumed")),
+            }
 
             let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
             interval.tick().await; // the first tick is immediate: boot just did it
@@ -1690,6 +1760,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     }
 
     // Boot trigger providers (Schedule + Event) for automatic plan execution
+    boot.start("triggers");
     if chat_manager.is_some() {
         use runner::TriggerProvider; // for setup() method
         let graph = orchestrator.neo4j_arc();
@@ -1701,8 +1772,10 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             engine.clone(),
             None, // default 60s
         );
+        let mut trigger_failure: Option<String> = None;
         if let Err(e) = schedule_provider.setup().await {
             tracing::warn!("ScheduleProvider setup failed (non-fatal): {}", e);
+            trigger_failure = Some(format!("schedule: {e}"));
         } else {
             tracing::info!("ScheduleProvider started (60s tick)");
         }
@@ -1715,6 +1788,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             runner::providers::event::EventProvider::new(graph.clone(), engine.clone(), event_rx);
         if let Err(e) = event_provider.setup().await {
             tracing::warn!("EventProvider setup failed (non-fatal): {}", e);
+            trigger_failure = Some(format!("event: {e}"));
         } else {
             tracing::info!("EventProvider started (CrudEvent subscriber)");
         }
@@ -1723,6 +1797,10 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         // WebhookProvider — no setup needed, the POST /api/webhooks/:trigger_id
         // endpoint handles validation and evaluation inline.
         tracing::info!("TriggerEngine booted with 2 active providers (schedule, event)");
+        match trigger_failure {
+            Some(error) => boot.fail("triggers", error),
+            None => boot.done("triggers"),
+        }
     }
 
     // Boot HeartbeatEngine — background daemon for periodic health checks.
@@ -1769,6 +1847,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         // upgraded install repairs its data without blocking startup. The
         // heartbeat only starts once they are done: deep maintenance evolves
         // the same skills the migrations archive and purge.
+        boot.start("migrations");
         tokio::spawn(async move {
             let outcomes = graph.run_data_migrations().await;
             for o in outcomes.iter().filter(|o| !o.skipped) {
@@ -1779,6 +1858,16 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                     error = ?o.error,
                     "Data migration result"
                 );
+            }
+            let failed = outcomes.iter().filter(|o| o.error.is_some()).count();
+            let applied = outcomes.iter().filter(|o| !o.skipped).count();
+            if failed > 0 {
+                boot::tracker().fail(
+                    "migrations",
+                    format!("{failed} of {applied} migration(s) failed"),
+                );
+            } else {
+                boot::tracker().done_with("migrations", format!("{applied} migration(s) run"));
             }
             let handle = engine.start_owned();
             // Keep handle alive for the lifetime of the process
@@ -1839,15 +1928,18 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         trajectory_store: Some(trajectory_store),
         oidc_client,
         identity: {
+            boot::tracker().start("identity");
             match identity::InstanceIdentity::load_or_generate(None) {
                 Ok(id) => {
                     tracing::info!(did = %id.did_key(), "Instance identity loaded");
+                    boot::tracker().done("identity");
                     Some(Arc::new(id))
                 }
                 Err(e) => {
                     tracing::warn!(
                         "Failed to load instance identity: {e} — package signing disabled"
                     );
+                    boot::tracker().fail("identity", &e);
                     None
                 }
             }
@@ -1864,6 +1956,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     });
 
     // ── EventReactor: build, register built-in reactions, and spawn ──
+    boot.start("reactor");
     {
         let builder = events::ReactorBuilder::new(
             reactor_receiver,
@@ -1877,6 +1970,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
 
         tokio::spawn(reactor.run());
         tracing::info!("EventReactor started with built-in reactions");
+        boot::tracker().done("reactor");
     }
 
     // Seed builtin lifecycle hooks
@@ -2090,10 +2184,13 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     }
 
     // Log frontend serving mode
+    boot.start("frontend");
     if config.serve_frontend {
         tracing::info!("Frontend serving enabled — path: {}", config.frontend_path);
+        boot.done_with("frontend", format!("served from {}", config.frontend_path));
     } else {
         tracing::info!("Frontend serving disabled (API-only mode)");
+        boot.skip("frontend", "API-only mode");
     }
 
     // Release checker (startup + every ~6h, never blocks or fails startup).
@@ -2105,7 +2202,10 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     let _ = update::service::start_global(config.chat_auto_update_app == Some(true));
 
     // Start serving. The port was bound at the top of `start_server`.
+    boot.start("listening");
     tracing::info!("Server listening on {}", addr);
+    boot.done("listening");
+    boot.finish();
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
