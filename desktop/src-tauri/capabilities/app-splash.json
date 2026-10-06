@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "app-splash",
+  "description": "Application commands the splash screen calls (splash.html, local origin). Exactly those: tests/desktop_acl.rs compares this list with the invoke() calls of splash.html.",
+  "windows": [
+    "splashscreen"
+  ],
+  "permissions": [
+    "allow-check-dependencies",
+    "allow-check-health",
+    "allow-check-services-health",
+    "allow-get-server-port",
+    "allow-open-docker-desktop",
+    "allow-open-url",
+    "allow-probe-services",
+    "allow-proceed-to-main",
+    "allow-start-docker-services",
+    "allow-webview-log"
+  ]
+}
