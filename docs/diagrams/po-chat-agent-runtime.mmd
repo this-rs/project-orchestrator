@@ -1,6 +1,6 @@
 %% name: po-chat-agent-runtime
-%% covers: backend:src/chat/agent_runtime.rs
-%% verified: 878281ca
+%% covers: backend:src/chat/{agent_runtime,agent_hooks}.rs
+%% verified: 98130a5f
 %% ---
 %% PROUVE : le moteur « agent » du chat (tâche B13) : comment un AgentSession nexus est piloté, ce qu'il
 %%   diffuse et persiste, ce qu'il ne fait PAS encore. Le routage entre moteurs est dans po-chat-manager.
@@ -9,12 +9,15 @@
 %%   src/chat/agent_runtime.rs — AgentRuntime, AgentSessionHandle (send_message, answer_permission, interrupt,
 %%                               set_model, set_policy_mode), mask_agent_event, degraded_features, retry,
 %%                               pump_out_of_band, BuiltinProviders, fake (tests)
+%%   src/chat/agent_hooks.rs — GraphSessionHooks (SessionHooks sur la table de hooks du chemin Claude)
+%%   src/chat/manager.rs (graph_hook_table, build_agent_spec) — la table partagée et sa remise au provider
 %%   src/chat/provider/event_map.rs — EventMapper (AgentEvent vers ChatEvent)
 %% ---
 %% NON ETABLI :
 %%   jamais exercé contre le VRAI CLI Claude, un vrai endpoint ni un vrai Codex/ACP (faux provider, fake_openai,
-%%   fake_mcp seulement) ; hooks, file de messages, auto-continue, compaction, NATS, enrichissement : absents
-%%   (annoncés par degraded_features) ; la publication NATS de session_closed est faite par le manager, non testée.
+%%   fake_mcp seulement) ; file de messages, auto-continue, NATS, enrichissement : absents
+%%   (annoncés par degraded_features) ; hooks du graphe : écrits et testés, VIVANTS seulement après le relevé
+%%   de l'épingle nexus-claude (le natif épinglé 35acfbf n'appelle pas SessionHooks : PR nexus #71) ; la publication NATS de session_closed est faite par le manager, non testée.
 %% ---
 %% LEGENDE
 %%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans test / décidé non écrit  ⚪ amont ou autre domaine
@@ -42,8 +45,10 @@ flowchart TD
         CLOSE["✅ close : ferme le provider (5 s max), émet session_closed, oublie la session<br/>test : agent_path_interrupt_model_mode_and_close_reach_the_provider"]
     end
 
-    DEGR["✅ degraded_features(Capabilities) : ce que le moteur n'a pas porté (hooks, message_queue, auto_continue, nats, enrichment) + images, compaction et project_orchestrator_tools (pas de MCP par session : Claude Code distant) selon la session<br/>test : the_agent_system_init_lists_what_the_session_capabilities_do_not_cover, a_session_without_per_session_mcp_reports_the_missing_po_tools"]
-    LOST["🟠 NON porté : hooks, file de messages, auto-continue, compaction, NATS, enrichissement d'entités ; jamais contre un vrai fournisseur"]
+    DEGR["✅ degraded_features(Capabilities) : ce que le moteur n'a pas porté (message_queue, auto_continue, nats, enrichment) ; `hooks` seulement si le provider ne les exécute pas (capacité in_protocol ET MCP par session) + images, compaction et project_orchestrator_tools (pas de MCP par session : Claude Code distant) selon la session<br/>test : hooks_are_degraded_only_where_the_provider_does_not_run_them, the_agent_system_init_lists_what_the_session_capabilities_do_not_cover, a_session_without_per_session_mcp_reports_the_missing_po_tools"]
+    LOST["🟠 NON porté : file de messages, auto-continue, NATS, enrichissement d'entités ; jamais contre un vrai fournisseur"]
+    GHOOKS["✅ GraphSessionHooks (agent_hooks.rs) : SessionHooks sur la MÊME table que le chemin Claude (graph_hook_table) :<br/>before_tool = PreToolUse (contexte → AddContext, block / permissionDecision deny → Deny, updatedInput → ReplaceInput) ; after_tool = PostToolUse ; before_compaction = le `reason` du CompactionNotifier ; outil nommé comme Claude Code (canonical), entrée intacte ; hook en échec ignoré ; matcher honoré<br/>remis par build_agent_spec à Native et Claude Code seulement (ni Codex/ACP, ni session distante) ; runner : guidage de compaction seul ; le notifier de l'agent n'annonce pas la compaction (le provider émet la sienne)<br/><i>test : chat::agent_hooks::tests (9), the_agent_engine_gives_the_graph_hooks_only_to_providers_that_run_hooks, the_hook_table_has_the_per_tool_hooks_unless_the_session_is_a_runner, an_agent_engine_compaction_is_not_announced_twice. Rejoué SANS le correctif : spec.hooks jamais posé → 1 rouge ; contexte et refus ignorés → 4 rouges<br/>🟠 inerte avec l'épingle actuelle (le natif ignore SessionHooks) ; aucun hôte ni modèle réel</i>"]
+    MGR --> GHOOKS
 
     MGR --> BUSY
     MGR --> CTL

@@ -53,7 +53,7 @@ diagrams:
     status: verified
     file: docs/diagrams/po-chat-agent-runtime.mmd
     covers:
-      - "backend:src/chat/agent_runtime.rs"
+      - "backend:src/chat/{agent_runtime,agent_hooks}.rs"
   - name: po-provider-settings
     owner: theotime
     status: verified
