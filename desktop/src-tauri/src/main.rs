@@ -171,6 +171,7 @@ fn main() {
             proceed_to_main,
             check_health,
             net::probe_services,
+            net::test_connection_detailed,
             open_url,
             pick_directory,
             restart_app,

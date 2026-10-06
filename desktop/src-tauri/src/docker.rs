@@ -869,80 +869,18 @@ pub async fn get_service_logs(
 /// Timeout: 5 seconds.
 #[tauri::command]
 pub async fn test_connection(service: String, url: String) -> Result<bool, String> {
-    let timeout = std::time::Duration::from_secs(5);
-
-    match service.as_str() {
-        "neo4j" => {
-            // Parse bolt://host:port → TCP connect
-            let addr = parse_host_port(&url, 7687)?;
-            tracing::info!("Testing Neo4j connection to {}...", addr);
-            match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
-                Ok(Ok(_)) => Ok(true),
-                Ok(Err(e)) => {
-                    tracing::warn!("Neo4j connection failed: {}", e);
-                    Ok(false)
-                }
-                Err(_) => {
-                    tracing::warn!("Neo4j connection timed out");
-                    Ok(false)
-                }
-            }
-        }
-        "meilisearch" => {
-            // HTTP GET /health
-            let health_url = format!("{}/health", url.trim_end_matches('/'));
-            tracing::info!("Testing MeiliSearch connection to {}...", health_url);
-            let client = reqwest::Client::builder()
-                .timeout(timeout)
-                .build()
-                .map_err(|e| format!("HTTP client error: {}", e))?;
-            match client.get(&health_url).send().await {
-                Ok(resp) if resp.status().is_success() => Ok(true),
-                Ok(resp) => {
-                    tracing::warn!("MeiliSearch returned status {}", resp.status());
-                    Ok(false)
-                }
-                Err(e) => {
-                    tracing::warn!("MeiliSearch connection failed: {}", e);
-                    Ok(false)
-                }
-            }
-        }
-        "nats" => {
-            // Parse nats://host:port → TCP connect
-            let addr = parse_host_port(&url, 4222)?;
-            tracing::info!("Testing NATS connection to {}...", addr);
-            match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
-                Ok(Ok(_)) => Ok(true),
-                Ok(Err(e)) => {
-                    tracing::warn!("NATS connection failed: {}", e);
-                    Ok(false)
-                }
-                Err(_) => {
-                    tracing::warn!("NATS connection timed out");
-                    Ok(false)
-                }
-            }
-        }
-        _ => Err(format!("Unknown service: {}", service)),
+    // Kept for older frontends: the answer without the reason. See `net::test_connection_detailed`.
+    let result = crate::net::test_service(&service, &url).await?;
+    if !result.ok {
+        tracing::warn!(
+            "{} connection to {}:{} failed: {}",
+            service,
+            result.host,
+            result.port,
+            result.hint.as_deref().unwrap_or("no detail")
+        );
     }
-}
-
-/// Parse a URL like `bolt://host:port` or `nats://host:port` into `host:port`.
-/// Falls back to the given default port if the URL has no port.
-fn parse_host_port(url: &str, default_port: u16) -> Result<String, String> {
-    // Try to parse as a URL
-    if let Ok(parsed) = url::Url::parse(url) {
-        let host = parsed.host_str().unwrap_or("localhost");
-        let port = parsed.port().unwrap_or(default_port);
-        return Ok(format!("{}:{}", host, port));
-    }
-    // Fallback: treat as host:port or just host
-    if url.contains(':') {
-        Ok(url.to_string())
-    } else {
-        Ok(format!("{}:{}", url, default_port))
-    }
+    Ok(result.ok)
 }
 
 #[cfg(test)]
