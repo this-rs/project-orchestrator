@@ -157,6 +157,7 @@ fn instance(fake: &FakeOpenAi, credential_ref: &str) -> InstanceRecord {
         default_model: Some("m".into()),
         cost_source: "free".into(),
         credential_ref: credential_ref.into(),
+        ..Default::default()
     }
 }
 
@@ -186,6 +187,7 @@ async fn consent(graph: &MockGraphStore, slug: &str, id: &str, origin: &str) {
         consented_by: "me@example.com".into(),
         consented_at: Utc::now().to_rfc3339(),
         credential_ref: Some(credential_ref.to_string()),
+        ..Default::default()
     };
     graph
         .put_llm_setting(
@@ -392,6 +394,7 @@ async fn the_endpoint_guard_runs_before_any_connection() {
         default_model: Some("m".into()),
         cost_source: "unknown".into(),
         credential_ref: "none".into(),
+        ..Default::default()
     };
     // Stored by an older version, or by hand: the guard must still refuse it.
     store_instance(&graph, &record).await;

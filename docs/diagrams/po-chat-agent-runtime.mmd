@@ -42,7 +42,7 @@ flowchart TD
         CLOSE["✅ close : ferme le provider (5 s max), émet session_closed, oublie la session<br/>test : agent_path_interrupt_model_mode_and_close_reach_the_provider"]
     end
 
-    DEGR["✅ degraded_features(Capabilities) : ce que le moteur n'a pas porté (hooks, message_queue, auto_continue, nats, enrichment) + images et compaction selon la session<br/>test : the_agent_system_init_lists_what_the_session_capabilities_do_not_cover"]
+    DEGR["✅ degraded_features(Capabilities) : ce que le moteur n'a pas porté (hooks, message_queue, auto_continue, nats, enrichment) + images, compaction et project_orchestrator_tools (pas de MCP par session : Claude Code distant) selon la session<br/>test : the_agent_system_init_lists_what_the_session_capabilities_do_not_cover, a_session_without_per_session_mcp_reports_the_missing_po_tools"]
     LOST["🟠 NON porté : hooks, file de messages, auto-continue, compaction, NATS, enrichissement d'entités ; jamais contre un vrai fournisseur"]
 
     MGR --> BUSY

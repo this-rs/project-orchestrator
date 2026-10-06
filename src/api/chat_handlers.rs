@@ -2199,6 +2199,271 @@ mod tests {
         assert!(resp["ok"].is_boolean(), "{resp}");
     }
 
+    const REMOTE_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXTCY3J636nEyMNqNrVj6HXnIXUnXL8sk4c5J6tek3N";
+
+    fn remote_body() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "claude_code_remote", "label": "Build box 1",
+            "host": "127.0.0.1", "ssh_user": "deploy", "ssh_port": 1,
+            "host_key": REMOTE_KEY, "remote_cwd": "/srv/work",
+            "credential_ref": "vault:ssh-box", "default_model": "sonnet",
+        })
+    }
+
+    #[tokio::test]
+    async fn a_remote_instance_goes_from_the_route_to_a_provider_and_never_to_the_local_claude() {
+        let state = mock_server_state().await;
+        let app = create_router(state.clone());
+
+        // Create: the id is forced, the origin is the machine, the fingerprint is computed.
+        let (status, created) = call_json(
+            &app,
+            auth_json("POST", "/api/chat/providers", remote_body()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["id"], "claude-code@build-box-1");
+        assert_eq!(created["origin"], "ssh:deploy@127.0.0.1:1");
+        assert_eq!(
+            created["host_key_fingerprint"],
+            "SHA256:lP63ZdLutNnRU0/59cDaFw2mPoJzdasi0I3zFrtS3Ak"
+        );
+        // The reserved id and a pasted key stay refused.
+        let mut reserved = remote_body();
+        reserved["id"] = serde_json::json!("claude-code");
+        let (status, _) = call_json(&app, auth_json("POST", "/api/chat/providers", reserved)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let mut pasted = remote_body();
+        pasted["credential_ref"] = serde_json::json!("-----BEGIN OPENSSH PRIVATE KEY-----");
+        let (status, resp) =
+            call_json(&app, auth_json("POST", "/api/chat/providers", pasted)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert!(!resp.to_string().contains("BEGIN OPENSSH"), "{resp}");
+        let mut private_field = remote_body();
+        private_field["private_key"] = serde_json::json!("x");
+        let (status, _) = call_json(
+            &app,
+            auth_json("POST", "/api/chat/providers", private_field),
+        )
+        .await;
+        assert!(status.is_client_error(), "{status}");
+
+        // The listing exposes kind, host and fingerprint, never a key.
+        let (_, listing) = call_json(&app, auth_get("/api/chat/providers?project_slug=p")).await;
+        let entry = listing["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "claude-code@build-box-1")
+            .expect("listed")
+            .clone();
+        assert_eq!(entry["kind"], "claude_code_remote");
+        assert_eq!(entry["remote"]["host"], "127.0.0.1");
+        assert_eq!(entry["remote"]["ssh_port"], 1);
+        assert_eq!(
+            entry["remote"]["host_key_fingerprint"],
+            "SHA256:lP63ZdLutNnRU0/59cDaFw2mPoJzdasi0I3zFrtS3Ak"
+        );
+        assert!(entry["endpoint_origin"].is_null());
+        assert_eq!(entry["allowed_for_project"], false);
+        assert_eq!(listing["providers"][0]["id"], "claude-code");
+        assert!(listing["providers"][0].get("remote").is_none());
+        assert!(
+            !listing.to_string().contains("AAAAC3NzaC1lZDI1NTE5"),
+            "no key blob"
+        );
+
+        // Consent is tied to the machine, and a change of host revokes it.
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "PUT",
+                "/api/projects/p/llm-consent",
+                serde_json::json!({"provider_id": "claude-code@build-box-1", "origin": "ssh:deploy@127.0.0.1:1"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The real route -> record -> provider -> open path, on a manager over the
+        // SAME store: the vault holds the key and grants it to the instance; the
+        // machine does not answer (loopback port 1).
+        let vault = crate::vault::VaultService::ephemeral();
+        vault
+            .init(
+                "correct horse battery staple".into(),
+                chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        vault
+            .put(
+                "ssh-box",
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n-----END OPENSSH PRIVATE KEY-----",
+                None,
+                now,
+            )
+            .unwrap();
+        vault
+            .grant(
+                crate::vault::grants::SecretSelector::Names(["ssh-box".to_string()].into()),
+                crate::vault::grants::GrantScope::Provider("claude-code@build-box-1".into()),
+                chrono::Duration::hours(1),
+                None,
+                now,
+            )
+            .unwrap();
+        let config = crate::chat::config::ChatConfig {
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager = crate::chat::manager::ChatManager::new_without_memory(
+            state.orchestrator.neo4j_arc(),
+            mock_app_state().meili,
+            config,
+        )
+        .with_vault(vault);
+        let provider = manager
+            .provider_for("claude-code@build-box-1")
+            .await
+            .unwrap();
+        assert_eq!(provider.id(), "claude-code@build-box-1");
+        assert_eq!(
+            provider.kind(),
+            nexus_claude::agent::ProviderKind::ClaudeCode
+        );
+        let request = crate::chat::types::ChatRequest {
+            attachments: Vec::new(),
+            message: "hi".into(),
+            session_id: None,
+            cwd: std::env::temp_dir().display().to_string(),
+            project_slug: Some("p".into()),
+            model: None,
+            provider: Some("claude-code@build-box-1".into()),
+            task_alias: None,
+            run_provider: None,
+            run_model: None,
+            max_tokens: None,
+            task_class: None,
+            permission_mode: Some("default".into()),
+            add_dirs: None,
+            workspace_slug: None,
+            user_claims: Some(crate::auth::jwt::Claims::service_account("t")),
+            spawned_by: None,
+            task_context: None,
+            scaffolding_override: None,
+            runner_context: None,
+        };
+        let err = manager.create_session(&request).await.unwrap_err();
+        let failure = crate::chat::provider::errors::classify_open_error(
+            &err,
+            Some("claude-code@build-box-1"),
+        )
+        .unwrap_or_else(|| panic!("not a typed failure: {err:#}"));
+        // Preflight refused it: the machine is unreachable. Nothing ran locally.
+        assert_eq!(failure.code, "endpoint_unreachable", "{err:#}");
+        assert!(!format!("{err:#} {failure:?}").contains("PRIVATE KEY"));
+        assert!(manager.agent_runtime.is_empty().await, "no live session");
+
+        // Trust is refused for a remote machine by default...
+        let mut trust = request.clone();
+        trust.permission_mode = Some("bypassPermissions".into());
+        let err = manager.create_session(&trust).await.unwrap_err();
+        let failure = crate::chat::provider::errors::classify_open_error(&err, None).unwrap();
+        assert_eq!(failure.code, "unsupported", "{err:#}");
+        // ... and passes that gate once the machine allows it (then the preflight
+        // refuses the unreachable machine, which is how we know it got that far).
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "PATCH",
+                "/api/chat/providers/claude-code@build-box-1",
+                serde_json::json!({"allow_trust": true}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let err = manager.create_session(&trust).await.unwrap_err();
+        let failure = crate::chat::provider::errors::classify_open_error(&err, None).unwrap();
+        assert_eq!(failure.code, "endpoint_unreachable", "{err:#}");
+
+        // A change of host revokes the consent: the same request is now refused.
+        let (status, patched) = call_json(
+            &app,
+            auth_json(
+                "PATCH",
+                "/api/chat/providers/claude-code@build-box-1",
+                serde_json::json!({"host": "127.0.0.2"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(patched["consents_invalidated"], true);
+        let err = manager.create_session(&request).await.unwrap_err();
+        let failure = crate::chat::provider::errors::classify_open_error(&err, None).unwrap();
+        assert_eq!(failure.code, "endpoint_not_allowed", "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn the_host_key_route_refuses_hostile_hosts_before_any_process_starts() {
+        let app = test_app().await;
+        for host in [
+            "-oProxyCommand=touch /tmp/pwned",
+            "-oProxyCommand=x",
+            "host name",
+            "a;b",
+            "a|b",
+            "$(id)",
+            "`id`",
+            "",
+            "a\nb",
+        ] {
+            let (status, resp) = call_json(
+                &app,
+                auth_json(
+                    "POST",
+                    "/api/chat/providers/ssh-host-key",
+                    serde_json::json!({"host": host}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{host:?}: {resp}");
+        }
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers/ssh-host-key",
+                serde_json::json!({"host": "h", "ssh_port": 0}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Unknown fields are refused like everywhere else in this family.
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers/ssh-host-key",
+                serde_json::json!({"host": "h", "extra": 1}),
+            ),
+        )
+        .await;
+        assert!(status.is_client_error());
+        // Without a token: refused (same auth as the other provider writes).
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/chat/providers/ssh-host-key")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"host":"h"}"#))
+            .unwrap();
+        let (status, _) = call_json(&app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn the_run_costs_route_answers_the_two_counters_by_model_provider_and_class() {
         let h = action_harness(None).await;

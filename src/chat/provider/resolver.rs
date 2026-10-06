@@ -15,6 +15,15 @@ use serde::{Deserialize, Serialize};
 /// Identifier of the built-in Claude Code instance.
 pub const CLAUDE_CODE: &str = "claude-code";
 
+/// Prefix of the id of a Claude Code instance on another machine
+/// (`claude-code@<name>`). `claude-code` alone is the built-in local instance.
+pub const REMOTE_PREFIX: &str = "claude-code@";
+
+/// Whether an instance id is a Claude Code on another machine.
+pub fn is_remote_instance(provider_id: &str) -> bool {
+    provider_id.starts_with(REMOTE_PREFIX)
+}
+
 /// Role of the session being opened (A15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -276,7 +285,8 @@ fn check(
 ///
 /// - An existing session is frozen: its provider wins without any check, and a
 ///   request naming another provider is a [`ResolveError::ProviderConflict`].
-/// - An explicit choice (request, task, persona) is never substituted.
+/// - An explicit choice (request, task, persona) is never substituted, and
+///   neither is a remote instance (`claude-code@<name>`) at any level.
 /// - A pilot never falls back, at any level.
 /// - An executor skips a non-explicit level that is unhealthy or not allowed;
 ///   the final choice then carries [`RoutedBy::Fallback`]. An unregistered
@@ -344,7 +354,11 @@ pub fn resolve(
                 });
             }
             Err(error) => {
+                // A remote instance is never skipped: running on the local
+                // `claude-code` instead would run the task on another machine than
+                // the one that was chosen.
                 let skippable = !explicit
+                    && !is_remote_instance(&candidate.provider_id)
                     && input.role == Role::Executor
                     && !matches!(error, ResolveError::UnknownProvider(_));
                 if !skippable {
@@ -858,5 +872,53 @@ mod tests {
     fn naming_claude_code_explicitly_is_a_request_choice() {
         let c = resolve_for_open(None, false, Some(CLAUDE_CODE), &BuiltinCatalog).unwrap();
         assert_eq!(c.routed_by, RoutedBy::Request);
+    }
+
+    #[test]
+    fn an_explicit_remote_instance_never_falls_back_to_the_local_claude() {
+        // The machine is down: the request is refused, the local claude-code is
+        // NOT used instead (it would run the task somewhere else than asked).
+        let catalog =
+            FakeCatalog::new(&[("claude-code@box", false, true), (CLAUDE_CODE, true, true)]);
+        for role in [Role::Pilot, Role::Executor] {
+            let mut input = ResolveInput::empty(role);
+            let candidate = Candidate::new("claude-code@box", Some("sonnet".into()));
+            input.request = Some(candidate);
+            let err = resolve(&input, &catalog).unwrap_err();
+            assert_eq!(
+                err,
+                ResolveError::Unavailable {
+                    provider_id: "claude-code@box".into(),
+                    role
+                }
+            );
+        }
+        // Not allowed for the project: same, no substitution.
+        let catalog =
+            FakeCatalog::new(&[("claude-code@box", true, false), (CLAUDE_CODE, true, true)]);
+        let mut input = ResolveInput::empty(Role::Executor);
+        input.request = Some(Candidate::new("claude-code@box", None));
+        assert_eq!(
+            resolve(&input, &catalog).unwrap_err(),
+            ResolveError::NotAllowed("claude-code@box".into())
+        );
+    }
+
+    #[test]
+    fn an_executor_rule_pointing_at_a_remote_instance_is_not_skipped_either() {
+        let catalog =
+            FakeCatalog::new(&[("claude-code@box", false, true), (CLAUDE_CODE, true, true)]);
+        let mut input = ResolveInput::empty(Role::Executor);
+        input.global_rule = Some(Candidate::new("claude-code@box", None));
+        assert!(matches!(
+            resolve(&input, &catalog),
+            Err(ResolveError::Unavailable { .. })
+        ));
+        // Control: the same rule on an ordinary instance IS skipped by an executor.
+        let catalog = FakeCatalog::new(&[("p-global", false, true), (CLAUDE_CODE, true, true)]);
+        let mut input = ResolveInput::empty(Role::Executor);
+        input.global_rule = Some(Candidate::new("p-global", None));
+        assert_eq!(resolve(&input, &catalog).unwrap().provider_id, CLAUDE_CODE);
+        assert!(is_remote_instance("claude-code@box") && !is_remote_instance(CLAUDE_CODE));
     }
 }

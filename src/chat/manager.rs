@@ -458,6 +458,11 @@ pub(crate) type NativeCacheEntry = (
     Arc<dyn nexus_claude::agent::AgentProvider>,
 );
 
+/// Appended to the system prompt of a session on another machine: the model must
+/// not promise tools it was not given.
+const REMOTE_SESSION_NOTICE: &str = "This session runs on a remote machine through SSH. The \
+project-orchestrator tools are not available in it: work with the files and the shell of that machine only.";
+
 /// What `build_agent_spec` needs to know about a session being opened or resumed.
 pub(crate) struct AgentSpecInput<'a> {
     pub cwd: &'a str,
@@ -471,6 +476,11 @@ pub(crate) struct AgentSpecInput<'a> {
     pub third_party: bool,
     pub max_tokens: Option<u64>,
     pub kind: nexus_claude::agent::ProviderKind,
+    /// Working directory ON THE REMOTE machine, for a `claude_code_remote`
+    /// instance. `Some` also means: no project-orchestrator MCP server, no extra
+    /// directories (the provider refuses both, and the local paths mean nothing
+    /// there).
+    pub remote_cwd: Option<&'a str>,
 }
 
 /// What `authorize_provider_use` checks before a session's content is sent.
@@ -8260,6 +8270,30 @@ impl ChatManager {
         Ok(provider)
     }
 
+    /// The working directory on the machine of a `claude_code_remote` instance;
+    /// `None` for every other provider. A remote instance without one is a
+    /// stored record that cannot work: refused, never run in a local path.
+    pub(crate) async fn remote_cwd_of(&self, provider_id: &str) -> Result<Option<String>> {
+        if !super::provider::resolver::is_remote_instance(provider_id) {
+            return Ok(None);
+        }
+        let record = super::provider::store::instance(self.graph.as_ref(), provider_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::Error::new(super::provider::resolver::ResolveError::UnknownProvider(
+                    provider_id.to_string(),
+                ))
+            })?;
+        if record.kind != super::provider::settings::KIND_CLAUDE_CODE_REMOTE {
+            return Ok(None);
+        }
+        record.remote_cwd.map(Some).ok_or_else(|| {
+            anyhow::Error::new(nexus_claude::agent::ProviderError::invalid(
+                "this remote instance has no working directory",
+            ))
+        })
+    }
+
     /// Everything that must hold before a session's content is sent to a
     /// provider other than Claude Code. Claude Code (the historical path) is
     /// not subject to it.
@@ -8325,7 +8359,12 @@ impl ChatManager {
                 provider_id.into(),
             )));
         }
+        // A remote machine may run `Trust` only when its record says so
+        // explicitly (A35, per machine): the tools run where nobody is watching.
+        let trust_allowed =
+            record.kind == super::provider::settings::KIND_CLAUDE_CODE_REMOTE && record.allow_trust;
         if mode == PolicyMode::Trust
+            && !trust_allowed
             && provider.capabilities(Some(model)).sandbox == SandboxLevel::None
         {
             return Err(anyhow::Error::new(ProviderError::unsupported("sandbox")));
@@ -8394,6 +8433,7 @@ impl ChatManager {
             third_party,
             max_tokens,
             kind,
+            remote_cwd,
         } = i;
         use nexus_claude::agent::{
             EnvSpec, McpServerSpec, SessionSpec, SystemPromptMode, SystemPromptSpec,
@@ -8425,7 +8465,12 @@ impl ChatManager {
                 third_party.then_some(crate::auth::tool_profile::RESTRICTED),
             )
             .await;
-        let mut spec = SessionSpec::new(expand_tilde(cwd));
+        // A remote session runs where `remote_cwd` says; the local path of the
+        // project (and a local `~`) means nothing on that machine.
+        let mut spec = SessionSpec::new(match remote_cwd {
+            Some(remote) => remote.to_string(),
+            None => expand_tilde(cwd),
+        });
         spec.model = Some(model.to_string());
         // What a provider kind refuses, it is not given (a refusal here would be a
         // typed `unsupported` at open): ACP has no system prompt and no extra
@@ -8437,21 +8482,32 @@ impl ChatManager {
                 | nexus_claude::agent::ProviderKind::Native
         );
         if !is_acp {
+            let text = if remote_cwd.is_some() {
+                format!("{system_prompt}\n\n{REMOTE_SESSION_NOTICE}")
+            } else {
+                system_prompt.to_string()
+            };
             spec.system_prompt = Some(SystemPromptSpec {
-                text: system_prompt.to_string(),
+                text,
                 mode: SystemPromptMode::Replace,
             });
         }
         spec.policy = policy;
-        spec.mcp_servers.insert(
-            "project-orchestrator".to_string(),
-            McpServerSpec::Stdio {
-                command: self.config.mcp_server_path.to_string_lossy().to_string(),
-                args: Vec::new(),
-                env: env.into_iter().collect(),
-            },
-        );
-        if !is_acp {
+        // A remote Claude Code cannot carry an MCP server (its configuration holds
+        // the session token, which must not reach another machine's command line):
+        // the PO tools are NOT given to it, and `system_init.degraded_features`
+        // says so (`project_orchestrator_tools`).
+        if remote_cwd.is_none() {
+            spec.mcp_servers.insert(
+                "project-orchestrator".to_string(),
+                McpServerSpec::Stdio {
+                    command: self.config.mcp_server_path.to_string_lossy().to_string(),
+                    args: Vec::new(),
+                    env: env.into_iter().collect(),
+                },
+            );
+        }
+        if !is_acp && remote_cwd.is_none() {
             spec.extra_dirs = add_dirs.iter().map(std::path::PathBuf::from).collect();
         }
         if has_turn_limits {
@@ -8478,6 +8534,7 @@ impl ChatManager {
             project_slug,
         } = o;
         let provider = self.provider_for(provider_id).await?;
+        let remote_cwd = self.remote_cwd_of(provider_id).await?;
         let sid = session_id.to_string();
         // A run (an executor) on a third-party provider never gets `Trust`: it
         // runs under `ask` with the restricted profile (A35). A pilot asking for
@@ -8505,6 +8562,7 @@ impl ChatManager {
                 third_party: provider_id != super::provider::resolver::CLAUDE_CODE,
                 max_tokens: request.max_tokens,
                 kind: provider.kind(),
+                remote_cwd: remote_cwd.as_deref(),
             })
             .await?;
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
@@ -8616,6 +8674,7 @@ impl ChatManager {
             .clone()
             .unwrap_or_else(|| super::provider::resolver::CLAUDE_CODE.to_string());
         let provider = self.provider_for(&provider_id).await?;
+        let remote_cwd = self.remote_cwd_of(&provider_id).await?;
         let sid = node.id.to_string();
         let (system_prompt, _) = self
             .build_system_prompt(
@@ -8638,6 +8697,7 @@ impl ChatManager {
                 third_party: provider_id != super::provider::resolver::CLAUDE_CODE,
                 max_tokens: None,
                 kind: provider.kind(),
+                remote_cwd: remote_cwd.as_deref(),
             })
             .await?;
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
@@ -9640,6 +9700,67 @@ mod tests {
         }
     }
 
+    // ── Claude Code on another machine (claude_code_remote) ────────────────
+
+    #[tokio::test]
+    async fn a_remote_session_spec_runs_in_the_remote_directory_with_no_local_server_or_dirs() {
+        use nexus_claude::agent::ProviderKind;
+        let state = mock_app_state();
+        let mut config = test_config();
+        config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let claims = crate::auth::jwt::Claims::service_account("remote");
+        let add_dirs = vec!["/local/extra".to_string()];
+        let spec_for = |remote_cwd: Option<&'static str>| {
+            let manager = &manager;
+            let claims = &claims;
+            let add_dirs = &add_dirs;
+            async move {
+                manager
+                    .build_agent_spec(AgentSpecInput {
+                        cwd: "/Users/me/project",
+                        model: "sonnet",
+                        system_prompt: "base prompt",
+                        permission_mode: None,
+                        add_dirs,
+                        user_claims: Some(claims),
+                        session_id: "remote-s1",
+                        third_party: true,
+                        max_tokens: None,
+                        kind: ProviderKind::ClaudeCode,
+                        remote_cwd,
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        let remote = spec_for(Some("~/work/app")).await;
+        // The remote path, untouched (no local `~` expansion, no local project path).
+        assert_eq!(remote.cwd, std::path::PathBuf::from("~/work/app"));
+        assert!(remote.mcp_servers.is_empty(), "the PO server is not given");
+        assert!(remote.extra_dirs.is_empty());
+        let prompt = remote.system_prompt.as_ref().unwrap();
+        assert!(prompt.text.starts_with("base prompt"));
+        assert!(prompt.text.contains("remote machine"), "the model is told");
+        // The same input, local: the server and the directories are there.
+        let local = spec_for(None).await;
+        assert!(local.mcp_servers.contains_key("project-orchestrator"));
+        assert_eq!(local.extra_dirs.len(), 1);
+    }
+
+    #[test]
+    fn a_session_without_per_session_mcp_reports_the_missing_po_tools() {
+        let mut caps = nexus_claude::agent::Capabilities::none();
+        caps.per_session_mcp = false;
+        assert!(super::super::agent_runtime::degraded_features(&caps)
+            .iter()
+            .any(|f| f == "project_orchestrator_tools"));
+        caps.per_session_mcp = true;
+        assert!(!super::super::agent_runtime::degraded_features(&caps)
+            .iter()
+            .any(|f| f == "project_orchestrator_tools"));
+    }
+
     // ── agent environment and MCP secrets (decision A33) ───────────────────
 
     /// VERIFIER: the token minted for a provider other than Claude Code carries the
@@ -9669,6 +9790,7 @@ mod tests {
                         third_party,
                         max_tokens: None,
                         kind: ProviderKind::Native,
+                        remote_cwd: None,
                     })
                     .await
                     .unwrap();
