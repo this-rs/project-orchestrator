@@ -471,6 +471,8 @@ fn make_task(title: &str, status: TaskStatus) -> TaskNode {
         description: format!("description for {title}"),
         status,
         assigned_to: None,
+        interrupted_at: None,
+        interrupted_reason: None,
         priority: Some(5),
         tags: vec!["test".to_string()],
         acceptance_criteria: vec![],

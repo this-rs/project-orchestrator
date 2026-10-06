@@ -411,6 +411,8 @@ pub fn test_task() -> TaskNode {
         description: "Implement test functionality".to_string(),
         status: TaskStatus::Pending,
         assigned_to: None,
+        interrupted_at: None,
+        interrupted_reason: None,
         priority: Some(5),
         tags: vec!["test".to_string()],
         acceptance_criteria: vec!["Tests pass".to_string()],

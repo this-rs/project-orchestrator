@@ -816,6 +816,10 @@ pub trait GraphStore: Send + Sync {
     /// Update task status
     async fn update_task_status(&self, task_id: Uuid, status: TaskStatus) -> Result<()>;
 
+    /// Marks a task `Interrupted` with a reason. Finished work (completed, failed) is left alone:
+    /// the answer says whether anything changed.
+    async fn interrupt_task(&self, task_id: Uuid, reason: &str) -> Result<bool>;
+
     /// Assign task to an agent
     async fn assign_task(&self, task_id: Uuid, agent_id: &str) -> Result<()>;
 

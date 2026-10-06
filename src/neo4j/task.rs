@@ -133,6 +133,15 @@ impl Neo4jClient {
             ))
             .unwrap_or(TaskStatus::Pending),
             assigned_to: node.get("assigned_to").ok(),
+            interrupted_at: node
+                .get::<String>("interrupted_at")
+                .ok()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc)),
+            interrupted_reason: node
+                .get::<String>("interrupted_reason")
+                .ok()
+                .filter(|s| !s.is_empty()),
             priority: node.get::<i64>("priority").ok().map(|v| v as i32),
             tags: node.get("tags").unwrap_or_default(),
             acceptance_criteria: node.get("acceptance_criteria").unwrap_or_default(),
@@ -366,11 +375,13 @@ impl Neo4jClient {
                     t.updated_at = datetime($now)
                 "#,
             ),
+            // Leaving `Interrupted` (resumed, closed, parked as pending) ends the interruption.
             _ => query(
                 r#"
                 MATCH (t:Task {id: $id})
                 SET t.status = $status,
                     t.updated_at = datetime($now)
+                REMOVE t.interrupted_at, t.interrupted_reason
                 "#,
             ),
         }
@@ -380,6 +391,32 @@ impl Neo4jClient {
 
         self.graph.run(q).await?;
         Ok(())
+    }
+
+    /// Marks a task `Interrupted`, with when and why. Only a task that is not already finished
+    /// can be interrupted: completed and failed work is left as it is, and the answer says so
+    /// (`Ok(false)`), so a caller sweeping many tasks can count what it really changed.
+    pub async fn interrupt_task(&self, task_id: Uuid, reason: &str) -> Result<bool> {
+        let q = query(
+            r#"
+            MATCH (t:Task {id: $id})
+            WHERE t.status IN ['Pending', 'InProgress', 'Blocked', 'Interrupted']
+            SET t.status = 'Interrupted',
+                t.interrupted_at = coalesce(t.interrupted_at, datetime($now)),
+                t.interrupted_reason = $reason,
+                t.updated_at = datetime($now)
+            RETURN count(t) AS changed
+            "#,
+        )
+        .param("id", task_id.to_string())
+        .param("reason", reason.to_owned())
+        .param("now", chrono::Utc::now().to_rfc3339());
+        let mut rows = self.graph.execute(q).await?;
+        let changed = match rows.next().await? {
+            Some(row) => row.get::<i64>("changed").unwrap_or(0),
+            None => 0,
+        };
+        Ok(changed > 0)
     }
 
     /// Assign task to an agent

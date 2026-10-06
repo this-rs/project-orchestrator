@@ -221,6 +221,8 @@ mod tests {
                 description: title.to_string(),
                 status: status.clone(),
                 assigned_to: None,
+                interrupted_at: None,
+                interrupted_reason: None,
                 priority: Some(50),
                 tags: vec![],
                 acceptance_criteria: vec![],

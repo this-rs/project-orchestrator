@@ -25,6 +25,10 @@ pub enum Eligibility {
     SkipDone,
     /// Blocked: skipped until someone unblocks it.
     SkipBlocked,
+    /// Interrupted: its owner disappeared mid-way. NEVER relaunched on the runner's own
+    /// initiative: whatever made it look current may be out of date, so somebody resumes it, or
+    /// does not. This is the rule that keeps a restart from re-running stale work.
+    SkipInterrupted,
 }
 
 impl Eligibility {
@@ -38,6 +42,7 @@ pub fn task_eligibility(status: &TaskStatus) -> Eligibility {
     match status {
         TaskStatus::Completed => Eligibility::SkipDone,
         TaskStatus::Blocked => Eligibility::SkipBlocked,
+        TaskStatus::Interrupted => Eligibility::SkipInterrupted,
         TaskStatus::Pending | TaskStatus::InProgress | TaskStatus::Failed => Eligibility::Run,
     }
 }
@@ -52,6 +57,10 @@ pub struct ResumeBreakdown {
     pub failed_to_retry: u32,
     /// Never-finished tasks (pending / in_progress) that will run.
     pub todo: u32,
+    /// Interrupted tasks that will be skipped, named. Not in the `ResumePreview` contract yet
+    /// (it is strict and shared with the frontend): the preview counts them nowhere, so they are
+    /// neither re-run nor presented as done; naming them to the user comes with the contract change.
+    pub interrupted: Vec<TaskRef>,
 }
 
 impl ResumeBreakdown {
@@ -72,6 +81,10 @@ pub fn resume_breakdown<'a>(tasks: impl IntoIterator<Item = &'a WaveTask>) -> Re
         match task_eligibility(&t.status) {
             Eligibility::SkipDone => b.done += 1,
             Eligibility::SkipBlocked => b.blocked.push(TaskRef {
+                id: t.id,
+                title: t.title.clone().unwrap_or_else(|| "untitled".to_string()),
+            }),
+            Eligibility::SkipInterrupted => b.interrupted.push(TaskRef {
                 id: t.id,
                 title: t.title.clone().unwrap_or_else(|| "untitled".to_string()),
             }),
@@ -212,6 +225,46 @@ mod tests {
         let run = crate::runner::runner::eligible_wave_tasks(&wave);
         assert_eq!(run.len() as u32, p.rerun_count);
         assert!(run.iter().all(|t| t.id != b.blocked[0].id));
+    }
+
+    #[test]
+    fn an_interrupted_task_is_never_run_on_the_runners_own_initiative() {
+        // The point of the status: a restart must not re-run work whose owner disappeared and
+        // that may since have been done, abandoned or overtaken. `InProgress` IS re-run by the
+        // rule above; `Interrupted` is what stale in-progress work is turned into.
+        assert_eq!(
+            task_eligibility(&TaskStatus::Interrupted),
+            Eligibility::SkipInterrupted
+        );
+        assert!(!task_eligibility(&TaskStatus::Interrupted).is_run());
+        assert!(task_eligibility(&TaskStatus::InProgress).is_run());
+    }
+
+    #[test]
+    fn interrupted_work_is_neither_done_nor_to_rerun_in_the_preview_and_the_runner_skips_it() {
+        let mut tasks = plan();
+        let before = resume_breakdown(&tasks).to_preview();
+        tasks.push(wt(TaskStatus::Interrupted, "left over"));
+
+        let b = resume_breakdown(&tasks);
+        assert_eq!(b.interrupted.len(), 1);
+        assert_eq!(b.interrupted[0].title, "left over");
+        assert_eq!(
+            b.to_preview(),
+            before,
+            "it changes neither the done nor the rerun count"
+        );
+
+        // The runner's own wave filter drops it: the tasks it runs are still the rerun set.
+        let wave = Wave {
+            wave_number: 1,
+            task_count: tasks.len(),
+            tasks: tasks.clone(),
+            split_from_conflicts: false,
+        };
+        let run = crate::runner::runner::eligible_wave_tasks(&wave);
+        assert_eq!(run.len() as u32, before.rerun_count);
+        assert!(run.iter().all(|t| t.id != b.interrupted[0].id));
     }
 
     #[test]
