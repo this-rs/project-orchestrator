@@ -457,7 +457,7 @@ fn random_secret(len: usize) -> String {
 pub struct DependencyStatus {
     /// Backward compat: true when Docker daemon is reachable.
     pub docker_available: bool,
-    /// Fine-grained Docker status: "running", "installed", or "not_installed".
+    /// Fine-grained Docker status: "running", "unresponsive", "installed", or "not_installed".
     pub docker_status: String,
     pub claude_code_available: bool,
     pub config_exists: bool,

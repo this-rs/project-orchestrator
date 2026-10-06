@@ -49,6 +49,10 @@ pub enum ServiceStatus {
 pub enum DockerStatus {
     /// Docker daemon is reachable and responding to ping.
     Running,
+    /// A runtime holds the socket and takes connections, but does not answer: Docker Desktop
+    /// is frozen (or still booting its VM). Opening the app again changes nothing; it has to
+    /// be restarted.
+    Unresponsive,
     /// Docker binary/app is present on disk but the daemon is not running
     /// (e.g. Docker Desktop is installed but closed).
     Installed,
@@ -60,6 +64,7 @@ impl std::fmt::Display for DockerStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DockerStatus::Running => write!(f, "running"),
+            DockerStatus::Unresponsive => write!(f, "unresponsive"),
             DockerStatus::Installed => write!(f, "installed"),
             DockerStatus::NotInstalled => write!(f, "not_installed"),
         }
@@ -171,14 +176,24 @@ impl DockerManager {
         self.resolve().await.is_some()
     }
 
-    /// Return fine-grained Docker status: Running, Installed, or NotInstalled.
+    /// Return fine-grained Docker status: Running, Unresponsive, Installed, or NotInstalled.
     ///
     /// - `Running` → a daemon answers a ping (on any known endpoint)
-    /// - `Installed` → a socket or an app/CLI is on disk but nothing answers (not started, or frozen)
+    /// - `Unresponsive` → something LISTENS on a known socket and accepts connections, but never
+    ///   answers (Docker Desktop frozen, or its VM still booting)
+    /// - `Installed` → a socket file or an app/CLI is on disk but nobody listens (not started)
     /// - `NotInstalled` → no trace of Docker on this machine
     pub async fn status(&self) -> DockerStatus {
         if self.resolve().await.is_some() {
             return DockerStatus::Running;
+        }
+        // Told apart from "not started" by the connection itself: a stale socket file refuses
+        // it, a frozen Docker Desktop takes it. "Open Docker Desktop" cannot fix the second, and
+        // the splash used to wait for ever behind that button.
+        for endpoint in self.candidates() {
+            if listens(&endpoint).await {
+                return DockerStatus::Unresponsive;
+            }
         }
         let socket_present = self.candidates().iter().any(|e| endpoint_exists(e));
         if socket_present || Self::is_docker_installed_on_disk() {
@@ -733,6 +748,26 @@ fn connect(endpoint: &str) -> Option<Docker> {
     Docker::connect_with_socket(endpoint, 5, bollard::API_DEFAULT_VERSION).ok()
 }
 
+/// Whether something is listening on `endpoint`: the connection is accepted (it is not
+/// necessarily answered). A socket file left behind by a runtime that is not running refuses it.
+async fn listens(endpoint: &str) -> bool {
+    #[cfg(unix)]
+    {
+        let Some(path) = endpoint.strip_prefix("unix://") else {
+            return false;
+        };
+        matches!(
+            tokio::time::timeout(PING_TIMEOUT, tokio::net::UnixStream::connect(path)).await,
+            Ok(Ok(_))
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = endpoint;
+        false
+    }
+}
+
 /// Whether the daemon answers a ping, within [`PING_TIMEOUT`].
 async fn answers(docker: &Docker) -> bool {
     matches!(
@@ -761,14 +796,14 @@ pub fn create_docker_manager() -> SharedDockerManager {
 pub struct CheckDockerResponse {
     /// Backward compat: true when Docker daemon is reachable.
     pub available: bool,
-    /// Fine-grained status: "running", "installed", or "not_installed".
+    /// Fine-grained status: "running", "unresponsive", "installed", or "not_installed".
     pub status: String,
 }
 
 /// Check if Docker is installed and accessible.
 ///
 /// Returns both a backward-compatible `available` bool and a fine-grained `status` string
-/// ("running", "installed", "not_installed") so the splash screen can differentiate
+/// ("running", "unresponsive", "installed", "not_installed") so the splash screen can differentiate
 /// "Docker not installed" from "Docker Desktop installed but not started".
 #[tauri::command]
 pub async fn check_docker(
@@ -1025,7 +1060,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_frozen_daemon_is_installed_not_running_and_the_check_returns() {
+    async fn a_frozen_daemon_is_unresponsive_not_not_running_and_the_check_returns() {
         let dir = scratch("frozen");
         let socket = dir.join("docker.sock");
         let _daemon = serve_frozen(&socket);
@@ -1034,14 +1069,27 @@ mod tests {
         let status = manager.status().await;
         assert_eq!(
             status,
-            DockerStatus::Installed,
-            "a socket is there, nobody answers"
+            DockerStatus::Unresponsive,
+            "it takes the connection, nobody answers: opening the app again cannot help"
         );
+        assert_eq!(status.to_string(), "unresponsive");
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(4),
+            started.elapsed() < std::time::Duration::from_secs(6),
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn a_socket_file_nobody_listens_on_is_installed_not_unresponsive() {
+        // What a runtime that was quit leaves behind: the file, with nothing behind it.
+        let dir = scratch("stale");
+        let socket = dir.join("docker.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        drop(listener);
+        assert!(socket.exists());
+        let manager = DockerManager::with_endpoints(vec![unix(&socket)]);
+        assert_eq!(manager.status().await, DockerStatus::Installed);
     }
 
     #[tokio::test]
