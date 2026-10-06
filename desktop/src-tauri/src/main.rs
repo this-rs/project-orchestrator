@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod docker;
+mod net;
 mod plugins;
 mod setup;
 mod tray;
@@ -169,6 +170,7 @@ fn main() {
             get_server_port,
             proceed_to_main,
             check_health,
+            net::probe_services,
             open_url,
             pick_directory,
             restart_app,

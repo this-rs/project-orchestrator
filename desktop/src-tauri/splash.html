@@ -302,6 +302,11 @@
       'windows': 'https://docs.docker.com/desktop/setup/install/windows-install/',
     };
 
+    // Why a service is unreachable (from the probe_services command), by service id.
+    const probeHints = {};
+    let probeDone = Promise.resolve();
+    function hintFor(id, fallback) { return probeHints[id] || fallback; }
+
     let platformOs = 'macos';
     let globalStartTime = Date.now();
     const GLOBAL_TIMEOUT = 120000; // 120s
@@ -476,6 +481,13 @@
         if (deps.infraMode === 'external') {
           // External mode: skip Docker, but check service connectivity
           setCheck('check-docker', 'skipped', 'External mode');
+          // Ask Rust why a service cannot be reached (refused, unreachable, macOS local-network
+          // permission...). It runs next to the health poll and only adds a reason to rows that fail.
+          probeDone = invoke('probe_services').then(results => {
+            for (const r of results || []) {
+              if (!r.ok && r.hint) probeHints['check-' + r.service] = r.hint;
+            }
+          }).catch(() => {});
           setCheck('check-neo4j', '', 'Checking connectivity...');
           setCheck('check-meilisearch', '', 'Checking connectivity...');
           setCheck('check-nats', '', 'Checking connectivity...');
@@ -763,17 +775,17 @@
             if (health.services) {
               setCheck('check-neo4j',
                 health.services.neo4j === 'connected' ? 'success' : 'error',
-                health.services.neo4j === 'connected' ? 'Connected' : 'Unreachable');
+                health.services.neo4j === 'connected' ? 'Connected' : hintFor('check-neo4j', 'Unreachable'));
               setCheck('check-meilisearch',
                 health.services.meilisearch === 'connected' ? 'success' : 'error',
-                health.services.meilisearch === 'connected' ? 'Connected' : 'Unreachable');
+                health.services.meilisearch === 'connected' ? 'Connected' : hintFor('check-meilisearch', 'Unreachable'));
               // NATS status from /health
               if (health.services.nats === 'connected') {
                 setCheck('check-nats', 'success', 'Connected');
               } else if (health.services.nats === 'disabled') {
                 setCheck('check-nats', 'skipped', 'Disabled');
               } else if (health.services.nats === 'disconnected') {
-                setCheck('check-nats', 'error', 'Unreachable');
+                setCheck('check-nats', 'error', hintFor('check-nats', 'Unreachable'));
               } else {
                 setCheck('check-nats', 'skipped', 'Disabled');
               }
@@ -785,8 +797,24 @@
             }
 
             setCheck('check-backend', 'success');
-            setStatus('Ready');
-            await sleep(500);
+            const failed = health.services &&
+              ['neo4j', 'meilisearch', 'nats'].some(k => ['disconnected', 'unreachable'].includes(health.services[k]));
+            if (failed) {
+              // Something configured cannot be reached: say why before moving on, and leave time
+              // to read it (the main window opens either way, the app has its own error screens).
+              setStatus('Some services are unreachable');
+              await Promise.race([probeDone, sleep(3500)]);
+              const rows = { neo4j: 'check-neo4j', meilisearch: 'check-meilisearch', nats: 'check-nats' };
+              for (const [name, id] of Object.entries(rows)) {
+                if (probeHints[id] && ['disconnected', 'unreachable'].includes(health.services[name])) {
+                  setCheck(id, 'error', probeHints[id]);
+                }
+              }
+              await sleep(3000);
+            } else {
+              setStatus('Ready');
+              await sleep(500);
+            }
             transitionToMain();
             return;
           }
