@@ -370,9 +370,9 @@ pub async fn test_connection_detailed(
     test_service(&service, &url).await
 }
 
-/// Tauri command: reachability of the services of `config.yaml`, with a reason when one fails.
-#[tauri::command]
-pub async fn probe_services() -> Vec<Probe> {
+/// The services of `config.yaml` as (name, endpoint): Neo4j, Meilisearch, and NATS when it is on.
+/// Empty when there is no readable configuration yet.
+fn configured_endpoints() -> Vec<(&'static str, String)> {
     let path = crate::setup::config_path();
     let Ok(contents) = std::fs::read_to_string(&path) else {
         return Vec::new();
@@ -387,7 +387,47 @@ pub async fn probe_services() -> Vec<Probe> {
     if let Some(nats) = yaml.nats.url.clone() {
         endpoints.push(("nats", nats));
     }
-    probe_endpoints(endpoints).await
+    endpoints
+}
+
+/// Tauri command: reachability of the services of `config.yaml`, with a reason when one fails.
+#[tauri::command]
+pub async fn probe_services() -> Vec<Probe> {
+    probe_endpoints(configured_endpoints()).await
+}
+
+/// Every service answers ITS OWN protocol (Bolt handshake, NATS banner, Meilisearch `/health`),
+/// and there is at least one. An open port is not enough: something else may hold it.
+pub(crate) async fn services_all_up(endpoints: Vec<(&'static str, String)>) -> bool {
+    if endpoints.is_empty() {
+        return false;
+    }
+    let tasks: Vec<_> = endpoints
+        .into_iter()
+        .map(|(service, raw)| {
+            tokio::spawn(async move {
+                test_service(service, &raw)
+                    .await
+                    .map(|test| test.ok)
+                    .unwrap_or(false)
+            })
+        })
+        .collect();
+    for task in tasks {
+        if !task.await.unwrap_or(false) {
+            return false;
+        }
+    }
+    true
+}
+
+/// [`services_all_up`] for the services of `config.yaml`.
+///
+/// What the app asks when Docker's API does not answer: Docker Desktop can have its control
+/// socket stuck while the containers it started keep running and serving, and the containers
+/// are what the app needs, not the socket.
+pub(crate) async fn configured_services_up() -> bool {
+    services_all_up(configured_endpoints()).await
 }
 
 #[cfg(test)]
@@ -566,6 +606,33 @@ mod tests {
             }
         });
         port
+    }
+
+    #[tokio::test]
+    async fn services_are_up_only_when_every_one_answers_its_own_protocol() {
+        let bolt = serve_once(&[0, 0, 4, 5], false).await;
+        let nats = serve_once(b"INFO {\"server_id\":\"x\"}\r\n", true).await;
+        let endpoints = |bolt_port: u16, nats_port: u16| {
+            vec![
+                ("neo4j", format!("bolt://127.0.0.1:{bolt_port}")),
+                ("nats", format!("nats://127.0.0.1:{nats_port}")),
+            ]
+        };
+        assert!(services_all_up(endpoints(bolt, nats)).await);
+
+        // Something else on NATS's port (it speaks, but it is not NATS): not up.
+        let impostor = serve_once(b"hello\r\n", true).await;
+        assert!(!services_all_up(endpoints(bolt, impostor)).await);
+
+        // A port nobody listens on: not up.
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        assert!(!services_all_up(endpoints(bolt, closed)).await);
+
+        // No service configured says nothing: never "up".
+        assert!(!services_all_up(Vec::new()).await);
     }
 
     #[tokio::test]

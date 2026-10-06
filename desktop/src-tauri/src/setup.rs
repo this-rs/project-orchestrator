@@ -457,8 +457,11 @@ fn random_secret(len: usize) -> String {
 pub struct DependencyStatus {
     /// Backward compat: true when Docker daemon is reachable.
     pub docker_available: bool,
-    /// Fine-grained Docker status: "running", "installed", or "not_installed".
+    /// Fine-grained Docker status: "running", "unresponsive", "installed", or "not_installed".
     pub docker_status: String,
+    /// Docker's API does not answer, but every configured service does: the containers run on.
+    /// Only ever true with `docker_status == "unresponsive"`.
+    pub docker_services_reachable: bool,
     pub claude_code_available: bool,
     pub config_exists: bool,
     /// Whether setup has been completed (from config.yaml).
@@ -544,14 +547,22 @@ pub async fn check_dependencies(
         match tokio::time::timeout(std::time::Duration::from_secs(5), probe).await {
             Ok(status) => status,
             Err(_) => {
-                tracing::warn!(
-                    "Docker did not answer within 5 s — treating it as installed but not running"
-                );
-                crate::docker::DockerStatus::Installed
+                tracing::warn!("Docker did not answer within 5 s — treating it as not responding");
+                crate::docker::DockerStatus::Unresponsive
             }
         }
     };
     let docker_available = docker_status == crate::docker::DockerStatus::Running;
+    // Docker's API is stuck, but are the SERVICES up? Asked with their own protocols, and only
+    // then: the containers are what the app needs, and Docker Desktop can keep running them
+    // with its control socket frozen.
+    let docker_services_reachable = docker_status == crate::docker::DockerStatus::Unresponsive
+        && tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            crate::net::configured_services_up(),
+        )
+        .await
+        .unwrap_or(false);
 
     // Claude Code CLI check
     let claude_code_available = project_orchestrator::setup_claude::detect_claude_cli().is_some();
@@ -563,6 +574,7 @@ pub async fn check_dependencies(
     Ok(DependencyStatus {
         docker_available,
         docker_status: docker_status.to_string(),
+        docker_services_reachable,
         claude_code_available,
         config_exists,
         setup_completed,

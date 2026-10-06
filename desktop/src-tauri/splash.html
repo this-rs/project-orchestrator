@@ -544,11 +544,33 @@
     // ========================================================================
 
     async function handleDockerMode(deps) {
-      const dockerStatus = deps.dockerStatus; // "running", "installed", "not_installed"
+      const dockerStatus = deps.dockerStatus; // "running", "unresponsive", "installed", "not_installed"
 
       if (dockerStatus === 'running') {
         setCheck('check-docker', 'success');
         await startServices(deps);
+
+      } else if (dockerStatus === 'unresponsive' && deps.dockerServicesReachable) {
+        // Docker's control socket does not answer, but Neo4j, Meilisearch and NATS do (each
+        // checked with its own protocol): Docker Desktop is running, only its API is stuck.
+        // The services are what the app needs, so go on exactly as in external mode, and say
+        // why Docker shows a warning. Asking the user to restart Docker would stop them.
+        setCheck('check-docker', 'warning', 'Docker Desktop is not answering its API, but your services are running');
+        setCheck('check-neo4j', '', 'Checking connectivity...');
+        setCheck('check-meilisearch', '', 'Checking connectivity...');
+        setCheck('check-nats', '', 'Checking connectivity...');
+        setStatus('Checking services...');
+        await pollBackendHealthWithServices();
+
+      } else if (dockerStatus === 'unresponsive') {
+        // Something holds Docker's socket and takes connections but never answers, and the
+        // services do not answer either: Docker Desktop is frozen (or its VM is still
+        // booting). "Open" cannot help a frozen one.
+        showDockerUnresponsive();
+        setCheck('check-neo4j', '', 'Waiting for Docker...');
+        setCheck('check-meilisearch', '', 'Waiting for Docker...');
+        setCheck('check-nats', '', 'Waiting for Docker...');
+        await pollDockerAvailability(deps);
 
       } else if (dockerStatus === 'installed') {
         // Docker Desktop is installed but daemon is not running
@@ -581,6 +603,11 @@
     // Poll for Docker daemon availability (installed but not running)
     // ========================================================================
 
+    function showDockerUnresponsive() {
+      setCheck('check-docker', 'warning', 'Docker Desktop is not responding');
+      setStatus('Docker Desktop is not responding. If it has just started, wait; otherwise quit it (Cmd+Q, or Force Quit) and open it again.');
+    }
+
     async function pollDockerAvailability(deps) {
       while (!isGlobalTimeout()) {
         await sleep(3000);
@@ -591,6 +618,12 @@
             // Use fresh deps for credentials (may have changed)
             await startServices(freshDeps);
             return;
+          } else if (freshDeps.dockerStatus === 'unresponsive') {
+            showDockerUnresponsive();
+          } else if (freshDeps.dockerStatus === 'installed') {
+            setCheck('check-docker', 'warning', 'Docker Desktop is not running',
+              `<button class="check-action" onclick="invoke('open_docker_desktop').catch(()=>{})">Open</button>`);
+            setStatus('Please start Docker Desktop');
           }
         } catch (_) { /* continue polling */ }
       }
@@ -614,8 +647,8 @@
             setCheck('check-docker', 'success');
             await startServices(freshDeps);
             return;
-          } else if (freshDeps.dockerStatus === 'installed') {
-            // User installed Docker but hasn't started it yet
+          } else if (freshDeps.dockerStatus === 'installed' || freshDeps.dockerStatus === 'unresponsive') {
+            // User installed Docker but hasn't started it yet (or it is not answering)
             setCheck('check-docker', 'warning', 'Docker Desktop is not running');
             setStatus('Please start Docker Desktop');
             await pollDockerAvailability(freshDeps);
