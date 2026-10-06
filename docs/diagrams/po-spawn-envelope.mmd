@@ -1,0 +1,124 @@
+%% name: po-spawn-envelope
+%% covers: backend:src/chat/envelope.rs backend:src/auth/{agent_tokens,jwt,tool_profile}.rs
+%% verified: 878281ca
+%% ---
+%% PROUVE : ce qu'une session ouverte PAR UN AGENT a le droit d'être (décisions A17, A25, A34),
+%%   tel que le code le fait sur la branche integration/harness-multi-provider (base 84804df0,
+%%   tranches B20/B21/B22) : jeton de session lié et révocable, routes réservées à un humain,
+%%   enveloppe d'une session enfant.
+%% ---
+%% SOURCES LUES :
+%%   src/auth/jwt.rs          — generate_session_token, agent_session_binding, AgentSessionBinding,
+%%                              Claims::is_agent_session, Claims::is_human
+%%   src/auth/agent_tokens.rs — register, is_live, revoke_session
+%%   src/auth/tool_profile.rs — ToolProfile (from_name, from_unverified_token, filter_tools,
+%%                              allows_action, route_forbidden) ; src/mcp/server.rs — profile_refusal
+%%   src/auth/middleware.rs   — require_auth, enforce_token_policy, is_human_only_mutation (po-api)
+%%   src/chat/envelope.rs     — identify_caller, resolve_envelope, ParentEnvelope::apply,
+%%                              restrict_permission_mode, is_within, ensure_child_of
+%%   src/api/chat_handlers.rs — create_session ; src/api/handlers.rs — delegate_task,
+%%                              delegation_chat_request
+%%   src/chat/manager.rs      — build_options (frappe du jeton), close_session (révocation)
+%% ---
+%% NON ETABLI :
+%%   aucun test de bout en bout avec un vrai CLI : la règle est testée sur ses fonctions et sur
+%%   le middleware (MockGraphStore, routeur de test) ;
+%%   budget de l'enfant = reste du parent, annulation en cascade, coût des descendants : tâche B36 ;
+%%   sans authentification (auth_config absent) le parent vient de l'en-tête X-Session-Id : indice,
+%%   pas frontière.
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans test / décidé non écrit
+%%   🔴 défaut constaté (raison dans le nœud)  ⚪ amont ou autre domaine
+
+flowchart TD
+    subgraph legend["Légende"]
+        direction LR
+        L1["✅ vérifié par test"]
+        L2["🟠 écrit, sans test"]
+        L3["⚪ autre domaine"]
+    end
+
+    subgraph token["Jeton de session (PO_AUTH_TOKEN)"]
+        MINT["✅ build_options → generate_session_token<br/>scope signé : session:&lt;id&gt; ceiling:&lt;mode&gt; tools:&lt;profil&gt;<br/>jti unique<br/>test : session_token_is_bound_to_its_session_and_carries_a_jti"]
+        REG["✅ agent_tokens::register(jti, session)<br/>liste d'AUTORISATION en mémoire ;<br/>un nouveau jeton remplace ceux de la session<br/>test : a_new_token_for_a_session_supersedes_the_previous_one"]
+        REVOKE["✅ close_session → agent_tokens::revoke_session<br/>test : agent_token_of_a_closed_session_is_refused"]
+        MINT --> REG
+        REG -.fermeture.-> REVOKE
+    end
+
+    subgraph mw["require_auth / enforce_token_policy"]
+        LIVE{"✅ jeton agent_session :<br/>jti encore enregistré ?"}
+        R401["✅ 401 — session fermée, jeton inconnu<br/>ou frappé avant un redémarrage<br/>test : agent_token_never_registered_is_refused"]
+        WS{"✅ chemin /auth/ws-ticket ?"}
+        R403WS["✅ 403 — pas de WebSocket pour un agent<br/>(réponses aux permissions, changement de mode)<br/>test : agent_token_gets_no_websocket_ticket"]
+        HUMAN{"✅ is_human_only_mutation(méthode, chemin) ?<br/>/auth/mcp-tokens, /api/chat/config*,<br/>/api/chat/providers*, /api/chat/roles,<br/>/api/chat/model-policy, /api/chat/model-aliases,<br/>/api/projects/*/llm-*,<br/>/api/chat/sessions/*/permissions/*"}
+        R403["✅ 403 — réservé à un humain<br/>test : agent_token_cannot_mutate_human_only_routes"]
+        PASS["✅ Claims injectés ; lectures et travail courant ouverts"]
+        LIVE -- non --> R401
+        LIVE -- oui --> WS
+        WS -- oui --> R403WS
+        WS -- non --> HUMAN
+        PROFILE{"✅ profil d'outils signé dans le jeton (tools:&lt;profil&gt;) :<br/>ToolProfile::route_forbidden(méthode, chemin) ?<br/>restricted : /api/admin*, /api/mcp-federation*, /api/lifecycle-hooks*,<br/>POST /api/chat/sessions, /api/plans/*/run*, …/delegate, déclencheurs<br/>absent = full ; nom inconnu = restricted"}
+        R403P["✅ 403 tool_not_in_profile<br/>test : a_restricted_profile_token_is_refused_the_routes_behind_withheld_tools"]
+        HUMAN -- "oui (hors GET)" --> R403
+        HUMAN -- non --> PROFILE
+        PROFILE -- oui --> R403P
+        PROFILE -- non --> PASS
+    end
+
+    REG --> LIVE
+    REVOKE --> R401
+
+    subgraph mcpproc["Sous-processus MCP (présentation, pas frontière)"]
+        MCPLIST["✅ McpServer::handle_tools_list : ToolProfile::filter_tools(all_tools())<br/>profil lu du jeton par McpHttpClient::tool_profile (sans vérifier la signature)<br/>test : the_restricted_profile_has_no_way_to_open_a_session_or_run_a_plan"]
+        MCPCALL["✅ McpServer::handle_tools_call : profile_refusal → erreur tool_not_in_profile<br/>test : a_restricted_session_is_refused_the_withheld_calls"]
+        NOMINT["✅ le profil restreint est une LISTE BLANCHE (22 outils ; en REST : DÉFAUT REFUSÉ, seuls les préfixes de routes des outils gardés sont ouverts — ALLOWED_ROUTE_PREFIXES / CLOSED_ROUTE_PREFIXES, plus long préfixe gagnant ; test route_table_is_classified : une route de routes.rs non classée fait échouer la CI ; test every_classification_entry_matches_a_real_route : pas d'entrée morte ; vault, admin, mcp_federation, lifecycle_hook, protocol, sharing, environment, neural_routing, trajectory absents ; un outil ajouté demain est retenu par défaut), les routes /api/vault* lui sont fermées ; build_agent_spec frappe tools:restricted pour tout provider non-Claude (po_mcp_env)<br/>test : the_restricted_profile_has_no_way_to_open_a_session_or_run_a_plan, the_vault_routes_are_closed_to_a_restricted_token_reads_included, calls_are_decided_by_tool_and_action<br/>✅ frontière sur les routes de session : un jeton agent_session n est admis que sur les sessions qu il a ENGENDRÉES (ensure_child_of sur toute écriture /api/chat/sessions/{id}/*, hors annotation de sa propre session)<br/>test : an_agent_token_cannot_write_to_a_session_it_did_not_spawn"]
+    end
+    MINT -.-> MCPLIST
+    MINT -.-> NOMINT
+
+    subgraph caller["Qui demande une session ? — identify_caller"]
+        C1["✅ jeton agent_session lié → Agent(session signée, plafond signé)<br/>l'en-tête X-Session-Id est ignoré<br/>test : the_parent_comes_from_the_signed_token_not_from_a_header"]
+        C2["✅ jeton agent sans session → 403 envelope_unbound_token<br/>test : an_unbound_agent_token_cannot_spawn"]
+        C3["✅ autre jeton → Human (aucune enveloppe)<br/>test : a_human_is_not_enveloped_…"]
+        C4["✅ sans authentification : en-tête X-Session-Id → Agent<br/>test : without_auth_the_header_names_the_parent"]
+    end
+
+    PASS --> ENTRY
+    ENTRY["⚪ POST /api/chat/sessions (create_session)<br/>⚪ POST /api/plans/{p}/tasks/{t}/delegate (delegate_task)"]
+    ENTRY --> C1 & C2 & C3 & C4
+
+    subgraph env["Enveloppe — resolve_envelope puis ParentEnvelope::apply"]
+        DEPTH{"✅ le parent a-t-il lui-même un parent ?<br/>(spawned_by.parent_session_id)"}
+        E_DEPTH["✅ 403 envelope_depth_exceeded (profondeur 1)<br/>test : a_spawned_session_cannot_spawn"]
+        FAN{"✅ enfants VIVANTS du parent ≥ 4 ?<br/>(get_session_children × is_session_active)"}
+        E_FAN["✅ 403 envelope_too_many_children<br/>test : a_fifth_live_child_is_refused_…"]
+        CEIL["✅ plafond = min(mode vivant | persisté | défaut global, plafond signé)<br/>test : the_live_mode_and_the_signed_ceiling_both_clamp"]
+        DIRS{"✅ cwd et add_dirs sous cwd/add_dirs du parent ?<br/>(is_within : composants entiers, .. replié, liens résolus)"}
+        E_DIRS["✅ 403 envelope_cwd_outside_parent /<br/>envelope_add_dir_outside_parent<br/>test : cwd_outside_the_parent_is_refused"]
+        PROJ{"✅ projet = celui du parent ?<br/>workspace = celui du parent ?"}
+        E_PROJ["✅ 403 envelope_project_mismatch /<br/>envelope_workspace_mismatch"]
+        MODE["✅ permission_mode = restrict_permission_mode(plafond, demandé | défaut)<br/>plan &lt; default &lt; acceptEdits &lt; auto &lt; bypassPermissions ; inconnu = default<br/>test : a_child_is_never_more_permissive_than_its_parent"]
+        DEPTH -- oui --> E_DEPTH
+        DEPTH -- non --> FAN
+        FAN -- oui --> E_FAN
+        FAN -- non --> CEIL --> DIRS
+        DIRS -- non --> E_DIRS
+        DIRS -- oui --> PROJ
+        PROJ -- non --> E_PROJ
+        PROJ -- oui --> MODE
+    end
+
+    C1 --> DEPTH
+    C4 --> DEPTH
+
+    MODE --> SPAWN_CHAT["✅ create_session : spawned_by = SpawnedBy::Conversation{parent du jeton}<br/>🟠 pas de test de handler (demande un ChatManager avec CLI)"]
+    MODE --> SPAWN_DEL["✅ delegate_task : delegation_chat_request<br/>demande bypassPermissions, bornée par le plafond ;<br/>spawned_by = SpawnedBy::Delegation{plan, tâche, parent du jeton}<br/>test : a_session_in_ask_mode_cannot_delegate_to_a_bypass_child"]
+    C3 --> HUMAN_PATH["✅ humain : comportement antérieur<br/>(delegate_task en bypassPermissions, parent du corps accepté)<br/>test : a_person_delegating_keeps_the_previous_behaviour"]
+
+    RESUME["✅ agent + session_id (envoi à une session existante) :<br/>ensure_child_of — seulement une session qu'il a ouverte<br/>test : an_agent_only_reaches_sessions_it_spawned"]
+    C1 --> RESUME
+
+    LATER["🟠 B36 : budget = reste du parent, annulation en cascade,<br/>coût des descendants — non écrit"]
+    SPAWN_DEL -.-> LATER

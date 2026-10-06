@@ -1,6 +1,6 @@
 %% name: po-chat-transport
-%% covers: backend:src/api/ws_chat_handler.rs
-%% verified: d42312a2
+%% covers: backend:src/api/ws_chat_handler.rs backend:src/chat/wire_contract.rs
+%% verified: 878281ca
 %% ---
 %% PROUVE : le transport WebSocket du chat — /ws/chat/{session_id} — tel que le code
 %%   le fait au sha d42312a2 (relu le 2026-10-02) : authentification avant l'upgrade,
@@ -46,6 +46,9 @@ flowchart TD
         REPLAY["✅ rejeu : get_events_since(last_event) depuis Neo4j<br/>→ subscribe (broadcast local) ou nats.subscribe_chat_events si distante<br/>→ get_streaming_snapshot (ou nats.request_streaming_snapshot) : partial_text + streaming_status<br/>→ replay_complete → auto_continue_state_changed<br/><i>vérifié : test_snapshot_fingerprints_cleared_on_dormant</i>"]
         UPGRADE --> REPLAY
     end
+
+    CONTRACT["✅ contrat de fil au niveau des champs — src/chat/wire_contract.rs (test)<br/>docs/api/chat-contract/{server-events,client-messages,control-frames}.json + SHA256SUMS<br/>33 ChatEvent (dont session_closed ; champs additifs facultatifs : tool_use/permission_request category+canonical,<br/>result cost/usage/model/stop_reason, system_init provider/capabilities/tool_policy/policy_mode, ask_user_question synthetic,<br/>permission_mode_changed policy_mode), 9 messages clients, 5 trames de contrôle (auth_ok, partial_text,<br/>replay_complete, events_lagged, session_dormant) + enveloppe seq/replaying<br/>exemples full/minimal par variante, champs requis/optionnels dérivés<br/><i>vérifié : wire_contract_matches_committed_fixtures, every_example_roundtrips,<br/>client_examples_parse_as_their_variant</i><br/>🔴 auth_error n'est émis nulle part dans src/ (le nœud UPGRADE le cite à tort)<br/>🟠 les champs additifs ne sont émis que par le chemin agent (EventMapper) : le chemin hérité n'en porte aucun ; session_closed n'est pas encore émis par close_session<br/>🟠 les trames de contrôle sont des copies statiques, non liées au handler par un test"]
+    CONTRACT -.->|"copié par le frontend, somme de contrôle"| FRONT
 
     FRONT --> AUTH --> UPGRADE
     RESTCREATE -.->|"session_id"| FRONT

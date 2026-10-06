@@ -577,6 +577,10 @@ mod tests {
                 is_error: false,
                 num_turns: Some(3),
                 result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             });
         });
 
@@ -664,6 +668,8 @@ mod tests {
                     tool: "Read".to_string(),
                     input: serde_json::json!({"path": "/same/file.rs"}),
                     parent_tool_use_id: None,
+                    category: None,
+                    canonical: None,
                 });
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -676,6 +682,10 @@ mod tests {
                 is_error: false,
                 num_turns: Some(3),
                 result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             });
         });
 
@@ -746,6 +756,10 @@ mod tests {
                 is_error: false,
                 num_turns: Some(1),
                 result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             });
         });
 
@@ -842,6 +856,10 @@ mod tests {
                 is_error: false,
                 num_turns: Some(1),
                 result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             });
         });
 
@@ -963,6 +981,10 @@ mod tests {
                 is_error: false,
                 num_turns: Some(1),
                 result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             });
         });
 
@@ -1038,6 +1060,7 @@ mod tests {
                 questions: serde_json::json!([{"question": "Should I continue?"}]),
                 input: serde_json::json!({"questions": [{"question": "Should I continue?"}]}),
                 parent_tool_use_id: None,
+                synthetic: None,
             });
             tokio::time::sleep(Duration::from_millis(50)).await;
             let _ = tx.send(ChatEvent::Result {
@@ -1048,6 +1071,10 @@ mod tests {
                 is_error: false,
                 num_turns: Some(1),
                 result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             });
         });
 
@@ -1187,6 +1214,8 @@ mod tests {
                 tool: "Read".to_string(),
                 input: serde_json::json!({"path": "/src/main.rs"}),
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             });
             tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -1206,6 +1235,10 @@ mod tests {
                 is_error: false,
                 num_turns: Some(3),
                 result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             });
         });
 
@@ -1322,6 +1355,10 @@ mod tests {
                 is_error: false,
                 num_turns: Some(3),
                 result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             });
         });
 
@@ -1402,6 +1439,10 @@ mod tests {
                 is_error: false,
                 num_turns: Some(3),
                 result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             });
         });
 
@@ -1507,6 +1548,10 @@ mod tests {
                 is_error: false,
                 num_turns: Some(0),
                 result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             });
         });
 
@@ -1572,6 +1617,8 @@ mod tests {
                     tool: "Read".to_string(),
                     input: serde_json::json!({"path": "/same/file.rs"}),
                     parent_tool_use_id: None,
+                    category: None,
+                    canonical: None,
                 });
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 // OOB noise between agent tool calls — MUST NOT reset
@@ -1593,6 +1640,10 @@ mod tests {
                 is_error: false,
                 num_turns: Some(3),
                 result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             });
         });
 

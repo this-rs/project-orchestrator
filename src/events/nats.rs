@@ -608,6 +608,8 @@ mod tests {
                 tool: "create_plan".into(),
                 input: serde_json::json!({"title": "Plan"}),
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             },
             ChatEvent::ToolResult {
                 id: "tu_1".into(),
@@ -625,6 +627,8 @@ mod tests {
                 tool: "bash".into(),
                 input: serde_json::json!({"command": "ls"}),
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             },
             ChatEvent::Result {
                 session_id: "sess-1".into(),
@@ -634,6 +638,10 @@ mod tests {
                 is_error: false,
                 num_turns: None,
                 result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             },
             ChatEvent::StreamDelta {
                 text: "tok".into(),

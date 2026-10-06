@@ -1,0 +1,178 @@
+{
+  "contract_version": 1,
+  "status": "server_events delivered",
+  "note": "Champs que le backend AJOUTERA au fil avec le harness multi-provider. Noms FIXÉS ici pour le frontend ; aucun n'est encore émis, sauf ceux marqués \"since\". Tous sont additifs et optionnels : une trame qui ne les porte pas reste valide. Quand un champ est livré, il passe dans server-events.json (généré) et sort d'ici. Les noms suivent nexus docs/agent-contract.md (§4, §5, §6, §7). MISE A JOUR : les champs additifs de server_events (tool_use/permission_request category+canonical, result cost/usage/model/stop_reason, ask_user_question synthetic, system_init provider/capabilities/tool_policy/policy_mode, permission_mode_changed policy_mode) et l'evenement session_closed sont maintenant dans server-events.json (genere). session_closed est emis par close_session ; les autres champs ne sont emis que par le chemin agent (CHAT_PROVIDER_PATH=agent), jamais par le chemin legacy. Restent ici : rest (DTO, GET /api/chat/providers livre, erreurs).",
+  "server_events": {},
+  "permission_modes": {
+    "doc": "Le backend ACCEPTE en entrée les 11 valeurs et émet les deux formes. Table héritée → neutre (jamais plus permissif) :",
+    "legacy_to_neutral": {
+      "default": "ask",
+      "manual": "ask",
+      "dontAsk": "ask",
+      "acceptEdits": "auto_edits",
+      "auto": "auto_edits",
+      "plan": "plan_only",
+      "bypassPermissions": "trust"
+    },
+    "neutral_to_legacy": {
+      "ask": "default",
+      "auto_edits": "acceptEdits",
+      "plan_only": "plan",
+      "trust": "bypassPermissions"
+    }
+  },
+  "rest": {
+    "ChatSession": {
+      "doc": "DTO de GET /api/chat/sessions et GET /api/chat/sessions/{id}",
+      "provider_id": {
+        "type": "string",
+        "required": false,
+        "doc": "absent = claude-code"
+      },
+      "capabilities": {
+        "type": "object",
+        "required": false,
+        "doc": "même instantané que system_init.capabilities ; présent sur GET /api/chat/sessions/{id}"
+      },
+      "routed_by": {
+        "type": "string",
+        "required": false,
+        "enum": [
+          "session",
+          "request",
+          "task",
+          "persona",
+          "run",
+          "project_rule",
+          "global_rule",
+          "default",
+          "claude_code",
+          "fallback"
+        ]
+      }
+    },
+    "CreateSessionRequest": {
+      "provider": {
+        "type": "string",
+        "required": false,
+        "doc": "id d'instance ; sur une session existante, un provider différent → 409 provider_conflict"
+      }
+    },
+    "GET /api/chat/providers": {
+      "query": {
+        "project_slug": "string?"
+      },
+      "response": {
+        "default_provider": "string | null",
+        "providers": [
+          {
+            "id": "string",
+            "kind": "string (claude_code | openai_compatible | codex | acp)",
+            "label": "string",
+            "builtin": "boolean",
+            "is_default": "boolean",
+            "allowed_for_project": "boolean | null (null sans project_slug)",
+            "endpoint_origin": "string | null (jamais d'identifiant ; origine seule)",
+            "credential": "string (vault:<nom> | env:<VAR> | none) — la référence, jamais la valeur",
+            "health": {
+              "state": "ok | auth_required | unreachable | cli_not_found | unknown",
+              "code": "string? (code d'erreur ci-dessous)",
+              "action": "string? (commande à lancer)",
+              "checked_at": "string? (RFC 3339)"
+            },
+            "models": [
+              {
+                "id": "string",
+                "alias": "string? (fast|default|deep|utility)",
+                "capabilities": "Capabilities (par modèle)"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "error_body": {
+      "doc": "Corps d'une ouverture refusée (create/resume). LIVRÉ pour claude-code : cli_not_found.",
+      "since": "integration/harness-multi-provider (B27)",
+      "shape": {
+        "error": "string (message court, sans détail interne)",
+        "code": "string",
+        "provider_id": "string?",
+        "action": "string?",
+        "retryable": "boolean",
+        "retry_after_ms": "number?"
+      },
+      "codes": {
+        "cli_not_found": 424,
+        "auth_required": 424,
+        "credentials_locked": 423,
+        "unauthorized": 502,
+        "endpoint_unreachable": 502,
+        "model_no_tools": 422,
+        "context_too_small": 422,
+        "rate_limited": 429,
+        "overloaded": 503,
+        "timeout": 504,
+        "process_exited": 502,
+        "protocol": 502,
+        "unsupported": 422,
+        "turn_in_progress": 409,
+        "invalid_request": 400,
+        "closed": 410,
+        "provider_error": 502,
+        "provider_conflict": 409,
+        "provider_unknown": 404,
+        "endpoint_not_allowed": 403,
+        "provider_unavailable": 503,
+        "no_provider": 409
+      },
+      "forbidden_403_prefixed": {
+        "doc": "403 dont le corps est {\"error\": \"<code>: <message>\"} (pas de champ code séparé) — livrés",
+        "codes": [
+          "envelope_unbound_token",
+          "envelope_parent_not_found",
+          "envelope_depth_exceeded",
+          "envelope_too_many_children",
+          "envelope_cwd_outside_parent",
+          "envelope_add_dir_outside_parent",
+          "envelope_project_mismatch",
+          "envelope_workspace_mismatch",
+          "envelope_not_a_child",
+          "tool_not_in_profile"
+        ]
+      }
+    }
+  },
+  "rest_settings": {
+    "doc": "LIVRE (backend ... settings). Toutes les mutations exigent un jeton HUMAIN (403 sinon). Aucun corps ne porte de secret : `credential_ref` = none | vault:<nom> | env:<VAR> ; tout autre champ (api_key...) est refuse (422), une valeur collee dans credential_ref est refusee (400) sans etre renvoyee.",
+    "ecarts_vs_message_coordinateur": "Le frontend appelle PUT /chat/providers/{id} et /projects/{slug}/llm-consent (singulier) ; le message du coordinateur disait PATCH et llm-consents (pluriel). Le backend accepte LES DEUX (PUT et PATCH ; llm-consent et llm-consents).",
+    "instances": {
+      "POST /api/chat/providers/test": "corps ProviderDraft -> 200 {ok:false, health:{state,code}} ; code = endpoint_* (refus de la garde), credentials_locked, credential_test_requires_saved_instance, model_no_tools ; sonde reelle (health, liste des modeles, appel d'outil, fenetre) ; ok = sante ok ET outils ok",
+      "POST /api/chat/providers": "201 {id,kind,preset,label,base_url,origin,default_model,cost_source,credential_ref,builtin:false} ; 409 id existant ; 409 security_gate_closed sans authentification ; 400 URL refusee ; 403 id claude-code",
+      "PUT|PATCH /api/chat/providers/{id}": "corps ProviderPatch -> 200 meme forme + consents_invalidated (true si l'origine change) ; 403 claude-code ; 404",
+      "DELETE /api/chat/providers/{id}": "204 ; 403 claude-code ; 404",
+      "GET /api/chat/providers/{id}/status": "HealthEntry {state, code?, action?, checked_at?}",
+      "GET /api/chat/providers/{id}/models": "[{id}]"
+    },
+    "consentement": {
+      "GET /api/projects/{slug}/llm-consent[s]": "[{provider_id, origin, consented_by, consented_at, valid}] ; valid=false si l'origine de l'instance a change",
+      "PUT /api/projects/{slug}/llm-consent[s]": "corps {provider_id, origin} -> 200 ligne ; 409 origin_mismatch si origin != origine courante de l'instance ; consented_by = email du jeton humain",
+      "PUT /api/projects/{slug}/llm-consent[s]/{provider_id}": "corps {origin}",
+      "DELETE /api/projects/{slug}/llm-consent[s]/{provider_id}": "204 ; 404 sans consentement"
+    },
+    "roles": "GET/PUT /api/chat/roles et /api/projects/{slug}/llm-roles : {pilot?:{provider,model?,alias?}, executor?:...} ; role absent = herite / fournisseur unique ; 404 instance inconnue ; 400 model ET alias ensemble ; STOCKE mais pas encore lu par le resolveur",
+    "aliases": "GET/PUT /api/chat/model-aliases : [{alias,provider,model}] ; alias = minuscules/chiffres/tirets, uniques ; 404 instance inconnue",
+    "policy": "GET/PUT /api/chat/model-policy : {mode: off|shadow|enforce, rules:{role:alias}, fallback:[alias], caps:{per_task_usd?,per_run_usd?,per_task_tokens?,per_run_tokens?}} ; livre `off` ; roles de regle et alias valides (400) ; STOCKEE, pas encore appliquee",
+    "GET /api/chat/providers": "liste maintenant aussi les instances stockees (health unknown, allowed_for_project selon le consentement valide) ; default_provider = cible `pilot` des roles si elle existe ; capabilities.images = true pour claude-code tant que le chemin legacy sert (ecart A12 assume : le chemin agent ne porte pas les images)",
+    "NON LIVRE": "preflight reel (sonde d'appel d'outil) via l'API de test ; fallback_reason ; sante des instances sondee"
+  },
+  "rest_runs": {
+    "doc": "LIVRE. Champs additifs, tous facultatifs : un corps qui ne les porte pas est inchange.",
+    "POST /api/plans/{id}/run": "corps + {provider?, model?, max_tokens?} ; 404 si l'instance n'existe pas (avant tout demarrage) ; le run est le niveau `run` de A16 ; consentement/garde/journal s'appliquent a CHAQUE session ; un run sur un tiers tourne en ask + profil restreint (jamais de bypass) ; max_tokens = budget de tokens par session",
+    "PATCH /api/tasks/{id}": "corps + {model_alias} : doit nommer un alias defini (400 sinon), chaine vide = efface ; 404 tache inconnue ; GET /api/tasks/{id} renvoie task.model_alias quand il existe",
+    "POST /api/chat/sessions/{id}/interrupt": "corps {scope?, cascade?:true} -> reponse inchangee + cascade:{stopped,total} (total = descendants, stopped = ceux qui etaient vivants et ont ete interrompus ; feuilles d'abord) ; sans cascade : aucune cle cascade",
+    "GET /api/chat/sessions/{id}/tree": "noeuds + provider_id (absent = claude-code), model, cost_usd (absent = inconnu), subtree_cost_usd (SEULEMENT si tous les noeuds du sous-arbre ont un cout), max_depth et max_children sur la racine",
+    "AgentExecution": "provider_id, model_requested, model, model_alias, routed_by, route_rule, fallback_reason (non rempli), shadow_model, shadow_provider, task_class, attempt, cost_basis, input_tokens, output_tokens (noms JSON ; tokens_in/tokens_out acceptes en lecture)",
+    "politique de modele": "off|shadow|enforce lue par le resolveur : enforce = candidat de la regle (chat, runner.*) a la place de la regle globale ; shadow = enregistre shadow_provider/shadow_model sans rien changer"
+  }
+}

@@ -596,14 +596,26 @@ pub async fn add_task(
 pub async fn get_task(
     State(state): State<OrchestratorState>,
     Path(task_id): Path<Uuid>,
-) -> Result<Json<TaskDetails>, AppError> {
+) -> Result<Json<serde_json::Value>, AppError> {
     let details = state
         .orchestrator
         .plan_manager()
         .get_task_details(task_id)
         .await?
         .ok_or(AppError::NotFound("Task not found".into()))?;
-    Ok(Json(details))
+    let mut body = serde_json::to_value(&details).map_err(|e| AppError::Internal(e.into()))?;
+    // The alias lives in the provider settings: shown on the task, absent = inherits.
+    if let Ok(Some(alias)) = state
+        .orchestrator
+        .neo4j()
+        .get_llm_setting(&format!("task:{task_id}"), "model_alias")
+        .await
+    {
+        if let Some(task) = body.get_mut("task").and_then(|t| t.as_object_mut()) {
+            task.insert("model_alias".into(), serde_json::Value::String(alias));
+        }
+    }
+    Ok(Json(body))
 }
 
 /// Delete a task and all its related data
@@ -629,6 +641,40 @@ pub async fn update_task(
     Path(task_id): Path<Uuid>,
     Json(req): Json<UpdateTaskRequest>,
 ) -> Result<StatusCode, AppError> {
+    // The task's model alias (A16): it must name a defined alias; an empty
+    // string clears it. Stored in the provider settings, not on the task node.
+    if let Some(alias) = req.model_alias.as_deref() {
+        let graph = state.orchestrator.neo4j();
+        if state
+            .orchestrator
+            .neo4j()
+            .get_task(task_id)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            return Err(AppError::NotFound("Task not found".into()));
+        }
+        if alias.is_empty() {
+            let _ = graph
+                .delete_llm_setting(&format!("task:{task_id}"), "model_alias")
+                .await;
+        } else {
+            let known = crate::chat::provider::store::aliases(graph)
+                .await
+                .map_err(AppError::Internal)?;
+            if !known.iter().any(|a| a.alias == alias) {
+                return Err(AppError::BadRequest(format!(
+                    "model_alias '{alias}' is not defined (see /api/chat/model-aliases)"
+                )));
+            }
+            graph
+                .put_llm_setting(&format!("task:{task_id}"), "model_alias", alias)
+                .await
+                .map_err(AppError::Internal)?;
+        }
+    }
     // Extract auto-linking fields before moving req.
     // Priority: explicit session_id in body > X-Session-Id header (injected by MCP proxy)
     let session_id_for_linking = req.session_id.clone().or_else(|| {
@@ -914,9 +960,13 @@ pub struct DelegateTaskResponse {
 /// Retrieve results from the AgentExecution node after completion.
 pub async fn delegate_task(
     State(state): State<OrchestratorState>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    headers: axum::http::HeaderMap,
     Path((plan_id, task_id)): Path<(Uuid, Uuid)>,
     Json(req): Json<DelegateTaskRequest>,
 ) -> Result<(StatusCode, Json<DelegateTaskResponse>), AppError> {
+    use crate::chat::envelope;
+
     let chat_manager = state
         .chat_manager
         .as_ref()
@@ -935,6 +985,38 @@ pub async fn delegate_task(
         .clone()
         .unwrap_or_else(|| "Untitled task".to_string());
 
+    // Step 0: the spawn envelope (decision A17). When the caller is a chat
+    // session, the parent is read from its signed token and the child stays
+    // inside it: same project, a directory the parent can see, a permission
+    // mode no wider than the parent's, no grandchild, at most 4 live children.
+    // Resolved BEFORE the prompt is built so a refused delegation costs nothing
+    // and the prompt is built for the parent's project.
+    let caller = envelope::identify_caller(
+        claims.as_ref().map(|c| &c.0),
+        envelope::session_header(&headers),
+        state.auth_config.is_some(),
+    )?;
+    let parent_envelope =
+        envelope::envelope_for_caller(graph.as_ref(), chat_manager.as_ref(), &caller).await?;
+    let default_mode = chat_manager.default_permission_mode().await;
+    let mut chat_request = delegation_chat_request(
+        req.cwd,
+        req.project_slug,
+        task_id,
+        &task_title,
+        parent_envelope.as_ref(),
+        &default_mode,
+    )?;
+    // A person may name the parent in the body; an agent's parent is its token's.
+    let parent_session_id = match &parent_envelope {
+        Some(env) => Some(env.parent_session_id),
+        None => req
+            .parent_session_id
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok()),
+    };
+    let project_slug = chat_request.project_slug.clone();
+
     // Step 1: Build enriched prompt via ContextBuilder + EnrichmentPipeline
     let pipeline = chat_manager.enrichment_pipeline.clone();
     let structured = state
@@ -944,7 +1026,7 @@ pub async fn delegate_task(
             task_id,
             plan_id,
             Some(&pipeline),
-            req.project_slug.as_deref(),
+            project_slug.as_deref(),
             None, // project_id resolved from slug if needed
             req.custom_sections,
         )
@@ -962,7 +1044,7 @@ pub async fn delegate_task(
     };
 
     // Step 2: Resolve scaffolding level from project for inheritance
-    let scaffolding_override = if let Some(ref slug) = req.project_slug {
+    let scaffolding_override = if let Some(ref slug) = project_slug {
         match graph.get_project_by_slug(slug).await {
             Ok(Some(project)) => {
                 match graph
@@ -980,34 +1062,17 @@ pub async fn delegate_task(
     };
 
     // Step 3: Spawn sub-agent via ChatManager
-    let spawned_by_json = serde_json::json!({
-        "type": "delegation",
-        "plan_id": plan_id.to_string(),
-        "task_id": task_id.to_string(),
-        "parent_session_id": req.parent_session_id,
-        "scaffolding_level": scaffolding_override,
-    });
-
-    let chat_request_cwd = req.cwd.clone();
-    let chat_request = crate::chat::types::ChatRequest {
-        attachments: Vec::new(),
-        message: String::new(), // prompt sent via send_message
-        session_id: None,
-        cwd: req.cwd,
-        project_slug: req.project_slug,
-        model: None,
-        permission_mode: Some("bypassPermissions".to_string()),
-        add_dirs: None,
-        workspace_slug: None,
-        user_claims: Some(crate::auth::jwt::Claims::service_account(&format!(
-            "delegate-agent:{}",
-            task_id
-        ))),
-        spawned_by: Some(spawned_by_json.to_string()),
-        task_context: Some(task_title.clone()),
-        scaffolding_override,
-        runner_context: None, // TODO: populate for delegate_task
-    };
+    chat_request.spawned_by = Some(
+        crate::chat::types::SpawnedBy::Delegation {
+            plan_id,
+            task_id,
+            parent_session_id,
+            scaffolding_level: scaffolding_override,
+        }
+        .to_json_string(),
+    );
+    chat_request.scaffolding_override = scaffolding_override;
+    let chat_request_cwd = chat_request.cwd.clone();
 
     let session = chat_manager
         .create_session(&chat_request)
@@ -1036,6 +1101,7 @@ pub async fn delegate_task(
             vector_json: None,
             report_json: None,
             execution_type: Default::default(),
+            ..Default::default()
         };
         let graph_clone = graph.clone();
         tokio::spawn(async move {
@@ -1098,6 +1164,51 @@ pub async fn delegate_task(
             prompt_preview,
         }),
     ))
+}
+
+/// The session request of a delegated task.
+///
+/// A delegation asks for `bypassPermissions` (nobody watches a sub-agent's
+/// prompts). When a chat session delegates, `envelope` clamps that to the
+/// session's own mode and refuses a directory or project outside it — a
+/// session in Ask mode gets a child in Ask mode, not a full-shell one.
+fn delegation_chat_request(
+    cwd: String,
+    project_slug: Option<String>,
+    task_id: Uuid,
+    task_title: &str,
+    envelope: Option<&crate::chat::envelope::ParentEnvelope>,
+    default_mode: &str,
+) -> Result<crate::chat::types::ChatRequest, crate::chat::envelope::EnvelopeError> {
+    let mut request = crate::chat::types::ChatRequest {
+        attachments: Vec::new(),
+        message: String::new(), // prompt sent via send_message
+        session_id: None,
+        cwd,
+        project_slug,
+        model: None,
+        provider: None,
+        task_alias: None,
+        run_provider: None,
+        run_model: None,
+        max_tokens: None,
+        task_class: None,
+        permission_mode: Some("bypassPermissions".to_string()),
+        add_dirs: None,
+        workspace_slug: None,
+        user_claims: Some(crate::auth::jwt::Claims::service_account(&format!(
+            "delegate-agent:{}",
+            task_id
+        ))),
+        spawned_by: None,
+        task_context: Some(task_title.to_string()),
+        scaffolding_override: None,
+        runner_context: None, // TODO: populate for delegate_task
+    };
+    if let Some(env) = envelope {
+        env.apply(&mut request, default_mode)?;
+    }
+    Ok(request)
 }
 
 /// Listen for a delegated sub-agent's Result event and emit a RunnerEvent-compatible
@@ -5361,6 +5472,16 @@ pub struct RunPlanRequest {
     /// Optional budget limit in USD. Overrides the default ($10).
     /// When omitted, falls back to RunnerConfig::default().max_cost_usd.
     pub max_cost_usd: Option<f64>,
+    /// Provider instance of every session of the run (A16 level "run"). Absent:
+    /// the rules decide.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model (or alias) of the run's sessions.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Token budget per session; the only budget a provider without a price can have.
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
 }
 
 /// Response for a successfully started plan run.
@@ -5397,11 +5518,26 @@ pub async fn run_plan(
         caller_claims,
         req.cwd,
         req.project_slug,
-        req.max_cost_usd,
         trigger_source,
+        RunRouting {
+            max_cost_usd: req.max_cost_usd,
+            provider: req.provider,
+            model: req.model,
+            max_tokens: req.max_tokens,
+        },
     )
     .await?;
     Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+/// Provider, model and token budget named by a run request.
+#[derive(Default)]
+pub(crate) struct RunRouting {
+    /// Budget in USD of the run; absent: the runner's default.
+    pub max_cost_usd: Option<f64>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub max_tokens: Option<u64>,
 }
 
 /// Build a `PlanRunner` wired to the server (chat manager, event bus, caller
@@ -5413,9 +5549,24 @@ async fn start_plan_run(
     caller_claims: crate::auth::jwt::Claims,
     cwd: String,
     project_slug: Option<String>,
-    max_cost_usd: Option<f64>,
     trigger_source: crate::runner::TriggerSource,
+    routing: RunRouting,
 ) -> Result<RunPlanResponse, AppError> {
+    let max_cost_usd = routing.max_cost_usd;
+    // A run naming an instance that does not exist is refused before it starts
+    // (consent and the rest are checked per session, at opening).
+    if let Some(provider) = routing.provider.as_deref().filter(|p| !p.is_empty()) {
+        let exists = provider == crate::chat::provider::resolver::CLAUDE_CODE
+            || crate::chat::provider::store::instance(state.orchestrator.neo4j(), provider)
+                .await
+                .map_err(AppError::Internal)?
+                .is_some();
+        if !exists {
+            return Err(AppError::NotFound(format!(
+                "unknown provider instance '{provider}'"
+            )));
+        }
+    }
     let chat_manager = state
         .chat_manager
         .as_ref()
@@ -5442,6 +5593,7 @@ async fn start_plan_run(
 
     // Inherit caller's auth claims so runner agents authenticate as the user
     runner = runner.with_user_claims(caller_claims);
+    runner = runner.with_run_routing(routing.provider, routing.model, routing.max_tokens);
 
     // Bridge RunnerEvents to CrudEvent for WebSocket delivery
     runner =
@@ -5543,8 +5695,8 @@ pub async fn retry_plan_task(
         caller_claims,
         ".".to_string(),
         None,
-        None,
         crate::runner::TriggerSource::Manual,
+        RunRouting::default(),
     )
     .await?;
     Ok((StatusCode::ACCEPTED, Json(response)))
@@ -6455,6 +6607,24 @@ pub enum AppError {
     /// 410: the thing existed but is permanently gone (e.g. the CLI that asked).
     Gone(String),
     NotImplemented(String),
+    /// A session could not be opened, for a reason the client can act on:
+    /// carries its own status, a stable `code`, the provider concerned and a
+    /// suggested action (decision A29).
+    Provider(Box<crate::chat::provider::errors::OpenFailure>),
+}
+
+impl AppError {
+    /// The error of a failed session opening: typed when the cause is a known
+    /// provider failure (missing CLI, locked credentials, …), internal otherwise.
+    pub fn from_open_error(err: anyhow::Error, provider_id: Option<&str>) -> Self {
+        match crate::chat::provider::errors::classify_open_error(&err, provider_id) {
+            Some(failure) => {
+                tracing::warn!(code = failure.code, error = %err, "session opening failed");
+                AppError::Provider(Box::new(failure))
+            }
+            None => AppError::Internal(err),
+        }
+    }
 }
 
 /// Generic message returned to clients for `AppError::Internal`.
@@ -6467,6 +6637,11 @@ pub(crate) const STEP_FAILED_MESSAGE: &str = "step failed (see server logs)";
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
+            AppError::Provider(failure) => {
+                let status = StatusCode::from_u16(failure.status)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                return (status, Json(failure.to_json())).into_response();
+            }
             AppError::Internal(e) => {
                 // Never leak internal details (DB errors, paths, queries) to the client.
                 tracing::error!(error = ?e, "internal server error");
@@ -6501,6 +6676,111 @@ impl From<anyhow::Error> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── delegate_task: the spawn envelope (decision A17) ───────────────────
+
+    fn parent_envelope(ceiling: &str) -> crate::chat::envelope::ParentEnvelope {
+        crate::chat::envelope::ParentEnvelope {
+            parent_session_id: Uuid::new_v4(),
+            ceiling: ceiling.to_string(),
+            roots: vec!["/work/repo".to_string()],
+            project_slug: Some("demo".to_string()),
+            workspace_slug: None,
+        }
+    }
+
+    #[test]
+    fn a_session_in_ask_mode_cannot_delegate_to_a_bypass_child() {
+        let env = parent_envelope("default");
+        let req = delegation_chat_request(
+            "/work/repo".into(),
+            None,
+            Uuid::new_v4(),
+            "t",
+            Some(&env),
+            "default",
+        )
+        .unwrap();
+        assert_eq!(
+            req.permission_mode.as_deref(),
+            Some("default"),
+            "the child of an Ask-mode session must stay in Ask mode"
+        );
+        assert_eq!(req.project_slug.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn a_bypass_parent_still_delegates_in_bypass() {
+        let env = parent_envelope("bypassPermissions");
+        let req = delegation_chat_request(
+            "/work/repo/sub".into(),
+            Some("demo".into()),
+            Uuid::new_v4(),
+            "t",
+            Some(&env),
+            "default",
+        )
+        .unwrap();
+        assert_eq!(req.permission_mode.as_deref(), Some("bypassPermissions"));
+    }
+
+    #[test]
+    fn a_delegation_outside_the_parents_directory_or_project_is_refused() {
+        let env = parent_envelope("bypassPermissions");
+        let err =
+            delegation_chat_request("/".into(), None, Uuid::new_v4(), "t", Some(&env), "default")
+                .unwrap_err();
+        assert_eq!(err.code(), "envelope_cwd_outside_parent");
+
+        let err = delegation_chat_request(
+            "/work/repo".into(),
+            Some("other".into()),
+            Uuid::new_v4(),
+            "t",
+            Some(&env),
+            "default",
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "envelope_project_mismatch");
+    }
+
+    #[test]
+    fn a_person_delegating_keeps_the_previous_behaviour() {
+        let req = delegation_chat_request(
+            "/anywhere".into(),
+            Some("p".into()),
+            Uuid::new_v4(),
+            "t",
+            None,
+            "default",
+        )
+        .unwrap();
+        assert_eq!(req.permission_mode.as_deref(), Some("bypassPermissions"));
+        assert_eq!(req.project_slug.as_deref(), Some("p"));
+    }
+
+    #[tokio::test]
+    async fn a_missing_cli_answers_424_with_a_code_instead_of_a_mute_500() {
+        let sdk = nexus_claude::SdkError::CliNotFound {
+            searched_paths: "/secret/path".to_string(),
+        };
+        let err = crate::chat::provider::errors::sdk_open_error("Failed to create", sdk);
+        let resp = AppError::from_open_error(err, Some("claude-code")).into_response();
+        assert_eq!(resp.status(), StatusCode::FAILED_DEPENDENCY);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], "cli_not_found");
+        assert_eq!(body["provider_id"], "claude-code");
+        assert!(body["error"]
+            .as_str()
+            .is_some_and(|m| !m.contains("/secret/path")));
+    }
+
+    #[tokio::test]
+    async fn an_unclassified_opening_error_stays_an_internal_error() {
+        let resp = AppError::from_open_error(anyhow::anyhow!("neo4j down"), None).into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     #[tokio::test]
     async fn test_internal_error_does_not_leak_detail() {

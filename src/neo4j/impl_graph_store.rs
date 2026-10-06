@@ -2480,6 +2480,33 @@ impl GraphStore for Neo4jClient {
         self.update_chat_session_model(id, model).await
     }
 
+    async fn get_llm_setting(&self, scope: &str, key: &str) -> anyhow::Result<Option<String>> {
+        self.get_llm_setting(scope, key).await
+    }
+    async fn put_llm_setting(&self, scope: &str, key: &str, value: &str) -> anyhow::Result<()> {
+        self.put_llm_setting(scope, key, value).await
+    }
+    async fn delete_llm_setting(&self, scope: &str, key: &str) -> anyhow::Result<bool> {
+        self.delete_llm_setting(scope, key).await
+    }
+    async fn list_llm_settings(
+        &self,
+        scope: &str,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        self.list_llm_settings(scope, prefix).await
+    }
+
+    async fn update_chat_session_harness(
+        &self,
+        id: Uuid,
+        capabilities: Option<&str>,
+        resume_token: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.update_chat_session_harness(id, capabilities, resume_token)
+            .await
+    }
+
     async fn set_session_auto_continue(&self, id: Uuid, enabled: bool) -> anyhow::Result<()> {
         self.set_session_auto_continue(id, enabled).await
     }

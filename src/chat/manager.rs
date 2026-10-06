@@ -452,6 +452,49 @@ pub(crate) struct RuntimeEnvConfig {
     pub auto_update_app: bool,
 }
 
+/// A built provider and the stored record it was built from.
+pub(crate) type NativeCacheEntry = (
+    super::provider::settings::InstanceRecord,
+    Arc<dyn nexus_claude::agent::AgentProvider>,
+);
+
+/// What `build_agent_spec` needs to know about a session being opened or resumed.
+pub(crate) struct AgentSpecInput<'a> {
+    pub cwd: &'a str,
+    pub model: &'a str,
+    pub system_prompt: &'a str,
+    pub permission_mode: Option<&'a str>,
+    pub add_dirs: &'a [String],
+    pub user_claims: Option<&'a crate::auth::jwt::Claims>,
+    pub session_id: &'a str,
+    /// A provider other than Claude Code: restricted tool profile in the token.
+    pub third_party: bool,
+    pub max_tokens: Option<u64>,
+    pub kind: nexus_claude::agent::ProviderKind,
+}
+
+/// What `authorize_provider_use` checks before a session's content is sent.
+pub(crate) struct ProviderUse<'a> {
+    pub provider_id: &'a str,
+    pub provider: &'a Arc<dyn nexus_claude::agent::AgentProvider>,
+    pub model: &'a str,
+    pub mode: nexus_claude::agent::PolicyMode,
+    pub project_slug: Option<&'a str>,
+    pub claims: Option<&'a crate::auth::jwt::Claims>,
+    pub session_id: &'a str,
+}
+
+/// What `open_agent_session` opens.
+struct AgentOpen<'a> {
+    request: &'a ChatRequest,
+    session_id: Uuid,
+    provider_id: &'a str,
+    model: &'a str,
+    system_prompt: &'a str,
+    add_dirs: &'a [String],
+    project_slug: Option<&'a str>,
+}
+
 /// Manages chat sessions and their lifecycle
 pub struct ChatManager {
     pub(crate) graph: Arc<dyn GraphStore>,
@@ -459,6 +502,13 @@ pub struct ChatManager {
     pub(crate) search: Arc<dyn SearchStore>,
     pub(crate) config: ChatConfig,
     pub(crate) active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+    /// Sessions of the provider-neutral path (`CHAT_PROVIDER_PATH=agent`).
+    pub(crate) agent_runtime: Arc<super::agent_runtime::AgentRuntime>,
+    /// Where the agent path finds a provider instance.
+    pub(crate) provider_source: Arc<dyn super::agent_runtime::ProviderSource>,
+    /// Native providers built for stored instances, by instance id; an entry is
+    /// reused while the stored record is unchanged.
+    pub(crate) native_cache: Arc<RwLock<HashMap<String, NativeCacheEntry>>>,
     /// Nexus memory injector for conversation persistence
     pub(crate) context_injector: Option<Arc<ContextInjector>>,
     /// Memory config (for creating ConversationMemoryManagers)
@@ -672,6 +722,14 @@ impl nexus_claude::HookCallback for CompactionNotifier {
 // Pure helpers (testable without ChatManager)
 // ============================================================================
 
+/// `subtype` of the system message that stands in for a CLI message withheld
+/// because it held a secret that could not be masked (fail closed).
+pub(crate) const MASKING_FAILED_SUBTYPE: &str = "po_masking_failed";
+
+/// What the user sees in place of a withheld message.
+pub(crate) const MASKING_FAILED_MESSAGE: &str =
+    "A message from the agent was withheld: it contained a secret that could not be masked.";
+
 /// Extracted protocol context from a `spawned_by` JSON payload.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SpawnedByContext {
@@ -790,6 +848,98 @@ pub(crate) const SERVER_ONLY_SECRETS: &[&str] = &[
     "PO_JWT_SECRET",
 ];
 
+/// Variables of the server's environment an agent process may inherit, on top
+/// of the SDK's base list (PATH, HOME, locale, temp dir, proxy, certificates)
+/// and the `ANTHROPIC_*` / `CLAUDE_*` the Claude Code CLI authenticates with.
+///
+/// Developer tooling only — what `git`, `cargo`, `node`, … need to behave in
+/// the agent's shell as they do in the operator's. Nothing credential-shaped:
+/// a token the operator wants agents to have goes through the vault, or is
+/// named explicitly in `CHAT_CHILD_ENV_INHERIT`.
+pub(crate) const CHILD_ENV_TOOLING: &[&str] = &[
+    "SSH_AUTH_SOCK",
+    "GIT_SSH_COMMAND",
+    "GIT_EXEC_PATH",
+    "EDITOR",
+    "VISUAL",
+    "PAGER",
+    "COLORTERM",
+    "NO_COLOR",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "GOPATH",
+    "GOROOT",
+    "GOBIN",
+    "JAVA_HOME",
+    "NVM_DIR",
+    "NVM_BIN",
+    "PNPM_HOME",
+    "VOLTA_HOME",
+    "BUN_INSTALL",
+    "PYENV_ROOT",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "HOMEBREW_PREFIX",
+    "DOCKER_HOST",
+];
+
+/// Operator-chosen additions to the agent environment: a comma-separated list
+/// of variable names (e.g. `GH_TOKEN,AWS_PROFILE`).
+pub(crate) const CHILD_ENV_INHERIT_VAR: &str = "CHAT_CHILD_ENV_INHERIT";
+
+/// Rough size, in tokens, of the tool schemas a third-party session is given
+/// (the restricted profile's tool list, as JSON, at four characters a token).
+pub(crate) fn restricted_tool_schema_tokens() -> u64 {
+    let tools = crate::auth::tool_profile::ToolProfile::Restricted
+        .filter_tools(crate::mcp::tools::all_tools());
+    (serde_json::to_string(&tools).map_or(0, |s| s.len()) / 4) as u64
+}
+
+/// Refuses a model whose context window cannot hold the tool schemas with room
+/// to work: the schemas must take at most half of it. A window that is not known
+/// is not a refusal (nothing is invented).
+pub(crate) fn window_holds_the_tools(
+    caps: &nexus_claude::agent::Capabilities,
+) -> Result<(), nexus_claude::agent::ProviderError> {
+    let Some(window) = caps.context_window.as_ref().map(|w| w.value) else {
+        return Ok(());
+    };
+    let needed = restricted_tool_schema_tokens() * 2;
+    if window < needed {
+        return Err(nexus_claude::agent::ProviderError::ContextTooSmall {
+            needed: Some(needed),
+            available: Some(window),
+        });
+    }
+    Ok(())
+}
+
+/// The environment policy of every agent process this server starts (chat
+/// sessions, runner tasks, the feature-graph one-shot): clean environment,
+/// allowlist only. The server's own secrets are simply not on the list.
+pub(crate) fn child_env_policy() -> nexus_claude::EnvPolicy {
+    let extra = std::env::var(CHILD_ENV_INHERIT_VAR).unwrap_or_default();
+    child_env_policy_with(&extra)
+}
+
+/// [`child_env_policy`] with the operator list given explicitly (testable).
+pub(crate) fn child_env_policy_with(operator_list: &str) -> nexus_claude::EnvPolicy {
+    let operator = operator_list
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        // An operator cannot hand the server's own secrets to agents by listing them.
+        .filter(|name| !SERVER_ONLY_SECRETS.contains(name))
+        .map(str::to_string);
+    nexus_claude::EnvPolicy::claude_code().with_inherited(
+        CHILD_ENV_TOOLING
+            .iter()
+            .map(|name| (*name).to_string())
+            .chain(operator),
+    )
+}
+
 pub(crate) fn server_secrets_to_hide(present: impl Fn(&str) -> bool) -> Vec<&'static str> {
     SERVER_ONLY_SECRETS
         .iter()
@@ -872,11 +1022,18 @@ impl ChatManager {
         }));
         let enrichment_pipeline =
             Self::build_enrichment_pipeline(&graph, &search, None, None, None);
+        let agent_runtime = Arc::new(super::agent_runtime::AgentRuntime::new(graph.clone()));
+        let provider_source: Arc<dyn super::agent_runtime::ProviderSource> = Arc::new(
+            super::agent_runtime::BuiltinProviders::new(config.claude_cli_path.clone()),
+        );
         Self {
             graph,
             search,
             config,
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
+            agent_runtime,
+            provider_source,
+            native_cache: Arc::new(RwLock::new(HashMap::new())),
             context_injector: None,
             memory_config: None,
             event_emitter: None,
@@ -928,11 +1085,18 @@ impl ChatManager {
         }));
         let enrichment_pipeline =
             Self::build_enrichment_pipeline(&graph, &search, None, None, None);
+        let agent_runtime = Arc::new(super::agent_runtime::AgentRuntime::new(graph.clone()));
+        let provider_source: Arc<dyn super::agent_runtime::ProviderSource> = Arc::new(
+            super::agent_runtime::BuiltinProviders::new(config.claude_cli_path.clone()),
+        );
         Self {
             graph,
             search,
             config,
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
+            agent_runtime,
+            provider_source,
+            native_cache: Arc::new(RwLock::new(HashMap::new())),
             context_injector,
             memory_config: Some(memory_config),
             event_emitter: None,
@@ -962,6 +1126,16 @@ impl ChatManager {
     }
 
     /// Set the event emitter for CRUD events (streaming status notifications)
+    /// Replaces where the agent path finds provider instances (the nexus
+    /// registry, or a fake in tests).
+    pub fn with_provider_source(
+        mut self,
+        source: Arc<dyn super::agent_runtime::ProviderSource>,
+    ) -> Self {
+        self.provider_source = source;
+        self
+    }
+
     pub fn with_event_emitter(mut self, emitter: Arc<dyn crate::events::EventEmitter>) -> Self {
         self.event_emitter = Some(emitter);
         self
@@ -2333,7 +2507,25 @@ impl ChatManager {
 
     /// Check if a session is currently active (subprocess alive)
     pub async fn is_session_active(&self, session_id: &str) -> bool {
+        if self.agent_runtime.owns(session_id).await {
+            return true;
+        }
         self.active_sessions.read().await.contains_key(session_id)
+    }
+
+    /// The live permission mode of an active session (`None` when the session
+    /// is not active or runs on the global default).
+    pub async fn live_session_permission_mode(&self, session_id: &str) -> Option<String> {
+        self.active_sessions
+            .read()
+            .await
+            .get(session_id)
+            .and_then(|s| s.permission_mode.clone())
+    }
+
+    /// The permission mode a session gets when its request names none.
+    pub async fn default_permission_mode(&self) -> String {
+        self.permission_config.read().await.mode.clone()
     }
 
     // ========================================================================
@@ -2401,41 +2593,19 @@ impl ChatManager {
         Vec::new()
     }
 
-    /// Build `ClaudeCodeOptions` for a new or resumed session.
-    ///
-    /// `permission_mode_override`: if Some, overrides the global config permission mode
-    /// for this specific session (e.g. user chose a different mode for this session).
-    #[allow(deprecated, clippy::too_many_arguments)]
-    pub async fn build_options(
+    /// Environment of the project-orchestrator MCP server of one session: the
+    /// server URL, the session-BOUND token (registered live, revoked by
+    /// `close_session`), the vault token and the session id. Shared by the
+    /// Claude path (`build_options`) and the agent path (`build_agent_spec`) so
+    /// both hand the agent exactly the same, and nothing else (A33).
+    pub(crate) async fn po_mcp_env(
         &self,
-        cwd: &str,
-        model: &str,
-        system_prompt: &str,
-        resume_id: Option<&str>,
         permission_mode_override: Option<&str>,
-        hooks: Option<std::collections::HashMap<String, Vec<nexus_claude::HookMatcher>>>,
-        add_dirs: &[String],
         user_claims: Option<&crate::auth::jwt::Claims>,
         session_id: Option<&str>,
-    ) -> ClaudeCodeOptions {
-        // Expand tilde in cwd (shell doesn't expand ~ when passed via Command)
-        let cwd = expand_tilde(cwd);
-        let mcp_path = self.config.mcp_server_path.to_string_lossy().to_string();
-
+        tool_profile: Option<&str>,
+    ) -> HashMap<String, String> {
         let mut env = HashMap::new();
-        // Neo4j/MeiliSearch env vars — kept for non-CRUD processes that still
-        // call the database directly (e.g., sync, code parsing, analytics).
-        env.insert("NEO4J_URI".into(), self.config.neo4j_uri.clone());
-        env.insert("NEO4J_USER".into(), self.config.neo4j_user.clone());
-        env.insert("NEO4J_PASSWORD".into(), self.config.neo4j_password.clone());
-        env.insert(
-            "MEILISEARCH_URL".into(),
-            self.config.meilisearch_url.clone(),
-        );
-        env.insert(
-            "MEILISEARCH_KEY".into(),
-            self.config.meilisearch_key.clone(),
-        );
 
         // PO_SERVER_URL is always injected — mcp_server runs as an HTTP proxy
         // regardless of whether auth is enabled.
@@ -2447,17 +2617,33 @@ impl ChatManager {
         // Inject session token only when auth is enabled (jwt_secret present)
         // AND user claims are available.
         if let (Some(ref secret), Some(claims)) = (&self.config.jwt_secret, user_claims) {
+            // The token is BOUND to the session (id + policy ceiling signed in)
+            // and registered as live; `close_session` revokes it. The ceiling is
+            // the session's effective permission mode at spawn: anything this
+            // session spawns can only be as permissive or less.
+            let ceiling = match permission_mode_override {
+                Some(mode) => mode.to_string(),
+                None => self.permission_config.read().await.mode.clone(),
+            };
+            let binding = session_id.map(|sid| crate::auth::jwt::AgentSessionBinding {
+                session_id: sid.to_string(),
+                ceiling: Some(ceiling),
+                tool_profile: tool_profile.map(str::to_string),
+            });
             match crate::auth::jwt::generate_session_token(
                 claims,
+                binding.as_ref(),
                 secret,
                 self.config.session_token_expiry_secs,
             ) {
-                Ok(token) => {
+                Ok((token, jti)) => {
+                    crate::auth::agent_tokens::register(&jti, session_id);
                     env.insert("PO_AUTH_TOKEN".into(), token);
                     tracing::debug!(
                         user = %claims.email,
                         expiry_secs = self.config.session_token_expiry_secs,
                         server_port = self.config.server_port,
+                        bound_session = ?session_id,
                         "Injected PO_AUTH_TOKEN into MCP env"
                     );
                 }
@@ -2506,6 +2692,39 @@ impl ChatManager {
         if let Some(sid) = session_id {
             env.insert("PO_SESSION_ID".into(), sid.to_string());
         }
+        env
+    }
+
+    /// Build `ClaudeCodeOptions` for a new or resumed session.
+    ///
+    /// `permission_mode_override`: if Some, overrides the global config permission mode
+    /// for this specific session (e.g. user chose a different mode for this session).
+    #[allow(deprecated, clippy::too_many_arguments)]
+    pub async fn build_options(
+        &self,
+        cwd: &str,
+        model: &str,
+        system_prompt: &str,
+        resume_id: Option<&str>,
+        permission_mode_override: Option<&str>,
+        hooks: Option<std::collections::HashMap<String, Vec<nexus_claude::HookMatcher>>>,
+        add_dirs: &[String],
+        user_claims: Option<&crate::auth::jwt::Claims>,
+        session_id: Option<&str>,
+    ) -> ClaudeCodeOptions {
+        // Expand tilde in cwd (shell doesn't expand ~ when passed via Command)
+        let cwd = expand_tilde(cwd);
+        let mcp_path = self.config.mcp_server_path.to_string_lossy().to_string();
+
+        // The MCP server is an HTTP proxy to this server (`McpHttpClient`): it
+        // needs a URL and a token, nothing else. The database and search
+        // credentials used to be copied here "just in case"; they were then
+        // readable by the agent (decision A33).
+        let env = self
+            .po_mcp_env(permission_mode_override, user_claims, session_id, None)
+            .await;
+
+        let vault_token = env.get("PO_VAULT_TOKEN").cloned();
 
         let mcp_config = McpServerConfig::Stdio {
             command: mcp_path,
@@ -2537,6 +2756,13 @@ impl ChatManager {
             .include_partial_messages(true)
             .permission_prompt_tool_name("stdio")
             .cli_channel_buffer_size(8192)
+            // The agent starts from a CLEAN environment: only an allowlist of
+            // the server's variables reaches the CLI and every shell it opens.
+            .env_policy(child_env_policy())
+            // The MCP config holds the session token: hand it to the CLI in a
+            // 0600 file removed with the session, not on its command line
+            // (where `ps` shows it to any process of the same user).
+            .mcp_config_via_file(true)
             .add_mcp_server("project-orchestrator", mcp_config);
 
         // Wire allowed/disallowed tool patterns from config
@@ -2601,13 +2827,33 @@ impl ChatManager {
 
     /// Replace every secret value delivered by the vault inside a CLI message,
     /// before anything reads, stores or broadcasts it.
+    ///
+    /// Fails CLOSED: a message that cannot be masked is not passed on. It is
+    /// replaced by a marker ([`MASKING_FAILED_SUBTYPE`]) that surfaces as a
+    /// visible error, never by the original.
     pub(crate) fn mask_cli_message(msg: Message) -> Message {
         let masker = crate::vault::mask::global().snapshot();
-        match crate::vault::mask::mask_serde(&masker, msg) {
+        Self::mask_cli_message_with(&masker, msg)
+    }
+
+    /// [`Self::mask_cli_message`] against an explicit masker (testable).
+    pub(crate) fn mask_cli_message_with(
+        masker: &crate::vault::mask::Masker,
+        msg: Message,
+    ) -> Message {
+        match crate::vault::mask::mask_serde(masker, msg) {
             Ok(m) => m,
-            Err(m) => {
-                tracing::error!("vault: a CLI message could not be masked; passing it unmasked");
-                m
+            // Reached only when a secret value was found AND the masked form no
+            // longer reads back (the value collides with the message structure).
+            // The original holds the secret in clear: drop it.
+            Err(_unmasked) => {
+                tracing::error!(
+                    "vault: a CLI message holding a secret could not be masked; withholding it"
+                );
+                Message::System {
+                    subtype: MASKING_FAILED_SUBTYPE.to_string(),
+                    data: serde_json::Value::Null,
+                }
             }
         }
     }
@@ -2641,6 +2887,8 @@ impl ChatManager {
                                 tool: t.name.clone(),
                                 input: t.input.clone(),
                                 parent_tool_use_id: parent.clone(),
+                                category: None,
+                                canonical: None,
                             });
                         }
                         ContentBlock::ToolResult(t) => {
@@ -2680,6 +2928,10 @@ impl ChatManager {
                     is_error: *is_error,
                     num_turns: Some(*num_turns),
                     result_text: result.clone(),
+                    cost: None,
+                    usage: None,
+                    model: None,
+                    stop_reason: None,
                 }]
             }
             Message::StreamEvent { event, .. } => match event {
@@ -2716,6 +2968,8 @@ impl ChatManager {
                             tool: name,
                             input,
                             parent_tool_use_id: parent,
+                            category: None,
+                            canonical: None,
                         }]
                     } else {
                         vec![]
@@ -2725,6 +2979,10 @@ impl ChatManager {
             },
             Message::System { subtype, data } => {
                 match subtype.as_str() {
+                    MASKING_FAILED_SUBTYPE => vec![ChatEvent::Error {
+                        message: MASKING_FAILED_MESSAGE.to_string(),
+                        parent_tool_use_id: None,
+                    }],
                     "init" => {
                         // Extract session metadata from init system message
                         let cli_session_id = data
@@ -2760,6 +3018,13 @@ impl ChatManager {
                             tools,
                             mcp_servers,
                             permission_mode,
+                            provider: None,
+                            capabilities: None,
+                            tool_policy: None,
+                            policy_mode: None,
+                            // The historical engine does everything: nothing is missing.
+                            engine: Some("legacy".to_string()),
+                            degraded_features: Some(Vec::new()),
                         }]
                     }
                     "compact_boundary" => {
@@ -2843,7 +3108,6 @@ impl ChatManager {
         }
 
         let session_id = Uuid::new_v4();
-        let model = self.resolve_model(request.model.as_deref());
 
         // Resolve scaffolding override: explicit field takes priority,
         // fallback to spawned_by JSON if present (for MCP callers)
@@ -2873,6 +3137,35 @@ impl ChatManager {
                 }
                 inferred
             }
+        };
+
+        // Which provider serves this session (A16), decided from what is stored
+        // (instances, the project's consent, roles, aliases) BEFORE anything is
+        // spawned or persisted: a refusal costs nothing.
+        let provider_choice = self
+            .resolve_provider_choice(request, project_slug.as_deref())
+            .await?;
+        let model = match request.model.as_deref().filter(|m| !m.is_empty()) {
+            Some(explicit) => explicit.to_string(),
+            None => match provider_choice.model.as_deref() {
+                Some(chosen) => chosen.to_string(),
+                None if provider_choice.provider_id == super::provider::resolver::CLAUDE_CODE => {
+                    self.resolve_model(None)
+                }
+                // Another provider never gets Claude's default model: its own
+                // default, or a clear refusal.
+                None => super::provider::store::instance(
+                    self.graph.as_ref(),
+                    &provider_choice.provider_id,
+                )
+                .await?
+                .and_then(|i| i.default_model)
+                .ok_or_else(|| {
+                    anyhow::Error::new(nexus_claude::agent::ProviderError::invalid(
+                        "this provider instance has no default model: name one",
+                    ))
+                })?,
+            },
         };
 
         // Build system prompt — runner-spawned agents get a dedicated autonomous
@@ -2937,11 +3230,37 @@ impl ChatManager {
                 Some(resolved_add_dirs.clone())
             },
             spawned_by: request.spawned_by.clone(),
+            provider_id: Some(provider_choice.provider_id.clone()),
+            routed_by: Some(provider_choice.routed_by.as_str().to_string()),
+            capabilities: None,
+            resume_token: None,
         };
         self.graph
             .create_chat_session(&session_node)
             .await
             .context("Failed to persist chat session")?;
+
+        // The policy rule that applied, and what a `shadow` policy would have
+        // chosen, are kept for the execution record (A22): the runner reads
+        // them back. A write that fails loses a note, never a session.
+        if provider_choice.route_rule.is_some()
+            || provider_choice.shadow.is_some()
+            || provider_choice.fallback_reason.is_some()
+        {
+            let note = serde_json::json!({
+                "route_rule": provider_choice.route_rule,
+                "fallback_reason": provider_choice.fallback_reason,
+                "shadow_provider": provider_choice.shadow.as_ref().map(|s| &s.0),
+                "shadow_model": provider_choice.shadow.as_ref().and_then(|s| s.1.as_ref()),
+            });
+            if let Err(e) = self
+                .graph
+                .put_llm_setting(&format!("routing:{session_id}"), "note", &note.to_string())
+                .await
+            {
+                warn!(session_id = %session_id, error = %e, "Failed to record the routing note (non-fatal)");
+            }
+        }
 
         // If this session was spawned by another, create the SPAWNED_BY relation in Neo4j
         // and extract protocol FSM context (run_id + state) for trajectory tagging.
@@ -2997,6 +3316,25 @@ impl ChatManager {
                     Err(e) => warn!("Failed to link runner session to its run: {e}"),
                 }
             }
+        }
+
+        // The provider-neutral path takes over here: the session is persisted
+        // and the system prompt built; what follows is the Claude CLI engine.
+        // Hybrid routing: Claude Code stays on the historical engine (hooks,
+        // queue, retry, compaction, NATS, images) unless the operator FORCES it
+        // onto the agent engine; every other provider is served by the agent engine.
+        if self.engine_is_agent(&provider_choice.provider_id) {
+            return self
+                .open_agent_session(AgentOpen {
+                    request,
+                    session_id,
+                    provider_id: &provider_choice.provider_id,
+                    model: &model,
+                    system_prompt: &system_prompt,
+                    add_dirs: &resolved_add_dirs,
+                    project_slug: project_slug.as_deref(),
+                })
+                .await;
         }
 
         // Create broadcast channel early so CompactionNotifier can use the sender
@@ -3072,13 +3410,13 @@ impl ChatManager {
                 Some(&sid_str),
             )
             .await;
-        let mut client = InteractiveClient::new(options)
-            .map_err(|e| anyhow!("Failed to create InteractiveClient: {}", e))?;
+        let mut client = InteractiveClient::new(options).map_err(|e| {
+            super::provider::errors::sdk_open_error("Failed to create InteractiveClient", e)
+        })?;
 
-        client
-            .connect()
-            .await
-            .map_err(|e| anyhow!("Failed to connect InteractiveClient: {}", e))?;
+        client.connect().await.map_err(|e| {
+            super::provider::errors::sdk_open_error("Failed to connect InteractiveClient", e)
+        })?;
 
         // Initialize hooks with the CLI (sends PreCompact, etc. registrations).
         // Must be called AFTER connect() and BEFORE take_sdk_control_receiver().
@@ -4675,6 +5013,7 @@ impl ChatManager {
                                         ref tool,
                                         ref input,
                                         ref parent_tool_use_id,
+                                        ..
                                     } = event
                                     {
                                         // Plan 754a1379, T3 — INSERT side of the
@@ -5097,6 +5436,9 @@ impl ChatManager {
 
     /// Send a follow-up message to an existing session
     pub async fn send_message(&self, session_id: &str, message: &str) -> Result<()> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return handle.send_message(message).await;
+        }
         // Check is_streaming with read lock first — if streaming, queue the message
         // AND trigger an interrupt so the stream breaks and processes it sooner (T4 fix, Gap 8).
         {
@@ -5652,6 +5994,13 @@ impl ChatManager {
         allow: bool,
         require_pending: bool,
     ) -> std::result::Result<DeliveryRoute, PermissionDeliveryError> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return handle
+                .answer_permission(request_id, allow)
+                .await
+                .map(|()| DeliveryRoute::Local)
+                .map_err(PermissionDeliveryError::Failed);
+        }
         if self.is_session_active(session_id).await {
             return self
                 .send_permission_response_inner(session_id, request_id, allow, require_pending)
@@ -5727,15 +6076,23 @@ impl ChatManager {
     /// it awaits the lock while stream_response holds it, so broadcast events
     /// can no longer be forwarded to the frontend.
     pub async fn set_session_permission_mode(&self, session_id: &str, mode: &str) -> Result<()> {
-        // Validate mode
-        const VALID_MODES: &[&str] = &["default", "acceptEdits", "bypassPermissions", "plan"];
-        if !VALID_MODES.contains(&mode) {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            let pair = super::provider::policy::parse_mode(mode)
+                .ok_or_else(|| anyhow!("Unknown permission mode '{mode}'"))?;
+            // Refused for a mode the provider's ceiling does not allow: the
+            // session's token was signed with that ceiling at open.
+            let native = super::provider::policy::to_legacy(mode);
+            return handle.set_policy_mode(pair.neutral, native).await;
+        }
+        // Validate mode: the Claude strings or the neutral names (A43). The CLI
+        // only understands its own strings, so a neutral name is translated.
+        let Some(mode) = super::provider::policy::to_legacy(mode) else {
             bail!(
                 "Invalid permission mode '{}'. Valid modes: {}",
                 mode,
-                VALID_MODES.join(", ")
+                super::config::PermissionConfig::valid_modes().join(", ")
             );
-        }
+        };
 
         // Get session state and stdin_tx — do NOT extract client (avoids Mutex deadlock)
         let (stdin_tx, old_mode, events_tx) = {
@@ -5799,6 +6156,7 @@ impl ChatManager {
         // Broadcast event to WebSocket clients
         let _ = events_tx.send(ChatEvent::PermissionModeChanged {
             mode: mode.to_string(),
+            policy_mode: None,
         });
 
         Ok(())
@@ -5822,6 +6180,13 @@ impl ChatManager {
     /// Returns `false` for a dormant session, which has no subscribers: the
     /// caller confirms to the asker directly.
     pub async fn set_session_model(&self, session_id: &str, model: &str) -> Result<bool> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            handle.set_model(model).await?;
+            if let Ok(uuid) = Uuid::parse_str(session_id) {
+                let _ = self.graph.update_chat_session_model(uuid, model).await;
+            }
+            return Ok(true);
+        }
         // Capture the live session's stdin_tx + events_tx IF the CLI subprocess is still
         // attached. A dormant session (idle-cleaned) won't be present in `active_sessions`
         // — that is NOT an error: we still persist the chosen model to Neo4j below so the
@@ -6029,6 +6394,32 @@ impl ChatManager {
             });
     }
 
+    /// Refuses a request whose `provider` differs from the one the session was
+    /// opened on (409 `provider_conflict`). A session that does not exist yet,
+    /// or a request that names no provider, passes.
+    pub async fn check_provider_binding(
+        &self,
+        session_id: &str,
+        requested: Option<&str>,
+    ) -> Result<()> {
+        let Some(requested) = requested.filter(|p| !p.is_empty()) else {
+            return Ok(());
+        };
+        let Ok(uuid) = Uuid::parse_str(session_id) else {
+            return Ok(());
+        };
+        if let Some(node) = self.graph.get_chat_session(uuid).await? {
+            super::provider::resolver::resolve_for_open(
+                node.provider_id.as_deref(),
+                true,
+                Some(requested),
+                &super::provider::resolver::BuiltinCatalog,
+            )
+            .map_err(anyhow::Error::new)?;
+        }
+        Ok(())
+    }
+
     pub async fn resume_session(
         &self,
         session_id: &str,
@@ -6052,6 +6443,45 @@ impl ChatManager {
                     self.graph.as_ref(),
                     &session_node.cwd,
                 )
+                .await;
+        }
+
+        // The provider is frozen at open (A16): a resume never re-resolves. The
+        // legacy path only drives Claude Code, so a session bound to another
+        // provider cannot be resumed here.
+        let frozen = super::provider::resolver::resolve_for_open(
+            session_node.provider_id.as_deref(),
+            true,
+            None,
+            &super::provider::resolver::BuiltinCatalog,
+        )
+        .map_err(anyhow::Error::new)?;
+        if frozen.provider_id != super::provider::resolver::CLAUDE_CODE
+            && session_node.capabilities.is_none()
+        {
+            return Err(anyhow::Error::new(
+                super::provider::resolver::ResolveError::Unavailable {
+                    provider_id: frozen.provider_id,
+                    role: super::provider::resolver::Role::Pilot,
+                },
+            ));
+        }
+
+        // A session opened by the agent engine carries its capability snapshot:
+        // it resumes on that engine, and only when that engine is switched on.
+        if session_node.capabilities.is_some() {
+            // A third-party session always resumes on the agent engine. A Claude
+            // Code session that was forced onto it needs the flag still on:
+            // otherwise a typed, explicit error (not a mute `provider_unavailable`).
+            if !self.engine_is_agent(&frozen.provider_id) {
+                return Err(anyhow::Error::new(
+                    super::provider::resolver::ResolveError::EngineUnavailable {
+                        provider_id: frozen.provider_id,
+                    },
+                ));
+            }
+            return self
+                .resume_agent_session(&session_node, message, user_claims)
                 .await;
         }
 
@@ -6145,13 +6575,19 @@ impl ChatManager {
             .await;
 
         // Create new InteractiveClient with --resume
-        let mut client = InteractiveClient::new(options)
-            .map_err(|e| anyhow!("Failed to create InteractiveClient for resume: {}", e))?;
+        let mut client = InteractiveClient::new(options).map_err(|e| {
+            super::provider::errors::sdk_open_error(
+                "Failed to create InteractiveClient for resume",
+                e,
+            )
+        })?;
 
-        client
-            .connect()
-            .await
-            .map_err(|e| anyhow!("Failed to connect resumed InteractiveClient: {}", e))?;
+        client.connect().await.map_err(|e| {
+            super::provider::errors::sdk_open_error(
+                "Failed to connect resumed InteractiveClient",
+                e,
+            )
+        })?;
 
         // Initialize hooks with the CLI (sends PreCompact, etc. registrations).
         // Must be called AFTER connect() and BEFORE take_sdk_control_receiver().
@@ -6751,6 +7187,9 @@ impl ChatManager {
 
     /// Subscribe to a session's broadcast channel (used by WebSocket handler)
     pub async fn subscribe(&self, session_id: &str) -> Result<broadcast::Receiver<ChatEvent>> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return Ok(handle.events_tx.subscribe());
+        }
         let sessions = self.active_sessions.read().await;
         let session = sessions
             .get(session_id)
@@ -6760,6 +7199,9 @@ impl ChatManager {
 
     /// Get the broadcast sender for a session (used by AgentGuard to emit events).
     pub async fn get_events_tx(&self, session_id: &str) -> Result<broadcast::Sender<ChatEvent>> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return Ok(handle.events_tx.clone());
+        }
         let sessions = self.active_sessions.read().await;
         let session = sessions
             .get(session_id)
@@ -6781,6 +7223,9 @@ impl ChatManager {
 
     /// Check if a session is currently streaming
     pub async fn is_session_streaming(&self, session_id: &str) -> bool {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return handle.is_streaming.load(Ordering::SeqCst);
+        }
         let sessions = self.active_sessions.read().await;
         sessions
             .get(session_id)
@@ -6798,6 +7243,13 @@ impl ChatManager {
     /// This allows a newly connected WebSocket client to fully reconstruct the
     /// in-progress assistant turn, including tool calls.
     pub async fn get_streaming_snapshot(&self, session_id: &str) -> (bool, String, Vec<ChatEvent>) {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return (
+                handle.is_streaming.load(Ordering::SeqCst),
+                handle.streaming_text.lock().await.clone(),
+                handle.streaming_events.lock().await.clone(),
+            );
+        }
         let sessions = self.active_sessions.read().await;
         match sessions.get(session_id) {
             Some(session) => {
@@ -6861,6 +7313,25 @@ impl ChatManager {
         session_id: &str,
         kill_tools: bool,
     ) -> Result<InterruptOutcome> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            let scope = if kill_tools {
+                nexus_claude::agent::InterruptScope::TurnAndTools
+            } else {
+                nexus_claude::agent::InterruptScope::TurnOnly
+            };
+            let outcome = handle
+                .session
+                .interrupt(scope)
+                .await
+                .map_err(anyhow::Error::new)?;
+            let diagnostic = outcome.diagnostic;
+            return Ok(InterruptOutcome {
+                delivered: true,
+                routed: "local".to_string(),
+                cli_pid: diagnostic.as_ref().and_then(|d| d.pid),
+                killed_pids: diagnostic.map(|d| d.killed_pids).unwrap_or_default(),
+            });
+        }
         let (interrupt_flag, interrupt_token, stdin_tx, child_pid) = {
             let sessions = self.active_sessions.read().await;
             match sessions.get(session_id) {
@@ -7669,6 +8140,555 @@ impl ChatManager {
         }
     }
 
+    /// Whether a provider is served by the agent engine: every provider but
+    /// Claude Code, and Claude Code itself only when `CHAT_PROVIDER_PATH=agent`.
+    pub(crate) fn engine_is_agent(&self, provider_id: &str) -> bool {
+        provider_id != super::provider::resolver::CLAUDE_CODE
+            || self.config.provider_path == super::config::ProviderPath::Agent
+    }
+
+    /// The visible warning when Claude Code is FORCED onto the agent engine
+    /// (`CHAT_PROVIDER_PATH=agent`): the server logs what that session loses.
+    fn warn_if_forced(&self, provider_id: &str, session: &dyn nexus_claude::agent::AgentSession) {
+        if provider_id == super::provider::resolver::CLAUDE_CODE {
+            warn!(
+                features = ?super::agent_runtime::degraded_features(session.capabilities()),
+                "Claude Code is running on the AGENT engine (CHAT_PROVIDER_PATH=agent): \
+                 these features are NOT available for this session"
+            );
+        }
+    }
+
+    /// Decides which provider instance serves a session being opened (A16).
+    ///
+    /// Reads the stored instances, the consent of the project (tied to the
+    /// instance's current origin), the roles (project before global) and the
+    /// aliases. The legacy engine can only drive Claude Code: a choice of any
+    /// other instance is `provider_unavailable` there.
+    pub(crate) async fn resolve_provider_choice(
+        &self,
+        request: &ChatRequest,
+        project_slug: Option<&str>,
+    ) -> Result<super::provider::resolver::ProviderChoice> {
+        use super::provider::{catalog, resolver, settings, store};
+        let instances = store::instances(self.graph.as_ref()).await?;
+        let consents = match project_slug {
+            Some(slug) => store::consents(self.graph.as_ref(), slug).await?,
+            None => Vec::new(),
+        };
+        let global = store::roles(self.graph.as_ref(), settings::GLOBAL).await?;
+        let project = match project_slug {
+            Some(slug) => store::roles(self.graph.as_ref(), &settings::project_scope(slug)).await?,
+            None => Default::default(),
+        };
+        let aliases = store::aliases(self.graph.as_ref()).await?;
+        let role = if request.spawned_by.is_some() || request.runner_context.is_some() {
+            resolver::Role::Executor
+        } else {
+            resolver::Role::Pilot
+        };
+        let store_catalog =
+            catalog::StoreCatalog::new(instances, &consents, project_slug.is_some());
+        let policy: settings::ModelPolicy = self
+            .graph
+            .get_llm_setting(settings::GLOBAL, settings::POLICY_KEY)
+            .await?
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        let pick = catalog::policy_pick(&policy, role, request.task_class.as_deref(), &aliases);
+        let mut input = catalog::resolve_input(
+            role,
+            request.provider.as_deref(),
+            request.task_alias.as_deref(),
+            request
+                .run_provider
+                .as_deref()
+                .map(|p| (p, request.run_model.as_deref())),
+            &global,
+            &project,
+            &aliases,
+        );
+        // `enforce` puts the policy's candidate where the global rule would be;
+        // `shadow` changes nothing and is only recorded (A19).
+        if let Some(p) = pick.as_ref().filter(|p| p.enforced) {
+            input.global_rule = Some(p.candidate.clone());
+        }
+        let mut choice = resolver::resolve(&input, &store_catalog).map_err(anyhow::Error::new)?;
+        if let Some(p) = &pick {
+            if p.enforced && choice.routed_by == resolver::RoutedBy::GlobalRule {
+                choice.route_rule = Some(p.rule.clone());
+            } else if !p.enforced {
+                choice.shadow = Some((p.candidate.provider_id.clone(), p.candidate.model.clone()));
+                choice.route_rule = Some(p.rule.clone());
+            }
+        }
+        Ok(choice)
+    }
+
+    /// The provider instance, built-in or stored. A stored instance becomes a
+    /// native harness over its OpenAI-compatible endpoint; the result is kept
+    /// until the stored record changes.
+    pub(crate) async fn provider_for(
+        &self,
+        provider_id: &str,
+    ) -> Result<Arc<dyn nexus_claude::agent::AgentProvider>> {
+        use super::provider::{native_factory, resolver, store};
+        if let Some(provider) = self.provider_source.get(provider_id) {
+            return Ok(provider);
+        }
+        let record = store::instance(self.graph.as_ref(), provider_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::Error::new(resolver::ResolveError::UnknownProvider(
+                    provider_id.to_string(),
+                ))
+            })?;
+        {
+            let cache = self.native_cache.read().await;
+            if let Some((cached, provider)) = cache.get(provider_id) {
+                if *cached == record {
+                    return Ok(Arc::clone(provider));
+                }
+            }
+        }
+        let provider = native_factory::build_native_provider(&record, self.vault.clone())
+            .map_err(anyhow::Error::new)?;
+        self.native_cache
+            .write()
+            .await
+            .insert(provider_id.to_string(), (record, Arc::clone(&provider)));
+        Ok(provider)
+    }
+
+    /// Everything that must hold before a session's content is sent to a
+    /// provider other than Claude Code. Claude Code (the historical path) is
+    /// not subject to it.
+    ///
+    /// 1. the security gate: bound session tokens need a signing key (A32);
+    /// 2. the project's consent, tied to the instance's CURRENT origin (A28);
+    /// 3. the endpoint guard (A36), before any connection;
+    /// 4. `Trust` is refused when the provider declares no sandbox (A35);
+    /// 5. the sending is journaled; a failed write refuses the opening (A37).
+    pub(crate) async fn authorize_provider_use(&self, u: ProviderUse<'_>) -> Result<()> {
+        let ProviderUse {
+            provider_id,
+            provider,
+            model,
+            mode,
+            project_slug,
+            claims,
+            session_id,
+        } = u;
+        use super::provider::{endpoint_guard, resolver, store};
+        use nexus_claude::agent::{PolicyMode, ProviderError, SandboxLevel};
+        if provider_id == resolver::CLAUDE_CODE {
+            return Ok(());
+        }
+        let refuse = |e: resolver::ResolveError| anyhow::Error::new(e);
+        if self.config.jwt_secret.is_none() {
+            return Err(anyhow::Error::new(ProviderError::unsupported(
+                "security_gate",
+            )));
+        }
+        let record = store::instance(self.graph.as_ref(), provider_id)
+            .await?
+            .ok_or_else(|| refuse(resolver::ResolveError::UnknownProvider(provider_id.into())))?;
+        let slug = project_slug
+            .ok_or_else(|| refuse(resolver::ResolveError::NotAllowed(provider_id.into())))?;
+        let consented = store::consents(self.graph.as_ref(), slug)
+            .await?
+            .iter()
+            .any(|c| super::provider::settings::consent_holds(c, &record));
+        if !consented {
+            return Err(refuse(resolver::ResolveError::NotAllowed(
+                provider_id.into(),
+            )));
+        }
+        // A codex / acp instance is a local process: there is no endpoint to guard.
+        let guard = if super::provider::settings::is_process_kind(&record.kind) {
+            Ok(())
+        } else {
+            endpoint_guard::validate_endpoint(
+                &record.base_url,
+                &endpoint_guard::EndpointPolicy::default(),
+            )
+            .await
+            .map(|_| ())
+        };
+        if let Err(refusal) = guard {
+            warn!(
+                provider = provider_id,
+                code = refusal.code(),
+                "endpoint refused by the guard"
+            );
+            return Err(refuse(resolver::ResolveError::NotAllowed(
+                provider_id.into(),
+            )));
+        }
+        if mode == PolicyMode::Trust
+            && provider.capabilities(Some(model)).sandbox == SandboxLevel::None
+        {
+            return Err(anyhow::Error::new(ProviderError::unsupported("sandbox")));
+        }
+        let entry = serde_json::json!({
+            "session_id": session_id,
+            "project": slug,
+            "provider": provider_id,
+            "origin": record.origin,
+            "model": model,
+            "by": claims.map(|c| c.email.as_str()),
+            "at": chrono::Utc::now().to_rfc3339(),
+        });
+        let key = format!(
+            "send:{}:{}",
+            chrono::Utc::now().timestamp_millis(),
+            session_id
+        );
+        if let Err(e) = self
+            .graph
+            .put_llm_setting("journal", &key, &entry.to_string())
+            .await
+        {
+            error!(error = %e, "send journal write failed: refusing to open");
+            return Err(refuse(resolver::ResolveError::Unavailable {
+                provider_id: provider_id.into(),
+                role: resolver::Role::Pilot,
+            }));
+        }
+        Ok(())
+    }
+
+    /// Names of the server variables handed to an agent besides the base
+    /// allowlist: the tooling list and the operator's, never a server secret.
+    fn child_env_inherit_names() -> Vec<String> {
+        let operator = std::env::var(CHILD_ENV_INHERIT_VAR).unwrap_or_default();
+        CHILD_ENV_TOOLING
+            .iter()
+            .map(|name| (*name).to_string())
+            .chain(
+                operator
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty() && !SERVER_ONLY_SECRETS.contains(name))
+                    .map(str::to_string),
+            )
+            .collect()
+    }
+
+    /// The `SessionSpec` of a session of the agent path: working directory,
+    /// model, system prompt, the neutral tool policy of the permission mode,
+    /// the project-orchestrator MCP server (same environment as the Claude
+    /// path, session-bound token included) and the clean child environment.
+    pub(crate) async fn build_agent_spec(
+        &self,
+        i: AgentSpecInput<'_>,
+    ) -> Result<nexus_claude::agent::SessionSpec> {
+        let AgentSpecInput {
+            cwd,
+            model,
+            system_prompt,
+            permission_mode,
+            add_dirs,
+            user_claims,
+            session_id,
+            third_party,
+            max_tokens,
+            kind,
+        } = i;
+        use nexus_claude::agent::{
+            EnvSpec, McpServerSpec, SessionSpec, SystemPromptMode, SystemPromptSpec,
+        };
+        let (mode, allowed, disallowed) = {
+            let perm = self.permission_config.read().await;
+            (
+                permission_mode
+                    .map(str::to_string)
+                    .unwrap_or_else(|| perm.mode.clone()),
+                perm.allowed_tools.clone(),
+                perm.disallowed_tools.clone(),
+            )
+        };
+        let policy = super::provider::policy::tool_policy(&mode, &allowed, &disallowed)
+            .ok_or_else(|| {
+                anyhow::Error::new(nexus_claude::agent::ProviderError::invalid(
+                    "unknown permission mode or malformed tool pattern",
+                ))
+            })?;
+        let env = self
+            .po_mcp_env(
+                Some(&mode),
+                user_claims,
+                Some(session_id),
+                // A provider other than Claude Code sees the restricted
+                // profile: no tool that opens a session or reconfigures the
+                // server (A35). The profile is signed into the token.
+                third_party.then_some(crate::auth::tool_profile::RESTRICTED),
+            )
+            .await;
+        let mut spec = SessionSpec::new(expand_tilde(cwd));
+        spec.model = Some(model.to_string());
+        // What a provider kind refuses, it is not given (a refusal here would be a
+        // typed `unsupported` at open): ACP has no system prompt and no extra
+        // dirs; Codex and ACP have no turn limits.
+        let is_acp = kind == nexus_claude::agent::ProviderKind::Acp;
+        let has_turn_limits = matches!(
+            kind,
+            nexus_claude::agent::ProviderKind::ClaudeCode
+                | nexus_claude::agent::ProviderKind::Native
+        );
+        if !is_acp {
+            spec.system_prompt = Some(SystemPromptSpec {
+                text: system_prompt.to_string(),
+                mode: SystemPromptMode::Replace,
+            });
+        }
+        spec.policy = policy;
+        spec.mcp_servers.insert(
+            "project-orchestrator".to_string(),
+            McpServerSpec::Stdio {
+                command: self.config.mcp_server_path.to_string_lossy().to_string(),
+                args: Vec::new(),
+                env: env.into_iter().collect(),
+            },
+        );
+        if !is_acp {
+            spec.extra_dirs = add_dirs.iter().map(std::path::PathBuf::from).collect();
+        }
+        if has_turn_limits {
+            spec.max_turns = u32::try_from(self.config.max_turns).ok();
+        }
+        spec.limits.max_tokens = max_tokens;
+        spec.env = EnvSpec {
+            inherit: Self::child_env_inherit_names(),
+            set: Default::default(),
+        };
+        Ok(spec)
+    }
+
+    /// Opens a session on the provider-neutral engine and sends the first
+    /// message. The `ChatSession` node is already persisted by `create_session`.
+    async fn open_agent_session(&self, o: AgentOpen<'_>) -> Result<CreateSessionResponse> {
+        let AgentOpen {
+            request,
+            session_id,
+            provider_id,
+            model,
+            system_prompt,
+            add_dirs,
+            project_slug,
+        } = o;
+        let provider = self.provider_for(provider_id).await?;
+        let sid = session_id.to_string();
+        // A run (an executor) on a third-party provider never gets `Trust`: it
+        // runs under `ask` with the restricted profile (A35). A pilot asking for
+        // `Trust` is refused instead (authorize_provider_use), never downgraded.
+        let permission_mode = match request.permission_mode.as_deref() {
+            Some(mode)
+                if provider_id != super::provider::resolver::CLAUDE_CODE
+                    && request.spawned_by.is_some()
+                    && super::provider::policy::parse_mode(mode)
+                        .is_some_and(|p| p.neutral == nexus_claude::agent::PolicyMode::Trust) =>
+            {
+                Some("default")
+            }
+            other => other,
+        };
+        let spec = self
+            .build_agent_spec(AgentSpecInput {
+                cwd: &request.cwd,
+                model,
+                system_prompt,
+                permission_mode,
+                add_dirs,
+                user_claims: request.user_claims.as_ref(),
+                session_id: &sid,
+                third_party: provider_id != super::provider::resolver::CLAUDE_CODE,
+                max_tokens: request.max_tokens,
+                kind: provider.kind(),
+            })
+            .await?;
+        let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
+        if let Err(e) = self
+            .authorize_provider_use(ProviderUse {
+                provider_id,
+                provider: &provider,
+                model: spec.model.as_deref().unwrap_or(model),
+                mode: spec.policy.mode,
+                project_slug,
+                claims: request.user_claims.as_ref(),
+                session_id: &sid,
+            })
+            .await
+        {
+            crate::auth::agent_tokens::revoke_session(&sid);
+            return Err(e);
+        }
+        // Preflight at EVERY opening (A30), not only when the instance was saved:
+        // is the provider reachable and logged in now?
+        if provider_id != super::provider::resolver::CLAUDE_CODE {
+            let health = provider.health().await;
+            if health.status == nexus_claude::agent::HealthStatus::Unavailable {
+                crate::auth::agent_tokens::revoke_session(&sid);
+                return Err(anyhow::Error::new(health.error.unwrap_or(
+                    nexus_claude::agent::ProviderError::EndpointUnreachable {
+                        detail: "the provider reports itself unavailable".to_string(),
+                    },
+                )));
+            }
+        }
+        let session = provider.open(spec).await.map_err(|e| {
+            // Nothing will ever use this session's token.
+            crate::auth::agent_tokens::revoke_session(&sid);
+            anyhow::Error::new(e)
+        })?;
+        // ... and does the model's window hold the tool schemas the session was
+        // given, with room left to work? (known only once the provider has probed)
+        if provider_id != super::provider::resolver::CLAUDE_CODE {
+            if let Err(e) = window_holds_the_tools(session.capabilities()) {
+                let _ = session.close().await;
+                crate::auth::agent_tokens::revoke_session(&sid);
+                return Err(anyhow::Error::new(e));
+            }
+        }
+        self.finish_agent_open(&sid, provider_id, provider.kind(), session, 1, tool_policy)
+            .await;
+        if !request.message.is_empty() {
+            if let Some(handle) = self.agent_runtime.get(&sid).await {
+                handle.send_message(&request.message).await?;
+            }
+        }
+        Ok(CreateSessionResponse {
+            session_id: sid.clone(),
+            stream_url: format!("/ws/chat/{sid}"),
+        })
+    }
+
+    /// Records what the provider reported (frozen capabilities, resume token)
+    /// and registers the live session.
+    async fn finish_agent_open(
+        &self,
+        session_id: &str,
+        provider_id: &str,
+        kind: nexus_claude::agent::ProviderKind,
+        session: Arc<dyn nexus_claude::agent::AgentSession>,
+        first_seq: i64,
+        tool_policy: serde_json::Value,
+    ) {
+        self.warn_if_forced(provider_id, session.as_ref());
+        let capabilities = serde_json::to_string(session.capabilities()).unwrap_or_default();
+        let token = session.resume_token().map(|t| t.to_wire());
+        if let Ok(uuid) = Uuid::parse_str(session_id) {
+            if let Err(e) = self
+                .graph
+                .update_chat_session_harness(uuid, Some(&capabilities), token.as_deref())
+                .await
+            {
+                warn!(session_id, error = %e, "Failed to persist the provider snapshot (non-fatal)");
+            }
+        }
+        let kind_name = serde_json::to_value(kind)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "claude_code".to_string());
+        self.agent_runtime
+            .adopt(
+                session_id,
+                provider_id,
+                session,
+                first_seq,
+                &kind_name,
+                tool_policy,
+            )
+            .await;
+    }
+
+    /// Reopens a session of the agent engine that is no longer live, from its
+    /// persisted resume token (a new session when it never got one), then
+    /// delivers `message`.
+    async fn resume_agent_session(
+        &self,
+        node: &ChatSessionNode,
+        message: &str,
+        user_claims: Option<&crate::auth::jwt::Claims>,
+    ) -> Result<()> {
+        let provider_id = node
+            .provider_id
+            .clone()
+            .unwrap_or_else(|| super::provider::resolver::CLAUDE_CODE.to_string());
+        let provider = self.provider_for(&provider_id).await?;
+        let sid = node.id.to_string();
+        let (system_prompt, _) = self
+            .build_system_prompt(
+                node.project_slug.as_deref(),
+                message,
+                Some(&node.model),
+                Some(&sid),
+                None,
+            )
+            .await;
+        let spec = self
+            .build_agent_spec(AgentSpecInput {
+                cwd: &node.cwd,
+                model: &node.model,
+                system_prompt: &system_prompt,
+                permission_mode: node.permission_mode.as_deref(),
+                add_dirs: node.add_dirs.as_deref().unwrap_or(&[]),
+                user_claims,
+                session_id: &sid,
+                third_party: provider_id != super::provider::resolver::CLAUDE_CODE,
+                max_tokens: None,
+                kind: provider.kind(),
+            })
+            .await?;
+        let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
+        // A resume is a new sending of the project's content: consent, guard
+        // and journal apply again (a consent may have been revoked meanwhile).
+        if let Err(e) = self
+            .authorize_provider_use(ProviderUse {
+                provider_id: &provider_id,
+                provider: &provider,
+                model: &node.model,
+                mode: spec.policy.mode,
+                project_slug: node.project_slug.as_deref(),
+                claims: user_claims,
+                session_id: &sid,
+            })
+            .await
+        {
+            crate::auth::agent_tokens::revoke_session(&sid);
+            return Err(e);
+        }
+        let token = node
+            .resume_token
+            .as_deref()
+            .and_then(|raw| nexus_claude::agent::ResumeToken::from_wire(raw).ok());
+        let session = match token {
+            Some(token) => provider.resume(spec, token).await,
+            None => provider.open(spec).await,
+        }
+        .map_err(anyhow::Error::new)?;
+        let latest = self
+            .graph
+            .get_latest_chat_event_seq(node.id)
+            .await
+            .unwrap_or(0);
+        self.finish_agent_open(
+            &sid,
+            &provider_id,
+            provider.kind(),
+            session,
+            latest + 1,
+            tool_policy,
+        )
+        .await;
+        let handle = self
+            .agent_runtime
+            .get(&sid)
+            .await
+            .ok_or_else(|| anyhow!("Session {sid} vanished while resuming"))?;
+        handle.send_message(message).await
+    }
+
     /// Close an active session: interrupt first, then disconnect and remove.
     ///
     /// T3 fix (Gap 5): call interrupt() BEFORE removing the session from
@@ -7676,6 +8696,25 @@ impl ChatManager {
     /// disconnect with a 5s timeout — if the CLI hangs, drop the client to
     /// trigger SIGKILL via the Drop impl.
     pub async fn close_session(&self, session_id: &str) -> Result<()> {
+        if self.agent_runtime.owns(session_id).await {
+            crate::auth::agent_tokens::revoke_session(session_id);
+            self.agent_runtime.close(session_id).await?;
+            // Every instance learns the session is gone, as on the legacy path.
+            if let Some(ref nats) = self.nats {
+                nats.publish_chat_event(
+                    session_id,
+                    ChatEvent::SessionClosed {
+                        session_id: session_id.to_string(),
+                        reason: Some("closed".to_string()),
+                    },
+                );
+            }
+            return Ok(());
+        }
+        // 0. The session's MCP token dies with it — before anything that can
+        //    fail, so a half-closed session never leaves a usable token behind.
+        crate::auth::agent_tokens::revoke_session(session_id);
+
         // 1. Interrupt first (session still in map so interrupt() can find it)
         self.interrupt(session_id).await.ok();
 
@@ -7683,7 +8722,7 @@ impl ChatManager {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // 3. Remove session from active map
-        let (client, protocol_run_id, protocol_state) = {
+        let (client, protocol_run_id, protocol_state, events_tx) = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
                 .remove(session_id)
@@ -7692,9 +8731,20 @@ impl ChatManager {
                 session.client,
                 session.protocol_run_id,
                 session.protocol_state,
+                session.events_tx,
             )
         };
         self.notify_attention(session_id, AttentionReason::SessionInactive);
+
+        // A45: tell every client (and every instance) the session is gone.
+        let closed = ChatEvent::SessionClosed {
+            session_id: session_id.to_string(),
+            reason: Some("closed".to_string()),
+        };
+        let _ = events_tx.send(closed.clone());
+        if let Some(ref nats) = self.nats {
+            nats.publish_chat_event(session_id, closed);
+        }
 
         // 4. Finalize trajectory — fire-and-forget (non-blocking)
         //    Uses end_session_auto() so the collector computes the reward from
@@ -8144,6 +9194,7 @@ fn parse_permission_control_msg(
             questions,
             input,
             parent_tool_use_id: current_parent,
+            synthetic: None,
         });
     }
 
@@ -8152,6 +9203,8 @@ fn parse_permission_control_msg(
         tool: tool_name,
         input,
         parent_tool_use_id: current_parent,
+        category: None,
+        canonical: None,
     })
 }
 
@@ -8235,6 +9288,7 @@ mod tests {
 
     fn test_config() -> ChatConfig {
         ChatConfig {
+            provider_path: Default::default(),
             mcp_server_path: PathBuf::from("/usr/bin/mcp_server"),
             default_model: "claude-sonnet-4-6".into(),
             max_sessions: 10,
@@ -8580,14 +9634,141 @@ mod tests {
             McpServerConfig::Stdio { command, env, .. } => {
                 assert_eq!(command, "/usr/bin/mcp_server");
                 let env = env.as_ref().unwrap();
-                assert_eq!(env.get("NEO4J_URI").unwrap(), "bolt://localhost:7687");
-                assert_eq!(env.get("NEO4J_USER").unwrap(), "neo4j");
-                assert_eq!(env.get("NEO4J_PASSWORD").unwrap(), "test");
-                assert_eq!(env.get("MEILISEARCH_URL").unwrap(), "http://localhost:7700");
-                assert_eq!(env.get("MEILISEARCH_KEY").unwrap(), "key");
+                assert!(env.contains_key("PO_SERVER_URL"));
             }
             _ => panic!("Expected Stdio MCP config"),
         }
+    }
+
+    // ── agent environment and MCP secrets (decision A33) ───────────────────
+
+    /// VERIFIER: the token minted for a provider other than Claude Code carries the
+    /// restricted tool profile (A35); Claude Code keeps the full one.
+    #[tokio::test]
+    async fn verifier_a_third_party_session_token_carries_the_restricted_profile() {
+        use crate::auth::tool_profile::ToolProfile;
+        use nexus_claude::agent::{McpServerSpec, ProviderKind};
+        let state = mock_app_state();
+        let mut config = test_config();
+        config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let claims = crate::auth::jwt::Claims::service_account("verifier");
+        let token_profile = |third_party: bool, sid: &'static str| {
+            let manager = &manager;
+            let claims = &claims;
+            async move {
+                let spec = manager
+                    .build_agent_spec(AgentSpecInput {
+                        cwd: "/tmp",
+                        model: "m",
+                        system_prompt: "p",
+                        permission_mode: None,
+                        add_dirs: &[],
+                        user_claims: Some(claims),
+                        session_id: sid,
+                        third_party,
+                        max_tokens: None,
+                        kind: ProviderKind::Native,
+                    })
+                    .await
+                    .unwrap();
+                let Some(McpServerSpec::Stdio { env, .. }) =
+                    spec.mcp_servers.get("project-orchestrator")
+                else {
+                    panic!("stdio MCP server expected");
+                };
+                let token = env.get("PO_AUTH_TOKEN").expect("a session token").clone();
+                ToolProfile::from_unverified_token(&token)
+            }
+        };
+        assert_eq!(
+            token_profile(true, "verifier-s1").await,
+            ToolProfile::Restricted
+        );
+        assert_eq!(token_profile(false, "verifier-s2").await, ToolProfile::Full);
+    }
+
+    #[tokio::test]
+    async fn mcp_config_carries_no_secret() {
+        let state = mock_app_state();
+        let config = test_config();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let options = manager
+            .build_options("/tmp", "model", "prompt", None, None, None, &[], None, None)
+            .await;
+
+        let Some(McpServerConfig::Stdio { env, .. }) =
+            options.mcp_servers.get("project-orchestrator")
+        else {
+            panic!("Expected Stdio MCP config");
+        };
+        let env = env.as_ref().unwrap();
+        for name in [
+            "NEO4J_PASSWORD",
+            "NEO4J_USER",
+            "NEO4J_URI",
+            "MEILISEARCH_KEY",
+            "MEILISEARCH_URL",
+        ] {
+            assert!(
+                !env.contains_key(name),
+                "the MCP proxy does not need {name}; it must not be handed to the agent"
+            );
+        }
+        let serialized = serde_json::to_string(&env).unwrap();
+        assert!(
+            !serialized.contains("\"test\"") && !serialized.contains("\"key\""),
+            "database/search credentials leaked into the MCP config: {serialized}"
+        );
+        assert!(
+            options.mcp_config_via_file,
+            "the MCP config (session token) must go through a file, not argv"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_env_only_carries_allowlisted_names() {
+        let state = mock_app_state();
+        let config = test_config();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let options = manager
+            .build_options("/tmp", "model", "prompt", None, None, None, &[], None, None)
+            .await;
+
+        let policy = &options.env_policy;
+        assert!(
+            policy.is_isolated(),
+            "the agent must start from a clean environment"
+        );
+        for secret in [
+            "NEO4J_PASSWORD",
+            "MEILISEARCH_KEY",
+            "EMBEDDING_API_KEY",
+            "PO_JWT_SECRET",
+            "GOOGLE_CLIENT_SECRET",
+            "AWS_SECRET_ACCESS_KEY",
+            "SOME_UNKNOWN_SERVER_VARIABLE",
+        ] {
+            assert!(!policy.allows(secret), "{secret} must not reach the agent");
+        }
+        for needed in [
+            "PATH",
+            "HOME",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "SSH_AUTH_SOCK",
+        ] {
+            assert!(policy.allows(needed), "{needed} must reach the agent");
+        }
+    }
+
+    #[test]
+    fn the_operator_list_extends_the_allowlist_but_never_with_server_secrets() {
+        let policy = child_env_policy_with(" GH_TOKEN , PO_JWT_SECRET,,NEO4J_PASSWORD ");
+        assert!(policy.allows("GH_TOKEN"));
+        assert!(!policy.allows("PO_JWT_SECRET"));
+        assert!(!policy.allows("NEO4J_PASSWORD"));
+        assert!(!child_env_policy_with("").allows("GH_TOKEN"));
     }
 
     #[tokio::test]
@@ -8931,7 +10112,7 @@ mod tests {
         let events = ChatManager::message_to_events(&msg);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], ChatEvent::Result {
-            session_id, duration_ms, cost_usd, subtype, is_error, num_turns, result_text,
+            session_id, duration_ms, cost_usd, subtype, is_error, num_turns, result_text, ..
         } if session_id == "cli-abc-123"
             && *duration_ms == 5000
             && *cost_usd == Some(0.15)
@@ -9034,7 +10215,7 @@ mod tests {
         let events = ChatManager::message_to_events(&msg);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], ChatEvent::SystemInit {
-            cli_session_id, model, tools, mcp_servers, permission_mode,
+            cli_session_id, model, tools, mcp_servers, permission_mode, ..
         } if cli_session_id == "cli-sess-abc"
             && model.as_deref() == Some("claude-sonnet-4-6")
             && tools.len() == 4
@@ -9053,6 +10234,63 @@ mod tests {
 
         let events = ChatManager::message_to_events(&msg);
         assert!(events.is_empty());
+    }
+
+    // ── masking fails closed (decision A36) ────────────────────────────────
+
+    #[test]
+    fn a_message_that_cannot_be_masked_is_withheld_not_passed_in_clear() {
+        // The secret value collides with a key of the message's own JSON form:
+        // once masked, the message no longer reads back.
+        let secret = "duration_api_ms";
+        let masker = crate::vault::mask::Masker::from_values([("TOKEN", secret)]);
+        let msg = Message::Result {
+            subtype: "success".into(),
+            duration_ms: 1,
+            duration_api_ms: 1,
+            is_error: false,
+            num_turns: 1,
+            session_id: "cli-1".into(),
+            total_cost_usd: None,
+            usage: None,
+            result: Some(format!("the value is {secret}")),
+            structured_output: None,
+        };
+
+        let out = ChatManager::mask_cli_message_with(&masker, msg);
+        assert!(
+            matches!(&out, Message::System { subtype, .. } if subtype == MASKING_FAILED_SUBTYPE),
+            "an unmaskable message must be replaced, got {out:?}"
+        );
+        let events = ChatManager::message_to_events(&out);
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], ChatEvent::Error { message, .. } if message == MASKING_FAILED_MESSAGE)
+        );
+        let wire = serde_json::to_string(&events).unwrap();
+        assert!(
+            !wire.contains(secret),
+            "the secret reached the wire: {wire}"
+        );
+    }
+
+    #[test]
+    fn a_maskable_message_is_masked_and_an_unrelated_one_is_untouched() {
+        let masker = crate::vault::mask::Masker::from_values([("TOKEN", "s3cr3t-value")]);
+        let with_secret = Message::System {
+            subtype: "note".into(),
+            data: serde_json::json!({"text": "key=s3cr3t-value"}),
+        };
+        let out = ChatManager::mask_cli_message_with(&masker, with_secret);
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(!json.contains("s3cr3t-value") && json.contains("[secret:TOKEN]"));
+
+        let plain = Message::System {
+            subtype: "note".into(),
+            data: serde_json::json!({"text": "nothing here"}),
+        };
+        let out = ChatManager::mask_cli_message_with(&masker, plain);
+        assert!(matches!(&out, Message::System { subtype, .. } if subtype == "note"));
     }
 
     #[test]
@@ -9404,6 +10642,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closing_a_session_broadcasts_session_closed() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        test_support::insert_live_session_without_cli(&manager, "sess-close").await;
+        let mut rx = manager
+            .active_sessions
+            .read()
+            .await
+            .get("sess-close")
+            .expect("registered")
+            .events_tx
+            .subscribe();
+        manager.close_session("sess-close").await.unwrap();
+        let mut seen = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let ChatEvent::SessionClosed { session_id, reason } = ev {
+                seen = Some((session_id, reason));
+            }
+        }
+        assert_eq!(
+            seen,
+            Some(("sess-close".to_string(), Some("closed".to_string())))
+        );
+    }
+
+    #[tokio::test]
     async fn test_send_message_nonexistent_session() {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
@@ -9476,6 +10740,12 @@ mod tests {
             cwd: "/tmp/test".into(),
             project_slug: None,
             model: None,
+            provider: None,
+            task_alias: None,
+            run_provider: None,
+            run_model: None,
+            max_tokens: None,
+            task_class: None,
             permission_mode: Some("bypassPermissions".into()),
             add_dirs: None,
             workspace_slug: None,
@@ -9567,6 +10837,722 @@ mod tests {
         let sessions: Vec<_> = graph.chat_sessions.read().await.values().cloned().collect();
         let a = crate::chat::attachment::attach(&sessions, &[]);
         assert_eq!(a.unattached.len(), sessions.len());
+    }
+
+    #[tokio::test]
+    async fn create_session_persists_the_provider_and_how_it_was_routed() {
+        let (manager, graph) = manager_with_mock();
+        // The CLI is not available in tests: only the persisted side matters.
+        let _ = manager
+            .create_session(&runner_request(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+            ))
+            .await;
+        let sessions: Vec<_> = graph.chat_sessions.read().await.values().cloned().collect();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].provider_id.as_deref(), Some("claude-code"));
+        assert_eq!(sessions[0].routed_by.as_deref(), Some("claude_code"));
+    }
+
+    #[tokio::test]
+    async fn create_session_naming_an_unknown_provider_is_refused_before_persisting() {
+        let (manager, graph) = manager_with_mock();
+        let mut req = runner_request(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        req.provider = Some("deepseek".into());
+        let err = manager.create_session(&req).await.unwrap_err();
+        let failure =
+            crate::chat::provider::errors::classify_open_error(&err, None).expect("typed failure");
+        assert_eq!((failure.status, failure.code), (404, "provider_unknown"));
+        assert!(
+            graph.chat_sessions.read().await.is_empty(),
+            "nothing persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_for_another_provider_on_an_existing_session_is_a_409() {
+        let (manager, graph) = manager_with_mock();
+        let mut s = test_chat_session(None);
+        s.provider_id = Some("claude-code".into());
+        graph.create_chat_session(&s).await.unwrap();
+        let id = s.id.to_string();
+        manager.check_provider_binding(&id, None).await.unwrap();
+        manager
+            .check_provider_binding(&id, Some("claude-code"))
+            .await
+            .unwrap();
+        let err = manager
+            .check_provider_binding(&id, Some("deepseek"))
+            .await
+            .unwrap_err();
+        let failure = crate::chat::provider::errors::classify_open_error(&err, None).unwrap();
+        assert_eq!((failure.status, failure.code), (409, "provider_conflict"));
+    }
+
+    #[tokio::test]
+    async fn resuming_a_session_bound_to_a_non_claude_provider_is_unavailable_on_the_legacy_path() {
+        let (manager, graph) = manager_with_mock();
+        let mut s = test_chat_session(None);
+        s.provider_id = Some("deepseek".into());
+        graph.create_chat_session(&s).await.unwrap();
+        let err = manager
+            .resume_session(&s.id.to_string(), "hi", None)
+            .await
+            .unwrap_err();
+        let failure = crate::chat::provider::errors::classify_open_error(&err, None).unwrap();
+        assert_eq!(failure.code, "provider_unavailable");
+    }
+
+    // ---- the agent path (CHAT_PROVIDER_PATH=agent), against a fake provider ----
+
+    fn agent_manager() -> (
+        ChatManager,
+        Arc<crate::neo4j::mock::MockGraphStore>,
+        super::super::agent_runtime::fake::FakeProvider,
+    ) {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let state = mock_app_state();
+        let mut config = test_config();
+        config.provider_path = crate::chat::config::ProviderPath::Agent;
+        let fake = super::super::agent_runtime::fake::FakeProvider::new();
+        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
+            .with_provider_source(Arc::new(fake.clone()));
+        (manager, graph, fake)
+    }
+
+    fn agent_request(message: &str) -> ChatRequest {
+        let mut req = runner_request(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        req.spawned_by = None;
+        req.runner_context = None;
+        req.message = message.to_string();
+        req.permission_mode = Some("acceptEdits".into());
+        req
+    }
+
+    async fn next_matching(
+        rx: &mut broadcast::Receiver<ChatEvent>,
+        pred: impl Fn(&ChatEvent) -> bool,
+    ) -> ChatEvent {
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("an event within 5 s")
+                .expect("channel open");
+            if pred(&ev) {
+                return ev;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_path_opens_a_session_persists_the_snapshot_and_streams_a_turn() {
+        use nexus_claude::agent::{AgentEvent, StopReason};
+        let (manager, graph, fake) = agent_manager();
+        let created = manager
+            .create_session(&agent_request("hello"))
+            .await
+            .unwrap();
+        let sid = created.session_id.clone();
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+
+        // The provider got the turn, a neutral policy and the PO MCP server.
+        let spec = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+        assert_eq!(spec.policy.mode, nexus_claude::agent::PolicyMode::AutoEdits);
+        assert!(spec.mcp_servers.contains_key("project-orchestrator"));
+        assert_eq!(
+            fake.state.turns_started.lock().unwrap().as_slice(),
+            ["hello"]
+        );
+
+        // What the provider reported is on the persisted session.
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(node.capabilities.is_some(), "frozen capability snapshot");
+        assert!(node.resume_token.is_some(), "resume token");
+        assert_eq!(node.provider_id.as_deref(), Some("claude-code"));
+
+        fake.state.push(AgentEvent::Text {
+            text: "hi!".into(),
+            seq: None,
+            parent: None,
+        });
+        fake.state.push(AgentEvent::Done {
+            stop_reason: StopReason::Completed,
+            subtype: Some("success".into()),
+            is_error: false,
+            result_text: None,
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 5,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: Some("m".into()),
+            provider_session_id: Some("p-1".into()),
+            structured_output: None,
+            error: None,
+        });
+        let text = next_matching(&mut rx, |e| matches!(e, ChatEvent::AssistantText { .. })).await;
+        assert!(matches!(text, ChatEvent::AssistantText { ref content, .. } if content == "hi!"));
+        let result = next_matching(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        assert!(
+            matches!(result, ChatEvent::Result { ref stop_reason, .. } if stop_reason.as_deref() == Some("completed"))
+        );
+        next_matching(&mut rx, |e| {
+            matches!(
+                e,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            )
+        })
+        .await;
+        assert!(!manager.is_session_streaming(&sid).await);
+
+        // The events were persisted for replay (never the transient ones).
+        let events = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 100)
+            .await
+            .unwrap();
+        let kinds: Vec<_> = events.iter().map(|e| e.event_type.as_str()).collect();
+        assert_eq!(kinds, ["user_message", "assistant_text", "result"]);
+    }
+
+    #[tokio::test]
+    async fn agent_path_refuses_a_second_turn_while_one_runs_and_answers_permissions() {
+        use nexus_claude::agent::AgentEvent;
+        let (manager, _graph, fake) = agent_manager();
+        let sid = manager
+            .create_session(&agent_request("first"))
+            .await
+            .unwrap()
+            .session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+
+        let err = manager.send_message(&sid, "second").await.unwrap_err();
+        let typed = err
+            .downcast_ref::<nexus_claude::agent::ProviderError>()
+            .expect("typed");
+        assert_eq!(typed.kind(), "turn_in_progress");
+
+        fake.state.push(AgentEvent::PermissionAsk {
+            request_id: "perm-1".into(),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+            category: Default::default(),
+            canonical: None,
+            tool_call_id: None,
+            scopes: vec![],
+            parent: None,
+        });
+        next_matching(&mut rx, |e| {
+            matches!(e, ChatEvent::PermissionRequest { .. })
+        })
+        .await;
+        manager
+            .route_permission_response(&sid, "perm-1", true, true)
+            .await
+            .unwrap();
+        let answers = fake.state.permission_answers.lock().unwrap().clone();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].0, "perm-1");
+    }
+
+    #[tokio::test]
+    async fn agent_path_interrupt_model_mode_and_close_reach_the_provider() {
+        let (manager, _graph, fake) = agent_manager();
+        let sid = manager
+            .create_session(&agent_request("go"))
+            .await
+            .unwrap()
+            .session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+
+        manager.interrupt(&sid).await.unwrap();
+        assert_eq!(fake.state.interrupts.lock().unwrap().len(), 1);
+
+        assert!(manager
+            .set_session_model(&sid, "other-model")
+            .await
+            .unwrap());
+        assert_eq!(
+            fake.state.models.lock().unwrap().as_slice(),
+            ["other-model"]
+        );
+        manager
+            .set_session_permission_mode(&sid, "plan_only")
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.state.modes.lock().unwrap().as_slice(),
+            [nexus_claude::agent::PolicyMode::PlanOnly]
+        );
+        let changed = next_matching(&mut rx, |e| {
+            matches!(e, ChatEvent::PermissionModeChanged { .. })
+        })
+        .await;
+        assert!(
+            matches!(changed, ChatEvent::PermissionModeChanged { ref policy_mode, .. } if policy_mode.as_deref() == Some("plan_only"))
+        );
+
+        manager.close_session(&sid).await.unwrap();
+        assert!(fake.state.closed.load(Ordering::SeqCst));
+        next_matching(&mut rx, |e| matches!(e, ChatEvent::SessionClosed { .. })).await;
+        assert!(!manager.is_session_active(&sid).await);
+    }
+
+    #[tokio::test]
+    async fn agent_path_masks_a_vault_secret_before_persisting_and_broadcasting() {
+        use nexus_claude::agent::{AgentEvent, StopReason, ToolOutput};
+        let secret = "sk-vault-secret-in-a-tool-output-5521";
+        crate::vault::mask::global().register("AGENT_PATH_TEST_KEY", secret);
+        let (manager, graph, fake) = agent_manager();
+        let sid = manager
+            .create_session(&agent_request("go"))
+            .await
+            .unwrap()
+            .session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        fake.state.push(AgentEvent::ToolResult {
+            id: "t1".into(),
+            output: Some(ToolOutput::Text(format!("cat .env -> KEY={secret}"))),
+            is_error: false,
+            seq: None,
+            parent: None,
+        });
+        fake.state.push(AgentEvent::Text {
+            text: format!("the key is {secret}"),
+            seq: None,
+            parent: None,
+        });
+        fake.state.push(AgentEvent::Done {
+            stop_reason: StopReason::Completed,
+            subtype: Some("success".into()),
+            is_error: false,
+            result_text: Some(format!("done, {secret}")),
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 1,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        });
+        let mut seen = Vec::new();
+        loop {
+            let ev = next_matching(&mut rx, |_| true).await;
+            let done = matches!(
+                ev,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            );
+            seen.push(serde_json::to_string(&ev).unwrap());
+            if done {
+                break;
+            }
+        }
+        assert!(
+            seen.iter().all(|e| !e.contains(secret)),
+            "broadcast: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|e| e.contains("cat .env")),
+            "the rest of the output is kept"
+        );
+        let stored = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 100)
+            .await
+            .unwrap();
+        assert!(stored.iter().all(|e| !e.data.contains(secret)), "persisted");
+        crate::vault::mask::global().forget("AGENT_PATH_TEST_KEY");
+    }
+
+    #[tokio::test]
+    async fn agent_path_open_failure_is_typed_and_revokes_nothing_live() {
+        let (manager, _graph, fake) = agent_manager();
+        *fake.fail_open.lock().unwrap() = Some(nexus_claude::agent::ProviderError::CliNotFound {
+            program: "claude".into(),
+        });
+        let err = manager
+            .create_session(&agent_request("x"))
+            .await
+            .unwrap_err();
+        let failure =
+            crate::chat::provider::errors::classify_open_error(&err, Some("claude-code")).unwrap();
+        assert_eq!((failure.status, failure.code), (424, "cli_not_found"));
+    }
+
+    #[tokio::test]
+    async fn agent_path_resumes_from_the_persisted_token_and_out_of_turn_output_regroups() {
+        use nexus_claude::agent::AgentEvent;
+        let (manager, graph, fake) = agent_manager();
+        let sid = manager
+            .create_session(&agent_request("one"))
+            .await
+            .unwrap()
+            .session_id;
+        fake.state.end_turn();
+        manager.agent_runtime.close(&sid).await.unwrap();
+        assert!(!manager.is_session_active(&sid).await);
+
+        manager.resume_session(&sid, "two", None).await.unwrap();
+        let token = fake
+            .state
+            .resumed_with
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("resumed with a token");
+        assert_eq!(token.data()["session_id"], "fake-provider-session");
+        assert_eq!(
+            fake.state
+                .turns_started
+                .lock()
+                .unwrap()
+                .last()
+                .map(String::as_str),
+            Some("two")
+        );
+        // Event numbers continue after the persisted ones.
+        let events = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 100)
+            .await
+            .unwrap();
+        let seqs: Vec<i64> = events.iter().map(|e| e.seq).collect();
+        let mut sorted = seqs.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(seqs.len(), sorted.len(), "no event number reused: {seqs:?}");
+
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        fake.state.push_oob(AgentEvent::Text {
+            text: "background line".into(),
+            seq: Some(9),
+            parent: None,
+        });
+        let bg = next_matching(&mut rx, |e| matches!(e, ChatEvent::BackgroundOutput { .. })).await;
+        assert!(
+            matches!(bg, ChatEvent::BackgroundOutput { ref source, ref content, .. } if source == "assistant" && content == "background line")
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_code_stays_on_the_legacy_engine_by_default_hooks_included() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let state = mock_app_state();
+        let config = test_config();
+        assert_eq!(
+            config.provider_path,
+            crate::chat::config::ProviderPath::Legacy
+        );
+        let fake = super::super::agent_runtime::fake::FakeProvider::new();
+        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
+            .with_provider_source(Arc::new(fake.clone()));
+        // The Claude CLI is not there in tests: the call may fail, but it must
+        // NOT have gone through the agent engine (which has no hooks, queue, retry...).
+        let _ = manager.create_session(&agent_request("hello")).await;
+        assert_eq!(manager.agent_runtime.len().await, 0);
+        assert!(
+            fake.state.opened_specs.lock().unwrap().is_empty(),
+            "the agent provider was never asked"
+        );
+        let nodes: Vec<_> = graph.chat_sessions.read().await.values().cloned().collect();
+        assert_eq!(nodes.len(), 1);
+        assert!(
+            nodes[0].capabilities.is_none(),
+            "no agent snapshot: it is a legacy session"
+        );
+    }
+
+    #[tokio::test]
+    async fn forcing_claude_code_onto_the_agent_engine_says_what_is_missing() {
+        use nexus_claude::agent::AgentEvent;
+        let (manager, _graph, fake) = agent_manager(); // CHAT_PROVIDER_PATH=agent
+        let sid = manager
+            .create_session(&agent_request("go"))
+            .await
+            .unwrap()
+            .session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        fake.state.push(AgentEvent::SessionStarted {
+            provider_session_id: Some("p1".into()),
+            model: Some("m".into()),
+            policy_mode: None,
+            native_mode: None,
+            tools: vec![],
+            mcp_servers: vec![],
+            cwd: None,
+        });
+        let init = next_matching(&mut rx, |e| matches!(e, ChatEvent::SystemInit { .. })).await;
+        let wire = serde_json::to_value(&init).unwrap();
+        assert_eq!(wire["engine"], "agent", "{wire}");
+        let degraded: Vec<String> = serde_json::from_value(wire["degraded_features"].clone())
+            .unwrap_or_else(|_| panic!("degraded_features missing: {wire}"));
+        for lost in [
+            "hooks",
+            "message_queue",
+            "auto_continue",
+            "compaction",
+            "nats",
+            "images",
+        ] {
+            assert!(
+                degraded.iter().any(|d| d == lost),
+                "{lost} must be listed: {degraded:?}"
+            );
+        }
+    }
+
+    /// The `system_init` a live agent session REALLY emits (not a fixture).
+    async fn real_agent_system_init(
+        manager: &ChatManager,
+        fake: &super::super::agent_runtime::fake::FakeProvider,
+    ) -> serde_json::Value {
+        use nexus_claude::agent::AgentEvent;
+        let sid = manager
+            .create_session(&agent_request("go"))
+            .await
+            .unwrap()
+            .session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        fake.state.push(AgentEvent::SessionStarted {
+            provider_session_id: Some("p1".into()),
+            model: Some("m".into()),
+            policy_mode: None,
+            native_mode: None,
+            tools: vec![],
+            mcp_servers: vec![],
+            cwd: None,
+        });
+        let init = next_matching(&mut rx, |e| matches!(e, ChatEvent::SystemInit { .. })).await;
+        serde_json::to_value(&init).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_agent_system_init_lists_what_the_session_capabilities_do_not_cover() {
+        // A provider that declares images and a compaction signal: those two are not missing.
+        let (manager, _graph, fake) = agent_manager();
+        {
+            let mut caps = fake.caps.lock().unwrap();
+            caps.images = true;
+            caps.compaction_signal = true;
+        }
+        let wire = real_agent_system_init(&manager, &fake).await;
+        assert_eq!(wire["engine"], "agent", "{wire}");
+        let degraded: Vec<String> =
+            serde_json::from_value(wire["degraded_features"].clone()).expect("a list");
+        // What the backend does not do on this engine, whatever the provider says...
+        for lost in [
+            "hooks",
+            "message_queue",
+            "auto_continue",
+            "nats",
+            "enrichment",
+        ] {
+            assert!(degraded.iter().any(|d| d == lost), "{lost}: {degraded:?}");
+        }
+        // ...and what the provider covers is not claimed missing.
+        assert!(
+            !degraded.iter().any(|d| d == "images" || d == "compaction"),
+            "{degraded:?}"
+        );
+
+        // A provider that declares neither: both are listed.
+        let (manager, _graph, fake) = agent_manager();
+        let wire = real_agent_system_init(&manager, &fake).await;
+        let degraded: Vec<String> =
+            serde_json::from_value(wire["degraded_features"].clone()).unwrap();
+        assert!(
+            degraded.iter().any(|d| d == "images") && degraded.iter().any(|d| d == "compaction")
+        );
+    }
+
+    #[test]
+    fn the_legacy_system_init_says_legacy_with_nothing_missing() {
+        // `message_to_events` is what the legacy stream loop emits for the CLI's init.
+        let msg = Message::System {
+            subtype: "init".into(),
+            data: serde_json::json!({"session_id": "cli-1", "model": "m"}),
+        };
+        let events = ChatManager::message_to_events(&msg);
+        let wire = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(wire["engine"], "legacy", "{wire}");
+        assert_eq!(wire["degraded_features"], serde_json::json!([]), "{wire}");
+    }
+
+    fn done_event(
+        is_error: bool,
+        error: Option<nexus_claude::agent::ProviderError>,
+    ) -> nexus_claude::agent::AgentEvent {
+        nexus_claude::agent::AgentEvent::Done {
+            stop_reason: if is_error {
+                nexus_claude::agent::StopReason::Error
+            } else {
+                nexus_claude::agent::StopReason::Completed
+            },
+            subtype: Some(
+                if is_error {
+                    "error_during_execution"
+                } else {
+                    "success"
+                }
+                .into(),
+            ),
+            is_error,
+            result_text: None,
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 1,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: None,
+            provider_session_id: Some("p".into()),
+            structured_output: None,
+            error,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retryable_done_error_before_any_output_is_retried_once_the_provider_says_when() {
+        use nexus_claude::agent::{AgentEvent, ProviderError};
+        let (manager, _graph, fake) = agent_manager();
+        let sid = manager
+            .create_session(&agent_request("go"))
+            .await
+            .unwrap()
+            .session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        fake.state.push(done_event(
+            true,
+            Some(ProviderError::RateLimited {
+                retry_after_ms: Some(10),
+            }),
+        ));
+        let retrying = next_matching(&mut rx, |e| matches!(e, ChatEvent::Retrying { .. })).await;
+        assert!(matches!(
+            retrying,
+            ChatEvent::Retrying {
+                attempt: 1,
+                delay_ms: 10,
+                ..
+            }
+        ));
+        // The same turn is sent again.
+        for _ in 0..200 {
+            if fake.state.turns_started.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            fake.state.turns_started.lock().unwrap().as_slice(),
+            ["go", "go"]
+        );
+        fake.state.push(AgentEvent::Text {
+            text: "ok".into(),
+            seq: None,
+            parent: None,
+        });
+        fake.state.push(done_event(false, None));
+        let result = next_matching(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        // The failed attempt never reached the user: the first Result is the good one.
+        assert!(
+            matches!(
+                result,
+                ChatEvent::Result {
+                    is_error: false,
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_already_showed_output_or_failed_for_good_is_not_retried() {
+        use nexus_claude::agent::{AgentEvent, ProviderError};
+        let (manager, _graph, fake) = agent_manager();
+        let sid = manager
+            .create_session(&agent_request("go"))
+            .await
+            .unwrap()
+            .session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        fake.state.push(AgentEvent::Text {
+            text: "partial".into(),
+            seq: None,
+            parent: None,
+        });
+        fake.state
+            .push(done_event(true, Some(ProviderError::Overloaded)));
+        let result = next_matching(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        assert!(matches!(result, ChatEvent::Result { is_error: true, .. }));
+        assert_eq!(
+            fake.state.turns_started.lock().unwrap().len(),
+            1,
+            "no replay after output"
+        );
+
+        // A non-retryable cause is shown at once.
+        let sid2 = manager
+            .create_session(&agent_request("again"))
+            .await
+            .unwrap()
+            .session_id;
+        let mut rx2 = manager.subscribe(&sid2).await.unwrap();
+        fake.state
+            .push(done_event(true, Some(ProviderError::Unauthorized)));
+        let result = next_matching(&mut rx2, |e| matches!(e, ChatEvent::Result { .. })).await;
+        assert!(matches!(result, ChatEvent::Result { is_error: true, .. }));
+    }
+
+    #[tokio::test]
+    async fn an_agent_session_of_claude_code_resumed_without_the_engine_is_a_typed_engine_error() {
+        let (manager, graph, _fake) = agent_manager();
+        let sid = manager
+            .create_session(&agent_request("one"))
+            .await
+            .unwrap()
+            .session_id;
+        manager.agent_runtime.close(&sid).await.unwrap();
+        // The flag is back to its default: the engine of that session is not available.
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let legacy = ChatManager::new_without_memory(dyn_graph, state.meili, test_config());
+        let err = legacy.resume_session(&sid, "two", None).await.unwrap_err();
+        let failure =
+            crate::chat::provider::errors::classify_open_error(&err, None).expect("typed");
+        assert_eq!((failure.status, failure.code), (409, "engine_unavailable"));
+        assert!(
+            failure.message.contains("CHAT_PROVIDER_PATH"),
+            "{}",
+            failure.message
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_path_never_touches_the_agent_runtime() {
+        let (manager, _graph) = {
+            let (m, g) = manager_with_mock();
+            (m, g)
+        };
+        let _ = manager
+            .create_session(&runner_request(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+            ))
+            .await;
+        assert_eq!(manager.agent_runtime.len().await, 0);
     }
 
     #[tokio::test]
@@ -9958,6 +11944,10 @@ mod tests {
             permission_mode: None,
             add_dirs: None,
             spawned_by: None,
+            provider_id: None,
+            routed_by: None,
+            capabilities: None,
+            resume_token: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -10053,6 +12043,8 @@ mod tests {
                     tool: "list_plans".into(),
                     input: serde_json::json!({"status": "in_progress"}),
                     parent_tool_use_id: None,
+                    category: None,
+                    canonical: None,
                 })
                 .unwrap(),
                 created_at: chrono::Utc::now(),
@@ -10317,6 +12309,10 @@ mod tests {
             permission_mode: None,
             add_dirs: None,
             spawned_by: None,
+            provider_id: None,
+            routed_by: None,
+            capabilities: None,
+            resume_token: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -10348,6 +12344,10 @@ mod tests {
             permission_mode: None,
             add_dirs: None,
             spawned_by: None,
+            provider_id: None,
+            routed_by: None,
+            capabilities: None,
+            resume_token: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -10469,6 +12469,8 @@ mod tests {
                 tool: "list_plans".into(),
                 input: serde_json::json!({}),
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             },
             ChatEvent::ToolResult {
                 id: "t1".into(),
@@ -10828,6 +12830,8 @@ mod tests {
                 tool: "create_plan".into(),
                 input: serde_json::json!({"title": "Plan"}),
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             },
             ChatEvent::ToolResult {
                 id: "t1".into(),
@@ -10844,6 +12848,8 @@ mod tests {
                 tool: "bash".into(),
                 input: serde_json::json!({"command": "ls"}),
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             },
             ChatEvent::Error {
                 message: "Something went wrong".into(),
@@ -10857,6 +12863,10 @@ mod tests {
                 is_error: false,
                 num_turns: None,
                 result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             },
             ChatEvent::UserMessage {
                 content: "Hello".into(),
@@ -11699,6 +13709,7 @@ mod tests {
                 tool,
                 input,
                 parent_tool_use_id,
+                ..
             } => {
                 assert_eq!(id, "req_abc");
                 assert_eq!(tool, "Bash");
@@ -11730,6 +13741,7 @@ mod tests {
                 tool,
                 input,
                 parent_tool_use_id,
+                ..
             } => {
                 assert_eq!(id, "req_xyz");
                 assert_eq!(tool, "Read");
@@ -11900,6 +13912,7 @@ mod tests {
                 questions,
                 input,
                 parent_tool_use_id,
+                ..
             } => {
                 assert_eq!(id, "req_ask_001");
                 assert_eq!(tool_call_id, "toolu_ask_123");

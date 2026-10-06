@@ -95,6 +95,10 @@ pub struct UpdateTaskRequest {
     /// creates ASSOCIATED_WITH between this session and the task + its parent plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Model alias of the task (A16 level "task"); empty clears it. Kept in the
+    /// provider settings store, not on the task node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_alias: Option<String>,
 }
 
 /// Request to add a step to a task

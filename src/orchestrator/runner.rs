@@ -1156,6 +1156,8 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .system_prompt("You are a code architecture analyst. Respond only with valid JSON.")
             .permission_mode(PermissionMode::BypassPermissions)
             .max_turns(1)
+            // Same clean environment as every other agent process (A33).
+            .env_policy(crate::chat::manager::child_env_policy())
             .build();
 
         let mut client = match InteractiveClient::new(options) {

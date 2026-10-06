@@ -226,6 +226,10 @@ jobs:
           save-if: ${{ env.CACHE_SAVE == 'true' && env.CACHE_FRESH == '' }}
           cache-workspace-crates: true
 
+      # src/chat/agent_e2e_tests.rs needs the nexus fake servers (see the action).
+      - name: Build the nexus fake servers used by the agent e2e tests
+        uses: ./.github/actions/nexus-fakes
+
       - name: Run unit tests (lib)
         # --workspace so member crates' unit tests actually run in CI (the
         # neural-routing-* crates carry their own #[cfg(test)] suites that the
@@ -311,8 +315,10 @@ jobs:
           MEILISEARCH_URL: http://localhost:7700
           MEILISEARCH_KEY: test-master-key
         run: |
-          cargo test --test integration_tests --test data_migrations \
-            --test workspace_tests --test neo4j_store_tests
+          # harness_neo4j: the Cypher of the provider settings; REQUIRED here, so a
+          # missing Neo4j fails instead of passing silently.
+          HARNESS_NEO4J_REQUIRED=1 cargo test --test integration_tests --test data_migrations \
+            --test workspace_tests --test neo4j_store_tests --test harness_neo4j
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
@@ -480,6 +486,9 @@ jobs:
       # `test_large_index_performance` is a wall-clock assertion that does not
       # hold under llvm-cov instrumentation — skipped here, still run by the
       # Unit Tests job. See docs/COVERAGE.md.
+      - name: Build the nexus fake servers used by the agent e2e tests
+        uses: ./.github/actions/nexus-fakes
+
       - name: Collect coverage — unit tests (workspace)
         run: |
           cargo llvm-cov --no-report --no-fail-fast \
@@ -559,6 +568,9 @@ jobs:
           shared-key: "ci-test-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
           save-if: false
           cache-workspace-crates: true
+
+      - name: Build the nexus fake servers used by the agent e2e tests
+        uses: ./.github/actions/nexus-fakes
 
       - name: Run the lib suite with per-test times
         env:

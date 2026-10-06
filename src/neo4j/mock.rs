@@ -79,6 +79,11 @@ pub struct MockGraphStore {
     /// undirected the way the Cypher reads them
     pub document_links: RwLock<HashMap<Uuid, Vec<(EntityType, String)>>>,
     pub chat_sessions: RwLock<HashMap<Uuid, ChatSessionNode>>,
+    /// Provider harness settings, by (scope, key).
+    pub llm_settings: RwLock<HashMap<(String, String), String>>,
+    /// Test switch: writes to the `journal` scope (the send journal) fail, to prove
+    /// that an opening is refused when the journal cannot be written (A37).
+    pub fail_journal_writes: std::sync::atomic::AtomicBool,
     /// Stored session links (run relation / associations), seedable by tests
     pub session_link_rows: RwLock<Vec<SessionLinkRow>>,
     /// Chat sessions linked to a task, as `get_task_enrichment_data` reports
@@ -290,6 +295,8 @@ impl MockGraphStore {
             document_chunks: RwLock::new(HashMap::new()),
             document_links: RwLock::new(HashMap::new()),
             chat_sessions: RwLock::new(HashMap::new()),
+            llm_settings: RwLock::new(HashMap::new()),
+            fail_journal_writes: std::sync::atomic::AtomicBool::new(false),
             session_link_rows: RwLock::new(Vec::new()),
             task_sessions: RwLock::new(HashMap::new()),
             session_link_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -7584,6 +7591,12 @@ impl GraphStore for MockGraphStore {
             task_id: None,
             depth: 0,
             created_at: Some(chrono::Utc::now()),
+            provider_id: None,
+            model: None,
+            cost_usd: None,
+            subtree_cost_usd: None,
+            max_depth: None,
+            max_children: None,
         }])
     }
 
@@ -7648,6 +7661,68 @@ impl GraphStore for MockGraphStore {
         let mut sessions = self.chat_sessions.write().await;
         if let Some(session) = sessions.get_mut(&id) {
             session.model = model.to_string();
+            session.updated_at = Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .llm_settings
+            .read()
+            .await
+            .get(&(scope.to_string(), key.to_string()))
+            .cloned())
+    }
+    async fn put_llm_setting(&self, scope: &str, key: &str, value: &str) -> Result<()> {
+        if scope == "journal"
+            && self
+                .fail_journal_writes
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("mock: the send journal cannot be written");
+        }
+        self.llm_settings
+            .write()
+            .await
+            .insert((scope.to_string(), key.to_string()), value.to_string());
+        Ok(())
+    }
+    async fn delete_llm_setting(&self, scope: &str, key: &str) -> Result<bool> {
+        Ok(self
+            .llm_settings
+            .write()
+            .await
+            .remove(&(scope.to_string(), key.to_string()))
+            .is_some())
+    }
+    async fn list_llm_settings(&self, scope: &str, prefix: &str) -> Result<Vec<(String, String)>> {
+        let mut rows: Vec<(String, String)> = self
+            .llm_settings
+            .read()
+            .await
+            .iter()
+            .filter(|((s, k), _)| s == scope && k.starts_with(prefix))
+            .map(|((_, k), v)| (k.clone(), v.clone()))
+            .collect();
+        rows.sort();
+        Ok(rows)
+    }
+
+    async fn update_chat_session_harness(
+        &self,
+        id: Uuid,
+        capabilities: Option<&str>,
+        resume_token: Option<&str>,
+    ) -> Result<()> {
+        let mut sessions = self.chat_sessions.write().await;
+        if let Some(session) = sessions.get_mut(&id) {
+            if let Some(c) = capabilities {
+                session.capabilities = Some(c.to_string());
+            }
+            if let Some(t) = resume_token {
+                session.resume_token = Some(t.to_string());
+            }
             session.updated_at = Utc::now();
         }
         Ok(())

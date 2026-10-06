@@ -33,8 +33,19 @@ use uuid::Uuid;
 pub async fn create_session(
     State(state): State<OrchestratorState>,
     claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    headers: axum::http::HeaderMap,
     Json(mut request): Json<ChatRequest>,
 ) -> Result<Json<CreateSessionResponse>, AppError> {
+    use crate::chat::envelope;
+
+    // Who is asking? A chat session calling through its MCP server is held to
+    // its spawn envelope (decision A17); a person is not.
+    let caller = envelope::identify_caller(
+        claims.as_ref().map(|c| &c.0),
+        envelope::session_header(&headers),
+        state.auth_config.is_some(),
+    )?;
+
     // Inject authenticated user claims into the request so ChatManager
     // can generate a session token for the MCP subprocess.
     if let Some(axum::Extension(c)) = claims {
@@ -45,6 +56,25 @@ pub async fn create_session(
         .chat_manager
         .as_ref()
         .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
+
+    if let envelope::SpawnCaller::Agent { session_id, .. } = &caller {
+        let graph = state.orchestrator.neo4j_arc();
+        match request.session_id.as_deref() {
+            // Sending to an existing session: only one this session spawned.
+            Some(target) => envelope::ensure_child_of(graph.as_ref(), session_id, target).await?,
+            // Opening a session: inside the caller's envelope, parent recorded
+            // from the token.
+            None => {
+                let env =
+                    envelope::envelope_for_caller(graph.as_ref(), chat_manager.as_ref(), &caller)
+                        .await?
+                        .expect("an agent caller always has an envelope");
+                let default_mode = chat_manager.default_permission_mode().await;
+                env.apply(&mut request, &default_mode)?;
+                request.spawned_by = Some(envelope::conversation_spawned_by(env.parent_session_id));
+            }
+        }
+    }
 
     // Fold attached documents into the message once, before either path: both
     // persist and broadcast `request.message`, so the chips survive replay.
@@ -63,6 +93,13 @@ pub async fn create_session(
     if let Some(sid) = request.session_id.clone() {
         Uuid::parse_str(&sid)
             .map_err(|_| AppError::BadRequest("Invalid session_id UUID".to_string()))?;
+
+        chat_manager
+            .check_provider_binding(&sid, request.provider.as_deref())
+            .await
+            .map_err(|e| {
+                AppError::from_open_error(e, Some(crate::chat::provider::resolver::CLAUDE_CODE))
+            })?;
 
         if chat_manager.is_session_active(&sid).await {
             // 1. Session is local — send directly into the running CLI
@@ -83,10 +120,15 @@ pub async fn create_session(
                 .resume_session(&sid, &request.message, request.user_claims.as_ref())
                 .await
                 .map_err(|e| {
-                    if e.to_string().contains("not found") {
+                    let typed =
+                        crate::chat::provider::errors::classify_open_error(&e, None).is_some();
+                    if !typed && e.to_string().contains("not found") {
                         AppError::NotFound(format!("Session {} not found", sid))
                     } else {
-                        AppError::Internal(e)
+                        AppError::from_open_error(
+                            e,
+                            Some(crate::chat::provider::resolver::CLAUDE_CODE),
+                        )
                     }
                 })?;
         }
@@ -109,10 +151,9 @@ pub async fn create_session(
     }
 
     // ── Create path (no session_id) ────────────────────────────────────────
-    let response = chat_manager
-        .create_session(&request)
-        .await
-        .map_err(AppError::Internal)?;
+    let response = chat_manager.create_session(&request).await.map_err(|e| {
+        AppError::from_open_error(e, Some(crate::chat::provider::resolver::CLAUDE_CODE))
+    })?;
 
     // T4.3: Extract code entities from the first message and create DISCUSSED relations (non-blocking)
     super::ws_chat_handler::spawn_entity_extraction(&state, &response.session_id, &request.message);
@@ -263,6 +304,9 @@ fn session_node_to_response(s: crate::neo4j::models::ChatSessionNode) -> ChatSes
         linked_tasks: Vec::new(),
         linked_rfcs: Vec::new(),
         activity: None,
+        provider_id: s.provider_id,
+        capabilities: None,
+        routed_by: s.routed_by,
     }
 }
 
@@ -448,7 +492,13 @@ pub async fn get_session(
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Session {} not found", session_id)))?;
 
+    // The frozen capability snapshot rides on the single-session read only.
+    let capabilities = node
+        .capabilities
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
     let mut session = session_node_to_response(node);
+    session.capabilities = capabilities;
 
     // Enrich with linked entities (best-effort — don't fail if enrichment fails)
     if let Ok(links) = neo4j.get_session_links(session_id).await {
@@ -483,13 +533,47 @@ pub async fn get_session_tree(
     State(state): State<OrchestratorState>,
     Path(session_id): Path<Uuid>,
 ) -> Result<Json<Vec<crate::neo4j::models::SessionTreeNode>>, AppError> {
-    let tree = state
+    let mut tree = state
         .orchestrator
         .neo4j()
         .get_session_tree(&session_id.to_string())
         .await
         .map_err(AppError::Internal)?;
+    // Which provider and model ran each node and what it cost, read from the
+    // sessions themselves; a session that cannot be read stays unannotated.
+    let mut info = std::collections::HashMap::new();
+    for node in &tree {
+        if let Ok(id) = node.session_id.parse::<Uuid>() {
+            if let Ok(Some(s)) = state.orchestrator.neo4j().get_chat_session(id).await {
+                info.insert(
+                    node.session_id.clone(),
+                    crate::chat::tree::NodeInfo {
+                        provider_id: s.provider_id,
+                        model: Some(s.model),
+                        cost_usd: s.total_cost_usd,
+                    },
+                );
+            }
+        }
+    }
+    crate::chat::tree::annotate(&mut tree, &info);
     Ok(Json(tree))
+}
+
+/// GET /api/chat/runs/{run_id}/costs — the run's two counters (marginal: real
+/// spend; notional: subscription / free) and the split by model, provider and
+/// task class (A21). An unknown cost is counted apart, never as zero.
+pub async fn get_run_costs(
+    State(state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<crate::chat::cost::CostReport>, AppError> {
+    let executions = state
+        .orchestrator
+        .neo4j()
+        .get_agent_executions_for_run(run_id)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(crate::chat::cost::report(&executions)))
 }
 
 /// GET /api/chat/runs/{run_id}/sessions — Get all sessions for a PlanRun
@@ -612,6 +696,10 @@ pub struct InterruptRequest {
     /// background subprocesses (`Bash`/`Monitor`) alive.
     #[serde(default)]
     pub scope: Option<String>,
+    /// Also stop every descendant session (delegations). The answer then
+    /// carries `cascade: { stopped, total }`.
+    #[serde(default)]
+    pub cascade: Option<bool>,
 }
 
 /// POST /api/chat/sessions/{id}/interrupt — End the current turn of a
@@ -650,9 +738,13 @@ pub async fn interrupt_session(
         AppError::NotFound("chat_manager not configured on this server".to_string())
     })?;
 
-    let scope = body
-        .and_then(|Json(b)| b.scope)
-        .unwrap_or_else(|| "turn_and_tools".to_string());
+    let (scope, cascade) = match body {
+        Some(Json(b)) => (
+            b.scope.unwrap_or_else(|| "turn_and_tools".to_string()),
+            b.cascade.unwrap_or(false),
+        ),
+        None => ("turn_and_tools".to_string(), false),
+    };
 
     let kill_tools = match scope.as_str() {
         "turn_and_tools" => true,
@@ -664,12 +756,54 @@ pub async fn interrupt_session(
         }
     };
 
+    // Descendants first (leaves before parents), so a parent never gets the
+    // time to start a new child while its subtree is being stopped.
+    let cascade_report = if cascade {
+        let mut descendants = Vec::new();
+        let mut frontier = vec![session_id];
+        let mut seen = std::collections::HashSet::from([session_id]);
+        while let Some(parent) = frontier.pop() {
+            let children = state
+                .orchestrator
+                .neo4j()
+                .get_session_children(parent)
+                .await
+                .map_err(AppError::Internal)?;
+            for child in children {
+                if seen.insert(child.id) {
+                    descendants.push(child.id);
+                    frontier.push(child.id);
+                }
+            }
+        }
+        let total = descendants.len();
+        let mut stopped = 0usize;
+        for id in descendants.into_iter().rev() {
+            let sid = id.to_string();
+            if chat_manager.is_session_active(&sid).await
+                && chat_manager
+                    .interrupt_scoped(&sid, kill_tools)
+                    .await
+                    .is_ok()
+            {
+                stopped += 1;
+            }
+        }
+        Some(serde_json::json!({ "stopped": stopped, "total": total }))
+    } else {
+        None
+    };
+
     let outcome = chat_manager
         .interrupt_scoped(&session_id.to_string(), kill_tools)
         .await
         .map_err(AppError::Internal)?;
 
-    Ok(Json(serde_json::to_value(&outcome).unwrap_or_default()))
+    let mut body = serde_json::to_value(&outcome).unwrap_or_default();
+    if let (Some(report), Some(obj)) = (cascade_report, body.as_object_mut()) {
+        obj.insert("cascade".to_string(), report);
+    }
+    Ok(Json(body))
 }
 
 // ============================================================================
@@ -1322,6 +1456,103 @@ pub async fn get_cli_status() -> Json<crate::chat::cli_version::CliVersionStatus
     Json(crate::chat::cli_version::check_cli_status().await)
 }
 
+/// Query of `GET /api/chat/providers`.
+#[derive(Debug, Deserialize)]
+pub struct ListProvidersQuery {
+    /// When given, `allowed_for_project` is answered for this project.
+    pub project_slug: Option<String>,
+}
+
+/// GET /api/chat/providers — the provider instances, their health and the
+/// capabilities of each model, before any session exists (A42).
+///
+/// Never answers a secret: an instance carries a credential reference and the
+/// origin of its endpoint, nothing more.
+pub async fn list_providers(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<ListProvidersQuery>,
+) -> Result<Json<crate::chat::provider::listing::ProviderListing>, AppError> {
+    use crate::chat::provider::listing::{self, HealthEntry, ModelEntry};
+    use nexus_claude::agent::AgentProvider;
+    use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
+
+    let default_model = state
+        .chat_manager
+        .as_ref()
+        .map(|m| m.resolve_model(None))
+        .unwrap_or_else(|| crate::chat::ChatConfig::from_env().default_model);
+
+    let provider = ClaudeCodeProvider::new(ClaudeCodeConfig::default());
+    let health = HealthEntry::from_nexus(&provider.health().await);
+    let mut models: Vec<ModelEntry> = provider
+        .catalog()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|m| {
+            ModelEntry::new(
+                m.id.clone(),
+                m.is_default.then(|| "default".to_string()),
+                &provider.capabilities(Some(&m.id)),
+            )
+        })
+        .collect();
+    if models.is_empty() {
+        models.push(ModelEntry::new(
+            default_model.clone(),
+            Some("default".to_string()),
+            &provider.capabilities(Some(&default_model)),
+        ));
+    }
+
+    // The historical engine sends images to Claude Code today; the neutral
+    // contract (A12) declares `images: false` because the agent path does not
+    // carry them yet. The listing tells the truth of the engine that will serve
+    // the session, so the UI keeps its attachments on the legacy path.
+    let legacy = state
+        .chat_manager
+        .as_ref()
+        .map(|m| m.config.provider_path == crate::chat::config::ProviderPath::Legacy)
+        .unwrap_or(true);
+    if legacy {
+        for m in &mut models {
+            if let Some(caps) = m.capabilities.as_object_mut() {
+                caps.insert("images".to_string(), serde_json::Value::Bool(true));
+            }
+        }
+    }
+
+    let mut entries = vec![listing::builtin_claude_code(
+        health,
+        models,
+        query.project_slug.is_some(),
+    )];
+    // The stored instances, with the consent of the asked project.
+    entries.extend(
+        super::provider_handlers::stored_entries(
+            state.orchestrator.neo4j(),
+            query.project_slug.as_deref(),
+        )
+        .await?,
+    );
+    // The pilot's configured target is the default when it names an instance.
+    let configured = state
+        .orchestrator
+        .neo4j()
+        .get_llm_setting(
+            crate::chat::provider::settings::GLOBAL,
+            crate::chat::provider::settings::ROLES_KEY,
+        )
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| {
+            serde_json::from_str::<crate::chat::provider::settings::RoleAssignments>(&raw).ok()
+        })
+        .and_then(|roles| roles.pilot.map(|p| p.provider));
+    Ok(Json(listing::assemble(entries, configured.as_deref())))
+}
+
 /// Request body for POST /api/chat/cli/install
 #[derive(Debug, Deserialize)]
 pub struct InstallCliRequest {
@@ -1652,6 +1883,810 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["total"], 0);
         assert_eq!(json["items"].as_array().unwrap().len(), 0);
+    }
+
+    // ====================================================================
+    // GET /api/chat/providers
+    // ====================================================================
+
+    #[tokio::test]
+    async fn providers_lists_the_builtin_instance_with_the_documented_fields() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/chat/providers?project_slug=p"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["default_provider"], "claude-code");
+        let p = &json["providers"][0];
+        assert_eq!(p["id"], "claude-code");
+        assert_eq!(p["kind"], "claude_code");
+        assert_eq!(p["builtin"], true);
+        assert_eq!(p["allowed_for_project"], true);
+        assert_eq!(p["credential"], "none");
+        assert!(p["health"]["state"].is_string());
+        assert!(p["models"][0]["capabilities"].is_object());
+    }
+
+    #[tokio::test]
+    async fn providers_reports_images_for_claude_code_on_the_legacy_engine() {
+        let app = test_app().await;
+        let resp = app.oneshot(auth_get("/api/chat/providers")).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["providers"][0]["models"][0]["capabilities"]["images"],
+            true
+        );
+    }
+
+    // ====================================================================
+    // Provider settings: instances, consent, roles, aliases, policy
+    // ====================================================================
+
+    fn auth_json(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn call_json(app: &axum::Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    fn deepseek(url: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "deepseek", "kind": "openai_compatible", "label": "DeepSeek",
+            "base_url": url, "default_model": "deepseek-chat",
+            "cost_source": "priced", "credential_ref": "vault:deepseek"
+        })
+    }
+
+    #[tokio::test]
+    async fn an_instance_is_created_listed_and_never_carries_a_secret() {
+        let app = test_app().await;
+        let (status, body) = call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["origin"], "https://8.8.8.8");
+        assert_eq!(body["credential_ref"], "vault:deepseek");
+
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (_, listing) = call_json(&app, auth_get("/api/chat/providers?project_slug=p")).await;
+        let providers = listing["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 2);
+        let entry = providers.iter().find(|p| p["id"] == "deepseek").unwrap();
+        assert_eq!(entry["endpoint_origin"], "https://8.8.8.8");
+        assert_eq!(entry["credential"], "vault:deepseek");
+        assert_eq!(entry["allowed_for_project"], false);
+        assert_eq!(entry["builtin"], false);
+    }
+
+    #[tokio::test]
+    async fn a_secret_in_a_body_or_a_forbidden_endpoint_is_refused() {
+        let app = test_app().await;
+        let mut with_key = deepseek("https://8.8.8.8/v1");
+        with_key["api_key"] = serde_json::json!("sk-live-123");
+        let (status, _) = call_json(&app, auth_json("POST", "/api/chat/providers", with_key)).await;
+        assert!(status.is_client_error(), "{status}");
+
+        let mut bare = deepseek("https://8.8.8.8/v1");
+        bare["credential_ref"] = serde_json::json!("sk-live-123");
+        let (status, body) = call_json(&app, auth_json("POST", "/api/chat/providers", bare)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!body.to_string().contains("sk-live"), "{body}");
+
+        for url in [
+            "http://8.8.8.8/v1",
+            "https://169.254.169.254/latest",
+            "https://10.0.0.5/v1",
+            "https://u:p@8.8.8.8/v1",
+        ] {
+            let (status, _) = call_json(
+                &app,
+                auth_json("POST", "/api/chat/providers", deepseek(url)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}");
+        }
+        let mut builtin = deepseek("https://8.8.8.8/v1");
+        builtin["id"] = serde_json::json!("claude-code");
+        let (status, _) = call_json(&app, auth_json("POST", "/api/chat/providers", builtin)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "DELETE",
+                "/api/chat/providers/claude-code",
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_codex_instance_is_created_behind_the_gate_with_a_process_identity() {
+        let app = test_app().await;
+        let body = serde_json::json!({"id": "codex", "kind": "codex", "label": "Codex"});
+        let (status, resp) =
+            call_json(&app, auth_json("POST", "/api/chat/providers", body.clone())).await;
+        assert_eq!(status, StatusCode::CREATED, "{resp}");
+        assert_eq!(resp["origin"], "process:codex");
+        let (_, listing) = call_json(&app, auth_get("/api/chat/providers?project_slug=p")).await;
+        let entry = listing["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "codex")
+            .unwrap()
+            .clone();
+        assert_eq!(entry["kind"], "codex");
+        assert!(
+            entry["endpoint_origin"].is_null(),
+            "a process has no endpoint"
+        );
+        // Consent is tied to the process identity.
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "PUT",
+                "/api/projects/p/llm-consent",
+                serde_json::json!({"provider_id": "codex", "origin": "process:codex"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // A URL or a command line has no place in it.
+        let mut with_url = body.clone();
+        with_url["id"] = serde_json::json!("codex2");
+        with_url["base_url"] = serde_json::json!("https://8.8.8.8/v1");
+        let (status, _) = call_json(&app, auth_json("POST", "/api/chat/providers", with_url)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let cmd = serde_json::json!({"id": "x", "kind": "acp", "command": ["sh", "-c", "evil"]});
+        let (status, _) = call_json(&app, auth_json("POST", "/api/chat/providers", cmd)).await;
+        assert!(status.is_client_error(), "{status}");
+        // ACP names a declared command; none is declared here.
+        let acp = serde_json::json!({"id": "oc", "kind": "acp", "preset": "opencode"});
+        let (status, resp) = call_json(&app, auth_json("POST", "/api/chat/providers", acp)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert!(
+            resp.to_string().contains("CHAT_PROVIDER_ACP_COMMANDS"),
+            "{resp}"
+        );
+        // The test route is a health check of the process: still a 200 verdict.
+        let (status, resp) =
+            call_json(&app, auth_json("POST", "/api/chat/providers/test", body)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(resp["ok"].is_boolean(), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn the_run_costs_route_answers_the_two_counters_by_model_provider_and_class() {
+        let h = action_harness(None).await;
+        let run = Uuid::new_v4();
+        let mut rows = Vec::new();
+        for (provider, model, class, usd, basis) in [
+            ("claude-code", "opus", "complex", 2.0, "reported"),
+            ("claude-code", "opus", "simple", 3.0, "subscription"),
+            ("local", "llama", "simple", 0.0, "unknown"),
+        ] {
+            let mut ae =
+                crate::neo4j::agent_execution::AgentExecutionNode::new(run, Uuid::new_v4());
+            ae.provider_id = provider.into();
+            ae.model = Some(model.into());
+            ae.task_class = Some(class.into());
+            ae.cost_usd = usd;
+            ae.cost_basis = Some(basis.into());
+            h.graph.create_agent_execution(&ae).await.unwrap();
+            rows.push(ae);
+        }
+        let (status, body) = call(&h.app, auth_get(&format!("/api/chat/runs/{run}/costs"))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total"]["marginal_usd"], 2.0);
+        assert_eq!(body["total"]["notional_usd"], 3.0);
+        assert_eq!(body["total"]["unknown_cost_executions"], 1);
+        assert_eq!(body["by_provider"]["claude-code"]["executions"], 2);
+        assert_eq!(body["by_task_class"]["simple"]["executions"], 2);
+        assert_eq!(body["by_model"]["llama"]["unknown_cost_executions"], 1);
+    }
+
+    #[tokio::test]
+    async fn the_send_journal_is_readable_by_a_person_only_filtered_and_newest_first() {
+        let h = action_harness(None).await;
+        for (ms, project) in [(1_000, "a"), (2_000, "b"), (3_000, "a")] {
+            h.graph
+                .put_llm_setting(
+                    "journal",
+                    &format!("send:{ms}:sess-{ms}"),
+                    &serde_json::json!({"session_id": format!("sess-{ms}"), "project": project, "provider": "local", "origin": "https://x"}).to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        let (status, body) = call(&h.app, auth_get("/api/chat/send-journal")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<_> = body["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["session_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, ["sess-3000", "sess-2000", "sess-1000"]);
+        let (_, body) = call(
+            &h.app,
+            auth_get("/api/chat/send-journal?project_slug=a&limit=1"),
+        )
+        .await;
+        assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(body["entries"][0]["session_id"], "sess-3000");
+        // An agent token has no business reading it.
+        let token = agent_bearer(Uuid::new_v4());
+        let (status, _) = call(
+            &h.app,
+            agent_req(&token, "GET", "/api/chat/send-journal", ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_saved_instances_status_is_its_real_health_not_unknown() {
+        let app = test_app().await;
+        let mut body = deepseek("http://127.0.0.1:9/v1");
+        body["credential_ref"] = serde_json::json!("none");
+        let (status, _) = call_json(&app, auth_json("POST", "/api/chat/providers", body)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, health) =
+            call_json(&app, auth_get("/api/chat/providers/deepseek/status")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(health["state"], "ok", "{health}");
+        assert_ne!(
+            health["state"], "unknown",
+            "a closed port is measured: {health}"
+        );
+    }
+
+    /// VERIFIER: creating a third-party instance while authentication is off is
+    /// refused with 409 `security_gate_closed` (A32, documented in provider-errors.md).
+    #[tokio::test]
+    async fn verifier_creating_a_third_party_instance_without_authentication_is_409() {
+        let mut state = Arc::try_unwrap(mock_server_state().await)
+            .ok()
+            .expect("sole owner of the state");
+        state.auth_config = None;
+        let app = create_router(Arc::new(state));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/chat/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(deepseek("https://8.8.8.8/v1").to_string()))
+            .unwrap();
+        let (status, body) = call_json(&app, req).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_env_credential_is_refused_unless_the_variable_is_declared() {
+        let app = test_app().await;
+        let mut body = deepseek("https://8.8.8.8/v1");
+        body["credential_ref"] = serde_json::json!("env:HOME");
+        let (status, resp) = call_json(&app, auth_json("POST", "/api/chat/providers", body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert!(
+            resp.to_string().contains("CHAT_PROVIDER_ENV_CREDENTIALS"),
+            "{resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_test_route_always_answers_200_with_a_verdict() {
+        let app = test_app().await;
+        let (status, body) = call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers/test",
+                deepseek("https://10.1.2.3/v1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["health"]["code"], "endpoint_private_address");
+        let (_, body) = call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers/test",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+        // A draft with a key is not tried: the key would go to an endpoint nobody saved.
+        assert_eq!(body["ok"], false);
+        assert_eq!(
+            body["health"]["code"],
+            "credential_test_requires_saved_instance"
+        );
+        // Saved, then tried: the key lives in a vault nobody unlocked: a verdict, no connection.
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (_, body) = call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers/test",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["health"]["code"], "credentials_locked");
+        assert_eq!(body["health"]["state"], "auth_required");
+        // A closed local port with no credential: unreachable, still a 200.
+        let mut local = deepseek("http://127.0.0.1:9/v1");
+        local["credential_ref"] = serde_json::json!("none");
+        let (status, body) =
+            call_json(&app, auth_json("POST", "/api/chat/providers/test", local)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], false, "{body}");
+    }
+
+    #[tokio::test]
+    async fn consent_is_bound_to_the_origin_and_stops_holding_when_it_changes() {
+        let app = test_app().await;
+        call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+
+        let (status, body) = call_json(
+            &app,
+            auth_json(
+                "PUT",
+                "/api/projects/p/llm-consent",
+                serde_json::json!({"provider_id": "deepseek", "origin": "https://1.1.1.1"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+        let (status, body) = call_json(
+            &app,
+            auth_json(
+                "PUT",
+                "/api/projects/p/llm-consent",
+                serde_json::json!({"provider_id": "deepseek", "origin": "https://8.8.8.8"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["valid"], true);
+        assert!(body["consented_by"].is_string() && body["consented_at"].is_string());
+
+        let (_, listing) = call_json(&app, auth_get("/api/chat/providers?project_slug=p")).await;
+        let entry = listing["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "deepseek")
+            .unwrap()
+            .clone();
+        assert_eq!(entry["allowed_for_project"], true);
+
+        // The instance moves to another origin: the consent no longer holds.
+        let (status, patched) = call_json(
+            &app,
+            auth_json(
+                "PATCH",
+                "/api/chat/providers/deepseek",
+                serde_json::json!({"base_url": "https://1.1.1.1/v1"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{patched}");
+        assert_eq!(patched["consents_invalidated"], true);
+        let (_, rows) = call_json(&app, auth_get("/api/projects/p/llm-consents")).await;
+        assert_eq!(rows[0]["valid"], false);
+        let (_, listing) = call_json(&app, auth_get("/api/chat/providers?project_slug=p")).await;
+        let entry = listing["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "deepseek")
+            .unwrap()
+            .clone();
+        assert_eq!(entry["allowed_for_project"], false);
+
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "DELETE",
+                "/api/projects/p/llm-consent/deepseek",
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "DELETE",
+                "/api/projects/p/llm-consent/deepseek",
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn roles_aliases_and_policy_round_trip_and_are_validated() {
+        let app = test_app().await;
+        call_json(
+            &app,
+            auth_json(
+                "POST",
+                "/api/chat/providers",
+                deepseek("https://8.8.8.8/v1"),
+            ),
+        )
+        .await;
+
+        let (_, roles) = call_json(&app, auth_get("/api/chat/roles")).await;
+        assert_eq!(roles, serde_json::json!({}), "absent = single provider");
+        let want = serde_json::json!({"pilot": {"provider": "claude-code"}, "executor": {"provider": "deepseek", "alias": "fast"}});
+        let (status, _) = call_json(&app, auth_json("PUT", "/api/chat/roles", want.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, got) = call_json(&app, auth_get("/api/chat/roles")).await;
+        assert_eq!(got, want);
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "PUT",
+                "/api/chat/roles",
+                serde_json::json!({"pilot": {"provider": "ghost"}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = call_json(
+            &app,
+            auth_json(
+                "PUT",
+                "/api/projects/p/llm-roles",
+                serde_json::json!({"executor": {"provider": "claude-code"}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, project_roles) = call_json(&app, auth_get("/api/projects/p/llm-roles")).await;
+        assert_eq!(
+            project_roles,
+            serde_json::json!({"executor": {"provider": "claude-code"}})
+        );
+
+        let aliases = serde_json::json!([{"alias": "fast", "provider": "deepseek", "model": "deepseek-chat"}]);
+        let (status, _) = call_json(
+            &app,
+            auth_json("PUT", "/api/chat/model-aliases", aliases.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, got) = call_json(&app, auth_get("/api/chat/model-aliases")).await;
+        assert_eq!(got, aliases);
+
+        let (_, policy) = call_json(&app, auth_get("/api/chat/model-policy")).await;
+        assert_eq!(policy["mode"], "off", "ships off");
+        let ok = serde_json::json!({"mode": "shadow", "rules": {"runner.simple": "fast"}, "fallback": ["fast"], "caps": {"per_run_usd": 5.0}});
+        let (status, _) = call_json(&app, auth_json("PUT", "/api/chat/model-policy", ok)).await;
+        assert_eq!(status, StatusCode::OK);
+        let bad = serde_json::json!({"mode": "enforce", "rules": {"chat": "ghost"}, "fallback": [], "caps": {}});
+        let (status, _) = call_json(&app, auth_json("PUT", "/api/chat/model-policy", bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ====================================================================
+    // Run routing, task alias, interrupt cascade, tree annotation
+    // ====================================================================
+
+    #[tokio::test]
+    async fn a_task_model_alias_must_be_defined_is_stored_and_shown_and_can_be_cleared() {
+        let h = action_harness(None).await;
+        let plan = crate::test_helpers::test_plan();
+        h.graph.create_plan(&plan).await.unwrap();
+        let task = crate::test_helpers::test_task();
+        h.graph.create_task(plan.id, &task).await.unwrap();
+        let uri = format!("/api/tasks/{}", task.id);
+        let patch = |body: serde_json::Value| {
+            Request::builder()
+                .method("PATCH")
+                .uri(uri.clone())
+                .header("content-type", "application/json")
+                .header("authorization", test_bearer_token())
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        // Not defined: refused.
+        let (status, _) = call(&h.app, patch(serde_json::json!({"model_alias": "fast"}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Define it, then set it.
+        h.graph
+            .put_llm_setting(
+                "global",
+                "model_aliases",
+                &serde_json::json!([{"alias": "fast", "provider": "claude-code", "model": "m"}])
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        let (status, _) = call(&h.app, patch(serde_json::json!({"model_alias": "fast"}))).await;
+        assert!(status.is_success(), "{status}");
+        let (_, body) = call(&h.app, auth_get(&uri)).await;
+        assert_eq!(body["task"]["model_alias"], "fast");
+        // Empty clears it.
+        let (status, _) = call(&h.app, patch(serde_json::json!({"model_alias": ""}))).await;
+        assert!(status.is_success());
+        let (_, body) = call(&h.app, auth_get(&uri)).await;
+        assert!(body["task"].get("model_alias").is_none(), "{body}");
+        // An unknown task is a 404, nothing stored.
+        let ghost = Request::builder()
+            .method("PATCH")
+            .uri(format!("/api/tasks/{}", Uuid::new_v4()))
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(r#"{"model_alias":"fast"}"#))
+            .unwrap();
+        let (status, _) = call(&h.app, ghost).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_run_naming_an_unknown_provider_is_refused_before_it_starts() {
+        let h = action_harness(None).await;
+        let plan = crate::test_helpers::test_plan();
+        h.graph.create_plan(&plan).await.unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/plans/{}/run", plan.id))
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(
+                r#"{"cwd": ".", "provider": "ghost", "model": "m", "max_tokens": 1000}"#,
+            ))
+            .unwrap();
+        let (status, body) = call(&h.app, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    #[tokio::test]
+    async fn interrupt_with_cascade_stops_the_descendants_and_reports_the_count() {
+        let h = action_harness(None).await;
+        let parent = crate::test_helpers::test_chat_session(None);
+        let mut child = crate::test_helpers::test_chat_session(None);
+        child.spawned_by = Some(
+            serde_json::json!({"type": "delegation", "parent_session_id": parent.id.to_string()})
+                .to_string(),
+        );
+        let mut idle_child = crate::test_helpers::test_chat_session(None);
+        idle_child.spawned_by = child.spawned_by.clone();
+        for n in [&parent, &child, &idle_child] {
+            h.graph.create_chat_session(n).await.unwrap();
+        }
+        for n in [&parent, &child] {
+            test_support::insert_live_session_without_cli(&h.manager, &n.id.to_string()).await;
+        }
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/chat/sessions/{}/interrupt", parent.id))
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(
+                r#"{"scope": "turn_and_tools", "cascade": true}"#,
+            ))
+            .unwrap();
+        let (status, body) = call(&h.app, req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Two children persisted, one of them live: 1 of 2 stopped.
+        assert_eq!(body["cascade"]["total"], 2, "{body}");
+        assert_eq!(body["cascade"]["stopped"], 1, "{body}");
+        // Without the flag the answer has no cascade part (unchanged shape).
+        let plain = Request::builder()
+            .method("POST")
+            .uri(format!("/api/chat/sessions/{}/interrupt", parent.id))
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap();
+        let (_, body) = call(&h.app, plain).await;
+        assert!(body.get("cascade").is_none());
+    }
+
+    // ====================================================================
+    // An agent session token reaches only the sessions it spawned
+    // ====================================================================
+
+    /// A bound, live agent token for `session` (restricted profile, like a third party's).
+    fn agent_bearer(session: Uuid) -> String {
+        let claims = crate::auth::jwt::Claims::service_account("agent");
+        let binding = crate::auth::jwt::AgentSessionBinding {
+            session_id: session.to_string(),
+            ceiling: Some("default".into()),
+            tool_profile: Some("restricted".into()),
+        };
+        let (token, jti) = crate::auth::jwt::generate_session_token(
+            &claims,
+            Some(&binding),
+            "test-secret-key-minimum-32-chars!!",
+            3600,
+        )
+        .unwrap();
+        crate::auth::agent_tokens::register(&jti, Some(&session.to_string()));
+        format!("Bearer {token}")
+    }
+
+    fn agent_req(token: &str, method: &str, uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", token)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_agent_token_cannot_write_to_a_session_it_did_not_spawn() {
+        let h = action_harness(None).await;
+        let parent = crate::test_helpers::test_chat_session(None);
+        let mut child = crate::test_helpers::test_chat_session(None);
+        child.spawned_by = Some(
+            serde_json::json!({"type": "conversation", "parent_session_id": parent.id.to_string()})
+                .to_string(),
+        );
+        let human = crate::test_helpers::test_chat_session(None);
+        for n in [&parent, &child, &human] {
+            h.graph.create_chat_session(n).await.unwrap();
+        }
+        let token = agent_bearer(parent.id);
+
+        // Every mutating route under /api/chat/sessions/{id}: a stranger is refused.
+        let routes: [(&str, String, &str); 5] = [
+            (
+                "POST",
+                format!("/api/chat/sessions/{}/messages", human.id),
+                r#"{"content":"x"}"#,
+            ),
+            (
+                "POST",
+                format!("/api/chat/sessions/{}/interrupt", human.id),
+                "{}",
+            ),
+            (
+                "POST",
+                format!("/api/chat/sessions/{}/cancel-tools", human.id),
+                "{}",
+            ),
+            (
+                "PATCH",
+                format!("/api/chat/sessions/{}", human.id),
+                r#"{"title":"x"}"#,
+            ),
+            ("DELETE", format!("/api/chat/sessions/{}", human.id), ""),
+        ];
+        for (method, uri, body) in &routes {
+            let (status, _) = call(&h.app, agent_req(&token, method, uri, body)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+        // The session itself is not a child of itself: an agent does not drive its own session through REST either.
+        let own = format!("/api/chat/sessions/{}/interrupt", parent.id);
+        let (status, _) = call(&h.app, agent_req(&token, "POST", &own, "{}")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // Annotating its own session stays possible (what the MCP tools do).
+        let (status, _) = call(
+            &h.app,
+            agent_req(
+                &token,
+                "POST",
+                &format!("/api/chat/sessions/{}/discussed", parent.id),
+                r#"{"entities":[]}"#,
+            ),
+        )
+        .await;
+        assert_ne!(status, StatusCode::FORBIDDEN, "own annotation");
+        // Its own child: not refused by the boundary.
+        let (status, _) = call(
+            &h.app,
+            agent_req(
+                &token,
+                "POST",
+                &format!("/api/chat/sessions/{}/interrupt", child.id),
+                "{}",
+            ),
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a child of the session is reachable"
+        );
+        // Reads stay open (the tree, the session).
+        let (status, _) = call(
+            &h.app,
+            agent_req(
+                &token,
+                "GET",
+                &format!("/api/chat/sessions/{}", human.id),
+                "",
+            ),
+        )
+        .await;
+        assert_ne!(status, StatusCode::FORBIDDEN);
+        // A person is not held to it.
+        let (status, _) = call(
+            &h.app,
+            auth_post(&format!("/api/chat/sessions/{}/interrupt", human.id), "{}"),
+        )
+        .await;
+        assert_ne!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn providers_answers_null_consent_without_a_project() {
+        let app = test_app().await;
+        let resp = app.oneshot(auth_get("/api/chat/providers")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["providers"][0]["allowed_for_project"].is_null());
     }
 
     #[tokio::test]
@@ -2429,6 +3464,8 @@ mod tests {
                 tool: "Bash".to_string(),
                 input: serde_json::json!({"command": "ls"}),
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             },
         )
         .await;

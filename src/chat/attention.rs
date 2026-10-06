@@ -418,6 +418,8 @@ mod tests {
                 tool: "Bash".into(),
                 input: json!({"command": "rm -rf target"}),
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             },
         )
     }
@@ -444,6 +446,7 @@ mod tests {
                     {"label": "A", "description": "first"}, {"label": "B"}]}]),
                 input: json!({}),
                 parent_tool_use_id: None,
+                synthetic: None,
             },
         )
     }

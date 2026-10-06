@@ -379,6 +379,9 @@ pub struct NatsYamlConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct ChatYamlConfig {
+    /// Provider chosen in the setup wizard (`claude-code`, `none`, ...). `none`
+    /// means the install has no chat provider: no default model, no CLI path.
+    pub provider: Option<String>,
     pub default_model: Option<String>,
     pub max_sessions: Option<usize>,
     pub session_timeout_secs: Option<u64>,

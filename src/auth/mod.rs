@@ -7,6 +7,7 @@
 //! - Axum middleware for route protection (`middleware` submodule)
 //! - AuthUser extractor for handlers (`extractor` submodule)
 
+pub mod agent_tokens;
 pub mod extractor;
 pub mod google;
 pub mod jwt;
@@ -14,3 +15,4 @@ pub mod middleware;
 pub mod oauth_server;
 pub mod oidc;
 pub mod refresh;
+pub mod tool_profile;

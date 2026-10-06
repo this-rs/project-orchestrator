@@ -46,6 +46,16 @@ impl McpHttpClient {
         }
     }
 
+    /// MCP tool profile of the session this client authenticates as, read from
+    /// the session token (signed by the server; see [`crate::auth::tool_profile`]).
+    /// No token = the full profile (no-auth mode, standalone use).
+    pub fn tool_profile(&self) -> crate::auth::tool_profile::ToolProfile {
+        match self.auth_token.as_deref() {
+            Some(token) => crate::auth::tool_profile::ToolProfile::from_unverified_token(token),
+            None => crate::auth::tool_profile::ToolProfile::Full,
+        }
+    }
+
     /// Create from environment variables.
     ///
     /// Returns `Some` if `PO_SERVER_URL` is set, `None` otherwise.

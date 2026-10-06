@@ -67,7 +67,11 @@ impl Neo4jClient {
                     preview: $preview,
                     permission_mode: $permission_mode,
                     add_dirs: $add_dirs,
-                    spawned_by: $spawned_by
+                    spawned_by: $spawned_by,
+                    provider_id: $provider_id,
+                    routed_by: $routed_by,
+                    capabilities: $capabilities,
+                    resume_token: $resume_token
                 })
                 WITH s
                 OPTIONAL MATCH (p:Project {slug: $project_slug})
@@ -95,7 +99,11 @@ impl Neo4jClient {
                     preview: $preview,
                     permission_mode: $permission_mode,
                     add_dirs: $add_dirs,
-                    spawned_by: $spawned_by
+                    spawned_by: $spawned_by,
+                    provider_id: $provider_id,
+                    routed_by: $routed_by,
+                    capabilities: $capabilities,
+                    resume_token: $resume_token
                 })
                 "#,
             )
@@ -137,7 +145,20 @@ impl Neo4jClient {
                         serde_json::to_string(&session.add_dirs.clone().unwrap_or_default())
                             .unwrap_or_else(|_| "[]".to_string()),
                     )
-                    .param("spawned_by", session.spawned_by.clone().unwrap_or_default()),
+                    .param("spawned_by", session.spawned_by.clone().unwrap_or_default())
+                    .param(
+                        "provider_id",
+                        session.provider_id.clone().unwrap_or_default(),
+                    )
+                    .param("routed_by", session.routed_by.clone().unwrap_or_default())
+                    .param(
+                        "capabilities",
+                        session.capabilities.clone().unwrap_or_default(),
+                    )
+                    .param(
+                        "resume_token",
+                        session.resume_token.clone().unwrap_or_default(),
+                    ),
             )
             .await?;
         Ok(())
@@ -328,6 +349,83 @@ impl Neo4jClient {
         let q = query(cypher)
             .param("id", id.to_string())
             .param("model", model.to_string());
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// One setting document of the provider harness.
+    pub async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>> {
+        let q = query("MATCH (s:LlmSetting {scope: $scope, key: $key}) RETURN s.value AS value")
+            .param("scope", scope.to_string())
+            .param("key", key.to_string());
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => Ok(Some(row.get::<String>("value")?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Creates or replaces a setting document.
+    pub async fn put_llm_setting(&self, scope: &str, key: &str, value: &str) -> Result<()> {
+        let q = query(
+            "MERGE (s:LlmSetting {scope: $scope, key: $key}) \
+             SET s.value = $value, s.updated_at = datetime()",
+        )
+        .param("scope", scope.to_string())
+        .param("key", key.to_string())
+        .param("value", value.to_string());
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Deletes a setting document; `true` when it existed.
+    pub async fn delete_llm_setting(&self, scope: &str, key: &str) -> Result<bool> {
+        let q = query(
+            "MATCH (s:LlmSetting {scope: $scope, key: $key}) \
+             WITH s, count(s) AS n DELETE s RETURN n",
+        )
+        .param("scope", scope.to_string())
+        .param("key", key.to_string());
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
+    /// All documents of a scope whose key starts with `prefix`.
+    pub async fn list_llm_settings(
+        &self,
+        scope: &str,
+        prefix: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let q = query(
+            "MATCH (s:LlmSetting {scope: $scope}) WHERE s.key STARTS WITH $prefix \
+             RETURN s.key AS key, s.value AS value ORDER BY s.key",
+        )
+        .param("scope", scope.to_string())
+        .param("prefix", prefix.to_string());
+        let mut result = self.graph.execute(q).await?;
+        let mut out = Vec::new();
+        while let Some(row) = result.next().await? {
+            out.push((row.get::<String>("key")?, row.get::<String>("value")?));
+        }
+        Ok(out)
+    }
+
+    /// Record the capability snapshot and the resume token of a harness session.
+    /// A `None` argument leaves the stored value untouched.
+    pub async fn update_chat_session_harness(
+        &self,
+        id: Uuid,
+        capabilities: Option<&str>,
+        resume_token: Option<&str>,
+    ) -> Result<()> {
+        let cypher = "MATCH (s:ChatSession {id: $id}) \
+            SET s.capabilities = coalesce($capabilities, s.capabilities), \
+                s.resume_token = coalesce($resume_token, s.resume_token), \
+                s.updated_at = datetime()";
+        let q = query(cypher)
+            .param("id", id.to_string())
+            .param("capabilities", capabilities.map(str::to_string))
+            .param("resume_token", resume_token.map(str::to_string));
         self.graph.run(q).await?;
         Ok(())
     }
@@ -653,6 +751,12 @@ impl Neo4jClient {
                 task_id: task_id_str.and_then(|s| s.parse().ok()),
                 depth: depth as u32,
                 created_at: created_at_str.and_then(|s| s.parse().ok()),
+                provider_id: None,
+                model: None,
+                cost_usd: None,
+                subtree_cost_usd: None,
+                max_depth: None,
+                max_children: None,
             });
         }
         Ok(nodes)
@@ -800,6 +904,10 @@ impl Neo4jClient {
         let permission_mode: String = node.get("permission_mode").unwrap_or_default();
         let add_dirs_json: String = node.get("add_dirs").unwrap_or_default();
         let spawned_by: String = node.get("spawned_by").unwrap_or_default();
+        // Harness fields: absent on every session written before the harness.
+        let non_empty = |key: &str| -> Option<String> {
+            node.get::<String>(key).ok().filter(|v| !v.is_empty())
+        };
 
         // Deserialize add_dirs from JSON string (backward compat: empty string → None)
         let add_dirs: Option<Vec<String>> = if add_dirs_json.is_empty() {
@@ -868,6 +976,10 @@ impl Neo4jClient {
             } else {
                 Some(spawned_by)
             },
+            provider_id: non_empty("provider_id"),
+            routed_by: non_empty("routed_by"),
+            capabilities: non_empty("capabilities"),
+            resume_token: non_empty("resume_token"),
         })
     }
 

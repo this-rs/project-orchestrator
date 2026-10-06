@@ -240,6 +240,12 @@ pub async fn create_grant(
 ) -> Result<(StatusCode, Json<Grant>), AppError> {
     require_human(&state, &claims)?;
     require_proof(&state, &headers)?;
+    // A grant to a provider instance lets the SERVER read that key to send it to
+    // that instance's endpoint: it must name the key the instance is configured
+    // with, on an instance that exists, and nothing else.
+    if let GrantScope::Provider(instance) = &body.scope {
+        validate_provider_grant(state.orchestrator.neo4j(), instance, &body.secrets).await?;
+    }
     let grant = state.vault.grant(
         body.secrets,
         body.scope,
@@ -248,6 +254,40 @@ pub async fn create_grant(
         Utc::now(),
     )?;
     Ok((StatusCode::CREATED, Json(grant)))
+}
+
+/// Validation of a `Provider(instance)` grant.
+///
+/// - the instance must be a stored one (`claude-code` has no key to grant);
+/// - the selector must be `names`, never `all`;
+/// - the names must be exactly what the instance's `credential_ref` points at
+///   (`vault:<name>`): a grant cannot hand a provider another secret.
+pub(crate) async fn validate_provider_grant(
+    graph: &dyn crate::neo4j::GraphStore,
+    instance: &str,
+    secrets: &SecretSelector,
+) -> Result<(), AppError> {
+    let record = crate::chat::provider::store::instance(graph, instance)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "unknown provider instance '{instance}' (claude-code has no key to grant)"
+            ))
+        })?;
+    let SecretSelector::Names(names) = secrets else {
+        return Err(AppError::BadRequest(
+            "a provider grant names its secret: `all` is not accepted".to_string(),
+        ));
+    };
+    let allowed = record.credential_ref.strip_prefix("vault:");
+    if names.is_empty() || names.iter().any(|n| Some(n.as_str()) != allowed) {
+        return Err(AppError::BadRequest(format!(
+            "instance '{instance}' reads the secret named in its credential_ref ({}); a grant to it can name only that",
+            record.credential_ref
+        )));
+    }
+    Ok(())
 }
 
 pub async fn revoke_grant(
@@ -295,6 +335,14 @@ pub async fn answer_request(
     Json(body): Json<AnswerBody>,
 ) -> Result<Json<AnswerResponse>, AppError> {
     require_human(&state, &claims)?;
+    // An agent's request is answered with a session/project/anywhere grant. A
+    // grant to a provider instance is made on its own, validated (see
+    // `validate_provider_grant`), never through an agent's request.
+    if matches!(body.scope, Some(GrantScope::Provider(_))) {
+        return Err(AppError::BadRequest(
+            "a provider grant cannot answer an agent's request".to_string(),
+        ));
+    }
     let (answer, outcome) = match body.action.as_str() {
         "provide" => {
             let value = body
@@ -595,8 +643,10 @@ mod tests {
     fn tokens() -> Tokens {
         let human = encode_jwt(Uuid::new_v4(), "t@example.com", "T", SECRET, 3600).unwrap();
         let claims = decode_jwt(&human, SECRET).unwrap();
+        let (agent_session, jti) = generate_session_token(&claims, None, SECRET, 3600).unwrap();
+        crate::auth::agent_tokens::register(&jti, None);
         Tokens {
-            agent_session: generate_session_token(&claims, SECRET, 3600).unwrap(),
+            agent_session,
             vault_s1: generate_vault_token(&claims, "session-1", SECRET, 3600).unwrap(),
             vault_s2: generate_vault_token(&claims, "session-2", SECRET, 3600).unwrap(),
             human,
@@ -818,6 +868,122 @@ mod tests {
         )
         .await;
         assert_ne!(s, StatusCode::CREATED, "a proof dies with the unlock");
+    }
+
+    async fn store_instance(state: &Arc<ServerState>, credential_ref: &str) {
+        let record = crate::chat::provider::settings::InstanceRecord {
+            id: "deepseek".into(),
+            kind: "openai_compatible".into(),
+            preset: None,
+            label: "DeepSeek".into(),
+            base_url: "https://api.example.com/v1".into(),
+            origin: "https://api.example.com".into(),
+            default_model: Some("m".into()),
+            cost_source: "unknown".into(),
+            credential_ref: credential_ref.into(),
+        };
+        state
+            .orchestrator
+            .neo4j()
+            .put_llm_setting(
+                "global",
+                "instance:deepseek",
+                &serde_json::to_string(&record).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_provider_grant_must_name_the_instance_key_on_an_existing_instance() {
+        let _serial = SERIAL.lock().await;
+        let (app, state) = app().await;
+        let t = tokens();
+        let proof = open_with_secret(&app, &t).await;
+        store_instance(&state, "vault:demo-secret").await;
+        let grant = |scope: serde_json::Value, secrets: serde_json::Value| {
+            Some(serde_json::json!({"secrets": secrets, "scope": scope, "minutes": 60}))
+        };
+        let provider = |id: &str| serde_json::json!({"kind": "provider", "value": id});
+        let names = |n: &[&str]| serde_json::json!({"kind": "names", "names": n});
+
+        // The key the instance is configured with, on that instance: created.
+        let (s, body) = call_with_proof(
+            &app,
+            "POST",
+            "/api/vault/grants",
+            &t.human,
+            Some(&proof),
+            grant(provider("deepseek"), names(&["demo-secret"])),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{body}");
+        // `all`: refused. Another secret: refused. An unknown instance: 404. claude-code: 404.
+        for (scope, secrets, want) in [
+            (
+                provider("deepseek"),
+                serde_json::json!({"kind": "all"}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                provider("deepseek"),
+                names(&["something-else"]),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                provider("deepseek"),
+                names(&["demo-secret", "something-else"]),
+                StatusCode::BAD_REQUEST,
+            ),
+            (provider("deepseek"), names(&[]), StatusCode::BAD_REQUEST),
+            (
+                provider("ghost"),
+                names(&["demo-secret"]),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                provider("claude-code"),
+                names(&["demo-secret"]),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let (s, body) = call_with_proof(
+                &app,
+                "POST",
+                "/api/vault/grants",
+                &t.human,
+                Some(&proof),
+                grant(scope.clone(), secrets.clone()),
+            )
+            .await;
+            assert_eq!(s, want, "{scope} {secrets}: {body}");
+        }
+        // Other scopes are untouched by the rule.
+        let (s, _) = call_with_proof(
+            &app,
+            "POST",
+            "/api/vault/grants",
+            &t.human,
+            Some(&proof),
+            grant(
+                serde_json::json!({"kind": "anywhere"}),
+                serde_json::json!({"kind": "all"}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        // An instance with no vault credential has nothing to grant.
+        store_instance(&state, "none").await;
+        let (s, _) = call_with_proof(
+            &app,
+            "POST",
+            "/api/vault/grants",
+            &t.human,
+            Some(&proof),
+            grant(provider("deepseek"), names(&["demo-secret"])),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

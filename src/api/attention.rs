@@ -182,6 +182,12 @@ pub struct RunRef {
     pub duration_secs: u64,
     /// Cost so far; updated in place by clients, never interpolated.
     pub cost_usd: f64,
+    /// Where `cost_usd` comes from (`reported`, `priced`, `free`, `subscription`,
+    /// `unknown`). Absent on a client that predates it. Until the runner records
+    /// the basis per execution (A22) this is derived: a non-zero amount is
+    /// `reported`, a zero is `unknown` (never shown as a true `$0.00`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_basis: Option<String>,
 }
 
 /// What "Resume" would do — announced BEFORE the click: the runner skips

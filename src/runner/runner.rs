@@ -6,6 +6,7 @@
 use crate::chat::manager::ChatManager;
 use crate::chat::types::{ChatEvent, ChatRequest};
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
+use crate::neo4j::agent_execution::{AgentExecutionNode, AgentExecutionStatus};
 use crate::neo4j::models::{PlanStatus, TaskStatus};
 use crate::neo4j::traits::GraphStore;
 use crate::orchestrator::context::ContextBuilder;
@@ -462,6 +463,10 @@ pub struct PlanRunner {
     /// a synthetic service account — avoids 403 when email domain checks are
     /// configured in the auth middleware.
     user_claims: Option<crate::auth::jwt::Claims>,
+    /// Provider/model/token budget named by the run request (A16 level "run").
+    run_provider: Option<String>,
+    run_model: Option<String>,
+    run_max_tokens: Option<u64>,
 }
 
 /// Result of starting a plan run.
@@ -582,8 +587,11 @@ struct TaskExecutionResult {
     pub persona_ids: Vec<Uuid>,
     /// AgentExecution UUID created for this task (for USED_SKILL relations).
     pub agent_execution_id: Uuid,
-    /// Persona profile string used for this agent.
-    pub persona_profile: String,
+    /// The AgentExecution node opened for this attempt, still `running`, with
+    /// what the provider reported (turns, cost basis) already filled in. The
+    /// caller closes it with [`PlanRunner::close_attempt`]. `None` when no node
+    /// was created (the session never spawned).
+    pub agent_execution: Option<AgentExecutionNode>,
     /// Structured execution report with tool usage metrics and confidence score.
     pub report: Option<TaskExecutionReport>,
 }
@@ -678,6 +686,9 @@ impl PlanRunner {
             event_tx,
             event_emitter: None,
             user_claims: None,
+            run_provider: None,
+            run_model: None,
+            run_max_tokens: None,
         }
     }
 
@@ -686,6 +697,20 @@ impl PlanRunner {
     /// using a synthetic service account.
     pub fn with_user_claims(mut self, claims: crate::auth::jwt::Claims) -> Self {
         self.user_claims = Some(claims);
+        self
+    }
+
+    /// Names the provider, model and token budget of every session of this run
+    /// (the run level of the resolution order, A16).
+    pub fn with_run_routing(
+        mut self,
+        provider: Option<String>,
+        model: Option<String>,
+        max_tokens: Option<u64>,
+    ) -> Self {
+        self.run_provider = provider.filter(|p| !p.is_empty());
+        self.run_model = model.filter(|m| !m.is_empty());
+        self.run_max_tokens = max_tokens;
         self
     }
 
@@ -1744,6 +1769,39 @@ impl PlanRunner {
         Ok(())
     }
 
+    /// Close the AgentExecution of one attempt (fire-and-forget).
+    ///
+    /// Every attempt — first pass and retries — goes through here, so no node
+    /// is left `running` once its attempt has returned. `cost_usd` /
+    /// `duration_secs` set to `None` keep the open node's cost and fall back to
+    /// the wall-clock time since the attempt started.
+    fn close_attempt(
+        &self,
+        open: Option<&AgentExecutionNode>,
+        status: AgentExecutionStatus,
+        cost_usd: Option<f64>,
+        duration_secs: Option<f64>,
+        report: Option<&TaskExecutionReport>,
+    ) {
+        let Some(open) = open else {
+            return;
+        };
+        let closed = close_attempt_node(
+            open,
+            status,
+            cost_usd,
+            duration_secs,
+            report,
+            chrono::Utc::now(),
+        );
+        let graph = self.graph.clone();
+        tokio::spawn(async move {
+            if let Err(e) = graph.update_agent_execution(&closed).await {
+                warn!("Failed to update AgentExecution {}: {}", closed.id, e);
+            }
+        });
+    }
+
     /// Execute all tasks in a wave in parallel using a JoinSet.
     ///
     /// Each task is spawned as a separate tokio task. Results are collected as
@@ -1887,6 +1945,7 @@ impl PlanRunner {
                         project_slug.as_deref(),
                         None, // no retry context on first attempt
                         &continuity,
+                        1, // first attempt
                     )
                     .await;
                 (task_id, title_clone, result)
@@ -1925,23 +1984,20 @@ impl PlanRunner {
 
             let task_agent_execution_id = task_result.as_ref().ok().map(|r| r.agent_execution_id);
 
+            // The node opened for this attempt — closed in every branch below.
+            let task_agent_execution = task_result
+                .as_ref()
+                .ok()
+                .and_then(|r| r.agent_execution.clone());
+
             let task_persona_ids = task_result
                 .as_ref()
                 .ok()
                 .map(|r| r.persona_ids.clone())
                 .unwrap_or_default();
 
-            let task_persona = task_result
-                .as_ref()
-                .ok()
-                .map(|r| r.persona_profile.clone())
-                .unwrap_or_default();
-
             // Extract execution report before consuming the result
             let task_report = task_result.as_ref().ok().and_then(|r| r.report.clone());
-            let task_report_json = task_report
-                .as_ref()
-                .and_then(|r| serde_json::to_string(r).ok());
 
             match task_result.map(|r| r.result) {
                 Ok(TaskResult::Success {
@@ -1982,48 +2038,13 @@ impl PlanRunner {
                     });
 
                     // Fire-and-forget: finalize AgentExecution node (success)
-                    if let Some(ae_id) = task_agent_execution_id {
-                        let graph = self.graph.clone();
-                        let persona = task_persona.clone();
-                        let report_json = task_report_json.clone();
-                        let report_ref = task_report.clone();
-                        tokio::spawn(async move {
-                            use crate::neo4j::agent_execution::{
-                                AgentExecutionNode, AgentExecutionStatus,
-                            };
-                            let (tools_json, files, commits) = if let Some(ref r) = report_ref {
-                                (
-                                    serde_json::to_string(&r.tool_use_breakdown)
-                                        .unwrap_or_else(|_| "{}".to_string()),
-                                    r.files_modified.clone(),
-                                    r.commits.clone(),
-                                )
-                            } else {
-                                ("{}".to_string(), vec![], vec![])
-                            };
-                            let ae = AgentExecutionNode {
-                                id: ae_id,
-                                run_id,
-                                task_id,
-                                session_id: task_session_id,
-                                started_at: task_start_time,
-                                completed_at: Some(chrono::Utc::now()),
-                                cost_usd,
-                                duration_secs,
-                                status: AgentExecutionStatus::Completed,
-                                tools_used: tools_json,
-                                files_modified: files,
-                                commits,
-                                persona_profile: persona,
-                                vector_json: None,
-                                report_json,
-                                execution_type: Default::default(),
-                            };
-                            if let Err(e) = graph.update_agent_execution(&ae).await {
-                                warn!("Failed to update AgentExecution {}: {}", ae_id, e);
-                            }
-                        });
-                    }
+                    self.close_attempt(
+                        task_agent_execution.as_ref(),
+                        AgentExecutionStatus::Completed,
+                        Some(cost_usd),
+                        Some(duration_secs),
+                        task_report.as_ref(),
+                    );
 
                     // Fire-and-forget skill feedback + USED_SKILL relations (success)
                     if !task_activated_skills.is_empty() {
@@ -2081,6 +2102,15 @@ impl PlanRunner {
                             .await?;
                         wave_result.tasks_completed.push(task_id);
                         wave_result.wave_cost_usd += cost_usd;
+
+                        // The runner counts this attempt as completed: close it so.
+                        self.close_attempt(
+                            task_agent_execution.as_ref(),
+                            AgentExecutionStatus::Completed,
+                            Some(cost_usd),
+                            None,
+                            None,
+                        );
                     } else {
                         self.on_task_failed(run_id, plan_id, task_id, &reason, 0.0, cost_usd)
                             .await?;
@@ -2088,36 +2118,13 @@ impl PlanRunner {
                         wave_result.wave_cost_usd += cost_usd;
 
                         // Fire-and-forget: finalize AgentExecution node (failure)
-                        if let Some(ae_id) = task_agent_execution_id {
-                            let graph = self.graph.clone();
-                            let persona = task_persona.clone();
-                            tokio::spawn(async move {
-                                use crate::neo4j::agent_execution::{
-                                    AgentExecutionNode, AgentExecutionStatus,
-                                };
-                                let ae = AgentExecutionNode {
-                                    id: ae_id,
-                                    run_id,
-                                    task_id,
-                                    session_id: task_session_id,
-                                    started_at: task_start_time,
-                                    completed_at: Some(chrono::Utc::now()),
-                                    cost_usd,
-                                    duration_secs: 0.0,
-                                    status: AgentExecutionStatus::Failed,
-                                    tools_used: "{}".to_string(),
-                                    files_modified: vec![],
-                                    commits: vec![],
-                                    persona_profile: persona,
-                                    vector_json: None,
-                                    report_json: None,
-                                    execution_type: Default::default(),
-                                };
-                                if let Err(e) = graph.update_agent_execution(&ae).await {
-                                    warn!("Failed to update AgentExecution {}: {}", ae_id, e);
-                                }
-                            });
-                        }
+                        self.close_attempt(
+                            task_agent_execution.as_ref(),
+                            AgentExecutionStatus::Failed,
+                            Some(cost_usd),
+                            None,
+                            None,
+                        );
 
                         // Fire-and-forget skill feedback + USED_SKILL (failure)
                         if !task_activated_skills.is_empty() {
@@ -2174,6 +2181,15 @@ impl PlanRunner {
                             .await?;
                         wave_result.tasks_completed.push(task_id);
                         wave_result.wave_cost_usd += cost_usd;
+
+                        // The runner counts this attempt as completed: close it so.
+                        self.close_attempt(
+                            task_agent_execution.as_ref(),
+                            AgentExecutionStatus::Completed,
+                            Some(cost_usd),
+                            Some(duration_secs),
+                            None,
+                        );
                     } else {
                         self.emit_event(RunnerEvent::TaskTimeout {
                             run_id,
@@ -2196,36 +2212,13 @@ impl PlanRunner {
                         wave_result.wave_cost_usd += cost_usd;
 
                         // Fire-and-forget: finalize AgentExecution (timeout)
-                        if let Some(ae_id) = task_agent_execution_id {
-                            let graph = self.graph.clone();
-                            let persona = task_persona.clone();
-                            tokio::spawn(async move {
-                                use crate::neo4j::agent_execution::{
-                                    AgentExecutionNode, AgentExecutionStatus,
-                                };
-                                let ae = AgentExecutionNode {
-                                    id: ae_id,
-                                    run_id,
-                                    task_id,
-                                    session_id: task_session_id,
-                                    started_at: task_start_time,
-                                    completed_at: Some(chrono::Utc::now()),
-                                    cost_usd,
-                                    duration_secs,
-                                    status: AgentExecutionStatus::Timeout,
-                                    tools_used: "{}".to_string(),
-                                    files_modified: vec![],
-                                    commits: vec![],
-                                    persona_profile: persona,
-                                    vector_json: None,
-                                    report_json: None,
-                                    execution_type: Default::default(),
-                                };
-                                if let Err(e) = graph.update_agent_execution(&ae).await {
-                                    warn!("Failed to update AgentExecution {}: {}", ae_id, e);
-                                }
-                            });
-                        }
+                        self.close_attempt(
+                            task_agent_execution.as_ref(),
+                            AgentExecutionStatus::Timeout,
+                            Some(cost_usd),
+                            Some(duration_secs),
+                            None,
+                        );
 
                         // Fire-and-forget skill feedback + USED_SKILL (timeout = failure)
                         if !task_activated_skills.is_empty() {
@@ -2277,6 +2270,16 @@ impl PlanRunner {
                         cumulated_cost_usd,
                         limit_usd,
                     });
+                    // The agent returned but the run is cut before its work is
+                    // judged: neither completed nor failed. The attempt's own
+                    // cost is already on the open node.
+                    self.close_attempt(
+                        task_agent_execution.as_ref(),
+                        AgentExecutionStatus::Interrupted,
+                        None,
+                        None,
+                        None,
+                    );
                     wave_result.aborted = true;
                     join_set.abort_all();
                     // Drain remaining aborted tasks
@@ -2285,6 +2288,13 @@ impl PlanRunner {
                 }
                 Ok(TaskResult::Blocked { blocked_by }) => {
                     warn!("Task {} blocked by {:?}", task_id, blocked_by);
+                    self.close_attempt(
+                        task_agent_execution.as_ref(),
+                        AgentExecutionStatus::Failed,
+                        None,
+                        None,
+                        None,
+                    );
 
                     // Extract session_id and remove agent from active_agents
                     let agent_session_id = {
@@ -2465,8 +2475,22 @@ impl PlanRunner {
                         project_slug,
                         Some(retry_context),
                         continuity_context,
+                        retry_count + 1, // attempt 1 was the first pass
                     )
                     .await;
+
+                // Close this attempt's AgentExecution whatever its outcome: a
+                // retry opens its own node, which used to stay `running`.
+                if let Ok(ref exec) = retry_result {
+                    let (status, attempt_cost, attempt_duration) = attempt_outcome(&exec.result);
+                    self.close_attempt(
+                        exec.agent_execution.as_ref(),
+                        status,
+                        attempt_cost,
+                        attempt_duration,
+                        exec.report.as_ref(),
+                    );
+                }
 
                 match retry_result {
                     Ok(exec_result) => match exec_result.result {
@@ -2668,6 +2692,7 @@ impl PlanRunner {
         project_slug: Option<&str>,
         retry_context: Option<String>,
         continuity_context: &str,
+        attempt: u32,
     ) -> Result<TaskExecutionResult> {
         if retry_context.is_some() {
             info!(
@@ -2809,6 +2834,8 @@ impl PlanRunner {
 
         // Build dynamic runner constraints with git branch, wave info, skills, and profile
         let git_branch = git::current_branch(cwd).await.unwrap_or_default();
+        // HEAD of the working directory when this attempt starts (A22 record).
+        let base_sha = git::head_sha(cwd).await.ok();
         let task_tags = task_node
             .as_ref()
             .map(|t| t.tags.clone())
@@ -3000,6 +3027,15 @@ impl PlanRunner {
                 }
             })
             .unwrap_or_default();
+        // The model alias set on the task (A16 level "task"); a read that fails
+        // is "no alias", never a stop.
+        let task_alias = self
+            .graph
+            .get_llm_setting(&format!("task:{task_id}"), "model_alias")
+            .await
+            .ok()
+            .flatten()
+            .filter(|a| !a.is_empty());
         let request = ChatRequest {
             attachments: Vec::new(),
             message: prompt, // Send the full prompt directly in create_session — avoids the ghost empty message at seq 1
@@ -3007,6 +3043,12 @@ impl PlanRunner {
             cwd: cwd.to_string(),
             project_slug: project_slug.map(|s| s.to_string()),
             model: None,
+            provider: None,
+            task_alias: task_alias.clone(),
+            run_provider: self.run_provider.clone(),
+            run_model: self.run_model.clone(),
+            max_tokens: self.run_max_tokens,
+            task_class: Some(task_profile.complexity.to_string()),
             permission_mode: Some("bypassPermissions".to_string()),
             add_dirs: None,
             workspace_slug: None,
@@ -3027,6 +3069,8 @@ impl PlanRunner {
             scaffolding_override: None,
             runner_context: Some(runner_context),
         };
+        // What the runner asks for today (None = provider default).
+        let model_requested = request.model.clone().or_else(|| request.run_model.clone());
 
         let spawning_timeout = Duration::from_secs(self.config.spawning_timeout_secs);
         let session = match tokio::time::timeout(
@@ -3074,7 +3118,7 @@ impl PlanRunner {
                     activated_skill_ids: activated_skill_ids.clone(),
                     persona_ids: persona_ids_for_feedback.clone(),
                     agent_execution_id: Uuid::new_v4(),
-                    persona_profile: String::new(),
+                    agent_execution: None, // no session, no node to close
                     report: None,
                 });
             }
@@ -3102,27 +3146,61 @@ impl PlanRunner {
             .map(|p| format!("{}:{}", p.persona_name, task_profile.complexity))
             .unwrap_or_else(|| task_profile.complexity.to_string());
 
-        // Create AgentExecution node in Neo4j (fire-and-forget)
+        // What the resolver decided for this session, read back from the session
+        // node it persisted: the record says which provider ran and why (A22).
+        let routing = match session_uuid {
+            Some(uuid) => self.graph.get_chat_session(uuid).await.ok().flatten(),
+            None => None,
+        };
+
+        // Policy rule and shadow choice recorded by the resolver, if any.
+        let routing_note: Option<serde_json::Value> = match session_uuid {
+            Some(uuid) => self
+                .graph
+                .get_llm_setting(&format!("routing:{uuid}"), "note")
+                .await
+                .ok()
+                .flatten()
+                .and_then(|raw| serde_json::from_str(&raw).ok()),
+            None => None,
+        };
+        let note_str = |key: &str| {
+            routing_note
+                .as_ref()
+                .and_then(|n| n.get(key))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+
+        // Open the AgentExecution node of this attempt (fire-and-forget create).
+        // One node per attempt: the caller closes it through `close_attempt`.
+        let ae_open = AgentExecutionNode {
+            id: agent_execution_id,
+            run_id,
+            task_id,
+            session_id: session_uuid,
+            persona_profile: persona_str.clone(),
+            provider_id: routing
+                .as_ref()
+                .and_then(|n| n.provider_id.clone())
+                .unwrap_or_else(|| crate::neo4j::agent_execution::DEFAULT_PROVIDER_ID.to_string()),
+            routed_by: routing
+                .as_ref()
+                .and_then(|n| n.routed_by.clone())
+                .unwrap_or_else(|| crate::neo4j::agent_execution::DEFAULT_ROUTED_BY.to_string()),
+            model_alias: task_alias,
+            route_rule: note_str("route_rule"),
+            fallback_reason: note_str("fallback_reason"),
+            shadow_provider: note_str("shadow_provider"),
+            shadow_model: note_str("shadow_model"),
+            model_requested,
+            task_class: Some(task_profile.complexity.to_string()),
+            attempt,
+            base_sha,
+            ..Default::default()
+        };
         {
-            use crate::neo4j::agent_execution::{AgentExecutionNode, AgentExecutionStatus};
-            let ae = AgentExecutionNode {
-                id: agent_execution_id,
-                run_id,
-                task_id,
-                session_id: session_uuid,
-                started_at: chrono::Utc::now(),
-                completed_at: None,
-                cost_usd: 0.0,
-                duration_secs: 0.0,
-                status: AgentExecutionStatus::Running,
-                tools_used: "{}".to_string(),
-                files_modified: vec![],
-                commits: vec![],
-                persona_profile: persona_str.clone(),
-                vector_json: None,
-                report_json: None,
-                execution_type: Default::default(),
-            };
+            let ae = ae_open.clone();
             let graph = self.graph.clone();
             tokio::spawn(async move {
                 if let Err(e) = graph.create_agent_execution(&ae).await {
@@ -3130,22 +3208,6 @@ impl PlanRunner {
                 }
             });
         }
-
-        // Helper to wrap TaskResult with session_id and activated skills/personas
-        let activated_ids = activated_skill_ids.clone();
-        let persona_ids_clone = persona_ids_for_feedback.clone();
-        let persona_clone = persona_str.clone();
-        let wrap = move |result: TaskResult| -> TaskExecutionResult {
-            TaskExecutionResult {
-                result,
-                session_id: session_uuid,
-                activated_skill_ids: activated_ids.clone(),
-                persona_ids: persona_ids_clone.clone(),
-                agent_execution_id,
-                persona_profile: persona_clone.clone(),
-                report: None,
-            }
-        };
 
         // Subscribe to events BEFORE the background task starts streaming
         // (create_session spawns a tokio task that sends the message — subscribe must happen first)
@@ -3262,6 +3324,46 @@ impl PlanRunner {
             }
         };
 
+        // Helper to wrap TaskResult with session_id, activated skills/personas and
+        // the open AgentExecution node carrying what the provider reported.
+        let reported_num_turns = event_metrics.num_turns;
+        let cost_reported = event_metrics.cost_reported;
+        let effective_model = event_metrics.model.clone();
+        let cost_basis = event_metrics.cost_basis.clone();
+        let basis_for_budget = event_metrics.cost_basis.clone();
+        let tokens = (
+            event_metrics.tokens_in,
+            event_metrics.tokens_out,
+            event_metrics.tokens_cache_read,
+            event_metrics.tokens_cache_write,
+        );
+        let activated_ids = activated_skill_ids.clone();
+        let persona_ids_clone = persona_ids_for_feedback.clone();
+        let wrap = move |result: TaskResult| -> TaskExecutionResult {
+            let mut ae = ae_open.clone();
+            ae.num_turns = reported_num_turns;
+            ae.model = effective_model.clone();
+            (
+                ae.tokens_in,
+                ae.tokens_out,
+                ae.tokens_cache_read,
+                ae.tokens_cache_write,
+            ) = tokens;
+            // The provider's own basis wins; a cost with no basis is `reported`.
+            ae.cost_basis = cost_basis
+                .clone()
+                .or_else(|| cost_reported.then(|| "reported".to_string()));
+            TaskExecutionResult {
+                result,
+                session_id: session_uuid,
+                activated_skill_ids: activated_ids.clone(),
+                persona_ids: persona_ids_clone.clone(),
+                agent_execution_id,
+                agent_execution: Some(ae),
+                report: None,
+            }
+        };
+
         // Process the event listener result
         let (cost_usd, is_error, error_text, _subtype, _timed_out) = match event_result {
             EventListenResult::Completed {
@@ -3318,14 +3420,24 @@ impl PlanRunner {
         {
             let mut global = RUNNER_STATE.write().await;
             if let Some(ref mut s) = *global {
-                s.add_cost(cost_usd);
+                // Two counters (A21): only a real spend (reported / priced) goes
+                // toward the budget; a subscription or a free endpoint does not.
+                if crate::chat::cost::counts_toward_budget(basis_for_budget.as_deref()) {
+                    s.add_cost(cost_usd);
+                }
                 if s.is_budget_exceeded(self.effective_budget()) {
                     let result = TaskResult::BudgetExceeded {
                         cumulated_cost_usd: s.cost_usd,
                         limit_usd: self.effective_budget(),
                     };
                     self.finalize_steps(task_id, &result, cwd).await;
-                    return Ok(wrap(result));
+                    // BudgetExceeded carries the run total, not this attempt's
+                    // cost: keep the latter on the node.
+                    let mut exec = wrap(result);
+                    if let Some(ae) = exec.agent_execution.as_mut() {
+                        ae.cost_usd = cost_usd;
+                    }
+                    return Ok(exec);
                 }
             }
         }
@@ -4636,11 +4748,33 @@ impl PlanRunner {
                             cost_usd: event_cost,
                             subtype,
                             is_error,
+                            num_turns,
                             result_text,
+                            cost,
+                            usage,
+                            model,
                             ..
                         } => {
+                            metrics.num_turns = (*num_turns).and_then(|n| u32::try_from(n).ok());
+                            metrics.model = model.clone();
+                            metrics.cost_basis = cost
+                                .as_ref()
+                                .and_then(|c| c.get("basis"))
+                                .and_then(|b| b.as_str())
+                                .map(str::to_string);
+                            let token = |k: &str| {
+                                usage
+                                    .as_ref()
+                                    .and_then(|u| u.get(k))
+                                    .and_then(|v| v.as_u64())
+                            };
+                            metrics.tokens_in = token("input_tokens");
+                            metrics.tokens_out = token("output_tokens");
+                            metrics.tokens_cache_read = token("cache_read_tokens");
+                            metrics.tokens_cache_write = token("cache_creation_tokens");
                             if let Some(c) = event_cost {
                                 cost_usd = *c;
+                                metrics.cost_reported = true;
                                 // Update agent cost in real-time for run_status
                                 if let Some(tid) = task_id {
                                     let mut global = RUNNER_STATE.write().await;
@@ -4709,6 +4843,83 @@ struct EventMetrics {
     error_count: u32,
     /// Last error text from a tool_result
     last_error: Option<String>,
+    /// Number of turns reported by the Result event, when it carried one
+    num_turns: Option<u32>,
+    /// Whether the Result event carried a cost (vs. the 0.0 default)
+    cost_reported: bool,
+    /// Model that actually answered, when the provider said.
+    model: Option<String>,
+    /// Basis of the cost (`reported`, `priced`, `free`, `subscription`, `unknown`).
+    cost_basis: Option<String>,
+    tokens_in: Option<u64>,
+    tokens_out: Option<u64>,
+    tokens_cache_read: Option<u64>,
+    tokens_cache_write: Option<u64>,
+}
+
+// ============================================================================
+// AgentExecution closing — one node per attempt
+// ============================================================================
+
+/// Status, cost and duration an attempt's [`TaskResult`] gives its
+/// AgentExecution. `None` means "not carried by this result".
+fn attempt_outcome(result: &TaskResult) -> (AgentExecutionStatus, Option<f64>, Option<f64>) {
+    match result {
+        TaskResult::Success {
+            cost_usd,
+            duration_secs,
+        } => (
+            AgentExecutionStatus::Completed,
+            Some(*cost_usd),
+            Some(*duration_secs),
+        ),
+        TaskResult::Failed { cost_usd, .. } => {
+            (AgentExecutionStatus::Failed, Some(*cost_usd), None)
+        }
+        TaskResult::Timeout {
+            duration_secs,
+            cost_usd,
+        } => (
+            AgentExecutionStatus::Timeout,
+            Some(*cost_usd),
+            Some(*duration_secs),
+        ),
+        TaskResult::Blocked { .. } => (AgentExecutionStatus::Failed, None, None),
+        // The run is cut before the attempt is judged: neither completed nor failed.
+        TaskResult::BudgetExceeded { .. } => (AgentExecutionStatus::Interrupted, None, None),
+    }
+}
+
+/// Build the closed version of an attempt's AgentExecution node.
+///
+/// Keeps everything recorded at launch (provider, routing, attempt, base_sha…)
+/// and sets the final status, `completed_at`, cost, duration and, when a report
+/// exists, tools / files / commits / report JSON.
+fn close_attempt_node(
+    open: &AgentExecutionNode,
+    status: AgentExecutionStatus,
+    cost_usd: Option<f64>,
+    duration_secs: Option<f64>,
+    report: Option<&TaskExecutionReport>,
+    completed_at: chrono::DateTime<chrono::Utc>,
+) -> AgentExecutionNode {
+    let mut ae = open.clone();
+    ae.status = status;
+    ae.completed_at = Some(completed_at);
+    if let Some(cost) = cost_usd {
+        ae.cost_usd = cost;
+    }
+    ae.duration_secs = duration_secs.unwrap_or_else(|| {
+        (completed_at - open.started_at).num_milliseconds().max(0) as f64 / 1000.0
+    });
+    if let Some(r) = report {
+        ae.tools_used =
+            serde_json::to_string(&r.tool_use_breakdown).unwrap_or_else(|_| "{}".to_string());
+        ae.files_modified = r.files_modified.clone();
+        ae.commits = r.commits.clone();
+        ae.report_json = serde_json::to_string(r).ok();
+    }
+    ae
 }
 
 // ============================================================================
@@ -4725,6 +4936,9 @@ impl Clone for PlanRunner {
             event_tx: self.event_tx.clone(),
             event_emitter: self.event_emitter.clone(),
             user_claims: self.user_claims.clone(),
+            run_provider: self.run_provider.clone(),
+            run_model: self.run_model.clone(),
+            run_max_tokens: self.run_max_tokens,
         }
     }
 }
@@ -5098,6 +5312,7 @@ mod tests {
         let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
         let search: Arc<dyn SearchStore> = Arc::new(MockSearchStore::new());
         let chat_config = ChatConfig {
+            provider_path: Default::default(),
             mcp_server_path: std::path::PathBuf::from("/dev/null"),
             default_model: "test".into(),
             max_sessions: 1,
@@ -5166,6 +5381,7 @@ mod tests {
             tool_use_breakdown: breakdown,
             error_count: 1,
             last_error: Some("something broke".into()),
+            ..Default::default()
         };
 
         assert_eq!(m.tool_use_count, 5);
@@ -5192,6 +5408,8 @@ mod tests {
             tool: "Edit".into(),
             input: serde_json::json!({}),
             parent_tool_use_id: None,
+            category: None,
+            canonical: None,
         })
         .unwrap();
 
@@ -5200,6 +5418,8 @@ mod tests {
             tool: "Bash".into(),
             input: serde_json::json!({}),
             parent_tool_use_id: None,
+            category: None,
+            canonical: None,
         })
         .unwrap();
 
@@ -5208,6 +5428,8 @@ mod tests {
             tool: "Edit".into(),
             input: serde_json::json!({}),
             parent_tool_use_id: None,
+            category: None,
+            canonical: None,
         })
         .unwrap();
 
@@ -5219,6 +5441,10 @@ mod tests {
             is_error: false,
             num_turns: Some(3),
             result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
         })
         .unwrap();
 
@@ -5276,6 +5502,10 @@ mod tests {
             is_error: false,
             num_turns: None,
             result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
         })
         .unwrap();
 
@@ -5310,6 +5540,10 @@ mod tests {
             is_error: false,
             num_turns: None,
             result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
         })
         .unwrap();
 
@@ -5571,7 +5805,7 @@ mod tests {
             activated_skill_ids: vec![],
             persona_ids: vec![],
             agent_execution_id: exec_id,
-            persona_profile: "test-persona".into(),
+            agent_execution: None,
             report: None,
         };
         assert_eq!(ter.session_id(), Some(session));
@@ -5591,7 +5825,7 @@ mod tests {
             activated_skill_ids: vec![Uuid::new_v4()],
             persona_ids: vec![Uuid::new_v4()],
             agent_execution_id: Uuid::new_v4(),
-            persona_profile: String::new(),
+            agent_execution: None,
             report: None,
         };
         assert_eq!(ter.session_id(), None);
@@ -5628,7 +5862,7 @@ mod tests {
             activated_skill_ids: vec![],
             persona_ids: vec![],
             agent_execution_id: Uuid::new_v4(),
-            persona_profile: "dev".into(),
+            agent_execution: None,
             report: Some(report),
         };
 
@@ -5659,6 +5893,7 @@ mod tests {
         let graph: Arc<dyn GraphStore> = mock_graph.clone();
         let search: Arc<dyn SearchStore> = Arc::new(MockSearchStore::new());
         let chat_config = ChatConfig {
+            provider_path: Default::default(),
             mcp_server_path: std::path::PathBuf::from("/dev/null"),
             default_model: "test".into(),
             max_sessions: 1,
@@ -8174,6 +8409,10 @@ mod tests {
             is_error: false,
             num_turns: None,
             result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
         })
         .unwrap();
         let (_r, metrics) = runner.listen_for_result(rx, Uuid::new_v4(), None).await;
@@ -8205,6 +8444,7 @@ mod tests {
             vector_json: None,
             report_json: None,
             execution_type: ExecutionType::TaskAgent,
+            ..Default::default()
         }
     }
 
@@ -8218,6 +8458,367 @@ mod tests {
 
     async fn agent_status(g: &MockGraphStore, id: Uuid) -> AgentExecutionNode {
         g.agent_executions.read().await.get(&id).cloned().unwrap()
+    }
+
+    // ========================================================================
+    // One AgentExecution per attempt, each one closed (A22 / B4 + B6)
+    // ========================================================================
+
+    fn open_attempt(run_id: Uuid, task_id: Uuid, attempt: u32) -> AgentExecutionNode {
+        AgentExecutionNode {
+            attempt,
+            task_class: Some("simple".to_string()),
+            base_sha: Some("0123abcd".to_string()),
+            persona_profile: "simple".to_string(),
+            ..AgentExecutionNode::new(run_id, task_id)
+        }
+    }
+
+    #[test]
+    fn attempt_outcome_maps_every_task_result() {
+        let (status, cost, duration) = attempt_outcome(&TaskResult::Success {
+            cost_usd: 0.4,
+            duration_secs: 12.0,
+        });
+        assert_eq!(status, AgentExecutionStatus::Completed);
+        assert_eq!(cost, Some(0.4));
+        assert_eq!(duration, Some(12.0));
+
+        let (status, cost, duration) = attempt_outcome(&TaskResult::Failed {
+            reason: "boom".into(),
+            attempts: 0,
+            cost_usd: 0.1,
+        });
+        assert_eq!(status, AgentExecutionStatus::Failed);
+        assert_eq!(cost, Some(0.1));
+        assert_eq!(duration, None);
+
+        let (status, cost, duration) = attempt_outcome(&TaskResult::Timeout {
+            duration_secs: 600.0,
+            cost_usd: 0.3,
+        });
+        assert_eq!(status, AgentExecutionStatus::Timeout);
+        assert_eq!(cost, Some(0.3));
+        assert_eq!(duration, Some(600.0));
+
+        let (status, cost, _) = attempt_outcome(&TaskResult::BudgetExceeded {
+            cumulated_cost_usd: 60.0,
+            limit_usd: 50.0,
+        });
+        assert_eq!(status, AgentExecutionStatus::Interrupted);
+        assert_eq!(cost, None, "the run total is not this attempt's cost");
+
+        let (status, _, _) = attempt_outcome(&TaskResult::Blocked { blocked_by: vec![] });
+        assert_eq!(status, AgentExecutionStatus::Failed);
+    }
+
+    #[test]
+    fn close_attempt_node_keeps_the_launch_record_and_fills_the_outcome() {
+        let mut open = open_attempt(Uuid::new_v4(), Uuid::new_v4(), 2);
+        open.started_at = chrono::Utc::now() - chrono::Duration::seconds(30);
+        open.num_turns = Some(5);
+        open.cost_basis = Some("reported".to_string());
+        open.cost_usd = 0.7;
+
+        let report = TaskExecutionReport {
+            tool_use_count: 2,
+            tool_use_breakdown: std::collections::HashMap::from([("Edit".to_string(), 2u32)]),
+            error_count: 0,
+            last_error: None,
+            files_modified: vec!["src/lib.rs".to_string()],
+            commits: vec!["deadbeef".to_string()],
+            agent_success: true,
+            cost_usd: 0.25,
+            duration_secs: 9.5,
+            confidence_score: 0.0,
+        };
+        let now = chrono::Utc::now();
+        let closed = close_attempt_node(
+            &open,
+            AgentExecutionStatus::Completed,
+            Some(0.25),
+            Some(9.5),
+            Some(&report),
+            now,
+        );
+        assert_eq!(closed.id, open.id);
+        assert_eq!(closed.status, AgentExecutionStatus::Completed);
+        assert_eq!(closed.completed_at, Some(now));
+        assert_eq!(closed.cost_usd, 0.25);
+        assert_eq!(closed.duration_secs, 9.5);
+        assert_eq!(closed.files_modified, vec!["src/lib.rs".to_string()]);
+        assert_eq!(closed.commits, vec!["deadbeef".to_string()]);
+        assert!(closed.tools_used.contains("Edit"));
+        assert!(closed.report_json.is_some());
+        // Launch record untouched.
+        assert_eq!(closed.attempt, 2);
+        assert_eq!(closed.provider_id, "claude-code");
+        assert_eq!(closed.routed_by, "default");
+        assert_eq!(closed.task_class.as_deref(), Some("simple"));
+        assert_eq!(closed.base_sha.as_deref(), Some("0123abcd"));
+        assert_eq!(closed.num_turns, Some(5));
+        assert_eq!(closed.cost_basis.as_deref(), Some("reported"));
+
+        // No cost / duration in the result: keep the node's cost, use wall-clock.
+        let cut = close_attempt_node(
+            &open,
+            AgentExecutionStatus::Interrupted,
+            None,
+            None,
+            None,
+            now,
+        );
+        assert_eq!(cut.cost_usd, 0.7);
+        assert!(cut.duration_secs >= 29.0, "got {}", cut.duration_secs);
+        assert!(cut.report_json.is_none());
+    }
+
+    #[tokio::test]
+    async fn two_attempts_give_two_closed_agent_executions_and_no_running_one() {
+        let g = MockGraphStore::new();
+        let (run_id, task_id) = (Uuid::new_v4(), Uuid::new_v4());
+
+        // Attempt 1 (first pass) fails.
+        let first = open_attempt(run_id, task_id, 1);
+        g.create_agent_execution(&first).await.unwrap();
+        let (status, cost, duration) = attempt_outcome(&TaskResult::Failed {
+            reason: "boom".into(),
+            attempts: 0,
+            cost_usd: 0.2,
+        });
+        g.update_agent_execution(&close_attempt_node(
+            &first,
+            status,
+            cost,
+            duration,
+            None,
+            chrono::Utc::now(),
+        ))
+        .await
+        .unwrap();
+
+        // Attempt 2 (retry) opens its own node and is closed the same way.
+        let second = open_attempt(run_id, task_id, 2);
+        g.create_agent_execution(&second).await.unwrap();
+        assert_eq!(g.list_running_agent_executions().await.unwrap().len(), 1);
+        let (status, cost, duration) = attempt_outcome(&TaskResult::Success {
+            cost_usd: 0.3,
+            duration_secs: 20.0,
+        });
+        g.update_agent_execution(&close_attempt_node(
+            &second,
+            status,
+            cost,
+            duration,
+            None,
+            chrono::Utc::now(),
+        ))
+        .await
+        .unwrap();
+
+        let all = g.get_agent_executions_for_run(run_id).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|ae| ae.completed_at.is_some()));
+        assert!(all
+            .iter()
+            .all(|ae| ae.status != AgentExecutionStatus::Running));
+        assert!(g.list_running_agent_executions().await.unwrap().is_empty());
+
+        let after_first = agent_status(&g, first.id).await;
+        assert_eq!(after_first.attempt, 1);
+        assert_eq!(after_first.status, AgentExecutionStatus::Failed);
+        assert_eq!(after_first.cost_usd, 0.2);
+        let after_second = agent_status(&g, second.id).await;
+        assert_eq!(after_second.attempt, 2);
+        assert_eq!(after_second.status, AgentExecutionStatus::Completed);
+        assert_eq!(after_second.cost_usd, 0.3);
+        assert_eq!(after_second.duration_secs, 20.0);
+    }
+
+    /// VERIFIER (runner level, not only `counts_toward_budget`): a task whose cost
+    /// is covered by a subscription must not consume the run budget, even when its
+    /// notional amount is far above the limit. Drives `execute_task` through the
+    /// real `ChatManager` agent path against the fake provider.
+    #[tokio::test]
+    async fn verifier_a_subscription_cost_does_not_count_toward_the_run_budget() {
+        use crate::chat::config::{ChatConfig, ProviderPath};
+        use crate::chat::manager::ChatManager;
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::meilisearch::traits::SearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::notes::manager::NoteManager;
+        use crate::orchestrator::context::ContextBuilder;
+        use crate::plan::manager::PlanManager;
+        use nexus_claude::agent::{AgentEvent, Cost, CostBasis, StopReason};
+
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
+        let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+        let search: Arc<dyn SearchStore> = Arc::new(MockSearchStore::new());
+        let chat_config = ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: std::path::PathBuf::from("/dev/null"),
+            default_model: "test".into(),
+            max_sessions: 4,
+            session_timeout: std::time::Duration::from_secs(30),
+            neo4j_uri: "bolt://mock:7687".into(),
+            neo4j_user: "neo4j".into(),
+            neo4j_password: "test".into(),
+            meilisearch_url: "http://mock:7700".into(),
+            meilisearch_key: "test".into(),
+            nats_url: None,
+            max_turns: 5,
+            permission: Default::default(),
+            auto_continue: false,
+            retry: Default::default(),
+            process_path: None,
+            claude_cli_path: None,
+            auto_update_cli: false,
+            auto_update_app: false,
+            jwt_secret: None,
+            server_port: 0,
+            session_token_expiry_secs: 3600,
+        };
+        let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
+        let chat_manager = Arc::new(
+            ChatManager::new_without_memory(graph.clone(), search.clone(), chat_config)
+                .with_provider_source(Arc::new(fake.clone())),
+        );
+        let plan_manager = Arc::new(PlanManager::new(graph.clone(), search.clone()));
+        let note_manager = Arc::new(NoteManager::new(graph.clone(), search.clone()));
+        let context_builder = Arc::new(ContextBuilder::new(
+            graph.clone(),
+            search.clone(),
+            plan_manager,
+            note_manager,
+        ));
+        let (event_tx, _) = broadcast::channel(16);
+        let config = RunnerConfig {
+            max_cost_usd: 1.0,
+            ..RunnerConfig::default()
+        };
+        let runner = PlanRunner::new(
+            chat_manager,
+            graph.clone(),
+            context_builder,
+            config,
+            event_tx,
+        );
+
+        let plan = crate::test_helpers::test_plan();
+        graph.create_plan(&plan).await.unwrap();
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan.id, &task).await.unwrap();
+        let run_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = Some(RunnerState::new(run_id, plan.id, 1, TriggerSource::Manual));
+        }
+
+        // The provider ends the turn with a 5 USD NOTIONAL cost covered by a subscription.
+        let pusher = fake.clone();
+        tokio::spawn(async move {
+            while pusher.state.turns_started.lock().unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            // let the runner subscribe to the session's events
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            pusher.state.push(AgentEvent::Done {
+                stop_reason: StopReason::Completed,
+                subtype: Some("success".into()),
+                is_error: false,
+                result_text: Some("done".into()),
+                usage: Default::default(),
+                cost: Cost {
+                    usd: Some(5.0),
+                    basis: CostBasis::Subscription,
+                },
+                duration_ms: 5,
+                duration_api_ms: None,
+                num_turns: 1,
+                model: Some("m".into()),
+                provider_session_id: Some("p-1".into()),
+                structured_output: None,
+                error: None,
+            });
+        });
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = runner
+            .execute_task(
+                run_id,
+                plan.id,
+                task.id,
+                "verifier task",
+                tmp.path().to_str().unwrap(),
+                None,
+                None,
+                "",
+                1,
+            )
+            .await
+            .expect("the task executes");
+
+        let spent = RUNNER_STATE
+            .read()
+            .await
+            .as_ref()
+            .map(|s| s.cost_usd)
+            .unwrap_or(-1.0);
+        reset_globals().await;
+        assert_eq!(
+            spent, 0.0,
+            "a subscription cost must not be charged to the budget"
+        );
+        assert!(
+            !matches!(out.result, TaskResult::BudgetExceeded { .. }),
+            "a subscription cost must not exhaust a 1 USD budget: {:?}",
+            out.result
+        );
+    }
+
+    #[tokio::test]
+    async fn listen_for_result_reports_turns_and_whether_a_cost_was_reported() {
+        let runner = test_plan_runner();
+
+        let (tx, rx) = broadcast::channel::<ChatEvent>(16);
+        tx.send(ChatEvent::Result {
+            session_id: "s1".into(),
+            duration_ms: 1,
+            cost_usd: Some(0.05),
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: Some(3),
+            result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
+        })
+        .unwrap();
+        let (_r, metrics) = runner.listen_for_result(rx, Uuid::new_v4(), None).await;
+        assert_eq!(metrics.num_turns, Some(3));
+        assert!(metrics.cost_reported);
+
+        let (tx, rx) = broadcast::channel::<ChatEvent>(16);
+        tx.send(ChatEvent::Result {
+            session_id: "s2".into(),
+            duration_ms: 1,
+            cost_usd: None,
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: None,
+            result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
+        })
+        .unwrap();
+        let (_r, metrics) = runner.listen_for_result(rx, Uuid::new_v4(), None).await;
+        assert_eq!(metrics.num_turns, None);
+        assert!(!metrics.cost_reported);
     }
 
     #[tokio::test]

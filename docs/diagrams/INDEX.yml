@@ -38,13 +38,42 @@ diagrams:
     status: verified
     file: docs/diagrams/po-chat-manager.mmd
     covers:
-      - "backend:src/chat/{mod,manager,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments,pending_queue}.rs"
+      - "backend:src/chat/{mod,manager,cost,agent_e2e_tests,tree,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments,pending_queue}.rs"
+  - name: po-spawn-envelope
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-spawn-envelope.mmd
+    # Arbitrage : auth/middleware.rs reste a po-api ; ici le jeton de session lie
+    # (jwt.rs, agent_tokens.rs) et l'enveloppe d'une session enfant (chat/envelope.rs).
+    covers:
+      - "backend:src/chat/envelope.rs"
+      - "backend:src/auth/{agent_tokens,jwt,tool_profile}.rs"
+  - name: po-chat-agent-runtime
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-chat-agent-runtime.mmd
+    covers:
+      - "backend:src/chat/agent_runtime.rs"
+  - name: po-provider-settings
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-provider-settings.mmd
+    covers:
+      - "backend:src/api/provider_handlers.rs"
+  - name: po-chat-provider
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-chat-provider.mmd
+    # Resolveur backend seulement : le registre des providers et la table de prix sont dans nexus (A1).
+    covers:
+      - "backend:src/chat/provider/**"
   - name: po-chat-transport
     owner: theotime
     status: verified
     file: docs/diagrams/po-chat-transport.mmd
     covers:
       - "backend:src/api/ws_chat_handler.rs"
+      - "backend:src/chat/wire_contract.rs"
   - name: po-p2p-transport
     owner: theotime
     status: planned

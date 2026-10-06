@@ -30,11 +30,13 @@ impl PermissionConfig {
     /// Convert the string mode to the Nexus SDK `PermissionMode` enum.
     /// Falls back to `Default` for unknown values (safe-by-default).
     pub fn to_nexus_mode(&self) -> PermissionMode {
+        // Legacy Claude strings AND the neutral names of the agent contract
+        // (decision A43): `ask`, `auto_edits`, `plan_only`, `trust`.
         match self.mode.as_str() {
-            "default" => PermissionMode::Default,
-            "acceptEdits" => PermissionMode::AcceptEdits,
-            "plan" => PermissionMode::Plan,
-            "bypassPermissions" => PermissionMode::BypassPermissions,
+            "default" | "ask" | "manual" | "dontAsk" => PermissionMode::Default,
+            "acceptEdits" | "auto_edits" | "auto" => PermissionMode::AcceptEdits,
+            "plan" | "plan_only" => PermissionMode::Plan,
+            "bypassPermissions" | "trust" => PermissionMode::BypassPermissions,
             _ => {
                 tracing::warn!(
                     mode = %self.mode,
@@ -45,9 +47,23 @@ impl PermissionConfig {
         }
     }
 
-    /// List of valid permission mode strings.
+    /// Accepted permission mode strings: the Claude strings the API always
+    /// took, plus the neutral names of the agent contract (A43). The legacy
+    /// `auto`, `dontAsk` and `manual` are accepted too (Claude Code knows them).
     pub fn valid_modes() -> &'static [&'static str] {
-        &["default", "acceptEdits", "plan", "bypassPermissions"]
+        &[
+            "default",
+            "acceptEdits",
+            "plan",
+            "bypassPermissions",
+            "auto",
+            "dontAsk",
+            "manual",
+            "ask",
+            "auto_edits",
+            "plan_only",
+            "trust",
+        ]
     }
 
     /// Check if the given mode string is valid.
@@ -138,6 +154,9 @@ impl RetryConfig {
 /// Configuration for the chat system
 #[derive(Debug, Clone)]
 pub struct ChatConfig {
+    /// Which engine drives a session: the historical Claude Code client
+    /// (`legacy`, default) or the provider-neutral `AgentSession` (`agent`).
+    pub provider_path: ProviderPath,
     /// Path to the MCP server binary
     pub mcp_server_path: PathBuf,
     /// Default model to use when not specified in request
@@ -184,12 +203,55 @@ pub struct ChatConfig {
     pub session_token_expiry_secs: u64,
 }
 
+/// Environment variable selecting the [`ProviderPath`].
+pub const PROVIDER_PATH_VAR: &str = "CHAT_PROVIDER_PATH";
+
+/// Engine that drives Claude Code sessions (decision A18 / task B38).
+///
+/// Routing is HYBRID: Claude Code stays on the historical engine (hooks, message
+/// queue, auto-continue, retry, compaction, NATS, images) by default, and every
+/// third-party provider is served by the agent engine whatever this says.
+/// `Agent` only FORCES Claude Code onto the agent engine, to try it: the session
+/// then says what it lost (`system_init.degraded_features`) and the server logs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProviderPath {
+    /// The historical path: `InteractiveClient` straight on the Claude CLI.
+    #[default]
+    Legacy,
+    /// The provider-neutral path: an `AgentSession` from the nexus registry.
+    Agent,
+}
+
+impl ProviderPath {
+    /// `legacy` or `agent` (case-insensitive). Anything else, or nothing, is
+    /// `legacy`: a typo must never switch the engine.
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("agent") => Self::Agent,
+            Some("legacy") | None => Self::Legacy,
+            Some(other) => {
+                tracing::warn!(value = other, "unknown CHAT_PROVIDER_PATH, using legacy");
+                Self::Legacy
+            }
+        }
+    }
+
+    /// Stable name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Agent => "agent",
+        }
+    }
+}
+
 impl ChatConfig {
     /// Create config from environment, auto-detecting the mcp_server binary path
     pub fn from_env() -> Self {
         let mcp_server_path = Self::detect_mcp_server_path();
 
         Self {
+            provider_path: ProviderPath::parse(std::env::var(PROVIDER_PATH_VAR).ok().as_deref()),
             mcp_server_path,
             default_model: std::env::var("CHAT_DEFAULT_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-5".into()),
@@ -301,8 +363,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provider_path_defaults_to_legacy_and_a_typo_never_switches() {
+        assert_eq!(ProviderPath::parse(None), ProviderPath::Legacy);
+        assert_eq!(ProviderPath::parse(Some("legacy")), ProviderPath::Legacy);
+        assert_eq!(ProviderPath::parse(Some(" AGENT ")), ProviderPath::Agent);
+        assert_eq!(ProviderPath::parse(Some("agnet")), ProviderPath::Legacy);
+        assert_eq!(ProviderPath::default().as_str(), "legacy");
+    }
+
+    #[test]
     fn test_default_config() {
         let config = ChatConfig {
+            provider_path: Default::default(),
             mcp_server_path: PathBuf::from("/usr/bin/mcp_server"),
             default_model: "claude-sonnet-4-6".into(),
             max_sessions: 10,
@@ -523,6 +595,51 @@ mod tests {
         assert!(!PermissionConfig::is_valid_mode("unknown"));
         assert!(!PermissionConfig::is_valid_mode(""));
         assert!(!PermissionConfig::is_valid_mode("Default")); // case-sensitive
+    }
+
+    #[test]
+    fn neutral_mode_names_are_accepted_next_to_the_legacy_strings() {
+        // Decision A43: the API accepts both forms.
+        for (neutral, legacy, expected) in [
+            ("ask", "default", PermissionMode::Default),
+            ("auto_edits", "acceptEdits", PermissionMode::AcceptEdits),
+            ("plan_only", "plan", PermissionMode::Plan),
+            (
+                "trust",
+                "bypassPermissions",
+                PermissionMode::BypassPermissions,
+            ),
+        ] {
+            assert!(PermissionConfig::is_valid_mode(neutral), "{neutral}");
+            let as_neutral = PermissionConfig {
+                mode: neutral.into(),
+                ..Default::default()
+            };
+            let as_legacy = PermissionConfig {
+                mode: legacy.into(),
+                ..Default::default()
+            };
+            assert_eq!(as_neutral.to_nexus_mode(), expected, "{neutral}");
+            assert_eq!(as_legacy.to_nexus_mode(), expected, "{legacy}");
+        }
+        // The other legacy strings Claude Code knows are accepted too, and
+        // never widen the policy beyond what they mean.
+        assert_eq!(
+            PermissionConfig {
+                mode: "dontAsk".into(),
+                ..Default::default()
+            }
+            .to_nexus_mode(),
+            PermissionMode::Default
+        );
+        assert_eq!(
+            PermissionConfig {
+                mode: "auto".into(),
+                ..Default::default()
+            }
+            .to_nexus_mode(),
+            PermissionMode::AcceptEdits
+        );
     }
 
     #[test]

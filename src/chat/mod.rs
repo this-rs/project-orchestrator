@@ -14,8 +14,13 @@ pub mod continuity;
 pub mod control_pump;
 pub(crate) mod drain;
 
+#[cfg(test)]
+mod agent_e2e_tests;
+pub mod agent_runtime;
+pub mod cost;
 pub mod enrichment;
 pub mod entity_extractor;
+pub mod envelope;
 pub mod feedback;
 pub(crate) mod hook_ledger;
 pub mod manager;
@@ -29,12 +34,16 @@ pub(crate) mod post_stream;
 pub(crate) mod post_tool_hook;
 pub mod prompt;
 pub mod prompt_sections;
+pub mod provider;
 pub mod routing;
 pub(crate) mod skill_hook;
 pub mod stages;
+pub mod tree;
 pub mod types;
 pub mod viz;
 pub mod viz_builder;
+#[cfg(test)]
+mod wire_contract;
 
 pub use config::{ChatConfig, PermissionConfig};
 pub use entity_extractor::{

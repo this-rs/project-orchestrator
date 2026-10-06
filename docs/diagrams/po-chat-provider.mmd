@@ -1,0 +1,106 @@
+%% name: po-chat-provider
+%% covers: backend:src/chat/provider/**
+%% verified: 878281ca
+%% ---
+%% PROUVE : le RÉSOLVEUR backend de provider (décisions A1, A16, A18, A29, A43) : quel
+%%   provider/modèle pour une demande, comment une erreur d'ouverture devient un statut HTTP
+%%   et un code, comment les modes de permission neutres cohabitent avec les chaînes héritées.
+%%   Le registre des providers et la table de prix sont dans nexus (A1) : rien de cela ici.
+%% ---
+%% SOURCES LUES :
+%%   src/chat/provider/resolver.rs — Role, RoutedBy, Candidate, ResolveInput, InstanceCatalog,
+%%                                   ResolveError, resolve
+%%   src/chat/provider/endpoint_guard.rs — validate_url, classify_ip, validate_resolved, validate_endpoint_with, origin_of, refuse_redirect, redact_error_body
+%%   src/chat/provider/settings.rs — InstanceDraft, InstanceRecord, ConsentRecord, RoleAssignments, ModelAlias, ModelPolicy, parse_credential_ref ; src/api/provider_handlers.rs
+%%   src/chat/provider/{catalog,store,native_factory}.rs — StoreCatalog, resolve_input, lectures LlmSetting, build_native_provider
+%%   src/chat/provider/errors.rs   — OpenFailure, open_failure, resolve_failure, classify_open_error (ProviderError et ResolveError)
+%%   src/chat/provider/event_map.rs — EventMapper, out_of_band_to_chat_events ; listing.rs — ProviderListing, assemble
+%%   src/chat/provider/credentials.rs — VaultCredentialResolver ; src/vault/service.rs — read_for_provider
+%%   src/chat/provider/policy.rs   — parse_mode, to_legacy, neutral_name, legacy_name,
+%%                                   tool_policy, wire_tool_policy
+%%   nexus_claude::agent           — ProviderError, PolicyMode, ToolPolicy (contrat nexus)
+%% ---
+%% NON ETABLI :
+%%   tool_policy / VaultCredentialResolver / EventMapper / endpoint_guard n'ont AUCUN appelant de
+%%   production (tâches B13a, B32, B33, B25) ; open_failure, resolve_for_open (BuiltinCatalog) et
+%%   listing sont branchés ; InstanceCatalog n'a pas d'autre implémentation que BuiltinCatalog
+%%   (attend le registre nexus + B25).
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans test / décidé non écrit
+%%   🔴 défaut constaté (raison dans le nœud)  ⚪ amont ou autre domaine
+
+flowchart TD
+    subgraph legend["Légende"]
+        direction LR
+        L1["✅ vérifié par test"]
+        L2["🟠 écrit, non branché"]
+        L3["⚪ autre domaine"]
+    end
+
+    NEXUS["⚪ nexus_claude::agent — ProviderRegistry (à venir), ProviderError,<br/>PolicyMode, ToolPolicy, Capabilities (docs/agent-contract.md)"]
+
+    subgraph resolver["resolver.rs — resolve(ResolveInput, InstanceCatalog)"]
+        SESSION{"✅ session existante ?"}
+        FROZEN["✅ provider de la session, routed_by = session, jamais re-résolu<br/>requête nommant un AUTRE provider → provider_conflict (409)<br/>test : session_wins_over_every_level_and_is_never_re_resolved"]
+        LEVELS["✅ premier niveau présent :<br/>requête &gt; tâche &gt; persona &gt; run &gt; règle projet &gt; règle globale &gt; défaut configuré<br/>test : level_*_wins_* (7 tests)"]
+        EXPLICIT["✅ choix explicite (requête, tâche, persona) jamais substitué :<br/>inconnu → provider_unknown, interdit → endpoint_not_allowed,<br/>malsain → provider_unavailable<br/>test : explicit_choice_is_never_substituted"]
+        PILOT["✅ rôle pilot : aucune bascule, à aucun niveau<br/>test : pilot_never_falls_back_at_any_level"]
+        EXEC["✅ rôle executor : un niveau non explicite malsain ou interdit passe au suivant,<br/>routed_by = fallback ; jamais vers une instance interdite<br/>test : executor_falls_back_to_the_next_level_and_records_it,<br/>executor_fallback_skips_a_not_allowed_instance"]
+        BUILTIN["✅ rien de configuré : claude-code s'il existe, est sain et autorisé<br/>(routed_by = claude_code), sinon no_provider<br/>test : builtin_claude_code_when_nothing_is_configured"]
+        SESSION -- oui --> FROZEN
+        SESSION -- non --> LEVELS
+        LEVELS --> EXPLICIT
+        LEVELS --> PILOT
+        LEVELS --> EXEC
+        LEVELS -- "aucun niveau" --> BUILTIN
+        EXEC -- "chaîne épuisée" --> BUILTIN
+    end
+
+    OPENRES["✅ resolve_for_open(stocké, session existante ?, demandé, catalogue) : le chemin d'ouverture d'une session pilote ;<br/>BuiltinCatalog = seule instance claude-code (registre nexus pas encore branché) ;<br/>appelé par ChatManager::create_session / resume_session / check_provider_binding<br/>test : open_without_any_choice_is_claude_code, open_names_an_unregistered_provider_is_unknown,<br/>an_existing_legacy_session_is_claude_code_and_frozen, naming_claude_code_explicitly_is_a_request_choice"]
+    OPENRES --> SESSION
+    GUARD["✅ endpoint_guard.rs (A36, B29) : validate_url (https hors boucle locale, http seulement vers un littéral loopback,<br/>jamais d'identifiants dans l'URL, hôte exigé — contrôle sur le texte brut : https:///v1 n'est pas l'hôte v1) ;<br/>classify_ip (privé, lien-local, métadonnées cloud, IPv4 mappée en IPv6) ; validate_resolved : TOUTES les adresses publiques (rebinding) ;<br/>refuse_redirect (3xx refusé) ; redact_error_body ; origin_of = identité du consentement (A28)<br/>test : 39 tests de endpoint_guard (validate_url_refuses_missing_host_and_garbage, validate_url_refuses_other_schemes, ...)<br/>🟠 aucun appelant de production : le CRUD d'instances (B25) et la sonde (B28) l'appelleront"]
+    subgraph settings["settings.rs + api/provider_handlers.rs — instances, consentement, rôles, alias, politique"]
+        SETTINGS["✅ instances (POST/PUT|PATCH/DELETE /api/chat/providers, POST .../test, GET .../{id}/status|models), consentement par projet<br/>(GET/PUT/DELETE /api/projects/{slug}/llm-consent[s][/{provider_id}]), rôles pilote/exécutant (GET/PUT /api/chat/roles et /llm-roles),<br/>alias (GET/PUT /api/chat/model-aliases), politique de modèle (GET/PUT /api/chat/model-policy, livrée `off`) ; stockage = documents JSON<br/>LlmSetting (scope, clé) dans Neo4j<br/>aucun secret : `credential_ref` = none | vault:&lt;nom&gt; | env:&lt;VAR&gt; (variables secrètes du serveur refusées), tout autre champ (api_key…) refusé, une valeur collée n'est jamais renvoyée ;<br/>URL via endpoint_guard (https, pas d'identifiants, pas d'adresse privée/métadonnées, DNS) ; claude-code intégré : ni modifiable ni supprimable (403) ;<br/>consentement lié à l'ORIGINE : PUT refusé (409 origin_mismatch) si l'origine montrée n'est plus celle de l'instance, un changement d'URL d'origine différente<br/>laisse le consentement stocké mais valid=false ; porte sécurité (A32) : création refusée (409 security_gate_closed) sans authentification ;<br/>mutations réservées à un jeton humain (middleware + require_human)<br/>test : an_instance_is_created_listed_and_never_carries_a_secret, a_secret_in_a_body_or_a_forbidden_endpoint_is_refused,<br/>the_test_route_always_answers_200_with_a_verdict, consent_is_bound_to_the_origin_and_stops_holding_when_it_changes,<br/>roles_aliases_and_policy_round_trip_and_are_validated + 8 tests de settings.rs<br/>🟠 Cypher LlmSetting exécuté seulement contre le Neo4j jetable des tests (tests/harness_neo4j.rs), jamais contre une base vivante"]
+    end
+    subgraph live["catalog.rs, store.rs, native_factory.rs — une instance ENREGISTRÉE ouvre une session (chemin agent)"]
+        LIVE["✅ StoreCatalog (InstanceCatalog) bâti de ce qui est stocké : instances, consentement du projet (compte seulement s'il porte l'origine COURANTE,<br/>et seulement avec un projet), rôles projet avant globaux → règle projet / règle globale, alias → (instance, modèle) ;<br/>resolve_provider_choice (ChatManager) tranche AVANT toute persistance ; moteur legacy + autre instance → 503 provider_unavailable ;<br/>un autre provider ne reçoit jamais le modèle par défaut de Claude (le sien, ou refus)<br/>native_factory : instance → NativeProvider (nexus) sur OpenAiEndpoint, identifiants = RÉFÉRENCE lue par VaultCredentialResolver<br/>(read_for_provider sous grant ; vault verrouillé → credentials_locked 423, jamais de repli ; sans vault : env: seulement)<br/>authorize_provider_use avant provider.open (et à la reprise) : porte sécurité (pas de jwt_secret → 422 unsupported), consentement lié à l'origine (403),<br/>garde d'endpoint B29 avant toute connexion (403), Trust refusé sans sandbox (422), profil d'outils RESTREINT signé dans le jeton, journal d'envoi<br/>(qui, projet, origine, modèle ; jamais le contenu ; échec d'écriture = refus)<br/>test : agent_e2e_tests.rs contre fake_openai + fake_mcp de nexus : a_registered_instance_opens_a_native_session_and_streams_a_turn,<br/>without_consent_nothing_reaches_the_endpoint, a_consent_for_another_origin_does_not_hold, the_endpoint_guard_runs_before_any_connection,<br/>trust_is_refused_for_a_provider_without_a_sandbox, a_third_party_is_refused_while_authentication_is_off, a_locked_vault_is_credentials_locked_and_never_falls_back,<br/>the_key_is_read_under_a_grant_for_that_instance_and_sent_as_a_header, a_pilot_role_routes_a_project_to_the_instance_and_consent_still_applies,<br/>the_legacy_engine_cannot_open_a_registered_instance + 4 tests de catalog.rs<br/><br/>niveaux A16 lus : requête > tâche (alias de tâche) > run (provider/model du POST /plans/{id}/run) > règle projet > règle globale ; politique de modèle :<br/>off = invisible, enforce = le candidat de la règle (chat | runner.simple|complex|creative|retry) prend la place de la règle globale (route_rule enregistrée),<br/>shadow = rien n'est appliqué, le choix qu'elle AURAIT fait est enregistré (shadow_provider/shadow_model, note routing:&lt;session&gt;) ; le runner recopie provider, routed_by,<br/>alias, route_rule, shadow, modèle EFFECTIF, tokens et base de coût dans l'AgentExecution ; un run sur un tiers ne reçoit jamais Trust (ask) ;<br/>session_tree : provider_id, model, cost_usd, subtree_cost_usd (somme SEULEMENT si tous connus), max_depth/max_children sur la racine (chat/tree.rs)<br/>test : an_enforced_policy_routes_the_chat_to_the_instance_and_records_the_rule, a_shadow_policy_changes_nothing_and_only_records_what_it_would_have_done,<br/>an_off_policy_is_invisible, the_policy_is_off_shadow_or_enforce, the_task_alias_beats_the_run_which_beats_the_project_rule, 3 tests de tree.rs<br/><br/>codex / acp (nexus provider-codex, provider-acp, épingle 0f8fc13) : POST /api/chat/providers accepte kind codex|acp derrière la même porte A32 ; AUCUNE ligne de commande dans un corps d'API (deny_unknown_fields) : codex lance `codex` du PATH du serveur, acp nomme par `preset` une commande DÉCLARÉE sur le serveur (CHAT_PROVIDER_ACP_COMMANDS, JSON, vide par défaut) ; identité du consentement = process:codex / process:acp:&lt;preset&gt; (pas d'URL, pas de garde d'endpoint) ; le test de connexion = health du processus ; ce qu'un kind refuse n'est pas envoyé (ACP : pas de prompt système ni de dossiers, Codex/ACP : pas de max_turns)<br/>test : codex_and_acp_instances_have_a_process_identity_and_never_a_command_line, codex_and_acp_instances_are_built_without_any_command_from_the_record, a_codex_instance_is_created_behind_the_gate_with_a_process_identity<br/>🟠 ÉCART ASSUMÉ (A1) : le backend ne consomme PAS nexus ProviderRegistry (ef0c0f4) : il garde StoreCatalog + native_factory (stockage Neo4j, consentement, cache invalidé au changement) et construit les providers par kind ; nexus SecurityGate::attest n'est pas appelé, la porte du backend = authentification active ; migrer vers le registre = tâche séparée (une seule source de vérité des instances)<br/>🟠 Codex n'a jamais tourné contre un vrai app-server (0.38.0 installé sans app-server) ; ACP : faux agent seulement<br/>fallback_reason : un exécutant qui retombe (routed_by = fallback) enregistre le code du PREMIER refus (provider_unavailable, endpoint_not_allowed…), recopié dans l'AgentExecution ; GET /api/chat/providers/{id}/status = santé RÉELLE d'une instance enregistrée (le listing la laisse « unknown » pour ne pas sonder N instances à chaque affichage) ; GET /api/chat/send-journal = journal d'envoi (qui, projet, origine, modèle ; jamais le contenu), humain seulement, filtre project_slug, récent d'abord<br/>test : executor_falls_back_to_the_next_level_and_records_it, the_send_journal_is_readable_by_a_person_only_filtered_and_newest_first, a_saved_instances_status_is_its_real_health_not_unknown<br/>credential_ref : `env:` REFUSÉ sauf variable déclarée dans CHAT_PROVIDER_ENV_CREDENTIALS (vide par défaut, jamais un secret du serveur) ; le consentement est lié à l ORIGINE ET à la référence d identifiant (changer l une ou l autre l invalide) ; le test de connexion avec identifiant exige une instance déjà enregistrée, même origine, même référence<br/>test : env_credentials_are_refused_unless_declared, changing_the_credential_reference_invalidates_the_consent_too, changing_the_credential_reference_after_consent_stops_the_sending, an_env_credential_is_refused_unless_the_variable_is_declared<br/>B28 : POST /api/chat/providers/test sonde pour de vrai (native_factory::probe_instance : health, liste des modèles, appel d'outil `ping`, fenêtre) → {ok, health{state,code}, models, probe{tools, context_window}} ; vault verrouillé → auth_required/credentials_locked sans connexion ;<br/>modèle sans outils → ok=false, code model_no_tools ; test : the_connection_test_really_probes_a_tool_call_and_reads_the_window, a_model_that_cannot_call_tools_is_reported_not_swallowed, a_probe_with_a_locked_vault_is_credentials_locked, the_test_route_always_answers_200_with_a_verdict<br/>🟠 le préflight n'est pas rejoué à CHAQUE ouverture par le backend (NativeProvider sonde et refuse ModelNoTools à l'open, sonde mise en cache avec le provider) ; fenêtre vs schémas MCP non vérifiée ; jamais contre un vrai endpoint ni https ; le health des instances n'est pas sondé (toutes saines pour le résolveur) ; règle runner.* : la classe vient de task_profile.complexity (valeurs non vérifiées contre simple|complex|creative) ; fallback_reason non enregistré"]
+    end
+    CATALOG["🟠 InstanceCatalog (exists, is_healthy, is_allowed_for_project) :<br/>trait seulement — implémentation avec le registre nexus et le consentement (B25, B3)"]
+    CATALOG --> LEVELS
+    NEXUS -.-> CATALOG
+
+    subgraph errors["errors.rs — erreurs d'ouverture typées"]
+        OPEN["✅ open_failure(ProviderError) → OpenFailure {status, code, message, provider_id, action,<br/>retryable, retry_after_ms}<br/>cli_not_found 424, auth_required 424 (+ commande de login), credentials_locked 423,<br/>unauthorized 502 (jamais 401), endpoint_unreachable 502, model_no_tools 422,<br/>context_too_small 422, rate_limited 429, overloaded 503, timeout 504,<br/>process_exited 502, protocol 502, unsupported 422, turn_in_progress 409,<br/>invalid_request 400, closed 410 ; variante inconnue → 502 provider_error<br/>aucun détail interne dans le message<br/>test : un par code (17 tests)"]
+        RFAIL["✅ resolve_failure(ResolveError) → provider_conflict 409, provider_unknown 404,<br/>endpoint_not_allowed 403, provider_unavailable 503, no_provider 409<br/>test : un par code (5 tests)"]
+    end
+    NEXUS -.-> OPEN
+    FROZEN -.-> RFAIL
+    EXPLICIT -.-> RFAIL
+
+    subgraph policy["policy.rs — modes neutres EN PLUS des chaînes héritées"]
+        PARSE["✅ parse_mode : default, acceptEdits, plan, bypassPermissions, auto, dontAsk, manual<br/>+ ask, auto_edits, plan_only, trust ; inconnu → None<br/>test : the_eleven_values_parse_and_round_trip"]
+        LEGACY["✅ to_legacy : une chaîne héritée reste elle-même (auto, dontAsk, manual non aplaties),<br/>une neutre devient sa correspondante Claude<br/>test : to_legacy_keeps_legacy_strings_and_maps_neutral_ones"]
+        TP["✅ tool_policy(mode, allowed, disallowed) → ToolPolicy nexus (native_mode = chaîne héritée) ;<br/>wire_tool_policy = forme JSON de system_init.tool_policy<br/>test : tool_policy_decides_allow_and_deny_as_configured, deny_still_wins_in_trust_mode"]
+        PARSE --> LEGACY
+        PARSE --> TP
+    end
+    NEXUS -.-> TP
+
+    WIRED["✅ branché sur le chemin actuel (Claude Code) : ChatManager enveloppe les erreurs SDK d'ouverture<br/>par sdk_open_error (ProviderError dans la chaîne anyhow) ; chat_handlers::create_session →<br/>AppError::from_open_error → AppError::Provider(OpenFailure) : statut + code + provider_id<br/>un CLI absent répond 424 cli_not_found au lieu d'un 500 muet<br/>test : a_missing_cli_answers_424_with_a_code_instead_of_a_mute_500,<br/>a_missing_cli_is_cli_not_found_424_not_a_mute_500<br/>🟠 le chemin WebSocket (reprise par message) n'émet pas encore le code"]
+    OPEN --> WIRED
+    subgraph evmap["event_map.rs — AgentEvent → ChatEvent (agent-contract §14)"]
+        EVMAP["✅ EventMapper::map (tour) et out_of_band_to_chat_events (hors tour, regroupés par seq → background_output) ;<br/>tool_call incomplet puis complet → tool_use puis tool_use_input_resolved ; Done sans subtype → sous-type hérité ;<br/>coût inconnu → cost_usd null (jamais 0) ; processus mort → session_error ; autres erreurs : texte écrit dans errors.rs<br/>(aucune URL ni identifiant) ; événement inconnu → rien<br/>test : replay_gives_the_same_chat_events_as_the_legacy_path (21 messages : map_message puis EventMapper == message_to_events),<br/>an_announced_tool_call_completes_as_input_resolved, a_dead_process_is_a_session_error_and_other_failures_leak_nothing,<br/>out_of_turn_messages_regroup_by_message_number<br/>🟠 aucun appelant de production (ChatManager sur AgentSession : tranche suivante)"]
+    end
+    NEXUS -.-> EVMAP
+    subgraph listing["listing.rs — GET /api/chat/providers (A42)"]
+        LIST["✅ ProviderListing {default_provider, providers[{id, kind, label, builtin, is_default, allowed_for_project, endpoint_origin,<br/>credential (référence seule), health{state, code, action, checked_at}, models[{id, alias, capabilities}]}]} ;<br/>health nexus → ok | auth_required | unreachable | cli_not_found | unknown (aucun chemin ni détail) ;<br/>l'instance claude-code est intégrée, première, consentie ; défaut inexistant ignoré<br/>test : the_listing_body_has_the_documented_field_names, health_maps_to_the_frontend_states,<br/>providers_lists_the_builtin_instance_with_the_documented_fields (HTTP), providers_answers_null_consent_without_a_project (HTTP)<br/>🟠 seule l'instance intégrée est listée : le CRUD d'instances (B25) n'existe pas encore"]
+    end
+    subgraph creds["credentials.rs — VaultCredentialResolver (CredentialResolver nexus)"]
+        CRED["✅ vault:&lt;nom&gt; → VaultService::read_for_provider sous grant Provider(instance) ;<br/>vault verrouillé → credentials_locked (pas de repli) ; pas de grant → auth_required + quoi faire ;<br/>env:&lt;VAR&gt; lu du serveur et enregistré au masqueur, SERVER_ONLY_SECRETS refusés ; none → aucun<br/>test : a_locked_vault_is_credentials_locked_never_no_credential,<br/>the_servers_own_secrets_cannot_be_used_as_a_provider_credential,<br/>the_server_reads_a_provider_key_only_under_a_provider_grant_for_that_instance (vault)"]
+    end
+    NEXUS -.-> CRED
+    TODO["🟠 non branché : create_session / resume_session / runner n'appellent pas encore resolve ;<br/>system_init ne porte pas tool_policy ; VaultCredentialResolver n'est passé à aucun registre"]
+    BUILTIN -.-> TODO
+    OPEN -.-> TODO
+    TP -.-> TODO

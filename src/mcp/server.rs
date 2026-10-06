@@ -7,6 +7,7 @@ use super::handlers::ToolHandler;
 use super::http_client::McpHttpClient;
 use super::protocol::*;
 use super::tools::all_tools;
+use crate::auth::tool_profile::ToolProfile;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -20,15 +21,20 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct McpServer {
     tool_handler: ToolHandler,
     initialized: bool,
+    /// Which tools this session sees — read from its signed token. This shapes
+    /// the list and refuses calls early; the boundary is the REST middleware.
+    tool_profile: ToolProfile,
 }
 
 impl McpServer {
     /// Create a new MCP server that proxies all tool calls to the REST API.
     pub fn new(http_client: McpHttpClient) -> Self {
+        let tool_profile = http_client.tool_profile();
         let tool_handler = ToolHandler::new(http_client);
         Self {
             tool_handler,
             initialized: false,
+            tool_profile,
         }
     }
 
@@ -181,7 +187,7 @@ impl McpServer {
             return Err(JsonRpcError::invalid_request("Server not initialized"));
         }
 
-        let tools = all_tools();
+        let tools = self.tool_profile.filter_tools(all_tools());
         let result = ToolsListResult { tools };
 
         serde_json::to_value(result).map_err(|e| JsonRpcError::internal_error(e.to_string()))
@@ -203,6 +209,12 @@ impl McpServer {
         info!("Tool call: {}", params.name);
         debug!("Arguments: {:?}", params.arguments);
 
+        if let Some(refusal) = profile_refusal(self.tool_profile, &params) {
+            warn!("Tool call refused by profile: {}", params.name);
+            return serde_json::to_value(ToolCallResult::error(refusal))
+                .map_err(|e| JsonRpcError::internal_error(e.to_string()));
+        }
+
         let result = self
             .tool_handler
             .handle(&params.name, params.arguments)
@@ -220,6 +232,28 @@ impl McpServer {
     }
 }
 
+/// Why this call is outside the session's tool profile, if it is. Refusal by
+/// default: a withheld tool, or a withheld action of a tool that stays.
+fn profile_refusal(profile: ToolProfile, params: &ToolCallParams) -> Option<String> {
+    let action = params
+        .arguments
+        .as_ref()
+        .and_then(|a| a.get("action"))
+        .and_then(|a| a.as_str());
+    let allowed = match action {
+        Some(action) => profile.allows_action(&params.name, action),
+        None => profile.allows_tool(&params.name),
+    };
+    (!allowed).then(|| {
+        format!(
+            "tool_not_in_profile: {}{} is not available to this session (tool profile: {})",
+            params.name,
+            action.map(|a| format!(".{a}")).unwrap_or_default(),
+            profile.name()
+        )
+    })
+}
+
 /// Extension trait for pipe operator
 trait Pipe: Sized {
     fn pipe<F, R>(self, f: F) -> R
@@ -235,6 +269,47 @@ impl<T> Pipe for T {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn call(name: &str, action: Option<&str>) -> ToolCallParams {
+        let arguments = action.map(|a| json!({ "action": a }));
+        serde_json::from_value(json!({ "name": name, "arguments": arguments })).unwrap()
+    }
+
+    #[test]
+    fn a_restricted_session_is_refused_the_withheld_calls() {
+        let r = ToolProfile::Restricted;
+        for (tool, action) in [
+            ("plan", Some("run")),
+            ("plan", Some("delegate_task")),
+            ("chat", Some("send_message")),
+            ("admin", Some("sync_directory")),
+            ("admin", None),
+        ] {
+            let refusal = profile_refusal(r, &call(tool, action));
+            assert!(
+                refusal
+                    .as_deref()
+                    .is_some_and(|m| m.starts_with("tool_not_in_profile")),
+                "{tool} {action:?} must be refused, got {refusal:?}"
+            );
+        }
+        assert_eq!(profile_refusal(r, &call("plan", Some("get"))), None);
+        assert_eq!(profile_refusal(r, &call("note", Some("create"))), None);
+    }
+
+    #[test]
+    fn the_full_profile_refuses_nothing() {
+        for (tool, action) in [
+            ("plan", Some("run")),
+            ("admin", None),
+            ("chat", Some("send_message")),
+        ] {
+            assert_eq!(
+                profile_refusal(ToolProfile::Full, &call(tool, action)),
+                None
+            );
+        }
+    }
 
     #[test]
     fn test_parse_initialize_request() {

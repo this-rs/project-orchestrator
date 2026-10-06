@@ -58,13 +58,116 @@ pub async fn require_auth(
         AppError::Unauthorized("Invalid or expired token".to_string())
     })?;
 
-    // 4. Email allowlist, MCP-token revocation, vault-token path scope.
+    // 4. Email allowlist, MCP-token revocation, agent-token liveness,
+    //    vault-token path scope.
     enforce_token_policy(&state, auth_config, &claims, req.uri().path()).await?;
+
+    // 4b. An agent's session token never reaches the routes that decide what
+    //     agents may do or where a project's content may be sent.
+    if claims.is_agent_session() && is_human_only_mutation(req.method(), req.uri().path()) {
+        return Err(AppError::Forbidden(
+            "this route requires a human session; an agent session token cannot change \
+             providers, consent, roles, model policy or chat permissions"
+                .to_string(),
+        ));
+    }
+
+    // 4c. The session's MCP tool profile is a boundary here, not in the MCP
+    //     subprocess: the routes behind the tools a profile withholds answer
+    //     403 whatever the agent sends (the profile is signed into the token).
+    if let Some(binding) = crate::auth::jwt::agent_session_binding(&claims) {
+        let profile =
+            crate::auth::tool_profile::ToolProfile::from_name(binding.tool_profile.as_deref());
+        if profile.route_forbidden(req.method(), req.uri().path()) {
+            return Err(AppError::Forbidden(format!(
+                "tool_not_in_profile: this route is not available to this session (tool profile: {})",
+                profile.name()
+            )));
+        }
+    }
+
+    // 4d. An agent session token only acts on the sessions IT spawned. Without
+    //     this, any token (even a restricted one) could feed a human's session
+    //     running in bypass, answer for it, stop it or delete it: the profile
+    //     only withholds `POST /api/chat/sessions`, not the routes of a session.
+    //     A boundary on the path, so a route added later is covered too.
+    if let Some(binding) = crate::auth::jwt::agent_session_binding(&claims) {
+        let read = matches!(
+            *req.method(),
+            axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+        );
+        if !read {
+            let path = req.uri().path();
+            // Annotating its OWN session (the entities it discussed, the plans it
+            // works on) is what the MCP tools do all day; nothing else of its own.
+            let own_annotation = chat_session_target(path) == Some(binding.session_id.as_str())
+                && (path.ends_with("/discussed") || path.ends_with("/associate"));
+            if let Some(target) = chat_session_target(path).filter(|_| !own_annotation) {
+                crate::chat::envelope::ensure_child_of(
+                    state.orchestrator.neo4j(),
+                    &binding.session_id,
+                    target,
+                )
+                .await?;
+            }
+        }
+    }
 
     // 5. Inject claims into request extensions
     req.extensions_mut().insert(claims);
 
     Ok(next.run(req).await)
+}
+
+/// Where a Bearer token is exchanged for a WebSocket ticket.
+pub const WS_TICKET_PATH: &str = "/auth/ws-ticket";
+
+/// Path prefixes whose MUTATION is reserved to a human session (decision A25):
+/// provider instances, per-project consent, pilot/executor roles, model policy,
+/// the chat permission config, and long-lived MCP tokens. Reads stay open.
+const HUMAN_ONLY_MUTATION_PREFIXES: &[&str] = &[
+    "/auth/mcp-tokens",
+    "/api/chat/config",
+    "/api/chat/providers",
+    "/api/chat/roles",
+    "/api/chat/model-policy",
+    "/api/chat/model-aliases",
+];
+
+/// Per-project settings that decide where a project's content may go
+/// (`/api/projects/{slug}/llm-consent`, `/llm-roles`, …).
+const HUMAN_ONLY_PROJECT_SEGMENT: &str = "/llm-";
+
+/// Whether `method path` is a mutation only a human session may perform.
+///
+/// An `agent_session` token sits in the agent's environment: if it could reach
+/// these routes, a prompt injection could authorise an endpoint, widen the
+/// permission config or re-route sessions — the agent would grant itself.
+pub fn is_human_only_mutation(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return false;
+    }
+    let under = |prefix: &str| {
+        path == prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    HUMAN_ONLY_MUTATION_PREFIXES.iter().any(|p| under(p))
+        || (path.starts_with("/api/projects/") && path.contains(HUMAN_ONLY_PROJECT_SEGMENT))
+        // Answering a permission prompt IS the human's decision: an agent that
+        // could post it would approve its own tool calls.
+        || (path.starts_with("/api/chat/sessions/") && path.contains("/permissions/"))
+}
+
+/// The session id a `/api/chat/sessions/{id}[/...]` path acts on, if it is one.
+/// `/api/chat/sessions` itself (opening a session) has no target: the spawn
+/// envelope governs it.
+pub fn chat_session_target(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/api/chat/sessions/")?;
+    let id = rest.split('/').next()?;
+    (!id.is_empty()).then_some(id)
 }
 
 /// Policy every decoded token must satisfy before it is trusted: the email
@@ -112,6 +215,28 @@ pub async fn enforce_token_policy(
         }
     }
 
+    // An agent session token is bound to its session and dies with it: the
+    // `jti` must still be registered. Fail closed on a token without one
+    // (minted before tokens were bound — its holder is gone anyway).
+    if claims.is_agent_session() {
+        let live = claims
+            .jti
+            .as_deref()
+            .is_some_and(crate::auth::agent_tokens::is_live);
+        if !live {
+            return Err(AppError::Unauthorized(
+                "Agent session token revoked: its session is closed".to_string(),
+            ));
+        }
+        // The chat WebSocket answers permission prompts and changes a session's
+        // permission mode: it is a human surface. No ticket for an agent.
+        if path == WS_TICKET_PATH {
+            return Err(AppError::Forbidden(
+                "an agent session token cannot open a WebSocket".to_string(),
+            ));
+        }
+    }
+
     // A vault token lives in an agent's shell environment. It opens the
     // agent read path and nothing else — otherwise that shell would hold a
     // key to the whole API.
@@ -129,6 +254,23 @@ pub async fn enforce_token_policy(
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod target_tests {
+    use super::chat_session_target;
+
+    #[test]
+    fn the_target_of_a_chat_session_route_is_its_id() {
+        assert_eq!(
+            chat_session_target("/api/chat/sessions/abc/messages"),
+            Some("abc")
+        );
+        assert_eq!(chat_session_target("/api/chat/sessions/abc"), Some("abc"));
+        assert_eq!(chat_session_target("/api/chat/sessions"), None);
+        assert_eq!(chat_session_target("/api/chat/sessions/"), None);
+        assert_eq!(chat_session_target("/api/chat/providers"), None);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -433,5 +575,241 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── agent_session tokens: bound, revocable, kept off human-only routes ──
+
+    fn agent_token(session_id: &str) -> (String, String) {
+        let human = Claims {
+            sub: uuid::Uuid::new_v4().to_string(),
+            email: "alice@ffs.holdings".to_string(),
+            name: "Alice".to_string(),
+            iat: 0,
+            exp: 0,
+            token_type: None,
+            scope: None,
+            jti: None,
+        };
+        let binding = crate::auth::jwt::AgentSessionBinding {
+            session_id: session_id.to_string(),
+            ceiling: Some("default".to_string()),
+            tool_profile: None,
+        };
+        let (token, jti) =
+            crate::auth::jwt::generate_session_token(&human, Some(&binding), TEST_SECRET, 3600)
+                .unwrap();
+        crate::auth::agent_tokens::register(&jti, Some(session_id));
+        (token, jti)
+    }
+
+    async fn status_of(app: Router, method: &str, uri: &str, token: &str) -> StatusCode {
+        let req = HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn agent_token_of_a_closed_session_is_refused() {
+        let sid = uuid::Uuid::new_v4().to_string();
+        let (token, _) = agent_token(&sid);
+        let app = test_app(Some(test_auth_config())).await;
+        assert_eq!(
+            status_of(app.clone(), "GET", "/test", &token).await,
+            StatusCode::OK,
+            "a live session's token authenticates"
+        );
+
+        crate::auth::agent_tokens::revoke_session(&sid);
+        assert_eq!(
+            status_of(app, "GET", "/test", &token).await,
+            StatusCode::UNAUTHORIZED,
+            "closing the session must kill its token"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_token_never_registered_is_refused() {
+        // Signed correctly, but minted outside the registry (or before a
+        // restart): fail closed.
+        let human = Claims::service_account("runner:test");
+        let (token, _) =
+            crate::auth::jwt::generate_session_token(&human, None, TEST_SECRET, 3600).unwrap();
+        let app = test_app(Some(test_auth_config())).await;
+        assert_eq!(
+            status_of(app, "GET", "/test", &token).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_token_cannot_mutate_human_only_routes() {
+        let state = make_server_state(Some(test_auth_config())).await;
+        async fn ok_handler() -> &'static str {
+            "ok"
+        }
+        use axum::routing::{post, put};
+        let app = Router::new()
+            .route(
+                "/api/chat/config/permissions",
+                get(ok_handler).put(ok_handler),
+            )
+            .route("/api/chat/providers", get(ok_handler).post(ok_handler))
+            .route("/api/chat/providers/{id}", put(ok_handler))
+            .route("/api/projects/{slug}/llm-consent", put(ok_handler))
+            .route("/api/notes", post(ok_handler))
+            .layer(from_fn_with_state(state.clone(), require_auth))
+            .with_state(state);
+
+        let sid = uuid::Uuid::new_v4().to_string();
+        let (agent, _) = agent_token(&sid);
+        let human = encode_jwt(
+            uuid::Uuid::new_v4(),
+            "alice@ffs.holdings",
+            "Alice",
+            TEST_SECRET,
+            3600,
+        )
+        .unwrap();
+
+        for (method, uri) in [
+            ("PUT", "/api/chat/config/permissions"),
+            ("POST", "/api/chat/providers"),
+            ("PUT", "/api/chat/providers/deepseek"),
+            ("PUT", "/api/projects/demo/llm-consent"),
+        ] {
+            assert_eq!(
+                status_of(app.clone(), method, uri, &agent).await,
+                StatusCode::FORBIDDEN,
+                "agent token must get 403 on {method} {uri}"
+            );
+            assert_eq!(
+                status_of(app.clone(), method, uri, &human).await,
+                StatusCode::OK,
+                "a human keeps {method} {uri}"
+            );
+        }
+        // Reads and ordinary work stay open to the agent.
+        for (method, uri) in [
+            ("GET", "/api/chat/config/permissions"),
+            ("GET", "/api/chat/providers"),
+            ("POST", "/api/notes"),
+        ] {
+            assert_eq!(
+                status_of(app.clone(), method, uri, &agent).await,
+                StatusCode::OK,
+                "agent token keeps {method} {uri}"
+            );
+        }
+        crate::auth::agent_tokens::revoke_session(&sid);
+    }
+
+    #[tokio::test]
+    async fn a_restricted_profile_token_is_refused_the_routes_behind_withheld_tools() {
+        let state = make_server_state(Some(test_auth_config())).await;
+        async fn ok_handler() -> &'static str {
+            "ok"
+        }
+        use axum::routing::post;
+        let app = Router::new()
+            .route("/api/chat/sessions", get(ok_handler).post(ok_handler))
+            .route("/api/plans/{id}/run", post(ok_handler))
+            .route("/api/plans/{id}/tasks/{tid}/delegate", post(ok_handler))
+            .route("/api/admin/backfill-synapses", post(ok_handler))
+            .route("/api/notes", post(ok_handler))
+            .layer(from_fn_with_state(state.clone(), require_auth))
+            .with_state(state);
+
+        let mint = |profile: Option<&str>| {
+            let sid = uuid::Uuid::new_v4().to_string();
+            let binding = crate::auth::jwt::AgentSessionBinding {
+                session_id: sid.clone(),
+                ceiling: Some("default".to_string()),
+                tool_profile: profile.map(str::to_string),
+            };
+            let (token, jti) = crate::auth::jwt::generate_session_token(
+                &Claims::service_account("runner:t"),
+                Some(&binding),
+                TEST_SECRET,
+                3600,
+            )
+            .unwrap();
+            crate::auth::agent_tokens::register(&jti, Some(&sid));
+            token
+        };
+        let restricted = mint(Some("restricted"));
+        let full = mint(None);
+
+        for (method, uri) in [
+            ("POST", "/api/chat/sessions"),
+            ("POST", "/api/plans/p1/run"),
+            ("POST", "/api/plans/p1/tasks/t1/delegate"),
+            ("POST", "/api/admin/backfill-synapses"),
+        ] {
+            assert_eq!(
+                status_of(app.clone(), method, uri, &restricted).await,
+                StatusCode::FORBIDDEN,
+                "restricted profile must get 403 on {method} {uri}"
+            );
+            assert_eq!(
+                status_of(app.clone(), method, uri, &full).await,
+                StatusCode::OK,
+                "a session without a profile keeps {method} {uri}"
+            );
+        }
+        for (method, uri) in [("GET", "/api/chat/sessions"), ("POST", "/api/notes")] {
+            assert_eq!(
+                status_of(app.clone(), method, uri, &restricted).await,
+                StatusCode::OK,
+                "restricted profile keeps {method} {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn human_only_mutation_matches_whole_segments_only() {
+        use axum::http::Method;
+        assert!(is_human_only_mutation(&Method::POST, "/api/chat/providers"));
+        assert!(is_human_only_mutation(
+            &Method::DELETE,
+            "/api/chat/providers/x"
+        ));
+        assert!(is_human_only_mutation(&Method::PATCH, "/api/chat/config"));
+        assert!(!is_human_only_mutation(&Method::GET, "/api/chat/config"));
+        assert!(
+            !is_human_only_mutation(&Method::POST, "/api/chat/providers-export"),
+            "a sibling route sharing the prefix text is not covered"
+        );
+        assert!(!is_human_only_mutation(&Method::POST, "/api/chat/sessions"));
+        assert!(is_human_only_mutation(
+            &Method::PUT,
+            "/api/projects/p/llm-roles"
+        ));
+        assert!(
+            is_human_only_mutation(&Method::POST, "/api/chat/sessions/abc/permissions/req-1"),
+            "an agent must not answer permission prompts"
+        );
+        assert!(!is_human_only_mutation(
+            &Method::POST,
+            "/api/chat/sessions/abc/interrupt"
+        ));
+    }
+
+    #[tokio::test]
+    async fn agent_token_gets_no_websocket_ticket() {
+        let state = make_server_state(Some(test_auth_config())).await;
+        let sid = uuid::Uuid::new_v4().to_string();
+        let (token, _) = agent_token(&sid);
+        let claims = decode_jwt(&token, TEST_SECRET).unwrap();
+        let cfg = test_auth_config();
+        let refused = enforce_token_policy(&state, &cfg, &claims, WS_TICKET_PATH).await;
+        assert!(matches!(refused, Err(AppError::Forbidden(_))));
+        assert!(enforce_token_policy(&state, &cfg, &claims, "/api/notes")
+            .await
+            .is_ok());
+        crate::auth::agent_tokens::revoke_session(&sid);
     }
 }

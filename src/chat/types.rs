@@ -53,6 +53,17 @@ pub enum SpawnedBy {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_use_id: Option<String>,
     },
+    /// A task delegated by a session (`plan(delegate_task)`) or by a person.
+    /// `parent_session_id` is the calling session as read from its signed
+    /// token — never a value taken from the request body of an agent.
+    Delegation {
+        plan_id: Uuid,
+        task_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_session_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scaffolding_level: Option<u8>,
+    },
 }
 
 impl SpawnedBy {
@@ -85,6 +96,9 @@ impl SpawnedBy {
             Self::Conversation {
                 parent_session_id, ..
             } => Some(*parent_session_id),
+            Self::Delegation {
+                parent_session_id, ..
+            } => *parent_session_id,
         }
     }
 
@@ -96,6 +110,7 @@ impl SpawnedBy {
             Self::Gate { .. } => "gate",
             Self::Trigger { .. } => "trigger",
             Self::Conversation { .. } => "conversation",
+            Self::Delegation { .. } => "delegation",
         }
     }
 
@@ -106,7 +121,7 @@ impl SpawnedBy {
             Self::Pipeline { run_id, .. } => Some(*run_id),
             Self::Gate { run_id, .. } => Some(*run_id),
             Self::Trigger { run_id, .. } => *run_id,
-            Self::Conversation { .. } => None,
+            Self::Conversation { .. } | Self::Delegation { .. } => None,
         }
     }
 
@@ -118,6 +133,7 @@ impl SpawnedBy {
             Self::Gate { task_id, .. } => Some(*task_id),
             Self::Trigger { task_id, .. } => *task_id,
             Self::Conversation { .. } => None,
+            Self::Delegation { task_id, .. } => Some(*task_id),
         }
     }
 }
@@ -188,6 +204,26 @@ pub struct ChatRequest {
     /// Model override (default: from ChatConfig)
     #[serde(default)]
     pub model: Option<String>,
+    /// Provider instance to open the session on. Absent: resolved (A16). On an
+    /// existing session a different provider is a 409 `provider_conflict`.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model alias set on the task (A16 level "task"). Internal.
+    #[serde(skip)]
+    pub task_alias: Option<String>,
+    /// Provider named by the run (A16 level "run"). Internal.
+    #[serde(skip)]
+    pub run_provider: Option<String>,
+    /// Model named by the run. Internal.
+    #[serde(skip)]
+    pub run_model: Option<String>,
+    /// Token budget of the session (`SessionLimits::max_tokens`). Internal.
+    #[serde(skip)]
+    pub max_tokens: Option<u64>,
+    /// Class of the task being executed (`simple`, `complex`, ...), which the
+    /// model policy reads. Internal.
+    #[serde(skip)]
+    pub task_class: Option<String>,
     /// Permission mode override for this session (default: from ChatConfig)
     /// Values: "default", "acceptEdits", "plan", "bypassPermissions"
     #[serde(default)]
@@ -358,6 +394,12 @@ pub enum ChatEvent {
         input: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_tool_use_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Neutral category (command, read, edit, search, web, mcp, agent, other), from the adapter.
+        category: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Stable alias of the tool, from the adapter.
+        canonical: Option<String>,
     },
     /// Result of a tool call
     ToolResult {
@@ -392,6 +434,12 @@ pub enum ChatEvent {
         input: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_tool_use_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Neutral category (command, read, edit, search, web, mcp, agent, other), from the adapter.
+        category: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Stable alias of the tool, from the adapter.
+        canonical: Option<String>,
     },
     /// Claude Code called the AskUserQuestion tool — display the interactive
     /// question widget instead of a permission approval dialog.
@@ -409,6 +457,9 @@ pub enum ChatEvent {
         input: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_tool_use_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// True when the provider has no native question: the answer goes back as a user turn (A45).
+        synthetic: Option<bool>,
     },
     /// Conversation turn completed
     Result {
@@ -428,6 +479,18 @@ pub enum ChatEvent {
         /// Result text or error message
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// `{ usd?, basis }` — basis is reported|priced|free|subscription|unknown; an unknown price has no `usd` (never 0).
+        cost: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Token usage of the turn: input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, reasoning_tokens.
+        usage: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Model that actually answered.
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Neutral stop reason (completed, max_turns, max_tokens, interrupted, refusal, budget_exceeded, error).
+        stop_reason: Option<String>,
     },
     /// Streaming text delta (real-time token)
     StreamDelta {
@@ -461,7 +524,13 @@ pub enum ChatEvent {
         allow: bool,
     },
     /// Permission mode was changed mid-session
-    PermissionModeChanged { mode: String },
+    PermissionModeChanged {
+        /// Mode in the provider's own vocabulary (legacy strings stay emitted).
+        mode: String,
+        /// Neutral form: ask, auto_edits, plan_only, trust.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_mode: Option<String>,
+    },
     /// Model was changed mid-session
     ModelChanged { model: String },
     /// Context window compaction is starting (emitted via PreCompact hook)
@@ -507,6 +576,27 @@ pub enum ChatEvent {
         /// Permission mode for this session
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_mode: Option<String>,
+        /// `{ id, kind }` of the provider instance; absent means claude-code.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<serde_json::Value>,
+        /// Capability snapshot frozen at open (agent-contract section 5).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capabilities: Option<serde_json::Value>,
+        /// `ToolPolicy` in effect: mode, native_mode?, allow[], deny[].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_policy: Option<serde_json::Value>,
+        /// Neutral form of `permission_mode`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_mode: Option<String>,
+        /// Engine that drives the session: `agent` (provider-neutral) or
+        /// `legacy` (the historical Claude Code engine). Absent on an old frame.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        engine: Option<String>,
+        /// What this session does NOT do: hooks, message queue, auto-continue,
+        /// compaction, NATS fan-out, enrichment, images (the ones the engine or
+        /// the provider lacks). Empty on the legacy engine.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        degraded_features: Option<Vec<String>>,
     },
     /// Claude Code Dynamic Workflow lifecycle event (intra-task sub-agent fan-out).
     ///
@@ -661,6 +751,13 @@ pub enum ChatEvent {
     /// A secret request was answered (`provided`, `granted` or `declined`).
     /// Carries no value.
     SecretRequestResolved { id: String, outcome: String },
+    /// The session was closed by the server (A45). Emitted by `close_session`.
+    SessionClosed {
+        session_id: String,
+        /// `closed`, `idle` or `error`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 impl ChatEvent {
@@ -699,6 +796,7 @@ impl ChatEvent {
             ChatEvent::ActiveTasksUpdate { .. } => "active_tasks_update",
             ChatEvent::SecretRequest { .. } => "secret_request",
             ChatEvent::SecretRequestResolved { .. } => "secret_request_resolved",
+            ChatEvent::SessionClosed { .. } => "session_closed",
         }
     }
 
@@ -769,7 +867,7 @@ impl ChatEvent {
                 Some(format!("error:{}", hasher.finish()))
             }
             ChatEvent::Result { session_id, .. } => Some(format!("result:{}", session_id)),
-            ChatEvent::PermissionModeChanged { mode } => {
+            ChatEvent::PermissionModeChanged { mode, .. } => {
                 Some(format!("permission_mode_changed:{}", mode))
             }
             ChatEvent::ModelChanged { model } => Some(format!("model_changed:{}", model)),
@@ -864,7 +962,8 @@ impl ChatEvent {
             | ChatEvent::PendingQueue { .. }
             | ChatEvent::ActiveTasksUpdate { .. }
             | ChatEvent::SecretRequest { .. }
-            | ChatEvent::SecretRequestResolved { .. } => None,
+            | ChatEvent::SecretRequestResolved { .. }
+            | ChatEvent::SessionClosed { .. } => None,
         }
     }
 }
@@ -961,6 +1060,16 @@ pub struct ChatSession {
     /// stays exactly as small as it was before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<SessionActivity>,
+    /// Provider instance serving the session; absent means `claude-code`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// Capability snapshot frozen at open. Only carried by the single-session
+    /// read, never by listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<serde_json::Value>,
+    /// Which precedence level chose the provider (`session`, `request`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed_by: Option<String>,
 }
 
 /// What a chat session is doing *right now*, read from the live
@@ -1581,6 +1690,8 @@ mod tests {
                 tool: "".into(),
                 input: serde_json::Value::Null,
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             }
             .event_type(),
             "tool_use"
@@ -1599,6 +1710,8 @@ mod tests {
                 tool: "".into(),
                 input: serde_json::Value::Null,
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             }
             .event_type(),
             "permission_request"
@@ -1620,6 +1733,10 @@ mod tests {
                 is_error: false,
                 num_turns: None,
                 result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             }
             .event_type(),
             "result"
@@ -1660,6 +1777,8 @@ mod tests {
                 tool: "create_plan".into(),
                 input: serde_json::json!({"title": "Plan"}),
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             },
             ChatEvent::ToolResult {
                 id: "tu_1".into(),
@@ -1686,6 +1805,8 @@ mod tests {
                 tool: "bash".into(),
                 input: serde_json::json!({"command": "rm -rf /"}),
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             },
             ChatEvent::Result {
                 session_id: "cli-123".into(),
@@ -1695,6 +1816,10 @@ mod tests {
                 is_error: false,
                 num_turns: Some(3),
                 result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             },
             ChatEvent::Result {
                 session_id: "cli-456".into(),
@@ -1704,6 +1829,10 @@ mod tests {
                 is_error: true,
                 num_turns: Some(15),
                 result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             },
             ChatEvent::Result {
                 session_id: "cli-789".into(),
@@ -1713,6 +1842,10 @@ mod tests {
                 is_error: true,
                 num_turns: Some(1),
                 result_text: Some("CLI crashed unexpectedly".into()),
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
             },
             ChatEvent::StreamDelta {
                 text: "Hello".into(),
@@ -1763,6 +1896,12 @@ mod tests {
                 tools: vec!["Bash".into(), "Read".into(), "Write".into()],
                 mcp_servers: vec![serde_json::json!({"name": "po", "status": "connected"})],
                 permission_mode: Some("default".into()),
+                provider: None,
+                capabilities: None,
+                tool_policy: None,
+                policy_mode: None,
+                engine: None,
+                degraded_features: None,
             },
             ChatEvent::SystemInit {
                 cli_session_id: "cli-init-456".into(),
@@ -1770,6 +1909,12 @@ mod tests {
                 tools: vec![],
                 mcp_servers: vec![],
                 permission_mode: None,
+                provider: None,
+                capabilities: None,
+                tool_policy: None,
+                policy_mode: None,
+                engine: None,
+                degraded_features: None,
             },
             ChatEvent::AutoContinue {
                 session_id: "sess-auto-1".into(),
@@ -1988,6 +2133,8 @@ mod tests {
             tool: "Bash".into(),
             input: serde_json::json!({}),
             parent_tool_use_id: None,
+            category: None,
+            canonical: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(!json.contains("parent_tool_use_id"));
@@ -1998,6 +2145,8 @@ mod tests {
             tool: "Read".into(),
             input: serde_json::json!({"path": "/src/main.rs"}),
             parent_tool_use_id: Some("toolu_abc123".into()),
+            category: None,
+            canonical: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"parent_tool_use_id\":\"toolu_abc123\""));
@@ -2069,6 +2218,8 @@ mod tests {
                 tool: "bash".into(),
                 input: serde_json::json!({}),
                 parent_tool_use_id: Some("p5".into()),
+                category: None,
+                canonical: None,
             },
             ChatEvent::ToolUseInputResolved {
                 id: "tu1".into(),
@@ -2167,6 +2318,9 @@ mod tests {
             linked_tasks: Vec::new(),
             linked_rfcs: Vec::new(),
             activity: None,
+            provider_id: None,
+            capabilities: None,
+            routed_by: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -2385,6 +2539,9 @@ mod tests {
             linked_tasks: Vec::new(),
             linked_rfcs: Vec::new(),
             activity: None,
+            provider_id: None,
+            capabilities: None,
+            routed_by: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();

@@ -737,6 +737,14 @@ pub async fn build_attention(graph: &dyn GraphStore, p: &AttentionParams) -> Att
                 started_at: r.started_at,
                 duration_secs: secs_since(r.completed_at.unwrap_or(now), r.started_at),
                 cost_usd: r.cost_usd,
+                cost_basis: Some(
+                    if r.cost_usd > 0.0 {
+                        "reported"
+                    } else {
+                        "unknown"
+                    }
+                    .to_string(),
+                ),
             }),
             session_ids: Vec::new(),
             sessions: atts
@@ -1288,6 +1296,8 @@ mod tests {
                 tool: "Bash".into(),
                 input: json!({"command": "cargo publish"}),
                 parent_tool_use_id: None,
+                category: None,
+                canonical: None,
             };
             self.store(session, 1, ev, age).await;
         }
@@ -1299,6 +1309,7 @@ mod tests {
                 questions: json!([{"question": "Which database?", "options": [{"label": "pg"}]}]),
                 input: json!({}),
                 parent_tool_use_id: None,
+                synthetic: None,
             };
             self.store(session, 2, ev, age).await;
         }

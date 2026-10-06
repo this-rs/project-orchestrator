@@ -1,0 +1,54 @@
+%% name: po-chat-agent-runtime
+%% covers: backend:src/chat/agent_runtime.rs
+%% verified: 878281ca
+%% ---
+%% PROUVE : le moteur « agent » du chat (tâche B13) : comment un AgentSession nexus est piloté, ce qu'il
+%%   diffuse et persiste, ce qu'il ne fait PAS encore. Le routage entre moteurs est dans po-chat-manager.
+%% ---
+%% SOURCES LUES :
+%%   src/chat/agent_runtime.rs — AgentRuntime, AgentSessionHandle (send_message, answer_permission, interrupt,
+%%                               set_model, set_policy_mode), mask_agent_event, degraded_features, retry,
+%%                               pump_out_of_band, BuiltinProviders, fake (tests)
+%%   src/chat/provider/event_map.rs — EventMapper (AgentEvent vers ChatEvent)
+%% ---
+%% NON ETABLI :
+%%   jamais exercé contre le VRAI CLI Claude, un vrai endpoint ni un vrai Codex/ACP (faux provider, fake_openai,
+%%   fake_mcp seulement) ; hooks, file de messages, auto-continue, compaction, NATS, enrichissement : absents
+%%   (annoncés par degraded_features) ; la publication NATS de session_closed est faite par le manager, non testée.
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans test / décidé non écrit  ⚪ amont ou autre domaine
+
+flowchart TD
+    MGR["⚪ ChatManager (po-chat-manager) : create_session / send_message / permissions / interrupt / close délèguent ici pour les sessions que le runtime possède"]
+    PROV["⚪ nexus AgentProvider / AgentSession (contrat) ; le provider est choisi par le manager (po-chat-provider)"]
+
+    subgraph turn["Un tour — AgentSessionHandle::send_message"]
+        BUSY{"✅ un tour tourne déjà ?<br/>oui : ProviderError turn_in_progress (409), pas de file<br/>test : agent_path_refuses_a_second_turn_while_one_runs_and_answers_permissions"}
+        SEND["✅ UserMessage persisté, StreamingStatus true, session.send_turn<br/>test : agent_path_opens_a_session_persists_the_snapshot_and_streams_a_turn"]
+        MASK["✅ chaque événement du provider est MASQUÉ (secrets du coffre) avant tout, en échec fermé : un événement non masquable devient un marqueur visible, un terminal retenu termine quand même le tour<br/>test : agent_path_masks_a_vault_secret_before_persisting_and_broadcasting, an_event_that_cannot_be_masked_is_withheld_not_passed_in_clear"]
+        RETRY["✅ done.error / error retryable ET rien montré : Retrying puis le même tour, 3 essais, retry_after du provider sinon backoff ; sinon jamais rejoué<br/>test : a_retryable_done_error_before_any_output_is_retried_once_the_provider_says_when, a_turn_that_already_showed_output_or_failed_for_good_is_not_retried"]
+        MAP["✅ EventMapper : AgentEvent vers ChatEvent (rejeu identique au chemin hérité sur 21 messages), tool_use puis tool_use_input_resolved, coût inconnu jamais 0<br/>test : replay_gives_the_same_chat_events_as_the_legacy_path"]
+        EMIT["✅ emit : ajoute provider/capabilities/tool_policy/engine=agent/degraded_features à system_init, persiste (sauf stream_delta, streaming_status), diffuse, tient l'instantané de mi-flux<br/>test : the_agent_system_init_lists_what_the_session_capabilities_do_not_cover (lit le system_init réellement émis)"]
+        BUSY --> SEND --> MASK --> RETRY --> MAP --> EMIT
+    end
+
+    subgraph oob["Hors tour"]
+        OOB["✅ pump_out_of_band : regroupe par numéro de message du provider, masque, émet background_output<br/>test : agent_path_resumes_from_the_persisted_token_and_out_of_turn_output_regroups"]
+    end
+
+    subgraph ctl["Commandes de session"]
+        CTL["✅ answer_permission (PermissionDecision émis), interrupt (TurnAndTools), set_model (ModelChanged), set_policy_mode (PermissionModeChanged avec policy_mode neutre)<br/>test : agent_path_interrupt_model_mode_and_close_reach_the_provider"]
+        CLOSE["✅ close : ferme le provider (5 s max), émet session_closed, oublie la session<br/>test : agent_path_interrupt_model_mode_and_close_reach_the_provider"]
+    end
+
+    DEGR["✅ degraded_features(Capabilities) : ce que le moteur n'a pas porté (hooks, message_queue, auto_continue, nats, enrichment) + images et compaction selon la session<br/>test : the_agent_system_init_lists_what_the_session_capabilities_do_not_cover"]
+    LOST["🟠 NON porté : hooks, file de messages, auto-continue, compaction, NATS, enrichissement d'entités ; jamais contre un vrai fournisseur"]
+
+    MGR --> BUSY
+    MGR --> CTL
+    PROV -.-> SEND
+    PROV -.-> OOB
+    EMIT --> DEGR
+    DEGR --> LOST
+    CTL --> CLOSE
