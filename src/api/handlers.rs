@@ -934,6 +934,56 @@ pub struct DelegateTaskRequest {
     /// so the delegation is visible in the session tree.
     #[serde(default)]
     pub parent_session_id: Option<String>,
+    /// Provider instance that should run the sub-agent (an explicit choice, decision
+    /// A16 level "request"). Absent = the server resolves it (task alias, persona,
+    /// project rule, default...). Subject to the project's consent like any other.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model (or alias) for the sub-agent. Absent = the instance's own default.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Class of the task (`simple`, `complex`, `creative`...), recorded and fed to the
+    /// model policy (A19) so a rule can still pick the model when none is named.
+    #[serde(default)]
+    pub task_class: Option<String>,
+}
+
+/// The model-related part of a delegation, as a person or an agent wrote it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct DelegationTarget {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub task_class: Option<String>,
+}
+
+impl DelegationTarget {
+    /// An empty or blank string names nothing: `""` from a form is the same as absent.
+    pub(crate) fn new(
+        provider: Option<String>,
+        model: Option<String>,
+        task_class: Option<String>,
+    ) -> Self {
+        let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        Self {
+            provider: clean(provider),
+            model: clean(model),
+            task_class: clean(task_class),
+        }
+    }
+
+    /// Puts the explicit choice on the session request. A model alone keeps the
+    /// provider the resolver finds; a provider alone keeps that instance's default.
+    pub(crate) fn apply(self, request: &mut crate::chat::types::ChatRequest) {
+        if self.provider.is_some() {
+            request.provider = self.provider;
+        }
+        if self.model.is_some() {
+            request.model = self.model;
+        }
+        if self.task_class.is_some() {
+            request.task_class = self.task_class;
+        }
+    }
 }
 
 /// Response for a successfully delegated task.
@@ -1007,6 +1057,10 @@ pub async fn delegate_task(
         parent_envelope.as_ref(),
         &default_mode,
     )?;
+    // The model the delegating agent (or person) chose for THIS task, if any. It goes
+    // through the same resolution as every session: consent, health and the
+    // project's rules still apply, and a refusal costs nothing.
+    DelegationTarget::new(req.provider, req.model, req.task_class).apply(&mut chat_request);
     // A person may name the parent in the body; an agent's parent is its token's.
     let parent_session_id = match &parent_envelope {
         Some(env) => Some(env.parent_session_id),
@@ -6742,6 +6796,71 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code(), "envelope_project_mismatch");
+    }
+
+    #[test]
+    fn a_delegation_names_the_model_it_wants_for_this_task() {
+        let mut req = delegation_chat_request(
+            "/anywhere".into(),
+            None,
+            Uuid::new_v4(),
+            "t",
+            None,
+            "default",
+        )
+        .unwrap();
+        assert!(req.provider.is_none() && req.model.is_none() && req.task_class.is_none());
+        DelegationTarget::new(
+            Some("deepseek".into()),
+            Some("deepseek-v4-pro".into()),
+            Some("complex".into()),
+        )
+        .apply(&mut req);
+        assert_eq!(req.provider.as_deref(), Some("deepseek"));
+        assert_eq!(req.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(req.task_class.as_deref(), Some("complex"));
+        // The envelope's clamp on permissions is not touched by the choice.
+        assert_eq!(req.permission_mode.as_deref(), Some("bypassPermissions"));
+    }
+
+    #[test]
+    fn a_blank_choice_names_nothing_and_changes_nothing() {
+        let mut req = delegation_chat_request(
+            "/anywhere".into(),
+            None,
+            Uuid::new_v4(),
+            "t",
+            None,
+            "default",
+        )
+        .unwrap();
+        let before = (
+            req.provider.clone(),
+            req.model.clone(),
+            req.task_class.clone(),
+        );
+        DelegationTarget::new(Some("  ".into()), Some(String::new()), None).apply(&mut req);
+        assert_eq!((req.provider, req.model, req.task_class), before);
+    }
+
+    #[test]
+    fn a_model_alone_keeps_the_resolved_provider_and_a_provider_alone_keeps_its_default_model() {
+        let mut req =
+            delegation_chat_request("/a".into(), None, Uuid::new_v4(), "t", None, "default")
+                .unwrap();
+        DelegationTarget::new(None, Some("fast".into()), None).apply(&mut req);
+        assert_eq!(
+            (req.provider.as_deref(), req.model.as_deref()),
+            (None, Some("fast"))
+        );
+        let mut req =
+            delegation_chat_request("/a".into(), None, Uuid::new_v4(), "t", None, "default")
+                .unwrap();
+        DelegationTarget::new(Some("local-llama".into()), None, None).apply(&mut req);
+        assert_eq!(
+            (req.provider.as_deref(), req.model.as_deref()),
+            (Some("local-llama"), None)
+        );
     }
 
     #[test]
