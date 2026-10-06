@@ -5,301 +5,273 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Project Orchestrator</title>
   <style>
+    /* Tokens mirror the app (frontend/src/index.css): one accent, quiet surfaces, short motion. */
+    :root {
+      --surface-base: #0f1117;
+      --primary: #6366f1;
+      --primary-light: #818cf8;
+      --primary-muted: rgba(99, 102, 241, 0.15);
+      --success: #22c55e;
+      --warning: #f59e0b;
+      --error: #ef4444;
+      --text-primary: #f1f5f9;
+      --text-secondary: #94a3b8;
+      --text-tertiary: #64748b;
+      --text-muted: #475569;
+      --ease: cubic-bezier(0.22, 1, 0.36, 1);
+    }
     * { margin: 0; padding: 0; box-sizing: border-box; }
-
-    html, body {
-      width: 100%;
-      height: 100%;
-    }
-
+    html, body { width: 100%; height: 100%; }
     body {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      padding: 32px 0;
-      background: #0f1117;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      color: #f1f5f9;
-      overflow: hidden;
-      -webkit-user-select: none;
-      user-select: none;
+      position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      background: var(--surface-base);
+      font-family: 'Inter Variable', Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      color: var(--text-primary); overflow: hidden;
+      -webkit-user-select: none; user-select: none; -webkit-font-smoothing: antialiased;
     }
+    body, .stage { -webkit-app-region: drag; app-region: drag; }
 
-    .logo-container {
-      position: relative;
-      width: 80px;
-      height: 80px;
-      margin-bottom: 20px;
-    }
+    /* Transparent overlay, only for the small effects (particles where a row settles). The
+       background stays a flat colour. */
+    #fx { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; }
 
-    .logo-icon {
-      width: 80px;
-      height: 80px;
-      opacity: 0;
-      animation: fadeInScale 0.5s ease-out 0.1s forwards;
-    }
+    .stage { position: relative; display: flex; flex-direction: column; align-items: center; width: 100%; padding: 0 48px;
+      transition: opacity .3s var(--ease); }
+    body.leaving .stage { opacity: 0; }
 
-    .title {
-      font-size: 20px;
-      font-weight: 600;
-      letter-spacing: -0.02em;
-      color: #f1f5f9;
-      margin-bottom: 4px;
-      text-align: center;
-      opacity: 0;
-      animation: fadeIn 0.4s ease-out 0.4s forwards;
-    }
+    /* The logo's place; the shader draws it. Without WebGL the plain image shows instead. */
+    .logo-container { width: 72px; height: 72px; margin-bottom: 22px; }
+    .logo-icon { width: 72px; height: 72px; display: block; opacity: 0; animation: fade .6s var(--ease) .1s forwards; }
 
-    .subtitle {
-      font-size: 13px;
-      color: #64748b;
-      margin-bottom: 24px;
-      text-align: center;
-      opacity: 0;
-      animation: fadeIn 0.4s ease-out 0.6s forwards;
-    }
+    .title { font-size: 15px; font-weight: 500; letter-spacing: -0.01em; opacity: 0; animation: rise .5s var(--ease) .25s forwards; }
+    .subtitle { font-size: 12px; color: var(--text-tertiary); margin: 4px 0 26px; opacity: 0; animation: rise .5s var(--ease) .35s forwards; }
 
-    /* -- Checklist -- */
-    .checklist {
-      width: 300px;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      opacity: 0;
-      animation: fadeIn 0.4s ease-out 0.8s forwards;
-    }
+    /* Progress: one hairline. */
+    .progress { width: 160px; height: 1px; background: rgba(255,255,255,.08); margin: -10px 0 22px; opacity: 0; animation: fade .4s .5s forwards; }
+    .progress .fill { height: 100%; width: 6%; background: var(--primary-light); transition: width .5s var(--ease); }
 
-    .check-item {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 7px 12px;
-      border-radius: 8px;
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px solid rgba(255, 255, 255, 0.06);
-      transition: background 0.3s, border-color 0.3s;
-      min-height: 34px;
-    }
+    .checklist { width: 240px; display: flex; flex-direction: column; gap: 1px; }
+    .check-item { display: flex; align-items: center; gap: 12px; padding: 5px 0; min-height: 26px;
+      opacity: 0; transform: translateY(4px); animation: rise .45s var(--ease) forwards; }
+    .check-item:nth-child(1){animation-delay:.45s} .check-item:nth-child(2){animation-delay:.5s}
+    .check-item:nth-child(3){animation-delay:.55s} .check-item:nth-child(4){animation-delay:.6s}
+    .check-item:nth-child(5){animation-delay:.65s} .check-item:nth-child(6){animation-delay:.7s}
+    .check-item:nth-child(7){animation-delay:.75s}
+    .check-item.hidden { display: none; }
+    .check-item.skipped { opacity: .5 !important; }
 
-    .check-item.success {
-      border-color: rgba(34, 197, 94, 0.2);
-      background: rgba(34, 197, 94, 0.05);
-    }
+    .check-icon { width: 14px; height: 14px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
+    .check-icon svg { width: 14px; height: 14px; }
+    .check-icon svg circle { display: none; }
+    .check-icon svg path { stroke-dasharray: 24; stroke-dashoffset: 24; animation: draw .38s cubic-bezier(.22,1,.36,1) .04s forwards; }
+    .check-icon svg { animation: settle .38s cubic-bezier(.22,1,.36,1); }
+    .check-icon .spinner { width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid rgba(129,140,248,.25);
+      border-top-color: var(--primary-light); animation: spin .9s linear infinite; }
 
-    .check-item.error {
-      border-color: rgba(239, 68, 68, 0.2);
-      background: rgba(239, 68, 68, 0.05);
-    }
+    .check-content { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+    .check-label { font-size: 12.5px; color: var(--text-muted); transition: color .2s ease; }
+    .check-item.success .check-label { color: var(--text-secondary); }
+    .check-item.error .check-label { color: var(--error); }
+    .check-item.warning .check-label { color: var(--warning); }
+    .check-subtext { font-size: 11px; color: var(--text-muted); line-height: 1.3; }
+    .check-subtext.error-text { color: var(--error); opacity: .85; }
 
-    .check-item.warning {
-      border-color: rgba(245, 158, 11, 0.2);
-      background: rgba(245, 158, 11, 0.05);
-    }
+    .check-action { font: inherit; font-size: 11px; color: var(--primary-light); cursor: pointer; padding: 2px 8px; border: none;
+      border-radius: 6px; background: var(--primary-muted); transition: background .15s ease; flex-shrink: 0; white-space: nowrap;
+      -webkit-app-region: no-drag; app-region: no-drag; }
+    .check-action:hover { background: rgba(99,102,241,.25); }
 
-    .check-item.skipped {
-      border-color: rgba(107, 114, 128, 0.2);
-      background: rgba(107, 114, 128, 0.03);
-    }
-
-    .check-item.hidden {
-      display: none;
-    }
-
-    .check-icon {
-      width: 18px;
-      height: 18px;
-      flex-shrink: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-
-    /* Spinner for pending state */
-    .check-icon .spinner {
-      width: 16px;
-      height: 16px;
-      border: 2px solid rgba(99, 102, 241, 0.15);
-      border-top-color: #6366f1;
-      border-radius: 50%;
-      animation: spin 0.7s linear infinite;
-    }
-
-    .check-icon svg { width: 16px; height: 16px; }
-
-    .check-content {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-      min-width: 0;
-    }
-
-    .check-label {
-      font-size: 13px;
-      color: #cbd5e1;
-    }
-
-    .check-subtext {
-      font-size: 10px;
-      color: #64748b;
-      line-height: 1.3;
-    }
-
-    .check-subtext.error-text {
-      color: #f87171;
-    }
-
-    .check-action {
-      font-size: 11px;
-      font-family: inherit;
-      color: #6366f1;
-      text-decoration: none;
-      cursor: pointer;
-      padding: 3px 8px;
-      border-radius: 4px;
-      border: 1px solid rgba(99, 102, 241, 0.3);
-      background: rgba(99, 102, 241, 0.1);
-      transition: background 0.2s;
-      flex-shrink: 0;
-      white-space: nowrap;
-      -webkit-app-region: no-drag;
-      app-region: no-drag;
-    }
-    .check-action:hover {
-      background: rgba(99, 102, 241, 0.2);
-    }
-
-    /* -- Footer actions -- */
-    .footer {
-      margin-top: 14px;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      opacity: 0;
-      animation: fadeIn 0.4s ease-out 1s forwards;
-      text-align: center;
-      width: 300px;
-    }
-
-    .status-text {
-      font-size: 11px;
-      color: #475569;
-      transition: color 0.3s;
-      text-align: center;
-      width: 100%;
-    }
-
-    .branding {
-      font-size: 10px;
-      letter-spacing: 0.05em;
-      margin-top: 4px;
-      text-align: center;
-    }
-
-    .branding-made-by {
-      color: #1e293b;
-    }
-
-    .branding-name {
-      color: #334155;
-    }
-
-    .btn-continue {
-      display: none;
-      padding: 6px 20px;
-      font-size: 12px;
-      font-weight: 500;
-      color: #fff;
-      background: #6366f1;
-      border: none;
-      border-radius: 6px;
-      cursor: pointer;
-      transition: background 0.2s;
-      -webkit-app-region: no-drag;
-      app-region: no-drag;
-    }
+    .footer { margin-top: 38px; display: flex; flex-direction: column; align-items: center; gap: 14px; text-align: center; width: 100%;
+      opacity: 0; animation: fade .5s var(--ease) .9s forwards; }
+    .status-text { font-size: 12px; color: var(--text-tertiary); min-height: 16px; transition: opacity .15s ease; }
+    .status-text.swap { opacity: 0; }
+    .btn-continue { display: none; padding: 6px 16px; font: inherit; font-size: 12px; font-weight: 500; color: var(--text-primary);
+      background: var(--primary); border: none; border-radius: 6px; cursor: pointer; transition: background .15s ease;
+      -webkit-app-region: no-drag; app-region: no-drag; }
     .btn-continue:hover { background: #4f46e5; }
     .btn-continue.visible { display: inline-block; }
+    .branding { font-size: 10px; color: var(--text-muted); margin-top: 10px; display: flex; flex-direction: column; gap: 3px; align-items: center; }
+    .branding .version { font-size: 10px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; opacity: 0; transition: opacity .4s ease; }
+    .branding .version.shown { opacity: 1; }
 
-    @keyframes fadeInScale {
-      from { opacity: 0; transform: scale(0.85); }
-      to { opacity: 1; transform: scale(1); }
-    }
-
-    @keyframes fadeIn {
-      from { opacity: 0; transform: translateY(4px); }
-      to { opacity: 1; transform: translateY(0); }
-    }
-
-    @keyframes spin {
-      to { transform: rotate(360deg); }
+    @keyframes fade { to { opacity: 1; } }
+    @keyframes rise { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes draw { to { stroke-dashoffset: 0; } }
+    @keyframes settle { 0% { transform: scale(.55); opacity: 0; } 60% { transform: scale(1.18); opacity: 1; } 100% { transform: scale(1); } }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
     }
   </style>
 </head>
 <body>
-  <div class="logo-container">
-    <img class="logo-icon" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAFAAAABQCAYAAACOEfKtAAAAIGNIUk0AAHomAACAhAAA+gAAAIDoAAB1MAAA6mAAADqYAAAXcJy6UTwAAAAGYktHRAD/AP8A/6C9p5MAAAAHdElNRQfqAg0QKDia2Ky9AAACPnpUWHRSYXcgcHJvZmlsZSB0eXBlIHhtcAAAOI2VVVu22zAI/GcVXYIMCOTl2JH113P62eV3QM3rxsltrRM/BGKGASn0++cv+hGXNyG5yPDmxRYT2626cjG2am6rHdKZj7Hv+2DG/GoaM9Wlapei3YsKfJutpM03x8IqvulR1fBEQBEsYpYhBxe5AHLzZlhoPcBs4RLfdrHDJWwUCGCjNoKHbNNwc08m9zCY22OF3lZwqU17LcRBbnhOifEhhTv4FAyEEJcVc4uYqIhUzF0wy5I/HngCDBYE6nADE/wK7iKNy5fBf9NjsDDZKquqfUmNKY2RXnPFQDCkMzwvPhxefCRjB/Iia4xkwrgz7n0CgJGLoz6hiDekBYSwP7MABZQKhWBbU6kVCsHjareFINhwCBusprCPtQiBX/km2HEvEd6F8NqRSgOfEG9Jucd5SO3onjdh6TnueVgE7CfBxbVG66bG9D3p8+DR3A694DMiHLmkRowFdcYPqSd2hNcQuCKIRu1qAAy7vDRlASM4hJPkW8l2C1RsAkbP5h6cVU0fXu8wqdmmYRWKslskUHXVrN10QlJrblKUHl2NPlY0osTVtKKbFF21aNXoLfQ94WOBE0zhhj3bsC0ggOgLciQiXmMfBsNnYAKyniLrOfI7YArk61HxhF6ziw3o+MB71K48lHxL5eQqDf2zNstnhvRGm0fkj9pcpaEXZP4/bRIY5yiFOjw+7/Kp4d1rnki32Tw/6fEcnqaTPwOkNI9953mO0x96xW3A+N1npQAAApJJREFUeNrtnDGLVDEURs/LzMoq6CJYuCCLWtgIglYWYieLWFr74yy08x8INoKdIBbaW2izFgouuM48izfLdpNkvvt8GfwOvGqGkBxuXpI7dwLGGGPMhnS5L1x9+nbqPk7Kt1cP1n4+n7qDE5ANGqAvbaxUYAIOgZs1jTdGD+wBVzJjmAHvgRclY62JwNvAfWAxtYkN6YF94KDAyTngJcEClwzytlngn9WTo3iMaepRbTsWKGKBIhYoYoEiFigyxkmkZKc/FV10/8YQ+A74THvRvQTuAQ9Zv0GeA18pPHFFC+yAj8CbCQSVcALcIH+UOyptcIwITJDPYvxrVlmlRH4KV03x1qbZ1mGBIhYoYoEiFihigSIWKGKBIhYoYoEiFihigSIWKDJGNqaHZmtqSnJ8VZUXYwi8zFABMAsYbMdZCkotKVkylHXskM8HFnuJFtgDT4BHQe0l4CJxr5odYJd8RnqvtMExIvD86okgAZeIfVfnIjlREfWjvQMD2zp9msSrsIgFiligiAWKWKBI66Udp6UYibiVOHRFrxG4YPhlP1f+egz8DupfWrUXMVN64ALDxjyMGoFHwBeGI9E6XgMfggZNYDsL4DHwjMAo3CQCcwJ/AN+jOhjMz+gGxygu6qDZ2phwvAqLWKCIBYpYoIgFiligiAWKWKCIBYpYoIgFiligiAWK1GRjSn6j7VklXLe4NqaKGoEHwB3yGekT4Bbt/WuzZ7h5JJRSgR1wHbhL/taLawxJ1RYJr3KInsJwdj1KaxE4Cl5ERCxQxAJFLFDEAkUsUKRmG1NafD2vbLc1ZlQEVulAe4brTH6x/iTSMWyij6e2IJCATwRfe7IEnlO+OW62pjma2qn234gxxhhjRucv/gts7OEgjFwAAAAldEVYdGRhdGU6Y3JlYXRlADIwMjYtMDItMTNUMTY6MzY6MjYrMDA6MDAsVF+YAAAAJXRFWHRkYXRlOm1vZGlmeQAyMDIwLTA1LTIxVDIyOjM0OjExKzAwOjAwQvnuFQAAACh0RVh0ZGF0ZTp0aW1lc3RhbXAAMjAyNi0wMi0xM1QxNjo0MDo1NiswMDowMCT8qiYAAAAZdEVYdFNvZnR3YXJlAEFkb2JlIEltYWdlUmVhZHlxyWU8AAAAAElFTkSuQmCC" alt="Project Orchestrator" />
-  </div>
-  <div class="title">Project Orchestrator</div>
-  <div class="subtitle">AI Agent Orchestrator</div>
+  <canvas id="fx" aria-hidden="true"></canvas>
 
-  <div class="checklist">
-    <div class="check-item" id="check-config">
-      <div class="check-icon"><div class="spinner"></div></div>
-      <div class="check-content">
-        <span class="check-label">Configuration</span>
+  <div class="stage">
+    <div class="logo-container">
+      <img class="logo-icon" src="data:image/png;base64,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" alt="Project Orchestrator" />
+    </div>
+    <div class="title">Project Orchestrator</div>
+    <div class="subtitle">AI agent orchestrator</div>
+
+    <div class="progress"><div class="fill" id="progress-fill"></div></div>
+
+    <div class="checklist">
+      <div class="check-item" id="check-config">
+        <div class="check-icon"><div class="spinner"></div></div>
+        <div class="check-content"><span class="check-label">Configuration</span></div>
+      </div>
+      <div class="check-item" id="check-claude">
+        <div class="check-icon"><div class="spinner"></div></div>
+        <div class="check-content"><span class="check-label">Claude Code CLI</span></div>
+      </div>
+      <div class="check-item" id="check-docker">
+        <div class="check-icon"><div class="spinner"></div></div>
+        <div class="check-content"><span class="check-label">Docker Desktop</span></div>
+      </div>
+      <div class="check-item" id="check-neo4j">
+        <div class="check-icon"><div class="spinner"></div></div>
+        <div class="check-content"><span class="check-label">Neo4j</span></div>
+      </div>
+      <div class="check-item" id="check-meilisearch">
+        <div class="check-icon"><div class="spinner"></div></div>
+        <div class="check-content"><span class="check-label">Meilisearch</span></div>
+      </div>
+      <div class="check-item" id="check-nats">
+        <div class="check-icon"><div class="spinner"></div></div>
+        <div class="check-content"><span class="check-label">NATS</span></div>
+      </div>
+      <div class="check-item" id="check-backend">
+        <div class="check-icon"><div class="spinner"></div></div>
+        <div class="check-content"><span class="check-label">Backend server</span></div>
       </div>
     </div>
-    <div class="check-item" id="check-claude">
-      <div class="check-icon"><div class="spinner"></div></div>
-      <div class="check-content">
-        <span class="check-label">Claude Code CLI</span>
-      </div>
-    </div>
-    <div class="check-item" id="check-docker">
-      <div class="check-icon"><div class="spinner"></div></div>
-      <div class="check-content">
-        <span class="check-label">Docker Desktop</span>
-      </div>
-    </div>
-    <div class="check-item" id="check-neo4j">
-      <div class="check-icon"><div class="spinner"></div></div>
-      <div class="check-content">
-        <span class="check-label">Neo4j</span>
-      </div>
-    </div>
-    <div class="check-item" id="check-meilisearch">
-      <div class="check-icon"><div class="spinner"></div></div>
-      <div class="check-content">
-        <span class="check-label">Meilisearch</span>
-      </div>
-    </div>
-    <div class="check-item" id="check-nats">
-      <div class="check-icon"><div class="spinner"></div></div>
-      <div class="check-content">
-        <span class="check-label">NATS</span>
-      </div>
-    </div>
-    <div class="check-item" id="check-backend">
-      <div class="check-icon"><div class="spinner"></div></div>
-      <div class="check-content">
-        <span class="check-label">Backend server</span>
-      </div>
+
+    <div class="footer">
+      <div class="status-text" id="status">Checking dependencies...</div>
+      <button class="btn-continue" id="btn-continue" onclick="continueAnyway()">Continue anyway</button>
+      <div class="branding">Freedom From Scratch<span class="version" id="version"></span></div>
     </div>
   </div>
 
-  <div class="footer">
-    <div class="status-text" id="status">Checking dependencies...</div>
-    <button class="btn-continue" id="btn-continue" onclick="continueAnyway()">Continue anyway</button>
-    <div class="branding">
-      <div class="branding-made-by">Made by</div>
-      <div class="branding-name">Freedom From Scratch</div>
-    </div>
-  </div>
+  <script>
+    // ========================================================================
+    // Small effects only. The window background is a flat colour; this transparent WebGL overlay
+    // draws just the transition where a row settles: a thin ring and a burst of particles that
+    // leave the tick (green: ok, red: error, amber: warning). Without WebGL there is simply no
+    // burst; the tick still draws itself in CSS.
+    // ========================================================================
+    (function () {
+      const canvas = document.getElementById('fx');
+      const gl = canvas.getContext('webgl', { antialias: false, alpha: true, premultipliedAlpha: true, powerPreference: 'low-power' });
+      if (!gl) return;
 
+      const VS = 'attribute vec2 p; void main(){ gl_Position = vec4(p, 0., 1.); }';
+      const FS = `
+        precision highp float;
+        uniform vec2  u_res;
+        uniform float u_time, u_dpr;
+        uniform vec4  u_burst[4];      // x, y (device px, from top-left), start time, kind (0 ok, 1 error, 2 warning)
+
+        float hash(float n){ return fract(sin(n * 127.1) * 43758.5453); }
+
+        void main(){
+          vec2 frag = vec2(gl_FragCoord.x, u_res.y - gl_FragCoord.y);
+          vec3 sum = vec3(0.);
+          float alpha = 0.;
+          for (int i = 0; i < 4; i++) {
+            vec4 b = u_burst[i];
+            float age = u_time - b.z;
+            if (b.z <= 0. || age < 0. || age > 1.0) continue;
+            vec2 p = frag - b.xy;
+            float r = length(p);
+            if (r > 46. * u_dpr) continue;
+            float k = age / 1.0;
+            float out_ = 1. - pow(1. - k, 3.);                 // ease-out
+            vec3 c = b.w < .5 ? vec3(.133, .773, .369)          // --success
+                   : (b.w < 1.5 ? vec3(.937, .267, .267)        // --error
+                                : vec3(.961, .620, .043));      // --warning
+            float a = 0.;
+            // Thin ring
+            float R = (3. + 15. * out_) * u_dpr;
+            a += exp(-pow((r - R) / (.8 * u_dpr), 2.)) * (1. - k) * .55;
+            // Particles: a dozen specks fly out along their own direction and fade
+            for (int j = 0; j < 14; j++) {
+              float fj = float(j) + b.z * 7.;
+              float ang = hash(fj * 1.7) * 6.2831853;
+              float spd = 10. + hash(fj * 3.1) * 24.;
+              vec2 pos = vec2(cos(ang), sin(ang)) * spd * out_ * u_dpr;
+              pos.y += 6. * k * k * u_dpr;                     // a little weight
+              float size = (1.9 - 1.3 * k) * u_dpr;
+              float d = length(p - pos);
+              float tw = .65 + .35 * sin(u_time * 30. + fj * 5.);
+              a += smoothstep(size, size * .35, d) * (1. - k) * tw;
+            }
+            a = clamp(a, 0., 1.);
+            sum += c * a;
+            alpha = max(alpha, a);
+          }
+          gl_FragColor = vec4(sum, alpha);                      // premultiplied
+        }`;
+
+      function compile(type, src) {
+        const sh = gl.createShader(type); gl.shaderSource(sh, src); gl.compileShader(sh);
+        if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) { console.warn(gl.getShaderInfoLog(sh)); return null; }
+        return sh;
+      }
+      const vs = compile(gl.VERTEX_SHADER, VS), fs = compile(gl.FRAGMENT_SHADER, FS);
+      if (!vs || !fs) return;
+      const prog = gl.createProgram();
+      gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) { console.warn(gl.getProgramInfoLog(prog)); return; }
+      gl.useProgram(prog);
+
+      const buf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+      const loc = gl.getAttribLocation(prog, 'p');
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+      const uRes = gl.getUniformLocation(prog, 'u_res'), uTime = gl.getUniformLocation(prog, 'u_time'),
+            uDpr = gl.getUniformLocation(prog, 'u_dpr'), uBurst = gl.getUniformLocation(prog, 'u_burst');
+
+      const t0 = performance.now();
+      const bursts = new Float32Array(16);
+      let nextBurst = 0, dpr = 1, running = false;
+
+      function resize() {
+        dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const w = Math.round(canvas.clientWidth * dpr), h = Math.round(canvas.clientHeight * dpr);
+        if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; gl.viewport(0, 0, w, h); }
+      }
+      window.addEventListener('resize', resize);
+
+      // Frames are drawn only while a burst is alive: an idle splash costs nothing.
+      function frame(now) {
+        resize();
+        const time = (now - t0) / 1000;
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.uniform2f(uRes, canvas.width, canvas.height);
+        gl.uniform1f(uTime, time);
+        gl.uniform1f(uDpr, dpr);
+        gl.uniform4fv(uBurst, bursts);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        const alive = [0, 1, 2, 3].some(i => bursts[i * 4 + 2] > 0 && time - bursts[i * 4 + 2] < 1.05);
+        if (alive) requestAnimationFrame(frame); else { running = false; gl.clear(gl.COLOR_BUFFER_BIT); }
+      }
+
+      window.__fxBurst = (element, state) => {
+        const r = element.getBoundingClientRect();
+        resize();
+        bursts.set([(r.left + r.width / 2) * dpr, (r.top + r.height / 2) * dpr,
+                    (performance.now() - t0) / 1000, state === 'error' ? 1 : state === 'warning' ? 2 : 0],
+                   (nextBurst++ % 4) * 4);
+        if (!running) { running = true; requestAnimationFrame(frame); }
+      };
+    })();
+  </script>
   <script>
     // ========================================================================
     // macOS Tauri 2 click fix — block touch events that interfere with mouse
@@ -345,7 +317,11 @@
       const content = el.querySelector('.check-content');
 
       // Update state class
+      const prevState = el.className.replace('check-item', '').trim();
       el.className = 'check-item ' + state;
+      if (state !== prevState && window.__fxBurst && ['success', 'error', 'warning'].includes(state)) {
+        window.__fxBurst(icon, state);
+      }
 
       // Update icon
       if (state === 'success') icon.innerHTML = ICON_OK;
@@ -375,6 +351,7 @@
       if (actionHtml) {
         el.insertAdjacentHTML('beforeend', actionHtml);
       }
+      updateProgress();
     }
 
     function showItem(id) {
@@ -388,7 +365,20 @@
     }
 
     function setStatus(text) {
-      document.getElementById('status').textContent = text;
+      const el = document.getElementById('status');
+      if (el.textContent === text) return;
+      el.classList.add('swap');
+      setTimeout(() => { el.textContent = text; el.classList.remove('swap'); }, 160);
+    }
+
+    // Progress = share of visible checks that reached a settled state.
+    function updateProgress() {
+      const items = [...document.querySelectorAll('.check-item')].filter(e => !e.classList.contains('hidden'));
+      if (!items.length) return;
+      const settled = items.filter(e => /\b(success|skipped|warning|error)\b/.test(e.className)).length;
+      const pct = Math.max(6, Math.round((settled / items.length) * 100));
+      document.getElementById('progress-fill').style.width = pct + '%';
+      if (settled === items.length) document.body.classList.add('done');
     }
 
     function openUrl(url) {
@@ -399,11 +389,36 @@
       }
     }
 
+    // Every call the splash makes to Rust is reported to the app log (webview_log), once per change
+    // of outcome, so a stuck splash can be diagnosed from the terminal: release builds have no
+    // inspector, and the splash window has no console bridge.
+    const lastOutcome = {};
+    function report(level, message) {
+      try { window.__TAURI__.core.invoke('webview_log', { level, message: '[splash] ' + message }); } catch (_) {}
+    }
+    window.addEventListener('error', e => report('error', 'uncaught: ' + e.message + ' @' + e.lineno));
+    window.addEventListener('unhandledrejection', e => report('error', 'unhandled rejection: ' + e.reason));
+
     async function invoke(cmd, args) {
-      if (window.__TAURI__) {
-        return window.__TAURI__.core.invoke(cmd, args || {});
+      if (!window.__TAURI__) throw new Error('Tauri not available');
+      const started = Date.now();
+      try {
+        const result = await window.__TAURI__.core.invoke(cmd, args || {});
+        const brief = JSON.stringify(result);
+        const outcome = 'ok ' + (brief || '').slice(0, 160);
+        if (cmd !== 'webview_log' && lastOutcome[cmd] !== outcome) {
+          lastOutcome[cmd] = outcome;
+          report('info', cmd + ' ' + JSON.stringify(args || {}) + ' -> ' + outcome + ' (' + (Date.now() - started) + 'ms)');
+        }
+        return result;
+      } catch (err) {
+        const outcome = 'ERR ' + String(err).slice(0, 160);
+        if (lastOutcome[cmd] !== outcome) {
+          lastOutcome[cmd] = outcome;
+          report('error', cmd + ' ' + JSON.stringify(args || {}) + ' -> ' + outcome);
+        }
+        throw err;
       }
-      throw new Error('Tauri not available');
     }
 
     function isGlobalTimeout() {
@@ -436,7 +451,11 @@
       setStatus('Checking dependencies...');
 
       try {
-        const deps = await invoke('check_dependencies');
+        // A hung backend call must never freeze the splash: give it a few seconds, then carry on.
+        const deps = await Promise.race([
+          invoke('check_dependencies'),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('check_dependencies timed out')), 8000)),
+        ]);
         platformOs = deps.os === 'windows' ? 'windows' : deps.os === 'linux' ? 'linux' : 'macos';
 
         // -- Configuration --
@@ -706,7 +725,7 @@
       setCheck('check-backend', '', 'Starting...');
       setStatus('Starting backend...');
 
-      const port = await invoke('get_server_port').catch(() => 6600);
+      const port = await resolveServerPort();
 
       while (!isGlobalTimeout()) {
         try {
@@ -734,7 +753,7 @@
     async function pollBackendHealthWithServices() {
       setCheck('check-backend', '', 'Starting...');
 
-      const port = await invoke('get_server_port').catch(() => 6600);
+      const port = await resolveServerPort();
 
       while (!isGlobalTimeout()) {
         try {
@@ -785,7 +804,13 @@
     // Transition & utility
     // ========================================================================
 
+    let leaving = false;
     async function transitionToMain() {
+      if (leaving) return;
+      leaving = true;
+      document.getElementById('progress-fill').style.width = '100%';
+      document.body.classList.add('leaving');
+      await sleep(320);   // let the exit animation play before the window closes
       // Signal the Rust backend thread to close the splash and show the main window.
       // The Rust thread waits for this signal (SPLASH_READY flag) before calling
       // show_main_window(). This makes the splash screen the single source of truth
@@ -797,9 +822,26 @@
       }
     }
 
+    // The backend thread publishes its port only after loading config.yaml.
+    // Until then get_server_port() returns 0, and probing localhost:0 can never
+    // succeed — wait for a real port instead of burning the whole timeout.
+    async function resolveServerPort() {
+      for (let i = 0; i < 150; i++) {            // up to ~30 s
+        try {
+          const p = await invoke('get_server_port');
+          if (p > 0) return p;
+        } catch (_) { /* Tauri not ready yet */ }
+        await sleep(200);
+      }
+      return 6600;
+    }
+
+    // "Continue anyway" used to only hide the button, leaving the splash stuck
+    // forever. Actually hand over to the main window.
     function continueAnyway() {
-      setStatus('Waiting for backend...');
+      setStatus('Opening app...');
       document.getElementById('btn-continue').classList.remove('visible');
+      transitionToMain();
     }
 
     function sleep(ms) {
@@ -811,6 +853,15 @@
     // ========================================================================
 
     if (window.__TAURI__) {
+      // The version of THIS build (tauri.conf.json, stamped by build-desktop.sh / the release workflow).
+      try {
+        window.__TAURI__.app.getVersion().then(v => {
+          const el = document.getElementById('version');
+          el.textContent = 'v' + v;
+          el.classList.add('shown');
+        }).catch(e => report('warn', 'getVersion failed: ' + e));
+      } catch (e) { report('warn', 'getVersion unavailable: ' + e); }
+      report('info', 'splash started, platform ' + navigator.userAgent.slice(0, 60));
       runChecks();
     } else {
       window.addEventListener('DOMContentLoaded', () => {
