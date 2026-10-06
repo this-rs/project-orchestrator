@@ -125,6 +125,52 @@ else
     fi
 fi
 
+# ── Local version stamp ─────────────────────────────────────────────────────
+# CI injects the tag version into Cargo.toml / tauri.conf.json (release.yml).
+# Locally nothing did, so every build said 0.1.0. Derive it from git instead:
+#   exactly on tag v0.0.16  -> 0.0.16
+#   3 commits after it      -> 0.0.16-dev-<short sha>   (+ "-dirty" if uncommitted)
+# The files are restored on exit (even on failure), lockfiles included.
+if [ -z "${VERSION_OVERRIDE:-}" ]; then
+    DESC="$(git -C "$PROJECT_DIR" describe --tags --match 'v[0-9]*' --long 2>/dev/null || true)"
+    if [[ "$DESC" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)-g([0-9a-f]+)$ ]]; then
+        BASE="${BASH_REMATCH[1]}"; AHEAD="${BASH_REMATCH[2]}"; SHA="${BASH_REMATCH[3]}"
+        if [ "$AHEAD" = "0" ] && [ -z "$(git -C "$PROJECT_DIR" status --porcelain --untracked-files=no)" ]; then
+            BUILD_VERSION="$BASE"
+        else
+            BUILD_VERSION="$BASE-dev-$SHA"
+            [ -n "$(git -C "$PROJECT_DIR" status --porcelain --untracked-files=no)" ] && BUILD_VERSION="$BUILD_VERSION-dirty"
+        fi
+    else
+        BUILD_VERSION="0.0.0-dev-$(git -C "$PROJECT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    fi
+else
+    BUILD_VERSION="$VERSION_OVERRIDE"
+fi
+
+STAMPED=(Cargo.toml Cargo.lock desktop/src-tauri/Cargo.toml desktop/src-tauri/Cargo.lock desktop/src-tauri/tauri.conf.json)
+STAMP_BAK="$(mktemp -d)"
+for f in "${STAMPED[@]}"; do
+    [ -f "$PROJECT_DIR/$f" ] && { mkdir -p "$STAMP_BAK/$(dirname "$f")"; cp -p "$PROJECT_DIR/$f" "$STAMP_BAK/$f"; }
+done
+restore_stamp() {
+    for f in "${STAMPED[@]}"; do
+        [ -f "$STAMP_BAK/$f" ] && cp -p "$STAMP_BAK/$f" "$PROJECT_DIR/$f"
+    done
+    rm -rf "$STAMP_BAK"
+}
+trap restore_stamp EXIT
+
+# perl, not sed: the GNU-only `0,/re/` address that CI uses is silently ignored by macOS's BSD sed
+# (exit 0, nothing replaced), which left Cargo.toml at 0.1.0 in local builds.
+VERSION="$BUILD_VERSION" perl -0pi -e 's/^version = "[^"]*"/version = "$ENV{VERSION}"/m' "$PROJECT_DIR/Cargo.toml"
+VERSION="$BUILD_VERSION" perl -0pi -e 's/^version = "[^"]*"/version = "$ENV{VERSION}"/m' "$DESKTOP_DIR/src-tauri/Cargo.toml"
+VERSION="$BUILD_VERSION" perl -0pi -e 's/"version": "[^"]*"/"version": "$ENV{VERSION}"/' "$DESKTOP_DIR/src-tauri/tauri.conf.json"
+for f in "$PROJECT_DIR/Cargo.toml" "$DESKTOP_DIR/src-tauri/Cargo.toml" "$DESKTOP_DIR/src-tauri/tauri.conf.json"; do
+    grep -q "\"\?version\"\? *[=:] *\"${BUILD_VERSION}\"" "$f" || { log_err "version stamp did not apply to $f"; exit 1; }
+done
+log_ok "Version stamped: ${BUILD_VERSION}"
+
 # ── Step 3: Build backend binary (mcp_server) ──────────────────────────────
 if [ "$SKIP_BACK" = false ]; then
     log_step "Building mcp_server (release)"

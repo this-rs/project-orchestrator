@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- macOS 15 (Sequoia) blocks an app's connections to other machines of the local network
+         until the user allows it under Privacy & Security > Local Network. Without this string
+         the app cannot ask properly and the connection fails with "No route to host" (os error
+         65), which looks like a dead service. Neo4j, Meilisearch and NATS may live on the LAN
+         (infra_mode: external). -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Project Orchestrator connects to the Neo4j, Meilisearch and NATS services you configured, which may run on your local network.</string>
+    <!-- The embedded web view may load http:// pages of the local network (a .local name, a LAN
+         address). Plain localhost already works; this keeps the others from being refused. -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
+</dict>
+</plist>

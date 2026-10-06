@@ -486,17 +486,7 @@ pub struct DependencyStatus {
 pub async fn check_dependencies(
     docker: tauri::State<'_, crate::docker::SharedDockerManager>,
 ) -> Result<DependencyStatus, String> {
-    // Docker check — fine-grained status (async via bollard)
-    let docker_status = {
-        let mgr = docker.read().await;
-        mgr.status().await
-    };
-    let docker_available = docker_status == crate::docker::DockerStatus::Running;
-
-    // Claude Code CLI check
-    let claude_code_available = project_orchestrator::setup_claude::detect_claude_cli().is_some();
-
-    // Config file check + read config for infra_mode, credentials, etc.
+    // Config first: it is a file read, and it says whether Docker matters at all.
     let config_path = config_path();
     let config_exists = config_path.exists();
 
@@ -538,6 +528,33 @@ pub async fn check_dependencies(
         } else {
             (false, "docker".to_string(), true, None, None)
         };
+
+    // Docker status — only when the services are meant to run in Docker, and never for long.
+    // A Docker Desktop that is frozen (its socket accepts and never answers) used to block this
+    // command forever: the splash stayed on its first screen, with every service unchecked, even
+    // though the user's own Neo4j/Meilisearch/NATS were up and `infra_mode: external` needs no
+    // Docker at all.
+    let docker_status = if infra_mode == "external" {
+        crate::docker::DockerStatus::NotInstalled
+    } else {
+        let probe = async {
+            let mgr = docker.read().await;
+            mgr.status().await
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(5), probe).await {
+            Ok(status) => status,
+            Err(_) => {
+                tracing::warn!(
+                    "Docker did not answer within 5 s — treating it as installed but not running"
+                );
+                crate::docker::DockerStatus::Installed
+            }
+        }
+    };
+    let docker_available = docker_status == crate::docker::DockerStatus::Running;
+
+    // Claude Code CLI check
+    let claude_code_available = project_orchestrator::setup_claude::detect_claude_cli().is_some();
 
     // Platform info
     let os = std::env::consts::OS.to_string();

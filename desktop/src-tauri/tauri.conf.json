@@ -9,6 +9,7 @@
   },
   "app": {
     "withGlobalTauri": true,
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "splashscreen",
@@ -20,7 +21,8 @@
         "fullscreen": false,
         "center": true,
         "decorations": false,
-        "transparent": false,
+        "transparent": true,
+        "shadow": false,
         "alwaysOnTop": true
       }
     ],

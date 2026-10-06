@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod docker;
+mod net;
 mod plugins;
 mod setup;
 mod tray;
@@ -58,7 +59,15 @@ async fn check_health(port: u16) -> Result<Option<serde_json::Value>, String> {
             Ok(body) => Ok(Some(body)),
             Err(_) => Ok(Some(serde_json::json!({"status": "ok"}))),
         },
-        Err(_) => Ok(None),
+        Err(e) => {
+            // The splash polls every 200 ms: say why once, not 600 times.
+            static REPORTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!("check_health {} failed: {}", url, e);
+            }
+            Ok(None)
+        }
     }
 }
 
@@ -161,6 +170,8 @@ fn main() {
             get_server_port,
             proceed_to_main,
             check_health,
+            net::probe_services,
+            net::test_connection_detailed,
             open_url,
             pick_directory,
             restart_app,
@@ -199,6 +210,7 @@ fn main() {
             plugins::mac_rounded_corners::reposition_traffic_lights,
         ])
         .setup(move |app| {
+            style_splash_window(app.handle());
             // Create system tray
             if let Err(e) = tray::create_tray(app.handle()) {
                 tracing::warn!("Failed to create system tray: {}", e);
@@ -490,6 +502,47 @@ fn main() {
             }
         }
     });
+}
+
+/// Give the borderless splash window native rounded corners and the app's dark
+/// background, so no square edge or white flash shows before the HTML paints.
+/// Same technique as the main window (corner radius on the content view layer);
+/// it avoids a transparent window, which would need macOS private APIs.
+fn style_splash_window(handle: &tauri::AppHandle) {
+    #[cfg(target_os = "macos")]
+    if let Some(splash) = handle.get_webview_window("splashscreen") {
+        let _ = splash.with_webview(|webview| unsafe {
+            use cocoa::appkit::{NSColor, NSView, NSWindow};
+            use cocoa::base::id;
+            use objc::{msg_send, sel, sel_impl};
+
+            let ns_window = webview.ns_window() as id;
+            let bg = NSColor::colorWithSRGBRed_green_blue_alpha_(
+                cocoa::base::nil,
+                11.0 / 255.0,
+                13.0 / 255.0,
+                19.0 / 255.0,
+                1.0,
+            );
+            // The window itself is clear and has no shadow: the rounded content view is the only
+            // thing drawn, so there is no frame, outline or square corner around it.
+            ns_window.setOpaque_(cocoa::base::NO);
+            ns_window.setBackgroundColor_(NSColor::clearColor(cocoa::base::nil));
+            ns_window.setHasShadow_(cocoa::base::NO);
+            let wk_webview = webview.inner() as id;
+            let _: () = msg_send![wk_webview, setUnderPageBackgroundColor: bg];
+
+            let content_view = ns_window.contentView();
+            content_view.setWantsLayer(cocoa::base::YES);
+            let layer: id = msg_send![content_view, layer];
+            if !layer.is_null() {
+                let _: () = msg_send![layer, setCornerRadius: 18.0_f64];
+                let _: () = msg_send![layer, setMasksToBounds: cocoa::base::YES];
+            }
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = handle;
 }
 
 /// Close the splash screen and show the main application window.

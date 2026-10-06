@@ -92,77 +92,99 @@ pub struct DockerConfig {
 // Docker Manager
 // ============================================================================
 
+/// How long one candidate endpoint gets to answer a ping. A Docker Desktop that is frozen
+/// accepts the connection and never answers; without a bound the whole check hangs with it.
+const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub struct DockerManager {
-    docker: Option<Docker>,
+    /// The connection that last answered. Never trusted blindly: it is pinged again, and
+    /// replaced when it stops answering or another runtime comes up.
+    current: std::sync::Mutex<Option<Docker>>,
+    /// Endpoints to try instead of the machine's own (tests).
+    endpoints_override: Option<Vec<String>>,
 }
 
 impl DockerManager {
-    /// Try to connect to Docker. Returns a manager even if Docker is unavailable.
+    /// A manager that finds Docker when it is asked, not once at launch.
     ///
-    /// On macOS, Docker Desktop may place its socket in different locations depending
-    /// on the version and architecture. We try multiple paths if the default fails.
+    /// It used to connect once, at startup. When Docker Desktop was not running yet (exactly the
+    /// case in which the splash offers to open it) there was no socket to connect to, the manager
+    /// kept "no Docker" for the life of the app, and `status()` stayed `Installed` after Docker
+    /// had come up: the splash waited for a Docker that was already running.
     pub fn new() -> Self {
-        // Try the default first (DOCKER_HOST env var, or /var/run/docker.sock)
-        let docker = Docker::connect_with_local_defaults().ok().or_else(|| {
-            // On macOS, Docker Desktop often uses ~/.docker/run/docker.sock
-            // instead of /var/run/docker.sock (especially on newer installs)
-            #[cfg(target_os = "macos")]
-            {
-                let home = std::env::var("HOME").unwrap_or_default();
-                let alt_sockets = [
-                    format!("{}/.docker/run/docker.sock", home),
-                    format!("{}/.docker/desktop/docker.sock", home),
-                    "/var/run/docker.sock.raw".to_string(),
-                ];
-                for socket in &alt_sockets {
-                    if std::path::Path::new(socket).exists() {
-                        tracing::info!("Trying Docker socket: {}", socket);
-                        let url = format!("unix://{}", socket);
-                        if let Ok(d) =
-                            Docker::connect_with_socket(&url, 5, bollard::API_DEFAULT_VERSION)
-                        {
-                            return Some(d);
-                        }
-                    }
-                }
+        Self {
+            current: std::sync::Mutex::new(None),
+            endpoints_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_endpoints(endpoints: Vec<String>) -> Self {
+        Self {
+            current: std::sync::Mutex::new(None),
+            endpoints_override: Some(endpoints),
+        }
+    }
+
+    fn candidates(&self) -> Vec<String> {
+        match &self.endpoints_override {
+            Some(list) => list.clone(),
+            None => docker_endpoints(),
+        }
+    }
+
+    /// A connection to a Docker that answers right now, or `None`.
+    async fn resolve(&self) -> Option<Docker> {
+        let cached = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(docker) = cached {
+            if answers(&docker).await {
+                return Some(docker);
             }
-            None
-        });
-        Self { docker }
+            *self
+                .current
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+        for endpoint in self.candidates() {
+            let Some(docker) = connect(&endpoint) else {
+                continue;
+            };
+            if answers(&docker).await {
+                tracing::info!("Docker answers on {}", endpoint);
+                *self
+                    .current
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(docker.clone());
+                return Some(docker);
+            }
+            tracing::debug!("Docker endpoint {} exists but does not answer", endpoint);
+        }
+        None
     }
 
     /// Check if Docker daemon is reachable.
     pub async fn is_available(&self) -> bool {
-        match &self.docker {
-            Some(docker) => docker.ping().await.is_ok(),
-            None => false,
-        }
+        self.resolve().await.is_some()
     }
 
     /// Return fine-grained Docker status: Running, Installed, or NotInstalled.
     ///
-    /// - `Running` → daemon is reachable (ping OK)
-    /// - `Installed` → binary/app exists on disk but daemon is not responding
-    /// - `NotInstalled` → no Docker found on this machine
+    /// - `Running` → a daemon answers a ping (on any known endpoint)
+    /// - `Installed` → a socket or an app/CLI is on disk but nothing answers (not started, or frozen)
+    /// - `NotInstalled` → no trace of Docker on this machine
     pub async fn status(&self) -> DockerStatus {
-        match &self.docker {
-            Some(docker) => {
-                // bollard connected to the socket — try pinging the daemon
-                if docker.ping().await.is_ok() {
-                    DockerStatus::Running
-                } else {
-                    // Socket exists but daemon not responding → installed but not started
-                    DockerStatus::Installed
-                }
-            }
-            None => {
-                // bollard couldn't connect at all — check if Docker is installed on disk
-                if Self::is_docker_installed_on_disk() {
-                    DockerStatus::Installed
-                } else {
-                    DockerStatus::NotInstalled
-                }
-            }
+        if self.resolve().await.is_some() {
+            return DockerStatus::Running;
+        }
+        let socket_present = self.candidates().iter().any(|e| endpoint_exists(e));
+        if socket_present || Self::is_docker_installed_on_disk() {
+            DockerStatus::Installed
+        } else {
+            DockerStatus::NotInstalled
         }
     }
 
@@ -170,16 +192,33 @@ impl DockerManager {
     fn is_docker_installed_on_disk() -> bool {
         #[cfg(target_os = "macos")]
         {
-            // Docker Desktop for macOS installs to /Applications/Docker.app
-            if std::path::Path::new("/Applications/Docker.app").exists() {
-                return true;
+            let home = dirs::home_dir().unwrap_or_default();
+            // Docker Desktop, OrbStack, Rancher Desktop, Podman Desktop; system and per-user.
+            let apps = [
+                "Docker.app",
+                "OrbStack.app",
+                "Rancher Desktop.app",
+                "Podman Desktop.app",
+            ];
+            for app in apps {
+                if std::path::Path::new("/Applications").join(app).exists()
+                    || home.join("Applications").join(app).exists()
+                {
+                    return true;
+                }
             }
-            // Also check for docker CLI in PATH (e.g. colima, rancher desktop)
-            std::process::Command::new("which")
-                .arg("docker")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
+            // The CLI. A GUI app's PATH is /usr/bin:/bin:/usr/sbin:/sbin, which does NOT contain
+            // Homebrew, Colima or OrbStack: `which docker` said "not installed" for all of them.
+            let dirs = [
+                std::path::PathBuf::from("/usr/local/bin"),
+                std::path::PathBuf::from("/opt/homebrew/bin"),
+                std::path::PathBuf::from("/usr/bin"),
+                home.join(".orbstack/bin"),
+                home.join(".rd/bin"),
+                home.join(".docker/bin"),
+                home.join(".colima/bin"),
+            ];
+            dirs.iter().any(|dir| dir.join("docker").exists())
         }
 
         #[cfg(target_os = "linux")]
@@ -189,6 +228,7 @@ impl DockerManager {
                 .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false)
+                || std::path::Path::new("/usr/bin/docker").exists()
         }
 
         #[cfg(target_os = "windows")]
@@ -217,15 +257,16 @@ impl DockerManager {
         }
     }
 
-    fn docker(&self) -> Result<&Docker, String> {
-        self.docker
-            .as_ref()
-            .ok_or_else(|| "Docker is not available".into())
+    /// A connection to Docker, found now.
+    async fn docker(&self) -> Result<Docker, String> {
+        self.resolve()
+            .await
+            .ok_or_else(|| "Docker is not available".to_string())
     }
 
     /// Pull an image if it's not already present locally.
     async fn ensure_image(&self, image: &str) -> Result<(), String> {
-        let docker = self.docker()?;
+        let docker = self.docker().await?;
 
         // Check if image exists locally
         if docker.inspect_image(image).await.is_ok() {
@@ -256,7 +297,7 @@ impl DockerManager {
 
     /// Check if a container exists (running or stopped).
     async fn container_exists(&self, name: &str) -> Result<bool, String> {
-        let docker = self.docker()?;
+        let docker = self.docker().await?;
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
         filters.insert("name".to_string(), vec![name.to_string()]);
 
@@ -281,7 +322,7 @@ impl DockerManager {
 
     /// Check if a container is running.
     async fn container_running(&self, name: &str) -> Result<bool, String> {
-        let docker = self.docker()?;
+        let docker = self.docker().await?;
         match docker.inspect_container(name, None).await {
             Ok(info) => Ok(info.state.and_then(|s| s.running).unwrap_or(false)),
             Err(_) => Ok(false),
@@ -290,7 +331,7 @@ impl DockerManager {
 
     /// Start Neo4j, MeiliSearch, and optionally NATS containers.
     pub async fn start_services(&self, config: &DockerConfig) -> Result<(), String> {
-        let docker = self.docker()?;
+        let docker = self.docker().await?;
 
         // Pull images in parallel (only pull NATS if enabled)
         let (r1, r2) = tokio::join!(
@@ -535,7 +576,7 @@ impl DockerManager {
 
     /// Stop both services gracefully.
     pub async fn stop_services(&self) -> Result<(), String> {
-        let docker = self.docker()?;
+        let docker = self.docker().await?;
 
         for name in [NEO4J_CONTAINER, MEILISEARCH_CONTAINER, NATS_CONTAINER] {
             if self.container_running(name).await.unwrap_or(false) {
@@ -553,7 +594,7 @@ impl DockerManager {
 
     /// Get recent logs from a container.
     pub async fn get_logs(&self, service: &str, tail: u64) -> Result<Vec<String>, String> {
-        let docker = self.docker()?;
+        let docker = self.docker().await?;
 
         let name = match service {
             "neo4j" => NEO4J_CONTAINER,
@@ -580,6 +621,124 @@ impl DockerManager {
 
         Ok(lines)
     }
+}
+
+// ============================================================================
+// Finding Docker
+// ============================================================================
+
+/// Every place a Docker daemon may listen on this machine, most specific first, without
+/// repeats. A GUI app does not inherit the shell's `DOCKER_HOST`, and `docker context` may point
+/// at OrbStack or Colima, so the well-known sockets of the common runtimes are listed too.
+pub(crate) fn docker_endpoints() -> Vec<String> {
+    endpoints_for(
+        std::env::var("DOCKER_HOST").ok().as_deref(),
+        dirs::home_dir().as_deref(),
+        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+    )
+}
+
+fn endpoints_for(
+    docker_host: Option<&str>,
+    home: Option<&std::path::Path>,
+    xdg_runtime_dir: Option<&str>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // Only local endpoints: a tcp:// or ssh:// host is somebody else's daemon.
+    let mut push = |endpoint: String| {
+        if (endpoint.starts_with("unix://") || endpoint.starts_with("npipe://"))
+            && !out.contains(&endpoint)
+        {
+            out.push(endpoint);
+        }
+    };
+    if let Some(host) = docker_host.filter(|h| !h.trim().is_empty()) {
+        push(host.trim().to_string());
+    }
+    if let Some(home) = home {
+        if let Some(host) = current_context_host(home) {
+            push(host);
+        }
+    }
+    #[cfg(windows)]
+    push("npipe:////./pipe/docker_engine".to_string());
+    push("unix:///var/run/docker.sock".to_string());
+    if let Some(home) = home {
+        for relative in [
+            ".docker/run/docker.sock",     // Docker Desktop (4.13+ default)
+            ".docker/desktop/docker.sock", // Docker Desktop (older / alternative)
+            ".orbstack/run/docker.sock",   // OrbStack
+            ".colima/default/docker.sock", // Colima
+            ".colima/docker.sock",
+            ".rd/docker.sock",               // Rancher Desktop
+            ".lima/docker/sock/docker.sock", // Lima
+        ] {
+            push(format!("unix://{}", home.join(relative).display()));
+        }
+    }
+    push("unix:///var/run/docker.sock.raw".to_string());
+    if let Some(dir) = xdg_runtime_dir.filter(|d| !d.is_empty()) {
+        push(format!("unix://{dir}/docker.sock")); // rootless Docker on Linux
+    }
+    out
+}
+
+/// The endpoint of the Docker context selected with `docker context use`, if it is a local one.
+/// `~/.docker/config.json` names the context; its endpoint is in
+/// `~/.docker/contexts/meta/<hash>/meta.json`.
+fn current_context_host(home: &std::path::Path) -> Option<String> {
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.join(".docker/config.json")).ok()?).ok()?;
+    let name = config.get("currentContext")?.as_str()?;
+    if name.is_empty() || name == "default" {
+        return None;
+    }
+    for entry in std::fs::read_dir(home.join(".docker/contexts/meta"))
+        .ok()?
+        .flatten()
+    {
+        let Ok(bytes) = std::fs::read(entry.path().join("meta.json")) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        if meta.get("Name").and_then(|n| n.as_str()) == Some(name) {
+            return meta
+                .pointer("/Endpoints/docker/Host")
+                .and_then(|h| h.as_str())
+                .map(str::to_owned);
+        }
+    }
+    None
+}
+
+fn endpoint_exists(endpoint: &str) -> bool {
+    match endpoint.strip_prefix("unix://") {
+        Some(path) => std::path::Path::new(path).exists(),
+        // A named pipe cannot be told from a stale name without opening it.
+        None => cfg!(windows),
+    }
+}
+
+/// A client for `endpoint`, if there is anything there to connect to.
+fn connect(endpoint: &str) -> Option<Docker> {
+    if !endpoint_exists(endpoint) {
+        return None;
+    }
+    #[cfg(windows)]
+    if endpoint.starts_with("npipe://") {
+        return Docker::connect_with_local_defaults().ok();
+    }
+    Docker::connect_with_socket(endpoint, 5, bollard::API_DEFAULT_VERSION).ok()
+}
+
+/// Whether the daemon answers a ping, within [`PING_TIMEOUT`].
+async fn answers(docker: &Docker) -> bool {
+    matches!(
+        tokio::time::timeout(PING_TIMEOUT, docker.ping()).await,
+        Ok(Ok(_))
+    )
 }
 
 // ============================================================================
@@ -710,78 +869,207 @@ pub async fn get_service_logs(
 /// Timeout: 5 seconds.
 #[tauri::command]
 pub async fn test_connection(service: String, url: String) -> Result<bool, String> {
-    let timeout = std::time::Duration::from_secs(5);
-
-    match service.as_str() {
-        "neo4j" => {
-            // Parse bolt://host:port → TCP connect
-            let addr = parse_host_port(&url, 7687)?;
-            tracing::info!("Testing Neo4j connection to {}...", addr);
-            match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
-                Ok(Ok(_)) => Ok(true),
-                Ok(Err(e)) => {
-                    tracing::warn!("Neo4j connection failed: {}", e);
-                    Ok(false)
-                }
-                Err(_) => {
-                    tracing::warn!("Neo4j connection timed out");
-                    Ok(false)
-                }
-            }
-        }
-        "meilisearch" => {
-            // HTTP GET /health
-            let health_url = format!("{}/health", url.trim_end_matches('/'));
-            tracing::info!("Testing MeiliSearch connection to {}...", health_url);
-            let client = reqwest::Client::builder()
-                .timeout(timeout)
-                .build()
-                .map_err(|e| format!("HTTP client error: {}", e))?;
-            match client.get(&health_url).send().await {
-                Ok(resp) if resp.status().is_success() => Ok(true),
-                Ok(resp) => {
-                    tracing::warn!("MeiliSearch returned status {}", resp.status());
-                    Ok(false)
-                }
-                Err(e) => {
-                    tracing::warn!("MeiliSearch connection failed: {}", e);
-                    Ok(false)
-                }
-            }
-        }
-        "nats" => {
-            // Parse nats://host:port → TCP connect
-            let addr = parse_host_port(&url, 4222)?;
-            tracing::info!("Testing NATS connection to {}...", addr);
-            match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
-                Ok(Ok(_)) => Ok(true),
-                Ok(Err(e)) => {
-                    tracing::warn!("NATS connection failed: {}", e);
-                    Ok(false)
-                }
-                Err(_) => {
-                    tracing::warn!("NATS connection timed out");
-                    Ok(false)
-                }
-            }
-        }
-        _ => Err(format!("Unknown service: {}", service)),
+    // Kept for older frontends: the answer without the reason. See `net::test_connection_detailed`.
+    let result = crate::net::test_service(&service, &url).await?;
+    if !result.ok {
+        tracing::warn!(
+            "{} connection to {}:{} failed: {}",
+            service,
+            result.host,
+            result.port,
+            result.hint.as_deref().unwrap_or("no detail")
+        );
     }
+    Ok(result.ok)
 }
 
-/// Parse a URL like `bolt://host:port` or `nats://host:port` into `host:port`.
-/// Falls back to the given default port if the URL has no port.
-fn parse_host_port(url: &str, default_port: u16) -> Result<String, String> {
-    // Try to parse as a URL
-    if let Ok(parsed) = url::Url::parse(url) {
-        let host = parsed.host_str().unwrap_or("localhost");
-        let port = parsed.port().unwrap_or(default_port);
-        return Ok(format!("{}:{}", host, port));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pd-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
-    // Fallback: treat as host:port or just host
-    if url.contains(':') {
-        Ok(url.to_string())
-    } else {
-        Ok(format!("{}:{}", url, default_port))
+
+    fn unix(path: &Path) -> String {
+        format!("unix://{}", path.display())
+    }
+
+    /// A daemon that answers `/_ping`, the way Docker does.
+    fn serve_ping(path: &Path) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nApi-Version: 1.45\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK",
+                        )
+                        .await;
+                });
+            }
+        })
+    }
+
+    /// A daemon that takes the connection and never answers: a frozen Docker Desktop.
+    fn serve_frozen(path: &Path) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        })
+    }
+
+    #[test]
+    fn endpoints_start_with_the_environment_then_the_context_then_the_well_known_sockets() {
+        let home = scratch("endpoints");
+        let list = endpoints_for(Some("unix:///custom/docker.sock"), Some(&home), None);
+        assert_eq!(list[0], "unix:///custom/docker.sock");
+        let at = |needle: &str| list.iter().position(|e| e.ends_with(needle)).unwrap();
+        assert!(at("/var/run/docker.sock") > 0);
+        for runtime in [
+            ".docker/run/docker.sock",
+            ".orbstack/run/docker.sock",
+            ".colima/default/docker.sock",
+            ".rd/docker.sock",
+        ] {
+            assert!(
+                list.iter().any(|e| e.ends_with(runtime)),
+                "{runtime} missing"
+            );
+        }
+        let unique: std::collections::HashSet<_> = list.iter().collect();
+        assert_eq!(unique.len(), list.len(), "no endpoint is listed twice");
+    }
+
+    #[test]
+    fn a_remote_docker_host_is_never_used() {
+        let home = scratch("remote");
+        for host in ["tcp://10.0.0.5:2375", "ssh://user@server", "  "] {
+            let list = endpoints_for(Some(host), Some(&home), None);
+            assert!(
+                !list
+                    .iter()
+                    .any(|e| e.contains("10.0.0.5") || e.starts_with("ssh")),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_selected_docker_context_is_followed() {
+        let home = scratch("context");
+        let meta = home.join(".docker/contexts/meta/abc123");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::write(
+            home.join(".docker/config.json"),
+            r#"{"currentContext":"colima"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            meta.join("meta.json"),
+            r#"{"Name":"colima","Endpoints":{"docker":{"Host":"unix:///Users/me/.colima/default/docker.sock"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            current_context_host(&home).as_deref(),
+            Some("unix:///Users/me/.colima/default/docker.sock")
+        );
+        // It comes before the defaults.
+        assert_eq!(
+            endpoints_for(None, Some(&home), None)[0],
+            "unix:///Users/me/.colima/default/docker.sock"
+        );
+        // "default" and a missing config mean: no context to follow.
+        std::fs::write(
+            home.join(".docker/config.json"),
+            r#"{"currentContext":"default"}"#,
+        )
+        .unwrap();
+        assert_eq!(current_context_host(&home), None);
+        assert_eq!(current_context_host(&scratch("nocontext")), None);
+    }
+
+    #[tokio::test]
+    async fn docker_started_after_the_app_is_noticed() {
+        // The splash offers to open Docker Desktop when it is not running. The manager used to
+        // connect once at launch, found no socket, and never looked again.
+        let dir = scratch("late");
+        let socket = dir.join("docker.sock");
+        let manager = DockerManager::with_endpoints(vec![unix(&socket)]);
+        assert_ne!(
+            manager.status().await,
+            DockerStatus::Running,
+            "nothing is listening yet"
+        );
+
+        let _daemon = serve_ping(&socket);
+        assert_eq!(
+            manager.status().await,
+            DockerStatus::Running,
+            "it came up: it must be seen"
+        );
+        assert!(manager.is_available().await);
+    }
+
+    #[tokio::test]
+    async fn a_frozen_daemon_is_installed_not_running_and_the_check_returns() {
+        let dir = scratch("frozen");
+        let socket = dir.join("docker.sock");
+        let _daemon = serve_frozen(&socket);
+        let manager = DockerManager::with_endpoints(vec![unix(&socket)]);
+        let started = std::time::Instant::now();
+        let status = manager.status().await;
+        assert_eq!(
+            status,
+            DockerStatus::Installed,
+            "a socket is there, nobody answers"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_endpoint_that_answers_wins_and_a_dead_one_before_it_is_skipped() {
+        let dir = scratch("order");
+        let frozen = dir.join("a.sock");
+        let live = dir.join("b.sock");
+        let missing = dir.join("c.sock");
+        let _a = serve_frozen(&frozen);
+        let _b = serve_ping(&live);
+        let manager =
+            DockerManager::with_endpoints(vec![unix(&missing), unix(&frozen), unix(&live)]);
+        assert_eq!(manager.status().await, DockerStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_stops_answering_is_replaced_by_one_that_does() {
+        let dir = scratch("failover");
+        let first = dir.join("first.sock");
+        let second = dir.join("second.sock");
+        let daemon = serve_ping(&first);
+        let manager = DockerManager::with_endpoints(vec![unix(&first), unix(&second)]);
+        assert_eq!(manager.status().await, DockerStatus::Running);
+
+        // The first runtime goes away (its socket is removed), another comes up.
+        daemon.abort();
+        let _ = std::fs::remove_file(&first);
+        let _second = serve_ping(&second);
+        assert_eq!(manager.status().await, DockerStatus::Running);
     }
 }

@@ -24,6 +24,18 @@ fn main() {
         );
     }
 
+    // ── Splash: dist/ must carry the CURRENT splash.html ─────────────────
+    // The splash window loads "splash.html" from frontendDist (dist/), which Tauri embeds in the
+    // binary. A copy made only when the frontend is rebuilt (build-desktop.sh --skip-front does not)
+    // left an OLD splash inside new builds: fixes to splash.html never shipped.
+    let splash_src = Path::new("splash.html");
+    if splash_src.exists() {
+        if let Err(e) = fs::copy(splash_src, dist_dir.join("splash.html")) {
+            panic!("cannot copy splash.html into dist/: {e}");
+        }
+        println!("cargo:rerun-if-changed=splash.html");
+    }
+
     // ── Freshness check: warn if dist/ is older than 1 hour ─────────────
     if let Ok(meta) = fs::metadata(&index_html) {
         if let Ok(modified) = meta.modified() {
