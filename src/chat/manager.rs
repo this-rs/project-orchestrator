@@ -486,7 +486,6 @@ pub(crate) struct AgentSpecInput<'a> {
 /// What `authorize_provider_use` checks before a session's content is sent.
 pub(crate) struct ProviderUse<'a> {
     pub provider_id: &'a str,
-    pub provider: &'a Arc<dyn nexus_claude::agent::AgentProvider>,
     pub model: &'a str,
     pub mode: nexus_claude::agent::PolicyMode,
     pub project_slug: Option<&'a str>,
@@ -8301,12 +8300,13 @@ impl ChatManager {
     /// 1. the security gate: bound session tokens need a signing key (A32);
     /// 2. the project's consent, tied to the instance's CURRENT origin (A28);
     /// 3. the endpoint guard (A36), before any connection;
-    /// 4. `Trust` is refused when the provider declares no sandbox (A35);
+    /// 4. `Trust` is refused only for a remote machine whose record does not allow it:
+    ///    every other provider treats it like Claude Code does (decision of 2026-10-07,
+    ///    which replaces A35 — the sandbox level informs the user, it gates nothing);
     /// 5. the sending is journaled; a failed write refuses the opening (A37).
     pub(crate) async fn authorize_provider_use(&self, u: ProviderUse<'_>) -> Result<()> {
         let ProviderUse {
             provider_id,
-            provider,
             model,
             mode,
             project_slug,
@@ -8314,7 +8314,7 @@ impl ChatManager {
             session_id,
         } = u;
         use super::provider::{endpoint_guard, resolver, store};
-        use nexus_claude::agent::{PolicyMode, ProviderError, SandboxLevel};
+        use nexus_claude::agent::{PolicyMode, ProviderError};
         if provider_id == resolver::CLAUDE_CODE {
             return Ok(());
         }
@@ -8359,14 +8359,10 @@ impl ChatManager {
                 provider_id.into(),
             )));
         }
-        // A remote machine may run `Trust` only when its record says so
-        // explicitly (A35, per machine): the tools run where nobody is watching.
-        let trust_allowed =
-            record.kind == super::provider::settings::KIND_CLAUDE_CODE_REMOTE && record.allow_trust;
-        if mode == PolicyMode::Trust
-            && !trust_allowed
-            && provider.capabilities(Some(model)).sandbox == SandboxLevel::None
-        {
+        // A remote machine may run `Trust` only when its record says so explicitly (per
+        // machine): the tools run where nobody is watching. Any other provider behaves like
+        // Claude Code: `trust` opens, whatever its sandbox.
+        if mode == PolicyMode::Trust && Self::trust_needs_opt_in(&record) {
             return Err(anyhow::Error::new(ProviderError::unsupported("sandbox")));
         }
         let entry = serde_json::json!({
@@ -8395,6 +8391,12 @@ impl ChatManager {
             }));
         }
         Ok(())
+    }
+
+    /// Whether this instance only runs `Trust` when its own record allows it: a Claude Code on
+    /// another machine, whose tools run where nobody is watching. No other provider is held to it.
+    pub(crate) fn trust_needs_opt_in(record: &super::provider::settings::InstanceRecord) -> bool {
+        record.kind == super::provider::settings::KIND_CLAUDE_CODE_REMOTE && !record.allow_trust
     }
 
     /// Names of the server variables handed to an agent besides the base
@@ -8536,15 +8538,21 @@ impl ChatManager {
         let provider = self.provider_for(provider_id).await?;
         let remote_cwd = self.remote_cwd_of(provider_id).await?;
         let sid = session_id.to_string();
-        // A run (an executor) on a third-party provider never gets `Trust`: it
-        // runs under `ask` with the restricted profile (A35). A pilot asking for
-        // `Trust` is refused instead (authorize_provider_use), never downgraded.
+        // A run (an executor) on a remote machine that does not allow `Trust` runs under `ask`
+        // instead (a pilot asking for it is refused in authorize_provider_use). Every other
+        // provider keeps the mode it was asked: it behaves like Claude Code (decision of
+        // 2026-10-07, which replaces A35).
         let permission_mode = match request.permission_mode.as_deref() {
             Some(mode)
-                if provider_id != super::provider::resolver::CLAUDE_CODE
-                    && request.spawned_by.is_some()
+                if request.spawned_by.is_some()
                     && super::provider::policy::parse_mode(mode)
-                        .is_some_and(|p| p.neutral == nexus_claude::agent::PolicyMode::Trust) =>
+                        .is_some_and(|p| p.neutral == nexus_claude::agent::PolicyMode::Trust)
+                    && match super::provider::store::instance(self.graph.as_ref(), provider_id)
+                        .await?
+                    {
+                        Some(record) => Self::trust_needs_opt_in(&record),
+                        None => false,
+                    } =>
             {
                 Some("default")
             }
@@ -8569,7 +8577,6 @@ impl ChatManager {
         if let Err(e) = self
             .authorize_provider_use(ProviderUse {
                 provider_id,
-                provider: &provider,
                 model: spec.model.as_deref().unwrap_or(model),
                 mode: spec.policy.mode,
                 project_slug,
@@ -8706,7 +8713,6 @@ impl ChatManager {
         if let Err(e) = self
             .authorize_provider_use(ProviderUse {
                 provider_id: &provider_id,
-                provider: &provider,
                 model: &node.model,
                 mode: spec.policy.mode,
                 project_slug: node.project_slug.as_deref(),
