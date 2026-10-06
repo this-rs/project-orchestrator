@@ -354,6 +354,7 @@ impl Neo4jClient {
                 SET t.status = $status,
                     t.started_at = datetime($now),
                     t.updated_at = datetime($now)
+                REMOVE t.interrupted_at, t.interrupted_reason
                 "#,
             ),
             TaskStatus::Completed | TaskStatus::Failed => query(
@@ -362,6 +363,7 @@ impl Neo4jClient {
                 SET t.status = $status,
                     t.completed_at = datetime($now),
                     t.updated_at = datetime($now)
+                REMOVE t.interrupted_at, t.interrupted_reason
                 "#,
             ),
             TaskStatus::Blocked => query(
@@ -373,9 +375,10 @@ impl Neo4jClient {
                         ELSE coalesce(t.frustration_score, 0.0) + 0.2
                     END,
                     t.updated_at = datetime($now)
+                REMOVE t.interrupted_at, t.interrupted_reason
                 "#,
             ),
-            // Leaving `Interrupted` (resumed, closed, parked as pending) ends the interruption.
+            // Every arm ends an interruption: resumed, closed, blocked or parked as pending.
             _ => query(
                 r#"
                 MATCH (t:Task {id: $id})
