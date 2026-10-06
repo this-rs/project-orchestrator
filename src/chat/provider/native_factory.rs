@@ -88,6 +88,21 @@ pub async fn probe_instance(
     })
 }
 
+/// Models an OpenAI-compatible instance lists (`GET /models`), in the order the
+/// endpoint gives them. Nothing is stored; the key is read for this request only.
+pub async fn list_models(
+    record: &InstanceRecord,
+    vault: Option<Arc<VaultService>>,
+) -> Result<Vec<String>, ProviderError> {
+    let provider = build_native(record, vault)?;
+    Ok(provider
+        .catalog()
+        .await?
+        .into_iter()
+        .map(|m| m.id)
+        .collect())
+}
+
 fn build_native(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,

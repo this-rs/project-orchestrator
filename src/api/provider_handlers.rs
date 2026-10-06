@@ -460,6 +460,18 @@ pub async fn send_journal(
     Ok(Json(json!({ "entries": entries })))
 }
 
+/// The stored default stays first and is kept even when the endpoint does not
+/// list it (some gateways answer with a partial list); duplicates collapse.
+fn merge_listed_models(mut listed: Vec<String>, default: Option<&str>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    listed.retain(|m| seen.insert(m.clone()));
+    if let Some(d) = default {
+        listed.retain(|m| m != d);
+        listed.insert(0, d.to_string());
+    }
+    listed
+}
+
 /// GET /api/chat/providers/{id}/models — models of one instance.
 pub async fn provider_models(
     State(state): State<OrchestratorState>,
@@ -480,8 +492,38 @@ pub async fn provider_models(
         .map_err(AppError::Internal)?
         .and_then(|v| parse(&v))
         .ok_or_else(|| AppError::NotFound(format!("unknown provider instance '{id}'")))?;
-    Ok(Json(json!(record
+    let stored: Vec<Value> = record
         .default_model
+        .iter()
+        .map(|m| json!({ "id": m }))
+        .collect();
+    // A process instance (codex, acp) chooses its own models: only the stored
+    // default is known here.
+    if st::is_process_kind(&record.kind) {
+        return Ok(Json(json!(stored)));
+    }
+    // An OpenAI-compatible endpoint lists its models (`GET /models`). Ask it:
+    // answering with the stored default alone left an instance saved without a
+    // default with an empty picker, so no session could ever name a model.
+    // A refusal or an unreachable endpoint falls back to the stored default; the
+    // chat shows its own state card for the failure when a session is opened.
+    let listed = match crate::chat::provider::native_factory::list_models(
+        &record,
+        Some(state.vault.clone()),
+    )
+    .await
+    {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(provider = %record.id, error = %e, "model listing failed");
+            Vec::new()
+        }
+    };
+    if listed.is_empty() {
+        return Ok(Json(json!(stored)));
+    }
+    let ids = merge_listed_models(listed, record.default_model.as_deref());
+    Ok(Json(json!(ids
         .iter()
         .map(|m| json!({ "id": m }))
         .collect::<Vec<_>>())))
@@ -753,3 +795,33 @@ pub async fn put_policy(
 #[allow(dead_code)]
 #[derive(Serialize)]
 struct _Unused;
+
+#[cfg(test)]
+mod listed_models_tests {
+    use super::merge_listed_models;
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn the_endpoint_order_is_kept_without_a_default() {
+        assert_eq!(
+            merge_listed_models(v(&["deepseek-chat", "deepseek-reasoner"]), None),
+            v(&["deepseek-chat", "deepseek-reasoner"])
+        );
+    }
+
+    #[test]
+    fn the_stored_default_comes_first_and_is_not_repeated() {
+        assert_eq!(
+            merge_listed_models(v(&["a", "b", "c"]), Some("b")),
+            v(&["b", "a", "c"])
+        );
+    }
+
+    #[test]
+    fn a_default_the_endpoint_does_not_list_is_kept() {
+        assert_eq!(merge_listed_models(v(&["a"]), Some("z")), v(&["z", "a"]));
+    }
+}
