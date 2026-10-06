@@ -1954,7 +1954,8 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         .route(
             "/api/chat/providers/{id}",
-            put(provider_handlers::update_provider)
+            get(provider_handlers::get_provider)
+                .put(provider_handlers::update_provider)
                 .patch(provider_handlers::update_provider)
                 .delete(provider_handlers::delete_provider),
         )

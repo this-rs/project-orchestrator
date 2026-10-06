@@ -309,6 +309,28 @@ pub async fn create_provider(
     Ok((StatusCode::CREATED, Json(instance_view(&record))))
 }
 
+/// GET /api/chat/providers/{id} — the stored detail of one instance, for the
+/// edit form: the full `base_url` (path included), model, preset, cost source
+/// and credential REFERENCE. Human only: the listing deliberately never shows a
+/// path, and this route is the one that does. Never a secret value.
+pub async fn get_provider(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    require_human(&state, &claims)?;
+    if id == CLAUDE_CODE {
+        return Err(map_settings_error(SettingsError::Builtin));
+    }
+    let record: InstanceRecord = graph(&state)
+        .get_llm_setting(GLOBAL, &format!("{INSTANCE_PREFIX}{id}"))
+        .await
+        .map_err(AppError::Internal)?
+        .and_then(|v| parse(&v))
+        .ok_or_else(|| map_settings_error(SettingsError::UnknownInstance(id.clone())))?;
+    Ok(Json(instance_view(&record)))
+}
+
 /// PUT|PATCH /api/chat/providers/{id} — change an instance (never its id).
 pub async fn update_provider(
     State(state): State<OrchestratorState>,

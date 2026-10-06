@@ -149,6 +149,7 @@
     "instances": {
       "POST /api/chat/providers/test": "corps ProviderDraft -> 200 {ok:false, health:{state,code}} ; code = endpoint_* (refus de la garde), credentials_locked, credential_test_requires_saved_instance, model_no_tools ; sonde reelle (health, liste des modeles, appel d'outil, fenetre) ; ok = sante ok ET outils ok",
       "POST /api/chat/providers": "201 {id,kind,preset,label,base_url,origin,default_model,cost_source,credential_ref,builtin:false} ; 409 id existant ; 409 security_gate_closed sans authentification ; 400 URL refusee ; 403 id claude-code",
+      "GET /api/chat/providers/{id}": "200 {id,kind,preset,label,base_url,origin,default_model,cost_source,credential_ref,builtin:false} (base_url COMPLET, chemin compris : pour prereplir le formulaire d'edition ; jamais une valeur de secret) ; humain seulement : 403 pour un jeton d'agent ; 403 claude-code ; 404 inconnu. Le listing GET /api/chat/providers, lui, ne donne toujours que endpoint_origin",
       "PUT|PATCH /api/chat/providers/{id}": "corps ProviderPatch -> 200 meme forme + consents_invalidated (true si l'origine change) ; 403 claude-code ; 404",
       "DELETE /api/chat/providers/{id}": "204 ; 403 claude-code ; 404",
       "GET /api/chat/providers/{id}/status": "HealthEntry {state, code?, action?, checked_at?}",
