@@ -9,6 +9,7 @@
 //! unchanged until then.
 
 pub mod mode;
+pub mod signature;
 
 pub use mode::{
     effective_routing, parse_routing_settings, validate_routing_settings, EffectiveRouting,
