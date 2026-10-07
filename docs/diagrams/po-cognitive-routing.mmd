@@ -1,0 +1,65 @@
+%% name: po-cognitive-routing
+%% covers: backend:src/api/routing_handlers.rs backend:src/chat/provider/cognitive/**
+%% verified: 41425090
+%% ---
+%% PROUVE : la couche RÉGLAGES du routage cognitif (RFC v2, décision R2, tranche B-R1) : le mode de routage
+%%   (primary | mixed | full) et l'étape d'apprentissage (shadow | advisory | auto), réglés en global avec surcharge
+%%   par projet, lus avec un défaut, exposés par /api/chat/routing et /api/projects/{slug}/routing, résumés dans
+%%   GET /api/chat/providers.routing. AUCUNE décision n'est prise : le résolveur (po-chat-provider) ne lit pas
+%%   encore ces réglages.
+%% ---
+%% SOURCES LUES :
+%%   src/chat/provider/cognitive/mode.rs — ProviderRoutingMode, LearningStage, RoutingSettings (Default), RoutingError (code),
+%%                                        validate_routing_settings, parse_routing_settings, RoutingScope, effective_routing, EffectiveRouting
+%%   src/chat/provider/cognitive/mod.rs  — stored_routing, load_routing (GraphStore::get_llm_setting, scope global | project:<slug>, clé routing)
+%%   src/api/routing_handlers.rs         — get_routing, put_routing, get_project_routing, put_project_routing, delete_project_routing,
+%%                                        routing_error (AppError::Provider(OpenFailure{status 400, code}))
+%%   src/api/provider_handlers.rs        — require_human (partagé) ; src/auth/middleware.rs — is_human_only_mutation (/api/chat/routing, /api/projects/{slug}/routing)
+%%   src/api/chat_handlers.rs            — list_providers pose listing.routing ; src/chat/provider/listing.rs — RoutingSummary
+%%   « aucun appelant » : grep -rn "load_routing\|RoutingSettings" src --include='*.rs' → cognitive/**, routing_handlers.rs, chat_handlers.rs, listing.rs seulement
+%% ---
+%% NON ETABLI :
+%%   rien n'est appliqué : signature, candidats, scorer, décisions, feedback et rapport sont les tranches suivantes (B-R2…) ;
+%%   `primary` du réglage n'est pas croisé avec les instances existantes (validation de forme seulement : provider non vide, modèle OU alias) ;
+%%   le Cypher LlmSetting n'a tourné que contre le Neo4j jetable de tests/harness_neo4j.rs.
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans test / décidé non écrit  ⚪ amont ou autre domaine
+
+flowchart TD
+    CALLER["⚪ le frontend (réglages « Routage », RoutingModePicker à venir) ou un appel REST"]
+
+    subgraph types["cognitive/mode.rs — les types"]
+        MODE["✅ ProviderRoutingMode primary | mixed | full × LearningStage shadow | advisory | auto (serde minuscules, inconnu refusé) ;<br/>RoutingSettings {mode, stage, primary?: RoleTarget, exploration_epsilon 0.05, cost_weight 0.3, latency_weight 0.1, demote_after 20} ; Default = primary + shadow ; tout champ absent prend son défaut<br/>test : the_default_is_primary_and_shadow_with_the_documented_knobs, modes_and_stages_round_trip_through_serde_and_as_str, a_full_document_round_trips_with_its_primary"]
+        VALID["✅ parse_routing_settings : mode et stage vérifiés PAR NOM avant la désérialisation (code propre), puis validate_routing_settings : ε ∈ [0, 0.25], poids ∈ [0, 1], demote_after ≥ 5, NaN/∞ refusés, primary = provider non vide et modèle OU alias ;<br/>RoutingError.code : invalid_routing_mode | invalid_learning_stage | invalid_routing_weight | invalid_routing_primary | invalid_routing_settings ; la valeur refusée n'est jamais renvoyée<br/>test : an_unknown_mode_or_stage_is_refused_with_its_own_code, the_knobs_are_bounded, a_primary_names_an_instance_and_a_model_or_an_alias"]
+        EFF["✅ effective_routing(global?, projet?) → (réglages, RoutingScope project | global | default) : projet &gt; global &gt; défaut<br/>test : effective_routing_prefers_project_then_global_then_default"]
+        MODE --> VALID
+        MODE --> EFF
+    end
+
+    subgraph store["cognitive/mod.rs — lecture avec défaut"]
+        LOAD["✅ stored_routing(scope) : LlmSetting {scope, key: routing} → Option ; document illisible = journalisé et lu comme absent (jamais de migration) ;<br/>load_routing(graph, project_slug?) : global puis project:&lt;slug&gt; → effective_routing<br/>test : load_routing_reads_project_over_global_over_default, an_unreadable_document_reads_as_absent, routing_settings_project_override_wins_and_delete_returns_to_global (Neo4j jetable)"]
+    end
+    EFF --> LOAD
+
+    subgraph routes["api/routing_handlers.rs — les routes"]
+        HUMAN["✅ toute mutation = jeton HUMAIN : le middleware refuse agent_session (403) ET chaque handler revérifie require_human<br/>test : routing_mutations_are_refused_to_an_agent_token, human_only_mutation_matches_whole_segments_only"]
+        RGET["✅ GET /api/chat/routing (global | default) et GET /api/projects/{slug}/routing (project | global | default) : réglages aplatis + scope<br/>test : routing_get_without_a_setting_is_the_default"]
+        RPUT["✅ PUT /api/chat/routing et PUT /api/projects/{slug}/routing : corps JSON libre → parse_routing_settings → document remplacé → 200 réglages + scope ;<br/>refus = 400 {error, code, retryable: false} par AppError::Provider(OpenFailure)<br/>test : routing_put_valid_is_stored_and_read_back, routing_put_invalid_is_a_typed_400_and_stores_nothing"]
+        RDEL["✅ DELETE /api/projects/{slug}/routing : 204 et le global s'applique de nouveau ; 404 sans surcharge<br/>test : routing_project_override_wins_and_delete_returns_to_global"]
+        HUMAN --> RPUT
+        HUMAN --> RDEL
+    end
+    CALLER --> RGET
+    CALLER --> HUMAN
+    LOAD --> RGET
+    RPUT --> LOAD
+
+    LISTING["✅ GET /api/chat/providers.routing {mode, stage, scope} (listing.rs RoutingSummary, posé par chat_handlers::list_providers pour le project_slug demandé)<br/>test : routing_listing_carries_the_effective_mode_stage_and_scope, the_listing_carries_the_routing_mode_stage_and_scope"]
+    LOAD --> LISTING
+
+    CONTRACT["✅ docs/api/chat-contract/provider-additions.json : routed_by + « auto », ChatSession.routing_mode, ChatSession.route_reason, ProvidersResponse.routing, rest_settings.routing<br/>test : the_provider_additions_contract_lists_every_routed_by_level_and_the_routing_fields"]
+    LISTING -.-> CONTRACT
+
+    NOOP["🟠 PAS APPLIQUÉ : aucun chemin de resolve ne lit ces réglages ; RoutedBy::Auto et ProviderChoice.reason existent (po-chat-provider) sans producteur ;<br/>primary + shadow = identité : agent_e2e_tests inchangée. Tranches suivantes : signature, candidats, scorer, décisions, feedback, rapport (B-R2…)"]
+    LOAD -.-> NOOP

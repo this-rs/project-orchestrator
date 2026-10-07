@@ -47,8 +47,25 @@
           "global_rule",
           "default",
           "claude_code",
-          "fallback"
-        ]
+          "fallback",
+          "auto"
+        ],
+        "doc": "auto = choisi par le routeur cognitif (mode mixed|full, stage auto) ; route_reason dit pourquoi. Pas encore émis : la session porte ce niveau quand B-R4 prendra une décision"
+      },
+      "routing_mode": {
+        "type": "string",
+        "required": false,
+        "enum": [
+          "primary",
+          "mixed",
+          "full"
+        ],
+        "doc": "mode de routage en vigueur quand la session a été ouverte (réglage projet > global > défaut primary). Pas encore émis (B-R4)"
+      },
+      "route_reason": {
+        "type": "string | null",
+        "required": false,
+        "doc": "raison lisible du choix automatique (routed_by = auto) ; null ou absent pour tout autre niveau. Pas encore émis (B-R4)"
       }
     },
     "CreateSessionRequest": {
@@ -89,7 +106,13 @@
               }
             ]
           }
-        ]
+        ],
+        "routing": {
+          "doc": "LIVRÉ (B-R1). Le mode de routage en vigueur pour le project_slug demandé (réglage projet > global > défaut) ; sans project_slug : global ou défaut. Montré, pas encore appliqué.",
+          "mode": "primary | mixed | full",
+          "stage": "shadow | advisory | auto",
+          "scope": "project | global | default"
+        }
       }
     },
     "error_body": {
@@ -167,6 +190,15 @@
     "roles": "GET/PUT /api/chat/roles et /api/projects/{slug}/llm-roles : {pilot?:{provider,model?,alias?}, executor?:...} ; role absent = herite / fournisseur unique ; 404 instance inconnue ; 400 model ET alias ensemble ; STOCKE mais pas encore lu par le resolveur",
     "aliases": "GET/PUT /api/chat/model-aliases : [{alias,provider,model}] ; alias = minuscules/chiffres/tirets, uniques ; 404 instance inconnue",
     "policy": "GET/PUT /api/chat/model-policy : {mode: off|shadow|enforce, rules:{role:alias}, fallback:[alias], caps:{per_task_usd?,per_run_usd?,per_task_tokens?,per_run_tokens?}} ; livre `off` ; roles de regle et alias valides (400) ; STOCKEE, pas encore appliquee",
+    "routing": {
+      "doc": "LIVRE (B-R1, decision R2). Mode de routage {mode: primary|mixed|full, stage: shadow|advisory|auto, primary?: {provider, model?|alias?}, exploration_epsilon: 0..0.25 (defaut 0.05), cost_weight: 0..1 (0.3), latency_weight: 0..1 (0.1), demote_after: >=5 (20)} + scope (lecture). Stocke LlmSetting{scope: global | project:<slug>, key: routing} ; noeud absent = defaut primary+shadow, aucune migration ; tout champ absent d'un PUT prend son defaut (un PUT remplace le document). STOCKE, montre dans GET /api/chat/providers.routing, PAS ENCORE APPLIQUE : primary+shadow = comportement actuel a l'identique.",
+      "GET /api/chat/routing": "200 reglages + scope: global | default",
+      "PUT /api/chat/routing": "corps reglages -> 200 reglages + scope: global ; humain seulement (403 jeton d'agent)",
+      "GET /api/projects/{slug}/routing": "200 reglages effectifs pour le projet + scope: project | global | default",
+      "PUT /api/projects/{slug}/routing": "corps reglages -> 200 reglages + scope: project ; humain seulement",
+      "DELETE /api/projects/{slug}/routing": "204 (le global s'applique de nouveau) ; 404 sans surcharge ; humain seulement",
+      "erreurs 400": "corps {error, code, retryable:false} ; code = invalid_routing_mode (mode inconnu, casse comprise) | invalid_learning_stage | invalid_routing_weight (epsilon, poids ou demote_after hors borne) | invalid_routing_primary (primary sans provider, ou model ET alias) | invalid_routing_settings (corps sans la forme attendue) ; la valeur refusee n'est jamais renvoyee"
+    },
     "GET /api/chat/providers": "liste maintenant aussi les instances stockees (health unknown, allowed_for_project selon le consentement valide) ; default_provider = cible `pilot` des roles si elle existe ; capabilities.images = true pour claude-code tant que le chemin legacy sert (ecart A12 assume : le chemin agent ne porte pas les images)",
     "NON LIVRE": "preflight reel (sonde d'appel d'outil) via l'API de test ; fallback_reason ; sante des instances sondee"
   },

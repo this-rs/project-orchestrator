@@ -132,11 +132,15 @@ const HUMAN_ONLY_MUTATION_PREFIXES: &[&str] = &[
     "/api/chat/roles",
     "/api/chat/model-policy",
     "/api/chat/model-aliases",
+    "/api/chat/routing",
 ];
 
 /// Per-project settings that decide where a project's content may go
 /// (`/api/projects/{slug}/llm-consent`, `/llm-roles`, …).
 const HUMAN_ONLY_PROJECT_SEGMENT: &str = "/llm-";
+/// The project's routing override (`/api/projects/{slug}/routing`): it decides
+/// which provider the project's sessions may be routed to.
+const HUMAN_ONLY_PROJECT_ROUTING: &str = "/routing";
 
 /// Whether `method path` is a mutation only a human session may perform.
 ///
@@ -155,7 +159,9 @@ pub fn is_human_only_mutation(method: &axum::http::Method, path: &str) -> bool {
                 .is_some_and(|rest| rest.starts_with('/'))
     };
     HUMAN_ONLY_MUTATION_PREFIXES.iter().any(|p| under(p))
-        || (path.starts_with("/api/projects/") && path.contains(HUMAN_ONLY_PROJECT_SEGMENT))
+        || (path.starts_with("/api/projects/")
+            && (path.contains(HUMAN_ONLY_PROJECT_SEGMENT)
+                || path.ends_with(HUMAN_ONLY_PROJECT_ROUTING)))
         // Answering a permission prompt IS the human's decision: an agent that
         // could post it would approve its own tool calls.
         || (path.starts_with("/api/chat/sessions/") && path.contains("/permissions/"))
@@ -787,6 +793,16 @@ mod tests {
         assert!(is_human_only_mutation(
             &Method::PUT,
             "/api/projects/p/llm-roles"
+        ));
+        assert!(is_human_only_mutation(&Method::PUT, "/api/chat/routing"));
+        assert!(!is_human_only_mutation(&Method::GET, "/api/chat/routing"));
+        assert!(is_human_only_mutation(
+            &Method::DELETE,
+            "/api/projects/p/routing"
+        ));
+        assert!(!is_human_only_mutation(
+            &Method::GET,
+            "/api/projects/p/routing"
         ));
         assert!(
             is_human_only_mutation(&Method::POST, "/api/chat/sessions/abc/permissions/req-1"),

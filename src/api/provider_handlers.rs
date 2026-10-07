@@ -33,7 +33,7 @@ use crate::chat::provider::settings::{
 use crate::neo4j::GraphStore;
 use std::sync::Arc;
 
-fn require_human(state: &OrchestratorState, claims: &Claims) -> Result<(), AppError> {
+pub(crate) fn require_human(state: &OrchestratorState, claims: &Claims) -> Result<(), AppError> {
     if state.auth_config.is_none() || claims.is_human() {
         Ok(())
     } else {

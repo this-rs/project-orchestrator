@@ -28,6 +28,7 @@ pub mod reason_handlers;
 pub mod registry_handlers;
 pub mod rfc_handlers;
 pub mod routes;
+pub mod routing_handlers;
 pub mod sharing_handlers;
 pub mod skill_handlers;
 pub mod trajectory_handlers;

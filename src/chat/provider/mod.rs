@@ -7,6 +7,7 @@
 //! so that it stays pure and testable until the nexus registry is wired in.
 
 pub mod catalog;
+pub mod cognitive;
 pub mod credentials;
 pub mod endpoint_guard;
 pub mod errors;

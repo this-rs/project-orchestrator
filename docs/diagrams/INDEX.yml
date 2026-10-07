@@ -65,8 +65,18 @@ diagrams:
     status: verified
     file: docs/diagrams/po-chat-provider.mmd
     # Resolveur backend seulement : le registre des providers et la table de prix sont dans nexus (A1).
+    # Arbitrage : src/chat/provider/cognitive/** (routage cognitif, R2) appartient a po-cognitive-routing.
     covers:
-      - "backend:src/chat/provider/**"
+      - "backend:src/chat/provider/{catalog,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,policy,resolver,settings,store}.rs"
+  - name: po-cognitive-routing
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-cognitive-routing.mmd
+    # Routage cognitif (RFC v2, decision R2) : reglages mode/stage (B-R1), puis signature, candidats,
+    # scorer, decisions, feedback, rapport (B-R2..). Les routes /api/chat/routing vivent dans routing_handlers.rs.
+    covers:
+      - "backend:src/chat/provider/cognitive/**"
+      - "backend:src/api/routing_handlers.rs"
   - name: po-chat-transport
     owner: theotime
     status: verified
