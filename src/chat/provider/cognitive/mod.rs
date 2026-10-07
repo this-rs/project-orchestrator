@@ -8,6 +8,7 @@
 //! later slices. Whatever the settings say, the resolver (`resolver.rs`) is
 //! unchanged until then.
 
+pub mod candidates;
 pub mod mode;
 pub mod signature;
 
