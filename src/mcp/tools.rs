@@ -427,7 +427,10 @@ fn plan_tool() -> ToolDefinition {
                 "run_ids": {"type": "array", "items": {"type": "string"}, "description": "Run UUIDs to compare (compare_runs)"},
                 "task_id": {"type": "string", "description": "Task UUID to delegate (delegate_task)"},
                 "parent_session_id": {"type": "string", "description": "Parent session UUID for SPAWNED_BY relation (delegate_task)"},
-                "custom_sections": {"type": "array", "items": {"type": "string"}, "description": "Custom prompt sections to append (delegate_task)"}
+                "custom_sections": {"type": "array", "items": {"type": "string"}, "description": "Custom prompt sections to append (delegate_task)"},
+                "provider": {"type": "string", "description": "Provider instance id that should run the sub-agent (delegate_task). Optional: omit to let the server resolve it. The project's consent still applies."},
+                "model": {"type": "string", "description": "Model id or alias (fast, default, deep, utility) for the sub-agent (delegate_task). Optional: omit for the instance's default."},
+                "task_class": {"type": "string", "description": "Task class (simple, complex, creative...) recorded with the delegation and used by the model policy (delegate_task)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
