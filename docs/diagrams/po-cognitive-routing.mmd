@@ -1,6 +1,6 @@
 %% name: po-cognitive-routing
 %% covers: backend:src/api/routing_handlers.rs backend:src/chat/provider/cognitive/**
-%% verified: 41425090
+%% verified: 8b0b020f
 %% ---
 %% PROUVE : la couche RÉGLAGES du routage cognitif (RFC v2, décision R2, tranche B-R1) : le mode de routage
 %%   (primary | mixed | full) et l'étape d'apprentissage (shadow | advisory | auto), réglés en global avec surcharge
@@ -16,10 +16,14 @@
 %%                                        routing_error (AppError::Provider(OpenFailure{status 400, code}))
 %%   src/api/provider_handlers.rs        — require_human (partagé) ; src/auth/middleware.rs — is_human_only_mutation (/api/chat/routing, /api/projects/{slug}/routing)
 %%   src/api/chat_handlers.rs            — list_providers pose listing.routing ; src/chat/provider/listing.rs — RoutingSummary
+%%   src/chat/provider/cognitive/signature.rs — TaskClass, ChatIntent, TaskSignature (from_chat_request, from_task, from_delegation, utility, arm_key), ContextHints
+%%   src/chat/provider/cognitive/candidates.rs — ModelFacts (from_capabilities, estimated_turn_cost_usd), RejectReason, Slot, apply, Filtered, HealthCache
+%%   src/runner/persona.rs — profile_task (classification reprise) ; src/neurons/intent.rs — IntentDetector (mots-clés FR/EN)
 %%   « aucun appelant » : grep -rn "load_routing\|RoutingSettings" src --include='*.rs' → cognitive/**, routing_handlers.rs, chat_handlers.rs, listing.rs seulement
 %% ---
 %% NON ETABLI :
-%%   rien n'est appliqué : signature, candidats, scorer, décisions, feedback et rapport sont les tranches suivantes (B-R2…) ;
+%%   rien n'est appliqué : scorer, décisions, feedback et rapport sont les tranches suivantes (B-R4, B-R5…) ; signature.rs et candidats.rs n'ont AUCUN appelant de production (grep -rn "TaskSignature\|cognitive::candidates" src --include='*.rs' → cognitive/** seulement) ;
+%%   ModelFacts::from_capabilities n'est pas branché au listing ni aux prix nexus (B-R4) ; la santé n'est pas sondée : HealthCache attend une sonde injectée ; la fenêtre de contexte d'un modèle d'instance enregistrée dépend de la sonde (inconnue = rejetée) ;
 %%   `primary` du réglage n'est pas croisé avec les instances existantes (validation de forme seulement : provider non vide, modèle OU alias) ;
 %%   le Cypher LlmSetting n'a tourné que contre le Neo4j jetable de tests/harness_neo4j.rs.
 %% ---
@@ -63,3 +67,27 @@ flowchart TD
 
     NOOP["🟠 PAS APPLIQUÉ : aucun chemin de resolve ne lit ces réglages ; RoutedBy::Auto et ProviderChoice.reason existent (po-chat-provider) sans producteur ;<br/>primary + shadow = identité : agent_e2e_tests inchangée. Tranches suivantes : signature, candidats, scorer, décisions, feedback, rapport (B-R2…)"]
     LOAD -.-> NOOP
+
+    subgraph sig["cognitive/signature.rs — ce que la requête demande"]
+        SIG["✅ TaskSignature {role, class, complexity 1..=10, context_need_tokens bornés 8k..200k, needs_tools, needs_images, budget_remaining_usd, attempt, project, persona} ; arm_key = clé de classe stable (simple, complex, creative, retry, utility.feature_graph, utility.compaction, chat.&lt;intent&gt;) ;<br/>aucun appel réseau ni LLM<br/>test : arm_keys_are_stable_and_parse_round_trips, a_signature_survives_a_json_round_trip, the_context_need_grows_with_the_files_and_stays_bounded"]
+        SIGCHAT["✅ from_chat_request : pilote, intent par IntentDetector (mots-clés bilingues), longueur du message → complexité +2 au plus<br/>test : the_class_does_not_depend_on_the_language (10 paires FR/EN, au moins 4 classes distinctes), a_chat_request_is_a_pilot_with_tools_and_reads_images_from_the_caller"]
+        SIGTASK["✅ from_task : exécutant, classe = profile_task du runner ; TOUTE tentative après la première = retry (la règle runner.retry ne matchait jamais) ; complexité = estimated_complexity si &gt; 0 (0 = non estimée) sinon dérivée fichiers/étapes<br/>test : any_attempt_after_the_first_is_the_retry_class (rouge sans la règle : mutation jouée), the_task_class_is_the_runners_own_classification, complexity_is_the_estimate_when_given_else_derived_and_always_bounded"]
+        SIGDEL["✅ from_delegation : la classe énoncée par l'agent délégant gagne, sinon la tâche, sinon simple ; une tentative &gt; 1 reste retry ; utility(classe, contexte) : exécutant sans outils<br/>test : a_stated_delegation_class_wins_over_the_default_and_a_retry_wins_over_both, a_utility_call_needs_no_tools_and_is_an_executor"]
+        SIG --> SIGCHAT
+        SIG --> SIGTASK
+        SIG --> SIGDEL
+    end
+    NOOP -.-> SIG
+
+    subgraph cand["cognitive/candidates.rs — qui a le droit de répondre"]
+        FILTER["✅ apply(slot, signature, pool, trust) → Filtered {eligible, rejected[{candidate, reason}]} : première contrainte en échec, dans l'ordre remote, consentement, santé, outils, fenêtre, images, budget, trust ;<br/>RemoteMachine jamais candidate ; fenêtre inconnue = rejet (jamais supposée) ; santé non mesurée (None) passe ; prix inconnu passe (jamais zéro) ; Free/Subscription = pas d'argent marginal ; Trust sans bac à sable refusé sauf claude-code (A35)<br/>test : un test par RejectReason (a_remote_machine_is_never_a_candidate, a_pair_without_the_projects_consent_is_not_allowed, an_unhealthy_instance_is_out_and_an_unmeasured_one_is_in, a_request_that_needs_tools_refuses_a_model_that_cannot_call_them, a_window_smaller_than_the_need_or_unknown_is_rejected, images_need_a_model_that_reads_them, a_turn_dearer_than_the_budget_left_is_rejected_and_an_unknown_price_passes, trust_mode_needs_a_sandbox_unless_it_is_claude_code), the_first_failing_constraint_is_the_one_reported"]
+        EXPL["✅ Slot::Explicit (requête, tâche, persona) : apply rend None, le filtre ne s'applique jamais et ne substitue jamais (A16, A20)<br/>test : an_explicit_choice_never_enters_the_filter"]
+        HEALTH["✅ HealthCache : une sonde au plus par instance et par fenêtre de 60 s, horloge injectée<br/>test : health_is_probed_once_per_instance_per_window"]
+        EST["✅ ModelFacts::estimated_turn_cost_usd : contexte × prix d'entrée + 2000 jetons × prix de sortie ; prix de nexus (A1), aucune table backend ; None sans prix<br/>test : the_estimate_is_none_without_a_price_and_grows_with_the_context"]
+        FILTER --> EXPL
+        FILTER --> HEALTH
+        FILTER --> EST
+    end
+    SIG --> FILTER
+    FACTSGAP["🟠 ModelFacts::from_capabilities existe mais le listing et les prix nexus ne l'appellent pas encore : branchement dans resolve_provider_choice (B-R4)"]
+    FILTER -.-> FACTSGAP
