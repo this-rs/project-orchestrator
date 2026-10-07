@@ -246,3 +246,95 @@ async fn a_session_written_before_the_harness_reads_back_without_provider_fields
         .await
         .unwrap();
 }
+
+/// The routing document (decision R2) through the real Cypher: absent = default,
+/// the project's document wins over the global one, deleting it returns the
+/// project to the global one. The global scope is shared by nature: the test
+/// restores it at the end.
+#[tokio::test]
+async fn routing_settings_project_override_wins_and_delete_returns_to_global() {
+    use project_orchestrator::chat::provider::cognitive::{
+        load_routing, stored_routing, LearningStage, ProviderRoutingMode, RoutingScope,
+        RoutingSettings, ROUTING_KEY,
+    };
+    use project_orchestrator::chat::provider::settings::{project_scope, GLOBAL};
+
+    let Some(e) = env().await else { return };
+    let store: &dyn GraphStore = &e.client;
+    let slug = format!("harness-routing-{}", Uuid::new_v4());
+    let scope = project_scope(&slug);
+    // Whatever another run left in the global scope is kept aside and put back.
+    let previous_global = store.get_llm_setting(GLOBAL, ROUTING_KEY).await.unwrap();
+    store.delete_llm_setting(GLOBAL, ROUTING_KEY).await.unwrap();
+
+    // Nothing stored anywhere: the default, from nowhere.
+    assert_eq!(stored_routing(store, &scope).await.unwrap(), None);
+    assert_eq!(
+        load_routing(store, Some(&slug)).await.unwrap(),
+        (RoutingSettings::default(), RoutingScope::Default)
+    );
+
+    // A global document: every project inherits it, missing fields default.
+    store
+        .put_llm_setting(
+            GLOBAL,
+            ROUTING_KEY,
+            r#"{"mode":"mixed","stage":"advisory"}"#,
+        )
+        .await
+        .unwrap();
+    let (s, from) = load_routing(store, Some(&slug)).await.unwrap();
+    assert_eq!(s.mode, ProviderRoutingMode::Mixed);
+    assert_eq!(s.stage, LearningStage::Advisory);
+    assert_eq!(s.exploration_epsilon, 0.05);
+    assert_eq!(from, RoutingScope::Global);
+
+    // The project's own document wins, for that project only.
+    let project = RoutingSettings {
+        mode: ProviderRoutingMode::Full,
+        stage: LearningStage::Shadow,
+        cost_weight: 0.6,
+        ..Default::default()
+    };
+    store
+        .put_llm_setting(
+            &scope,
+            ROUTING_KEY,
+            &serde_json::to_string(&project).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        load_routing(store, Some(&slug)).await.unwrap(),
+        (project.clone(), RoutingScope::Project)
+    );
+    assert_eq!(
+        load_routing(store, Some("some-other-project"))
+            .await
+            .unwrap()
+            .1,
+        RoutingScope::Global
+    );
+    assert_eq!(
+        load_routing(store, None).await.unwrap().1,
+        RoutingScope::Global
+    );
+
+    // Deleting the override returns the project to the global document.
+    assert!(store.delete_llm_setting(&scope, ROUTING_KEY).await.unwrap());
+    let (s, from) = load_routing(store, Some(&slug)).await.unwrap();
+    assert_eq!(
+        (s.mode, from),
+        (ProviderRoutingMode::Mixed, RoutingScope::Global)
+    );
+    assert!(!store.delete_llm_setting(&scope, ROUTING_KEY).await.unwrap());
+
+    // Cleanup: the global scope as it was.
+    store.delete_llm_setting(GLOBAL, ROUTING_KEY).await.unwrap();
+    if let Some(raw) = previous_global {
+        store
+            .put_llm_setting(GLOBAL, ROUTING_KEY, &raw)
+            .await
+            .unwrap();
+    }
+}

@@ -24,6 +24,7 @@ use super::provider_handlers;
 use super::reason_handlers;
 use super::registry_handlers;
 use super::rfc_handlers;
+use super::routing_handlers;
 use super::sharing_handlers;
 use super::skill_handlers;
 use super::trajectory_handlers;
@@ -2006,6 +2007,17 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/projects/{slug}/llm-roles",
             get(provider_handlers::get_project_roles).put(provider_handlers::put_project_roles),
+        )
+        // Routing mode and learning stage (R2): global, with a per-project override.
+        .route(
+            "/api/chat/routing",
+            get(routing_handlers::get_routing).put(routing_handlers::put_routing),
+        )
+        .route(
+            "/api/projects/{slug}/routing",
+            get(routing_handlers::get_project_routing)
+                .put(routing_handlers::put_project_routing)
+                .delete(routing_handlers::delete_project_routing),
         )
         .route("/api/chat/cli/status", get(chat_handlers::get_cli_status))
         .route("/api/chat/cli/install", post(chat_handlers::install_cli))

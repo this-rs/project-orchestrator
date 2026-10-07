@@ -77,6 +77,10 @@ pub enum RoutedBy {
     /// A higher level was skipped (unhealthy or not allowed) for an executor.
     #[serde(rename = "fallback")]
     Fallback,
+    /// Chosen by the cognitive router (routing mode `mixed` or `full`, stage
+    /// `auto`); `ProviderChoice::reason` says why.
+    #[serde(rename = "auto")]
+    Auto,
 }
 
 impl RoutedBy {
@@ -93,6 +97,7 @@ impl RoutedBy {
             Self::ConfiguredDefault => "default",
             Self::BuiltinClaudeCode => "claude_code",
             Self::Fallback => "fallback",
+            Self::Auto => "auto",
         }
     }
 }
@@ -116,6 +121,10 @@ pub struct ProviderChoice {
     /// first refusal (`provider_unavailable`, `endpoint_not_allowed`, ...).
     #[serde(default)]
     pub fallback_reason: Option<String>,
+    /// Readable reason of an automatic choice (`routed_by = auto`); absent for
+    /// every other level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// A provider (and optional model) proposed by one precedence level.
@@ -312,6 +321,7 @@ pub fn resolve(
             route_rule: None,
             shadow: None,
             fallback_reason: None,
+            reason: None,
         });
     }
 
@@ -351,6 +361,7 @@ pub fn resolve(
                     route_rule: None,
                     shadow: None,
                     fallback_reason: first_skip.as_ref().map(|e| e.code().to_string()),
+                    reason: None,
                 });
             }
             Err(error) => {
@@ -387,6 +398,7 @@ pub fn resolve(
             route_rule: None,
             shadow: None,
             fallback_reason: first_skip.as_ref().map(|e| e.code().to_string()),
+            reason: None,
         });
     }
     match first_skip {
@@ -920,5 +932,50 @@ mod tests {
         input.global_rule = Some(Candidate::new("p-global", None));
         assert_eq!(resolve(&input, &catalog).unwrap().provider_id, CLAUDE_CODE);
         assert!(is_remote_instance("claude-code@box") && !is_remote_instance(CLAUDE_CODE));
+    }
+
+    #[test]
+    fn routed_by_auto_round_trips_and_a_choice_carries_an_optional_reason() {
+        assert_eq!(RoutedBy::Auto.as_str(), "auto");
+        assert_eq!(serde_json::to_string(&RoutedBy::Auto).unwrap(), "\"auto\"");
+        assert_eq!(
+            serde_json::from_str::<RoutedBy>("\"auto\"").unwrap(),
+            RoutedBy::Auto
+        );
+        // Every level still serialises as its as_str name.
+        for level in [
+            RoutedBy::Session,
+            RoutedBy::Request,
+            RoutedBy::Task,
+            RoutedBy::Persona,
+            RoutedBy::Run,
+            RoutedBy::ProjectRule,
+            RoutedBy::GlobalRule,
+            RoutedBy::ConfiguredDefault,
+            RoutedBy::BuiltinClaudeCode,
+            RoutedBy::Fallback,
+            RoutedBy::Auto,
+        ] {
+            let wire = serde_json::to_string(&level).unwrap();
+            assert_eq!(wire, format!("\"{}\"", level.as_str()));
+            assert_eq!(serde_json::from_str::<RoutedBy>(&wire).unwrap(), level);
+        }
+        // `reason` is additive: absent from the wire unless set, and a stored
+        // choice without it still reads.
+        let catalog = FakeCatalog::new(&[(CLAUDE_CODE, true, true)]);
+        let choice = resolve(&ResolveInput::empty(Role::Pilot), &catalog).unwrap();
+        assert_eq!(choice.reason, None);
+        let wire = serde_json::to_value(&choice).unwrap();
+        assert!(wire.get("reason").is_none(), "{wire}");
+        let back: ProviderChoice = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, choice);
+        let with_reason = ProviderChoice {
+            routed_by: RoutedBy::Auto,
+            reason: Some("cheapest healthy arm of class simple".into()),
+            ..choice
+        };
+        let wire = serde_json::to_value(&with_reason).unwrap();
+        assert_eq!(wire["routed_by"], "auto");
+        assert_eq!(wire["reason"], "cheapest healthy arm of class simple");
     }
 }

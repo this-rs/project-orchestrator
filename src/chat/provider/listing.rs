@@ -10,6 +10,7 @@ use nexus_claude::agent::{Capabilities, HealthStatus, ProviderError, ProviderHea
 use serde::Serialize;
 use serde_json::Value;
 
+use super::cognitive::{LearningStage, ProviderRoutingMode, RoutingScope, RoutingSettings};
 use super::resolver::CLAUDE_CODE;
 
 /// One model of an instance and what it can do.
@@ -183,6 +184,29 @@ pub struct RemoteEntry {
     pub allow_trust: bool,
 }
 
+/// The routing mode that applies to the asked project (decision R2), so the
+/// interface knows who chooses before any session exists.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RoutingSummary {
+    /// `primary | mixed | full`.
+    pub mode: ProviderRoutingMode,
+    /// `shadow | advisory | auto`.
+    pub stage: LearningStage,
+    /// `project | global | default`: where the settings come from.
+    pub scope: RoutingScope,
+}
+
+impl RoutingSummary {
+    /// The summary of the effective settings.
+    pub fn new(settings: &RoutingSettings, scope: RoutingScope) -> Self {
+        Self {
+            mode: settings.mode,
+            stage: settings.stage,
+            scope,
+        }
+    }
+}
+
 /// The listing.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderListing {
@@ -190,6 +214,10 @@ pub struct ProviderListing {
     pub default_provider: Option<String>,
     /// The instances, the built-in one first.
     pub providers: Vec<ProviderEntry>,
+    /// The routing mode in force for the asked project (additive: the handler
+    /// fills it from the stored settings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingSummary>,
 }
 
 /// The built-in Claude Code instance. Always consented (it is the historical
@@ -236,6 +264,7 @@ pub fn assemble(
     ProviderListing {
         default_provider: default,
         providers,
+        routing: None,
     }
 }
 
@@ -334,6 +363,112 @@ mod tests {
         assert_eq!(p["models"][0]["alias"], "default");
         assert!(p["models"][0]["capabilities"].is_object());
         assert_eq!(v["default_provider"], "claude-code");
+    }
+
+    #[test]
+    fn the_listing_carries_the_routing_mode_stage_and_scope() {
+        let mut l = assemble(
+            vec![builtin_claude_code(HealthEntry::unknown(), vec![], false)],
+            None,
+        );
+        let v = serde_json::to_value(&l).unwrap();
+        assert!(v.get("routing").is_none(), "additive: absent until filled");
+        let settings = RoutingSettings {
+            mode: ProviderRoutingMode::Mixed,
+            stage: LearningStage::Advisory,
+            ..Default::default()
+        };
+        l.routing = Some(RoutingSummary::new(&settings, RoutingScope::Project));
+        let v = serde_json::to_value(&l).unwrap();
+        assert_eq!(
+            v["routing"],
+            serde_json::json!({"mode": "mixed", "stage": "advisory", "scope": "project"})
+        );
+        assert_eq!(
+            RoutingSummary::new(&RoutingSettings::default(), RoutingScope::Default),
+            RoutingSummary {
+                mode: ProviderRoutingMode::Primary,
+                stage: LearningStage::Shadow,
+                scope: RoutingScope::Default
+            }
+        );
+    }
+
+    /// The contract file the frontend vendors: every `routed_by` level the
+    /// resolver can produce is listed there, the routing summary and the
+    /// session fields of R2 are documented.
+    #[test]
+    fn the_provider_additions_contract_lists_every_routed_by_level_and_the_routing_fields() {
+        use super::super::resolver::RoutedBy;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/api/chat-contract/provider-additions.json");
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let contract: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        // Exhaustive on purpose: a new RoutedBy variant does not compile until
+        // it is listed here, and then the contract must name it too.
+        let every_level = [
+            RoutedBy::Session,
+            RoutedBy::Request,
+            RoutedBy::Task,
+            RoutedBy::Persona,
+            RoutedBy::Run,
+            RoutedBy::ProjectRule,
+            RoutedBy::GlobalRule,
+            RoutedBy::ConfiguredDefault,
+            RoutedBy::BuiltinClaudeCode,
+            RoutedBy::Fallback,
+            RoutedBy::Auto,
+        ];
+        for level in every_level {
+            match level {
+                RoutedBy::Session
+                | RoutedBy::Request
+                | RoutedBy::Task
+                | RoutedBy::Persona
+                | RoutedBy::Run
+                | RoutedBy::ProjectRule
+                | RoutedBy::GlobalRule
+                | RoutedBy::ConfiguredDefault
+                | RoutedBy::BuiltinClaudeCode
+                | RoutedBy::Fallback
+                | RoutedBy::Auto => {}
+            }
+        }
+        let mut documented: Vec<&str> = contract["rest"]["ChatSession"]["routed_by"]["enum"]
+            .as_array()
+            .expect("ChatSession.routed_by.enum")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        documented.sort_unstable();
+        let mut produced: Vec<&str> = every_level.iter().map(|l| l.as_str()).collect();
+        produced.sort_unstable();
+        assert_eq!(documented, produced, "routed_by enum of the contract");
+
+        let modes: Vec<&str> = contract["rest"]["ChatSession"]["routing_mode"]["enum"]
+            .as_array()
+            .expect("ChatSession.routing_mode.enum")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            modes,
+            ProviderRoutingMode::ALL.map(|m| m.as_str()),
+            "routing_mode enum of the contract"
+        );
+        assert_eq!(
+            contract["rest"]["ChatSession"]["route_reason"]["type"],
+            "string | null"
+        );
+        let routing = &contract["rest"]["GET /api/chat/providers"]["response"]["routing"];
+        for key in ["mode", "stage", "scope"] {
+            assert!(
+                routing.get(key).is_some(),
+                "ProvidersResponse.routing.{key}"
+            );
+        }
     }
 
     #[test]

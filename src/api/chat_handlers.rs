@@ -1550,7 +1550,17 @@ pub async fn list_providers(
             serde_json::from_str::<crate::chat::provider::settings::RoleAssignments>(&raw).ok()
         })
         .and_then(|roles| roles.pilot.map(|p| p.provider));
-    Ok(Json(listing::assemble(entries, configured.as_deref())))
+    let mut body = listing::assemble(entries, configured.as_deref());
+    // The routing mode in force for the asked project (R2): who chooses the
+    // provider, and how far the learnt choices are trusted. Shown, not applied.
+    let (routing, scope) = crate::chat::provider::cognitive::load_routing(
+        state.orchestrator.neo4j(),
+        query.project_slug.as_deref(),
+    )
+    .await
+    .map_err(AppError::Internal)?;
+    body.routing = Some(listing::RoutingSummary::new(&routing, scope));
+    Ok(Json(body))
 }
 
 /// Request body for POST /api/chat/cli/install
