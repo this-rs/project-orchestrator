@@ -51,7 +51,10 @@
     .progress .fill { height: 100%; width: 6%; background: var(--primary-light); transition: width .5s var(--ease); }
 
     .checklist { width: 240px; display: flex; flex-direction: column; gap: 1px; }
-    .check-item { display: flex; align-items: center; gap: 12px; padding: 5px 0; min-height: 26px;
+    /* The icon is centred on the FIRST LINE of the label (--check-line), not on the whole row: a
+       row that gains a sub-text used to centre its icon between the two lines (14.8 px off the
+       title on a three-line row). With one line the row is the same height as before. */
+    .check-item { --check-line: 16px; display: flex; align-items: flex-start; gap: 12px; padding: 5px 0; min-height: 26px;
       opacity: 0; transform: translateY(4px); animation: rise .45s var(--ease) forwards; }
     .check-item:nth-child(1){animation-delay:.45s} .check-item:nth-child(2){animation-delay:.5s}
     .check-item:nth-child(3){animation-delay:.55s} .check-item:nth-child(4){animation-delay:.6s}
@@ -60,7 +63,7 @@
     .check-item.hidden { display: none; }
     .check-item.skipped { opacity: .5 !important; }
 
-    .check-icon { width: 14px; height: 14px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
+    .check-icon { width: 14px; height: var(--check-line); flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
     .check-icon svg { width: 14px; height: 14px; }
     .check-icon svg circle { display: none; }
     .check-icon svg path { stroke-dasharray: 24; stroke-dashoffset: 24; animation: draw .38s cubic-bezier(.22,1,.36,1) .04s forwards; }
@@ -69,7 +72,7 @@
       border-top-color: var(--primary-light); animation: spin .9s linear infinite; }
 
     .check-content { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-    .check-label { font-size: 12.5px; color: var(--text-muted); transition: color .2s ease; }
+    .check-label { font-size: 12.5px; line-height: var(--check-line); color: var(--text-muted); transition: color .2s ease; }
     .check-item.success .check-label { color: var(--text-secondary); }
     .check-item.error .check-label { color: var(--error); }
     .check-item.warning .check-label { color: var(--warning); }
