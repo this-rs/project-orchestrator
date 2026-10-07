@@ -1,6 +1,6 @@
 %% name: po-chat-provider
-%% covers: backend:src/chat/provider/**
-%% verified: 878281ca
+%% covers: backend:src/chat/provider/{catalog,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,policy,resolver,settings,store}.rs
+%% verified: 41425090
 %% ---
 %% PROUVE : le RÉSOLVEUR backend de provider (décisions A1, A16, A18, A29, A43) : quel
 %%   provider/modèle pour une demande, comment une erreur d'ouverture devient un statut HTTP
@@ -8,8 +8,9 @@
 %%   Le registre des providers et la table de prix sont dans nexus (A1) : rien de cela ici.
 %% ---
 %% SOURCES LUES :
-%%   src/chat/provider/resolver.rs — Role, RoutedBy, Candidate, ResolveInput, InstanceCatalog,
-%%                                   ResolveError, resolve
+%%   src/chat/provider/resolver.rs — Role, RoutedBy (dont Auto), Candidate, ResolveInput, InstanceCatalog,
+%%                                   ResolveError, resolve ; ProviderChoice.reason
+%%   src/chat/provider/cognitive/ — HORS de cette carte : po-cognitive-routing (réglages R2, lus par chat_handlers::list_providers)
 %%   src/chat/provider/endpoint_guard.rs — validate_url, classify_ip, validate_resolved, validate_endpoint_with, origin_of, refuse_redirect, redact_error_body
 %%   src/chat/provider/settings.rs — InstanceDraft, InstanceRecord, ConsentRecord, RoleAssignments, ModelAlias, ModelPolicy, parse_credential_ref ; src/api/provider_handlers.rs
 %%   src/chat/provider/{catalog,store,native_factory}.rs — StoreCatalog, resolve_input, lectures LlmSetting, build_native_provider
@@ -48,12 +49,14 @@ flowchart TD
         PILOT["✅ rôle pilot : aucune bascule, à aucun niveau<br/>test : pilot_never_falls_back_at_any_level"]
         EXEC["✅ rôle executor : un niveau non explicite malsain ou interdit passe au suivant,<br/>routed_by = fallback ; jamais vers une instance interdite<br/>test : executor_falls_back_to_the_next_level_and_records_it,<br/>executor_fallback_skips_a_not_allowed_instance"]
         BUILTIN["✅ rien de configuré : claude-code s'il existe, est sain et autorisé<br/>(routed_by = claude_code), sinon no_provider<br/>test : builtin_claude_code_when_nothing_is_configured"]
+        AUTO["✅ RoutedBy::Auto (serde « auto ») et ProviderChoice.reason : Option&lt;String&gt; (additif, absent du fil sauf s'il est posé) : le niveau que le routeur cognitif (R2, po-cognitive-routing) produira ;<br/>AUCUN chemin de resolve ne le produit encore : reason = None partout, le résolveur est inchangé en mode primary + stage shadow<br/>test : routed_by_auto_round_trips_and_a_choice_carries_an_optional_reason, the_provider_additions_contract_lists_every_routed_by_level_and_the_routing_fields"]
         SESSION -- oui --> FROZEN
         SESSION -- non --> LEVELS
         LEVELS --> EXPLICIT
         LEVELS --> PILOT
         LEVELS --> EXEC
         LEVELS -- "aucun niveau" --> BUILTIN
+        LEVELS -.-> AUTO
         EXEC -- "chaîne épuisée" --> BUILTIN
     end
 
@@ -94,7 +97,7 @@ flowchart TD
     end
     NEXUS -.-> EVMAP
     subgraph listing["listing.rs — GET /api/chat/providers (A42)"]
-        LIST["✅ ProviderListing {default_provider, providers[{id, kind, label, builtin, is_default, allowed_for_project, endpoint_origin,<br/>credential (référence seule), health{state, code, action, checked_at}, models[{id, alias, capabilities}]}]} ;<br/>health nexus → ok | auth_required | unreachable | cli_not_found | unknown (aucun chemin ni détail) ;<br/>l'instance claude-code est intégrée, première, consentie ; défaut inexistant ignoré<br/>test : the_listing_body_has_the_documented_field_names, health_maps_to_the_frontend_states,<br/>providers_lists_the_builtin_instance_with_the_documented_fields (HTTP), providers_answers_null_consent_without_a_project (HTTP)<br/>🟠 seule l'instance intégrée est listée : le CRUD d'instances (B25) n'existe pas encore"]
+        LIST["✅ ProviderListing {default_provider, providers[{id, kind, label, builtin, is_default, allowed_for_project, endpoint_origin,<br/>credential (référence seule), health{state, code, action, checked_at}, models[{id, alias, capabilities}]}], routing {mode, stage, scope}} ;<br/>routing (R2, additif) = réglages effectifs du project_slug demandé (projet &gt; global &gt; défaut), posés par chat_handlers::list_providers via cognitive::load_routing ; montrés, pas appliqués<br/>test : the_listing_carries_the_routing_mode_stage_and_scope, routing_listing_carries_the_effective_mode_stage_and_scope (HTTP) ;<br/>health nexus → ok | auth_required | unreachable | cli_not_found | unknown (aucun chemin ni détail) ;<br/>l'instance claude-code est intégrée, première, consentie ; défaut inexistant ignoré<br/>test : the_listing_body_has_the_documented_field_names, health_maps_to_the_frontend_states,<br/>providers_lists_the_builtin_instance_with_the_documented_fields (HTTP), providers_answers_null_consent_without_a_project (HTTP)<br/>🟠 seule l'instance intégrée est listée : le CRUD d'instances (B25) n'existe pas encore"]
     end
     subgraph creds["credentials.rs — VaultCredentialResolver (CredentialResolver nexus)"]
         CRED["✅ vault:&lt;nom&gt; → VaultService::read_for_provider sous grant Provider(instance) ;<br/>vault verrouillé → credentials_locked (pas de repli) ; pas de grant → auth_required + quoi faire ;<br/>env:&lt;VAR&gt; lu du serveur et enregistré au masqueur, SERVER_ONLY_SECRETS refusés ; none → aucun<br/>test : a_locked_vault_is_credentials_locked_never_no_credential,<br/>the_servers_own_secrets_cannot_be_used_as_a_provider_credential,<br/>the_server_reads_a_provider_key_only_under_a_provider_grant_for_that_instance (vault)"]

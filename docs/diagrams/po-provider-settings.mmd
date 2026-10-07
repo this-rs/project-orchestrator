@@ -1,6 +1,6 @@
 %% name: po-provider-settings
 %% covers: backend:src/api/provider_handlers.rs
-%% verified: 878281ca
+%% verified: 41425090
 %% ---
 %% PROUVE : les routes de réglages des providers (A15, A19, A24, A25, A28, A32, A37) : instances, test de
 %%   connexion, consentement, rôles, alias, politique de modèle, journal d'envoi. La logique pure est dans
@@ -8,9 +8,10 @@
 %% ---
 %% SOURCES LUES :
 %%   src/api/provider_handlers.rs — create/update/delete/test_provider, provider_status, provider_models,
-%%                                   list/allow/revoke consent, roles, aliases, policy, send_journal
+%%                                   list/allow/revoke consent, roles, aliases, policy, send_journal, require_human (partagé)
+%%   src/api/routing_handlers.rs  — get/put_routing, get/put/delete_project_routing (fichier possédé par po-cognitive-routing ; ses routes sont montrées ici)
 %%   src/api/routes.rs — le montage des routes (/api/chat/providers*, /api/projects/{slug}/llm-*)
-%%   src/auth/middleware.rs — is_human_only_mutation (la garde du middleware)
+%%   src/auth/middleware.rs — is_human_only_mutation (la garde du middleware : préfixes + /api/projects/{slug}/llm-* et /routing)
 %% ---
 %% NON ETABLI :
 %%   aucun essai contre un vrai endpoint ou un vrai Codex ; le test de connexion d'un codex/acp = health du processus ;
@@ -48,6 +49,13 @@ flowchart TD
         POLICY["✅ GET/PUT /api/chat/model-aliases et /model-policy (livrée off) ; lus par le résolveur<br/>test : an_enforced_policy_routes_the_chat_to_the_instance_and_records_the_rule"]
     end
 
+    subgraph routingmode["Mode de routage (R2) — routing_handlers.rs"]
+        RGET["✅ GET /api/chat/routing et GET /api/projects/{slug}/routing : réglages effectifs {mode primary|mixed|full, stage shadow|advisory|auto, primary?, exploration_epsilon, cost_weight, latency_weight, demote_after} + scope (project &gt; global &gt; default) ; nœud LlmSetting absent = défaut primary + shadow, aucune migration<br/>test : routing_get_without_a_setting_is_the_default, routing_settings_project_override_wins_and_delete_returns_to_global (Neo4j jetable)"]
+        RPUT["✅ PUT /api/chat/routing et PUT /api/projects/{slug}/routing : humain seulement (middleware + require_human) ; un PUT remplace le document, un champ absent prend son défaut ; 400 typé {error, code} sans jamais renvoyer la valeur : invalid_routing_mode, invalid_learning_stage, invalid_routing_weight (ε 0..0.25, poids 0..1, demote_after ≥ 5), invalid_routing_primary, invalid_routing_settings<br/>test : routing_put_valid_is_stored_and_read_back, routing_put_invalid_is_a_typed_400_and_stores_nothing, routing_mutations_are_refused_to_an_agent_token"]
+        RDEL["✅ DELETE /api/projects/{slug}/routing : 204, le global s'applique de nouveau ; 404 sans surcharge ; humain seulement<br/>test : routing_project_override_wins_and_delete_returns_to_global"]
+        RNOOP["🟠 STOCKÉ et MONTRÉ (GET /api/chat/providers.routing), PAS APPLIQUÉ : aucune décision n'est prise par cette tranche (B-R4) ; primary + shadow = identité (agent_e2e_tests inchangée)"]
+    end
+
     JOURNAL["✅ GET /api/chat/send-journal : qui, projet, origine, modèle ; jamais le contenu ; humain seulement<br/>test : the_send_journal_is_readable_by_a_person_only_filtered_and_newest_first"]
     NOSEC["🟠 sans authentification (auth_config absent), require_human laisse tout passer (écart documenté dans le modèle de menace)"]
 
@@ -62,5 +70,9 @@ flowchart TD
     PATCH --> CONSENT
     CONSENT --> ROLES
     ROLES --> POLICY
+    POLICY --> RGET
+    HUMAN --> RPUT
+    RPUT --> RDEL
+    RGET -.-> RNOOP
     HUMAN --> JOURNAL
     HUMAN --> NOSEC
