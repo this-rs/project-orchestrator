@@ -481,6 +481,29 @@ pub(crate) struct AgentSpecInput<'a> {
     /// directories (the provider refuses both, and the local paths mean nothing
     /// there).
     pub remote_cwd: Option<&'a str>,
+    /// The knowledge-graph hooks to give the session (`None`: none).
+    pub hooks: Option<AgentHookScope>,
+}
+
+/// What [`ChatManager::graph_hook_table`] needs.
+pub(crate) struct GraphHookInput {
+    pub session_id: String,
+    pub context_source: CompactionContextSource,
+    pub work_log: Arc<Mutex<SessionWorkLog>>,
+    /// Register the per-tool hooks (skill activation, redirect advice). Off for runner
+    /// sessions, which already have their task context in the prompt.
+    pub tool_knowledge: bool,
+    /// Where to announce a compaction. `None`: the engine announces it itself.
+    pub announce: Option<broadcast::Sender<ChatEvent>>,
+}
+
+/// Which hooks a session of the agent engine gets.
+pub(crate) struct AgentHookScope {
+    pub project_slug: Option<String>,
+    /// The task the session works on (a runner session): its context guides compaction.
+    pub task_id: Option<Uuid>,
+    /// A runner session: no per-tool knowledge hooks.
+    pub runner: bool,
 }
 
 /// What `authorize_provider_use` checks before a session's content is sent.
@@ -3354,10 +3377,6 @@ impl ChatManager {
 
         // Build session hooks: PreCompact (compaction notifier) + PreToolUse (skill activation)
         let session_hooks = {
-            let mut hooks = std::collections::HashMap::new();
-
-            // PreCompact → CompactionNotifier broadcasts ChatEvent::CompactionStarted
-            // + builds custom_instructions from task/session context
             let context_source = match &spawned_ctx {
                 Some(ctx) if ctx.task_id.is_some() => {
                     CompactionContextSource::Task(ctx.task_id.unwrap())
@@ -3367,41 +3386,17 @@ impl ChatManager {
                     None => CompactionContextSource::None,
                 },
             };
-            let notifier = CompactionNotifier::new(
-                events_tx.clone(),
-                self.nats.clone(),
-                session_id.to_string(),
-            )
-            .with_context(self.graph.clone(), context_source)
-            .with_work_log(work_log.clone());
-            hooks.insert(
-                "PreCompact".to_string(),
-                vec![nexus_claude::HookMatcher {
-                    matcher: None,
-                    hooks: vec![std::sync::Arc::new(notifier)],
-                }],
-            );
-
-            // Skip PreToolUse/PostToolUse hooks for runner sessions — they inject
-            // ~1000 chars of context per tool call (persona, notes, redirect suggestions),
-            // which accelerates compaction and wastes tokens. Runner agents already have
-            // full task context via the prompt.
-            if request.runner_context.is_none() {
-                // PreToolUse → SkillActivationHook injects skill context as additionalContext
-                Self::register_skill_hook(&mut hooks, self.graph.clone());
-
-                // PostToolUse → PostToolUseRedirectHook suggests MCP alternatives after noisy Grep
-                let post_hook = post_tool_hook::PostToolUseRedirectHook::new(self.graph.clone());
-                hooks.insert(
-                    "PostToolUse".to_string(),
-                    vec![nexus_claude::HookMatcher {
-                        matcher: None,
-                        hooks: vec![std::sync::Arc::new(post_hook)],
-                    }],
-                );
-            }
-
-            hooks
+            self.graph_hook_table(GraphHookInput {
+                session_id: session_id.to_string(),
+                context_source,
+                work_log: work_log.clone(),
+                // PreToolUse/PostToolUse are skipped for runner sessions — they inject
+                // ~1000 chars of context per tool call (persona, notes, redirect suggestions),
+                // which accelerates compaction and wastes tokens. Runner agents already have
+                // full task context via the prompt.
+                tool_knowledge: request.runner_context.is_none(),
+                announce: Some(events_tx.clone()),
+            })
         };
 
         // Build options and create InteractiveClient
@@ -6376,6 +6371,57 @@ impl ChatManager {
 
     /// Resume a previously inactive session by creating a new InteractiveClient.
     ///
+    /// The knowledge-graph hooks of a session, as the table the Claude CLI takes
+    /// (`event → matchers`). The agent engine serves the SAME table to every
+    /// provider through [`super::agent_hooks::GraphSessionHooks`]: one logic, two
+    /// doors.
+    pub(crate) fn graph_hook_table(&self, i: GraphHookInput) -> super::agent_hooks::HookTable {
+        let GraphHookInput {
+            session_id,
+            context_source,
+            work_log,
+            tool_knowledge,
+            announce,
+        } = i;
+        let mut hooks = std::collections::HashMap::new();
+
+        // PreCompact → CompactionNotifier builds custom_instructions from the task /
+        // project context, and (when `announce` carries a sender) broadcasts
+        // ChatEvent::CompactionStarted. The agent engine announces compactions from the
+        // provider's own `compaction` event, so it passes none: a second announcement
+        // would show the spinner twice.
+        let (events_tx, nats) = match announce {
+            Some(tx) => (tx, self.nats.clone()),
+            None => (broadcast::channel(1).0, None),
+        };
+        let notifier = CompactionNotifier::new(events_tx, nats, session_id)
+            .with_context(self.graph.clone(), context_source)
+            .with_work_log(work_log);
+        hooks.insert(
+            "PreCompact".to_string(),
+            vec![nexus_claude::HookMatcher {
+                matcher: None,
+                hooks: vec![std::sync::Arc::new(notifier)],
+            }],
+        );
+
+        if tool_knowledge {
+            // PreToolUse → SkillActivationHook injects skill context as additionalContext
+            Self::register_skill_hook(&mut hooks, self.graph.clone());
+
+            // PostToolUse → PostToolUseRedirectHook suggests MCP alternatives after noisy Grep
+            let post_hook = post_tool_hook::PostToolUseRedirectHook::new(self.graph.clone());
+            hooks.insert(
+                "PostToolUse".to_string(),
+                vec![nexus_claude::HookMatcher {
+                    matcher: None,
+                    hooks: vec![std::sync::Arc::new(post_hook)],
+                }],
+            );
+        }
+        hooks
+    }
+
     /// If the session has a `cli_session_id`, resumes with `--resume`.
     /// If not (first message or previous spawn failed), starts fresh without `--resume`.
     /// Register the PreToolUse knowledge hook, plus a PreCompact companion that
@@ -8436,6 +8482,7 @@ impl ChatManager {
             max_tokens,
             kind,
             remote_cwd,
+            hooks,
         } = i;
         use nexus_claude::agent::{
             EnvSpec, McpServerSpec, SessionSpec, SystemPromptMode, SystemPromptSpec,
@@ -8520,6 +8567,34 @@ impl ChatManager {
             inherit: Self::child_env_inherit_names(),
             set: Default::default(),
         };
+        // The knowledge graph's hooks, for the providers that run hooks in their loop. A
+        // remote session has no local project to resolve a file against.
+        let runs_hooks = remote_cwd.is_none()
+            && matches!(
+                kind,
+                nexus_claude::agent::ProviderKind::Native
+                    | nexus_claude::agent::ProviderKind::ClaudeCode
+            );
+        if let Some(scope) = hooks.filter(|_| runs_hooks) {
+            let context_source = match (scope.task_id, scope.project_slug) {
+                (Some(task_id), _) => CompactionContextSource::Task(task_id),
+                (None, Some(slug)) => CompactionContextSource::Session(slug),
+                (None, None) => CompactionContextSource::None,
+            };
+            let table = self.graph_hook_table(GraphHookInput {
+                session_id: session_id.to_string(),
+                context_source,
+                work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
+                tool_knowledge: !scope.runner,
+                announce: None,
+            });
+            spec.hooks = Some(Arc::new(super::agent_hooks::GraphSessionHooks::new(
+                table,
+                session_id,
+                spec.cwd.display().to_string(),
+                Some(mode.clone()),
+            )));
+        }
         Ok(spec)
     }
 
@@ -8571,6 +8646,15 @@ impl ChatManager {
                 max_tokens: request.max_tokens,
                 kind: provider.kind(),
                 remote_cwd: remote_cwd.as_deref(),
+                hooks: Some(AgentHookScope {
+                    project_slug: project_slug.map(str::to_string),
+                    task_id: request
+                        .spawned_by
+                        .as_deref()
+                        .and_then(parse_spawned_by)
+                        .and_then(|ctx| ctx.task_id),
+                    runner: request.runner_context.is_some(),
+                }),
             })
             .await?;
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
@@ -8705,6 +8789,15 @@ impl ChatManager {
                 max_tokens: None,
                 kind: provider.kind(),
                 remote_cwd: remote_cwd.as_deref(),
+                hooks: Some(AgentHookScope {
+                    project_slug: node.project_slug.clone(),
+                    task_id: node
+                        .spawned_by
+                        .as_deref()
+                        .and_then(parse_spawned_by)
+                        .and_then(|ctx| ctx.task_id),
+                    runner: false,
+                }),
             })
             .await?;
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
@@ -9706,6 +9799,135 @@ mod tests {
         }
     }
 
+    // ── The knowledge graph's hooks on the agent engine ─────────────────────
+
+    fn scope(runner: bool) -> Option<AgentHookScope> {
+        Some(AgentHookScope {
+            project_slug: Some("proj".into()),
+            task_id: None,
+            runner,
+        })
+    }
+
+    #[tokio::test]
+    async fn the_agent_engine_gives_the_graph_hooks_only_to_providers_that_run_hooks() {
+        use nexus_claude::agent::ProviderKind;
+        let state = mock_app_state();
+        let mut config = test_config();
+        config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let claims = crate::auth::jwt::Claims::service_account("hooks");
+        let has_hooks = |kind: ProviderKind, remote: Option<&'static str>, hooks| {
+            let manager = &manager;
+            let claims = &claims;
+            async move {
+                manager
+                    .build_agent_spec(AgentSpecInput {
+                        cwd: "/tmp",
+                        model: "m",
+                        system_prompt: "p",
+                        permission_mode: None,
+                        add_dirs: &[],
+                        user_claims: Some(claims),
+                        session_id: "hooks-s1",
+                        third_party: true,
+                        max_tokens: None,
+                        kind,
+                        remote_cwd: remote,
+                        hooks,
+                    })
+                    .await
+                    .unwrap()
+                    .hooks
+                    .is_some()
+            }
+        };
+        // Native runs them in its loop; so does Claude Code (its hook protocol).
+        assert!(has_hooks(ProviderKind::Native, None, scope(false)).await);
+        assert!(has_hooks(ProviderKind::ClaudeCode, None, scope(false)).await);
+        // Codex and ACP ignore them (and say so): they are not handed any.
+        assert!(!has_hooks(ProviderKind::Codex, None, scope(false)).await);
+        assert!(!has_hooks(ProviderKind::Acp, None, scope(false)).await);
+        // A remote machine has no local project to resolve a file against.
+        assert!(!has_hooks(ProviderKind::ClaudeCode, Some("~/w"), scope(false)).await);
+        // No scope, no hooks.
+        assert!(!has_hooks(ProviderKind::Native, None, None).await);
+    }
+
+    #[tokio::test]
+    async fn the_hook_table_has_the_per_tool_hooks_unless_the_session_is_a_runner() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let table = |tool_knowledge: bool| {
+            let mut keys: Vec<String> = manager
+                .graph_hook_table(GraphHookInput {
+                    session_id: "s".into(),
+                    context_source: CompactionContextSource::None,
+                    work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
+                    tool_knowledge,
+                    announce: None,
+                })
+                .into_keys()
+                .collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(table(true), ["PostToolUse", "PreCompact", "PreToolUse"]);
+        // A runner has its task context in the prompt: compaction guidance only.
+        assert_eq!(table(false), ["PreCompact"]);
+    }
+
+    #[tokio::test]
+    async fn an_agent_engine_compaction_is_not_announced_twice() {
+        // The provider emits its own `compaction` event; the notifier of the agent
+        // path must stay silent on the chat channel (it only builds the instructions).
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let table = manager.graph_hook_table(GraphHookInput {
+            session_id: "s".into(),
+            context_source: CompactionContextSource::None,
+            work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
+            tool_knowledge: false,
+            announce: None,
+        });
+        let (tx, mut rx) = broadcast::channel(8);
+        // The same table, but the claude path's notifier would have announced on `tx`:
+        let announcing = manager.graph_hook_table(GraphHookInput {
+            session_id: "s".into(),
+            context_source: CompactionContextSource::None,
+            work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
+            tool_knowledge: false,
+            announce: Some(tx),
+        });
+        let input = nexus_claude::HookInput::PreCompact(nexus_claude::PreCompactHookInput {
+            session_id: "s".into(),
+            transcript_path: String::new(),
+            cwd: "/tmp".into(),
+            permission_mode: None,
+            trigger: "auto".into(),
+            custom_instructions: None,
+        });
+        let ctx = nexus_claude::HookContext { signal: None };
+        for matcher in &table["PreCompact"] {
+            for hook in &matcher.hooks {
+                hook.execute(&input, None, &ctx).await.unwrap();
+            }
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "the silent table announced something"
+        );
+        for matcher in &announcing["PreCompact"] {
+            for hook in &matcher.hooks {
+                hook.execute(&input, None, &ctx).await.unwrap();
+            }
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ChatEvent::CompactionStarted { .. })
+        ));
+    }
+
     // ── Claude Code on another machine (claude_code_remote) ────────────────
 
     #[tokio::test]
@@ -9735,6 +9957,7 @@ mod tests {
                         max_tokens: None,
                         kind: ProviderKind::ClaudeCode,
                         remote_cwd,
+                        hooks: None,
                     })
                     .await
                     .unwrap()
@@ -9797,6 +10020,7 @@ mod tests {
                         max_tokens: None,
                         kind: ProviderKind::Native,
                         remote_cwd: None,
+                        hooks: None,
                     })
                     .await
                     .unwrap();

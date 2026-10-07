@@ -117,19 +117,18 @@ fn retry_delay_ms(error: &ProviderError, attempt: u32) -> u64 {
 ///
 /// Two sources, kept apart on purpose:
 /// - what THIS ENGINE (the backend) has not ported, whatever the provider can do:
-///   hooks (no relay yet), message queue, auto-continue, retry, NATS fan-out, entity
-///   enrichment;
+///   message queue, auto-continue, retry, NATS fan-out, entity enrichment;
 /// - what THE SESSION's capabilities say it cannot do: `images`, and `compaction`
 ///   when the provider emits no compaction signal.
 pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
     // `retry` is NOT listed: the engine retries a retryable `done.error` (B15).
-    let mut missing = vec![
-        "hooks",
-        "message_queue",
-        "auto_continue",
-        "nats",
-        "enrichment",
-    ];
+    let mut missing = vec!["message_queue", "auto_continue", "nats", "enrichment"];
+    // The knowledge-graph hooks are served to a provider that runs hooks in its own loop
+    // (`GraphSessionHooks`). A session that cannot carry an MCP server is the remote Claude
+    // Code, which is given none: it keeps the entry.
+    if caps.hooks != nexus_claude::agent::HookSupport::InProtocol || !caps.per_session_mcp {
+        missing.push("hooks");
+    }
     if !caps.compaction_signal {
         missing.push("compaction");
     }
@@ -822,6 +821,28 @@ mod mask_tests {
         assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 1), 1000);
         assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 3), 4000);
         assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 20), 30_000);
+    }
+
+    #[test]
+    fn hooks_are_degraded_only_where_the_provider_does_not_run_them() {
+        use nexus_claude::agent::HookSupport;
+        let mut caps = Capabilities::none();
+        caps.per_session_mcp = true;
+        for support in [HookSupport::None, HookSupport::Command] {
+            caps.hooks = support;
+            assert!(
+                degraded_features(&caps).iter().any(|f| f == "hooks"),
+                "{support:?}"
+            );
+        }
+        caps.hooks = HookSupport::InProtocol;
+        assert!(
+            !degraded_features(&caps).iter().any(|f| f == "hooks"),
+            "a provider that runs hooks in its loop is not told it lost them"
+        );
+        // ...unless it cannot carry the MCP server either (remote Claude Code: given no hooks).
+        caps.per_session_mcp = false;
+        assert!(degraded_features(&caps).iter().any(|f| f == "hooks"));
     }
 
     /// VERIFIER: the engine retries (B15), so `retry` must not be announced as missing.
