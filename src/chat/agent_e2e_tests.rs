@@ -408,26 +408,24 @@ async fn the_endpoint_guard_runs_before_any_connection() {
 }
 
 #[tokio::test]
-async fn trust_is_refused_for_a_provider_without_a_sandbox() {
+async fn trust_opens_on_a_provider_without_a_sandbox_like_it_does_on_claude_code() {
+    // Decision of 2026-10-07 (replaces A35): a third-party provider behaves like Claude Code.
+    // The sandbox level informs the user, it gates nothing: Rock'n roll opens, and the sending
+    // is journaled like any other.
     let fake = FakeOpenAi::start(script());
     let graph = Arc::new(MockGraphStore::new());
     store_instance(&graph, &instance(&fake, "none")).await;
     consent(&graph, "proj", "local", &fake.origin()).await;
     let manager = manager(graph.clone(), true);
-    let err = manager
+    manager
         .create_session(&request(Some("local"), Some("proj"), "bypassPermissions"))
         .await
-        .unwrap_err();
-    assert_eq!(failure(&err), (422, "unsupported"));
-    assert!(
-        fake.chat_requests().is_empty(),
-        "refused before the model was called"
+        .expect("trust opens on a provider with no sandbox");
+    assert_eq!(
+        graph.list_llm_settings("journal", "").await.unwrap().len(),
+        1,
+        "the sending is journaled"
     );
-    assert!(graph
-        .list_llm_settings("journal", "")
-        .await
-        .unwrap()
-        .is_empty());
 }
 
 #[tokio::test]
@@ -820,12 +818,10 @@ async fn verify4_authorize_refuses_a_project_without_consent_even_when_called_di
     let graph = Arc::new(MockGraphStore::new());
     store_instance(&graph, &instance(&fake, "none")).await;
     let manager = manager(graph.clone(), true);
-    let provider = manager.provider_for("local").await.unwrap();
     let claims = crate::auth::jwt::Claims::service_account("e2e");
     let r = manager
         .authorize_provider_use(super::manager::ProviderUse {
             provider_id: "local",
-            provider: &provider,
             model: "m",
             mode: nexus_claude::agent::PolicyMode::Ask,
             project_slug: Some("proj"),
@@ -842,9 +838,14 @@ async fn verify4_a_refused_opening_revokes_the_session_token() {
     let graph = Arc::new(MockGraphStore::new());
     store_instance(&graph, &instance(&fake, "none")).await;
     consent(&graph, "proj", "local", &fake.origin()).await;
+    // The refusal comes from the same gate (authorize_provider_use), after the token was
+    // bound to the session: no trace of the sending, no sending (A37).
+    graph
+        .fail_journal_writes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let manager = manager(graph.clone(), true);
     let _ = manager
-        .create_session(&request(Some("local"), Some("proj"), "bypassPermissions"))
+        .create_session(&request(Some("local"), Some("proj"), "default"))
         .await
         .unwrap_err();
     let ids: Vec<_> = graph.chat_sessions.read().await.keys().cloned().collect();
@@ -902,4 +903,31 @@ async fn an_opening_is_refused_when_the_send_journal_cannot_be_written() {
         .create_session(&request(Some("local"), Some("proj"), "default"))
         .await
         .unwrap_or_else(|e| panic!("opens once the journal works: {e:#}"));
+}
+
+#[test]
+fn only_a_remote_machine_that_does_not_allow_it_holds_trust_back() {
+    use super::manager::ChatManager;
+    use super::provider::settings::{InstanceRecord, KIND_CLAUDE_CODE_REMOTE};
+    let record = |kind: &str, allow_trust: bool| InstanceRecord {
+        kind: kind.into(),
+        allow_trust,
+        ..Default::default()
+    };
+    // A machine nobody watches keeps its own explicit switch ...
+    assert!(ChatManager::trust_needs_opt_in(&record(
+        KIND_CLAUDE_CODE_REMOTE,
+        false
+    )));
+    assert!(!ChatManager::trust_needs_opt_in(&record(
+        KIND_CLAUDE_CODE_REMOTE,
+        true
+    )));
+    // ... every other provider behaves like Claude Code (decision of 2026-10-07).
+    for kind in ["openai_compatible", "codex", "acp", "claude_code"] {
+        assert!(
+            !ChatManager::trust_needs_opt_in(&record(kind, false)),
+            "{kind}"
+        );
+    }
 }
