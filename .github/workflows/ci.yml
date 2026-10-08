@@ -520,6 +520,20 @@ jobs:
       - name: Merge coverage runs into a single lcov
         run: cargo llvm-cov report --lcov --output-path lcov.info
 
+      # Blocking gate for src/refs (see scripts/lcov_gate.rs): Codecov is advisory
+      # here, and a file no test binary compiles never shows up in the report, so
+      # this reads the directory from disk. Fails the job - and the PR - when a
+      # file is absent from the report or under its threshold. No `ignore` entry.
+      - name: Blocking coverage gate - src/refs
+        run: |
+          rustc --test scripts/lcov_gate.rs -o "$RUNNER_TEMP/lcov_gate_test"
+          "$RUNNER_TEMP/lcov_gate_test"
+          rustc -O scripts/lcov_gate.rs -o "$RUNNER_TEMP/lcov_gate"
+          "$RUNNER_TEMP/lcov_gate" lcov.info --dir src/refs --min 90 \
+            --exact src/refs/access.rs \
+            --exact src/refs/validate.rs \
+            --exact src/refs/registry.rs
+
       # Guard: the merged report must actually contain the Neo4j lines. Without
       # it, a silently skipped integration suite (backends_available() returning
       # false) would upload a report that looks fine while covering nothing.
