@@ -55,6 +55,16 @@ pub struct DecisionOutcome {
     pub cost_usd: Option<f64>,
     /// Wall-clock duration in milliseconds.
     pub duration_ms: Option<u64>,
+    /// Input tokens of the work; `None` when unknown (never zero).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    /// Output tokens of the work; `None` when unknown (never zero).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// The user switched the model by hand after the decision. May be set
+    /// before the outcome is closed (`reward` is still `None` then).
+    #[serde(default)]
+    pub overridden: bool,
 }
 
 /// A routing decision, applied or not.
@@ -92,6 +102,10 @@ pub struct CognitiveDecision {
     pub turn_index: Option<u32>,
     /// Filled when the work closes.
     pub outcome: Option<DecisionOutcome>,
+    /// The pair the work actually ran on, when known. Equals `chosen` when the
+    /// decision was applied; differs when the declarative choice was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<Pick>,
 }
 
 impl CognitiveDecision {
