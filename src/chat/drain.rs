@@ -57,7 +57,18 @@ pub(crate) async fn drain_pending_messages(
     // (plan 806c8f2c, T2). FIFO is preserved within each priority class.
     let (next_message, held_left) = {
         let mut queue = pending_messages.lock().await;
-        let next = pop_highest_priority(&mut queue);
+        // A Stop that landed during the turn that just ended must not be undone
+        // by the next queued message: `stream_response` re-arms the interrupt
+        // flag and token at entry, so starting one here would swallow the Stop.
+        let interrupted = interrupt_flag.load(Ordering::SeqCst);
+        let (next, dropped) = pop_next_after_turn(&mut queue, interrupted);
+        if dropped > 0 {
+            info!(
+                session_id = %session_id,
+                dropped,
+                "Stop requested: dropped automated queued messages instead of restarting the turn"
+            );
+        }
         // A held message is leaving: the list clients show must lose it now,
         // not when the turn it starts is over.
         let held_left = next
@@ -220,6 +231,27 @@ pub(crate) async fn drain_pending_messages(
             session_id
         );
     }
+}
+
+/// What may start the next turn once the previous one ended.
+///
+/// Not interrupted: the highest-priority message, as before. Interrupted: the
+/// automated entries (`SystemHint`, `BackgroundOutput` — Monitor ticks,
+/// auto-continue, objective reminders) are discarded, because they were
+/// produced by the very work the user just stopped and would re-arm the turn
+/// forever. Messages the human typed still run. Returns the message and how
+/// many automated entries were dropped.
+fn pop_next_after_turn(
+    queue: &mut VecDeque<PendingMessage>,
+    interrupted: bool,
+) -> (Option<PendingMessage>, usize) {
+    let mut dropped = 0;
+    if interrupted {
+        let before = queue.len();
+        queue.retain(|m| matches!(m.kind, PendingMessageKind::User));
+        dropped = before - queue.len();
+    }
+    (pop_highest_priority(queue), dropped)
 }
 
 /// Pop the highest-priority `PendingMessage` from the queue, preserving
@@ -505,5 +537,48 @@ mod tests {
         assert_next(&mut q, PendingMessageKind::BackgroundOutput, "BG3");
 
         assert!(pop_highest_priority(&mut q).is_none());
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+
+    fn q(items: Vec<PendingMessage>) -> VecDeque<PendingMessage> {
+        items.into_iter().collect()
+    }
+
+    /// Corner case behind "I cannot even stop it": Stop during a turn while a
+    /// Monitor tick sits in the queue. Draining it started a fresh
+    /// `stream_response`, which re-arms the interrupt flag — the Stop vanished.
+    #[test]
+    fn stop_does_not_restart_the_turn_from_automated_messages() {
+        let mut queue = q(vec![
+            PendingMessage::background_output("tick".into()),
+            PendingMessage::system_hint("continue".into()),
+        ]);
+        let (next, dropped) = pop_next_after_turn(&mut queue, true);
+        assert!(next.is_none(), "an interrupted session must go idle");
+        assert_eq!(dropped, 2);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn stop_keeps_what_the_human_typed() {
+        let mut queue = q(vec![
+            PendingMessage::background_output("tick".into()),
+            PendingMessage::user("hello".into()),
+        ]);
+        let (next, dropped) = pop_next_after_turn(&mut queue, true);
+        assert_eq!(next.unwrap().content, "hello");
+        assert_eq!(dropped, 1);
+    }
+
+    #[test]
+    fn without_stop_automated_messages_still_drain() {
+        let mut queue = q(vec![PendingMessage::background_output("tick".into())]);
+        let (next, dropped) = pop_next_after_turn(&mut queue, false);
+        assert_eq!(next.unwrap().content, "tick");
+        assert_eq!(dropped, 0);
     }
 }
