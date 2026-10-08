@@ -208,6 +208,11 @@ pub struct ChatRequest {
     /// existing session a different provider is a 409 `provider_conflict`.
     #[serde(default)]
     pub provider: Option<String>,
+    /// Routing mode for THIS conversation (`primary` / `mixed` / `full`), replacing the
+    /// one of the settings. Absent: the settings in force decide. Only read when a
+    /// conversation opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_mode: Option<crate::chat::provider::cognitive::ProviderRoutingMode>,
     /// Model alias set on the task (A16 level "task"). Internal.
     #[serde(skip)]
     pub task_alias: Option<String>,
@@ -1076,6 +1081,9 @@ pub struct ChatSession {
     /// Which precedence level chose the provider (`session`, `request`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routed_by: Option<String>,
+    /// Routing mode this conversation was opened with, when its request named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_mode: Option<String>,
 }
 
 /// What a chat session is doing *right now*, read from the live
@@ -2350,6 +2358,7 @@ mod tests {
     #[test]
     fn test_chat_session_serde_roundtrip() {
         let session = ChatSession {
+            routing_mode: None,
             id: "test-id".into(),
             cli_session_id: Some("cli-123".into()),
             project_slug: Some("my-project".into()),
@@ -2571,6 +2580,7 @@ mod tests {
     #[test]
     fn test_chat_session_with_workspace_and_add_dirs() {
         let session = ChatSession {
+            routing_mode: None,
             id: "s1".into(),
             cli_session_id: None,
             project_slug: Some("proj".into()),

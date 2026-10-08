@@ -305,6 +305,7 @@ fn session_node_to_response(s: crate::neo4j::models::ChatSessionNode) -> ChatSes
         linked_rfcs: Vec::new(),
         activity: None,
         provider_id: s.provider_id,
+        routing_mode: s.routing_mode,
         capabilities: None,
         routed_by: s.routed_by,
     }
@@ -2495,6 +2496,7 @@ mod tests {
             nexus_claude::agent::ProviderKind::ClaudeCode
         );
         let request = crate::chat::types::ChatRequest {
+            routing_mode: None,
             attachments: Vec::new(),
             message: "hi".into(),
             session_id: None,
