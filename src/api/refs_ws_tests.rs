@@ -157,7 +157,7 @@ async fn auth_ok_has_no_features_field_with_the_switch_off() {
     let mut ws = connect(&rig).await;
     let ok = frame_where(&mut ws, of_type("auth_ok")).await;
     assert!(ok.get("features").is_none(), "{ok}");
-    assert_eq!(ok["user"]["email"].is_string(), true);
+    assert!(ok["user"]["email"].is_string());
 }
 
 #[tokio::test]

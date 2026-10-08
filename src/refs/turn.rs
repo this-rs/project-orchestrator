@@ -302,8 +302,10 @@ mod tests {
             mime_type: String::new(),
             size_bytes: 1,
         };
-        let stored =
-            message_attachments::encode(&block::encode("hello #plan:x", &[r]), &[att.clone()]);
+        let stored = message_attachments::encode(
+            &block::encode("hello #plan:x", &[r]),
+            std::slice::from_ref(&att),
+        );
         assert!(stored.contains("po-refs") && stored.contains("po-attachments"));
         assert_eq!(visible_text(&stored), "hello #plan:x");
         assert_eq!(visible_text("plain"), "plain");
