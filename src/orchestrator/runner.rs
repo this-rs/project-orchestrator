@@ -1118,6 +1118,30 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         neo4j: &dyn crate::neo4j::GraphStore,
         project_id: Uuid,
     ) -> Vec<FeatureGraphProposal> {
+        Self::propose_feature_graphs_routed(
+            neo4j,
+            project_id,
+            std::env::var("FEATURE_GRAPH_MODEL").ok(),
+            crate::runner::routing::installed().as_deref(),
+        )
+        .await
+    }
+
+    /// [`Self::propose_feature_graphs_with_llm`] with its inputs explicit.
+    ///
+    /// `configured_model` is `FEATURE_GRAPH_MODEL`: when set it is an EXPLICIT
+    /// choice that wins and is never filtered (an empty value skips the call).
+    /// Unset, the call goes through the cognitive decider as a
+    /// `utility.feature_graph` signature; an applied decision on the Claude
+    /// Code instance (the only one this one-shot call can run on) names the
+    /// model, otherwise the default model runs. The decision is closed with how
+    /// the call ended.
+    async fn propose_feature_graphs_routed(
+        neo4j: &dyn crate::neo4j::GraphStore,
+        project_id: Uuid,
+        configured_model: Option<String>,
+        routing: Option<&crate::runner::routing::RoutingHandle>,
+    ) -> Vec<FeatureGraphProposal> {
         // 1. Gather context
         let context = match Self::gather_codebase_context(neo4j, project_id).await {
             Ok(c) => c,
@@ -1133,15 +1157,84 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         // 2. Build prompt
         let prompt = Self::build_feature_graph_prompt(&context);
 
-        // 3. Oneshot LLM call
-        let model =
-            std::env::var("FEATURE_GRAPH_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".into());
-
-        if model.is_empty() {
+        // 3. Which model: the configured one is explicit; else the decider.
+        if configured_model.as_deref() == Some("") {
             tracing::info!("FEATURE_GRAPH_MODEL is empty, skipping LLM feature graph proposal");
             return Vec::new();
         }
+        let (model, decision_id) =
+            Self::choose_feature_graph_model(neo4j, project_id, configured_model, &prompt, routing)
+                .await;
 
+        let started = std::time::Instant::now();
+        let outcome = Self::call_feature_graph_model(project_id, &model, prompt).await;
+        if let (Some(routing), Some(id)) = (routing, decision_id) {
+            let outcome_record = crate::chat::provider::cognitive::feedback::Outcome {
+                success: Some(outcome.is_some()),
+                attempts: 1,
+                duration_ms: Some(started.elapsed().as_millis() as u64),
+                ..Default::default()
+            };
+            routing.close(neo4j, id, &outcome_record).await;
+        }
+        outcome.unwrap_or_default()
+    }
+
+    /// The model of the feature-graph call and the decision that chose it.
+    ///
+    /// A configured model (`FEATURE_GRAPH_MODEL`) is an explicit slot: it wins,
+    /// whatever the decider would say. Unset, an applied decision on the Claude
+    /// Code instance names the model; anything else keeps the default.
+    async fn choose_feature_graph_model(
+        neo4j: &dyn crate::neo4j::GraphStore,
+        project_id: Uuid,
+        configured_model: Option<String>,
+        prompt: &str,
+        routing: Option<&crate::runner::routing::RoutingHandle>,
+    ) -> (String, Option<Uuid>) {
+        let explicit = configured_model.is_some();
+        let mut model = configured_model.unwrap_or_else(|| DEFAULT_FEATURE_GRAPH_MODEL.into());
+        let mut decision_id = None;
+        if let Some(routing) = routing {
+            use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
+            let project_slug = neo4j
+                .get_project(project_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|p| p.slug);
+            let signature = TaskSignature::utility(
+                TaskClass::UtilityFeatureGraph,
+                (prompt.chars().count() / 4) as u64,
+                project_slug.as_deref(),
+            );
+            if let Some(decision) = routing
+                .decide(
+                    neo4j,
+                    signature,
+                    crate::runner::routing::slot_for(explicit),
+                    None,
+                    None,
+                )
+                .await
+            {
+                decision_id = Some(decision.id);
+                if let (false, true, Some(pick)) = (explicit, decision.applied, &decision.chosen) {
+                    if pick.provider_id == crate::neo4j::agent_execution::DEFAULT_PROVIDER_ID {
+                        model = pick.model.clone();
+                    }
+                }
+            }
+        }
+        (model, decision_id)
+    }
+
+    /// The one-shot call itself. `None` when the call or its parsing failed.
+    async fn call_feature_graph_model(
+        project_id: Uuid,
+        model: &str,
+        prompt: String,
+    ) -> Option<Vec<FeatureGraphProposal>> {
         tracing::info!(
             "Proposing feature graphs via LLM (model: {}) for project {}",
             model,
@@ -1152,7 +1245,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         #[allow(deprecated)]
         let options = ClaudeCodeOptions::builder()
-            .model(&model)
+            .model(model)
             .system_prompt("You are a code architecture analyst. Respond only with valid JSON.")
             .permission_mode(PermissionMode::BypassPermissions)
             .max_turns(1)
@@ -1167,7 +1260,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                     "Failed to create LLM client for feature graph proposal: {}",
                     e
                 );
-                return Vec::new();
+                return None;
             }
         };
 
@@ -1176,7 +1269,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 "Failed to connect LLM client for feature graph proposal: {}",
                 e
             );
-            return Vec::new();
+            return None;
         }
 
         let messages = match client.send_and_receive(prompt).await {
@@ -1184,7 +1277,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             Err(e) => {
                 tracing::warn!("LLM feature graph proposal call failed: {}", e);
                 let _ = client.disconnect().await;
-                return Vec::new();
+                return None;
             }
         };
 
@@ -1205,7 +1298,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         if response_text.is_empty() {
             tracing::warn!("LLM returned empty response for feature graph proposal");
-            return Vec::new();
+            return None;
         }
 
         // 5. Parse JSON — try to extract array from response
@@ -1224,7 +1317,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                     proposals.len(),
                     project_id
                 );
-                proposals
+                Some(proposals)
             }
             Err(e) => {
                 tracing::warn!(
@@ -1232,7 +1325,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                     e,
                     &response_text[..response_text.len().min(500)]
                 );
-                Vec::new()
+                None
             }
         }
     }
@@ -5292,6 +5385,10 @@ pub fn scan_files(root: &Path) -> Vec<FileEntry> {
 /// Files are grouped so that each chunk's total size does not exceed this limit.
 /// This controls peak memory usage during parsing: only one chunk's ASTs
 /// are in memory at a time. Inspired by GitGenius `CHUNK_BYTE_BUDGET`.
+/// Model of the feature-graph one-shot call when `FEATURE_GRAPH_MODEL` is unset
+/// and the decider names none.
+const DEFAULT_FEATURE_GRAPH_MODEL: &str = "claude-sonnet-4-6";
+
 pub const CHUNK_BYTE_BUDGET: u64 = 20 * 1024 * 1024;
 
 /// Group files into chunks that fit within a byte budget.
@@ -10839,5 +10936,70 @@ mod tests {
             !has_implements,
             "No implements edges for struct without interfaces"
         );
+    }
+    // ---- Cognitive routing of the feature-graph utility (B-R7) ------------
+
+    #[tokio::test]
+    async fn feature_graph_model_from_the_environment_is_explicit_and_wins() {
+        use crate::chat::provider::cognitive::candidates::Slot;
+        use crate::runner::routing::test_support::FakeDecider;
+        let graph = crate::neo4j::mock::MockGraphStore::new();
+        let (decider, handle) = FakeDecider::handle(true);
+
+        let (model, id) = Orchestrator::choose_feature_graph_model(
+            &graph,
+            Uuid::new_v4(),
+            Some("my-model".into()),
+            "prompt",
+            Some(&handle),
+        )
+        .await;
+        assert_eq!(
+            model, "my-model",
+            "the configured model is never substituted"
+        );
+        assert!(id.is_some(), "the call is still recorded");
+        let seen = decider.requests();
+        assert_eq!(seen[0].slot, Slot::Explicit);
+        assert_eq!(seen[0].signature.class.key(), "utility.feature_graph");
+    }
+
+    #[tokio::test]
+    async fn without_a_configured_model_an_applied_decision_names_the_model() {
+        use crate::chat::provider::cognitive::candidates::Slot;
+        use crate::runner::routing::test_support::FakeDecider;
+        let graph = crate::neo4j::mock::MockGraphStore::new();
+
+        // Applied: the decider's pick on the Claude Code instance is used.
+        let (decider, handle) = FakeDecider::handle(true);
+        let (model, _) = Orchestrator::choose_feature_graph_model(
+            &graph,
+            Uuid::new_v4(),
+            None,
+            "prompt",
+            Some(&handle),
+        )
+        .await;
+        assert_eq!(model, "fake-model");
+        assert_eq!(decider.requests()[0].slot, Slot::Automatic);
+
+        // Not applied (primary / shadow): the default runs, as before.
+        let (_d, handle) = FakeDecider::handle(false);
+        let (model, id) = Orchestrator::choose_feature_graph_model(
+            &graph,
+            Uuid::new_v4(),
+            None,
+            "prompt",
+            Some(&handle),
+        )
+        .await;
+        assert_eq!(model, DEFAULT_FEATURE_GRAPH_MODEL);
+        assert!(id.is_some());
+
+        // No handle: nothing decided.
+        let (model, id) =
+            Orchestrator::choose_feature_graph_model(&graph, Uuid::new_v4(), None, "p", None).await;
+        assert_eq!(model, DEFAULT_FEATURE_GRAPH_MODEL);
+        assert!(id.is_none());
     }
 }

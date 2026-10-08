@@ -1,5 +1,5 @@
 %% name: po-cognitive-routing
-%% covers: backend:src/api/routing_handlers.rs backend:src/chat/provider/cognitive/**
+%% covers: backend:src/api/routing_handlers.rs backend:src/chat/provider/cognitive/** backend:src/runner/routing.rs
 %% verified: 8b0b020f
 %% ---
 %% PROUVE : la couche RÉGLAGES du routage cognitif (RFC v2, décision R2, tranche B-R1) : le mode de routage
@@ -91,3 +91,20 @@ flowchart TD
     SIG --> FILTER
     FACTSGAP["🟠 ModelFacts::from_capabilities existe mais le listing et les prix nexus ne l'appellent pas encore : branchement dans resolve_provider_choice (B-R4)"]
     FILTER -.-> FACTSGAP
+
+    subgraph callers["runner/routing.rs — qui décide avant d'ouvrir une session, qui ferme la décision (B-R7)"]
+        HANDLE["✅ RoutingHandle {decider: Arc&lt;dyn Decider&gt;, store: Arc&lt;dyn RoutingArmStore&gt;, pool} ; installé au démarrage (routing::install), None = rien décidé, rien enregistré (comportement d'avant) ; une panne de décision est journalisée et le travail part non routé<br/>test : runner sans handle = suite runner inchangée, an_unapplied_decision_changes_nothing_on_the_request_but_its_id"]
+        RUNDEC["✅ PlanRunner::execute_task : TaskSignature::from_task(tâche, étapes, tentative réelle, projet, budget marginal restant) AVANT la ChatRequest ; slot Explicit si alias de tâche, run provider/model ou persona, sinon Automatic ; la ChatRequest ne reçoit que routing_decision_id (provider/model intacts : le resolver B-R4 en fait le slot project_rule)<br/>test : mixed_two_tasks_of_different_classes_give_two_decisions_carried_on_request_and_record, an_explicit_alias_makes_the_slot_explicit_and_model_requested_follows_the_resolver"]
+        RUNREC["✅ AgentExecution.routing_decision_id (additif, absent = None) ; task_class = retry dès la tentative 2 (sinon la complexité : vocabulaire existant) ; model_requested = le modèle nommé, sinon celui que le resolver a choisi (lu sur la session)<br/>test : a_retry_attempt_records_task_class_retry_and_is_decided_as_a_retry (rouge sans le changement), test_routing_decision_id_is_written_at_launch_and_only_when_set, test_agent_execution_legacy_json_reads_with_defaults"]
+        RUNCLOSE["✅ close_attempt → feedback::close_decision(Outcome {success = Completed, attempts, coût MARGINAL seulement (base reported/priced ; base inconnue = None), durée, interrupted, vérification}) ; idempotent par décision<br/>test : closing_an_attempt_feeds_the_chosen_arm_once_with_the_marginal_cost_only, unknown_or_non_marginal_cost_is_none, verification_shapes"]
+        DELEG["✅ delegate_task : TaskSignature::from_delegation (classe énoncée, sinon la tâche) ; passe enfin l'alias du modèle de la tâche (task_alias était None) ; Explicit si provider/model/alias/persona ; fermeture à l'événement Result de la session<br/>test : a_delegation_passes_the_alias_set_on_its_task, a_routed_delegation_carries_the_decision_id_and_nothing_else_changes"]
+        UTIL["✅ propose_feature_graphs_with_llm : TaskSignature::utility(UtilityFeatureGraph) ; FEATURE_GRAPH_MODEL posé = slot Explicit (gagne, jamais filtré) ; sinon la décision appliquée sur claude-code nomme le modèle, sinon le défaut ; décision fermée avec l'issue de l'appel<br/>test : feature_graph_model_from_the_environment_is_explicit_and_wins, without_a_configured_model_an_applied_decision_names_the_model"]
+        HANDLE --> RUNDEC
+        RUNDEC --> RUNREC
+        RUNREC --> RUNCLOSE
+        HANDLE --> DELEG
+        HANDLE --> UTIL
+    end
+    FILTER -.-> HANDLE
+    CALLGAP["🟠 PAS BRANCHÉ : personne n'appelle routing::install tant que CognitiveDecider (B-R4) n'existe pas ; le résumé de compaction est fait par le CLI dans manager.rs (hors de ces fichiers) : TaskSignature::utility(UtilityCompaction) est prêt, l'appel reste à poser ; le runner lancé par lib.rs (reprise) n'a pas encore with_routing"]
+    HANDLE -.-> CALLGAP

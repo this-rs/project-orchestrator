@@ -4,6 +4,7 @@
 //! The Runner owns task status transitions — agents update step statuses in real-time via MCP.
 
 use crate::chat::manager::ChatManager;
+use crate::chat::provider::cognitive::signature::{ContextHints, TaskSignature};
 use crate::chat::types::{ChatEvent, ChatRequest};
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 use crate::neo4j::agent_execution::{AgentExecutionNode, AgentExecutionStatus};
@@ -19,7 +20,7 @@ use crate::runner::models::{
     StepBreakdown, TaskExecutionReport, TaskResult, TaskRunStatus, TriggerSource,
 };
 use crate::runner::persona::{
-    activate_skills_for_task, complexity_directive, profile_task, record_skill_feedback,
+    activate_skills_for_task, complexity_directive, profile_task, record_skill_feedback, Complexity,
 };
 #[cfg(test)]
 use crate::runner::prompt::{build_runner_constraints, RunnerPromptContext};
@@ -475,6 +476,13 @@ pub struct PlanRunner {
     run_provider: Option<String>,
     run_model: Option<String>,
     run_max_tokens: Option<u64>,
+    /// Cognitive routing (B-R7): decides each attempt's model before its
+    /// session opens and learns from how the attempt ends. `None` = nothing
+    /// decided, nothing recorded.
+    routing: Option<Arc<crate::runner::routing::RoutingHandle>>,
+    /// Every session request this runner built (tests read what was asked).
+    #[cfg(test)]
+    request_spy: Arc<std::sync::Mutex<Vec<ChatRequest>>>,
 }
 
 /// Result of starting a plan run.
@@ -697,7 +705,20 @@ impl PlanRunner {
             run_provider: None,
             run_model: None,
             run_max_tokens: None,
+            routing: None,
+            #[cfg(test)]
+            request_spy: Default::default(),
         }
+    }
+
+    /// Routes every attempt of this run through the cognitive decider and
+    /// closes each decision when its attempt ends.
+    pub fn with_routing(
+        mut self,
+        routing: Option<Arc<crate::runner::routing::RoutingHandle>>,
+    ) -> Self {
+        self.routing = routing;
+        self
     }
 
     /// Set user claims inherited from the caller who started the run.
@@ -1777,6 +1798,19 @@ impl PlanRunner {
         Ok(())
     }
 
+    /// What is left of the run's budget in marginal USD, `None` when the run
+    /// has no state or no budget. Only a real spend counts (A21).
+    async fn remaining_marginal_budget(&self) -> Option<f64> {
+        let budget = self.effective_budget();
+        if budget <= 0.0 {
+            return None;
+        }
+        let global = RUNNER_STATE.read().await;
+        global
+            .as_ref()
+            .map(|state| (budget - state.cost_usd).max(0.0))
+    }
+
     /// Close the AgentExecution of one attempt (fire-and-forget).
     ///
     /// Every attempt — first pass and retries — goes through here, so no node
@@ -1803,9 +1837,15 @@ impl PlanRunner {
             chrono::Utc::now(),
         );
         let graph = self.graph.clone();
+        let routing = self.routing.clone();
         tokio::spawn(async move {
             if let Err(e) = graph.update_agent_execution(&closed).await {
                 warn!("Failed to update AgentExecution {}: {}", closed.id, e);
+            }
+            // Close the loop: the arm that was chosen learns how it went.
+            if let (Some(routing), Some(decision_id)) = (routing, closed.routing_decision_id) {
+                let outcome = crate::runner::routing::outcome_of_attempt(&closed);
+                routing.close(graph.as_ref(), decision_id, &outcome).await;
             }
         });
     }
@@ -3046,6 +3086,46 @@ impl PlanRunner {
             .ok()
             .flatten()
             .filter(|a| !a.is_empty());
+        // Cognitive routing (B-R7): decide BEFORE the request is built. The
+        // decision only travels as an id; provider and model stay untouched and
+        // the resolver turns an applied decision into the project_rule slot.
+        let task_class = attempt_task_class(task_profile.complexity, attempt);
+        let routing_decision_id = match &self.routing {
+            Some(routing) => {
+                let hints = ContextHints {
+                    budget_remaining_usd: self.remaining_marginal_budget().await,
+                    ..ContextHints::default()
+                };
+                let signature = match task_node.as_ref() {
+                    Some(node) => {
+                        TaskSignature::from_task(node, steps.len(), attempt, project_slug, hints)
+                    }
+                    None => TaskSignature::from_delegation(
+                        Some(&task_profile.complexity.to_string()),
+                        None,
+                        attempt,
+                        project_slug,
+                        hints,
+                    ),
+                };
+                // A choice somebody already made is never substituted.
+                let explicit = task_alias.is_some()
+                    || self.run_provider.is_some()
+                    || self.run_model.is_some()
+                    || task_node.as_ref().is_some_and(|t| t.persona.is_some());
+                routing
+                    .decide(
+                        self.graph.as_ref(),
+                        signature,
+                        crate::runner::routing::slot_for(explicit),
+                        Some(task_id),
+                        Some(run_id),
+                    )
+                    .await
+                    .map(|decision| decision.id)
+            }
+            None => None,
+        };
         let request = ChatRequest {
             attachments: Vec::new(),
             message: prompt, // Send the full prompt directly in create_session — avoids the ghost empty message at seq 1
@@ -3058,7 +3138,7 @@ impl PlanRunner {
             run_provider: self.run_provider.clone(),
             run_model: self.run_model.clone(),
             max_tokens: self.run_max_tokens,
-            task_class: Some(task_profile.complexity.to_string()),
+            task_class: Some(task_class.clone()),
             permission_mode: Some("bypassPermissions".to_string()),
             add_dirs: None,
             workspace_slug: None,
@@ -3078,9 +3158,18 @@ impl PlanRunner {
             task_context: Some(task_context_str),
             scaffolding_override: None,
             runner_context: Some(runner_context),
+            routing_decision_id,
         };
-        // What the runner asks for today (None = provider default).
-        let model_requested = request.model.clone().or_else(|| request.run_model.clone());
+        // What the runner asks for (None = provider default). When it named no
+        // model, the one the resolver picked (alias, policy, auto) is read back
+        // from the session below.
+        let named_model = request.model.clone().or_else(|| request.run_model.clone());
+
+        #[cfg(test)]
+        self.request_spy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(request.clone());
 
         let spawning_timeout = Duration::from_secs(self.config.spawning_timeout_secs);
         let session = match tokio::time::timeout(
@@ -3163,6 +3252,13 @@ impl PlanRunner {
             None => None,
         };
 
+        let model_requested = named_model.or_else(|| {
+            routing
+                .as_ref()
+                .map(|n| n.model.clone())
+                .filter(|m| !m.is_empty())
+        });
+
         // Policy rule and shadow choice recorded by the resolver, if any.
         let routing_note: Option<serde_json::Value> = match session_uuid {
             Some(uuid) => self
@@ -3204,7 +3300,8 @@ impl PlanRunner {
             shadow_provider: note_str("shadow_provider"),
             shadow_model: note_str("shadow_model"),
             model_requested,
-            task_class: Some(task_profile.complexity.to_string()),
+            task_class: Some(task_class),
+            routing_decision_id,
             attempt,
             base_sha,
             ..Default::default()
@@ -4900,6 +4997,17 @@ fn attempt_outcome(result: &TaskResult) -> (AgentExecutionStatus, Option<f64>, O
     }
 }
 
+/// The class recorded on an attempt's AgentExecution: the complexity of the
+/// task, except that any attempt after the first is `retry`, so the model
+/// policy's `runner.retry` rule and the retry arm family can see it.
+fn attempt_task_class(complexity: Complexity, attempt: u32) -> String {
+    if attempt > 1 {
+        "retry".to_string()
+    } else {
+        complexity.to_string()
+    }
+}
+
 /// Build the closed version of an attempt's AgentExecution node.
 ///
 /// Keeps everything recorded at launch (provider, routing, attempt, base_sha…)
@@ -4949,6 +5057,9 @@ impl Clone for PlanRunner {
             run_provider: self.run_provider.clone(),
             run_model: self.run_model.clone(),
             run_max_tokens: self.run_max_tokens,
+            routing: self.routing.clone(),
+            #[cfg(test)]
+            request_spy: self.request_spy.clone(),
         }
     }
 }
@@ -8786,6 +8897,452 @@ mod tests {
             "a subscription cost must not exhaust a 1 USD budget: {:?}",
             out.result
         );
+    }
+
+    // ---- Cognitive routing (B-R7) -----------------------------------------
+
+    use crate::chat::provider::cognitive::store::RoutingArmStore as _;
+
+    #[test]
+    fn a_retry_attempt_records_the_retry_class() {
+        assert_eq!(attempt_task_class(Complexity::Simple, 1), "simple");
+        assert_eq!(attempt_task_class(Complexity::Creative, 1), "creative");
+        assert_eq!(attempt_task_class(Complexity::Simple, 2), "retry");
+        assert_eq!(attempt_task_class(Complexity::Complex, 3), "retry");
+    }
+
+    /// A runner on the fake provider, optionally routed.
+    async fn routed_runner(
+        routing: Option<Arc<crate::runner::routing::RoutingHandle>>,
+    ) -> (
+        PlanRunner,
+        Arc<dyn GraphStore>,
+        crate::chat::agent_runtime::fake::FakeProvider,
+    ) {
+        use crate::chat::config::{ChatConfig, ProviderPath};
+        use crate::chat::manager::ChatManager;
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::meilisearch::traits::SearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::notes::manager::NoteManager;
+        use crate::orchestrator::context::ContextBuilder;
+        use crate::plan::manager::PlanManager;
+
+        let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+        let search: Arc<dyn SearchStore> = Arc::new(MockSearchStore::new());
+        let chat_config = ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: std::path::PathBuf::from("/dev/null"),
+            default_model: "test".into(),
+            max_sessions: 4,
+            session_timeout: std::time::Duration::from_secs(30),
+            neo4j_uri: "bolt://mock:7687".into(),
+            neo4j_user: "neo4j".into(),
+            neo4j_password: "test".into(),
+            meilisearch_url: "http://mock:7700".into(),
+            meilisearch_key: "test".into(),
+            nats_url: None,
+            max_turns: 5,
+            permission: Default::default(),
+            auto_continue: false,
+            retry: Default::default(),
+            process_path: None,
+            claude_cli_path: None,
+            auto_update_cli: false,
+            auto_update_app: false,
+            jwt_secret: None,
+            server_port: 0,
+            session_token_expiry_secs: 3600,
+        };
+        let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
+        let chat_manager = Arc::new(
+            ChatManager::new_without_memory(graph.clone(), search.clone(), chat_config)
+                .with_provider_source(Arc::new(fake.clone())),
+        );
+        let plan_manager = Arc::new(PlanManager::new(graph.clone(), search.clone()));
+        let note_manager = Arc::new(NoteManager::new(graph.clone(), search.clone()));
+        let context_builder = Arc::new(ContextBuilder::new(
+            graph.clone(),
+            search.clone(),
+            plan_manager,
+            note_manager,
+        ));
+        let (event_tx, _) = broadcast::channel(16);
+        let config = RunnerConfig {
+            max_cost_usd: 10.0,
+            ..RunnerConfig::default()
+        };
+        let runner = PlanRunner::new(
+            chat_manager,
+            graph.clone(),
+            context_builder,
+            config,
+            event_tx,
+        )
+        .with_routing(routing);
+        (runner, graph, fake)
+    }
+
+    /// Runs one attempt of `task` to its `Done` event (cost basis `basis`).
+    async fn run_attempt(
+        runner: &PlanRunner,
+        fake: &crate::chat::agent_runtime::fake::FakeProvider,
+        plan_id: Uuid,
+        run_id: Uuid,
+        task: &crate::neo4j::models::TaskNode,
+        attempt: u32,
+        basis: nexus_claude::agent::CostBasis,
+    ) -> TaskExecutionResult {
+        use nexus_claude::agent::{AgentEvent, Cost, StopReason};
+        let already = fake.state.turns_started.lock().unwrap().len();
+        let pusher = fake.clone();
+        tokio::spawn(async move {
+            while pusher.state.turns_started.lock().unwrap().len() <= already {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            pusher.state.push(AgentEvent::Done {
+                stop_reason: StopReason::Completed,
+                subtype: Some("success".into()),
+                is_error: false,
+                result_text: Some("done".into()),
+                usage: Default::default(),
+                cost: Cost {
+                    usd: Some(0.25),
+                    basis,
+                },
+                duration_ms: 5,
+                duration_api_ms: None,
+                num_turns: 1,
+                model: Some("m".into()),
+                provider_session_id: Some("p-1".into()),
+                structured_output: None,
+                error: None,
+            });
+        });
+        let tmp = tempfile::TempDir::new().unwrap();
+        runner
+            .execute_task(
+                run_id,
+                plan_id,
+                task.id,
+                "routed task",
+                tmp.path().to_str().unwrap(),
+                None,
+                None,
+                "",
+                attempt,
+            )
+            .await
+            .expect("the task executes")
+    }
+
+    async fn seed_run(graph: &Arc<dyn GraphStore>) -> (Uuid, Uuid) {
+        let plan = crate::test_helpers::test_plan();
+        graph.create_plan(&plan).await.unwrap();
+        let run_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = Some(RunnerState::new(run_id, plan.id, 1, TriggerSource::Manual));
+        }
+        (plan.id, run_id)
+    }
+
+    #[tokio::test]
+    async fn mixed_two_tasks_of_different_classes_give_two_decisions_carried_on_request_and_record()
+    {
+        use crate::runner::routing::test_support::FakeDecider;
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (decider, handle) = FakeDecider::handle(true);
+        let (runner, graph, fake) = routed_runner(Some(handle)).await;
+        graph
+            .put_llm_setting(
+                crate::chat::provider::settings::GLOBAL,
+                crate::chat::provider::cognitive::ROUTING_KEY,
+                r#"{"mode":"mixed","stage":"auto"}"#,
+            )
+            .await
+            .unwrap();
+        let (plan_id, run_id) = seed_run(&graph).await;
+        let simple = crate::test_helpers::test_task();
+        let mut creative = crate::test_helpers::test_task();
+        creative.tags = vec!["design".into()];
+        graph.create_task(plan_id, &simple).await.unwrap();
+        graph.create_task(plan_id, &creative).await.unwrap();
+
+        use nexus_claude::agent::CostBasis;
+        let first = run_attempt(
+            &runner,
+            &fake,
+            plan_id,
+            run_id,
+            &simple,
+            1,
+            CostBasis::Reported,
+        )
+        .await;
+        let second = run_attempt(
+            &runner,
+            &fake,
+            plan_id,
+            run_id,
+            &creative,
+            1,
+            CostBasis::Reported,
+        )
+        .await;
+        reset_globals().await;
+
+        let seen = decider.requests();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].signature.class.key(), "simple");
+        assert_eq!(seen[1].signature.class.key(), "creative");
+        assert_eq!(
+            seen[0].slot,
+            crate::chat::provider::cognitive::candidates::Slot::Automatic
+        );
+        assert!(seen[0].signature.budget_remaining_usd.is_some());
+        assert_eq!(
+            seen[0].settings.mode,
+            crate::chat::provider::cognitive::ProviderRoutingMode::Mixed
+        );
+
+        let spied = runner.request_spy.lock().unwrap().clone();
+        let ids: Vec<_> = spied.iter().map(|r| r.routing_decision_id).collect();
+        let first_ae = first.agent_execution.expect("first node");
+        let second_ae = second.agent_execution.expect("second node");
+        assert!(ids[0].is_some() && ids[1].is_some() && ids[0] != ids[1]);
+        assert_eq!(first_ae.routing_decision_id, ids[0]);
+        assert_eq!(second_ae.routing_decision_id, ids[1]);
+        for id in ids.into_iter().flatten() {
+            let decision = decider
+                .store
+                .decision(id)
+                .await
+                .unwrap()
+                .expect("persisted");
+            assert!(decision.applied);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unapplied_decision_changes_nothing_on_the_request_but_its_id() {
+        use crate::runner::routing::test_support::FakeDecider;
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (_decider, handle) = FakeDecider::handle(false);
+        let (routed, graph, fake) = routed_runner(Some(handle)).await;
+        let (plain, plain_graph, plain_fake) = routed_runner(None).await;
+        let (plan_id, run_id) = seed_run(&graph).await;
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan_id, &task).await.unwrap();
+        let mut plain_plan = crate::test_helpers::test_plan();
+        plain_plan.id = plan_id;
+        plain_graph.create_plan(&plain_plan).await.unwrap();
+        plain_graph.create_task(plan_id, &task).await.unwrap();
+
+        use nexus_claude::agent::CostBasis;
+        let with = run_attempt(
+            &routed,
+            &fake,
+            plan_id,
+            run_id,
+            &task,
+            1,
+            CostBasis::Reported,
+        )
+        .await;
+        let without = run_attempt(
+            &plain,
+            &plain_fake,
+            plan_id,
+            run_id,
+            &task,
+            1,
+            CostBasis::Reported,
+        )
+        .await;
+        reset_globals().await;
+
+        let mut a = routed.request_spy.lock().unwrap()[0].clone();
+        let b = plain.request_spy.lock().unwrap()[0].clone();
+        assert!(a.routing_decision_id.is_some());
+        assert!(b.routing_decision_id.is_none());
+        a.routing_decision_id = None;
+        let normalize = |mut r: ChatRequest| {
+            r.user_claims = None;
+            r.cwd = String::new(); // a fresh temp dir per run
+            format!("{r:?}")
+        };
+        assert_eq!(
+            normalize(a),
+            normalize(b),
+            "provider, model and the rest are untouched"
+        );
+        // Without a handle the execution is recorded exactly as before.
+        assert!(without
+            .agent_execution
+            .unwrap()
+            .routing_decision_id
+            .is_none());
+        assert!(with.agent_execution.unwrap().routing_decision_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_retry_attempt_records_task_class_retry_and_is_decided_as_a_retry() {
+        use crate::runner::routing::test_support::FakeDecider;
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (decider, handle) = FakeDecider::handle(true);
+        let (runner, graph, fake) = routed_runner(Some(handle)).await;
+        let (plan_id, run_id) = seed_run(&graph).await;
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        use nexus_claude::agent::CostBasis;
+        let first = run_attempt(
+            &runner,
+            &fake,
+            plan_id,
+            run_id,
+            &task,
+            1,
+            CostBasis::Reported,
+        )
+        .await;
+        let retry = run_attempt(
+            &runner,
+            &fake,
+            plan_id,
+            run_id,
+            &task,
+            2,
+            CostBasis::Reported,
+        )
+        .await;
+        reset_globals().await;
+
+        assert_eq!(
+            first.agent_execution.unwrap().task_class.as_deref(),
+            Some("simple")
+        );
+        let retry_ae = retry.agent_execution.unwrap();
+        assert_eq!(retry_ae.task_class.as_deref(), Some("retry"));
+        assert_eq!(retry_ae.attempt, 2);
+        let seen = decider.requests();
+        assert_eq!(seen[1].signature.class.key(), "retry");
+        assert_eq!(seen[1].signature.attempt, 2);
+        assert_eq!(
+            runner.request_spy.lock().unwrap()[1].task_class.as_deref(),
+            Some("retry")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_alias_makes_the_slot_explicit_and_model_requested_follows_the_resolver() {
+        use crate::runner::routing::test_support::FakeDecider;
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (decider, handle) = FakeDecider::handle(true);
+        let (runner, graph, fake) = routed_runner(Some(handle)).await;
+        let (plan_id, run_id) = seed_run(&graph).await;
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan_id, &task).await.unwrap();
+        graph
+            .put_llm_setting(&format!("task:{}", task.id), "model_alias", "cheap")
+            .await
+            .unwrap();
+
+        use nexus_claude::agent::CostBasis;
+        let out = run_attempt(
+            &runner,
+            &fake,
+            plan_id,
+            run_id,
+            &task,
+            1,
+            CostBasis::Reported,
+        )
+        .await;
+        reset_globals().await;
+
+        assert_eq!(
+            decider.requests()[0].slot,
+            crate::chat::provider::cognitive::candidates::Slot::Explicit
+        );
+        let ae = out.agent_execution.unwrap();
+        assert_eq!(ae.model_alias.as_deref(), Some("cheap"));
+        // The request named no model: the record carries the one the resolver
+        // chose (the session's), never nothing.
+        let session = graph
+            .get_chat_session(ae.session_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!session.model.is_empty());
+        assert_eq!(ae.model_requested.as_deref(), Some(session.model.as_str()));
+    }
+
+    #[tokio::test]
+    async fn closing_an_attempt_feeds_the_chosen_arm_once_with_the_marginal_cost_only() {
+        use crate::chat::provider::cognitive::store::ArmKey;
+        use crate::runner::routing::test_support::FakeDecider;
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (decider, handle) = FakeDecider::handle(true);
+        let (runner, graph, fake) = routed_runner(Some(handle)).await;
+        let (plan_id, run_id) = seed_run(&graph).await;
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        // A subscription cost is notional: the arm learns the success, not a cost.
+        let out = run_attempt(
+            &runner,
+            &fake,
+            plan_id,
+            run_id,
+            &task,
+            1,
+            nexus_claude::agent::CostBasis::Subscription,
+        )
+        .await;
+        reset_globals().await;
+        let ae = out.agent_execution.expect("node");
+        runner.close_attempt(
+            Some(&ae),
+            AgentExecutionStatus::Completed,
+            Some(5.0),
+            Some(2.0),
+            None,
+        );
+
+        let key = ArmKey::new("simple", "claude-code", "fake-model");
+        let arm = loop {
+            if let Some(arm) = decider.store.arm(&key).await.unwrap() {
+                break arm;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!((arm.alpha, arm.beta, arm.n), (2.0, 1.0, 1));
+        assert_eq!(
+            arm.cost_n, 0,
+            "an unknown or non-marginal cost stays unknown"
+        );
+        assert_eq!(arm.mean_cost_usd(), None);
+        assert_eq!(arm.latency_n, 1);
+        let decision = decider
+            .store
+            .decision(ae.routing_decision_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decision.outcome.unwrap().success, Some(true));
+
+        // Closing again does not count twice.
+        runner.close_attempt(Some(&ae), AgentExecutionStatus::Completed, None, None, None);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(decider.store.arm(&key).await.unwrap().unwrap().n, 1);
     }
 
     #[tokio::test]
