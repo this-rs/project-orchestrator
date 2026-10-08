@@ -253,6 +253,9 @@ impl Decider for CognitiveDecider {
     }
 }
 
+/// Capability probes attempted: (instance, model) to the time of the attempt.
+pub type ProbeLog = std::collections::HashMap<(String, String), std::time::Instant>;
+
 /// The routing pieces a chat manager owns: the decider, the handle through
 /// which the alias hints are refreshed, and the short-lived health memory.
 #[derive(Clone)]
@@ -263,6 +266,12 @@ pub struct CognitiveRouting {
     pub hints: Arc<RwLock<PriorHints>>,
     /// One health probe per instance per window.
     pub health: Arc<candidates::HealthCache>,
+    /// Models whose capability probe was attempted, and when: a probe that fails
+    /// is not replayed on every decision.
+    pub probed: Arc<std::sync::Mutex<ProbeLog>>,
+    /// Where decisions and arms live, when the standard wiring built this; it is
+    /// how a session's decision is linked and closed. `None` for a test decider.
+    pub store: Option<Arc<dyn RoutingArmStore>>,
 }
 
 impl CognitiveRouting {
@@ -270,9 +279,14 @@ impl CognitiveRouting {
     pub fn new(store: Arc<dyn RoutingArmStore>) -> Self {
         let hints = Arc::new(RwLock::new(PriorHints::new()));
         Self {
-            decider: Arc::new(CognitiveDecider::with_hints(store, Arc::clone(&hints))),
+            decider: Arc::new(CognitiveDecider::with_hints(
+                Arc::clone(&store),
+                Arc::clone(&hints),
+            )),
             hints,
             health: Arc::new(candidates::HealthCache::standard()),
+            probed: Default::default(),
+            store: Some(store),
         }
     }
 
@@ -282,6 +296,8 @@ impl CognitiveRouting {
             decider,
             hints: Arc::new(RwLock::new(PriorHints::new())),
             health: Arc::new(candidates::HealthCache::standard()),
+            probed: Default::default(),
+            store: None,
         }
     }
 

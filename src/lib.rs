@@ -1586,10 +1586,27 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             cm = cm.with_trajectory_collector(tc.clone());
         }
         cm = cm.with_nn_router(neural_router.clone(), config.neural_routing.enabled);
+        // Cognitive model routing: arms and decisions persist in the graph, so the
+        // posteriors survive a restart. Without this the provider is resolved from
+        // the declared rules only.
+        cm = cm.with_cognitive_routing(chat::provider::cognitive::decider::CognitiveRouting::new(
+            Arc::new(neo4j::routing::Neo4jRoutingStore::new(
+                orchestrator.neo4j_arc(),
+            )),
+        ));
         if let Some(re) = orchestrator.reasoning_engine() {
             cm = cm.with_reasoning_engine(re.clone());
         }
         let cm = Arc::new(cm);
+        // The learning side: the per-turn router, the runner's routing handle, and the
+        // store the routing routes (settings, decisions, shadow report) read.
+        chat::provider::cognitive::wiring::wire_learning(&cm);
+        if let Some(store) = cm
+            .cognitive_routing()
+            .and_then(|routing| routing.store.clone())
+        {
+            api::routing_handlers::set_routing_store(Some(store));
+        }
         cm.start_cleanup_task();
         tracing::info!("Chat manager initialized");
         boot.done("chat");

@@ -963,6 +963,11 @@ mod cognitive_routing {
     }
 
     async fn setup(mode: &str, stage: &str, wired: bool) -> Setup {
+        setup_with(mode, stage, wired, true).await
+    }
+
+    /// `warm` opens one session first, which probes the instance as a side effect.
+    async fn setup_with(mode: &str, stage: &str, wired: bool, warm: bool) -> Setup {
         let fake = FakeOpenAi::start(script());
         let graph = Arc::new(MockGraphStore::new());
         store_instance(&graph, &instance(&fake, "none")).await;
@@ -979,12 +984,14 @@ mod cognitive_routing {
         // The router only trusts what an instance is KNOWN to do: a provider that
         // was never probed reports no tools and an unknown window. Opening one
         // session on the instance probes it and keeps the probe in the cache.
-        let warm = manager
-            .create_session(&request(Some("local"), Some("proj"), "default"))
-            .await
-            .unwrap_or_else(|e| panic!("warm-up failed: {e:#}"));
-        let mut rx = manager.subscribe(&warm.session_id).await.unwrap();
-        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        if warm {
+            let opened = manager
+                .create_session(&request(Some("local"), Some("proj"), "default"))
+                .await
+                .unwrap_or_else(|e| panic!("warm-up failed: {e:#}"));
+            let mut rx = manager.subscribe(&opened.session_id).await.unwrap();
+            next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        }
         if wired {
             let store = Arc::new(Neo4jRoutingStore::new(graph.clone()));
             manager = manager.with_cognitive_routing(CognitiveRouting::new(store));
@@ -1056,6 +1063,27 @@ mod cognitive_routing {
     }
 
     #[tokio::test]
+    async fn an_unprobed_instance_is_probed_before_the_first_decision_and_the_decision_names_its_session(
+    ) {
+        let s = setup_with("mixed", "auto", true, false).await;
+        let session = Uuid::new_v4();
+        let choice = s
+            .manager
+            .resolve_provider_choice_for(&executor_request(), Some("proj"), Some(session))
+            .await
+            .unwrap_or_else(|e| panic!("resolve failed: {e:#}"));
+        assert_eq!(
+            choice.routed_by,
+            RoutedBy::Auto,
+            "the probe made local/m eligible"
+        );
+        assert_eq!(choice.provider_id, "local");
+        let all = decisions(&s).await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].session_id, Some(session));
+    }
+
+    #[tokio::test]
     async fn mixed_routes_an_executor_by_auto_and_leaves_the_pilot_on_the_primary() {
         let s = setup("mixed", "auto", true).await;
         let executor = choose(&s, &executor_request()).await;
@@ -1097,6 +1125,110 @@ mod cognitive_routing {
         let executor = choose(&s, &executor_request()).await;
         assert_eq!(executor.routed_by, RoutedBy::Auto);
         assert!(decisions(&s).await.iter().all(|d| d.applied));
+    }
+
+    /// Opens a session on the automatic choice and waits for its first result.
+    async fn open_routed_session(s: &Setup) -> String {
+        let created = s
+            .manager
+            .create_session(&pilot_request())
+            .await
+            .unwrap_or_else(|e| panic!("create_session failed: {e:#}"));
+        let mut rx = s.manager.subscribe(&created.session_id).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        created.session_id
+    }
+
+    #[tokio::test]
+    async fn a_chat_decision_is_linked_to_its_session_and_a_plain_close_learns_nothing() {
+        let s = setup("full", "auto", true).await;
+        let session_id = open_routed_session(&s).await;
+        let all = decisions(&s).await;
+        assert_eq!(all.len(), 1, "one decision for the one routed session");
+        let decision = &all[0];
+        assert_eq!(
+            decision.session_id.map(|id| id.to_string()).as_deref(),
+            Some(session_id.as_str()),
+            "the decision names the session it routed"
+        );
+        let arm = decision.arm().expect("the decision chose an arm");
+
+        s.manager.close_session(&session_id).await.unwrap();
+
+        let closed = decisions(&s).await.remove(0);
+        let outcome = closed.outcome.expect("the close recorded what it saw");
+        assert!(outcome.duration_ms.is_some(), "{outcome:?}");
+        assert_eq!(
+            outcome.reward, None,
+            "a chat cannot tell success: no reward"
+        );
+        // Nothing was fed to the arm: an unknown outcome reads as a failure.
+        let store = Neo4jRoutingStore::new(s.graph.clone());
+        assert!(
+            store.arm(&arm).await.unwrap().is_none(),
+            "a plain close must not create or move the arm"
+        );
+        assert!(s.manager.open_decisions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_model_switched_by_hand_closes_the_decision_with_the_override_and_teaches_the_arm() {
+        let s = setup("full", "auto", true).await;
+        let session_id = open_routed_session(&s).await;
+        let arm = decisions(&s).await[0].arm().unwrap();
+
+        // The switch itself may be refused by the fake; the user's intent counts.
+        let _ = s.manager.set_session_model(&session_id, "m2").await;
+        s.manager.close_session(&session_id).await.unwrap();
+
+        let closed = decisions(&s).await.remove(0);
+        let outcome = closed.outcome.expect("closed");
+        assert!(outcome.overridden, "{outcome:?}");
+        assert!(outcome.reward.is_some_and(|r| r < 0.5), "{outcome:?}");
+        let stats = Neo4jRoutingStore::new(s.graph.clone())
+            .arm(&arm)
+            .await
+            .unwrap()
+            .expect("the override taught the arm");
+        assert!(
+            stats.mean() < 0.5,
+            "one failure on a Beta(1,1) prior: {stats:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_the_router_a_session_keeps_no_open_decision() {
+        let s = setup("full", "auto", false).await;
+        let created = s
+            .manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap();
+        let mut rx = s.manager.subscribe(&created.session_id).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        let session_id = created.session_id;
+        assert!(s.manager.open_decisions.lock().unwrap().is_empty());
+        s.manager.close_session(&session_id).await.unwrap();
+        assert!(decisions(&s).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wire_learning_gives_the_per_turn_router_and_the_runner_a_handle() {
+        let s = setup("full", "auto", true).await;
+        let manager = Arc::new(s.manager);
+        crate::runner::routing::install(None);
+        assert!(crate::runner::routing::installed().is_none());
+        assert!(manager.turn_routing.configured().is_none());
+
+        crate::chat::provider::cognitive::wiring::wire_learning(&manager);
+        assert!(manager.turn_routing.configured().is_some());
+        let handle = crate::runner::routing::installed().expect("installed");
+        let pool = handle.pool.facts(Some("proj")).await;
+        assert!(
+            pool.iter().any(|f| f.provider_id == "local"),
+            "the runner pool is the manager's pool: {pool:?}"
+        );
+        crate::runner::routing::install(None);
     }
 
     #[tokio::test]

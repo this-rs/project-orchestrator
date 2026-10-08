@@ -18,6 +18,7 @@ pub mod report;
 pub mod scorer;
 pub mod signature;
 pub mod store;
+pub(crate) mod wiring;
 
 pub use mode::{
     effective_routing, parse_routing_settings, validate_routing_settings, EffectiveRouting,

@@ -452,6 +452,10 @@ pub(crate) struct RuntimeEnvConfig {
     pub auto_update_app: bool,
 }
 
+/// The concrete native harness of each stored instance, by id.
+pub(crate) type NativeProbers =
+    HashMap<String, Arc<nexus_claude::providers::native::NativeProvider>>;
+
 /// A built provider and the stored record it was built from.
 pub(crate) type NativeCacheEntry = (
     super::provider::settings::InstanceRecord,
@@ -554,9 +558,14 @@ pub struct ChatManager {
     /// The cognitive router (R2), when wired. `None` keeps the declarative
     /// resolution exactly as it was.
     pub(crate) cognitive_routing: Option<super::provider::cognitive::decider::CognitiveRouting>,
+    /// Open cognitive decisions of live chat sessions (session id -> decision id),
+    /// closed with what happened when the session is closed.
+    pub(crate) open_decisions: std::sync::Mutex<std::collections::HashMap<String, Uuid>>,
     /// Native providers built for stored instances, by instance id; an entry is
     /// reused while the stored record is unchanged.
     pub(crate) native_cache: Arc<RwLock<HashMap<String, NativeCacheEntry>>>,
+    /// The concrete native harness behind a cache entry, for capability probes.
+    pub(crate) native_probers: Arc<RwLock<NativeProbers>>,
     /// Nexus memory injector for conversation persistence
     pub(crate) context_injector: Option<Arc<ContextInjector>>,
     /// Memory config (for creating ConversationMemoryManagers)
@@ -1085,7 +1094,9 @@ impl ChatManager {
             agent_runtime,
             provider_source,
             cognitive_routing: None,
+            open_decisions: std::sync::Mutex::new(std::collections::HashMap::new()),
             native_cache: Arc::new(RwLock::new(HashMap::new())),
+            native_probers: Arc::new(RwLock::new(HashMap::new())),
             context_injector: None,
             memory_config: None,
             event_emitter: None,
@@ -1150,7 +1161,9 @@ impl ChatManager {
             agent_runtime,
             provider_source,
             cognitive_routing: None,
+            open_decisions: std::sync::Mutex::new(std::collections::HashMap::new()),
             native_cache: Arc::new(RwLock::new(HashMap::new())),
+            native_probers: Arc::new(RwLock::new(HashMap::new())),
             context_injector,
             memory_config: Some(memory_config),
             event_emitter: None,
@@ -3305,7 +3318,7 @@ impl ChatManager {
         // (instances, the project's consent, roles, aliases) BEFORE anything is
         // spawned or persisted: a refusal costs nothing.
         let provider_choice = self
-            .resolve_provider_choice(request, project_slug.as_deref())
+            .resolve_provider_choice_for(request, project_slug.as_deref(), Some(session_id))
             .await?;
         let model = match request.model.as_deref().filter(|m| !m.is_empty()) {
             Some(explicit) => explicit.to_string(),
@@ -3401,6 +3414,8 @@ impl ChatManager {
             .create_chat_session(&session_node)
             .await
             .context("Failed to persist chat session")?;
+        self.remember_routing_decision(&session_id.to_string(), provider_choice.decision_id)
+            .await;
 
         // The policy rule that applied, and what a `shadow` policy would have
         // chosen, are kept for the execution record (A22): the runner reads
@@ -6482,6 +6497,7 @@ impl ChatManager {
             if let Some(router) = self.turn_routing.get(session_id) {
                 router.mark_manual();
             }
+            self.flag_routing_override(session_id).await;
         }
         if let Some(handle) = self.agent_runtime.get(session_id).await {
             handle.set_model(model).await?;
@@ -8519,10 +8535,22 @@ impl ChatManager {
     /// instance's current origin), the roles (project before global) and the
     /// aliases. The legacy engine can only drive Claude Code: a choice of any
     /// other instance is `provider_unavailable` there.
+    #[cfg(test)]
     pub(crate) async fn resolve_provider_choice(
         &self,
         request: &ChatRequest,
         project_slug: Option<&str>,
+    ) -> Result<super::provider::resolver::ProviderChoice> {
+        self.resolve_provider_choice_for(request, project_slug, None)
+            .await
+    }
+
+    /// Same, tying the stored cognitive decision to the session being opened.
+    pub(crate) async fn resolve_provider_choice_for(
+        &self,
+        request: &ChatRequest,
+        project_slug: Option<&str>,
+        session_id: Option<Uuid>,
     ) -> Result<super::provider::resolver::ProviderChoice> {
         use super::provider::{catalog, resolver, settings, store};
         let instances = store::instances(self.graph.as_ref()).await?;
@@ -8577,6 +8605,7 @@ impl ChatManager {
                         &instances,
                         &store_catalog,
                         &aliases,
+                        session_id,
                     )
                     .await
                 {
@@ -8605,6 +8634,7 @@ impl ChatManager {
             input.global_rule = Some(p.candidate.clone());
         }
         let mut choice = resolver::resolve(&input, &store_catalog).map_err(anyhow::Error::new)?;
+        choice.decision_id = cognitive.as_ref().map(|d| d.id);
         if let Some(p) = &pick {
             if p.enforced && choice.routed_by == resolver::RoutedBy::GlobalRule {
                 choice.route_rule = Some(p.rule.clone());
@@ -8630,6 +8660,163 @@ impl ChatManager {
             }
         }
         Ok(choice)
+    }
+
+    /// The pool for a project (`None` = none): the routing pool built from what is
+    /// stored. Empty when the cognitive router is not wired.
+    pub(crate) async fn routing_pool_for(
+        &self,
+        project_slug: Option<&str>,
+    ) -> Vec<super::provider::cognitive::candidates::ModelFacts> {
+        use super::provider::{catalog, store};
+        let Some(routing) = self.cognitive_routing.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(instances) = store::instances(self.graph.as_ref()).await else {
+            return Vec::new();
+        };
+        let consents = match project_slug {
+            Some(slug) => store::consents(self.graph.as_ref(), slug)
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let store_catalog =
+            catalog::StoreCatalog::new(instances.clone(), &consents, project_slug.is_some());
+        self.routing_pool(routing, &instances, &store_catalog).await
+    }
+
+    /// Links the cognitive decision taken for a session to that session, then keeps
+    /// it open until the session closes. Best effort: a failure loses a link, never
+    /// a session.
+    async fn remember_routing_decision(&self, session_id: &str, decision_id: Option<Uuid>) {
+        let (Some(decision_id), Ok(session)) = (decision_id, Uuid::parse_str(session_id)) else {
+            return;
+        };
+        let Some(store) = self
+            .cognitive_routing
+            .as_ref()
+            .and_then(|routing| routing.store.clone())
+        else {
+            return;
+        };
+        match store.decision(decision_id).await {
+            Ok(Some(mut decision)) => {
+                decision.session_id = Some(session);
+                if let Err(error) = store.put_decision(&decision).await {
+                    warn!(%session_id, %decision_id, %error, "linking the routing decision to its session failed");
+                    return;
+                }
+            }
+            Ok(None) => return,
+            Err(error) => {
+                warn!(%session_id, %decision_id, %error, "routing decision unreadable: not linked");
+                return;
+            }
+        }
+        self.open_decisions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id.to_string(), decision_id);
+    }
+
+    /// The user changed the model of the session by hand: the open decision, if
+    /// any, counts that as an override when it closes.
+    async fn flag_routing_override(&self, session_id: &str) {
+        let decision_id = self
+            .open_decisions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .copied();
+        let (Some(decision_id), Some(store)) = (
+            decision_id,
+            self.cognitive_routing
+                .as_ref()
+                .and_then(|routing| routing.store.clone()),
+        ) else {
+            return;
+        };
+        if let Err(error) =
+            super::provider::cognitive::feedback::mark_override(store.as_ref(), decision_id).await
+        {
+            warn!(%session_id, %decision_id, %error, "flagging the routing override failed");
+        }
+    }
+
+    /// Closes the decision of a session that ends. A chat cannot tell whether its
+    /// work succeeded, so an unknown outcome is NOT fed to the arm (it would read
+    /// as a failure and bias every chat arm downward): cost and duration are
+    /// recorded, nothing is learned. A model switched by hand is the one signal a
+    /// chat gives: that closes the decision with the override penalty.
+    async fn close_routing_decision(&self, session_id: &str) {
+        use super::provider::cognitive::feedback::{close_decision, Outcome};
+        let decision_id = self
+            .open_decisions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id);
+        let (Some(decision_id), Some(store)) = (
+            decision_id,
+            self.cognitive_routing
+                .as_ref()
+                .and_then(|routing| routing.store.clone()),
+        ) else {
+            return;
+        };
+        let (cost_usd, duration_ms) = match Uuid::parse_str(session_id) {
+            Ok(id) => match self.graph.get_chat_session(id).await {
+                Ok(Some(session)) => (
+                    session.total_cost_usd,
+                    u64::try_from((chrono::Utc::now() - session.created_at).num_milliseconds())
+                        .ok(),
+                ),
+                _ => (None, None),
+            },
+            Err(_) => (None, None),
+        };
+        let decision = match store.decision(decision_id).await {
+            Ok(Some(decision)) => decision,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(%session_id, %decision_id, %error, "routing decision unreadable: left open");
+                return;
+            }
+        };
+        let overridden = decision.outcome.as_ref().is_some_and(|o| o.overridden);
+        if overridden {
+            let settings = match super::provider::cognitive::load_routing(
+                self.graph.as_ref(),
+                decision.signature.project_slug.as_deref(),
+            )
+            .await
+            {
+                Ok((settings, _scope)) => settings,
+                Err(error) => {
+                    warn!(%session_id, %decision_id, %error, "routing settings unreadable: decision left open");
+                    return;
+                }
+            };
+            let outcome = Outcome {
+                attempts: 1,
+                cost_usd,
+                duration_ms,
+                user_overrode_model: true,
+                ..Outcome::default()
+            };
+            if let Err(error) =
+                close_decision(store.as_ref(), &settings, decision_id, &outcome).await
+            {
+                warn!(%session_id, %decision_id, %error, "closing the routing decision failed");
+            }
+            return;
+        }
+        let mut outcome = decision.outcome.unwrap_or_default();
+        outcome.cost_usd = cost_usd;
+        outcome.duration_ms = duration_ms;
+        if let Err(error) = store.set_outcome(decision_id, outcome).await {
+            warn!(%session_id, %decision_id, %error, "recording the session cost on its routing decision failed");
+        }
     }
 
     /// The pool the cognitive router chooses from: every model of every
@@ -8693,6 +8880,45 @@ impl ChatManager {
                     entries.push((model, None));
                 }
             }
+            // A native model nobody probed reports no tools and no window, so the
+            // hard constraints would drop it for good. Probe the instance's default
+            // model once (bounded; a failure is remembered for ten minutes).
+            if id != resolver::CLAUDE_CODE && healthy {
+                if let Some(model) = instances
+                    .iter()
+                    .find(|i| i.id == id)
+                    .and_then(|i| i.default_model.clone())
+                {
+                    let unknown = {
+                        let caps = provider.capabilities(Some(&model));
+                        // `tools` stays false until a probe has run; a window can be
+                        // known from the preset without one.
+                        !caps.tools
+                    };
+                    let key = (id.clone(), model.clone());
+                    let recent = routing
+                        .probed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&key)
+                        .is_some_and(|at| now.duration_since(*at) < Duration::from_secs(600));
+                    let concrete = self.native_probers.read().await.get(&id).cloned();
+                    if let (true, false, Some(native)) = (unknown, recent, concrete) {
+                        let outcome = tokio::time::timeout(
+                            Duration::from_secs(10),
+                            native.refresh_capabilities(&model),
+                        )
+                        .await;
+                        if !matches!(outcome, Ok(Ok(ref caps)) if caps.tools) {
+                            routing
+                                .probed
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(key, now);
+                        }
+                    }
+                }
+            }
             for (model, price) in entries {
                 if !seen.insert(model.clone()) {
                     continue;
@@ -8723,6 +8949,7 @@ impl ChatManager {
         instances: &[super::provider::settings::InstanceRecord],
         store_catalog: &super::provider::catalog::StoreCatalog,
         aliases: &[super::provider::settings::ModelAlias],
+        session_id: Option<Uuid>,
     ) -> Result<Option<super::provider::cognitive::decision::CognitiveDecision>> {
         use super::provider::cognitive::{
             candidates::Slot,
@@ -8761,6 +8988,7 @@ impl ChatManager {
             Slot::Automatic
         };
         decide.trust = request.permission_mode.as_deref() == Some("bypassPermissions");
+        decide.session_id = session_id;
         Ok(Some(routing.decider.decide(&decide).await?))
     }
 
@@ -8790,8 +9018,16 @@ impl ChatManager {
                 }
             }
         }
-        let provider = native_factory::build_native_provider(&record, self.vault.clone())
-            .map_err(anyhow::Error::new)?;
+        let (provider, concrete) =
+            native_factory::build_provider_with_handle(&record, self.vault.clone())
+                .map_err(anyhow::Error::new)?;
+        {
+            let mut probers = self.native_probers.write().await;
+            match concrete {
+                Some(native) => probers.insert(provider_id.to_string(), native),
+                None => probers.remove(provider_id),
+            };
+        }
         self.native_cache
             .write()
             .await
@@ -9381,6 +9617,7 @@ impl ChatManager {
     /// trigger SIGKILL via the Drop impl.
     pub async fn close_session(&self, session_id: &str) -> Result<()> {
         self.turn_routing.remove(session_id);
+        self.close_routing_decision(session_id).await;
         if self.agent_runtime.owns(session_id).await {
             crate::auth::agent_tokens::revoke_session(session_id);
             self.agent_runtime.close(session_id).await?;
