@@ -543,6 +543,8 @@ pub(crate) struct OpeningTurn<'a> {
     pub explicit_model: bool,
     /// The mode the request asked for; it replaces the one of the settings for this conversation.
     pub routing_mode: Option<super::provider::cognitive::ProviderRoutingMode>,
+    /// The pairs the request restricted routing to (`mixed`).
+    pub routing_pool: Option<Vec<super::types::RoutingPoolEntry>>,
     pub permission_mode: Option<&'a str>,
     /// The message of the turn about to start.
     pub message: &'a str,
@@ -1242,8 +1244,12 @@ impl ChatManager {
         let (decider, pool) = self.turn_routing.configured()?;
         // A model the request named, or the user set by hand, stays pinned across a
         // resume or a restart: the pin is stored, not only held by the router.
-        let pinned = turn.explicit_model || self.model_is_pinned(session_id).await;
-        if turn.explicit_model {
+        // A conversation given a pool (mixed) names its pilot, but PO still routes among the pool:
+        // the pilot is not a pin.
+        let has_pool = turn.routing_pool.as_ref().is_some_and(|p| !p.is_empty());
+        let named = turn.explicit_model && !has_pool;
+        let pinned = named || self.model_is_pinned(session_id).await;
+        if named {
             self.pin_session_model(session_id).await;
         }
         let routing = match super::provider::cognitive::load_routing(
@@ -1267,20 +1273,29 @@ impl ChatManager {
             super::provider::policy::parse_mode(mode)
                 .is_some_and(|pair| pair.neutral == nexus_claude::agent::PolicyMode::Trust)
         });
-        let router = Arc::new(super::agent_hooks::TurnRouter::new(
-            super::agent_hooks::TurnRouterSpec {
-                decider,
-                pool,
-                routing,
-                provider_id: provider_id.to_owned(),
-                session_id: Uuid::parse_str(session_id).ok(),
-                project_slug: project_slug.map(str::to_owned),
-                trust,
-                explicit_model: pinned,
-                current_model: model.to_owned(),
-                next_turn: turn.next_turn,
-            },
-        ));
+        let router =
+            Arc::new(super::agent_hooks::TurnRouter::new(
+                super::agent_hooks::TurnRouterSpec {
+                    decider,
+                    pool,
+                    routing,
+                    provider_id: provider_id.to_owned(),
+                    session_id: Uuid::parse_str(session_id).ok(),
+                    project_slug: project_slug.map(str::to_owned),
+                    trust,
+                    explicit_model: pinned,
+                    allowed_models: turn.routing_pool.as_ref().filter(|p| !p.is_empty()).map(
+                        |pool| {
+                            pool.iter()
+                                .filter(|e| e.provider == provider_id)
+                                .map(|e| e.model.clone())
+                                .collect()
+                        },
+                    ),
+                    current_model: model.to_owned(),
+                    next_turn: turn.next_turn,
+                },
+            ));
         router.set_last_message(turn.message);
         self.turn_routing.insert(session_id, Arc::clone(&router));
         Some(router)
@@ -3453,6 +3468,10 @@ impl ChatManager {
             provider_id: Some(provider_choice.provider_id.clone()),
             routed_by: Some(provider_choice.routed_by.as_str().to_string()),
             routing_mode: request.routing_mode.map(|m| m.as_str().to_owned()),
+            routing_pool: request
+                .routing_pool
+                .as_ref()
+                .and_then(|pool| serde_json::to_string(pool).ok()),
             capabilities: None,
             resume_token: None,
         };
@@ -3571,6 +3590,7 @@ impl ChatManager {
                 OpeningTurn {
                     explicit_model: request.model.is_some(),
                     routing_mode: request.routing_mode,
+                    routing_pool: request.routing_pool.clone(),
                     permission_mode: request.permission_mode.as_deref(),
                     message: &request.message,
                     next_turn: 1,
@@ -6451,6 +6471,7 @@ impl ChatManager {
         );
 
         let request = ChatRequest {
+            routing_pool: None,
             routing_mode: None,
             attachments: Vec::new(),
             message: message.to_string(),
@@ -9447,6 +9468,7 @@ impl ChatManager {
             OpeningTurn {
                 explicit_model: request.model.is_some(),
                 routing_mode: request.routing_mode,
+                routing_pool: request.routing_pool.clone(),
                 permission_mode: request.permission_mode.as_deref(),
                 message: &request.message,
                 next_turn: 0,
@@ -9617,6 +9639,10 @@ impl ChatManager {
                 routing_mode: node.routing_mode.as_deref().and_then(|m| {
                     serde_json::from_value(serde_json::Value::String(m.to_owned())).ok()
                 }),
+                routing_pool: node
+                    .routing_pool
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok()),
                 explicit_model: false,
                 permission_mode: node.permission_mode.as_deref(),
                 message,
@@ -11936,6 +11962,7 @@ mod tests {
 
     fn runner_request(run_id: Uuid, plan_id: Uuid, task_id: Uuid) -> ChatRequest {
         ChatRequest {
+            routing_pool: None,
             routing_mode: None,
             attachments: Vec::new(),
             message: "go".into(),
@@ -13132,6 +13159,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_node_serialization() {
         let session = ChatSessionNode {
+            routing_pool: None,
             routing_mode: None,
             id: uuid::Uuid::new_v4(),
             cli_session_id: Some("cli-123".into()),
@@ -13498,6 +13526,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_node_serialization_with_conversation_id() {
         let session = ChatSessionNode {
+            routing_pool: None,
             routing_mode: None,
             id: uuid::Uuid::new_v4(),
             cli_session_id: None,
@@ -13534,6 +13563,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_node_serialization_without_conversation_id() {
         let session = ChatSessionNode {
+            routing_pool: None,
             routing_mode: None,
             id: uuid::Uuid::new_v4(),
             cli_session_id: None,

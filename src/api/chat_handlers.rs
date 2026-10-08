@@ -2496,6 +2496,7 @@ mod tests {
             nexus_claude::agent::ProviderKind::ClaudeCode
         );
         let request = crate::chat::types::ChatRequest {
+            routing_pool: None,
             routing_mode: None,
             attachments: Vec::new(),
             message: "hi".into(),

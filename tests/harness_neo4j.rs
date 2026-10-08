@@ -45,6 +45,7 @@ async fn env() -> Option<Env> {
 
 fn node(id: Uuid) -> ChatSessionNode {
     ChatSessionNode {
+        routing_pool: None,
         routing_mode: None,
         id,
         cli_session_id: None,

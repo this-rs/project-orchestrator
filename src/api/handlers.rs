@@ -1333,6 +1333,7 @@ fn delegation_chat_request(
     default_mode: &str,
 ) -> Result<crate::chat::types::ChatRequest, crate::chat::envelope::EnvelopeError> {
     let mut request = crate::chat::types::ChatRequest {
+        routing_pool: None,
         routing_mode: None,
         attachments: Vec::new(),
         message: String::new(), // prompt sent via send_message

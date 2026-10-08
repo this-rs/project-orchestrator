@@ -208,6 +208,9 @@ pub struct ChatSessionNode {
     /// (`primary` / `mixed` / `full`); absent = the settings in force decided.
     #[serde(default)]
     pub routing_mode: Option<String>,
+    /// JSON list of the `{provider, model}` pairs the request restricted routing to.
+    #[serde(default)]
+    pub routing_pool: Option<String>,
     /// Capability snapshot frozen at open (A4), JSON.
     #[serde(default)]
     pub capabilities: Option<String>,
@@ -3425,6 +3428,7 @@ mod tests {
     #[test]
     fn test_chat_session_node_with_workspace_and_add_dirs() {
         let session = ChatSessionNode {
+            routing_pool: None,
             routing_mode: None,
             id: Uuid::new_v4(),
             cli_session_id: None,
@@ -3458,6 +3462,7 @@ mod tests {
     #[test]
     fn test_chat_session_node_workspace_fields_default() {
         let session = ChatSessionNode {
+            routing_pool: None,
             routing_mode: None,
             id: Uuid::new_v4(),
             cli_session_id: None,
