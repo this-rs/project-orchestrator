@@ -4460,20 +4460,22 @@ mod switch_provider_tests {
 
     #[test]
     fn a_failure_of_opening_the_new_session_keeps_its_typed_status() {
-        let err = switch_error(
+        let open_failure = || {
             anyhow::Error::new(nexus_claude::agent::ProviderError::invalid(
                 "no default model",
-            )),
-            "abc",
+            ))
+        };
+        let kept = AppError::from_open_error(
+            open_failure(),
+            Some(crate::chat::provider::resolver::CLAUDE_CODE),
         );
-        assert!(
-            !matches!(&err, AppError::NotFound(_) | AppError::BadRequest(_) if false),
-            "{err:?}"
+        let told = switch_error(open_failure(), "abc");
+        assert_eq!(
+            format!("{told:?}"),
+            format!("{kept:?}"),
+            "an open failure must reach the client exactly as create_session tells it"
         );
-        // It is not turned into the switch's own 400/404 text.
-        assert!(
-            !format!("{err:?}").contains("Session abc not found"),
-            "{err:?}"
-        );
+        // And it is not one of the switch's own answers.
+        assert!(!matches!(&told, AppError::NotFound(_)), "{told:?}");
     }
 }
