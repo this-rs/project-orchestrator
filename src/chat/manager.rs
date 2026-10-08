@@ -260,6 +260,10 @@ pub struct ActiveSession {
     /// reminder was injected. Must reach `OBJECTIVE_REMINDER_COOLDOWN` before another
     /// reminder is sent, to avoid spamming the agent.
     pub objective_reminder_turns_since: Arc<AtomicU32>,
+    /// Objective reminders injected back to back with no productive tool use in between.
+    /// Capped at `OBJECTIVE_REMINDER_MAX_IN_A_ROW`: past it the tracker stays silent until the
+    /// agent works again (a reminder that is answered by text only, every turn, is a loop).
+    pub objective_reminders_in_a_row: Arc<AtomicU32>,
     /// Accumulates work performed during the session: files modified, files read,
     /// steps completed, last tool used. Source of truth for resumption after
     /// compaction or max_turns.
@@ -3739,6 +3743,7 @@ impl ChatManager {
                     reasoning_path_tracker: super::feedback::ReasoningPathTracker::new(),
                     objective_tracking: true,
                     objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
+                    objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
                     work_log: work_log.clone(),
                     oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
                     oob_trigger_cap,
@@ -7091,6 +7096,7 @@ impl ChatManager {
                     reasoning_path_tracker: super::feedback::ReasoningPathTracker::new(),
                     objective_tracking: true,
                     objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
+                    objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
                     work_log: work_log.clone(),
                     // Resumed sessions = interactive: use the generous cap (50/5min).
                     // T7 of plan 9a1684b2.
@@ -13540,6 +13546,7 @@ mod tests {
             reasoning_path_tracker: crate::chat::feedback::ReasoningPathTracker::new(),
             objective_tracking: false,
             objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
+            objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
             work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
             oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
             oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
@@ -14784,6 +14791,7 @@ mod tests {
             reasoning_path_tracker: crate::chat::feedback::ReasoningPathTracker::new(),
             objective_tracking: false,
             objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
+            objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
             work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
             oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
             oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
@@ -18192,6 +18200,7 @@ pub(crate) mod test_support {
             reasoning_path_tracker: crate::chat::feedback::ReasoningPathTracker::new(),
             objective_tracking: false,
             objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
+            objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
             work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
             oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
             oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,

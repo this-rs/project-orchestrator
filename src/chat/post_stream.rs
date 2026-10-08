@@ -391,13 +391,17 @@ impl PostStreamHandler {
         hit_error_max_turns: bool,
     ) {
         // Gather session-level state for the pure decision function
-        let (tracking_enabled, cooldown_turns) = {
+        let (tracking_enabled, cooldown_turns, reminders_in_a_row) = {
             let sessions = self.active_sessions.read().await;
             if let Some(session) = sessions.get(&self.session_id) {
                 if had_productive_tool_use && !had_conclusive_tool_use {
                     // Agent used ONLY productive tools (no commit/push) = actively working, reset cooldown
                     session
                         .objective_reminder_turns_since
+                        .store(0, Ordering::Relaxed);
+                    // The agent is working again: the next stall may be reminded afresh.
+                    session
+                        .objective_reminders_in_a_row
                         .store(0, Ordering::Relaxed);
                 }
                 // When both productive AND conclusive → agent did work AND committed.
@@ -406,7 +410,8 @@ impl PostStreamHandler {
                 let turns = session
                     .objective_reminder_turns_since
                     .fetch_add(1, Ordering::Relaxed);
-                (enabled, turns)
+                let in_a_row = session.objective_reminders_in_a_row.load(Ordering::Relaxed);
+                (enabled, turns, in_a_row)
             } else {
                 return;
             }
@@ -422,6 +427,7 @@ impl PostStreamHandler {
             && !hit_error_max_turns
             && !self.interrupt_flag.load(Ordering::SeqCst)
             && tracking_enabled
+            && reminders_in_a_row < OBJECTIVE_REMINDER_MAX_IN_A_ROW
             && (cooldown_turns == 0 || cooldown_turns >= OBJECTIVE_REMINDER_COOLDOWN)
         {
             let tasks = if let Some(ref slug) = self.ctx.project_slug {
@@ -470,6 +476,7 @@ impl PostStreamHandler {
             interrupted: self.interrupt_flag.load(Ordering::SeqCst),
             tracking_enabled,
             cooldown_turns,
+            reminders_in_a_row,
             pending_tasks,
             work_log_summary,
         };
@@ -490,6 +497,9 @@ impl PostStreamHandler {
                 session
                     .objective_reminder_turns_since
                     .store(1, Ordering::Relaxed);
+                session
+                    .objective_reminders_in_a_row
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -622,6 +632,17 @@ impl PostStreamHandler {
 /// Cooldown threshold for objective reminders (same as PostStreamHandler).
 pub(crate) const OBJECTIVE_REMINDER_COOLDOWN: u32 = 1;
 
+/// Most reminders injected back to back without the agent doing productive work in between.
+/// The cooldown above is 1, so without this cap a text-only answer is followed by the same
+/// reminder on every turn, for as long as one task of the project stays pending.
+pub(crate) const OBJECTIVE_REMINDER_MAX_IN_A_ROW: u32 = 2;
+
+/// First line of every objective reminder. It says what the message is (automatic, not typed by
+/// the user) so the agent never mistakes it for a request, and so a client can fold it into a
+/// card instead of showing it as a user message.
+pub(crate) const OBJECTIVE_REMINDER_MARKER: &str =
+    "[AUTOMATIC OBJECTIVE REMINDER — NOT USER INPUT]";
+
 /// Summary of a pending task for the structured objective reminder.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingTaskInfo {
@@ -640,6 +661,8 @@ pub(crate) struct ObjectiveCheckInput {
     pub interrupted: bool,
     pub tracking_enabled: bool,
     pub cooldown_turns: u32,
+    /// Reminders already injected back to back with no productive tool use in between.
+    pub reminders_in_a_row: u32,
     /// Structured pending tasks (replaces the old objectives oneliner).
     pub pending_tasks: Vec<PendingTaskInfo>,
     /// Work already done this session (from SessionWorkLog::to_summary_markdown).
@@ -673,6 +696,11 @@ pub(crate) fn check_objective_reminder(input: &ObjectiveCheckInput) -> Option<St
         return None;
     }
 
+    // Guard 3b: a reminder answered by text only, every turn, is a loop — stop at the cap.
+    if input.reminders_in_a_row >= OBJECTIVE_REMINDER_MAX_IN_A_ROW {
+        return None;
+    }
+
     // Guard 4: must have pending objectives
     if input.pending_tasks.is_empty() {
         return None;
@@ -680,6 +708,7 @@ pub(crate) fn check_objective_reminder(input: &ObjectiveCheckInput) -> Option<St
 
     // Build structured reminder
     let mut parts = Vec::new();
+    parts.push(OBJECTIVE_REMINDER_MARKER.to_string());
     parts.push("⚠️ **You have not finished your current task. Here is what remains:**".to_string());
 
     for task in &input.pending_tasks {
@@ -711,6 +740,9 @@ pub(crate) fn check_objective_reminder(input: &ObjectiveCheckInput) -> Option<St
     }
 
     parts.push("\n**Do NOT conclude. Continue working on the pending steps above.**".to_string());
+    parts.push(format!(
+        "\n_Automatic message, not from the user. If these tasks are not yours or you are waiting on the user, say so in ONE line and do not repeat it: this reminder stops after {OBJECTIVE_REMINDER_MAX_IN_A_ROW} in a row, until you work again._"
+    ));
 
     Some(parts.join("\n"))
 }
@@ -728,6 +760,7 @@ mod tests {
             interrupted: false,
             tracking_enabled: true,
             cooldown_turns: 0, // first turn → should fire
+            reminders_in_a_row: 0,
             pending_tasks: vec![PendingTaskInfo {
                 title: "Implement feature T1".to_string(),
                 status: "inprogress".to_string(),
@@ -847,6 +880,7 @@ mod tests {
             interrupted: false,
             tracking_enabled: true,
             cooldown_turns: 0,
+            reminders_in_a_row: 0,
             pending_tasks: vec![
                 PendingTaskInfo {
                     title: "Add REST endpoint".to_string(),
@@ -923,6 +957,25 @@ mod tests {
     }
 
     #[test]
+    fn test_reminder_is_labelled_as_automatic_on_its_first_line() {
+        let msg = check_objective_reminder(&base_input()).expect("reminder");
+        assert_eq!(msg.lines().next(), Some(OBJECTIVE_REMINDER_MARKER));
+        assert!(
+            msg.contains("not from the user"),
+            "footer must say it is automatic"
+        );
+    }
+
+    #[test]
+    fn test_reminder_silent_once_the_cap_is_reached() {
+        let mut input = base_input();
+        input.reminders_in_a_row = OBJECTIVE_REMINDER_MAX_IN_A_ROW - 1;
+        assert!(check_objective_reminder(&input).is_some());
+        input.reminders_in_a_row = OBJECTIVE_REMINDER_MAX_IN_A_ROW;
+        assert!(check_objective_reminder(&input).is_none());
+    }
+
+    #[test]
     fn test_objective_reminder_contains_do_not_conclude() {
         let input = base_input();
         let msg = check_objective_reminder(&input).unwrap();
@@ -954,6 +1007,7 @@ mod tests {
             interrupted: false,
             tracking_enabled: true,
             cooldown_turns: 0,
+            reminders_in_a_row: 0,
             pending_tasks: vec![
                 PendingTaskInfo {
                     title: "Task A".to_string(),
@@ -1102,6 +1156,7 @@ mod integration_tests {
                 )),
                 objective_tracking,
                 objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
+                objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
                 reasoning_path_tracker: crate::chat::feedback::ReasoningPathTracker::new(),
                 work_log: Arc::new(Mutex::new(crate::chat::types::SessionWorkLog::default())),
                 oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
@@ -1317,6 +1372,45 @@ mod integration_tests {
             handler.pending_messages.lock().await.len(),
             1,
             "Second call should fire (cooldown=1 means every turn after reset)"
+        );
+    }
+
+    /// The loop that flooded a chat: a text-only answer to a reminder is followed by the same
+    /// reminder on every turn. After OBJECTIVE_REMINDER_MAX_IN_A_ROW the tracker goes quiet, and
+    /// speaks again only once the agent has worked.
+    #[tokio::test]
+    async fn test_integration_reminders_stop_at_the_cap_until_the_agent_works() {
+        let graph = Arc::new(MockGraphStore::new());
+        let slug = seed_graph_with_pending_tasks(&graph).await;
+        let handler = build_handler(graph, Some(slug), "test-session-cap", true).await;
+
+        let mut injected = 0;
+        for _ in 0..(OBJECTIVE_REMINDER_MAX_IN_A_ROW + 3) {
+            handler
+                .handle_objective_tracking(false, false, false, false)
+                .await;
+            injected += handler.pending_messages.lock().await.len();
+            handler.pending_messages.lock().await.clear();
+        }
+        assert_eq!(
+            injected as u32, OBJECTIVE_REMINDER_MAX_IN_A_ROW,
+            "text-only turns must not be reminded past the cap"
+        );
+
+        // The agent works (productive tools, no commit): the counter resets.
+        handler
+            .handle_objective_tracking(true, false, false, false)
+            .await;
+        assert_eq!(handler.pending_messages.lock().await.len(), 0);
+
+        // Next stall is reminded afresh.
+        handler
+            .handle_objective_tracking(false, false, false, false)
+            .await;
+        assert_eq!(
+            handler.pending_messages.lock().await.len(),
+            1,
+            "after real work, a new stall gets a reminder again"
         );
     }
 
