@@ -36,6 +36,7 @@ pub(crate) mod post_tool_hook;
 pub mod prompt;
 pub mod prompt_sections;
 pub mod provider;
+pub mod relay;
 pub mod routing;
 pub(crate) mod skill_hook;
 pub mod stages;
