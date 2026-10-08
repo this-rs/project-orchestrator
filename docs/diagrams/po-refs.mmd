@@ -1,22 +1,23 @@
 %% name: po-refs
-%% covers: backend:src/refs/**
-%% verified: c3e30b2d
+%% covers: backend:src/refs/** backend:src/api/refs_handlers.rs
+%% verified: e490da03
 %% ---
-%% PROUVE : ce que le module src/refs/ fait aujourd'hui (PR 1 du plan « Chat : références #/@ ») :
-%%   valider une référence envoyée par un client, décider si l'appelant peut la lire, et la
-%%   replier dans le texte du message. Rien n'est branché au chat : le module n'est appelé par
-%%   personne en dehors de ses tests (le branchement est PR 3, derrière le drapeau refs_v1).
+%% PROUVE : ce que le module src/refs/ fait aujourd'hui (PR 1 et PR 2 du plan « Chat : références #/@ ») :
+%%   valider une référence envoyée par un client, décider si l'appelant peut la lire, la replier dans
+%%   le texte du message, la résoudre par kind sur le GraphStore et la proposer via GET /api/refs/search.
+%%   Rien n'est branché au chat : le branchement est PR 3, derrière le drapeau refs_v1.
 %% ---
 %% SOURCES LUES :
-%%   src/refs/{mod,types,registry,validate,access,block,wire}.rs
+%%   src/refs/{mod,types,registry,validate,access,block,wire,label,resolvers,search}.rs
+%%   src/api/refs_handlers.rs (route dans api/routes.rs)
 %%   tests/refs_contract.rs, tests/fixtures/refs/*.json
 %% ---
 %% NON ETABLI :
-%%   aucun RefSource sur GraphStore (PR 2) : resolve_checked n'est testé qu'avec un faux ;
-%%   aucun appelant HTTP/WS : /api/refs/search et la trame refs_resolved n'existent que comme
-%%   formes (wire.rs) figées par les fixtures ;
+%%   aucun appelant WS : la trame refs_resolved n'existe que comme forme (wire.rs) figée par la fixture ;
 %%   aucune ACL de lecture par entité n'existe dans le dépôt : OpenInstanceRule admet tout
-%%   appelant authentifié, ScopeRule est la couture où une règle projet/workspace se branchera.
+%%   appelant authentifié, ScopeRule est la couture où une règle projet/workspace se branchera ;
+%%   la recherche texte des tâches et des décisions est un filtre mémoire borné (SCAN_CAP = 300) ;
+%%   le push-down du workspace au store n'est pas prouvé pour plans et tâches (le mock l'ignore).
 %% ---
 %% LEGENDE
 %%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans appelant  ⚪ autre domaine
@@ -35,12 +36,12 @@ flowchart TD
     ERR["✅ wire::RefsErrorBody<br/>400 {error, code: refs_invalid, reason, index?} ;<br/>test: error_fixture"]
     ENTITYREF["✅ types::EntityRef {kind, id}<br/>sans label, champs inconnus refusés ;<br/>test: an_entity_ref_refuses_a_client_label"]
     BLOCK["✅ block::encode<br/>bloc po-refs en fin de texte, avant po-attachments ;<br/>marqueur tapé par l'utilisateur neutralisé ;<br/>test: a_typed_marker_cannot_forge_a_block"]
-    SOURCE["🟠 access::RefSource::load_unchecked<br/>lecture brute (implémentée en PR 2)"]
+    SOURCE["✅ resolvers::GraphRefSource::load_unchecked<br/>un KindResolver par kind, délégué aux get_* ;<br/>test: the_verdict_on_each_kind_comes_from_the_policy"]
     POLICY{"✅ access::AccessPolicy::resolve_checked<br/>non authentifié refusé avant lecture ;<br/>erreur de store = Failed ;<br/>réponse pour une autre entité = NotFound ;<br/>test: a_source_answering_for_another_entity_is_not_found"}
     RULE["✅ access::ScopeRule::allows<br/>OpenInstanceRule aujourd'hui ;<br/>test: denied_by_the_rule_is_forbidden_and_the_rule_spoke"]
     DISCLOSE["✅ Resolution::to_wire(Disclosure::Uniform)<br/>refus, absence et erreur = not_found ;<br/>test: uniform_disclosure_makes_denied_and_missing_indistinguishable"]
     EVENT["✅ wire::RefsEvent refs_resolved<br/>test: refs_resolved_fixture"]
-    SEARCH["🟠 wire::RefSearchResponse<br/>GET /api/refs/search, pas de handler<br/>test: search_fixture"]
+    SEARCH["✅ search::search_with + refs_handlers::search_refs<br/>GET /api/refs/search : portée, politique, un kind lent ou en panne est omis ;<br/>test: plan_and_rfc_items_are_the_fixture_items"]
     GATE["✅ scripts/lcov_gate.rs<br/>énumère src/refs/ depuis le disque ;<br/>CI: étape Blocking coverage gate"]
 
     CLIENT --> VALIDATE
