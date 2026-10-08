@@ -2174,3 +2174,279 @@ mod provider_switch {
         assert!(w.manager.is_session_active(&old).await);
     }
 }
+
+// ============================================================================
+// Engine parity: what the Claude Code engine does around a turn, the agent
+// engine does too, on a scripted provider (no process, no network).
+// ============================================================================
+
+mod parity {
+    use std::sync::Mutex as StdMutex;
+
+    use async_trait::async_trait;
+    use nexus_claude::agent::{
+        AgentEvent, AgentProvider, AgentSession, Capabilities, CompactionInfo, CompactionPhase,
+        CompactionTrigger, HookSupport, HookVerdict, ModelInfo, ProviderError, ProviderHealth,
+        ProviderKind, ResumeToken, SessionHooks, SessionSpec, ToolCallInfo, ToolResultInfo,
+        TurnContext, TurnDirective,
+    };
+    use nexus_claude::testkit::scripted::steps;
+    use nexus_claude::testkit::{RecordedCall, Script, ScriptedProvider, Step};
+
+    use super::*;
+
+    /// What the graph hooks answered while the scripted provider played its turns.
+    #[derive(Default)]
+    pub(super) struct Answers {
+        pub after_tool: StdMutex<Vec<Option<String>>>,
+        pub before_compaction: StdMutex<Vec<Option<String>>>,
+    }
+
+    /// The hooks the engine gave the session, with their answers recorded (the
+    /// scripted provider observes a hook's answer, it does not apply it).
+    struct Recording {
+        inner: Arc<dyn SessionHooks>,
+        answers: Arc<Answers>,
+    }
+
+    #[async_trait]
+    impl SessionHooks for Recording {
+        async fn before_tool(&self, call: &ToolCallInfo) -> HookVerdict {
+            self.inner.before_tool(call).await
+        }
+        async fn after_tool(&self, result: &ToolResultInfo) -> Option<String> {
+            let said = self.inner.after_tool(result).await;
+            self.answers.after_tool.lock().unwrap().push(said.clone());
+            said
+        }
+        async fn before_compaction(&self, info: &CompactionInfo) -> Option<String> {
+            let said = self.inner.before_compaction(info).await;
+            self.answers
+                .before_compaction
+                .lock()
+                .unwrap()
+                .push(said.clone());
+            said
+        }
+        async fn before_turn(&self, ctx: &TurnContext) -> TurnDirective {
+            self.inner.before_turn(ctx).await
+        }
+    }
+
+    /// The scripted provider under the id of Claude Code and the kind asked.
+    #[derive(Clone)]
+    pub(super) struct Tapped {
+        pub inner: Arc<ScriptedProvider>,
+        pub kind: ProviderKind,
+        pub answers: Arc<Answers>,
+    }
+
+    impl Tapped {
+        fn tap(&self, mut spec: SessionSpec) -> SessionSpec {
+            if let Some(inner) = spec.hooks.take() {
+                spec.hooks = Some(Arc::new(Recording {
+                    inner,
+                    answers: Arc::clone(&self.answers),
+                }));
+            }
+            spec
+        }
+    }
+
+    #[async_trait]
+    impl AgentProvider for Tapped {
+        fn id(&self) -> &str {
+            "claude-code"
+        }
+        fn kind(&self) -> ProviderKind {
+            self.kind
+        }
+        async fn health(&self) -> ProviderHealth {
+            self.inner.health().await
+        }
+        async fn catalog(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            self.inner.catalog().await
+        }
+        fn capabilities(&self, model: Option<&str>) -> Capabilities {
+            self.inner.capabilities(model)
+        }
+        async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            self.inner.open(self.tap(spec)).await
+        }
+        async fn resume(
+            &self,
+            spec: SessionSpec,
+            token: ResumeToken,
+        ) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            self.inner.resume(self.tap(spec), token).await
+        }
+    }
+
+    impl super::super::agent_runtime::ProviderSource for Tapped {
+        fn get(&self, provider_id: &str) -> Option<Arc<dyn AgentProvider>> {
+            (provider_id == "claude-code").then(|| Arc::new(self.clone()) as Arc<dyn AgentProvider>)
+        }
+    }
+
+    pub(super) fn caps() -> Capabilities {
+        let mut caps = Capabilities::none();
+        caps.hooks = HookSupport::InProtocol;
+        caps.per_session_mcp = true;
+        caps.tools = true;
+        caps
+    }
+
+    pub(super) struct Rig {
+        pub manager: ChatManager,
+        pub provider: Tapped,
+        pub sid: String,
+        pub rx: broadcast::Receiver<ChatEvent>,
+        pub project: crate::neo4j::models::ProjectNode,
+        _dir: tempfile::TempDir,
+    }
+
+    /// A session of `kind` opened on a project, no opening message: the turns
+    /// below are played in order by the scripted provider.
+    pub(super) async fn rig(kind: ProviderKind, turns: Vec<Vec<Step>>) -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        let mut project = crate::test_helpers::test_project();
+        project.root_path = dir.path().display().to_string();
+        graph.create_project(&project).await.unwrap();
+        crate::skills::project_resolver::seed_resolve_cache_for_tests(std::slice::from_ref(
+            &project,
+        ));
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let mut builder = Script::builder().capabilities(caps());
+        for turn in turns {
+            builder = builder.turn(turn);
+        }
+        let provider = Tapped {
+            inner: Arc::new(ScriptedProvider::new("claude-code", builder.build())),
+            kind,
+            answers: Arc::default(),
+        };
+        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
+            .with_provider_source(Arc::new(provider.clone()));
+        let mut req = request(None, Some(&project.slug), "default");
+        req.message = String::new();
+        req.cwd = project.root_path.clone();
+        let created = manager.create_session(&req).await.unwrap();
+        let rx = manager.subscribe(&created.session_id).await.unwrap();
+        Rig {
+            manager,
+            provider,
+            sid: created.session_id,
+            rx,
+            project,
+            _dir: dir,
+        }
+    }
+
+    impl Rig {
+        /// Waits for the end of the running turn (`streaming_status: false`).
+        pub(super) async fn turn_end(&mut self) {
+            next_event(&mut self.rx, |e| {
+                matches!(
+                    e,
+                    ChatEvent::StreamingStatus {
+                        is_streaming: false
+                    }
+                )
+            })
+            .await;
+        }
+
+        /// The texts of the turns the provider was sent, in order.
+        pub(super) fn sent(&self) -> Vec<String> {
+            self.provider
+                .inner
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    RecordedCall::SendTurn(input) => Some(
+                        input
+                            .blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                nexus_claude::agent::InputBlock::Text { text } => {
+                                    Some(text.clone())
+                                }
+                                _ => None,
+                            })
+                            .collect::<String>(),
+                    ),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    fn compaction_started() -> Step {
+        Step::Emit(AgentEvent::Compaction {
+            phase: CompactionPhase::Started,
+            trigger: Some(CompactionTrigger::Auto),
+            pre_tokens: None,
+        })
+    }
+
+    /// H2: a session of the agent engine receives the graph's context after a
+    /// tool and before a compaction — through the very hooks the Claude Code
+    /// engine registers (one table, `graph_hook_table`), whatever the kind.
+    #[tokio::test]
+    async fn the_graph_hooks_answer_after_a_tool_and_before_a_compaction() {
+        for kind in [ProviderKind::Native, ProviderKind::ClaudeCode] {
+            let noisy: String = (0..30)
+                .map(|i| format!("src/chat/manager.rs:{i}: build_agent_spec(input)\n"))
+                .collect();
+            let mut r = rig(
+                kind,
+                vec![vec![
+                    steps::tool_call(
+                        "t1",
+                        "Grep",
+                        json!({ "pattern": "build_agent_spec", "path": "." }),
+                    ),
+                    steps::tool_result("t1", noisy),
+                    compaction_started(),
+                    steps::done(&caps()),
+                ]],
+            )
+            .await;
+            r.manager
+                .send_message(&r.sid, "where is it built?")
+                .await
+                .unwrap();
+            r.turn_end().await;
+            assert_eq!(r.sent().len(), 1, "one turn played");
+
+            let after = r.provider.answers.after_tool.lock().unwrap().clone();
+            let advice = after
+                .first()
+                .cloned()
+                .flatten()
+                .unwrap_or_else(|| panic!("{kind:?}: no context after the tool: {after:?}"));
+            assert!(
+                advice.contains("find_references") && advice.contains("build_agent_spec"),
+                "{kind:?}: the redirect advice of the graph: {advice}"
+            );
+            let compaction = r.provider.answers.before_compaction.lock().unwrap().clone();
+            let guidance = compaction
+                .first()
+                .cloned()
+                .flatten()
+                .unwrap_or_else(|| panic!("{kind:?}: no compaction guidance: {compaction:?}"));
+            assert!(
+                guidance.contains(&r.project.name),
+                "{kind:?}: the compaction is told what the session works on: {guidance}"
+            );
+        }
+    }
+}
