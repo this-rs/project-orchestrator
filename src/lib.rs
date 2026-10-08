@@ -41,6 +41,7 @@ pub mod protocol;
 pub mod reasoning;
 pub mod reception;
 pub mod reflex;
+pub mod refs;
 pub mod resolver;
 pub mod runner;
 pub mod setup_claude;

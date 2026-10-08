@@ -1,0 +1,16 @@
+{
+  "_contract_version": 1,
+  "_description": "Error body for a refused request (HTTP 400; on the WebSocket the same object is the payload of the error frame). Shape: {error, code, reason, index?}. error is the human sentence, as in every other API error; code is always refs_invalid; reason is the stable value to switch on; index (0-based) names the offending element of refs[] when the problem is one element. Nothing about existence or permission is ever an error here: unavailable entities are reported by refs_resolved, not refused.",
+  "code": "refs_invalid",
+  "http_status": 400,
+  "cases": [
+    { "name": "too many refs", "body": { "error": "too many references in one message", "code": "refs_invalid", "reason": "too_many" } },
+    { "name": "unknown kind at index 2", "body": { "error": "unknown reference kind", "code": "refs_invalid", "reason": "unknown_kind", "index": 2 } },
+    { "name": "reserved kind", "body": { "error": "this reference kind is not available yet", "code": "refs_invalid", "reason": "kind_disabled", "index": 0 } },
+    { "name": "bad id", "body": { "error": "reference id is not a valid UUID", "code": "refs_invalid", "reason": "bad_id", "index": 1 } },
+    { "name": "bad token", "body": { "error": "malformed #kind:id token", "code": "refs_invalid", "reason": "bad_token" } },
+    { "name": "search text too long", "body": { "error": "search text is too long", "code": "refs_invalid", "reason": "query_too_long" } },
+    { "name": "search limit out of range", "body": { "error": "search limit is out of range", "code": "refs_invalid", "reason": "bad_limit" } }
+  ],
+  "reasons": ["too_many", "unknown_kind", "kind_disabled", "bad_id", "bad_token", "query_too_long", "bad_limit"]
+}
