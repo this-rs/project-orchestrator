@@ -161,11 +161,28 @@ pub fn build_native_provider(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
 ) -> Result<Arc<dyn AgentProvider>, ProviderError> {
+    build_provider_with_handle(record, vault).map(|(provider, _)| provider)
+}
+
+/// A provider and, for a native record, its concrete harness.
+pub type BuiltProvider = (Arc<dyn AgentProvider>, Option<Arc<NativeProvider>>);
+
+/// Same, also returning the concrete native harness when the record is one: only
+/// it can run a capability probe (the trait has no such method).
+pub fn build_provider_with_handle(
+    record: &InstanceRecord,
+    vault: Option<Arc<VaultService>>,
+) -> Result<BuiltProvider, ProviderError> {
     match record.kind.as_str() {
-        "codex" => build_codex(record, vault),
-        "acp" => build_acp(record),
-        super::settings::KIND_CLAUDE_CODE_REMOTE => build_remote_claude(record, vault),
-        _ => Ok(build_native(record, vault)? as Arc<dyn AgentProvider>),
+        "codex" => build_codex(record, vault).map(|p| (p, None)),
+        "acp" => build_acp(record).map(|p| (p, None)),
+        super::settings::KIND_CLAUDE_CODE_REMOTE => {
+            build_remote_claude(record, vault).map(|p| (p, None))
+        }
+        _ => {
+            let native = build_native(record, vault)?;
+            Ok((Arc::clone(&native) as Arc<dyn AgentProvider>, Some(native)))
+        }
     }
 }
 

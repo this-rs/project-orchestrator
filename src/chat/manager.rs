@@ -452,6 +452,10 @@ pub(crate) struct RuntimeEnvConfig {
     pub auto_update_app: bool,
 }
 
+/// The concrete native harness of each stored instance, by id.
+pub(crate) type NativeProbers =
+    HashMap<String, Arc<nexus_claude::providers::native::NativeProvider>>;
+
 /// A built provider and the stored record it was built from.
 pub(crate) type NativeCacheEntry = (
     super::provider::settings::InstanceRecord,
@@ -555,6 +559,8 @@ pub struct ChatManager {
     /// Native providers built for stored instances, by instance id; an entry is
     /// reused while the stored record is unchanged.
     pub(crate) native_cache: Arc<RwLock<HashMap<String, NativeCacheEntry>>>,
+    /// The concrete native harness behind a cache entry, for capability probes.
+    pub(crate) native_probers: Arc<RwLock<NativeProbers>>,
     /// Nexus memory injector for conversation persistence
     pub(crate) context_injector: Option<Arc<ContextInjector>>,
     /// Memory config (for creating ConversationMemoryManagers)
@@ -1084,6 +1090,7 @@ impl ChatManager {
             provider_source,
             cognitive_routing: None,
             native_cache: Arc::new(RwLock::new(HashMap::new())),
+            native_probers: Arc::new(RwLock::new(HashMap::new())),
             context_injector: None,
             memory_config: None,
             event_emitter: None,
@@ -1149,6 +1156,7 @@ impl ChatManager {
             provider_source,
             cognitive_routing: None,
             native_cache: Arc::new(RwLock::new(HashMap::new())),
+            native_probers: Arc::new(RwLock::new(HashMap::new())),
             context_injector,
             memory_config: Some(memory_config),
             event_emitter: None,
@@ -3292,7 +3300,7 @@ impl ChatManager {
         // (instances, the project's consent, roles, aliases) BEFORE anything is
         // spawned or persisted: a refusal costs nothing.
         let provider_choice = self
-            .resolve_provider_choice(request, project_slug.as_deref())
+            .resolve_provider_choice_for(request, project_slug.as_deref(), Some(session_id))
             .await?;
         let model = match request.model.as_deref().filter(|m| !m.is_empty()) {
             Some(explicit) => explicit.to_string(),
@@ -8379,10 +8387,22 @@ impl ChatManager {
     /// instance's current origin), the roles (project before global) and the
     /// aliases. The legacy engine can only drive Claude Code: a choice of any
     /// other instance is `provider_unavailable` there.
+    #[cfg(test)]
     pub(crate) async fn resolve_provider_choice(
         &self,
         request: &ChatRequest,
         project_slug: Option<&str>,
+    ) -> Result<super::provider::resolver::ProviderChoice> {
+        self.resolve_provider_choice_for(request, project_slug, None)
+            .await
+    }
+
+    /// Same, tying the stored cognitive decision to the session being opened.
+    pub(crate) async fn resolve_provider_choice_for(
+        &self,
+        request: &ChatRequest,
+        project_slug: Option<&str>,
+        session_id: Option<Uuid>,
     ) -> Result<super::provider::resolver::ProviderChoice> {
         use super::provider::{catalog, resolver, settings, store};
         let instances = store::instances(self.graph.as_ref()).await?;
@@ -8437,6 +8457,7 @@ impl ChatManager {
                         &instances,
                         &store_catalog,
                         &aliases,
+                        session_id,
                     )
                     .await
                 {
@@ -8553,6 +8574,45 @@ impl ChatManager {
                     entries.push((model, None));
                 }
             }
+            // A native model nobody probed reports no tools and no window, so the
+            // hard constraints would drop it for good. Probe the instance's default
+            // model once (bounded; a failure is remembered for ten minutes).
+            if id != resolver::CLAUDE_CODE && healthy {
+                if let Some(model) = instances
+                    .iter()
+                    .find(|i| i.id == id)
+                    .and_then(|i| i.default_model.clone())
+                {
+                    let unknown = {
+                        let caps = provider.capabilities(Some(&model));
+                        // `tools` stays false until a probe has run; a window can be
+                        // known from the preset without one.
+                        !caps.tools
+                    };
+                    let key = (id.clone(), model.clone());
+                    let recent = routing
+                        .probed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&key)
+                        .is_some_and(|at| now.duration_since(*at) < Duration::from_secs(600));
+                    let concrete = self.native_probers.read().await.get(&id).cloned();
+                    if let (true, false, Some(native)) = (unknown, recent, concrete) {
+                        let outcome = tokio::time::timeout(
+                            Duration::from_secs(10),
+                            native.refresh_capabilities(&model),
+                        )
+                        .await;
+                        if !matches!(outcome, Ok(Ok(ref caps)) if caps.tools) {
+                            routing
+                                .probed
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(key, now);
+                        }
+                    }
+                }
+            }
             for (model, price) in entries {
                 if !seen.insert(model.clone()) {
                     continue;
@@ -8583,6 +8643,7 @@ impl ChatManager {
         instances: &[super::provider::settings::InstanceRecord],
         store_catalog: &super::provider::catalog::StoreCatalog,
         aliases: &[super::provider::settings::ModelAlias],
+        session_id: Option<Uuid>,
     ) -> Result<Option<super::provider::cognitive::decision::CognitiveDecision>> {
         use super::provider::cognitive::{
             candidates::Slot,
@@ -8621,6 +8682,7 @@ impl ChatManager {
             Slot::Automatic
         };
         decide.trust = request.permission_mode.as_deref() == Some("bypassPermissions");
+        decide.session_id = session_id;
         Ok(Some(routing.decider.decide(&decide).await?))
     }
 
@@ -8650,8 +8712,16 @@ impl ChatManager {
                 }
             }
         }
-        let provider = native_factory::build_native_provider(&record, self.vault.clone())
-            .map_err(anyhow::Error::new)?;
+        let (provider, concrete) =
+            native_factory::build_provider_with_handle(&record, self.vault.clone())
+                .map_err(anyhow::Error::new)?;
+        {
+            let mut probers = self.native_probers.write().await;
+            match concrete {
+                Some(native) => probers.insert(provider_id.to_string(), native),
+                None => probers.remove(provider_id),
+            };
+        }
         self.native_cache
             .write()
             .await
