@@ -541,6 +541,8 @@ struct AgentOpen<'a> {
 pub(crate) struct OpeningTurn<'a> {
     /// The request named its model.
     pub explicit_model: bool,
+    /// The mode the request asked for; it replaces the one of the settings for this conversation.
+    pub routing_mode: Option<super::provider::cognitive::ProviderRoutingMode>,
     pub permission_mode: Option<&'a str>,
     /// The message of the turn about to start.
     pub message: &'a str,
@@ -1250,7 +1252,12 @@ impl ChatManager {
         )
         .await
         {
-            Ok((settings, _)) => settings,
+            Ok((mut settings, _)) => {
+                if let Some(mode) = turn.routing_mode {
+                    settings.mode = mode;
+                }
+                settings
+            }
             Err(error) => {
                 warn!(session_id, error = %error, "routing settings unreadable: no per-turn routing");
                 return None;
@@ -3445,6 +3452,7 @@ impl ChatManager {
             spawned_by: request.spawned_by.clone(),
             provider_id: Some(provider_choice.provider_id.clone()),
             routed_by: Some(provider_choice.routed_by.as_str().to_string()),
+            routing_mode: request.routing_mode.map(|m| m.as_str().to_owned()),
             capabilities: None,
             resume_token: None,
         };
@@ -3562,6 +3570,7 @@ impl ChatManager {
                 project_slug.as_deref(),
                 OpeningTurn {
                     explicit_model: request.model.is_some(),
+                    routing_mode: request.routing_mode,
                     permission_mode: request.permission_mode.as_deref(),
                     message: &request.message,
                     next_turn: 1,
@@ -6442,6 +6451,7 @@ impl ChatManager {
         );
 
         let request = ChatRequest {
+            routing_mode: None,
             attachments: Vec::new(),
             message: message.to_string(),
             session_id: None,
@@ -9436,6 +9446,7 @@ impl ChatManager {
             project_slug,
             OpeningTurn {
                 explicit_model: request.model.is_some(),
+                routing_mode: request.routing_mode,
                 permission_mode: request.permission_mode.as_deref(),
                 message: &request.message,
                 next_turn: 0,
@@ -9602,6 +9613,10 @@ impl ChatManager {
             &node.model,
             node.project_slug.as_deref(),
             OpeningTurn {
+                // The mode the conversation was opened with stays its own across a resume.
+                routing_mode: node.routing_mode.as_deref().and_then(|m| {
+                    serde_json::from_value(serde_json::Value::String(m.to_owned())).ok()
+                }),
                 explicit_model: false,
                 permission_mode: node.permission_mode.as_deref(),
                 message,
@@ -11921,6 +11936,7 @@ mod tests {
 
     fn runner_request(run_id: Uuid, plan_id: Uuid, task_id: Uuid) -> ChatRequest {
         ChatRequest {
+            routing_mode: None,
             attachments: Vec::new(),
             message: "go".into(),
             session_id: None,
@@ -13116,6 +13132,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_node_serialization() {
         let session = ChatSessionNode {
+            routing_mode: None,
             id: uuid::Uuid::new_v4(),
             cli_session_id: Some("cli-123".into()),
             project_slug: Some("test-proj".into()),
@@ -13481,6 +13498,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_node_serialization_with_conversation_id() {
         let session = ChatSessionNode {
+            routing_mode: None,
             id: uuid::Uuid::new_v4(),
             cli_session_id: None,
             project_slug: None,
@@ -13516,6 +13534,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_node_serialization_without_conversation_id() {
         let session = ChatSessionNode {
+            routing_mode: None,
             id: uuid::Uuid::new_v4(),
             cli_session_id: None,
             project_slug: None,

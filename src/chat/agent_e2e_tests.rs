@@ -214,6 +214,7 @@ fn manager(graph: Arc<MockGraphStore>, secure: bool) -> ChatManager {
 
 fn request(provider: Option<&str>, project: Option<&str>, mode: &str) -> ChatRequest {
     ChatRequest {
+        routing_mode: None,
         attachments: Vec::new(),
         message: "hi there".into(),
         session_id: None,
@@ -1830,6 +1831,7 @@ mod turn_routing {
                 "manual-model",
                 None,
                 OpeningTurn {
+                    routing_mode: None,
                     explicit_model: false,
                     permission_mode: None,
                     message: DEBUG,
@@ -1841,6 +1843,61 @@ mod turn_routing {
         router.set_model_live(true);
         r.manager.apply_turn_directive(&r.sid, DEBUG).await;
         assert_eq!(r.decider.calls(), 0, "a pinned model is never routed again");
+    }
+
+    /// Opens a router the way a conversation does, with the mode its request named.
+    async fn reopen_with_mode(
+        r: &Rig,
+        mode: Option<ProviderRoutingMode>,
+    ) -> Arc<crate::chat::agent_hooks::TurnRouter> {
+        use crate::chat::manager::OpeningTurn;
+        let router = r
+            .manager
+            .register_turn_router(
+                &r.sid,
+                "claude-code",
+                "small",
+                None,
+                OpeningTurn {
+                    routing_mode: mode,
+                    explicit_model: false,
+                    permission_mode: None,
+                    message: DEBUG,
+                    next_turn: 0,
+                },
+            )
+            .await
+            .expect("a router is registered");
+        router.set_model_live(true);
+        router
+    }
+
+    #[tokio::test]
+    async fn a_conversation_opened_in_strict_is_never_routed_even_when_the_settings_say_full() {
+        let r = rig("full", "auto", true, None, vec![Answer::Pick("big")]).await;
+        reopen_with_mode(&r, Some(ProviderRoutingMode::Primary)).await;
+        r.manager.apply_turn_directive(&r.sid, DEBUG).await;
+        assert_eq!(r.decider.calls(), 0, "strict: PO is not even asked");
+    }
+
+    #[tokio::test]
+    async fn a_conversation_opened_in_auto_is_routed_even_when_the_settings_say_primary() {
+        let r = rig("primary", "auto", true, None, vec![Answer::Pick("big")]).await;
+        reopen_with_mode(&r, Some(ProviderRoutingMode::Full)).await;
+        r.manager.apply_turn_directive(&r.sid, DEBUG).await;
+        assert_eq!(
+            r.decider.calls(),
+            1,
+            "auto: PO decides for this conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_mode_in_the_request_the_settings_decide() {
+        let r = rig("primary", "auto", true, None, vec![Answer::Pick("big")]).await;
+        reopen_with_mode(&r, None).await;
+        r.manager.apply_turn_directive(&r.sid, DEBUG).await;
+        assert_eq!(r.decider.calls(), 0);
     }
 
     #[tokio::test]
