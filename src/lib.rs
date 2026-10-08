@@ -1603,6 +1603,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             cm = cm.with_reasoning_engine(re.clone());
         }
         let cm = Arc::new(cm);
+        if std::env::var("PO_COGNITIVE_ROUTING").is_ok_and(|v| v == "1") {
+            chat::routing_wiring::wire_learning(&cm);
+        }
         cm.start_cleanup_task();
         tracing::info!("Chat manager initialized");
         boot.done("chat");

@@ -263,6 +263,9 @@ pub struct CognitiveRouting {
     pub hints: Arc<RwLock<PriorHints>>,
     /// One health probe per instance per window.
     pub health: Arc<candidates::HealthCache>,
+    /// Where decisions and arms live, when the standard wiring built this; it is
+    /// how a session's decision is linked and closed. `None` for a test decider.
+    pub store: Option<Arc<dyn RoutingArmStore>>,
 }
 
 impl CognitiveRouting {
@@ -270,9 +273,13 @@ impl CognitiveRouting {
     pub fn new(store: Arc<dyn RoutingArmStore>) -> Self {
         let hints = Arc::new(RwLock::new(PriorHints::new()));
         Self {
-            decider: Arc::new(CognitiveDecider::with_hints(store, Arc::clone(&hints))),
+            decider: Arc::new(CognitiveDecider::with_hints(
+                Arc::clone(&store),
+                Arc::clone(&hints),
+            )),
             hints,
             health: Arc::new(candidates::HealthCache::standard()),
+            store: Some(store),
         }
     }
 
@@ -282,6 +289,7 @@ impl CognitiveRouting {
             decider,
             hints: Arc::new(RwLock::new(PriorHints::new())),
             health: Arc::new(candidates::HealthCache::standard()),
+            store: None,
         }
     }
 
