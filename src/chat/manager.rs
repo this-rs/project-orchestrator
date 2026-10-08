@@ -3878,7 +3878,7 @@ impl ChatManager {
         let session_id_str = session_id.to_string();
         let graph = self.graph.clone();
         let active_sessions = self.active_sessions.clone();
-        let message = request.message.clone();
+        let message = super::relay::prefixed(request.relay.as_deref(), &request.message);
         let events_tx_clone = events_tx.clone();
         let injector = self.context_injector.clone();
         let event_emitter = self.event_emitter.clone();
@@ -6307,6 +6307,128 @@ impl ChatManager {
         });
 
         Ok(())
+    }
+
+    /// Moves a conversation to ANOTHER provider (B-SW).
+    ///
+    /// Providers do not share a session format, so this opens a NEW session on
+    /// `provider`, in the same project and directory, and closes the old one only
+    /// once the new one is open. The new session is sent the earlier conversation
+    /// as a relay (see [`super::relay`]) in front of `message`; the conversation
+    /// itself shows `message` alone. The target is resolved like any explicit
+    /// choice: the project's consent, the endpoint guard and the security gate all
+    /// apply, and a refusal leaves the old session untouched.
+    ///
+    /// Moving to the provider the session is already on is refused: that is
+    /// `set_session_model`'s job.
+    pub async fn switch_session_provider(
+        &self,
+        session_id: &str,
+        provider: &str,
+        model: Option<&str>,
+        message: &str,
+        claims: Option<crate::auth::jwt::Claims>,
+    ) -> Result<super::types::SwitchProviderResponse> {
+        use super::relay;
+        use super::types::SwitchProviderError;
+
+        let previous = Uuid::parse_str(session_id)
+            .map_err(|_| anyhow::Error::new(SwitchProviderError::InvalidSession))?;
+        if message.trim().is_empty() {
+            return Err(anyhow::Error::new(SwitchProviderError::EmptyMessage));
+        }
+        let node = self
+            .graph
+            .get_chat_session(previous)
+            .await?
+            .ok_or_else(|| anyhow::Error::new(SwitchProviderError::NotFound))?;
+        let current = node
+            .provider_id
+            .clone()
+            .unwrap_or_else(|| super::provider::resolver::CLAUDE_CODE.to_string());
+        if current == provider {
+            return Err(anyhow::Error::new(SwitchProviderError::SameProvider(
+                current,
+            )));
+        }
+
+        // The conversation so far, from what was stored.
+        let records = self.graph.get_chat_events(previous, 0, 5_000).await?;
+        let events: Vec<ChatEvent> = records
+            .iter()
+            .filter_map(|record| serde_json::from_str(&record.data).ok())
+            .collect();
+        // A relay may use 40 % of the target's window when it is known.
+        let window = match self.provider_for(provider).await {
+            Ok(target) => target
+                .capabilities(model.or(node.model.as_str().into()))
+                .context_window
+                .map(|w| w.value),
+            Err(_) => None,
+        };
+        let rendered = relay::render_relay(
+            &events,
+            &current,
+            provider,
+            relay::budget_for_window(window),
+        );
+
+        let request = ChatRequest {
+            attachments: Vec::new(),
+            message: message.to_string(),
+            session_id: None,
+            cwd: node.cwd.clone(),
+            project_slug: node.project_slug.clone(),
+            model: model.map(str::to_string),
+            provider: Some(provider.to_string()),
+            task_alias: None,
+            run_provider: None,
+            run_model: None,
+            max_tokens: None,
+            task_class: None,
+            permission_mode: node.permission_mode.clone(),
+            add_dirs: node.add_dirs.clone(),
+            workspace_slug: node.workspace_slug.clone(),
+            user_claims: claims,
+            spawned_by: None,
+            task_context: None,
+            scaffolding_override: None,
+            runner_context: None,
+            routing_decision_id: None,
+            relay: (!rendered.text.is_empty()).then(|| rendered.text.clone()),
+        };
+        // Opening can be refused (consent, endpoint, gate, no model): the old
+        // session is then left exactly as it was.
+        let created = self.create_session(&request).await?;
+
+        let note = serde_json::json!({
+            "from_session": session_id,
+            "from_provider": current,
+            "relayed_entries": rendered.included,
+            "omitted_entries": rendered.omitted,
+        });
+        if let Err(error) = self
+            .graph
+            .put_llm_setting(
+                &format!("handoff:{}", created.session_id),
+                "note",
+                &note.to_string(),
+            )
+            .await
+        {
+            warn!(session_id = %created.session_id, %error, "recording the provider handoff failed (non-fatal)");
+        }
+        // The conversation lives on in the new session; the old one ends.
+        if let Err(error) = self.close_session(session_id).await {
+            debug!(%session_id, %error, "closing the previous session after a provider switch");
+        }
+        Ok(super::types::SwitchProviderResponse {
+            session_id: created.session_id,
+            stream_url: created.stream_url,
+            previous_session_id: session_id.to_string(),
+            relayed_entries: rendered.included,
+            omitted_entries: rendered.omitted,
+        })
     }
 
     /// Change the model of an active CLI session mid-conversation.
@@ -9064,7 +9186,12 @@ impl ChatManager {
             .await;
         if !request.message.is_empty() {
             if let Some(handle) = self.agent_runtime.get(&sid).await {
-                handle.send_message(&request.message).await?;
+                handle
+                    .send_message_relayed(
+                        &request.message,
+                        &super::relay::prefixed(request.relay.as_deref(), &request.message),
+                    )
+                    .await?;
             }
         }
         Ok(CreateSessionResponse {
@@ -11495,6 +11622,7 @@ mod tests {
             scaffolding_override: None,
             runner_context: None,
             routing_decision_id: None,
+            relay: None,
         }
     }
 

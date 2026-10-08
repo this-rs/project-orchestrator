@@ -235,6 +235,7 @@ fn request(provider: Option<&str>, project: Option<&str>, mode: &str) -> ChatReq
         scaffolding_override: None,
         runner_context: None,
         routing_decision_id: None,
+        relay: None,
     }
 }
 
@@ -1612,5 +1613,253 @@ mod turn_routing {
             .filter(|c| matches!(c, RecordedCall::SetModel(_)))
             .count();
         assert_eq!(set_models, 1);
+    }
+}
+
+// ── Provider switch (B-SW) ──────────────────────────────────────────────────
+//
+// A conversation moves to another provider: a new session on the target gets the
+// earlier conversation as a relay in front of the next message, the old session
+// closes, and a refusal leaves the old one untouched.
+
+mod provider_switch {
+    use super::*;
+    use crate::chat::types::SwitchProviderError;
+
+    fn two_turn_script() -> Value {
+        json!([
+            sse_route("Call the ping tool now", vec![
+                delta(json!({"tool_calls": [{"index": 0, "id": "p1", "function": {"name": "ping", "arguments": "{}"}}]})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                json!("[DONE]"),
+            ]),
+            {"method": "GET", "path": "/v1/models", "status": 200,
+             "body": {"object": "list", "data": [{"id": "m", "context_length": 32000}]}},
+            // Listed first: the relayed request also contains "hi there".
+            sse_route("second question", vec![
+                delta(json!({"content": "the answer"})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}}),
+                json!("[DONE]"),
+            ]),
+            sse_route("hi there", vec![
+                delta(json!({"content": "hello from "})),
+                delta(json!({"content": "the fake model"})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}}),
+                json!("[DONE]"),
+            ]),
+        ])
+    }
+
+    struct World {
+        fake: FakeOpenAi,
+        graph: Arc<MockGraphStore>,
+        manager: ChatManager,
+    }
+
+    async fn world() -> World {
+        let fake = FakeOpenAi::start(two_turn_script());
+        let graph = Arc::new(MockGraphStore::new());
+        for id in ["local", "local2"] {
+            let mut record = instance(&fake, "none");
+            record.id = id.into();
+            store_instance(&graph, &record).await;
+            consent(&graph, "proj", id, &fake.origin()).await;
+        }
+        // A third instance the project never consented to.
+        let mut unconsented = instance(&fake, "none");
+        unconsented.id = "local3".into();
+        store_instance(&graph, &unconsented).await;
+        let manager = manager(graph.clone(), true);
+        World {
+            fake,
+            graph,
+            manager,
+        }
+    }
+
+    /// Opens a session on `local`, runs its first turn, and waits until the turn is stored.
+    async fn first_turn(w: &World) -> String {
+        let created = w
+            .manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"));
+        let mut rx = w.manager.subscribe(&created.session_id).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        stored_until(w, &created.session_id, |events| {
+            events.iter().any(|e| e.event_type == "assistant_text")
+        })
+        .await;
+        created.session_id
+    }
+
+    async fn stored_until(
+        w: &World,
+        session_id: &str,
+        done: impl Fn(&[crate::neo4j::models::ChatEventRecord]) -> bool,
+    ) -> Vec<crate::neo4j::models::ChatEventRecord> {
+        let id = Uuid::parse_str(session_id).unwrap();
+        for _ in 0..100 {
+            let events = w.graph.get_chat_events(id, 0, 500).await.unwrap();
+            if done(&events) {
+                return events;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the expected events were never stored for {session_id}");
+    }
+
+    #[tokio::test]
+    async fn a_conversation_moves_to_another_provider_with_its_history_relayed() {
+        let w = world().await;
+        let old = first_turn(&w).await;
+
+        let moved = w
+            .manager
+            .switch_session_provider(&old, "local2", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+        assert_ne!(moved.session_id, old);
+        assert_eq!(moved.previous_session_id, old);
+        assert!(
+            moved.relayed_entries >= 2,
+            "the user and the assistant turn"
+        );
+        assert_eq!(moved.omitted_entries, 0);
+
+        // The new session runs on the target and answers.
+        // Read what was stored, not the live stream: the answer may be out before we subscribe.
+        stored_until(&w, &moved.session_id, |events| {
+            events
+                .iter()
+                .any(|e| e.event_type == "assistant_text" && e.data.contains("the answer"))
+        })
+        .await;
+        let node = w
+            .graph
+            .get_chat_session(Uuid::parse_str(&moved.session_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.provider_id.as_deref(), Some("local2"));
+        assert_eq!(node.project_slug.as_deref(), Some("proj"));
+
+        // The model of the target saw the earlier conversation, then the new question.
+        let chats = w.fake.chat_requests();
+        let turn = chats
+            .iter()
+            .find(|r| r["body"].to_string().contains("second question"))
+            .expect("the relayed turn");
+        let body = turn["body"].to_string();
+        assert!(body.contains("<conversation_relay"), "{body}");
+        assert!(body.contains("hi there"), "the earlier user message");
+        assert!(
+            body.contains("hello from the fake model"),
+            "the earlier answer"
+        );
+        assert!(
+            body.find("<conversation_relay").unwrap() < body.find("second question").unwrap(),
+            "the relay comes first"
+        );
+
+        // The conversation shows the user's words only: the relay is not a message.
+        let stored = stored_until(&w, &moved.session_id, |events| {
+            events.iter().any(|e| e.event_type == "user_message")
+        })
+        .await;
+        let first_user = stored
+            .iter()
+            .find(|e| e.event_type == "user_message")
+            .unwrap();
+        assert!(first_user.data.contains("second question"));
+        assert!(
+            !first_user.data.contains("conversation_relay"),
+            "the relay must not be stored as the user's message: {}",
+            first_user.data
+        );
+
+        // The old session is closed and the handoff is traceable.
+        assert!(!w.manager.is_session_active(&old).await);
+        let note = w
+            .graph
+            .get_llm_setting(&format!("handoff:{}", moved.session_id), "note")
+            .await
+            .unwrap()
+            .expect("the handoff note");
+        let note: Value = serde_json::from_str(&note).unwrap();
+        assert_eq!(note["from_session"], old.as_str());
+        assert_eq!(note["from_provider"], "local");
+    }
+
+    #[tokio::test]
+    async fn a_refused_switch_leaves_the_old_session_untouched() {
+        let w = world().await;
+        let old = first_turn(&w).await;
+        let sessions_before = w.fake.chat_requests().len();
+
+        // An unknown provider, and one the project never consented to.
+        for target in ["ghost", "local3"] {
+            let err = w
+                .manager
+                .switch_session_provider(&old, target, None, "second question", None)
+                .await
+                .expect_err(target);
+            assert!(
+                err.downcast_ref::<SwitchProviderError>().is_none(),
+                "{target}: a refusal from the resolver, not a switch error: {err:#}"
+            );
+            assert!(
+                w.manager.is_session_active(&old).await,
+                "{target}: the old session must stay open"
+            );
+        }
+        assert_eq!(
+            w.fake.chat_requests().len(),
+            sessions_before,
+            "nothing was sent anywhere"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_provider_and_an_empty_message_are_refused_before_anything_opens() {
+        let w = world().await;
+        let old = first_turn(&w).await;
+
+        let same = w
+            .manager
+            .switch_session_provider(&old, "local", None, "second question", None)
+            .await
+            .expect_err("same provider");
+        assert_eq!(
+            same.downcast_ref::<SwitchProviderError>(),
+            Some(&SwitchProviderError::SameProvider("local".into()))
+        );
+        let empty = w
+            .manager
+            .switch_session_provider(&old, "local2", None, "   ", None)
+            .await
+            .expect_err("empty message");
+        assert_eq!(
+            empty.downcast_ref::<SwitchProviderError>(),
+            Some(&SwitchProviderError::EmptyMessage)
+        );
+        let missing = w
+            .manager
+            .switch_session_provider(
+                &Uuid::new_v4().to_string(),
+                "local2",
+                None,
+                "second question",
+                None,
+            )
+            .await
+            .expect_err("unknown session");
+        assert_eq!(
+            missing.downcast_ref::<SwitchProviderError>(),
+            Some(&SwitchProviderError::NotFound)
+        );
+        assert!(w.manager.is_session_active(&old).await);
     }
 }

@@ -232,6 +232,13 @@ impl AgentSessionHandle {
     /// Starts a turn and drives it to its terminal event in the background.
     /// A turn already running is `turn_in_progress`.
     pub async fn send_message(self: &Arc<Self>, text: &str) -> Result<()> {
+        self.send_message_relayed(text, text).await
+    }
+
+    /// Sends `sent` to the model while the conversation shows and stores `shown`: a
+    /// relayed history (B-SW) goes in front of the user's message without becoming
+    /// part of it.
+    pub async fn send_message_relayed(self: &Arc<Self>, shown: &str, sent: &str) -> Result<()> {
         if self
             .is_streaming
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -240,10 +247,10 @@ impl AgentSessionHandle {
             return Err(anyhow::Error::new(ProviderError::TurnInProgress));
         }
         self.emit(ChatEvent::UserMessage {
-            content: text.to_string(),
+            content: shown.to_string(),
         })
         .await;
-        let input = TurnInput::text(text);
+        let input = TurnInput::text(sent);
         let stream = match self.session.send_turn(input.clone()).await {
             Ok(stream) => stream,
             Err(error) => {

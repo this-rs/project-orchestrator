@@ -1913,6 +1913,12 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/sessions/{id}/interrupt",
             post(chat_handlers::interrupt_session),
         )
+        // Continue the conversation on another provider (B-SW): a new session,
+        // the earlier conversation relayed to it, the old one closed.
+        .route(
+            "/api/chat/sessions/{id}/switch-provider",
+            post(chat_handlers::switch_provider),
+        )
         // Cancel running tools (T3 of plan 28e9afe3) — kill the
         // currently-running tool subprocess(es) WITHOUT ending the
         // LLM turn. See chat_handlers::cancel_tools doc-comment.

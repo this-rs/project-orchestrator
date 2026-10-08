@@ -267,6 +267,10 @@ pub struct ChatRequest {
     /// applied. Absent for a request nobody routed. Additive.
     #[serde(default)]
     pub routing_decision_id: Option<uuid::Uuid>,
+    /// History relayed from another provider (B-SW), sent to the model in front of
+    /// `message` but never stored nor shown as the user's words. Internal.
+    #[serde(skip)]
+    pub relay: Option<String>,
 }
 
 /// Kind of background subprocess being tracked.
@@ -1148,6 +1152,52 @@ pub struct ChatLinkedRfc {
 pub struct CreateSessionResponse {
     pub session_id: String,
     pub stream_url: String,
+}
+
+/// Why a provider switch was refused before anything was opened (B-SW).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwitchProviderError {
+    /// The session id is not a UUID.
+    InvalidSession,
+    /// No such session.
+    NotFound,
+    /// A message is needed to continue the conversation on the new provider.
+    EmptyMessage,
+    /// The session is already on this provider (changing the model is another call).
+    SameProvider(String),
+}
+
+impl std::fmt::Display for SwitchProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSession => write!(f, "invalid session id"),
+            Self::NotFound => write!(f, "session not found"),
+            Self::EmptyMessage => write!(
+                f,
+                "a message is needed to continue the conversation on the new provider"
+            ),
+            Self::SameProvider(id) => write!(
+                f,
+                "the session is already on '{id}': change its model instead"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SwitchProviderError {}
+
+/// Result of moving a conversation to another provider (B-SW).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwitchProviderResponse {
+    /// The new session, on the target provider.
+    pub session_id: String,
+    pub stream_url: String,
+    /// The session the conversation moved from (now closed).
+    pub previous_session_id: String,
+    /// Earlier entries carried to the new session.
+    pub relayed_entries: usize,
+    /// Older entries left out to fit the target's context window (stated to the model).
+    pub omitted_entries: usize,
 }
 
 // ============================================================================
