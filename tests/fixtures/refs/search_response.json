@@ -1,0 +1,37 @@
+{
+  "_contract_version": 1,
+  "_description": "GET /api/refs/search. Query: q (string, 0..=200 chars, empty = most recent), kinds (optional comma list of active kinds, default all five), project_id / workspace_slug (optional filters), limit (1..=50, default 20). Response 200: {items}. Each item: kind, id, label (title), subtitle (optional, one line of context), project and workspace (optional {id, slug, name}), entity_status (the entity's own status, optional). Fields that are absent are omitted, not null. Results are already filtered by the access policy. 400 with the refs_invalid body on a bad query (see errors.json).",
+  "request": {
+    "method": "GET",
+    "path": "/api/refs/search",
+    "query": { "q": "refs", "kinds": "plan,task,rfc", "limit": 20 },
+    "example_url": "/api/refs/search?q=refs&kinds=plan,task,rfc&limit=20"
+  },
+  "response": {
+    "items": [
+      {
+        "kind": "plan",
+        "id": "57cf05c9-25b6-495d-ab07-de4b11d64736",
+        "label": "Chat : références #/@",
+        "subtitle": "12 tâches",
+        "project": { "id": "00333b5f-2d0a-4467-9c98-155e55d2b7e5", "slug": "project-orchestrator", "name": "Project Orchestrator" },
+        "workspace": { "id": "7a1d9c34-52e8-4b6f-a0c3-1e8f4d2b6a95", "slug": "po", "name": "PO" },
+        "entity_status": "in_progress"
+      },
+      {
+        "kind": "task",
+        "id": "3adeffc9-c8b0-4e2f-a674-55bfcb293433",
+        "label": "PR 1 — backend : fondations refs",
+        "subtitle": "Plan : Chat : références #/@",
+        "project": { "id": "00333b5f-2d0a-4467-9c98-155e55d2b7e5", "slug": "project-orchestrator", "name": "Project Orchestrator" },
+        "entity_status": "in_progress"
+      },
+      {
+        "kind": "rfc",
+        "id": "2191fcb0-e07c-49c1-9f29-cb9f7441f914",
+        "label": "RFC — Références (#/@), glisser-déposer et agents lancés depuis l'interface"
+      }
+    ]
+  },
+  "empty_response": { "items": [] }
+}

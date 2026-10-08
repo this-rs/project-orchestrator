@@ -135,6 +135,14 @@ Never bypass the hooks with `--no-verify`.
 PR adds or modifies. The target lives in a single place (`coverage.status.patch.default.target`)
 and is meant to ratchet 80% -> 90% -> 100%.
 
+On top of it, `src/refs/` has a BLOCKING gate in the `coverage` job
+(`scripts/lcov_gate.rs`, std only): every file under the directory is read from
+disk, must appear in the merged lcov and reach 90% of its non-test lines, and the
+pure decision modules (`access.rs`, `validate.rs`, `registry.rs`) must reach
+100%. Lines from the first `#[cfg(test)]` of a file onwards are not counted.
+Add a directory to the gate by extending that step; never by adding an `ignore`
+entry to `codecov.yml`.
+
 ## Pull Request Process
 
 1. **Create a branch** from `main`:

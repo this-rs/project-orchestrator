@@ -248,6 +248,8 @@ tokio-test = "0.4"
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3.14"
 wiremock = "0.6.5"
+# Property tests of src/refs (parsing and block coding must never panic).
+proptest = "1"
 # The scripted provider of nexus (a harness that calls the session hooks), for the tests of
 # per-turn model routing. Same pin as the dependency above.
 nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "fbb4a3239bd8b951f1e25486d3c26366002ad5d3", features = ["testkit"] }
