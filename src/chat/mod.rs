@@ -37,6 +37,7 @@ pub mod prompt;
 pub mod prompt_sections;
 pub mod provider;
 pub mod routing;
+pub(crate) mod routing_wiring;
 pub(crate) mod skill_hook;
 pub mod stages;
 pub mod tree;
