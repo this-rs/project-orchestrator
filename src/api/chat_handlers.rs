@@ -1320,23 +1320,6 @@ pub async fn get_model_catalog(
     Json(state.model_catalog.get_models().await)
 }
 
-/// POST /api/chat/models/refresh — ask for a catalog refresh NOW.
-///
-/// Never blocks: the fetch runs in a background task and this answers `202`
-/// at once. `started: false` means nothing new was launched (no credentials, or
-/// a refresh is already running). The client re-reads `GET /api/chat/models`
-/// a few seconds later, or reacts to the `model_added` event.
-pub async fn refresh_model_catalog(
-    State(state): State<OrchestratorState>,
-) -> (axum::http::StatusCode, Json<serde_json::Value>) {
-    let started = state.model_catalog.request_refresh().await;
-    let refreshing = state.model_catalog.is_refreshing().await;
-    (
-        axum::http::StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "started": started, "refreshing": refreshing })),
-    )
-}
-
 /// Request body for PATCH /api/chat/config
 #[derive(Debug, Deserialize)]
 pub struct UpdateChatConfigRequest {
@@ -2532,6 +2515,7 @@ mod tests {
             task_context: None,
             scaffolding_override: None,
             runner_context: None,
+            routing_decision_id: None,
         };
         let err = manager.create_session(&request).await.unwrap_err();
         let failure = crate::chat::provider::errors::classify_open_error(

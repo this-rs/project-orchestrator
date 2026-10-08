@@ -261,6 +261,12 @@ pub struct ChatRequest {
     /// Set by `PlanRunner.execute_task()` and `delegate_task()`.
     #[serde(skip)]
     pub runner_context: Option<RunnerContext>,
+    /// Cognitive routing decision (B-R7) taken for this session before it
+    /// opens: the runner, a delegation or a utility call decide first, and the
+    /// resolver turns the decision into the `project_rule` slot when it is
+    /// applied. Absent for a request nobody routed. Additive.
+    #[serde(default)]
+    pub routing_decision_id: Option<uuid::Uuid>,
 }
 
 /// Kind of background subprocess being tracked.

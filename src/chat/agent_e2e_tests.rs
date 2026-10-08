@@ -234,6 +234,7 @@ fn request(provider: Option<&str>, project: Option<&str>, mode: &str) -> ChatReq
         task_context: None,
         scaffolding_override: None,
         runner_context: None,
+        routing_decision_id: None,
     }
 }
 
@@ -929,5 +930,687 @@ fn only_a_remote_machine_that_does_not_allow_it_holds_trust_back() {
             !ChatManager::trust_needs_opt_in(&record(kind, false)),
             "{kind}"
         );
+    }
+}
+
+// ── Cognitive routing (R2, B-R4) ────────────────────────────────────────────
+//
+// `resolve_provider_choice` with the cognitive router wired, against a stored
+// instance served by `fake_openai`. The built-in Claude Code is hidden from the
+// provider source so the pool holds exactly one pair (`local`/`m`) and the
+// choice does not depend on what is installed on the machine.
+
+mod cognitive_routing {
+    use super::*;
+    use crate::chat::agent_runtime::ProviderSource;
+    use crate::chat::provider::cognitive::decider::CognitiveRouting;
+    use crate::chat::provider::cognitive::store::{DecisionFilter, RoutingArmStore};
+    use crate::chat::provider::resolver::{ProviderChoice, RoutedBy};
+    use crate::neo4j::routing::Neo4jRoutingStore;
+
+    struct NoBuiltin;
+
+    impl ProviderSource for NoBuiltin {
+        fn get(&self, _provider_id: &str) -> Option<Arc<dyn nexus_claude::agent::AgentProvider>> {
+            None
+        }
+    }
+
+    struct Setup {
+        _fake: FakeOpenAi,
+        graph: Arc<MockGraphStore>,
+        manager: ChatManager,
+    }
+
+    async fn setup(mode: &str, stage: &str, wired: bool) -> Setup {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        graph
+            .put_llm_setting(
+                GLOBAL,
+                "routing",
+                &json!({"mode": mode, "stage": stage, "exploration_epsilon": 0.0}).to_string(),
+            )
+            .await
+            .unwrap();
+        let mut manager = manager(graph.clone(), true).with_provider_source(Arc::new(NoBuiltin));
+        // The router only trusts what an instance is KNOWN to do: a provider that
+        // was never probed reports no tools and an unknown window. Opening one
+        // session on the instance probes it and keeps the probe in the cache.
+        let warm = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("warm-up failed: {e:#}"));
+        let mut rx = manager.subscribe(&warm.session_id).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        if wired {
+            let store = Arc::new(Neo4jRoutingStore::new(graph.clone()));
+            manager = manager.with_cognitive_routing(CognitiveRouting::new(store));
+        }
+        Setup {
+            _fake: fake,
+            graph,
+            manager,
+        }
+    }
+
+    fn executor_request() -> ChatRequest {
+        let mut r = request(None, Some("proj"), "default");
+        r.spawned_by = Some("{}".into());
+        r.task_class = Some("simple".into());
+        r
+    }
+
+    fn pilot_request() -> ChatRequest {
+        request(None, Some("proj"), "default")
+    }
+
+    async fn choose(s: &Setup, r: &ChatRequest) -> ProviderChoice {
+        s.manager
+            .resolve_provider_choice(r, Some("proj"))
+            .await
+            .unwrap_or_else(|e| panic!("resolve failed: {e:#}"))
+    }
+
+    async fn decisions(
+        s: &Setup,
+    ) -> Vec<crate::chat::provider::cognitive::decision::CognitiveDecision> {
+        Neo4jRoutingStore::new(s.graph.clone())
+            .decisions(&DecisionFilter::default())
+            .await
+            .unwrap()
+    }
+
+    /// What the choice is, without the recorded shadow.
+    fn essence(c: &ProviderChoice) -> (String, Option<String>, RoutedBy, Option<String>) {
+        (
+            c.provider_id.clone(),
+            c.model.clone(),
+            c.routed_by,
+            c.route_rule.clone(),
+        )
+    }
+
+    #[tokio::test]
+    async fn primary_changes_nothing_at_any_stage_for_anyone() {
+        for stage in ["shadow", "advisory", "auto"] {
+            let with = setup("primary", stage, true).await;
+            let without = setup("primary", stage, false).await;
+            let sent_after_warm_up = with._fake.chat_requests().len();
+            for r in [pilot_request(), executor_request()] {
+                let a = choose(&with, &r).await;
+                let b = choose(&without, &r).await;
+                assert_eq!(essence(&a), essence(&b), "primary/{stage}");
+                assert_ne!(a.routed_by, RoutedBy::Auto);
+                assert!(a.reason.is_none());
+            }
+            // Nothing was sent to the instance beyond the warm-up session.
+            assert_eq!(with._fake.chat_requests().len(), sent_after_warm_up);
+            // Every decision was stored, none applied, and the pick is only recorded.
+            let all = decisions(&with).await;
+            assert_eq!(all.len(), 2, "primary/{stage}");
+            assert!(all.iter().all(|d| !d.applied && d.chosen.is_some()));
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_routes_an_executor_by_auto_and_leaves_the_pilot_on_the_primary() {
+        let s = setup("mixed", "auto", true).await;
+        let executor = choose(&s, &executor_request()).await;
+        assert_eq!(executor.provider_id, "local");
+        assert_eq!(executor.model.as_deref(), Some("m"));
+        assert_eq!(executor.routed_by, RoutedBy::Auto);
+        assert_eq!(executor.route_rule.as_deref(), Some("auto:simple"));
+        assert!(executor
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("local/m")));
+
+        let pilot = choose(&s, &pilot_request()).await;
+        assert_eq!(
+            pilot.provider_id, "claude-code",
+            "the pilot keeps the primary"
+        );
+        assert_ne!(pilot.routed_by, RoutedBy::Auto);
+        assert_eq!(
+            pilot.shadow.as_ref().map(|p| p.0.as_str()),
+            Some("local"),
+            "what the router would have chosen is recorded"
+        );
+        let all = decisions(&s).await;
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.iter().filter(|d| d.applied).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn full_routes_the_pilot_too() {
+        let s = setup("full", "auto", true).await;
+        let pilot = choose(&s, &pilot_request()).await;
+        assert_eq!(pilot.provider_id, "local");
+        assert_eq!(pilot.routed_by, RoutedBy::Auto);
+        assert!(pilot
+            .route_rule
+            .as_deref()
+            .is_some_and(|r| r.starts_with("auto:chat")));
+        let executor = choose(&s, &executor_request()).await;
+        assert_eq!(executor.routed_by, RoutedBy::Auto);
+        assert!(decisions(&s).await.iter().all(|d| d.applied));
+    }
+
+    #[tokio::test]
+    async fn the_shadow_stage_applies_nothing_in_any_mode() {
+        for mode in ["primary", "mixed", "full"] {
+            let s = setup(mode, "shadow", true).await;
+            for r in [pilot_request(), executor_request()] {
+                let c = choose(&s, &r).await;
+                assert_eq!(c.provider_id, "claude-code", "{mode}/shadow");
+                assert_ne!(c.routed_by, RoutedBy::Auto);
+            }
+            let all = decisions(&s).await;
+            assert_eq!(all.len(), 2);
+            assert!(all.iter().all(|d| !d.applied), "{mode}/shadow");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_advisory_stage_applies_to_executors_only() {
+        let s = setup("full", "advisory", true).await;
+        assert_eq!(
+            choose(&s, &executor_request()).await.routed_by,
+            RoutedBy::Auto
+        );
+        assert_ne!(choose(&s, &pilot_request()).await.routed_by, RoutedBy::Auto);
+    }
+
+    #[tokio::test]
+    async fn a_choice_the_caller_named_is_never_substituted() {
+        let s = setup("full", "auto", true).await;
+        let mut explicit_provider = pilot_request();
+        explicit_provider.provider = Some("claude-code".into());
+        let mut explicit_model = executor_request();
+        explicit_model.model = Some("some-model".into());
+        let mut alias = executor_request();
+        alias.task_alias = Some("fast".into());
+        let mut run = executor_request();
+        run.run_provider = Some("claude-code".into());
+        for r in [explicit_provider, explicit_model, run] {
+            let c = choose(&s, &r).await;
+            assert_eq!(c.provider_id, "claude-code");
+            assert_ne!(c.routed_by, RoutedBy::Auto);
+        }
+        // An alias that is not defined is the caller's problem, not a reason to route.
+        assert!(s
+            .manager
+            .resolve_provider_choice(&alias, Some("proj"))
+            .await
+            .map(|c| c.routed_by != RoutedBy::Auto)
+            .unwrap_or(true));
+        let all = decisions(&s).await;
+        assert_eq!(all.len(), 4, "persisted in every case");
+        assert!(all.iter().all(|d| !d.applied && d.chosen.is_none()));
+        assert!(all.iter().all(|d| d.reason.contains("explicit")));
+    }
+
+    #[tokio::test]
+    async fn without_a_candidate_the_declared_rules_apply_and_the_decision_says_so() {
+        let s = setup("full", "auto", true).await;
+        // The project withdraws its consent: nothing is eligible.
+        s.graph
+            .delete_llm_setting("project:proj", "consent:local")
+            .await
+            .ok();
+        for (key, _) in s.graph.list_llm_settings("project:proj", "").await.unwrap() {
+            s.graph
+                .delete_llm_setting("project:proj", &key)
+                .await
+                .unwrap();
+        }
+        let c = choose(&s, &pilot_request()).await;
+        assert_eq!(c.provider_id, "claude-code");
+        assert_ne!(c.routed_by, RoutedBy::Auto);
+        let all = decisions(&s).await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].reason, "no_candidate");
+        assert!(!all[0].applied && all[0].chosen.is_none());
+    }
+}
+
+// ============================================================================
+// Per-turn model routing (`full` mode): `before_turn` on a scripted provider.
+// ============================================================================
+
+/// `before_turn` chooses the model of a turn. A scripted provider plays the
+/// harness of nexus (it calls the hooks and honours `set_model_live`); the
+/// decider is a fake that answers by turn, so the tests pin WHAT the hook does
+/// with an answer, not how a scorer would choose.
+mod turn_routing {
+    use std::collections::VecDeque;
+    use std::sync::Mutex as StdMutex;
+
+    use async_trait::async_trait;
+    use nexus_claude::agent::{
+        AgentProvider, AgentSession, Capabilities, HookSupport, ModelInfo, ProviderError,
+        ProviderHealth, ProviderKind, ResumeToken, SessionSpec,
+    };
+    use nexus_claude::testkit::{RecordedCall, Script, ScriptedProvider};
+
+    use super::*;
+    use crate::chat::agent_hooks::PoolSource;
+    use crate::chat::provider::cognitive::candidates::ModelFacts;
+    use crate::chat::provider::cognitive::decision::{
+        CognitiveDecision, DecideRequest, Decider, Pick,
+    };
+    use crate::chat::provider::cognitive::{LearningStage, ProviderRoutingMode, ROUTING_KEY};
+
+    /// The scripted provider under the id (and kind) of Claude Code, so the
+    /// engine hands it the graph hooks.
+    struct AsClaudeCode(Arc<ScriptedProvider>);
+
+    #[async_trait]
+    impl AgentProvider for AsClaudeCode {
+        fn id(&self) -> &str {
+            "claude-code"
+        }
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::ClaudeCode
+        }
+        async fn health(&self) -> ProviderHealth {
+            self.0.health().await
+        }
+        async fn catalog(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            self.0.catalog().await
+        }
+        fn capabilities(&self, model: Option<&str>) -> Capabilities {
+            self.0.capabilities(model)
+        }
+        async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            self.0.open(spec).await
+        }
+        async fn resume(
+            &self,
+            spec: SessionSpec,
+            token: ResumeToken,
+        ) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            self.0.resume(spec, token).await
+        }
+    }
+
+    impl super::super::agent_runtime::ProviderSource for AsClaudeCode {
+        fn get(&self, provider_id: &str) -> Option<Arc<dyn AgentProvider>> {
+            (provider_id == "claude-code")
+                .then(|| Arc::new(AsClaudeCode(Arc::clone(&self.0))) as Arc<dyn AgentProvider>)
+        }
+    }
+
+    struct Pool;
+
+    #[async_trait]
+    impl PoolSource for Pool {
+        async fn pool(&self, provider_id: &str) -> Vec<ModelFacts> {
+            ["small", "big"]
+                .iter()
+                .map(|m| ModelFacts {
+                    provider_id: provider_id.to_owned(),
+                    model: (*m).to_owned(),
+                    supports_tools: true,
+                    supports_images: true,
+                    context_window: Some(200_000),
+                    price: None,
+                    cost_basis: nexus_claude::agent::CostBasis::Unknown,
+                    healthy: Some(true),
+                    allowed_for_project: true,
+                    sandboxed: false,
+                })
+                .collect()
+        }
+    }
+
+    /// What the fake decider does on one call.
+    #[derive(Clone)]
+    enum Answer {
+        /// Pick this model, applied when the request's mode and stage say so.
+        Pick(&'static str),
+        /// Pick the model the session runs on now.
+        Stay,
+        Fail,
+        Hang,
+    }
+
+    /// Answers from a queue (the last answer repeats) and remembers every request.
+    struct FakeDecider {
+        answers: StdMutex<VecDeque<Answer>>,
+        requests: StdMutex<Vec<DecideRequest>>,
+        decisions: StdMutex<Vec<CognitiveDecision>>,
+    }
+
+    impl FakeDecider {
+        fn new(answers: Vec<Answer>) -> Arc<Self> {
+            Arc::new(Self {
+                answers: StdMutex::new(answers.into()),
+                requests: StdMutex::new(Vec::new()),
+                decisions: StdMutex::new(Vec::new()),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait]
+    impl Decider for FakeDecider {
+        async fn decide(&self, request: &DecideRequest) -> anyhow::Result<CognitiveDecision> {
+            self.requests.lock().unwrap().push(request.clone());
+            let answer = {
+                let mut queue = self.answers.lock().unwrap();
+                if queue.len() > 1 {
+                    queue.pop_front().unwrap()
+                } else {
+                    queue.front().cloned().unwrap_or(Answer::Fail)
+                }
+            };
+            let model: String = match answer {
+                Answer::Pick(model) => model.to_owned(),
+                Answer::Stay => request
+                    .current
+                    .as_ref()
+                    .map(|pick| pick.model.clone())
+                    .unwrap_or_default(),
+                Answer::Fail => anyhow::bail!("the scorer is down"),
+                Answer::Hang => {
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                }
+            };
+            let applied = request.settings.mode == ProviderRoutingMode::Full
+                && request.settings.stage == LearningStage::Auto;
+            let decision = CognitiveDecision {
+                id: Uuid::new_v4(),
+                at: Utc::now(),
+                signature: request.signature.clone(),
+                chosen: Some(Pick::new(
+                    request.restrict_provider.clone().unwrap_or_default(),
+                    model.clone(),
+                )),
+                score: Some(0.9),
+                explored: false,
+                reason: format!("fake: {model}"),
+                alternatives: Vec::new(),
+                applied,
+                mode: request.settings.mode,
+                stage: request.settings.stage,
+                session_id: request.session_id,
+                task_id: None,
+                run_id: None,
+                turn_index: request.turn_index,
+                outcome: None,
+                used: None,
+            };
+            self.decisions.lock().unwrap().push(decision.clone());
+            Ok(decision)
+        }
+    }
+
+    fn caps(set_model_live: bool) -> Capabilities {
+        let mut caps = Capabilities::none();
+        caps.set_model_live = set_model_live;
+        caps.hooks = HookSupport::InProtocol;
+        caps.per_session_mcp = true;
+        caps.tools = true;
+        caps
+    }
+
+    struct Rig {
+        manager: ChatManager,
+        decider: Arc<FakeDecider>,
+        provider: Arc<ScriptedProvider>,
+        sid: String,
+        rx: broadcast::Receiver<ChatEvent>,
+    }
+
+    async fn rig(
+        mode: &str,
+        stage: &str,
+        set_model_live: bool,
+        explicit_model: Option<&str>,
+        answers: Vec<Answer>,
+    ) -> Rig {
+        let graph = Arc::new(MockGraphStore::new());
+        graph
+            .put_llm_setting(
+                GLOBAL,
+                ROUTING_KEY,
+                &json!({ "mode": mode, "stage": stage }).to_string(),
+            )
+            .await
+            .unwrap();
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let provider = Arc::new(ScriptedProvider::new(
+            "claude-code",
+            Script::builder().capabilities(caps(set_model_live)).build(),
+        ));
+        let decider = FakeDecider::new(answers);
+        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
+            .with_provider_source(Arc::new(AsClaudeCode(Arc::clone(&provider))))
+            .with_turn_decider(decider.clone(), Arc::new(Pool));
+        let mut req = request(None, None, "default");
+        // No opening message: every turn below is sent by `turn`, from index 0.
+        req.message = String::new();
+        req.model = explicit_model.map(str::to_owned);
+        let created = manager.create_session(&req).await.unwrap();
+        let rx = manager.subscribe(&created.session_id).await.unwrap();
+        Rig {
+            manager,
+            decider,
+            provider,
+            sid: created.session_id,
+            rx,
+        }
+    }
+
+    impl Rig {
+        /// Sends one message and waits for its turn to end; returns the models
+        /// announced by `model_changed` during it.
+        async fn turn(&mut self, text: &str) -> Vec<String> {
+            self.manager.send_message(&self.sid, text).await.unwrap();
+            let mut changed = Vec::new();
+            loop {
+                match next_event(&mut self.rx, |e| {
+                    matches!(
+                        e,
+                        ChatEvent::ModelChanged { .. }
+                            | ChatEvent::StreamingStatus {
+                                is_streaming: false
+                            }
+                    )
+                })
+                .await
+                {
+                    ChatEvent::ModelChanged { model } => changed.push(model),
+                    _ => return changed,
+                }
+            }
+        }
+    }
+
+    const SIMPLE: &str = "rename this variable";
+    const DEBUG: &str = "why does this crash with a stack trace error";
+
+    #[tokio::test]
+    async fn full_auto_a_simple_turn_then_a_debug_turn_changes_the_model_of_the_second() {
+        let mut r = rig(
+            "full",
+            "auto",
+            true,
+            None,
+            vec![Answer::Stay, Answer::Pick("big")],
+        )
+        .await;
+        let first = r.turn(SIMPLE).await;
+        let second = r.turn(DEBUG).await;
+        assert_eq!(r.decider.calls(), 2);
+        assert!(
+            first.is_empty(),
+            "the simple turn keeps its model: {first:?}"
+        );
+        assert_eq!(second, ["big"], "the debug turn runs on the other model");
+        let requests = r.decider.requests.lock().unwrap();
+        assert_eq!(requests[0].turn_index, Some(0));
+        assert_eq!(requests[1].turn_index, Some(1));
+        assert_eq!(
+            requests[1].restrict_provider.as_deref(),
+            Some("claude-code")
+        );
+        assert!(requests[0].session_id.is_some());
+        assert_eq!(requests[0].pool.len(), 2, "the pool of that provider only");
+        assert!(r
+            .provider
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::SendTurn(_))));
+    }
+
+    #[tokio::test]
+    async fn without_set_model_live_there_is_no_directive_and_no_error() {
+        let mut r = rig("full", "auto", false, None, vec![Answer::Pick("big")]).await;
+        assert!(r.turn(SIMPLE).await.is_empty());
+        assert!(r.turn(DEBUG).await.is_empty());
+        assert_eq!(r.decider.calls(), 0, "nothing to apply: nothing is asked");
+    }
+
+    #[tokio::test]
+    async fn the_shadow_stage_records_the_decision_and_changes_nothing() {
+        let mut r = rig("full", "shadow", true, None, vec![Answer::Pick("big")]).await;
+        assert!(r.turn(SIMPLE).await.is_empty());
+        assert!(r.turn(DEBUG).await.is_empty());
+        assert_eq!(r.decider.calls(), 2, "asked, so the decision is recorded");
+        let decisions = r.decider.decisions.lock().unwrap();
+        assert!(decisions
+            .iter()
+            .all(|d| !d.applied && d.stage == LearningStage::Shadow));
+    }
+
+    #[tokio::test]
+    async fn mixed_and_primary_modes_leave_the_pilot_alone() {
+        for mode in ["mixed", "primary"] {
+            let mut r = rig(mode, "auto", true, None, vec![Answer::Pick("big")]).await;
+            assert!(r.turn(DEBUG).await.is_empty(), "{mode}");
+            assert_eq!(r.decider.calls(), 0, "{mode}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_model_named_by_the_request_is_never_replaced() {
+        let mut r = rig(
+            "full",
+            "auto",
+            true,
+            Some("explicit-model"),
+            vec![Answer::Pick("big")],
+        )
+        .await;
+        assert!(r.turn(DEBUG).await.is_empty());
+        assert_eq!(r.decider.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn never_two_changes_in_consecutive_turns() {
+        let mut r = rig(
+            "full",
+            "auto",
+            true,
+            None,
+            vec![
+                Answer::Pick("small"),
+                Answer::Pick("big"),
+                Answer::Pick("small"),
+                Answer::Pick("big"),
+                Answer::Pick("big"),
+            ],
+        )
+        .await;
+        let mut flips = Vec::new();
+        for text in [SIMPLE, DEBUG, SIMPLE, DEBUG, DEBUG] {
+            flips.push(!r.turn(text).await.is_empty());
+        }
+        for pair in flips.windows(2) {
+            assert!(!(pair[0] && pair[1]), "two changes in a row: {flips:?}");
+        }
+        assert!(
+            flips.iter().any(|f| *f),
+            "the guard does not freeze the router: {flips:?}"
+        );
+        // The turn that follows a change is still asked, but as a shadow decision.
+        let decisions = r.decider.decisions.lock().unwrap();
+        assert!(
+            decisions.iter().any(|d| !d.applied),
+            "recorded unapplied: {decisions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_or_hanging_decider_never_fails_the_turn() {
+        let mut r = rig("full", "auto", true, None, vec![Answer::Fail, Answer::Hang]).await;
+        assert!(
+            r.turn(SIMPLE).await.is_empty(),
+            "an error: the turn completes"
+        );
+        assert!(
+            r.turn(DEBUG).await.is_empty(),
+            "a timeout: the turn completes"
+        );
+        assert_eq!(r.decider.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_manual_model_change_ends_the_automatic_ones_for_the_session() {
+        let mut r = rig("full", "auto", true, None, vec![Answer::Pick("big")]).await;
+        assert!(r
+            .manager
+            .set_session_model(&r.sid, "manual-model")
+            .await
+            .unwrap());
+        // The confirmation of the user's own change is the first model_changed.
+        let changed = r.turn(DEBUG).await;
+        assert_eq!(
+            changed,
+            ["manual-model"],
+            "no automatic change after it: {changed:?}"
+        );
+        assert_eq!(r.decider.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_legacy_engines_entry_point_applies_the_same_decision_as_a_set_model() {
+        // `apply_turn_directive` is what the legacy engine (Claude Code CLI) calls from
+        // `send_message` before writing the message; here it drives a session whose
+        // `set_model` the scripted provider records.
+        let mut r = rig("full", "auto", true, None, vec![Answer::Pick("big")]).await;
+        r.manager.apply_turn_directive(&r.sid, DEBUG).await;
+        let ev = next_event(&mut r.rx, |e| matches!(e, ChatEvent::ModelChanged { .. })).await;
+        assert!(matches!(ev, ChatEvent::ModelChanged { ref model } if model == "big"));
+        assert!(r
+            .provider
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::SetModel(m) if m == "big")));
+        // Same guard as on the agent engine: no second change on the next turn.
+        r.manager.apply_turn_directive(&r.sid, DEBUG).await;
+        assert_eq!(r.decider.calls(), 2);
+        let set_models = r
+            .provider
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, RecordedCall::SetModel(_)))
+            .count();
+        assert_eq!(set_models, 1);
     }
 }

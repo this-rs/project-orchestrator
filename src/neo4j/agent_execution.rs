@@ -93,6 +93,11 @@ pub struct AgentExecutionNode {
     /// Per-check verification detail (serialized JSON).
     #[serde(default)]
     pub verification_json: Option<String>,
+    /// Cognitive routing decision that chose this execution's model (B-R7),
+    /// applied or not. `None` for an execution nobody routed, and for every
+    /// node written before the field existed.
+    #[serde(default)]
+    pub routing_decision_id: Option<Uuid>,
 }
 
 /// Provider recorded on executions that predate provider selection.
@@ -153,6 +158,7 @@ impl Default for AgentExecutionNode {
             cost_basis: None,
             num_turns: None,
             verification_json: None,
+            routing_decision_id: None,
         }
     }
 }
@@ -170,7 +176,9 @@ impl AgentExecutionNode {
 
     /// Optional string properties decided when the attempt is launched.
     fn launch_string_props(&self) -> Vec<(&'static str, String)> {
+        let decision = self.routing_decision_id.map(|id| id.to_string());
         [
+            ("routing_decision_id", &decision),
             ("model_requested", &self.model_requested),
             ("model_alias", &self.model_alias),
             ("route_rule", &self.route_rule),
@@ -576,6 +584,8 @@ impl Neo4jClient {
             cost_basis: opt_string("cost_basis"),
             num_turns: opt_u64("num_turns").and_then(|v| u32::try_from(v).ok()),
             verification_json: opt_string("verification_json"),
+            routing_decision_id: opt_string("routing_decision_id")
+                .and_then(|s| Uuid::parse_str(&s).ok()),
         })
     }
 }
@@ -632,6 +642,7 @@ mod tests {
             cost_basis: Some("reported".to_string()),
             num_turns: Some(7),
             verification_json: Some(r#"{"build":"pass"}"#.to_string()),
+            routing_decision_id: Some(Uuid::new_v4()),
             ..make_agent_execution(None, None)
         }
     }
@@ -656,6 +667,7 @@ mod tests {
         assert_eq!(a.cost_basis, b.cost_basis);
         assert_eq!(a.num_turns, b.num_turns);
         assert_eq!(a.verification_json, b.verification_json);
+        assert_eq!(a.routing_decision_id, b.routing_decision_id);
     }
 
     #[test]
@@ -711,6 +723,29 @@ mod tests {
         assert!(ae.cost_basis.is_none());
         assert!(ae.num_turns.is_none());
         assert!(ae.verification_json.is_none());
+        assert!(
+            ae.routing_decision_id.is_none(),
+            "a node written before routing decisions reads as None"
+        );
+    }
+
+    #[test]
+    fn test_routing_decision_id_is_written_at_launch_and_only_when_set() {
+        let mut ae = AgentExecutionNode::default();
+        assert!(!ae
+            .launch_string_props()
+            .iter()
+            .any(|(name, _)| *name == "routing_decision_id"));
+        let id = Uuid::new_v4();
+        ae.routing_decision_id = Some(id);
+        let props = ae.launch_string_props();
+        let written = props
+            .iter()
+            .find(|(name, _)| *name == "routing_decision_id");
+        assert_eq!(
+            written.map(|(_, v)| v.as_str()),
+            Some(id.to_string().as_str())
+        );
     }
 
     #[test]
@@ -737,7 +772,7 @@ mod tests {
         assert!(bare.outcome_int_props().is_empty());
 
         let full = make_fully_recorded_execution();
-        assert_eq!(full.launch_string_props().len(), 7);
+        assert_eq!(full.launch_string_props().len(), 8);
         assert_eq!(full.outcome_string_props().len(), 4);
         let ints = full.outcome_int_props();
         assert_eq!(ints.len(), 5);

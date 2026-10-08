@@ -1,12 +1,12 @@
 %% name: po-cognitive-routing
-%% covers: backend:src/api/routing_handlers.rs backend:src/chat/provider/cognitive/**
+%% covers: backend:src/api/routing_handlers.rs backend:src/chat/provider/cognitive/** backend:src/neo4j/routing.rs backend:src/runner/routing.rs
 %% verified: 8b0b020f
 %% ---
 %% PROUVE : la couche RÉGLAGES du routage cognitif (RFC v2, décision R2, tranche B-R1) : le mode de routage
 %%   (primary | mixed | full) et l'étape d'apprentissage (shadow | advisory | auto), réglés en global avec surcharge
 %%   par projet, lus avec un défaut, exposés par /api/chat/routing et /api/projects/{slug}/routing, résumés dans
-%%   GET /api/chat/providers.routing. AUCUNE décision n'est prise : le résolveur (po-chat-provider) ne lit pas
-%%   encore ces réglages.
+%%   GET /api/chat/providers.routing. et (tranche B-R4) la DÉCISION : scorer Thompson, décideur, magasin Neo4j des bras et des décisions, et le
+%%   branchement dans ChatManager::resolve_provider_choice selon mode × stage (identité en primary + shadow).
 %% ---
 %% SOURCES LUES :
 %%   src/chat/provider/cognitive/mode.rs — ProviderRoutingMode, LearningStage, RoutingSettings (Default), RoutingError (code),
@@ -16,14 +16,20 @@
 %%                                        routing_error (AppError::Provider(OpenFailure{status 400, code}))
 %%   src/api/provider_handlers.rs        — require_human (partagé) ; src/auth/middleware.rs — is_human_only_mutation (/api/chat/routing, /api/projects/{slug}/routing)
 %%   src/api/chat_handlers.rs            — list_providers pose listing.routing ; src/chat/provider/listing.rs — RoutingSummary
+%%   src/chat/provider/cognitive/scorer.rs — PriorHints, prior_for, beta_draw, seed_of, score (Scored), arm_key_of
+%%   src/chat/provider/cognitive/decider.rs — is_applied, decide_with (pur), CognitiveDecider (Decider), CognitiveRouting
+%%   src/neo4j/routing.rs — Neo4jClient::{get,list,observe}_routing_arm_impl, *_routing_decision_impl, Neo4jRoutingStore (RoutingArmStore sur GraphStore) ; neo4j/{traits,mock,impl_graph_store}.rs
+%%   src/chat/manager.rs — resolve_provider_choice, cognitive_decision, routing_pool, with_cognitive_routing ; src/chat/agent_e2e_tests.rs — mod cognitive_routing
 %%   src/chat/provider/cognitive/signature.rs — TaskClass, ChatIntent, TaskSignature (from_chat_request, from_task, from_delegation, utility, arm_key), ContextHints
 %%   src/chat/provider/cognitive/candidates.rs — ModelFacts (from_capabilities, estimated_turn_cost_usd), RejectReason, Slot, apply, Filtered, HealthCache
 %%   src/runner/persona.rs — profile_task (classification reprise) ; src/neurons/intent.rs — IntentDetector (mots-clés FR/EN)
 %%   « aucun appelant » : grep -rn "load_routing\|RoutingSettings" src --include='*.rs' → cognitive/**, routing_handlers.rs, chat_handlers.rs, listing.rs seulement
 %% ---
 %% NON ETABLI :
-%%   rien n'est appliqué : scorer, décisions, feedback et rapport sont les tranches suivantes (B-R4, B-R5…) ; signature.rs et candidats.rs n'ont AUCUN appelant de production (grep -rn "TaskSignature\|cognitive::candidates" src --include='*.rs' → cognitive/** seulement) ;
-%%   ModelFacts::from_capabilities n'est pas branché au listing ni aux prix nexus (B-R4) ; la santé n'est pas sondée : HealthCache attend une sonde injectée ; la fenêtre de contexte d'un modèle d'instance enregistrée dépend de la sonde (inconnue = rejetée) ;
+%%   le décideur n'est construit par AUCUN code de production : ChatManager::with_cognitive_routing existe, rien ne l'appelle hors tests (branchement du démarrage = tranche suivante) ; sans lui, comportement d'avant à l'identique ;
+%%   le Cypher RoutingArm / RoutingDecision n'a PAS tourné en local (pas de Neo4j) : seul le CI le joue ; le mock enveloppe InMemoryRoutingStore ;
+%%   le feedback (close_decision) n'est appelé par aucun chemin de fin de travail ici ; la rétrogradation automatique et le rapport sont B-R5 ;
+%%   la santé est sondée par provider.health() (cache 60 s), jamais contre une vraie instance distante ; le catalogue d'un provider est limité à 2 s ; la fenêtre de contexte d'un modèle d'instance enregistrée dépend de la sonde (inconnue = rejetée) ;
 %%   `primary` du réglage n'est pas croisé avec les instances existantes (validation de forme seulement : provider non vide, modèle OU alias) ;
 %%   le Cypher LlmSetting n'a tourné que contre le Neo4j jetable de tests/harness_neo4j.rs.
 %% ---
@@ -65,7 +71,7 @@ flowchart TD
     CONTRACT["✅ docs/api/chat-contract/provider-additions.json : routed_by + « auto », ChatSession.routing_mode, ChatSession.route_reason, ProvidersResponse.routing, rest_settings.routing<br/>test : the_provider_additions_contract_lists_every_routed_by_level_and_the_routing_fields"]
     LISTING -.-> CONTRACT
 
-    NOOP["🟠 PAS APPLIQUÉ : aucun chemin de resolve ne lit ces réglages ; RoutedBy::Auto et ProviderChoice.reason existent (po-chat-provider) sans producteur ;<br/>primary + shadow = identité : agent_e2e_tests inchangée. Tranches suivantes : signature, candidats, scorer, décisions, feedback, rapport (B-R2…)"]
+    NOOP["✅ resolve_provider_choice lit ces réglages SEULEMENT quand un décideur est branché (with_cognitive_routing) ; sans lui, ou en primary, rien ne change : RoutedBy::Auto n'est produit qu'en mixed/full aux stages advisory/auto<br/>test : primary_changes_nothing_at_any_stage_for_anyone"]
     LOAD -.-> NOOP
 
     subgraph sig["cognitive/signature.rs — ce que la requête demande"]
@@ -89,8 +95,49 @@ flowchart TD
         FILTER --> EST
     end
     SIG --> FILTER
-    FACTSGAP["🟠 ModelFacts::from_capabilities existe mais le listing et les prix nexus ne l'appellent pas encore : branchement dans resolve_provider_choice (B-R4)"]
+    FACTSGAP["✅ ModelFacts::from_capabilities est appelée par ChatManager::routing_pool (capacités et prix de nexus) ; le listing HTTP ne l'appelle toujours pas"]
     FILTER -.-> FACTSGAP
+
+    subgraph scorer["cognitive/scorer.rs — noter les candidats (pur, rejouable)"]
+        SDRAW["✅ un tirage Thompson Beta(alpha, beta) par bras, échantillonneur Marsaglia-Tsang à graine (splitmix64), seed = hash(decision id) : même graine = mêmes scores, ordre d'entrée sans effet ; graines distinctes = tirages distincts ; moyenne du tirage = alpha/(alpha+beta)<br/>test : a_seed_gives_the_same_scores_and_other_seeds_differ, the_beta_draw_stays_in_range_and_follows_its_mean"]
+        SUTIL["✅ utilité = tirage − cost_weight × coût normalisé − latency_weight × latence normalisée ; coût = moyenne connue du bras, sinon estimation du tour, sinon médiane des connus, ÷ le max des candidats, 0 si rien n'est connu<br/>test : utility_is_the_draw_minus_the_weighted_normalised_cost_and_latency, an_unknown_cost_takes_the_median_and_none_known_means_no_penalty, a_stored_arm_cost_wins_over_the_estimate"]
+        SPRIOR["✅ alias déclaratifs = PRIOR d'un bras neuf seulement : deep +1 alpha sur complex/creative/retry, fast +1 alpha sur simple/chat.general ; un bras stocké ignore l'alias ; jamais une règle<br/>test : the_alias_is_a_prior_on_a_fresh_arm_only_and_evidence_overrides_it, arms_of_another_class_do_not_count"]
+        SEXP["✅ exploration epsilon-greedy bornée par 0,25 (clamp même si les réglages disent plus), 0 = jamais, un seul candidat = rien à explorer, l'exploré passe en tête et porte explored<br/>test : exploration_never_fires_at_zero_and_is_bounded_by_the_hard_cap"]
+        SDRAW --> SUTIL
+        SPRIOR --> SUTIL
+        SUTIL --> SEXP
+    end
+    FILTER --> SDRAW
+
+    subgraph decider["cognitive/decider.rs — décider et persister"]
+        DAPPLY["✅ applied = f(mode, stage, rôle) : shadow → jamais ; primary → jamais ; mixed → exécutants ; full → tous ; advisory → exécutants seulement (le pilote est conseillé, pas appliqué)<br/>test : applied_follows_the_mode_stage_and_role_table (9 lignes × pilote/exécutant)"]
+        DPERSIST["✅ la décision est écrite (put_decision) AVANT d'être rendue, appliquée ou non ; slot explicite = chosen None, non appliquée, raison « explicit… » ; aucun éligible = chosen None, raison no_candidate, rejets listés<br/>test : every_decision_is_persisted_before_it_is_returned, an_explicit_slot_is_returned_unapplied_without_a_choice, nothing_eligible_is_no_candidate_with_the_rejections_listed"]
+        DHYST["✅ hystérésis : le couple en cours reste sauf si le challenger le bat d'au moins 0,1 ; un couple courant inéligible n'est pas gardé<br/>test : hysteresis_keeps_the_current_pair_unless_a_challenger_clears_the_margin"]
+        DREPLAY["✅ rejouable : mêmes (id, bras, pool) = même décision (decide_with est pur) ; alternatives du meilleur au pire puis les rejetés avec leur RejectReason<br/>test : the_same_id_arms_and_pool_give_the_same_decision, a_learnt_arm_beats_a_dear_one_and_the_alternatives_are_best_first, the_candidates_can_be_restricted_to_one_instance"]
+        DREASON["✅ raison = une phrase lisible : classe, fenêtre vs besoin, coût estimé, taux de réussite observé avec n ; sans URL ni secret<br/>test : the_reason_is_one_readable_sentence_without_url_or_secret"]
+        DAPPLY --> DPERSIST
+        DHYST --> DPERSIST
+        DREPLAY --> DPERSIST
+        DREASON --> DPERSIST
+    end
+    SEXP --> DAPPLY
+
+    subgraph arms["neo4j/routing.rs — le magasin"]
+        NSTORE["✅ Neo4jRoutingStore : RoutingArmStore sur Arc&lt;dyn GraphStore&gt; ; mock = InMemoryRoutingStore enveloppé<br/>test : the_adapter_reads_and_writes_arms_and_decisions_through_the_graph, a_stamp_orders_like_time_and_a_decision_round_trips_through_json"]
+        NCYPHER["🟠 (:RoutingArm {class, provider_id, model, alpha, beta, n, cost_sum_usd, cost_n, latency_sum_ms, latency_n, updated_at}) — observe en UN MERGE atomique (contrainte d'unicité du triplet) ; (:RoutingDecision {id, at, json, project_slug, session_id, task_id, run_id}) + ROUTED_FOR vers ChatSession/Task/PlanRun au mieux ; index project, session, task, run, at<br/>écrit, jamais exécuté contre Neo4j ici : le CI seul le joue"]
+        NSTORE -.-> NCYPHER
+    end
+    DPERSIST --> NSTORE
+
+    subgraph branch["chat/manager.rs — le branchement"]
+        BPOOL["✅ pool = claude-code + instances enregistrées non distantes : catalogue du provider (2 s max), capacités par modèle (ModelFacts::from_capabilities), prix nexus ModelInfo.pricing, santé via HealthCache + provider.health(), consentement du StoreCatalog ; moteur legacy = claude-code seul<br/>test : mixed_routes_an_executor_by_auto_and_leaves_the_pilot_on_the_primary (le pool est celui du fake_openai)"]
+        BAPPLY["✅ décision appliquée : le couple remplit input.project_rule (sous requête/tâche/persona/run, au-dessus de la règle globale) → routed_by = auto, route_rule = auto:&lt;classe&gt;, reason ; non appliquée : choice.shadow = le couple, tout le reste IDENTIQUE ; aucun décideur = comportement d'avant<br/>test : primary_changes_nothing_at_any_stage_for_anyone (rouge si applied est forcé : mutation jouée), mixed_routes_an_executor_by_auto_and_leaves_the_pilot_on_the_primary, full_routes_the_pilot_too, the_shadow_stage_applies_nothing_in_any_mode, the_advisory_stage_applies_to_executors_only"]
+        BEXPL["✅ un provider, modèle, alias ou run nommé par l'appelant n'est jamais substitué (Slot::Explicit) ; la décision est tout de même écrite ; sans candidat, la chaîne déclarative est inchangée et la décision dit no_candidate<br/>test : a_choice_the_caller_named_is_never_substituted, without_a_candidate_the_declared_rules_apply_and_the_decision_says_so"]
+        BPOOL --> BAPPLY
+        BAPPLY --> BEXPL
+    end
+    DPERSIST --> BPOOL
+    NOOP -.-> BAPPLY
 
     subgraph feedback["cognitive/feedback.rs — retour d'expérience (B-R5)"]
         REWARD["✅ reward(outcome, settings) ∈ [0,1] = reward_with(.., RewardContext{class_median_cost}) : succès 0,5 (échec 0, inconnu 0,25) ; +0,2 si réussi du premier coup ; −0,1 par tentative en plus ; vérification ±0,15 ;<br/>coût ≤ médiane +0,15, dégressif jusqu'à 0 à 3× la médiane, inconnu = 0 (jamais « gratuit») ; durée inconnue = 0 ; override manuel −0,3 ; interruption −0,2 ; borné [0,1]<br/>test : the_reward_of_each_case, more_attempts_never_raise_the_reward, a_costlier_run_never_earns_more_and_bad_medians_are_ignored"]
@@ -118,3 +165,27 @@ flowchart TD
         SHOULD --> APPLY
     end
     CLOSE --> SHOULD
+
+    subgraph callers["runner/routing.rs — qui décide avant d'ouvrir une session, qui ferme la décision (B-R7)"]
+        HANDLE["✅ RoutingHandle {decider: Arc&lt;dyn Decider&gt;, store: Arc&lt;dyn RoutingArmStore&gt;, pool} ; installé au démarrage (routing::install), None = rien décidé, rien enregistré (comportement d'avant) ; une panne de décision est journalisée et le travail part non routé<br/>test : runner sans handle = suite runner inchangée, an_unapplied_decision_changes_nothing_on_the_request_but_its_id"]
+        RUNDEC["✅ PlanRunner::execute_task : TaskSignature::from_task(tâche, étapes, tentative réelle, projet, budget marginal restant) AVANT la ChatRequest ; slot Explicit si alias de tâche, run provider/model ou persona, sinon Automatic ; la ChatRequest ne reçoit que routing_decision_id (provider/model intacts : le resolver B-R4 en fait le slot project_rule)<br/>test : mixed_two_tasks_of_different_classes_give_two_decisions_carried_on_request_and_record, an_explicit_alias_makes_the_slot_explicit_and_model_requested_follows_the_resolver"]
+        RUNREC["✅ AgentExecution.routing_decision_id (additif, absent = None) ; task_class = retry dès la tentative 2 (sinon la complexité : vocabulaire existant) ; model_requested = le modèle nommé, sinon celui que le resolver a choisi (lu sur la session)<br/>test : a_retry_attempt_records_task_class_retry_and_is_decided_as_a_retry (rouge sans le changement), test_routing_decision_id_is_written_at_launch_and_only_when_set, test_agent_execution_legacy_json_reads_with_defaults"]
+        RUNCLOSE["✅ close_attempt → feedback::close_decision(Outcome {success = Completed, attempts, coût MARGINAL seulement (base reported/priced ; base inconnue = None), durée, interrupted, vérification}) ; idempotent par décision<br/>test : closing_an_attempt_feeds_the_chosen_arm_once_with_the_marginal_cost_only, unknown_or_non_marginal_cost_is_none, verification_shapes"]
+        DELEG["✅ delegate_task : TaskSignature::from_delegation (classe énoncée, sinon la tâche) ; passe enfin l'alias du modèle de la tâche (task_alias était None) ; Explicit si provider/model/alias/persona ; fermeture à l'événement Result de la session<br/>test : a_delegation_passes_the_alias_set_on_its_task, a_routed_delegation_carries_the_decision_id_and_nothing_else_changes"]
+        UTIL["✅ propose_feature_graphs_with_llm : TaskSignature::utility(UtilityFeatureGraph) ; FEATURE_GRAPH_MODEL posé = slot Explicit (gagne, jamais filtré) ; sinon la décision appliquée sur claude-code nomme le modèle, sinon le défaut ; décision fermée avec l'issue de l'appel<br/>test : feature_graph_model_from_the_environment_is_explicit_and_wins, without_a_configured_model_an_applied_decision_names_the_model"]
+        HANDLE --> RUNDEC
+        RUNDEC --> RUNREC
+        RUNREC --> RUNCLOSE
+        HANDLE --> DELEG
+        HANDLE --> UTIL
+    end
+    FILTER -.-> HANDLE
+    CALLGAP["🟠 PAS BRANCHÉ : personne n'appelle routing::install tant que CognitiveDecider (B-R4) n'existe pas ; le résumé de compaction est fait par le CLI dans manager.rs (hors de ces fichiers) : TaskSignature::utility(UtilityCompaction) est prêt, l'appel reste à poser ; le runner lancé par lib.rs (reprise) n'a pas encore with_routing"]
+    HANDLE -.-> CALLGAP
+
+    subgraph perturn["Par tour (B-R6) — GraphSessionHooks::before_turn, voir po-chat-agent-runtime"]
+        TURN["✅ mode full + étape auto + set_model_live : le décideur (Arc&lt;dyn Decider&gt;) reçoit DecideRequest {signature du dernier message, pool du SEUL provider de la session, restrict_provider, current, turn_index, session_id} ; directive = modèle choisi si appliquée et différente ; un changement par tour, pas deux tours de suite (le tour suivant est décidé en shadow donc enregistré non appliqué) ; erreur / 2 s = aucun changement<br/>test : chat::agent_e2e_tests::turn_routing (décideur FAUX)"]
+        TURNGAP["🟠 le décideur réel (CognitiveDecider) et la source de pool réelle ne sont pas branchés : ChatManager::with_turn_decider est sans appelant"]
+        TURN -.-> TURNGAP
+    end
+    FACTSGAP -.-> TURN
