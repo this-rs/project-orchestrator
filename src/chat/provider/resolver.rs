@@ -125,6 +125,10 @@ pub struct ProviderChoice {
     /// every other level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The cognitive decision taken for this choice, when the router was asked.
+    /// Never serialized: it is how the manager closes the decision later.
+    #[serde(skip)]
+    pub decision_id: Option<uuid::Uuid>,
 }
 
 /// A provider (and optional model) proposed by one precedence level.
@@ -322,6 +326,7 @@ pub fn resolve(
             shadow: None,
             fallback_reason: None,
             reason: None,
+            decision_id: None,
         });
     }
 
@@ -362,6 +367,7 @@ pub fn resolve(
                     shadow: None,
                     fallback_reason: first_skip.as_ref().map(|e| e.code().to_string()),
                     reason: None,
+                    decision_id: None,
                 });
             }
             Err(error) => {
@@ -399,6 +405,7 @@ pub fn resolve(
             shadow: None,
             fallback_reason: first_skip.as_ref().map(|e| e.code().to_string()),
             reason: None,
+            decision_id: None,
         });
     }
     match first_skip {

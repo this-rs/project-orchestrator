@@ -269,6 +269,9 @@ pub struct CognitiveRouting {
     /// Models whose capability probe was attempted, and when: a probe that fails
     /// is not replayed on every decision.
     pub probed: Arc<std::sync::Mutex<ProbeLog>>,
+    /// Where decisions and arms live, when the standard wiring built this; it is
+    /// how a session's decision is linked and closed. `None` for a test decider.
+    pub store: Option<Arc<dyn RoutingArmStore>>,
 }
 
 impl CognitiveRouting {
@@ -276,10 +279,14 @@ impl CognitiveRouting {
     pub fn new(store: Arc<dyn RoutingArmStore>) -> Self {
         let hints = Arc::new(RwLock::new(PriorHints::new()));
         Self {
-            decider: Arc::new(CognitiveDecider::with_hints(store, Arc::clone(&hints))),
+            decider: Arc::new(CognitiveDecider::with_hints(
+                Arc::clone(&store),
+                Arc::clone(&hints),
+            )),
             hints,
             health: Arc::new(candidates::HealthCache::standard()),
             probed: Default::default(),
+            store: Some(store),
         }
     }
 
@@ -290,6 +297,7 @@ impl CognitiveRouting {
             hints: Arc::new(RwLock::new(PriorHints::new())),
             health: Arc::new(candidates::HealthCache::standard()),
             probed: Default::default(),
+            store: None,
         }
     }
 
