@@ -1598,8 +1598,14 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             cm = cm.with_reasoning_engine(re.clone());
         }
         let cm = Arc::new(cm);
-        if std::env::var("PO_COGNITIVE_ROUTING").is_ok_and(|v| v == "1") {
-            chat::routing_wiring::wire_learning(&cm);
+        // The learning side: the per-turn router, the runner's routing handle, and the
+        // store the routing routes (settings, decisions, shadow report) read.
+        chat::provider::cognitive::wiring::wire_learning(&cm);
+        if let Some(store) = cm
+            .cognitive_routing()
+            .and_then(|routing| routing.store.clone())
+        {
+            api::routing_handlers::set_routing_store(Some(store));
         }
         cm.start_cleanup_task();
         tracing::info!("Chat manager initialized");

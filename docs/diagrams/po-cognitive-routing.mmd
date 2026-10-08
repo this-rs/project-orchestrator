@@ -180,12 +180,12 @@ flowchart TD
         HANDLE --> UTIL
     end
     FILTER -.-> HANDLE
-    CALLGAP["🟠 PAS BRANCHÉ : personne n'appelle routing::install tant que CognitiveDecider (B-R4) n'existe pas ; le résumé de compaction est fait par le CLI dans manager.rs (hors de ces fichiers) : TaskSignature::utility(UtilityCompaction) est prêt, l'appel reste à poser ; le runner lancé par lib.rs (reprise) n'a pas encore with_routing"]
+    CALLGAP["✅ branché au démarrage par wire_learning (chat/provider/cognitive/wiring.rs) : routing::install reçoit un RoutingHandle sur le décideur du gestionnaire et ManagerPool (Weak&lt;ChatManager&gt;, le pool de routing_pool_for) ; test : wire_learning_gives_the_per_turn_router_and_the_runner_a_handle (mutation jouée : sans install, rouge)<br/>🟠 le résumé de compaction est fait par le CLI dans manager.rs (hors de ces fichiers) : TaskSignature::utility(UtilityCompaction) est prêt, l'appel reste à poser ; le runner lancé par lib.rs (reprise) n'a pas encore with_routing"]
     HANDLE -.-> CALLGAP
 
     subgraph perturn["Par tour (B-R6) — GraphSessionHooks::before_turn, voir po-chat-agent-runtime"]
         TURN["✅ mode full + étape auto + set_model_live : le décideur (Arc&lt;dyn Decider&gt;) reçoit DecideRequest {signature du dernier message, pool du SEUL provider de la session, restrict_provider, current, turn_index, session_id} ; directive = modèle choisi si appliquée et différente ; un changement par tour, pas deux tours de suite (le tour suivant est décidé en shadow donc enregistré non appliqué) ; erreur / 2 s = aucun changement<br/>test : chat::agent_e2e_tests::turn_routing (décideur FAUX)"]
-        TURNGAP["🟠 le décideur réel (CognitiveDecider) et la source de pool réelle ne sont pas branchés : ChatManager::with_turn_decider est sans appelant"]
+        TURNGAP["✅ wire_learning configure TurnRouting avec le décideur réel et ManagerPool (pool restreint au provider de la session) ; test : le même<br/>🟠 with_turn_decider reste un point d entrée de test ; le mode full par tour n a jamais tourné contre un vrai modèle"]
         TURN -.-> TURNGAP
     end
     FACTSGAP -.-> TURN

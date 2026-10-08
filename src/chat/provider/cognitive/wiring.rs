@@ -6,9 +6,9 @@ use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 
-use super::agent_hooks::PoolSource;
-use super::manager::ChatManager;
-use super::provider::cognitive::candidates::ModelFacts;
+use super::candidates::ModelFacts;
+use crate::chat::agent_hooks::PoolSource;
+use crate::chat::manager::ChatManager;
 use crate::runner::routing::{RoutingHandle, RoutingPool};
 
 /// The routing pool of a chat manager, held weakly (the manager owns the

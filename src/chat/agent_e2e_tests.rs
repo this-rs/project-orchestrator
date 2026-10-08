@@ -1220,7 +1220,7 @@ mod cognitive_routing {
         assert!(crate::runner::routing::installed().is_none());
         assert!(manager.turn_routing.configured().is_none());
 
-        crate::chat::routing_wiring::wire_learning(&manager);
+        crate::chat::provider::cognitive::wiring::wire_learning(&manager);
         assert!(manager.turn_routing.configured().is_some());
         let handle = crate::runner::routing::installed().expect("installed");
         let pool = handle.pool.facts(Some("proj")).await;
