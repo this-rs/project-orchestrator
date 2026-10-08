@@ -252,29 +252,42 @@ pub async fn get_report(
     Query(query): Query<ReportQuery>,
 ) -> Result<Json<RoutingReport>, AppError> {
     require_human_reader(&state, &claims)?;
-    let report = match routing_store() {
-        Some(store) => {
-            let prices = PoolPrices(match &state.chat_manager {
-                Some(manager) => {
-                    manager
-                        .routing_pool_for(query.project_slug.as_deref())
-                        .await
-                }
-                None => Vec::new(),
-            });
-            build_report_with(
-                store.as_ref(),
-                &prices,
-                query.project_slug.as_deref(),
-                query.from,
-                query.to,
-            )
-            .await
-            .map_err(AppError::Internal)?
-        }
-        None => cognitive::report::summarise(&[], &cognitive::report::NoPrices),
+    report_from(routing_store(), state.chat_manager.as_ref(), &query)
+        .await
+        .map(Json)
+}
+
+/// The report for a store and the chat manager whose pool prices it. The store is an
+/// argument, not read from the process-wide slot, so a test can drive it without
+/// racing the tests that expect the slot empty.
+async fn report_from(
+    store: Option<Arc<dyn RoutingArmStore>>,
+    chat_manager: Option<&Arc<crate::chat::ChatManager>>,
+    query: &ReportQuery,
+) -> Result<RoutingReport, AppError> {
+    let Some(store) = store else {
+        return Ok(cognitive::report::summarise(
+            &[],
+            &cognitive::report::NoPrices,
+        ));
     };
-    Ok(Json(report))
+    let prices = PoolPrices(match chat_manager {
+        Some(manager) => {
+            manager
+                .routing_pool_for(query.project_slug.as_deref())
+                .await
+        }
+        None => Vec::new(),
+    });
+    build_report_with(
+        store.as_ref(),
+        &prices,
+        query.project_slug.as_deref(),
+        query.from,
+        query.to,
+    )
+    .await
+    .map_err(AppError::Internal)
 }
 
 /// Prices read from the candidates the router sees now: the nexus catalogue of each
@@ -687,6 +700,92 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page["limit"], 200, "the page size is bounded");
+    }
+
+    /// A chat manager with no cognitive router wired: its pool is empty.
+    fn bare_manager() -> Arc<crate::chat::ChatManager> {
+        let state = mock_app_state();
+        Arc::new(crate::chat::ChatManager::new_without_memory(
+            state.neo4j,
+            state.meili,
+            crate::chat::config::ChatConfig::default(),
+        ))
+    }
+
+    async fn stored_decision(
+        store: &crate::chat::provider::cognitive::store::InMemoryRoutingStore,
+        project: &str,
+    ) {
+        use crate::chat::provider::cognitive::decision::{CognitiveDecision, Pick};
+        use crate::chat::provider::cognitive::mode::{LearningStage, ProviderRoutingMode};
+        use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
+        use crate::chat::provider::cognitive::store::RoutingArmStore;
+
+        store
+            .put_decision(&CognitiveDecision {
+                id: Uuid::new_v4(),
+                at: chrono::Utc::now(),
+                signature: TaskSignature::utility(TaskClass::Simple, 9_000, Some(project)),
+                chosen: Some(Pick::new("prov", "model")),
+                score: Some(0.5),
+                explored: false,
+                reason: "r".into(),
+                alternatives: vec![],
+                applied: false,
+                mode: ProviderRoutingMode::Mixed,
+                stage: LearningStage::Shadow,
+                session_id: None,
+                task_id: None,
+                run_id: None,
+                turn_index: None,
+                outcome: None,
+                used: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_report_reads_the_store_it_is_given_and_prices_from_the_manager_pool() {
+        use crate::chat::provider::cognitive::store::{InMemoryRoutingStore, RoutingArmStore};
+
+        let store = Arc::new(InMemoryRoutingStore::new());
+        stored_decision(&store, "p").await;
+        stored_decision(&store, "q").await;
+        let shared: Arc<dyn RoutingArmStore> = store;
+        let query = |project: Option<&str>| super::ReportQuery {
+            project_slug: project.map(str::to_owned),
+            from: None,
+            to: None,
+        };
+
+        // With a manager: the pool prices the report. No router is wired, so the pool
+        // is empty and nothing is priced: the estimate stays absent, never zero.
+        let manager = bare_manager();
+        let all = super::report_from(Some(shared.clone()), Some(&manager), &query(None))
+            .await
+            .unwrap();
+        assert_eq!(all.decisions, 2);
+        assert!(
+            all.estimated_cost_delta_usd.is_none(),
+            "no price, no estimate"
+        );
+        let one = super::report_from(Some(shared.clone()), Some(&manager), &query(Some("p")))
+            .await
+            .unwrap();
+        assert_eq!(one.decisions, 1, "the project filter reaches the store");
+
+        // Without a manager the report is the same: the prices are just empty.
+        let bare = super::report_from(Some(shared), None, &query(None))
+            .await
+            .unwrap();
+        assert_eq!(bare.decisions, 2);
+
+        // Without a store: an empty report, whatever the manager.
+        let empty = super::report_from(None, Some(&manager), &query(None))
+            .await
+            .unwrap();
+        assert_eq!(empty.decisions, 0);
     }
 
     #[test]

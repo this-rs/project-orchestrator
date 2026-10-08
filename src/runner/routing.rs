@@ -317,6 +317,28 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn the_chat_pool_is_the_managers_pool_and_empty_when_no_router_is_wired() {
+        let state = crate::test_helpers::mock_app_state();
+        let manager = Arc::new(crate::chat::ChatManager::new_without_memory(
+            state.neo4j,
+            state.meili,
+            crate::chat::config::ChatConfig::default(),
+        ));
+        let pool = ChatRoutingPool {
+            manager: Arc::clone(&manager),
+        };
+        // The runner asks the pool exactly what the chat does: same answer, whatever
+        // the project, and an empty one (not a panic) without a cognitive router.
+        for project in [None, Some("nexus")] {
+            assert_eq!(
+                pool.facts(project).await.len(),
+                manager.routing_pool_for(project).await.len()
+            );
+            assert!(pool.facts(project).await.is_empty());
+        }
+    }
+
     #[test]
     fn verification_shapes() {
         assert_eq!(verification_passed(None), None);
