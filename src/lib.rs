@@ -1586,6 +1586,18 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             cm = cm.with_trajectory_collector(tc.clone());
         }
         cm = cm.with_nn_router(neural_router.clone(), config.neural_routing.enabled);
+        // Cognitive model routing is opt-in while it is being proven: the router is
+        // wired only when PO_COGNITIVE_ROUTING=1. Without it, nothing is decided and
+        // no decision is written, exactly as before.
+        if std::env::var("PO_COGNITIVE_ROUTING").is_ok_and(|v| v == "1") {
+            let arms: Arc<dyn crate::chat::provider::cognitive::store::RoutingArmStore> =
+                Arc::new(crate::neo4j::routing::Neo4jRoutingStore::new(orchestrator.neo4j_arc()));
+            crate::api::routing_handlers::set_routing_store(Some(arms.clone()));
+            cm = cm.with_cognitive_routing(
+                crate::chat::provider::cognitive::decider::CognitiveRouting::new(arms),
+            );
+            tracing::info!("Cognitive routing wired (PO_COGNITIVE_ROUTING=1)");
+        }
         if let Some(re) = orchestrator.reasoning_engine() {
             cm = cm.with_reasoning_engine(re.clone());
         }
