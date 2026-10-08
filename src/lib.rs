@@ -1590,8 +1590,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         // wired only when PO_COGNITIVE_ROUTING=1. Without it, nothing is decided and
         // no decision is written, exactly as before.
         if std::env::var("PO_COGNITIVE_ROUTING").is_ok_and(|v| v == "1") {
-            let arms: Arc<dyn crate::chat::provider::cognitive::store::RoutingArmStore> =
-                Arc::new(crate::neo4j::routing::Neo4jRoutingStore::new(orchestrator.neo4j_arc()));
+            let arms: Arc<dyn crate::chat::provider::cognitive::store::RoutingArmStore> = Arc::new(
+                crate::neo4j::routing::Neo4jRoutingStore::new(orchestrator.neo4j_arc()),
+            );
             crate::api::routing_handlers::set_routing_store(Some(arms.clone()));
             cm = cm.with_cognitive_routing(
                 crate::chat::provider::cognitive::decider::CognitiveRouting::new(arms),
