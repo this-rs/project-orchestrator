@@ -931,3 +931,247 @@ fn only_a_remote_machine_that_does_not_allow_it_holds_trust_back() {
         );
     }
 }
+
+// ── Cognitive routing (R2, B-R4) ────────────────────────────────────────────
+//
+// `resolve_provider_choice` with the cognitive router wired, against a stored
+// instance served by `fake_openai`. The built-in Claude Code is hidden from the
+// provider source so the pool holds exactly one pair (`local`/`m`) and the
+// choice does not depend on what is installed on the machine.
+
+mod cognitive_routing {
+    use super::*;
+    use crate::chat::agent_runtime::ProviderSource;
+    use crate::chat::provider::cognitive::decider::CognitiveRouting;
+    use crate::chat::provider::cognitive::store::{DecisionFilter, RoutingArmStore};
+    use crate::chat::provider::resolver::{ProviderChoice, RoutedBy};
+    use crate::neo4j::routing::Neo4jRoutingStore;
+
+    struct NoBuiltin;
+
+    impl ProviderSource for NoBuiltin {
+        fn get(&self, _provider_id: &str) -> Option<Arc<dyn nexus_claude::agent::AgentProvider>> {
+            None
+        }
+    }
+
+    struct Setup {
+        _fake: FakeOpenAi,
+        graph: Arc<MockGraphStore>,
+        manager: ChatManager,
+    }
+
+    async fn setup(mode: &str, stage: &str, wired: bool) -> Setup {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        graph
+            .put_llm_setting(
+                GLOBAL,
+                "routing",
+                &json!({"mode": mode, "stage": stage, "exploration_epsilon": 0.0}).to_string(),
+            )
+            .await
+            .unwrap();
+        let mut manager = manager(graph.clone(), true).with_provider_source(Arc::new(NoBuiltin));
+        // The router only trusts what an instance is KNOWN to do: a provider that
+        // was never probed reports no tools and an unknown window. Opening one
+        // session on the instance probes it and keeps the probe in the cache.
+        let warm = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("warm-up failed: {e:#}"));
+        let mut rx = manager.subscribe(&warm.session_id).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        if wired {
+            let store = Arc::new(Neo4jRoutingStore::new(graph.clone()));
+            manager = manager.with_cognitive_routing(CognitiveRouting::new(store));
+        }
+        Setup {
+            _fake: fake,
+            graph,
+            manager,
+        }
+    }
+
+    fn executor_request() -> ChatRequest {
+        let mut r = request(None, Some("proj"), "default");
+        r.spawned_by = Some("{}".into());
+        r.task_class = Some("simple".into());
+        r
+    }
+
+    fn pilot_request() -> ChatRequest {
+        request(None, Some("proj"), "default")
+    }
+
+    async fn choose(s: &Setup, r: &ChatRequest) -> ProviderChoice {
+        s.manager
+            .resolve_provider_choice(r, Some("proj"))
+            .await
+            .unwrap_or_else(|e| panic!("resolve failed: {e:#}"))
+    }
+
+    async fn decisions(
+        s: &Setup,
+    ) -> Vec<crate::chat::provider::cognitive::decision::CognitiveDecision> {
+        Neo4jRoutingStore::new(s.graph.clone())
+            .decisions(&DecisionFilter::default())
+            .await
+            .unwrap()
+    }
+
+    /// What the choice is, without the recorded shadow.
+    fn essence(c: &ProviderChoice) -> (String, Option<String>, RoutedBy, Option<String>) {
+        (
+            c.provider_id.clone(),
+            c.model.clone(),
+            c.routed_by,
+            c.route_rule.clone(),
+        )
+    }
+
+    #[tokio::test]
+    async fn primary_changes_nothing_at_any_stage_for_anyone() {
+        for stage in ["shadow", "advisory", "auto"] {
+            let with = setup("primary", stage, true).await;
+            let without = setup("primary", stage, false).await;
+            let sent_after_warm_up = with._fake.chat_requests().len();
+            for r in [pilot_request(), executor_request()] {
+                let a = choose(&with, &r).await;
+                let b = choose(&without, &r).await;
+                assert_eq!(essence(&a), essence(&b), "primary/{stage}");
+                assert_ne!(a.routed_by, RoutedBy::Auto);
+                assert!(a.reason.is_none());
+            }
+            // Nothing was sent to the instance beyond the warm-up session.
+            assert_eq!(with._fake.chat_requests().len(), sent_after_warm_up);
+            // Every decision was stored, none applied, and the pick is only recorded.
+            let all = decisions(&with).await;
+            assert_eq!(all.len(), 2, "primary/{stage}");
+            assert!(all.iter().all(|d| !d.applied && d.chosen.is_some()));
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_routes_an_executor_by_auto_and_leaves_the_pilot_on_the_primary() {
+        let s = setup("mixed", "auto", true).await;
+        let executor = choose(&s, &executor_request()).await;
+        assert_eq!(executor.provider_id, "local");
+        assert_eq!(executor.model.as_deref(), Some("m"));
+        assert_eq!(executor.routed_by, RoutedBy::Auto);
+        assert_eq!(executor.route_rule.as_deref(), Some("auto:simple"));
+        assert!(executor
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("local/m")));
+
+        let pilot = choose(&s, &pilot_request()).await;
+        assert_eq!(
+            pilot.provider_id, "claude-code",
+            "the pilot keeps the primary"
+        );
+        assert_ne!(pilot.routed_by, RoutedBy::Auto);
+        assert_eq!(
+            pilot.shadow.as_ref().map(|p| p.0.as_str()),
+            Some("local"),
+            "what the router would have chosen is recorded"
+        );
+        let all = decisions(&s).await;
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.iter().filter(|d| d.applied).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn full_routes_the_pilot_too() {
+        let s = setup("full", "auto", true).await;
+        let pilot = choose(&s, &pilot_request()).await;
+        assert_eq!(pilot.provider_id, "local");
+        assert_eq!(pilot.routed_by, RoutedBy::Auto);
+        assert!(pilot
+            .route_rule
+            .as_deref()
+            .is_some_and(|r| r.starts_with("auto:chat")));
+        let executor = choose(&s, &executor_request()).await;
+        assert_eq!(executor.routed_by, RoutedBy::Auto);
+        assert!(decisions(&s).await.iter().all(|d| d.applied));
+    }
+
+    #[tokio::test]
+    async fn the_shadow_stage_applies_nothing_in_any_mode() {
+        for mode in ["primary", "mixed", "full"] {
+            let s = setup(mode, "shadow", true).await;
+            for r in [pilot_request(), executor_request()] {
+                let c = choose(&s, &r).await;
+                assert_eq!(c.provider_id, "claude-code", "{mode}/shadow");
+                assert_ne!(c.routed_by, RoutedBy::Auto);
+            }
+            let all = decisions(&s).await;
+            assert_eq!(all.len(), 2);
+            assert!(all.iter().all(|d| !d.applied), "{mode}/shadow");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_advisory_stage_applies_to_executors_only() {
+        let s = setup("full", "advisory", true).await;
+        assert_eq!(
+            choose(&s, &executor_request()).await.routed_by,
+            RoutedBy::Auto
+        );
+        assert_ne!(choose(&s, &pilot_request()).await.routed_by, RoutedBy::Auto);
+    }
+
+    #[tokio::test]
+    async fn a_choice_the_caller_named_is_never_substituted() {
+        let s = setup("full", "auto", true).await;
+        let mut explicit_provider = pilot_request();
+        explicit_provider.provider = Some("claude-code".into());
+        let mut explicit_model = executor_request();
+        explicit_model.model = Some("some-model".into());
+        let mut alias = executor_request();
+        alias.task_alias = Some("fast".into());
+        let mut run = executor_request();
+        run.run_provider = Some("claude-code".into());
+        for r in [explicit_provider, explicit_model, run] {
+            let c = choose(&s, &r).await;
+            assert_eq!(c.provider_id, "claude-code");
+            assert_ne!(c.routed_by, RoutedBy::Auto);
+        }
+        // An alias that is not defined is the caller's problem, not a reason to route.
+        assert!(s
+            .manager
+            .resolve_provider_choice(&alias, Some("proj"))
+            .await
+            .map(|c| c.routed_by != RoutedBy::Auto)
+            .unwrap_or(true));
+        let all = decisions(&s).await;
+        assert_eq!(all.len(), 4, "persisted in every case");
+        assert!(all.iter().all(|d| !d.applied && d.chosen.is_none()));
+        assert!(all.iter().all(|d| d.reason.contains("explicit")));
+    }
+
+    #[tokio::test]
+    async fn without_a_candidate_the_declared_rules_apply_and_the_decision_says_so() {
+        let s = setup("full", "auto", true).await;
+        // The project withdraws its consent: nothing is eligible.
+        s.graph
+            .delete_llm_setting("project:proj", "consent:local")
+            .await
+            .ok();
+        for (key, _) in s.graph.list_llm_settings("project:proj", "").await.unwrap() {
+            s.graph
+                .delete_llm_setting("project:proj", &key)
+                .await
+                .unwrap();
+        }
+        let c = choose(&s, &pilot_request()).await;
+        assert_eq!(c.provider_id, "claude-code");
+        assert_ne!(c.routed_by, RoutedBy::Auto);
+        let all = decisions(&s).await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].reason, "no_candidate");
+        assert!(!all[0].applied && all[0].chosen.is_none());
+    }
+}

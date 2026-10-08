@@ -9,9 +9,11 @@
 //! unchanged until then.
 
 pub mod candidates;
+pub mod decider;
 pub mod decision;
 pub mod feedback;
 pub mod mode;
+pub mod scorer;
 pub mod signature;
 pub mod store;
 

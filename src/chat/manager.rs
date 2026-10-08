@@ -538,6 +538,9 @@ pub struct ChatManager {
     pub(crate) agent_runtime: Arc<super::agent_runtime::AgentRuntime>,
     /// Where the agent path finds a provider instance.
     pub(crate) provider_source: Arc<dyn super::agent_runtime::ProviderSource>,
+    /// The cognitive router (R2), when wired. `None` keeps the declarative
+    /// resolution exactly as it was.
+    pub(crate) cognitive_routing: Option<super::provider::cognitive::decider::CognitiveRouting>,
     /// Native providers built for stored instances, by instance id; an entry is
     /// reused while the stored record is unchanged.
     pub(crate) native_cache: Arc<RwLock<HashMap<String, NativeCacheEntry>>>,
@@ -1065,6 +1068,7 @@ impl ChatManager {
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             agent_runtime,
             provider_source,
+            cognitive_routing: None,
             native_cache: Arc::new(RwLock::new(HashMap::new())),
             context_injector: None,
             memory_config: None,
@@ -1128,6 +1132,7 @@ impl ChatManager {
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             agent_runtime,
             provider_source,
+            cognitive_routing: None,
             native_cache: Arc::new(RwLock::new(HashMap::new())),
             context_injector,
             memory_config: Some(memory_config),
@@ -1166,6 +1171,23 @@ impl ChatManager {
     ) -> Self {
         self.provider_source = source;
         self
+    }
+
+    /// Wires the cognitive router. Without it the provider is resolved from the
+    /// declared rules only.
+    pub fn with_cognitive_routing(
+        mut self,
+        routing: super::provider::cognitive::decider::CognitiveRouting,
+    ) -> Self {
+        self.cognitive_routing = Some(routing);
+        self
+    }
+
+    /// The cognitive router, when wired.
+    pub fn cognitive_routing(
+        &self,
+    ) -> Option<&super::provider::cognitive::decider::CognitiveRouting> {
+        self.cognitive_routing.as_ref()
     }
 
     pub fn with_event_emitter(mut self, emitter: Arc<dyn crate::events::EventEmitter>) -> Self {
@@ -8242,6 +8264,7 @@ impl ChatManager {
         } else {
             resolver::Role::Pilot
         };
+        let routing_instances = self.cognitive_routing.as_ref().map(|_| instances.clone());
         let store_catalog =
             catalog::StoreCatalog::new(instances, &consents, project_slug.is_some());
         let policy: settings::ModelPolicy = self
@@ -8263,6 +8286,42 @@ impl ChatManager {
             &project,
             &aliases,
         );
+        // The cognitive router (R2): a decision is always taken and stored; it
+        // fills the project-rule level only when the mode and the stage say so.
+        // Never fatal: any failure leaves the declarative resolution untouched.
+        let cognitive = match (&self.cognitive_routing, routing_instances) {
+            (Some(routing), Some(instances)) => {
+                match self
+                    .cognitive_decision(
+                        routing,
+                        request,
+                        project_slug,
+                        role,
+                        &instances,
+                        &store_catalog,
+                        &aliases,
+                    )
+                    .await
+                {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        warn!(%error, "cognitive routing skipped: the declared rules apply");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        let auto_pick = cognitive
+            .as_ref()
+            .filter(|d| d.applied)
+            .and_then(|d| d.chosen.clone());
+        if let Some(pick) = &auto_pick {
+            input.project_rule = Some(resolver::Candidate::new(
+                pick.provider_id.clone(),
+                Some(pick.model.clone()),
+            ));
+        }
         // `enforce` puts the policy's candidate where the global rule would be;
         // `shadow` changes nothing and is only recorded (A19).
         if let Some(p) = pick.as_ref().filter(|p| p.enforced) {
@@ -8277,7 +8336,155 @@ impl ChatManager {
                 choice.route_rule = Some(p.rule.clone());
             }
         }
+        if let (Some(pick), Some(decision)) = (&auto_pick, &cognitive) {
+            // Our candidate won the project-rule level: it was chosen by the router.
+            if choice.routed_by == resolver::RoutedBy::ProjectRule
+                && choice.provider_id == pick.provider_id
+                && choice.model.as_deref() == Some(pick.model.as_str())
+            {
+                choice.routed_by = resolver::RoutedBy::Auto;
+                choice.route_rule = Some(format!("auto:{}", decision.signature.arm_key()));
+                choice.reason = Some(decision.reason.clone());
+            }
+        } else if let Some(pick) = cognitive.as_ref().and_then(|d| d.chosen.as_ref()) {
+            // Not applied: what the router would have chosen, recorded only.
+            if choice.shadow.is_none() {
+                choice.shadow = Some((pick.provider_id.clone(), Some(pick.model.clone())));
+            }
+        }
         Ok(choice)
+    }
+
+    /// The pool the cognitive router chooses from: every model of every
+    /// reachable instance, with the capabilities and the price nexus reports,
+    /// the health (one probe per instance per window) and the project's consent.
+    async fn routing_pool(
+        &self,
+        routing: &super::provider::cognitive::decider::CognitiveRouting,
+        instances: &[super::provider::settings::InstanceRecord],
+        store_catalog: &super::provider::catalog::StoreCatalog,
+    ) -> Vec<super::provider::cognitive::candidates::ModelFacts> {
+        use super::provider::cognitive::candidates::ModelFacts;
+        use super::provider::resolver::{self, InstanceCatalog};
+        use std::time::{Duration, Instant};
+
+        let mut ids = vec![resolver::CLAUDE_CODE.to_string()];
+        ids.extend(
+            instances
+                .iter()
+                .filter(|i| !resolver::is_remote_instance(&i.id))
+                .map(|i| i.id.clone()),
+        );
+        let mut pool = Vec::new();
+        for id in ids {
+            // The legacy engine can only drive Claude Code.
+            if !self.engine_is_agent(&id) && id != resolver::CLAUDE_CODE {
+                continue;
+            }
+            let Ok(provider) = self.provider_for(&id).await else {
+                continue;
+            };
+            let now = Instant::now();
+            let healthy = match routing.health.get(&id, now) {
+                Some(known) => known,
+                None => {
+                    let ok = provider.health().await.status
+                        != nexus_claude::agent::HealthStatus::Unavailable;
+                    routing.health.put(&id, ok, now);
+                    ok
+                }
+            };
+            let default_model = instances
+                .iter()
+                .find(|i| i.id == id)
+                .and_then(|i| i.default_model.clone());
+            let models = if healthy {
+                tokio::time::timeout(Duration::from_secs(2), provider.catalog())
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let allowed = store_catalog.is_allowed_for_project(&id);
+            let mut seen = std::collections::HashSet::new();
+            let mut entries: Vec<(String, Option<nexus_claude::agent::ModelPrice>)> =
+                models.into_iter().map(|m| (m.id, m.pricing)).collect();
+            if let Some(model) = default_model {
+                if !entries.iter().any(|(m, _)| *m == model) {
+                    entries.push((model, None));
+                }
+            }
+            for (model, price) in entries {
+                if !seen.insert(model.clone()) {
+                    continue;
+                }
+                let caps = provider.capabilities(Some(&model));
+                pool.push(ModelFacts::from_capabilities(
+                    id.clone(),
+                    model,
+                    &caps,
+                    price,
+                    Some(healthy),
+                    allowed,
+                ));
+            }
+        }
+        pool
+    }
+
+    /// Asks the cognitive router about the session being opened. The decision is
+    /// stored by the decider whether it is applied or not.
+    #[allow(clippy::too_many_arguments)]
+    async fn cognitive_decision(
+        &self,
+        routing: &super::provider::cognitive::decider::CognitiveRouting,
+        request: &ChatRequest,
+        project_slug: Option<&str>,
+        role: super::provider::resolver::Role,
+        instances: &[super::provider::settings::InstanceRecord],
+        store_catalog: &super::provider::catalog::StoreCatalog,
+        aliases: &[super::provider::settings::ModelAlias],
+    ) -> Result<Option<super::provider::cognitive::decision::CognitiveDecision>> {
+        use super::provider::cognitive::{
+            candidates::Slot,
+            decision::DecideRequest,
+            scorer::PriorHints,
+            signature::{ContextHints, TaskSignature},
+        };
+        let (settings, _) =
+            super::provider::cognitive::load_routing(self.graph.as_ref(), project_slug).await?;
+        let signature = match role {
+            super::provider::resolver::Role::Pilot => TaskSignature::from_chat_request(
+                &request.message,
+                !request.attachments.is_empty(),
+                project_slug,
+                ContextHints::default(),
+            ),
+            super::provider::resolver::Role::Executor => TaskSignature::from_delegation(
+                request.task_class.as_deref(),
+                None,
+                1,
+                project_slug,
+                ContextHints::default(),
+            ),
+        };
+        routing.set_hints(PriorHints::from_aliases(aliases));
+        let pool = self.routing_pool(routing, instances, store_catalog).await;
+        // A provider, model, alias or run the caller named is never substituted.
+        let named = request.provider.is_some()
+            || request.model.as_deref().is_some_and(|m| !m.is_empty())
+            || request.task_alias.is_some()
+            || request.run_provider.is_some();
+        let mut decide = DecideRequest::new(signature, settings, pool);
+        decide.slot = if named {
+            Slot::Explicit
+        } else {
+            Slot::Automatic
+        };
+        decide.trust = request.permission_mode.as_deref() == Some("bypassPermissions");
+        Ok(Some(routing.decider.decide(&decide).await?))
     }
 
     /// The provider instance, built-in or stored. A stored instance becomes a

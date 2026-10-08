@@ -31,6 +31,7 @@ mod protocol;
 pub(crate) mod reasoning;
 mod registry;
 mod release;
+pub mod routing;
 mod sharing;
 mod skill;
 mod step;
