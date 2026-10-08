@@ -278,6 +278,7 @@ mod tests {
             run_id: None,
             turn_index: None,
             outcome: None,
+            used: None,
         }
     }
 
