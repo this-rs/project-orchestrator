@@ -235,7 +235,6 @@ fn request(provider: Option<&str>, project: Option<&str>, mode: &str) -> ChatReq
         scaffolding_override: None,
         runner_context: None,
         routing_decision_id: None,
-        relay: None,
     }
 }
 

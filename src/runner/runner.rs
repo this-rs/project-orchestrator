@@ -3159,7 +3159,6 @@ impl PlanRunner {
             scaffolding_override: None,
             runner_context: Some(runner_context),
             routing_decision_id,
-            relay: None,
         };
         // What the runner asks for (None = provider default). When it named no
         // model, the one the resolver picked (alias, policy, auto) is read back

@@ -2516,7 +2516,6 @@ mod tests {
             scaffolding_override: None,
             runner_context: None,
             routing_decision_id: None,
-            relay: None,
         };
         let err = manager.create_session(&request).await.unwrap_err();
         let failure = crate::chat::provider::errors::classify_open_error(

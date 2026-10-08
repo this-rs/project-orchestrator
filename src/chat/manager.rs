@@ -525,6 +525,8 @@ struct AgentOpen<'a> {
     system_prompt: &'a str,
     add_dirs: &'a [String],
     project_slug: Option<&'a str>,
+    /// History relayed from another provider, sent in front of the first message.
+    relay: Option<&'a str>,
 }
 
 /// What the per-turn router of a session needs to know about its opening.
@@ -3245,6 +3247,17 @@ impl ChatManager {
 
     /// Create a new chat session: persist to Neo4j, spawn CLI subprocess, start streaming
     pub async fn create_session(&self, request: &ChatRequest) -> Result<CreateSessionResponse> {
+        self.create_session_relayed(request, None).await
+    }
+
+    /// [`Self::create_session`] with a history relayed from another provider (B-SW):
+    /// `relay` is sent to the model in front of `request.message`, but the conversation
+    /// stores and shows `request.message` alone.
+    pub async fn create_session_relayed(
+        &self,
+        request: &ChatRequest,
+        relay: Option<&str>,
+    ) -> Result<CreateSessionResponse> {
         // Check max sessions
         {
             let sessions = self.active_sessions.read().await;
@@ -3482,6 +3495,7 @@ impl ChatManager {
                     system_prompt: &system_prompt,
                     add_dirs: &resolved_add_dirs,
                     project_slug: project_slug.as_deref(),
+                    relay,
                 })
                 .await;
         }
@@ -3878,7 +3892,7 @@ impl ChatManager {
         let session_id_str = session_id.to_string();
         let graph = self.graph.clone();
         let active_sessions = self.active_sessions.clone();
-        let message = super::relay::prefixed(request.relay.as_deref(), &request.message);
+        let message = super::relay::prefixed(relay, &request.message);
         let events_tx_clone = events_tx.clone();
         let injector = self.context_injector.clone();
         let event_emitter = self.event_emitter.clone();
@@ -6395,11 +6409,15 @@ impl ChatManager {
             scaffolding_override: None,
             runner_context: None,
             routing_decision_id: None,
-            relay: (!rendered.text.is_empty()).then(|| rendered.text.clone()),
         };
         // Opening can be refused (consent, endpoint, gate, no model): the old
         // session is then left exactly as it was.
-        let created = self.create_session(&request).await?;
+        let created = self
+            .create_session_relayed(
+                &request,
+                (!rendered.text.is_empty()).then_some(rendered.text.as_str()),
+            )
+            .await?;
 
         let note = serde_json::json!({
             "from_session": session_id,
@@ -9078,6 +9096,7 @@ impl ChatManager {
             system_prompt,
             add_dirs,
             project_slug,
+            relay,
         } = o;
         let provider = self.provider_for(provider_id).await?;
         let remote_cwd = self.remote_cwd_of(provider_id).await?;
@@ -9189,7 +9208,7 @@ impl ChatManager {
                 handle
                     .send_message_relayed(
                         &request.message,
-                        &super::relay::prefixed(request.relay.as_deref(), &request.message),
+                        &super::relay::prefixed(relay, &request.message),
                     )
                     .await?;
             }
@@ -11622,7 +11641,6 @@ mod tests {
             scaffolding_override: None,
             runner_context: None,
             routing_decision_id: None,
-            relay: None,
         }
     }
 

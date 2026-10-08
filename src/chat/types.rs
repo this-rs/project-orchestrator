@@ -267,10 +267,6 @@ pub struct ChatRequest {
     /// applied. Absent for a request nobody routed. Additive.
     #[serde(default)]
     pub routing_decision_id: Option<uuid::Uuid>,
-    /// History relayed from another provider (B-SW), sent to the model in front of
-    /// `message` but never stored nor shown as the user's words. Internal.
-    #[serde(skip)]
-    pub relay: Option<String>,
 }
 
 /// Kind of background subprocess being tracked.
