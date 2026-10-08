@@ -11,6 +11,9 @@
 //! * [`validate`] — pure input validation (limits, excluded kinds);
 //! * [`access`] — the policy: the only way to read a referenced entity is
 //!   [`access::AccessPolicy::resolve_checked`];
+//! * [`label`] — server-side labels (never read from a client, 80 characters);
+//! * [`resolvers`] — one resolver per kind, delegating to the `get_*` of the store;
+//! * [`search`] — `GET /api/refs/search`: query parsing, scope, policy;
 //! * [`block`] — the trailing `<po-refs>` block carried inside the message text;
 //! * [`wire`] — search response, `refs_resolved` event and error bodies.
 //!
@@ -19,7 +22,14 @@
 
 pub mod access;
 pub mod block;
+pub mod label;
 pub mod registry;
+pub mod resolvers;
+pub mod search;
+#[cfg(test)]
+mod search_contract;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod types;
 pub mod validate;
 pub mod wire;

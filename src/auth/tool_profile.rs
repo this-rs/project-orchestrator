@@ -173,6 +173,8 @@ const CLOSED_ROUTE_PREFIXES: &[&str] = &[
     "/api/hooks",
     "/api/progress",
     "/api/reactor",
+    // the `#` picker of the UI; no tool searches references
+    "/api/refs",
     "/api/registry",
     "/api/rfcs",
     "/api/setup-status",
@@ -794,6 +796,7 @@ mod tests {
             "/api/hooks",
             "/api/progress",
             "/api/reactor",
+            "/api/refs/search",
             "/api/registry",
             "/api/rfcs",
             "/api/setup-status",

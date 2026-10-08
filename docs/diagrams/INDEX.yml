@@ -270,6 +270,7 @@ diagrams:
     file: docs/diagrams/po-refs.mmd
     covers:
       - "backend:src/refs/**"
+      - "backend:src/api/refs_handlers.rs"
   - name: po-bugs
     owner: theotime
     status: verified
