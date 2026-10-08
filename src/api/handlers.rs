@@ -1060,7 +1060,28 @@ pub async fn delegate_task(
     // The model the delegating agent (or person) chose for THIS task, if any. It goes
     // through the same resolution as every session: consent, health and the
     // project's rules still apply, and a refusal costs nothing.
-    DelegationTarget::new(req.provider, req.model, req.task_class).apply(&mut chat_request);
+    let target = DelegationTarget::new(req.provider, req.model, req.task_class);
+    let stated_class = target.task_class.clone();
+    target.apply(&mut chat_request);
+    // The model alias set on THIS task (A16 level "task"): a delegation used to
+    // leave it out, so the alias never applied to a delegated task.
+    apply_task_alias(graph.as_ref(), &mut chat_request, task_id).await;
+    // Cognitive routing (B-R7): decide before the session opens.
+    let routing = crate::runner::routing::installed();
+    let steps_count = graph
+        .get_task_steps(task_id)
+        .await
+        .map(|s| s.len())
+        .unwrap_or(0);
+    let routing_decision_id = route_delegation(
+        routing.as_deref(),
+        graph.as_ref(),
+        &mut chat_request,
+        &task_node,
+        steps_count,
+        stated_class.as_deref(),
+    )
+    .await;
     // A person may name the parent in the body; an agent's parent is its token's.
     let parent_session_id = match &parent_envelope {
         Some(env) => Some(env.parent_session_id),
@@ -1155,6 +1176,7 @@ pub async fn delegate_task(
             vector_json: None,
             report_json: None,
             execution_type: Default::default(),
+            routing_decision_id,
             ..Default::default()
         };
         let graph_clone = graph.clone();
@@ -1167,6 +1189,7 @@ pub async fn delegate_task(
 
     // Step 4: Send the enriched prompt to the agent (async — don't block)
     let cm = chat_manager.clone();
+    let graph_for_close = graph.clone();
     let sid = session_id.clone();
     let task_title_clone = task_title.clone();
 
@@ -1205,8 +1228,22 @@ pub async fn delegate_task(
         };
 
         let delegation_cwd = Some(chat_request_cwd.clone());
-        listen_delegation_result(rx, ev_task_id, &task_title_clone, event_bus, delegation_cwd)
-            .await;
+        let close = routing
+            .zip(routing_decision_id)
+            .map(|(handle, id)| DelegationClose {
+                routing: handle,
+                graph: graph_for_close,
+                decision_id: id,
+            });
+        listen_delegation_result(
+            rx,
+            ev_task_id,
+            &task_title_clone,
+            event_bus,
+            delegation_cwd,
+            close,
+        )
+        .await;
     });
 
     Ok((
@@ -1218,6 +1255,67 @@ pub async fn delegate_task(
             prompt_preview,
         }),
     ))
+}
+
+/// Puts the model alias set on the task (A16 level "task") on the request. A
+/// read that fails is "no alias", never a stop.
+async fn apply_task_alias(
+    graph: &dyn crate::neo4j::GraphStore,
+    request: &mut crate::chat::types::ChatRequest,
+    task_id: Uuid,
+) {
+    request.task_alias = graph
+        .get_llm_setting(&format!("task:{task_id}"), "model_alias")
+        .await
+        .ok()
+        .flatten()
+        .filter(|a| !a.is_empty());
+}
+
+/// What closes the routing decision of a delegation when its session ends.
+struct DelegationClose {
+    routing: Arc<crate::runner::routing::RoutingHandle>,
+    graph: Arc<dyn crate::neo4j::GraphStore>,
+    decision_id: Uuid,
+}
+
+/// Decides the model of a delegated task before its session opens and puts the
+/// decision id on the request (nothing else on it changes). The task's own
+/// alias is part of the signature's slot: an alias, a provider or a model named
+/// by the delegating agent, or a task persona, makes the slot explicit.
+/// `None` without a routing handle, or when the decider fails.
+async fn route_delegation(
+    routing: Option<&crate::runner::routing::RoutingHandle>,
+    graph: &dyn crate::neo4j::GraphStore,
+    request: &mut crate::chat::types::ChatRequest,
+    task: &crate::neo4j::models::TaskNode,
+    steps_count: usize,
+    stated_class: Option<&str>,
+) -> Option<Uuid> {
+    use crate::chat::provider::cognitive::signature::{ContextHints, TaskSignature};
+    let routing = routing?;
+    let signature = TaskSignature::from_delegation(
+        stated_class,
+        Some((task, steps_count)),
+        1,
+        request.project_slug.as_deref(),
+        ContextHints::default(),
+    );
+    let explicit = request.provider.is_some()
+        || request.model.is_some()
+        || request.task_alias.is_some()
+        || task.persona.is_some();
+    let decision = routing
+        .decide(
+            graph,
+            signature,
+            crate::runner::routing::slot_for(explicit),
+            Some(task.id),
+            None,
+        )
+        .await?;
+    request.routing_decision_id = Some(decision.id);
+    Some(decision.id)
 }
 
 /// The session request of a delegated task.
@@ -1258,6 +1356,7 @@ fn delegation_chat_request(
         task_context: Some(task_title.to_string()),
         scaffolding_override: None,
         runner_context: None, // TODO: populate for delegate_task
+        routing_decision_id: None,
     };
     if let Some(env) = envelope {
         env.apply(&mut request, default_mode)?;
@@ -1274,6 +1373,7 @@ async fn listen_delegation_result(
     task_title: &str,
     event_bus: std::sync::Arc<crate::events::HybridEmitter>,
     cwd: Option<String>,
+    close: Option<DelegationClose>,
 ) {
     use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 
@@ -1289,9 +1389,24 @@ async fn listen_delegation_result(
 
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await {
             Ok(Ok(crate::chat::types::ChatEvent::Result {
-                cost_usd, is_error, ..
+                cost_usd,
+                is_error,
+                cost: cost_detail,
+                ..
             })) => {
                 let duration_secs = start.elapsed().as_secs_f64();
+                // Close the loop: the arm that was chosen learns how it went.
+                if let Some(close) = &close {
+                    let outcome = crate::runner::routing::outcome_of_result(
+                        is_error,
+                        (duration_secs * 1000.0) as u64,
+                        cost_detail.as_ref(),
+                    );
+                    close
+                        .routing
+                        .close(close.graph.as_ref(), close.decision_id, &outcome)
+                        .await;
+                }
                 let cost = cost_usd.unwrap_or(0.0);
 
                 // Emit a CrudEvent so WebSocket clients see the completion
@@ -5648,6 +5763,8 @@ async fn start_plan_run(
     // Inherit caller's auth claims so runner agents authenticate as the user
     runner = runner.with_user_claims(caller_claims);
     runner = runner.with_run_routing(routing.provider, routing.model, routing.max_tokens);
+    // Cognitive routing (B-R7): None until the decider is installed at startup.
+    runner = runner.with_routing(crate::runner::routing::installed());
 
     // Bridge RunnerEvents to CrudEvent for WebSocket delivery
     runner =
@@ -9798,5 +9915,74 @@ mod retry_plan_task_tests {
             graph_counts(&ended.to_string(), Some(&[still_running])).await,
             (1, 0)
         );
+    }
+    #[tokio::test]
+    async fn a_delegation_passes_the_alias_set_on_its_task() {
+        let graph = crate::neo4j::mock::MockGraphStore::new();
+        let task_id = Uuid::new_v4();
+        let mut req =
+            delegation_chat_request("/a".into(), None, task_id, "t", None, "default").unwrap();
+        assert!(req.task_alias.is_none());
+        apply_task_alias(&graph, &mut req, task_id).await;
+        assert!(req.task_alias.is_none(), "no alias set: still none");
+
+        graph
+            .put_llm_setting(&format!("task:{task_id}"), "model_alias", "cheap")
+            .await
+            .unwrap();
+        apply_task_alias(&graph, &mut req, task_id).await;
+        assert_eq!(req.task_alias.as_deref(), Some("cheap"));
+    }
+
+    #[tokio::test]
+    async fn a_routed_delegation_carries_the_decision_id_and_nothing_else_changes() {
+        use crate::chat::provider::cognitive::candidates::Slot;
+        use crate::runner::routing::test_support::FakeDecider;
+        let graph = crate::neo4j::mock::MockGraphStore::new();
+        let task = crate::test_helpers::test_task();
+        let base =
+            delegation_chat_request("/a".into(), None, task.id, "t", None, "default").unwrap();
+
+        // No handle: nothing decided, request untouched.
+        let mut untouched = base.clone();
+        assert!(
+            route_delegation(None, &graph, &mut untouched, &task, 2, None)
+                .await
+                .is_none()
+        );
+        assert_eq!(format!("{untouched:?}"), format!("{base:?}"));
+
+        // An unapplied decision: same request but for the id; the slot is automatic.
+        let (decider, handle) = FakeDecider::handle(false);
+        let mut routed = base.clone();
+        let id = route_delegation(
+            Some(&handle),
+            &graph,
+            &mut routed,
+            &task,
+            2,
+            Some("complex"),
+        )
+        .await
+        .expect("decided");
+        assert_eq!(routed.routing_decision_id, Some(id));
+        routed.routing_decision_id = None;
+        assert_eq!(format!("{routed:?}"), format!("{base:?}"));
+        let seen = decider.requests();
+        assert_eq!(seen[0].slot, Slot::Automatic);
+        assert_eq!(
+            seen[0].signature.class.key(),
+            "complex",
+            "the stated class wins"
+        );
+        assert_eq!(seen[0].task_id, Some(task.id));
+
+        // The task's own alias makes the slot explicit.
+        let mut aliased = base.clone();
+        aliased.task_alias = Some("cheap".into());
+        route_delegation(Some(&handle), &graph, &mut aliased, &task, 2, None)
+            .await
+            .expect("decided");
+        assert_eq!(decider.requests()[1].slot, Slot::Explicit);
     }
 }

@@ -535,6 +535,7 @@ mod tests {
             task_context: None,
             scaffolding_override: None,
             runner_context: None,
+            routing_decision_id: None,
         }
     }
 

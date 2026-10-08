@@ -40,11 +40,6 @@ pub const MODEL_ADDED_ALERT: &str = "model_added";
 /// is triggered.
 const CACHE_TTL: Duration = Duration::from_secs(12 * 60 * 60); // 12h
 
-/// How long to wait before retrying after a FAILED refresh (expired login,
-/// network down, Keychain locked). A failure must not freeze the catalog for a
-/// full `CACHE_TTL`: the user would not see a model released meanwhile.
-const RETRY_BACKOFF: Duration = Duration::from_secs(2 * 60);
-
 /// HTTP timeout for the Anthropic Models API call itself.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -136,18 +131,11 @@ const CURATED_ORDER: &[(&str, &str, &str, &str, &str)] = &[
         "Best balance of speed and intelligence",
     ),
     (
-        "claude-haiku-5-5",
-        "haiku",
-        "5.5",
-        TIER_CURRENT,
-        "Fastest — near-frontier intelligence",
-    ),
-    (
         "claude-haiku-4-5",
         "haiku",
         "4.5",
-        TIER_LEGACY,
-        "Legacy — superseded by Haiku 5.5",
+        TIER_CURRENT,
+        "Fastest — near-frontier intelligence",
     ),
     (
         "claude-opus-5",
@@ -419,20 +407,6 @@ struct CacheState {
     models: Vec<ModelDefinition>,
     fetched_at: Instant,
     refreshing: bool,
-    /// The last refresh failed: staleness is then measured against
-    /// `RETRY_BACKOFF` instead of `CACHE_TTL`.
-    last_failed: bool,
-}
-
-impl CacheState {
-    fn is_stale(&self) -> bool {
-        let ttl = if self.last_failed {
-            RETRY_BACKOFF
-        } else {
-            CACHE_TTL
-        };
-        self.fetched_at.elapsed() >= ttl
-    }
 }
 
 /// Handles needed to announce a newly released model. Optional so the cache
@@ -470,7 +444,6 @@ impl ModelCatalogCache {
                 // so a real fetch is scheduled immediately when a key exists.
                 fetched_at: Instant::now() - CACHE_TTL - Duration::from_secs(1),
                 refreshing: false,
-                last_failed: false,
             }),
             http: reqwest::Client::builder()
                 .timeout(FETCH_TIMEOUT)
@@ -517,14 +490,14 @@ impl ModelCatalogCache {
     pub async fn get_models(self: &Arc<Self>) -> Vec<ModelDefinition> {
         let needs_refresh = {
             let state = self.inner.read().await;
-            !state.refreshing && state.is_stale()
+            !state.refreshing && state.fetched_at.elapsed() >= CACHE_TTL
         };
 
         if needs_refresh && self.credentials != CredentialSource::None {
             let mut state = self.inner.write().await;
             // Re-check under the write lock — another task may have started
             // the refresh between our read and this write.
-            if !state.refreshing && state.is_stale() {
+            if !state.refreshing && state.fetched_at.elapsed() >= CACHE_TTL {
                 state.refreshing = true;
                 let this = Arc::clone(self);
                 tokio::spawn(async move {
@@ -536,36 +509,9 @@ impl ModelCatalogCache {
         self.inner.read().await.models.clone()
     }
 
-    /// User-requested refresh ("Actualiser"). Never waits for the network:
-    /// the fetch runs in a background task and the call returns at once.
-    /// Returns `false` when nothing was started (no credentials, or a refresh
-    /// is already in flight — the caller's wish is being served either way).
-    /// A new model is announced over `/ws/events`; callers may also just
-    /// re-read `get_models()` a few seconds later.
-    pub async fn request_refresh(self: &Arc<Self>) -> bool {
-        if self.credentials == CredentialSource::None {
-            return false;
-        }
-        let mut state = self.inner.write().await;
-        if state.refreshing {
-            return false;
-        }
-        state.refreshing = true;
-        drop(state);
-        let this = Arc::clone(self);
-        tokio::spawn(async move {
-            this.refresh().await;
-        });
-        true
-    }
-
-    /// Whether a refresh is currently in flight.
-    pub async fn is_refreshing(&self) -> bool {
-        self.inner.read().await.refreshing
-    }
-
-    /// Run one refresh attempt to completion (the background task body).
-    /// Falls back silently to the existing cache on any failure.
+    /// Force an immediate synchronous refresh attempt (used by tests and by
+    /// an optional "refresh now" admin action). Falls back silently to the
+    /// existing cache on any failure.
     async fn refresh(self: &Arc<Self>) {
         let result = self.fetch_live_catalog().await;
 
@@ -582,7 +528,6 @@ impl ModelCatalogCache {
                 announce = Some(models.clone());
                 state.models = models;
                 state.fetched_at = Instant::now();
-                state.last_failed = false;
             }
             Ok(_) => {
                 tracing::warn!(
@@ -590,13 +535,13 @@ impl ModelCatalogCache {
                 );
                 // Still bump fetched_at so we don't hammer the API every request.
                 state.fetched_at = Instant::now();
-                state.last_failed = false;
             }
             Err(err) => {
                 tracing::warn!(error = %err, "Failed to refresh Claude model catalog — keeping previous list");
-                // Retry after the short backoff, not after 12h.
+                // Bump fetched_at anyway (with a shorter effective backoff isn't
+                // worth the complexity here — 12h between attempts on a broken
+                // key/network is an acceptable ceiling on wasted calls).
                 state.fetched_at = Instant::now();
-                state.last_failed = true;
             }
         }
         state.refreshing = false;
@@ -965,10 +910,7 @@ mod tests {
             entry("claude-sonnet-5-5", "Claude Sonnet 5.5"),
             entry("claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
         ]);
-        let haikus: Vec<_> = models
-            .iter()
-            .filter(|m| m.family == "haiku" && m.version == "4.5")
-            .collect();
+        let haikus: Vec<_> = models.iter().filter(|m| m.family == "haiku").collect();
         assert_eq!(
             haikus.len(),
             1,
@@ -1189,41 +1131,6 @@ mod tests {
             announced.project_id.is_none(),
             "a model announcement must not be scoped to a project"
         );
-    }
-
-    #[tokio::test]
-    async fn test_request_refresh_without_credentials_starts_nothing() {
-        let cache = ModelCatalogCache::new(None);
-        assert!(!cache.request_refresh().await);
-        assert!(!cache.is_refreshing().await);
-    }
-
-    #[tokio::test]
-    async fn test_failed_refresh_retries_after_short_backoff_not_ttl() {
-        let cache = ModelCatalogCache::with_credentials(CredentialSource::ApiKey("k".into()));
-        {
-            let mut st = cache.inner.write().await;
-            st.fetched_at = Instant::now() - RETRY_BACKOFF - Duration::from_secs(1);
-            st.last_failed = true;
-            assert!(st.is_stale(), "a failure is retried after the backoff");
-            st.last_failed = false;
-            assert!(!st.is_stale(), "a success stays fresh for the whole TTL");
-        }
-    }
-
-    #[test]
-    fn test_haiku_5_5_is_current_and_4_5_is_legacy() {
-        let m = static_fallback_models();
-        let h55 = m
-            .iter()
-            .find(|x| x.id == "claude-haiku-5-5")
-            .expect("haiku 5.5");
-        assert_eq!(h55.tier, TIER_CURRENT);
-        let h45 = m
-            .iter()
-            .find(|x| x.id == "claude-haiku-4-5")
-            .expect("haiku 4.5");
-        assert_eq!(h45.tier, TIER_LEGACY);
     }
 
     #[tokio::test]

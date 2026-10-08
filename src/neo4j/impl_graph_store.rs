@@ -4060,6 +4060,59 @@ impl GraphStore for Neo4jClient {
         self.list_trigger_firings_impl(trigger_id, limit).await
     }
 
+    // ── Cognitive routing ───────────────────────────────────────────────────
+
+    async fn get_routing_arm(
+        &self,
+        key: &crate::chat::provider::cognitive::store::ArmKey,
+    ) -> anyhow::Result<Option<crate::chat::provider::cognitive::store::ArmStats>> {
+        self.get_routing_arm_impl(key).await
+    }
+
+    async fn list_routing_arms(
+        &self,
+        class: &str,
+    ) -> anyhow::Result<Vec<crate::chat::provider::cognitive::store::ArmStats>> {
+        self.list_routing_arms_impl(class).await
+    }
+
+    async fn observe_routing_arm(
+        &self,
+        key: &crate::chat::provider::cognitive::store::ArmKey,
+        observation: &crate::chat::provider::cognitive::store::ArmObservation,
+    ) -> anyhow::Result<crate::chat::provider::cognitive::store::ArmStats> {
+        self.observe_routing_arm_impl(key, observation).await
+    }
+
+    async fn put_routing_decision(
+        &self,
+        decision: &crate::chat::provider::cognitive::decision::CognitiveDecision,
+    ) -> anyhow::Result<()> {
+        self.put_routing_decision_impl(decision).await
+    }
+
+    async fn get_routing_decision(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<crate::chat::provider::cognitive::decision::CognitiveDecision>> {
+        self.get_routing_decision_impl(id).await
+    }
+
+    async fn list_routing_decisions(
+        &self,
+        filter: &crate::chat::provider::cognitive::store::DecisionFilter,
+    ) -> anyhow::Result<Vec<crate::chat::provider::cognitive::decision::CognitiveDecision>> {
+        self.list_routing_decisions_impl(filter).await
+    }
+
+    async fn set_routing_decision_outcome(
+        &self,
+        id: Uuid,
+        outcome: crate::chat::provider::cognitive::decision::DecisionOutcome,
+    ) -> anyhow::Result<bool> {
+        self.set_routing_decision_outcome_impl(id, outcome).await
+    }
+
     // ── AgentExecution ──────────────────────────────────────────────────────
 
     async fn create_agent_execution(

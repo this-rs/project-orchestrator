@@ -527,6 +527,17 @@ struct AgentOpen<'a> {
     project_slug: Option<&'a str>,
 }
 
+/// What the per-turn router of a session needs to know about its opening.
+struct OpeningTurn<'a> {
+    /// The request named its model.
+    explicit_model: bool,
+    permission_mode: Option<&'a str>,
+    /// The message of the turn about to start.
+    message: &'a str,
+    /// Index of the first turn the router counts itself (legacy engine).
+    next_turn: u32,
+}
+
 /// Manages chat sessions and their lifecycle
 pub struct ChatManager {
     pub(crate) graph: Arc<dyn GraphStore>,
@@ -538,6 +549,9 @@ pub struct ChatManager {
     pub(crate) agent_runtime: Arc<super::agent_runtime::AgentRuntime>,
     /// Where the agent path finds a provider instance.
     pub(crate) provider_source: Arc<dyn super::agent_runtime::ProviderSource>,
+    /// The cognitive router (R2), when wired. `None` keeps the declarative
+    /// resolution exactly as it was.
+    pub(crate) cognitive_routing: Option<super::provider::cognitive::decider::CognitiveRouting>,
     /// Native providers built for stored instances, by instance id; an entry is
     /// reused while the stored record is unchanged.
     pub(crate) native_cache: Arc<RwLock<HashMap<String, NativeCacheEntry>>>,
@@ -582,6 +596,9 @@ pub struct ChatManager {
     /// Secrets vault: mints the per-session vault token and masks agent output.
     /// None in tests and when the server runs without one.
     pub(crate) vault: Option<Arc<crate::vault::VaultService>>,
+    /// Per-turn model routing (`full` mode): the shared decider and the router of each
+    /// live session. Empty until [`ChatManager::with_turn_decider`].
+    pub(crate) turn_routing: Arc<super::agent_hooks::TurnRouting>,
 }
 
 // ============================================================================
@@ -1065,6 +1082,7 @@ impl ChatManager {
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             agent_runtime,
             provider_source,
+            cognitive_routing: None,
             native_cache: Arc::new(RwLock::new(HashMap::new())),
             context_injector: None,
             memory_config: None,
@@ -1081,6 +1099,7 @@ impl ChatManager {
             dual_track_router: Arc::new(std::sync::RwLock::new(None)),
             nn_router: None,
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            turn_routing: Arc::new(super::agent_hooks::TurnRouting::default()),
         }
     }
 
@@ -1128,6 +1147,7 @@ impl ChatManager {
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             agent_runtime,
             provider_source,
+            cognitive_routing: None,
             native_cache: Arc::new(RwLock::new(HashMap::new())),
             context_injector,
             memory_config: Some(memory_config),
@@ -1144,6 +1164,86 @@ impl ChatManager {
             dual_track_router: Arc::new(std::sync::RwLock::new(None)),
             nn_router: None,
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            turn_routing: Arc::new(super::agent_hooks::TurnRouting::default()),
+        }
+    }
+
+    /// Lets the cognitive router choose the model of each turn of a session in routing
+    /// mode `full` + stage `auto` (a session keeps its provider; `pool` lists the models
+    /// of that provider only).
+    pub fn with_turn_decider(
+        self,
+        decider: Arc<dyn super::provider::cognitive::decision::Decider>,
+        pool: Arc<dyn super::agent_hooks::PoolSource>,
+    ) -> Self {
+        self.turn_routing.configure(decider, pool);
+        self
+    }
+
+    /// Builds and registers the per-turn router of a session being opened, `None` without
+    /// a decider. The routing mode and stage are read ONCE here for the session's project.
+    async fn register_turn_router(
+        &self,
+        session_id: &str,
+        provider_id: &str,
+        model: &str,
+        project_slug: Option<&str>,
+        turn: OpeningTurn<'_>,
+    ) -> Option<Arc<super::agent_hooks::TurnRouter>> {
+        let (decider, pool) = self.turn_routing.configured()?;
+        let routing = match super::provider::cognitive::load_routing(
+            self.graph.as_ref(),
+            project_slug,
+        )
+        .await
+        {
+            Ok((settings, _)) => settings,
+            Err(error) => {
+                warn!(session_id, error = %error, "routing settings unreadable: no per-turn routing");
+                return None;
+            }
+        };
+        let trust = turn.permission_mode.is_some_and(|mode| {
+            super::provider::policy::parse_mode(mode)
+                .is_some_and(|pair| pair.neutral == nexus_claude::agent::PolicyMode::Trust)
+        });
+        let router = Arc::new(super::agent_hooks::TurnRouter::new(
+            super::agent_hooks::TurnRouterSpec {
+                decider,
+                pool,
+                routing,
+                provider_id: provider_id.to_owned(),
+                session_id: Uuid::parse_str(session_id).ok(),
+                project_slug: project_slug.map(str::to_owned),
+                trust,
+                explicit_model: turn.explicit_model,
+                current_model: model.to_owned(),
+                next_turn: turn.next_turn,
+            },
+        ));
+        router.set_last_message(turn.message);
+        self.turn_routing.insert(session_id, Arc::clone(&router));
+        Some(router)
+    }
+
+    /// Legacy engine: asks the same per-turn decision as the agent engine and, when it
+    /// names another model, sends the `set_model` control frame before the message.
+    pub(crate) async fn apply_turn_directive(&self, session_id: &str, message: &str) {
+        let Some(router) = self.turn_routing.get(session_id) else {
+            return;
+        };
+        router.set_last_message(message);
+        let ctx = router.next_turn_context(message.chars().count());
+        let before = ctx.current_model.clone();
+        let directive = super::agent_hooks::directive_for_turn(&router, &ctx).await;
+        if let Some(model) = directive.model {
+            if let Err(error) = self
+                .set_session_model_inner(session_id, &model, false)
+                .await
+            {
+                warn!(session_id, error = %error, "turn routing could not change the model");
+                router.forget_change(&before);
+            }
         }
     }
 
@@ -1166,6 +1266,23 @@ impl ChatManager {
     ) -> Self {
         self.provider_source = source;
         self
+    }
+
+    /// Wires the cognitive router. Without it the provider is resolved from the
+    /// declared rules only.
+    pub fn with_cognitive_routing(
+        mut self,
+        routing: super::provider::cognitive::decider::CognitiveRouting,
+    ) -> Self {
+        self.cognitive_routing = Some(routing);
+        self
+    }
+
+    /// The cognitive router, when wired.
+    pub fn cognitive_routing(
+        &self,
+    ) -> Option<&super::provider::cognitive::decider::CognitiveRouting> {
+        self.cognitive_routing.as_ref()
     }
 
     pub fn with_event_emitter(mut self, emitter: Arc<dyn crate::events::EventEmitter>) -> Self {
@@ -3369,6 +3486,25 @@ impl ChatManager {
                 .await;
         }
 
+        // The Claude CLI always switches model live; the opening message was turn 0.
+        if let Some(router) = self
+            .register_turn_router(
+                &session_id.to_string(),
+                &provider_choice.provider_id,
+                &model,
+                project_slug.as_deref(),
+                OpeningTurn {
+                    explicit_model: request.model.is_some(),
+                    permission_mode: request.permission_mode.as_deref(),
+                    message: &request.message,
+                    next_turn: 1,
+                },
+            )
+            .await
+        {
+            router.set_model_live(true);
+        }
+
         // Create broadcast channel early so CompactionNotifier can use the sender
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
 
@@ -5441,6 +5577,10 @@ impl ChatManager {
     /// Send a follow-up message to an existing session
     pub async fn send_message(&self, session_id: &str, message: &str) -> Result<()> {
         if let Some(handle) = self.agent_runtime.get(session_id).await {
+            // The hook of the turn only sees the length of the text: hand it the text.
+            if let Some(router) = self.turn_routing.get(session_id) {
+                router.set_last_message(message);
+            }
             return handle.send_message(message).await;
         }
         // Check is_streaming with read lock first — if streaming, queue the message
@@ -5473,6 +5613,9 @@ impl ChatManager {
                 return Ok(());
             }
         }
+
+        // The model of the turn (`full` mode), before the message is written.
+        self.apply_turn_directive(session_id, message).await;
 
         // Not streaming — get session state for persist + stream.
         // DON'T create new interrupt_token here — stream_response will do it.
@@ -6184,6 +6327,22 @@ impl ChatManager {
     /// Returns `false` for a dormant session, which has no subscribers: the
     /// caller confirms to the asker directly.
     pub async fn set_session_model(&self, session_id: &str, model: &str) -> Result<bool> {
+        self.set_session_model_inner(session_id, model, true).await
+    }
+
+    /// `manual`: the user asked for it, which ends the automatic model routing of the
+    /// session. The router's own changes pass `false`.
+    async fn set_session_model_inner(
+        &self,
+        session_id: &str,
+        model: &str,
+        manual: bool,
+    ) -> Result<bool> {
+        if manual {
+            if let Some(router) = self.turn_routing.get(session_id) {
+                router.mark_manual();
+            }
+        }
         if let Some(handle) = self.agent_runtime.get(session_id).await {
             handle.set_model(model).await?;
             if let Ok(uuid) = Uuid::parse_str(session_id) {
@@ -8242,6 +8401,7 @@ impl ChatManager {
         } else {
             resolver::Role::Pilot
         };
+        let routing_instances = self.cognitive_routing.as_ref().map(|_| instances.clone());
         let store_catalog =
             catalog::StoreCatalog::new(instances, &consents, project_slug.is_some());
         let policy: settings::ModelPolicy = self
@@ -8263,6 +8423,42 @@ impl ChatManager {
             &project,
             &aliases,
         );
+        // The cognitive router (R2): a decision is always taken and stored; it
+        // fills the project-rule level only when the mode and the stage say so.
+        // Never fatal: any failure leaves the declarative resolution untouched.
+        let cognitive = match (&self.cognitive_routing, routing_instances) {
+            (Some(routing), Some(instances)) => {
+                match self
+                    .cognitive_decision(
+                        routing,
+                        request,
+                        project_slug,
+                        role,
+                        &instances,
+                        &store_catalog,
+                        &aliases,
+                    )
+                    .await
+                {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        warn!(%error, "cognitive routing skipped: the declared rules apply");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        let auto_pick = cognitive
+            .as_ref()
+            .filter(|d| d.applied)
+            .and_then(|d| d.chosen.clone());
+        if let Some(pick) = &auto_pick {
+            input.project_rule = Some(resolver::Candidate::new(
+                pick.provider_id.clone(),
+                Some(pick.model.clone()),
+            ));
+        }
         // `enforce` puts the policy's candidate where the global rule would be;
         // `shadow` changes nothing and is only recorded (A19).
         if let Some(p) = pick.as_ref().filter(|p| p.enforced) {
@@ -8277,7 +8473,155 @@ impl ChatManager {
                 choice.route_rule = Some(p.rule.clone());
             }
         }
+        if let (Some(pick), Some(decision)) = (&auto_pick, &cognitive) {
+            // Our candidate won the project-rule level: it was chosen by the router.
+            if choice.routed_by == resolver::RoutedBy::ProjectRule
+                && choice.provider_id == pick.provider_id
+                && choice.model.as_deref() == Some(pick.model.as_str())
+            {
+                choice.routed_by = resolver::RoutedBy::Auto;
+                choice.route_rule = Some(format!("auto:{}", decision.signature.arm_key()));
+                choice.reason = Some(decision.reason.clone());
+            }
+        } else if let Some(pick) = cognitive.as_ref().and_then(|d| d.chosen.as_ref()) {
+            // Not applied: what the router would have chosen, recorded only.
+            if choice.shadow.is_none() {
+                choice.shadow = Some((pick.provider_id.clone(), Some(pick.model.clone())));
+            }
+        }
         Ok(choice)
+    }
+
+    /// The pool the cognitive router chooses from: every model of every
+    /// reachable instance, with the capabilities and the price nexus reports,
+    /// the health (one probe per instance per window) and the project's consent.
+    async fn routing_pool(
+        &self,
+        routing: &super::provider::cognitive::decider::CognitiveRouting,
+        instances: &[super::provider::settings::InstanceRecord],
+        store_catalog: &super::provider::catalog::StoreCatalog,
+    ) -> Vec<super::provider::cognitive::candidates::ModelFacts> {
+        use super::provider::cognitive::candidates::ModelFacts;
+        use super::provider::resolver::{self, InstanceCatalog};
+        use std::time::{Duration, Instant};
+
+        let mut ids = vec![resolver::CLAUDE_CODE.to_string()];
+        ids.extend(
+            instances
+                .iter()
+                .filter(|i| !resolver::is_remote_instance(&i.id))
+                .map(|i| i.id.clone()),
+        );
+        let mut pool = Vec::new();
+        for id in ids {
+            // The legacy engine can only drive Claude Code.
+            if !self.engine_is_agent(&id) && id != resolver::CLAUDE_CODE {
+                continue;
+            }
+            let Ok(provider) = self.provider_for(&id).await else {
+                continue;
+            };
+            let now = Instant::now();
+            let healthy = match routing.health.get(&id, now) {
+                Some(known) => known,
+                None => {
+                    let ok = provider.health().await.status
+                        != nexus_claude::agent::HealthStatus::Unavailable;
+                    routing.health.put(&id, ok, now);
+                    ok
+                }
+            };
+            let default_model = instances
+                .iter()
+                .find(|i| i.id == id)
+                .and_then(|i| i.default_model.clone());
+            let models = if healthy {
+                tokio::time::timeout(Duration::from_secs(2), provider.catalog())
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let allowed = store_catalog.is_allowed_for_project(&id);
+            let mut seen = std::collections::HashSet::new();
+            let mut entries: Vec<(String, Option<nexus_claude::agent::ModelPrice>)> =
+                models.into_iter().map(|m| (m.id, m.pricing)).collect();
+            if let Some(model) = default_model {
+                if !entries.iter().any(|(m, _)| *m == model) {
+                    entries.push((model, None));
+                }
+            }
+            for (model, price) in entries {
+                if !seen.insert(model.clone()) {
+                    continue;
+                }
+                let caps = provider.capabilities(Some(&model));
+                pool.push(ModelFacts::from_capabilities(
+                    id.clone(),
+                    model,
+                    &caps,
+                    price,
+                    Some(healthy),
+                    allowed,
+                ));
+            }
+        }
+        pool
+    }
+
+    /// Asks the cognitive router about the session being opened. The decision is
+    /// stored by the decider whether it is applied or not.
+    #[allow(clippy::too_many_arguments)]
+    async fn cognitive_decision(
+        &self,
+        routing: &super::provider::cognitive::decider::CognitiveRouting,
+        request: &ChatRequest,
+        project_slug: Option<&str>,
+        role: super::provider::resolver::Role,
+        instances: &[super::provider::settings::InstanceRecord],
+        store_catalog: &super::provider::catalog::StoreCatalog,
+        aliases: &[super::provider::settings::ModelAlias],
+    ) -> Result<Option<super::provider::cognitive::decision::CognitiveDecision>> {
+        use super::provider::cognitive::{
+            candidates::Slot,
+            decision::DecideRequest,
+            scorer::PriorHints,
+            signature::{ContextHints, TaskSignature},
+        };
+        let (settings, _) =
+            super::provider::cognitive::load_routing(self.graph.as_ref(), project_slug).await?;
+        let signature = match role {
+            super::provider::resolver::Role::Pilot => TaskSignature::from_chat_request(
+                &request.message,
+                !request.attachments.is_empty(),
+                project_slug,
+                ContextHints::default(),
+            ),
+            super::provider::resolver::Role::Executor => TaskSignature::from_delegation(
+                request.task_class.as_deref(),
+                None,
+                1,
+                project_slug,
+                ContextHints::default(),
+            ),
+        };
+        routing.set_hints(PriorHints::from_aliases(aliases));
+        let pool = self.routing_pool(routing, instances, store_catalog).await;
+        // A provider, model, alias or run the caller named is never substituted.
+        let named = request.provider.is_some()
+            || request.model.as_deref().is_some_and(|m| !m.is_empty())
+            || request.task_alias.is_some()
+            || request.run_provider.is_some();
+        let mut decide = DecideRequest::new(signature, settings, pool);
+        decide.slot = if named {
+            Slot::Explicit
+        } else {
+            Slot::Automatic
+        };
+        decide.trust = request.permission_mode.as_deref() == Some("bypassPermissions");
+        Ok(Some(routing.decider.decide(&decide).await?))
     }
 
     /// The provider instance, built-in or stored. A stored instance becomes a
@@ -8588,12 +8932,15 @@ impl ChatManager {
                 tool_knowledge: !scope.runner,
                 announce: None,
             });
-            spec.hooks = Some(Arc::new(super::agent_hooks::GraphSessionHooks::new(
-                table,
-                session_id,
-                spec.cwd.display().to_string(),
-                Some(mode.clone()),
-            )));
+            spec.hooks = Some(Arc::new(
+                super::agent_hooks::GraphSessionHooks::new(
+                    table,
+                    session_id,
+                    spec.cwd.display().to_string(),
+                    Some(mode.clone()),
+                )
+                .with_turn_router(self.turn_routing.get(session_id)),
+            ));
         }
         Ok(spec)
     }
@@ -8633,6 +8980,19 @@ impl ChatManager {
             }
             other => other,
         };
+        self.register_turn_router(
+            &sid,
+            provider_id,
+            model,
+            project_slug,
+            OpeningTurn {
+                explicit_model: request.model.is_some(),
+                permission_mode: request.permission_mode.as_deref(),
+                message: &request.message,
+                next_turn: 0,
+            },
+        )
+        .await;
         let spec = self
             .build_agent_spec(AgentSpecInput {
                 cwd: &request.cwd,
@@ -8688,6 +9048,7 @@ impl ChatManager {
         let session = provider.open(spec).await.map_err(|e| {
             // Nothing will ever use this session's token.
             crate::auth::agent_tokens::revoke_session(&sid);
+            self.turn_routing.remove(&sid);
             anyhow::Error::new(e)
         })?;
         // ... and does the model's window hold the tool schemas the session was
@@ -8724,6 +9085,9 @@ impl ChatManager {
         tool_policy: serde_json::Value,
     ) {
         self.warn_if_forced(provider_id, session.as_ref());
+        if let Some(router) = self.turn_routing.get(session_id) {
+            router.set_model_live(session.capabilities().set_model_live);
+        }
         let capabilities = serde_json::to_string(session.capabilities()).unwrap_or_default();
         let token = session.resume_token().map(|t| t.to_wire());
         if let Ok(uuid) = Uuid::parse_str(session_id) {
@@ -8776,6 +9140,21 @@ impl ChatManager {
                 None,
             )
             .await;
+        // A resumed session starts counting its turns again; the harness is the authority
+        // on the index, and nothing says whether its model was named by the request.
+        self.register_turn_router(
+            &sid,
+            &provider_id,
+            &node.model,
+            node.project_slug.as_deref(),
+            OpeningTurn {
+                explicit_model: false,
+                permission_mode: node.permission_mode.as_deref(),
+                message,
+                next_turn: 0,
+            },
+        )
+        .await;
         let spec = self
             .build_agent_spec(AgentSpecInput {
                 cwd: &node.cwd,
@@ -8855,6 +9234,7 @@ impl ChatManager {
     /// disconnect with a 5s timeout — if the CLI hangs, drop the client to
     /// trigger SIGKILL via the Drop impl.
     pub async fn close_session(&self, session_id: &str) -> Result<()> {
+        self.turn_routing.remove(session_id);
         if self.agent_runtime.owns(session_id).await {
             crate::auth::agent_tokens::revoke_session(session_id);
             self.agent_runtime.close(session_id).await?;
@@ -11114,6 +11494,7 @@ mod tests {
             task_context: None,
             scaffolding_override: None,
             runner_context: None,
+            routing_decision_id: None,
         }
     }
 

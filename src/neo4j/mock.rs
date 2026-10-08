@@ -106,6 +106,8 @@ pub struct MockGraphStore {
     pub frozen_active_plan_runs: std::sync::Mutex<Option<Vec<crate::runner::RunnerState>>>,
     /// AgentExecution nodes, by id.
     pub agent_executions: RwLock<HashMap<Uuid, crate::neo4j::agent_execution::AgentExecutionNode>>,
+    /// Routing arms and decisions (cognitive routing).
+    pub routing: crate::chat::provider::cognitive::store::InMemoryRoutingStore,
     /// Failure injection: AgentExecution ids whose `update_agent_execution` errors.
     pub fail_agent_execution_updates: std::sync::Mutex<std::collections::HashSet<Uuid>>,
     /// Failure injection: PlanRun ids whose `update_plan_run` errors.
@@ -307,6 +309,7 @@ impl MockGraphStore {
             plan_runs: RwLock::new(HashMap::new()),
             frozen_active_plan_runs: std::sync::Mutex::new(None),
             agent_executions: RwLock::new(HashMap::new()),
+            routing: Default::default(),
             fail_agent_execution_updates: std::sync::Mutex::new(std::collections::HashSet::new()),
             fail_plan_run_updates: std::sync::Mutex::new(std::collections::HashSet::new()),
             fail_get_plan: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -11648,6 +11651,66 @@ impl GraphStore for MockGraphStore {
         result.sort_by(|a, b| b.fired_at.cmp(&a.fired_at));
         result.truncate(limit as usize);
         Ok(result)
+    }
+
+    // ── Cognitive routing (in-memory mock) ──────────────────────────────────
+
+    async fn get_routing_arm(
+        &self,
+        key: &crate::chat::provider::cognitive::store::ArmKey,
+    ) -> anyhow::Result<Option<crate::chat::provider::cognitive::store::ArmStats>> {
+        use crate::chat::provider::cognitive::store::RoutingArmStore;
+        self.routing.arm(key).await
+    }
+
+    async fn list_routing_arms(
+        &self,
+        class: &str,
+    ) -> anyhow::Result<Vec<crate::chat::provider::cognitive::store::ArmStats>> {
+        use crate::chat::provider::cognitive::store::RoutingArmStore;
+        self.routing.arms_of_class(class).await
+    }
+
+    async fn observe_routing_arm(
+        &self,
+        key: &crate::chat::provider::cognitive::store::ArmKey,
+        observation: &crate::chat::provider::cognitive::store::ArmObservation,
+    ) -> anyhow::Result<crate::chat::provider::cognitive::store::ArmStats> {
+        use crate::chat::provider::cognitive::store::RoutingArmStore;
+        self.routing.observe(key, observation).await
+    }
+
+    async fn put_routing_decision(
+        &self,
+        decision: &crate::chat::provider::cognitive::decision::CognitiveDecision,
+    ) -> anyhow::Result<()> {
+        use crate::chat::provider::cognitive::store::RoutingArmStore;
+        self.routing.put_decision(decision).await
+    }
+
+    async fn get_routing_decision(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<crate::chat::provider::cognitive::decision::CognitiveDecision>> {
+        use crate::chat::provider::cognitive::store::RoutingArmStore;
+        self.routing.decision(id).await
+    }
+
+    async fn list_routing_decisions(
+        &self,
+        filter: &crate::chat::provider::cognitive::store::DecisionFilter,
+    ) -> anyhow::Result<Vec<crate::chat::provider::cognitive::decision::CognitiveDecision>> {
+        use crate::chat::provider::cognitive::store::RoutingArmStore;
+        self.routing.decisions(filter).await
+    }
+
+    async fn set_routing_decision_outcome(
+        &self,
+        id: Uuid,
+        outcome: crate::chat::provider::cognitive::decision::DecisionOutcome,
+    ) -> anyhow::Result<bool> {
+        use crate::chat::provider::cognitive::store::RoutingArmStore;
+        self.routing.set_outcome(id, outcome).await
     }
 
     // ── AgentExecution (in-memory mock) ─────────────────────────────────────

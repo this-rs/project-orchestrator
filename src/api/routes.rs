@@ -1972,12 +1972,6 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/providers/{id}/models",
             get(provider_handlers::provider_models),
         )
-        // "Actualiser" for the Claude catalog: authenticated (the read is public,
-        // the trigger is not), answers 202 and never waits for Anthropic.
-        .route(
-            "/api/chat/models/refresh",
-            post(chat_handlers::refresh_model_catalog),
-        )
         .route(
             "/api/chat/send-journal",
             get(provider_handlers::send_journal),

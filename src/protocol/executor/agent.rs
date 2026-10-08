@@ -337,6 +337,7 @@ async fn execute_via_agent(
         )),
         scaffolding_override: None,
         runner_context: None,
+        routing_decision_id: None,
     };
 
     let session = chat_manager
