@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 // ============================================================================
 
 /// Parsed information about a single git worktree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WorktreeInfo {
     /// Absolute path to the worktree directory.
     pub path: PathBuf,
@@ -33,6 +33,13 @@ pub struct WorktreeInfo {
     pub head_sha: String,
     /// Whether the worktree is in detached HEAD state.
     pub is_detached: bool,
+    /// `locked` (optionally with a reason) — `git worktree lock` was used.
+    pub is_locked: bool,
+    /// `prunable` — the worktree directory is gone and `git worktree prune`
+    /// would drop its administrative files.
+    pub is_prunable: bool,
+    /// `bare` — the main entry of a bare repository (no working tree).
+    pub is_bare: bool,
 }
 
 /// Result of cherry-picking commits from a single worktree.
@@ -103,48 +110,54 @@ impl WorktreeCollector {
     }
 
     /// Pure parsing logic, separated for testability.
-    fn parse_worktree_porcelain(output: &str) -> Vec<WorktreeInfo> {
+    ///
+    /// Understands the attributes `git worktree list --porcelain` can emit:
+    /// `worktree`, `HEAD`, `branch`, `detached`, `bare`, and `locked` /
+    /// `prunable` (each with an optional free-text reason after a space).
+    pub fn parse_worktree_porcelain(output: &str) -> Vec<WorktreeInfo> {
         let mut worktrees = Vec::new();
-        let mut current_path: Option<PathBuf> = None;
-        let mut current_head = String::new();
-        let mut current_branch: Option<String> = None;
-        let mut is_detached = false;
+        let mut current: Option<WorktreeInfo> = None;
 
         for line in output.lines() {
             if let Some(path) = line.strip_prefix("worktree ") {
-                current_path = Some(PathBuf::from(path));
-            } else if let Some(head) = line.strip_prefix("HEAD ") {
-                current_head = head.to_string();
-            } else if let Some(branch) = line.strip_prefix("branch ") {
-                current_branch = Some(
-                    branch
-                        .strip_prefix("refs/heads/")
-                        .unwrap_or(branch)
-                        .to_string(),
-                );
-            } else if line == "detached" {
-                is_detached = true;
+                // A new record starts: flush a previous one that had no blank
+                // line separator (defensive — git always emits one).
+                if let Some(done) = current.take() {
+                    worktrees.push(done);
+                }
+                current = Some(WorktreeInfo {
+                    path: PathBuf::from(path),
+                    ..Default::default()
+                });
             } else if line.is_empty() {
-                if let Some(path) = current_path.take() {
-                    worktrees.push(WorktreeInfo {
-                        path,
-                        branch: current_branch.take(),
-                        head_sha: std::mem::take(&mut current_head),
-                        is_detached,
-                    });
-                    is_detached = false;
+                if let Some(done) = current.take() {
+                    worktrees.push(done);
+                }
+            } else if let Some(wt) = current.as_mut() {
+                if let Some(head) = line.strip_prefix("HEAD ") {
+                    wt.head_sha = head.to_string();
+                } else if let Some(branch) = line.strip_prefix("branch ") {
+                    wt.branch = Some(
+                        branch
+                            .strip_prefix("refs/heads/")
+                            .unwrap_or(branch)
+                            .to_string(),
+                    );
+                } else if line == "detached" {
+                    wt.is_detached = true;
+                } else if line == "bare" {
+                    wt.is_bare = true;
+                } else if line == "locked" || line.starts_with("locked ") {
+                    wt.is_locked = true;
+                } else if line == "prunable" || line.starts_with("prunable ") {
+                    wt.is_prunable = true;
                 }
             }
         }
 
         // Handle last entry if no trailing blank line
-        if let Some(path) = current_path.take() {
-            worktrees.push(WorktreeInfo {
-                path,
-                branch: current_branch.take(),
-                head_sha: current_head,
-                is_detached,
-            });
+        if let Some(done) = current.take() {
+            worktrees.push(done);
         }
 
         worktrees
@@ -696,6 +709,20 @@ mod tests {
     // ----------------------------------------------------------------
 
     #[test]
+    fn test_parse_porcelain_locked_prunable_bare_and_slashed_branch() {
+        let output = "worktree /repo.git\nbare\n\n\
+worktree /wt/a b\nHEAD aaa\nbranch refs/heads/feat/deep/name\nlocked being moved\n\n\
+worktree /wt/c\nHEAD bbb\ndetached\nlocked\nprunable gitdir file points to non-existent location\n";
+        let wts = WorktreeCollector::parse_worktree_porcelain(output);
+        assert_eq!(wts.len(), 3);
+        assert!(wts[0].is_bare && wts[0].branch.is_none());
+        assert_eq!(wts[1].path, PathBuf::from("/wt/a b"));
+        assert_eq!(wts[1].branch.as_deref(), Some("feat/deep/name"));
+        assert!(wts[1].is_locked && !wts[1].is_prunable);
+        assert!(wts[2].is_detached && wts[2].is_locked && wts[2].is_prunable);
+    }
+
+    #[test]
     fn test_parse_single_worktree() {
         let output = "\
 worktree /home/user/project
@@ -866,6 +893,7 @@ branch refs/heads/feature
                         branch: Some("wt-1".to_string()),
                         head_sha: "aaa".to_string(),
                         is_detached: false,
+                        ..Default::default()
                     },
                     merge: MergeResult {
                         merged: vec!["sha1".to_string(), "sha2".to_string()],
@@ -879,6 +907,7 @@ branch refs/heads/feature
                         branch: Some("wt-2".to_string()),
                         head_sha: "bbb".to_string(),
                         is_detached: false,
+                        ..Default::default()
                     },
                     merge: MergeResult {
                         merged: vec![],
