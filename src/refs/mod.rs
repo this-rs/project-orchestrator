@@ -22,12 +22,12 @@
 
 pub mod access;
 pub mod block;
-#[cfg(test)]
-mod contract_tests;
 pub mod label;
 pub mod registry;
 pub mod resolvers;
 pub mod search;
+#[cfg(test)]
+mod search_contract;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod types;
