@@ -9,16 +9,18 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.16_aarch64.dmg"><img src="https://img.shields.io/badge/Download_for_macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS" height="40"></a>
-  &nbsp;&nbsp;
-  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.16_x64-setup.exe"><img src="https://img.shields.io/badge/Download_for_Windows-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows" height="40"></a>
-  &nbsp;&nbsp;
-  <a href="#desktop-app"><img src="https://img.shields.io/badge/Download_for_Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Download for Linux" height="40"></a>
+  <a href="https://project-orchestrator.fr/install/"><img src="https://img.shields.io/badge/Install-6366F1?style=for-the-badge" alt="Install Project Orchestrator" height="40"></a>
 </p>
 
 <p align="center">
-  <a href="#desktop-app">All download options (Intel Mac, .msi, .deb, .rpm...)</a>
+  <strong>Other ways to install</strong> · <a href="#desktop-app">All download options</a>
 </p>
+
+```bash
+brew install this-rs/tap/project-orchestrator                                                    # macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/this-rs/project-orchestrator/main/install.sh | sh  # macOS / Linux
+irm https://raw.githubusercontent.com/this-rs/project-orchestrator/main/install.ps1 | iex       # Windows (PowerShell)
+```
 
 <p align="center">
   <a href="https://github.com/this-rs/project-orchestrator/actions/workflows/ci.yml"><img src="https://github.com/this-rs/project-orchestrator/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -62,19 +64,19 @@ Project Orchestrator gives your AI agents a shared brain. Instead of each agent 
 
 ### Desktop App
 
-Download the desktop app for your platform:
+Download the desktop app for your platform. Every link below goes through [project-orchestrator.fr/install](https://project-orchestrator.fr/install/), which looks up the latest release and downloads the right file, so these links do not change from one version to the next.
 
 | Platform | Download | Type |
 |----------|----------|------|
-| **macOS** (Apple Silicon) | [Download .dmg](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.16_aarch64.dmg) | M1/M2/M3/M4 |
-| **macOS** (Intel) | [Download .dmg](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.16_x64.dmg) | Intel Mac |
-| **Windows** (64-bit) | [Download .exe](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.16_x64-setup.exe) | Installer |
-| **Windows** (64-bit MSI) | [Download .msi](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.16_x64_en-US.msi) | MSI |
-| **Linux** (x86_64 AppImage) | [Download .AppImage](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.16_amd64.AppImage) | Intel/AMD |
-| **Linux** (Debian/Ubuntu x86_64) | [Download .deb](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.16_amd64.deb) | apt/dpkg |
-| **Linux** (Debian/Ubuntu **arm64**) | [Download .deb](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.16_arm64.deb) | apt/dpkg — ARM64 (DGX Spark, Ampere, RPi…) |
-| **Linux** (Fedora/RHEL x86_64) | [Download .rpm](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.16-1.x86_64.rpm) | dnf/rpm |
-| **Linux** (Fedora/RHEL arm64) | [Download .rpm](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.16-1.aarch64.rpm) | dnf/rpm |
+| **macOS** (Apple Silicon) | [Download .dmg](https://project-orchestrator.fr/install/?target=macos-arm64) | M1/M2/M3/M4 |
+| **macOS** (Intel) | [Download .dmg](https://project-orchestrator.fr/install/?target=macos-x64) | Intel Mac |
+| **Windows** (64-bit) | [Download .exe](https://project-orchestrator.fr/install/?target=windows-exe) | Installer |
+| **Windows** (64-bit MSI) | [Download .msi](https://project-orchestrator.fr/install/?target=windows-msi) | MSI |
+| **Linux** (x86_64 AppImage) | [Download .AppImage](https://project-orchestrator.fr/install/?target=linux-appimage) | Intel/AMD |
+| **Linux** (Debian/Ubuntu x86_64) | [Download .deb](https://project-orchestrator.fr/install/?target=linux-deb-x64) | apt/dpkg |
+| **Linux** (Debian/Ubuntu **arm64**) | [Download .deb](https://project-orchestrator.fr/install/?target=linux-deb-arm64) | apt/dpkg — ARM64 (DGX Spark, Ampere, RPi…) |
+| **Linux** (Fedora/RHEL x86_64) | [Download .rpm](https://project-orchestrator.fr/install/?target=linux-rpm-x64) | dnf/rpm |
+| **Linux** (Fedora/RHEL arm64) | [Download .rpm](https://project-orchestrator.fr/install/?target=linux-rpm-arm64) | dnf/rpm |
 
 > All releases are available on the [Releases page](https://github.com/this-rs/project-orchestrator/releases/latest).
 
@@ -100,7 +102,7 @@ Options:
 
 ```bash
 # Install a specific version
-curl -fsSL https://…/install.sh | sh -s -- --version 0.0.16
+curl -fsSL https://…/install.sh | sh -s -- --version <version>
 
 # Install without the embedded frontend (lighter)
 curl -fsSL https://…/install.sh | sh -s -- --no-frontend
@@ -142,9 +144,11 @@ docker compose up -d
 ### Debian / Ubuntu (apt)
 
 ```bash
-# Download and install the .deb package
-curl -LO https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator_0.0.16-1_amd64.deb
-sudo dpkg -i project-orchestrator_0.0.16-1_amd64.deb
+# Download the .deb of the latest release (the file name carries the version, so it is looked up)
+curl -s https://api.github.com/repos/this-rs/project-orchestrator/releases/latest \
+  | grep -o 'https://[^"]*/project-orchestrator_[^"/]*_amd64\.deb' \
+  | xargs curl -LO
+sudo dpkg -i project-orchestrator_*_amd64.deb
 
 # Start the service
 sudo systemctl enable --now project-orchestrator
@@ -155,9 +159,11 @@ sudo systemctl enable --now project-orchestrator
 ### Fedora / RHEL (rpm)
 
 ```bash
-# Download and install the .rpm package
-curl -LO https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.16-1.x86_64.rpm
-sudo rpm -i project-orchestrator-0.0.16-1.x86_64.rpm
+# Download the .rpm of the latest release (the file name carries the version, so it is looked up)
+curl -s https://api.github.com/repos/this-rs/project-orchestrator/releases/latest \
+  | grep -o 'https://[^"]*/project-orchestrator-[^"/]*\.x86_64\.rpm' \
+  | xargs curl -LO
+sudo rpm -i project-orchestrator-*.x86_64.rpm
 ```
 
 ---
