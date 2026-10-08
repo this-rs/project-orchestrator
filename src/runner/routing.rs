@@ -43,6 +43,20 @@ impl RoutingPool for FixedPool {
     }
 }
 
+/// The production pool: the candidates the chat manager routes sessions from,
+/// so a plan run and a chat session see the same instances, consents and probes.
+pub struct ChatRoutingPool {
+    /// Supplies the instances, the consents and the probe memory of the chat router.
+    pub manager: Arc<crate::chat::ChatManager>,
+}
+
+#[async_trait]
+impl RoutingPool for ChatRoutingPool {
+    async fn facts(&self, project_slug: Option<&str>) -> Vec<ModelFacts> {
+        self.manager.routing_pool_for(project_slug).await
+    }
+}
+
 /// What the runner, a delegation or a utility call needs to route work.
 #[derive(Clone)]
 pub struct RoutingHandle {

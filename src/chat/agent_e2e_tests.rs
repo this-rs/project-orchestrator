@@ -1084,6 +1084,23 @@ mod cognitive_routing {
     }
 
     #[tokio::test]
+    async fn a_manual_switch_to_another_model_counts_as_an_override_when_the_session_closes() {
+        let s = setup("full", "auto", true).await;
+        let session_id = open_routed_session(&s).await;
+
+        s.manager
+            .set_session_model(&session_id, "some-other-model")
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+        s.manager.close_session(&session_id).await.unwrap();
+
+        let closed = decisions(&s).await.remove(0);
+        let outcome = closed.outcome.expect("the close recorded an outcome");
+        assert!(outcome.overridden, "the switch by hand is counted");
+        assert!(outcome.reward.is_some(), "an override closes with a reward");
+    }
+
+    #[tokio::test]
     async fn mixed_routes_an_executor_by_auto_and_leaves_the_pilot_on_the_primary() {
         let s = setup("mixed", "auto", true).await;
         let executor = choose(&s, &executor_request()).await;

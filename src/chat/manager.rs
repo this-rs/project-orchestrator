@@ -8750,7 +8750,10 @@ impl ChatManager {
     /// recorded, nothing is learned. A model switched by hand is the one signal a
     /// chat gives: that closes the decision with the override penalty.
     async fn close_routing_decision(&self, session_id: &str) {
-        use super::provider::cognitive::feedback::{close_decision, Outcome};
+        use super::provider::cognitive::{
+            demotion::{apply_demotion, should_demote},
+            feedback::{close_decision_with, CollectorSink, Outcome, TrajectorySink},
+        };
         let decision_id = self
             .open_decisions
             .lock()
@@ -8785,9 +8788,10 @@ impl ChatManager {
         };
         let overridden = decision.outcome.as_ref().is_some_and(|o| o.overridden);
         if overridden {
+            let project = decision.signature.project_slug.clone();
             let settings = match super::provider::cognitive::load_routing(
                 self.graph.as_ref(),
-                decision.signature.project_slug.as_deref(),
+                project.as_deref(),
             )
             .await
             {
@@ -8804,10 +8808,37 @@ impl ChatManager {
                 user_overrode_model: true,
                 ..Outcome::default()
             };
+            // The closed decision reaches the trajectory collector when one is wired.
+            let collector = self
+                .trajectory_collector
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let sink = collector.map(CollectorSink::new);
+            let sink: Option<&dyn TrajectorySink> = sink.as_ref().map(|s| s as &dyn TrajectorySink);
             if let Err(error) =
-                close_decision(store.as_ref(), &settings, decision_id, &outcome).await
+                close_decision_with(store.as_ref(), &settings, sink, decision_id, &outcome).await
             {
                 warn!(%session_id, %decision_id, %error, "closing the routing decision failed");
+                return;
+            }
+            // The override is the only close that moves an arm: check its class for demotion.
+            let class = decision.signature.arm_key();
+            match should_demote(store.as_ref(), &class, project.as_deref(), &settings).await {
+                Ok(Some(reason)) => {
+                    if let Err(error) = apply_demotion(
+                        self.graph.as_ref(),
+                        project.as_deref(),
+                        &reason,
+                        self.event_emitter.as_deref(),
+                    )
+                    .await
+                    {
+                        warn!(%session_id, class, %error, "the demotion could not be applied");
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => warn!(%session_id, class, %error, "demotion check failed"),
             }
             return;
         }
