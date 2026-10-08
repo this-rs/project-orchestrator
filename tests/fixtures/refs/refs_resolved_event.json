@@ -1,0 +1,27 @@
+{
+  "_contract_version": 1,
+  "_description": "Chat event refs_resolved, sent once per turn that carries references, after the user_message and before the first assistant event. One entry per reference, in message order. status: ok (resolved), truncated (resolved, content cut to the prompt budget), not_found (missing, OR denied, OR the lookup failed: the server never lets a client tell these apart), forbidden (RESERVED: only sent if the server is configured to disclose existence; the current server never sends it, but the client must render it like not_found). label, subtitle, project, workspace and entity_status are present only for ok and truncated; they are written by the server, never echoed from the client. A client must not infer anything about a not_found entry beyond 'unavailable'.",
+  "event": {
+    "type": "refs_resolved",
+    "refs": [
+      {
+        "kind": "plan",
+        "id": "57cf05c9-25b6-495d-ab07-de4b11d64736",
+        "status": "ok",
+        "label": "Chat : références #/@",
+        "subtitle": "12 tâches",
+        "project": { "id": "00333b5f-2d0a-4467-9c98-155e55d2b7e5", "slug": "project-orchestrator", "name": "Project Orchestrator" },
+        "entity_status": "in_progress"
+      },
+      {
+        "kind": "rfc",
+        "id": "2191fcb0-e07c-49c1-9f29-cb9f7441f914",
+        "status": "truncated",
+        "label": "RFC — Références (#/@), glisser-déposer et agents lancés depuis l'interface",
+        "entity_status": "active"
+      },
+      { "kind": "task", "id": "3adeffc9-c8b0-4e2f-a674-55bfcb293433", "status": "not_found" },
+      { "kind": "note", "id": "9f1c2b7e-4d3a-4e58-8a61-0b2c7d9e1a10", "status": "forbidden" }
+    ]
+  }
+}

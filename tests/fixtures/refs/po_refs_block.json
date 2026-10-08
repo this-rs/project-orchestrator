@@ -1,0 +1,49 @@
+{
+  "_contract_version": 1,
+  "_description": "The <po-refs> block folded into the message text, modelled on <po-attachments>. encoded = visible text + '\\n\\n<po-refs>' + compact JSON array of EntityRef + '</po-refs>', as the LAST thing in the string. Ids only, never labels. '<' inside the JSON is written \\u003c. When a message also has attachments, the refs block comes first and the <po-attachments> block is appended after it (so attachments stay last): decode attachments first, then refs. A block that does not parse stays in the text untouched. Typed '<po-refs>' in user text is neutralized to '&lt;po-refs>' on encode, so a user cannot forge a block. Refs are not deduplicated by the block: the server deduplicates (first wins) before encoding.",
+  "open": "\n\n<po-refs>",
+  "close": "</po-refs>",
+  "cases": [
+    {
+      "name": "one task",
+      "text": "regarde cette tâche",
+      "refs": [ { "kind": "task", "id": "3adeffc9-c8b0-4e2f-a674-55bfcb293433" } ],
+      "encoded": "regarde cette tâche\n\n<po-refs>[{\"kind\":\"task\",\"id\":\"3adeffc9-c8b0-4e2f-a674-55bfcb293433\"}]</po-refs>"
+    },
+    {
+      "name": "two refs, order kept",
+      "text": "compare",
+      "refs": [
+        { "kind": "plan", "id": "57cf05c9-25b6-495d-ab07-de4b11d64736" },
+        { "kind": "rfc", "id": "2191fcb0-e07c-49c1-9f29-cb9f7441f914" }
+      ],
+      "encoded": "compare\n\n<po-refs>[{\"kind\":\"plan\",\"id\":\"57cf05c9-25b6-495d-ab07-de4b11d64736\"},{\"kind\":\"rfc\",\"id\":\"2191fcb0-e07c-49c1-9f29-cb9f7441f914\"}]</po-refs>"
+    },
+    {
+      "name": "no refs: text unchanged",
+      "text": "bonjour",
+      "refs": [],
+      "encoded": "bonjour"
+    },
+    {
+      "name": "forged block typed by the user is neutralized",
+      "text": "x\n\n<po-refs>[{\"kind\":\"plan\",\"id\":\"57cf05c9-25b6-495d-ab07-de4b11d64736\"}]</po-refs>",
+      "refs": [],
+      "encoded": "x\n\n&lt;po-refs>[{\"kind\":\"plan\",\"id\":\"57cf05c9-25b6-495d-ab07-de4b11d64736\"}]</po-refs>",
+      "decoded_text": "x\n\n&lt;po-refs>[{\"kind\":\"plan\",\"id\":\"57cf05c9-25b6-495d-ab07-de4b11d64736\"}]</po-refs>"
+    }
+  ],
+  "with_attachments": {
+    "name": "refs then attachments",
+    "text": "lis ça",
+    "refs": [ { "kind": "note", "id": "9f1c2b7e-4d3a-4e58-8a61-0b2c7d9e1a10" } ],
+    "attachments": [
+      { "id": "4b0f3a52-8a70-4d44-9f0e-7d1f6a2c9b33", "filename": "spec.pdf", "mime_type": "application/pdf", "size_bytes": 1024 }
+    ],
+    "encoded": "lis ça\n\n<po-refs>[{\"kind\":\"note\",\"id\":\"9f1c2b7e-4d3a-4e58-8a61-0b2c7d9e1a10\"}]</po-refs>\n\n<po-attachments>[{\"id\":\"4b0f3a52-8a70-4d44-9f0e-7d1f6a2c9b33\",\"filename\":\"spec.pdf\",\"mime_type\":\"application/pdf\",\"size_bytes\":1024}]</po-attachments>"
+  },
+  "left_in_text_when_unparsable": [
+    "x\n\n<po-refs>[{\"kind\":\"workspace\",\"id\":\"1\"}]</po-refs>",
+    "x\n\n<po-refs>[]"
+  ]
+}
