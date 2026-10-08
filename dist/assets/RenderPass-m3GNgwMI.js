@@ -1,4 +1,4 @@
-import{c as p,a7 as m,B as g,ce as n,di as c,dh as _,V as u,dg as C,H as x,b6 as w,dj as v,d as S}from"./OrbitControls-qiZcAhD0.js";const b={name:"CopyShader",uniforms:{tDiffuse:{value:null},opacity:{value:1}},vertexShader:`
+import{c as p,a7 as m,B as g,ce as n,dg as c,dh as _,V as u,di as C,H as x,b6 as w,dj as v,d as S}from"./OrbitControls-jQ2hnDk6.js";const b={name:"CopyShader",uniforms:{tDiffuse:{value:null},opacity:{value:1}},vertexShader:`
 
 		varying vec2 vUv;
 
