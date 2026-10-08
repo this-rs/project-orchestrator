@@ -253,6 +253,9 @@ proptest = "1"
 # The scripted provider of nexus (a harness that calls the session hooks), for the tests of
 # per-turn model routing. Same pin as the dependency above.
 nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "fbb4a3239bd8b951f1e25486d3c26366002ad5d3", features = ["testkit"] }
+# A real WebSocket client, to test the chat handler end to end (already in the lock
+# tree through axum).
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 
 [[bin]]
 name = "orchestrator"

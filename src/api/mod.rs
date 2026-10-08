@@ -26,6 +26,8 @@ pub mod provider_handlers;
 pub mod query;
 pub mod reason_handlers;
 pub mod refs_handlers;
+#[cfg(test)]
+mod refs_ws_tests;
 pub mod registry_handlers;
 pub mod rfc_handlers;
 pub mod routes;
