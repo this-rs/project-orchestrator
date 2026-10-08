@@ -9,8 +9,11 @@
 //! unchanged until then.
 
 pub mod candidates;
+pub mod decision;
+pub mod feedback;
 pub mod mode;
 pub mod signature;
+pub mod store;
 
 pub use mode::{
     effective_routing, parse_routing_settings, validate_routing_settings, EffectiveRouting,
