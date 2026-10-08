@@ -483,10 +483,10 @@ mod tests {
 
     #[tokio::test]
     async fn the_scope_is_pushed_to_the_store_so_a_small_page_is_not_starved() {
-        // Five newer plans of beta, one older of alpha: with a page of one the
-        // store must be asked for alpha, not for the newest.
+        // A hundred plans of beta, one of alpha: with a page of one the store must
+        // be asked for alpha, not for whatever it lists first.
         let w = world().await;
-        for i in 0..5 {
+        for i in 0..100 {
             let p = PlanNode::new_for_project(format!("beta {i}"), "d".into(), "t".into(), 1, w.b);
             w.graph.create_plan(&p).await.unwrap();
         }
@@ -852,5 +852,38 @@ mod fan_out_tests {
         .await
         .unwrap();
         assert!(out.items.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pushdown_tests {
+    use super::*;
+    use crate::refs::test_support::{note_with, user, world};
+
+    /// The mock honours `workspace_slug` for notes (not for plans or tasks),
+    /// so the push-down of the workspace is observable on notes.
+    #[tokio::test]
+    async fn the_workspace_is_pushed_to_the_store_for_notes() {
+        let w = world().await;
+        for i in 0..100 {
+            let n = note_with(
+                Some(w.b),
+                crate::notes::NoteType::Tip,
+                &format!("beta {i}"),
+                vec![],
+            );
+            w.graph.create_note(&n).await.unwrap();
+        }
+        let q = SearchQuery {
+            kinds: vec![RefKind::Note],
+            workspace_slug: Some("po".into()),
+            limit: 1,
+            ..RefSearchParams::default().into_query().unwrap()
+        };
+        let out = search(w.graph.clone(), &AccessPolicy::open_instance(), &user(), &q)
+            .await
+            .unwrap();
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(out.items[0].id, w.note_a.id);
     }
 }
