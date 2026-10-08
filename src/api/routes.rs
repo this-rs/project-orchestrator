@@ -2014,6 +2014,14 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(routing_handlers::get_routing).put(routing_handlers::put_routing),
         )
         .route(
+            "/api/chat/routing/decisions",
+            get(routing_handlers::list_decisions),
+        )
+        .route(
+            "/api/chat/routing/report",
+            get(routing_handlers::get_report),
+        )
+        .route(
             "/api/projects/{slug}/routing",
             get(routing_handlers::get_project_routing)
                 .put(routing_handlers::put_project_routing)

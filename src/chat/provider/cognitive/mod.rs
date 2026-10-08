@@ -10,8 +10,10 @@
 
 pub mod candidates;
 pub mod decision;
+pub mod demotion;
 pub mod feedback;
 pub mod mode;
+pub mod report;
 pub mod signature;
 pub mod store;
 
