@@ -91,3 +91,30 @@ flowchart TD
     SIG --> FILTER
     FACTSGAP["🟠 ModelFacts::from_capabilities existe mais le listing et les prix nexus ne l'appellent pas encore : branchement dans resolve_provider_choice (B-R4)"]
     FILTER -.-> FACTSGAP
+
+    subgraph feedback["cognitive/feedback.rs — retour d'expérience (B-R5)"]
+        REWARD["✅ reward(outcome, settings) ∈ [0,1] = reward_with(.., RewardContext{class_median_cost}) : succès 0,5 (échec 0, inconnu 0,25) ; +0,2 si réussi du premier coup ; −0,1 par tentative en plus ; vérification ±0,15 ;<br/>coût ≤ médiane +0,15, dégressif jusqu'à 0 à 3× la médiane, inconnu = 0 (jamais « gratuit») ; durée inconnue = 0 ; override manuel −0,3 ; interruption −0,2 ; borné [0,1]<br/>test : the_reward_of_each_case, more_attempts_never_raise_the_reward, a_costlier_run_never_earns_more_and_bad_medians_are_ignored"]
+        CLOSE["✅ close_decision / close_decision_with(sink) : écrit l'outcome, observe le bras choisi, UNE fois par décision (idempotent), puis pousse la trajectoire<br/>test : closing_a_decision_updates_its_arm_once, closing_with_a_sink_sends_one_trajectory_and_only_once"]
+        OVR["✅ mark_override(store, decision_id) pose DecisionOutcome.overridden avant la clôture ; close_decision le compte (−0,3) ; trop tard une fois clos<br/>test : a_manual_switch_flagged_before_the_close_lowers_the_reward<br/>🟠 appelant à ajouter : ChatManager::set_session_model (manager.rs, autre propriétaire)"]
+        TRAJ["✅ CollectorSink → TrajectoryCollector::record_decision(action_type routing.select_model, params {provider, model, arm, score, explored, applied, reward}, confidence = 1 − H(p)/ln k) ;<br/>session = session de chat, sinon run, sinon tâche, sinon la décision<br/>test : the_trajectory_record_describes_the_routing_choice, confidence_is_one_minus_normalised_entropy<br/>🟠 aucun appelant de production ne passe encore un CollectorSink"]
+        REWARD --> CLOSE
+        OVR --> CLOSE
+        CLOSE --> TRAJ
+    end
+    SIG -.-> CLOSE
+
+    subgraph rapport["cognitive/report.rs + routes — rapport shadow"]
+        REPORT["✅ build_report(store, projet, from, to) → {decisions, applied, agreement_rate (choisi == utilisé, None sans paire comparable), estimated_cost_delta_usd, skipped_cost_decisions, by_class[], by_arm[]} ;<br/>delta = Σ (prix du choix − prix de l'utilisé) × jetons réels, bases JAMAIS mélangées (seules reported/priced, identiques des deux côtés), sinon ignoré et compté ; None si rien ne qualifie, jamais 0<br/>test : agreement_counts_only_decisions_with_both_picks, the_cost_delta_sums_only_decisions_on_one_basis_and_counts_the_rest, by_arm_averages_the_closed_decisions_and_an_unknown_cost_is_not_zero"]
+        RROUTES["✅ GET /api/chat/routing/decisions (récent d'abord, pages limit ≤ 200, has_more) et GET /api/chat/routing/report : jeton HUMAIN seulement (403 agent) ; store absent = page et rapport vides<br/>test : decisions_come_newest_first_in_pages_filtered_by_project, the_log_and_the_report_are_empty_without_a_store_and_human_only"]
+        PRICEGAP["🟠 NoPrices par défaut : sans PriceLookup branché sur les prix nexus, estimated_cost_delta_usd reste None ; le store Neo4j n'est pas encore installé dans set_routing_store"]
+        REPORT --> RROUTES
+        REPORT -.-> PRICEGAP
+    end
+    CLOSE --> REPORT
+
+    subgraph demotion["cognitive/demotion.rs — rétrogradation automatique"]
+        SHOULD["✅ should_demote(store, classe, projet, réglages) : stage auto, moyenne des demote_after dernières décisions APPLIQUÉES clôturées < moyenne des non appliquées de la même classe − 0,1 ; moins de demote_after de chaque côté = None<br/>test : a_learnt_arm_clearly_below_the_baseline_is_demoted (rouge sans la comparaison), within_the_margin_or_better_nothing_happens, too_few_observations_on_either_side_is_not_evidence"]
+        APPLY["✅ apply_demotion : stage = shadow dans le LlmSetting du scope (surcharge projet créée depuis l'effectif si besoin), note gotcha high (au mieux), événement routing_demoted ; idempotent<br/>test : applying_a_demotion_writes_shadow_leaves_a_note_and_emits<br/>🟠 l'événement est un CrudEvent project/updated à payload event=routing_demoted (pas de type d'entité dédié) ; personne n'appelle encore should_demote en production"]
+        SHOULD --> APPLY
+    end
+    CLOSE --> SHOULD
