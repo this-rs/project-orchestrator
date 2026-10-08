@@ -76,18 +76,19 @@ pub async fn create_session(
         }
     }
 
-    // Fold attached documents into the message once, before either path: both
-    // persist and broadcast `request.message`, so the chips survive replay.
-    if !request.attachments.is_empty() {
-        request.message = crate::chat::message_attachments::compose(
-            &state.orchestrator.neo4j_arc(),
-            &request.message,
-            &request.attachments,
-        )
-        .await
-        .map_err(|e| AppError::BadRequest(e.to_string()))?;
-        request.attachments.clear();
-    }
+    // Fold the references and the attached documents into the message once,
+    // before either path: both persist and broadcast `request.message`, so the
+    // chips survive replay. Also makes inert any block typed into the text.
+    request.message = crate::refs::compose::compose_user_message(
+        &state.orchestrator.neo4j_arc(),
+        &request.message,
+        &request.refs,
+        &request.attachments,
+        chat_manager.refs_v1_enabled(),
+    )
+    .await?;
+    request.attachments.clear();
+    request.refs.clear();
 
     // ── Resume path ────────────────────────────────────────────────────────
     if let Some(sid) = request.session_id.clone() {
@@ -826,6 +827,10 @@ pub struct SendMessageRequest {
     /// Ids of documents already uploaded through `POST /api/documents`.
     #[serde(default)]
     pub attachments: Vec<Uuid>,
+    /// References the message points at (`{kind, id}` objects). Checked and
+    /// folded into the message by `refs::compose`; ignored when `refs_v1` is off.
+    #[serde(default)]
+    pub refs: Vec<serde_json::Value>,
 }
 
 const PERMISSION_GONE_REASON: &str = "le CLI qui demandait s'est arrêté ; continue par un message \
@@ -944,13 +949,14 @@ pub async fn send_session_message(
     // Same side effect as the WS path.
     super::ws_chat_handler::spawn_entity_extraction(&state, &sid, &body.content);
 
-    let content = crate::chat::message_attachments::compose(
+    let content = crate::refs::compose::compose_user_message(
         &state.orchestrator.neo4j_arc(),
         &body.content,
+        &body.refs,
         &body.attachments,
+        chat_manager.refs_v1_enabled(),
     )
-    .await
-    .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    .await?;
 
     match chat_manager
         .route_user_message(&sid, &content, claims.as_ref())
@@ -2498,6 +2504,7 @@ mod tests {
         let request = crate::chat::types::ChatRequest {
             routing_mode: None,
             attachments: Vec::new(),
+            refs: Vec::new(),
             message: "hi".into(),
             session_id: None,
             cwd: std::env::temp_dir().display().to_string(),
@@ -3914,15 +3921,22 @@ mod tests {
     }
 
     async fn action_harness(cli_path: Option<&str>) -> ActionHarness {
+        action_harness_with(cli_path, true).await
+    }
+
+    async fn action_harness_with(cli_path: Option<&str>, refs_v1: bool) -> ActionHarness {
         let app_state = mock_app_state();
         let graph = app_state.neo4j.clone();
         let mut config = test_support::chat_config();
         config.claude_cli_path = cli_path.map(str::to_string);
-        let manager = Arc::new(ChatManager::new_without_memory(
-            app_state.neo4j.clone(),
-            app_state.meili.clone(),
-            config,
-        ));
+        let manager = Arc::new(
+            ChatManager::new_without_memory(
+                app_state.neo4j.clone(),
+                app_state.meili.clone(),
+                config,
+            )
+            .with_refs_v1(refs_v1),
+        );
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -4261,6 +4275,150 @@ mod tests {
         let (status, resp) = call(&h.app, auth_post(&msg_uri(sid), &body)).await;
         assert_ne!(status, StatusCode::BAD_REQUEST, "{resp}");
         assert_ne!(status, StatusCode::UNPROCESSABLE_ENTITY, "{resp}");
+    }
+
+    // ----- references (`refs_v1`) over REST -----
+
+    fn errors_fixture() -> serde_json::Value {
+        let path = format!(
+            "{}/tests/fixtures/refs/errors.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn fixture_case(name: &str) -> serde_json::Value {
+        errors_fixture()["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("no fixture case {name}"))["body"]
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn a_message_with_invalid_refs_is_a_400_with_the_body_of_the_fixture() {
+        let h = action_harness(Some("/nonexistent/claude-cli")).await;
+        let sid = seed_session(&h).await;
+        let plan = Uuid::new_v4();
+        // unknown kind at index 2
+        let body = format!(
+            r#"{{"content":"x","refs":[{{"kind":"plan","id":"{plan}"}},{{"kind":"note","id":"{plan}"}},{{"kind":"workspace","id":"{plan}"}}]}}"#
+        );
+        let (status, resp) = call(&h.app, auth_post(&msg_uri(sid), &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert_eq!(resp, fixture_case("unknown kind at index 2"));
+
+        // more than 20
+        let many: Vec<_> = (1..=21u128)
+            .map(|n| serde_json::json!({"kind": "task", "id": Uuid::from_u128(n)}))
+            .collect();
+        let body = serde_json::json!({"content": "x", "refs": many}).to_string();
+        let (status, resp) = call(&h.app, auth_post(&msg_uri(sid), &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(resp, fixture_case("too many refs"));
+
+        // reserved kind, bad id
+        let body = format!(r#"{{"content":"x","refs":[{{"kind":"persona","id":"{plan}"}}]}}"#);
+        let (_, resp) = call(&h.app, auth_post(&msg_uri(sid), &body)).await;
+        assert_eq!(resp, fixture_case("reserved kind"));
+        let body =
+            r#"{"content":"x","refs":[{"kind":"plan","id":"nope"},{"kind":"plan","id":"nope"}]}"#;
+        let (_, resp) = call(&h.app, auth_post(&msg_uri(sid), body)).await;
+        assert_eq!(resp["reason"], "bad_id");
+        assert_eq!(resp["index"], 0);
+    }
+
+    #[tokio::test]
+    async fn the_first_message_with_invalid_refs_creates_no_session() {
+        let h = action_harness(Some("/nonexistent/claude-cli")).await;
+        let body = r#"{"message":"x","cwd":"/tmp","refs":[{"kind":"skill","id":"3adeffc9-c8b0-4e2f-a674-55bfcb293433"}]}"#;
+        let (status, resp) = call(&h.app, auth_post("/api/chat/sessions", body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert_eq!(resp["code"], "refs_invalid");
+        assert_eq!(resp["reason"], "kind_disabled");
+        let sessions = h
+            .graph
+            .list_chat_sessions(None, None, 10, 0, true)
+            .await
+            .unwrap();
+        assert!(sessions.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_the_switch_off_refs_are_ignored_like_on_an_older_server() {
+        let h = action_harness_with(Some("/nonexistent/claude-cli"), false).await;
+        let sid = seed_session(&h).await;
+        // The same body that is a 400 with the switch on is not refused…
+        let body = r#"{"content":"x","refs":[{"kind":"workspace","id":"nope"}]}"#;
+        let (status, resp) = call(&h.app, auth_post(&msg_uri(sid), body)).await;
+        assert_ne!(status, StatusCode::BAD_REQUEST, "{resp}");
+        // …and a valid ref is not folded into the text: the CLI sees the text only.
+        let mut cli = test_support::insert_mock_cli_session(&h.manager, &sid.to_string()).await;
+        let plan = Uuid::new_v4();
+        let body = format!(r#"{{"content":"just text","refs":[{{"kind":"plan","id":"{plan}"}}]}}"#);
+        let (status, _) = call(&h.app, auth_post(&msg_uri(sid), &body)).await;
+        assert_eq!(status, StatusCode::OK);
+        let sent =
+            tokio::time::timeout(std::time::Duration::from_secs(10), cli.sent_input_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(sent.message["content"], "just text");
+    }
+
+    #[tokio::test]
+    async fn a_message_with_refs_reaches_the_cli_expanded_through_the_rest_route() {
+        let h = action_harness(Some("/nonexistent/claude-cli")).await;
+        let sid = seed_session(&h).await;
+        let task = {
+            let plan = crate::neo4j::models::PlanNode::new_for_project(
+                "p".into(),
+                "d".into(),
+                "t".into(),
+                5,
+                Uuid::new_v4(),
+            );
+            h.graph.create_plan(&plan).await.unwrap();
+            let task = crate::refs::test_support::task_titled(Some("Tâche REST"), "corps");
+            h.graph.create_task(plan.id, &task).await.unwrap();
+            task
+        };
+        let mut cli = test_support::insert_mock_cli_session(&h.manager, &sid.to_string()).await;
+        let body = serde_json::json!({
+            "content": "regarde #task:x",
+            "refs": [{"kind": "task", "id": task.id}]
+        })
+        .to_string();
+        let (status, resp) = call(&h.app, auth_post(&msg_uri(sid), &body)).await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let sent =
+            tokio::time::timeout(std::time::Duration::from_secs(10), cli.sent_input_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        let prompt = sent.message["content"].as_str().unwrap().to_string();
+        assert!(prompt.starts_with("regarde #task:x"), "{prompt}");
+        assert!(
+            prompt.contains("<po-context") && prompt.contains("Tâche REST"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("<po-refs>"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn the_version_endpoint_announces_refs_v1_only_while_it_is_on() {
+        for on in [true, false] {
+            let h = action_harness_with(None, on).await;
+            let req = Request::builder()
+                .uri("/api/version")
+                .body(Body::empty())
+                .unwrap();
+            let (status, resp) = call(&h.app, req).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(resp["features"]["refs_v1"], on, "{resp}");
+        }
     }
 
     #[tokio::test]
