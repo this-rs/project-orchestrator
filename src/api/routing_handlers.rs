@@ -14,20 +14,35 @@
 //! `invalid_learning_stage`, `invalid_routing_weight`, ...), never echoing the
 //! value that was sent.
 //!
+//! The shadow report and the decision log are read here too:
+//! `GET /api/chat/routing/decisions` (newest first, paginated) and
+//! `GET /api/chat/routing/report`. Both are reserved to a human session (an
+//! agent must not read how it is routed, nor tune itself against the report).
+//! They read an `Arc<dyn RoutingArmStore>` installed once at boot with
+//! [`set_routing_store`]; until the Neo4j adapter is installed they answer an
+//! empty page and an empty report. The store lives in a process-wide slot, not
+//! in `ServerState`, so adding it does not touch every state constructor.
+//!
 //! Nothing here takes a routing decision: the settings are stored and shown
 //! (also summarised in `GET /api/chat/providers`), the resolver ignores them
 //! until the cognitive router lands.
 
+use std::sync::{Arc, RwLock};
+
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Extension, Json,
 };
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use serde_json::Value;
 
 use super::handlers::{AppError, OrchestratorState};
 use super::provider_handlers::require_human;
 use crate::auth::jwt::Claims;
+use crate::chat::provider::cognitive::report::{build_report, RoutingDecisionView, RoutingReport};
+use crate::chat::provider::cognitive::store::{DecisionFilter, RoutingArmStore};
 use crate::chat::provider::cognitive::{
     self, parse_routing_settings, EffectiveRouting, RoutingError, RoutingScope, RoutingSettings,
     ROUTING_KEY,
@@ -135,6 +150,125 @@ pub async fn delete_project_routing(
         Err(AppError::NotFound(format!(
             "project '{slug}' has no routing override"
         )))
+    }
+}
+
+static ROUTING_STORE: RwLock<Option<Arc<dyn RoutingArmStore>>> = RwLock::new(None);
+
+/// Installs the store the decision log and the report read (at boot).
+pub fn set_routing_store(store: Option<Arc<dyn RoutingArmStore>>) {
+    *ROUTING_STORE.write().unwrap_or_else(|e| e.into_inner()) = store;
+}
+
+fn routing_store() -> Option<Arc<dyn RoutingArmStore>> {
+    ROUTING_STORE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+const DEFAULT_LIMIT: usize = 50;
+const MAX_LIMIT: usize = 200;
+
+/// Query of `GET /api/chat/routing/decisions`.
+#[derive(Debug, Deserialize)]
+pub struct DecisionsQuery {
+    /// Only this project's decisions.
+    pub project_slug: Option<String>,
+    /// Page size, 1..=200, default 50.
+    pub limit: Option<usize>,
+    /// Page offset.
+    pub offset: Option<usize>,
+    /// Only decisions at or after this RFC 3339 time.
+    pub since: Option<DateTime<Utc>>,
+}
+
+/// Query of `GET /api/chat/routing/report`.
+#[derive(Debug, Deserialize)]
+pub struct ReportQuery {
+    /// Only this project's decisions.
+    pub project_slug: Option<String>,
+    /// Window start (RFC 3339).
+    pub from: Option<DateTime<Utc>>,
+    /// Window end (RFC 3339).
+    pub to: Option<DateTime<Utc>>,
+}
+
+/// One page of decisions, newest first. `has_more` is true when another page
+/// follows; the store does not count, so there is no `total`.
+pub async fn decisions_page(
+    store: Option<&dyn RoutingArmStore>,
+    query: &DecisionsQuery,
+) -> anyhow::Result<Value> {
+    let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+    let mut found = match store {
+        Some(store) => {
+            store
+                .decisions(&DecisionFilter {
+                    project_slug: query.project_slug.clone(),
+                    since: query.since,
+                    session_id: None,
+                    limit: Some(limit + 1),
+                    offset,
+                })
+                .await?
+        }
+        None => vec![],
+    };
+    let has_more = found.len() > limit;
+    found.truncate(limit);
+    let items: Vec<RoutingDecisionView> = found.iter().map(RoutingDecisionView::from).collect();
+    Ok(serde_json::json!({
+        "items": items,
+        "limit": limit,
+        "offset": offset,
+        "has_more": has_more,
+    }))
+}
+
+/// GET /api/chat/routing/decisions (human only).
+pub async fn list_decisions(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Query(query): Query<DecisionsQuery>,
+) -> Result<Json<Value>, AppError> {
+    require_human_reader(&state, &claims)?;
+    let store = routing_store();
+    decisions_page(store.as_deref(), &query)
+        .await
+        .map(Json)
+        .map_err(AppError::Internal)
+}
+
+/// GET /api/chat/routing/report (human only).
+pub async fn get_report(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Query(query): Query<ReportQuery>,
+) -> Result<Json<RoutingReport>, AppError> {
+    require_human_reader(&state, &claims)?;
+    let report = match routing_store() {
+        Some(store) => build_report(
+            store.as_ref(),
+            query.project_slug.as_deref(),
+            query.from,
+            query.to,
+        )
+        .await
+        .map_err(AppError::Internal)?,
+        None => cognitive::report::summarise(&[], &cognitive::report::NoPrices),
+    };
+    Ok(Json(report))
+}
+
+fn require_human_reader(state: &OrchestratorState, claims: &Claims) -> Result<(), AppError> {
+    if state.auth_config.is_none() || claims.is_human() {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "the routing log can only be read by a signed-in user".to_string(),
+        ))
     }
 }
 
@@ -427,5 +561,96 @@ mod tests {
         );
         let (_, body) = call(&app, human("GET", "/api/chat/providers", None)).await;
         assert_eq!(body["routing"]["scope"], "default", "no project asked");
+    }
+
+    #[tokio::test]
+    async fn the_log_and_the_report_are_empty_without_a_store_and_human_only() {
+        let app = app().await;
+        let (status, body) = call(&app, human("GET", "/api/chat/routing/decisions", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["items"], json!([]));
+        assert_eq!(body["has_more"], false);
+        let (status, body) = call(&app, human("GET", "/api/chat/routing/report", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["decisions"], 0);
+        assert!(body["agreement_rate"].is_null());
+        assert!(body["estimated_cost_delta_usd"].is_null());
+        assert_eq!(body["by_class"], json!([]));
+        let (status, _) = call(
+            &app,
+            human(
+                "GET",
+                "/api/chat/routing/report?from=2026-10-01T00:00:00Z&to=2026-10-07T00:00:00Z",
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            &app,
+            human("GET", "/api/chat/routing/report?from=nope", None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let agent = agent_bearer();
+        for uri in ["/api/chat/routing/decisions", "/api/chat/routing/report"] {
+            let (status, _) = call(&app, req(&agent, "GET", uri, None)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn decisions_come_newest_first_in_pages_filtered_by_project() {
+        use crate::chat::provider::cognitive::decision::{CognitiveDecision, Pick};
+        use crate::chat::provider::cognitive::mode::{LearningStage, ProviderRoutingMode};
+        use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
+        use crate::chat::provider::cognitive::store::{InMemoryRoutingStore, RoutingArmStore};
+
+        let store = InMemoryRoutingStore::new();
+        for (i, project) in ["p", "p", "p", "q"].into_iter().enumerate() {
+            let d = CognitiveDecision {
+                id: Uuid::new_v4(),
+                at: chrono::Utc::now() - chrono::Duration::seconds(100 - i as i64),
+                signature: TaskSignature::utility(TaskClass::Simple, 9_000, Some(project)),
+                chosen: Some(Pick::new("prov", "model")),
+                score: Some(0.5),
+                explored: false,
+                reason: format!("d{i}"),
+                alternatives: vec![],
+                applied: false,
+                mode: ProviderRoutingMode::Mixed,
+                stage: LearningStage::Shadow,
+                session_id: None,
+                task_id: None,
+                run_id: None,
+                turn_index: None,
+                outcome: None,
+                used: None,
+            };
+            store.put_decision(&d).await.unwrap();
+        }
+        let query = |project: &str, limit, offset| super::DecisionsQuery {
+            project_slug: Some(project.into()),
+            limit: Some(limit),
+            offset: Some(offset),
+            since: None,
+        };
+        let page = super::decisions_page(Some(&store), &query("p", 2, 0))
+            .await
+            .unwrap();
+        assert_eq!(page["items"][0]["reason"], "d2", "newest first");
+        assert_eq!(page["items"][1]["reason"], "d1");
+        assert_eq!(page["has_more"], true);
+        let page = super::decisions_page(Some(&store), &query("p", 2, 2))
+            .await
+            .unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(page["items"][0]["reason"], "d0");
+        assert_eq!(page["has_more"], false);
+        let page = super::decisions_page(Some(&store), &query("p", 10_000, 0))
+            .await
+            .unwrap();
+        assert_eq!(page["limit"], 200, "the page size is bounded");
     }
 }
