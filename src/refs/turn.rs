@@ -532,21 +532,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stored_block_is_deduplicated_and_capped() {
+    async fn a_stored_block_over_the_cap_or_with_duplicates_is_not_a_block() {
         let w = world().await;
         let g = graph_of(&w);
         // Built by hand, as a peer instance could store it.
         let ids: Vec<Uuid> = (1..=25).map(Uuid::from_u128).collect();
-        let list: Vec<EntityRef> = ids
-            .iter()
-            .chain(ids.iter())
-            .map(|id| EntityRef::new(RefKind::Task, *id))
-            .collect();
-        let json = serde_json::to_string(&list).unwrap();
-        let content = format!("t\n\n<po-refs>{json}</po-refs>");
-        let t = expand(&g, &content).await;
+        let block = |list: &[EntityRef]| {
+            format!(
+                "t\n\n<po-refs>{}</po-refs>",
+                serde_json::to_string(list).unwrap()
+            )
+        };
+        let refs = |ids: &[Uuid]| -> Vec<EntityRef> {
+            ids.iter()
+                .map(|id| EntityRef::new(RefKind::Task, *id))
+                .collect()
+        };
+        // 25 references, or duplicates: not a block, so no reference at all.
+        for content in [block(&refs(&ids)), block(&refs(&[ids[0], ids[0]]))] {
+            let t = expand(&g, &content).await;
+            assert!(t.resolved.is_empty(), "{content}");
+            assert_eq!(t.model_tail, "");
+        }
+        // Exactly the cap is fine.
+        let t = expand(&g, &block(&refs(&ids[..MAX_REFS_PER_MESSAGE]))).await;
         assert_eq!(t.resolved.len(), MAX_REFS_PER_MESSAGE);
-        assert_eq!(t.resolved[0].id, ids[0]);
         assert_eq!(t.resolved[19].id, ids[19]);
     }
 
