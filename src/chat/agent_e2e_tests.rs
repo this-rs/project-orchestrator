@@ -1721,6 +1721,37 @@ mod turn_routing {
     }
 
     #[tokio::test]
+    async fn a_pinned_model_stays_pinned_when_the_session_is_resumed() {
+        use crate::chat::manager::OpeningTurn;
+        let r = rig("full", "auto", true, None, vec![Answer::Pick("big")]).await;
+        r.manager
+            .set_session_model(&r.sid, "manual-model")
+            .await
+            .unwrap();
+        // A resume builds a new router that knows nothing of the hand change: the
+        // stored pin must carry it.
+        let router = r
+            .manager
+            .register_turn_router(
+                &r.sid,
+                "claude-code",
+                "manual-model",
+                None,
+                OpeningTurn {
+                    explicit_model: false,
+                    permission_mode: None,
+                    message: DEBUG,
+                    next_turn: 0,
+                },
+            )
+            .await
+            .expect("a router is registered");
+        router.set_model_live(true);
+        r.manager.apply_turn_directive(&r.sid, DEBUG).await;
+        assert_eq!(r.decider.calls(), 0, "a pinned model is never routed again");
+    }
+
+    #[tokio::test]
     async fn the_legacy_engines_entry_point_applies_the_same_decision_as_a_set_model() {
         // `apply_turn_directive` is what the legacy engine (Claude Code CLI) calls from
         // `send_message` before writing the message; here it drives a session whose

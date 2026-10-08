@@ -538,14 +538,14 @@ struct AgentOpen<'a> {
 }
 
 /// What the per-turn router of a session needs to know about its opening.
-struct OpeningTurn<'a> {
+pub(crate) struct OpeningTurn<'a> {
     /// The request named its model.
-    explicit_model: bool,
-    permission_mode: Option<&'a str>,
+    pub explicit_model: bool,
+    pub permission_mode: Option<&'a str>,
     /// The message of the turn about to start.
-    message: &'a str,
+    pub message: &'a str,
     /// Index of the first turn the router counts itself (legacy engine).
-    next_turn: u32,
+    pub next_turn: u32,
 }
 
 /// Manages chat sessions and their lifecycle
@@ -1199,9 +1199,37 @@ impl ChatManager {
         self
     }
 
+    /// Settings scope and key holding the pin of a session's model.
+    fn pin_scope(session_id: &str) -> String {
+        format!("session:{session_id}")
+    }
+
+    const MODEL_PIN_KEY: &'static str = "model_pinned";
+
+    /// Records that the model of the session is not the router's to change.
+    async fn pin_session_model(&self, session_id: &str) {
+        if let Err(error) = self
+            .graph
+            .put_llm_setting(&Self::pin_scope(session_id), Self::MODEL_PIN_KEY, "true")
+            .await
+        {
+            warn!(session_id, %error, "model pin not stored: a resume may route it again");
+        }
+    }
+
+    /// Whether the session's model was pinned (named by the request or set by hand).
+    async fn model_is_pinned(&self, session_id: &str) -> bool {
+        matches!(
+            self.graph
+                .get_llm_setting(&Self::pin_scope(session_id), Self::MODEL_PIN_KEY)
+                .await,
+            Ok(Some(value)) if value == "true"
+        )
+    }
+
     /// Builds and registers the per-turn router of a session being opened, `None` without
     /// a decider. The routing mode and stage are read ONCE here for the session's project.
-    async fn register_turn_router(
+    pub(crate) async fn register_turn_router(
         &self,
         session_id: &str,
         provider_id: &str,
@@ -1210,6 +1238,12 @@ impl ChatManager {
         turn: OpeningTurn<'_>,
     ) -> Option<Arc<super::agent_hooks::TurnRouter>> {
         let (decider, pool) = self.turn_routing.configured()?;
+        // A model the request named, or the user set by hand, stays pinned across a
+        // resume or a restart: the pin is stored, not only held by the router.
+        let pinned = turn.explicit_model || self.model_is_pinned(session_id).await;
+        if turn.explicit_model {
+            self.pin_session_model(session_id).await;
+        }
         let routing = match super::provider::cognitive::load_routing(
             self.graph.as_ref(),
             project_slug,
@@ -1235,7 +1269,7 @@ impl ChatManager {
                 session_id: Uuid::parse_str(session_id).ok(),
                 project_slug: project_slug.map(str::to_owned),
                 trust,
-                explicit_model: turn.explicit_model,
+                explicit_model: pinned,
                 current_model: model.to_owned(),
                 next_turn: turn.next_turn,
             },
@@ -6502,6 +6536,7 @@ impl ChatManager {
             if let Some(router) = self.turn_routing.get(session_id) {
                 router.mark_manual();
             }
+            self.pin_session_model(session_id).await;
             self.flag_routing_override(session_id).await;
         }
         if let Some(handle) = self.agent_runtime.get(session_id).await {
