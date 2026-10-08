@@ -185,6 +185,13 @@ impl RunnerContext {
     }
 }
 
+/// One (provider, model) a conversation may be routed to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingPoolEntry {
+    pub provider: String,
+    pub model: String,
+}
+
 /// Request to send a chat message
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatRequest {
@@ -229,6 +236,10 @@ pub struct ChatRequest {
     /// conversation opens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing_mode: Option<crate::chat::provider::cognitive::ProviderRoutingMode>,
+    /// `mixed` only: the (provider, model) pairs PO may route THIS conversation among
+    /// (the models ticked in the menu). Absent: no restriction beyond the mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_pool: Option<Vec<RoutingPoolEntry>>,
     /// Model alias set on the task (A16 level "task"). Internal.
     #[serde(skip)]
     pub task_alias: Option<String>,

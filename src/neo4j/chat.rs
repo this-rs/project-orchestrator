@@ -71,6 +71,7 @@ impl Neo4jClient {
                     provider_id: $provider_id,
                     routed_by: $routed_by,
                     routing_mode: $routing_mode,
+                    routing_pool: $routing_pool,
                     capabilities: $capabilities,
                     resume_token: $resume_token,
                     execution_place: $execution_place,
@@ -106,6 +107,7 @@ impl Neo4jClient {
                     provider_id: $provider_id,
                     routed_by: $routed_by,
                     routing_mode: $routing_mode,
+                    routing_pool: $routing_pool,
                     capabilities: $capabilities,
                     resume_token: $resume_token,
                     execution_place: $execution_place,
@@ -160,6 +162,10 @@ impl Neo4jClient {
                     .param(
                         "routing_mode",
                         session.routing_mode.clone().unwrap_or_default(),
+                    )
+                    .param(
+                        "routing_pool",
+                        session.routing_pool.clone().unwrap_or_default(),
                     )
                     .param(
                         "capabilities",
@@ -1032,6 +1038,7 @@ impl Neo4jClient {
             provider_id: non_empty("provider_id"),
             routed_by: non_empty("routed_by"),
             routing_mode: non_empty("routing_mode"),
+            routing_pool: non_empty("routing_pool"),
             capabilities: non_empty("capabilities"),
             resume_token: non_empty("resume_token"),
             execution_place: ExecutionPlace::parse_stored(

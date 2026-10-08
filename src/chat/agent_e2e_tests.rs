@@ -217,6 +217,7 @@ fn manager(graph: Arc<MockGraphStore>, secure: bool) -> ChatManager {
 fn request(provider: Option<&str>, project: Option<&str>, mode: &str) -> ChatRequest {
     ChatRequest {
         access: None,
+        routing_pool: None,
         routing_mode: None,
         attachments: Vec::new(),
         refs: Vec::new(),
@@ -2027,6 +2028,7 @@ mod turn_routing {
                 "manual-model",
                 None,
                 OpeningTurn {
+                    routing_pool: None,
                     routing_mode: None,
                     explicit_model: false,
                     permission_mode: None,
@@ -2046,6 +2048,14 @@ mod turn_routing {
         r: &Rig,
         mode: Option<ProviderRoutingMode>,
     ) -> Arc<crate::chat::agent_hooks::TurnRouter> {
+        reopen_with_pool(r, mode, None).await
+    }
+
+    async fn reopen_with_pool(
+        r: &Rig,
+        mode: Option<ProviderRoutingMode>,
+        pool: Option<&[&str]>,
+    ) -> Arc<crate::chat::agent_hooks::TurnRouter> {
         use crate::chat::manager::OpeningTurn;
         let router = r
             .manager
@@ -2055,6 +2065,15 @@ mod turn_routing {
                 "small",
                 None,
                 OpeningTurn {
+                    routing_pool: pool.map(|models| {
+                        models
+                            .iter()
+                            .map(|m| crate::chat::types::RoutingPoolEntry {
+                                provider: "claude-code".to_owned(),
+                                model: (*m).to_owned(),
+                            })
+                            .collect()
+                    }),
                     routing_mode: mode,
                     explicit_model: false,
                     permission_mode: None,
@@ -2086,6 +2105,61 @@ mod turn_routing {
             1,
             "auto: PO decides for this conversation"
         );
+    }
+
+    #[tokio::test]
+    async fn a_mixed_conversation_is_routed_among_its_pool_only() {
+        let mut r = rig("primary", "auto", true, None, vec![Answer::Pick("big")]).await;
+        reopen_with_pool(&r, Some(ProviderRoutingMode::Mixed), Some(&["big"])).await;
+        r.manager.apply_turn_directive(&r.sid, DEBUG).await;
+        let requests = r.decider.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            1,
+            "a pool is routed whatever the settings say"
+        );
+        let offered: Vec<&str> = requests[0].pool.iter().map(|f| f.model.as_str()).collect();
+        assert_eq!(offered, ["big"], "only the ticked models are candidates");
+        drop(requests);
+        let ev = next_event(&mut r.rx, |e| matches!(e, ChatEvent::ModelChanged { .. })).await;
+        assert!(matches!(ev, ChatEvent::ModelChanged { ref model } if model == "big"));
+    }
+
+    #[tokio::test]
+    async fn a_pilot_named_with_a_pool_is_not_a_pin() {
+        use crate::chat::manager::OpeningTurn;
+        let r = rig("primary", "auto", true, None, vec![Answer::Pick("big")]).await;
+        // The request names its pilot (explicit_model) AND a pool: PO still routes.
+        let router = r
+            .manager
+            .register_turn_router(
+                &r.sid,
+                "claude-code",
+                "small",
+                None,
+                OpeningTurn {
+                    routing_mode: Some(ProviderRoutingMode::Mixed),
+                    routing_pool: Some(vec![
+                        crate::chat::types::RoutingPoolEntry {
+                            provider: "claude-code".to_owned(),
+                            model: "small".to_owned(),
+                        },
+                        crate::chat::types::RoutingPoolEntry {
+                            provider: "claude-code".to_owned(),
+                            model: "big".to_owned(),
+                        },
+                    ]),
+                    explicit_model: true,
+                    permission_mode: None,
+                    message: DEBUG,
+                    next_turn: 0,
+                },
+            )
+            .await
+            .expect("a router is registered");
+        router.set_model_live(true);
+        r.manager.apply_turn_directive(&r.sid, DEBUG).await;
+        assert_eq!(r.decider.calls(), 1);
     }
 
     #[tokio::test]

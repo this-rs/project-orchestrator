@@ -516,6 +516,7 @@ mod tests {
     fn request(cwd: &str, mode: Option<&str>) -> ChatRequest {
         ChatRequest {
             access: None,
+            routing_pool: None,
             routing_mode: None,
             attachments: Vec::new(),
             refs: Vec::new(),

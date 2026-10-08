@@ -2532,6 +2532,7 @@ mod tests {
         );
         let request = crate::chat::types::ChatRequest {
             access: None,
+            routing_pool: None,
             routing_mode: None,
             attachments: Vec::new(),
             refs: Vec::new(),

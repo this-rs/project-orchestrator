@@ -321,6 +321,8 @@ pub(crate) struct TurnRouter {
     trust: bool,
     /// The request named its model: it is never replaced.
     explicit_model: bool,
+    /// Models of this provider the conversation may be routed among (mixed); `None` = all.
+    allowed_models: Option<Vec<String>>,
     /// The session can switch model between turns (known once it is open).
     set_model_live: AtomicBool,
     /// The user changed the model by hand: no more automatic change.
@@ -340,6 +342,7 @@ pub(crate) struct TurnRouterSpec {
     pub project_slug: Option<String>,
     pub trust: bool,
     pub explicit_model: bool,
+    pub allowed_models: Option<Vec<String>>,
     pub current_model: String,
     /// Index the next turn counted by the router itself gets (legacy engine).
     pub next_turn: u32,
@@ -362,6 +365,7 @@ impl TurnRouter {
             project_slug: spec.project_slug,
             trust: spec.trust,
             explicit_model: spec.explicit_model,
+            allowed_models: spec.allowed_models,
             set_model_live: AtomicBool::new(false),
             manual: AtomicBool::new(false),
             last_message: Mutex::new(None),
@@ -423,7 +427,10 @@ impl TurnRouter {
 pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -> TurnDirective {
     // The harness knows the model the turn would run on, whoever changed it.
     locked(&router.state).current_model = ctx.current_model.clone();
-    if router.routing.mode != ProviderRoutingMode::Full
+    // `full` routes everything; a pool (mixed, models ticked in the menu) routes among them.
+    let routed =
+        router.routing.mode == ProviderRoutingMode::Full || router.allowed_models.is_some();
+    if !routed
         || router.explicit_model
         || router.manual.load(Ordering::SeqCst)
         || !router.set_model_live.load(Ordering::SeqCst)
@@ -436,6 +443,10 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
         .is_some_and(|turn| turn.checked_add(1) == Some(ctx.turn_index));
     let apply = router.routing.stage == LearningStage::Auto && !just_changed;
     let mut settings = router.routing.clone();
+    // A pool is routed like `full` inside it, whatever the settings' mode.
+    if router.allowed_models.is_some() {
+        settings.mode = ProviderRoutingMode::Full;
+    }
     if !apply {
         settings.stage = match settings.stage {
             LearningStage::Auto => LearningStage::Shadow,
@@ -450,7 +461,10 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
         ContextHints::default(),
     );
     let decision = tokio::time::timeout(router.timeout, async {
-        let pool = router.pool.pool(&router.provider_id).await;
+        let mut pool = router.pool.pool(&router.provider_id).await;
+        if let Some(allowed) = &router.allowed_models {
+            pool.retain(|facts| allowed.iter().any(|m| m == &facts.model));
+        }
         let mut request = DecideRequest::new(signature, settings, pool);
         request.trust = router.trust;
         request.restrict_provider = Some(router.provider_id.clone());
