@@ -1,0 +1,27 @@
+{
+  "_contract_version": 1,
+  "_description": "Additive to tokens.json / po_refs_block.json (those stay untouched). The id of a reference is a HYPHENATED UUID (36 characters), never nil; upper case is accepted and normalized to lower case. Every other spelling of a UUID (no hyphens, braces, urn:uuid:) is bad_id. The wire shape of a reference is an OBJECT; a positional array is refused. A <po-refs> block holding anything refused here stays in the text.",
+  "valid": [
+    { "token": "#plan:57CF05C9-25B6-495D-AB07-DE4B11D64736", "ref": { "kind": "plan", "id": "57cf05c9-25b6-495d-ab07-de4b11d64736" } }
+  ],
+  "invalid_tokens": [
+    { "token": "#plan:57cf05c925b6495dab07de4b11d64736", "reason": "bad_id" },
+    { "token": "#plan:{57cf05c9-25b6-495d-ab07-de4b11d64736}", "reason": "bad_id" },
+    { "token": "#plan:urn:uuid:57cf05c9-25b6-495d-ab07-de4b11d64736", "reason": "bad_id" },
+    { "token": "#plan:57cf05c9-25b6-495d-ab07-de4b11d64736 ", "reason": "bad_id" },
+    { "token": "#plan:57cf05c9-25b6-495d-ab07-de4b11d6473", "reason": "bad_id" }
+  ],
+  "invalid_json": [
+    "[\"plan\",\"57cf05c9-25b6-495d-ab07-de4b11d64736\"]",
+    "{\"kind\":\"plan\",\"id\":\"00000000-0000-0000-0000-000000000000\"}",
+    "{\"kind\":\"plan\",\"id\":\"57cf05c925b6495dab07de4b11d64736\"}",
+    "{\"kind\":\"plan\",\"id\":\"{57cf05c9-25b6-495d-ab07-de4b11d64736}\"}",
+    "{\"kind\":\"plan\",\"id\":\"urn:uuid:57cf05c9-25b6-495d-ab07-de4b11d64736\"}"
+  ],
+  "invalid_blocks": [
+    "x\n\n<po-refs>[[\"plan\",\"57cf05c9-25b6-495d-ab07-de4b11d64736\"]]</po-refs>",
+    "x\n\n<po-refs>[{\"kind\":\"plan\",\"id\":\"00000000-0000-0000-0000-000000000000\"}]</po-refs>",
+    "x\n\n<po-refs>[{\"kind\":\"plan\",\"id\":\"57cf05c925b6495dab07de4b11d64736\"}]</po-refs>",
+    "x\n\n<po-refs>[{\"kind\":\"plan\",\"id\":\"{57cf05c9-25b6-495d-ab07-de4b11d64736}\"}]</po-refs>"
+  ]
+}

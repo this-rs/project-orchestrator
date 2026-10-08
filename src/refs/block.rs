@@ -6,11 +6,16 @@
 //! written before the `<po-attachments>` block (so attachments stay last) and
 //! read after it. The frontend has a TypeScript twin of [`split`].
 
-use super::types::EntityRef;
+use super::types::{EntityRef, RawRef};
+use super::validate::{validate_refs, MAX_REFS_PER_MESSAGE};
 
 const OPEN: &str = "\n\n<po-refs>";
 const CLOSE: &str = "</po-refs>";
 const MARKER: &str = "<po-refs>";
+/// Longest JSON array [`split`] will parse: room for [`MAX_REFS_PER_MESSAGE`] objects
+/// with the longest kind and a UUID (about 70 bytes each), with a margin. A longer
+/// block is not one we wrote, and is not parsed at all.
+const MAX_BLOCK_JSON_BYTES: usize = MAX_REFS_PER_MESSAGE * 128;
 /// What a typed `<po-refs>` becomes in user text, so a user cannot forge a block.
 const NEUTRAL_MARKER: &str = "&lt;po-refs>";
 
@@ -34,8 +39,14 @@ pub fn encode(text: &str, refs: &[EntityRef]) -> String {
 pub fn split(content: &str) -> (String, Vec<EntityRef>) {
     if let Some(start) = content.rfind(OPEN) {
         if let Some(inner) = content[start + OPEN.len()..].strip_suffix(CLOSE) {
-            if let Ok(list) = serde_json::from_str::<Vec<EntityRef>>(inner) {
-                return (content[..start].to_string(), list);
+            // The block is held to the rules of an incoming `refs[]`: same shape,
+            // same ids, same cap, same dedup. Anything else stays in the text.
+            if inner.len() <= MAX_BLOCK_JSON_BYTES {
+                if let Ok(raw) = serde_json::from_str::<Vec<RawRef>>(inner) {
+                    if let Ok(list) = validate_refs(&raw) {
+                        return (content[..start].to_string(), list);
+                    }
+                }
             }
         }
     }
@@ -131,5 +142,62 @@ mod tests {
         let (after_att, got_atts) = attachments::split(&text);
         assert_eq!(got_atts, atts);
         assert_eq!(split(&after_att), ("look".to_string(), refs));
+    }
+
+    fn block_of(items: &[String]) -> String {
+        format!("x\n\n<po-refs>[{}]</po-refs>", items.join(","))
+    }
+
+    fn obj(kind: &str, id: &str) -> String {
+        format!("{{\"kind\":\"{kind}\",\"id\":\"{id}\"}}")
+    }
+
+    #[test]
+    fn a_block_is_held_to_the_rules_of_incoming_refs() {
+        let nil = "00000000-0000-0000-0000-000000000000";
+        let bad = [
+            // positional, nil, braces, no hyphens
+            format!("[[\"plan\",\"{A}\"]]"),
+            format!("[{}]", obj("plan", nil)),
+            format!("[{}]", obj("plan", &format!("{{{A}}}"))),
+            format!("[{}]", obj("plan", &A.replace('-', ""))),
+            // a valid ref does not save an invalid neighbour
+            format!("[{},{}]", obj("plan", A), obj("plan", nil)),
+        ];
+        for b in bad {
+            let s = format!("x\n\n<po-refs>{b}</po-refs>");
+            assert_eq!(split(&s), (s.clone(), vec![]), "{b}");
+        }
+    }
+
+    #[test]
+    fn a_block_is_capped_and_deduplicated_like_the_request() {
+        let many: Vec<String> = (0..21u128)
+            .map(|i| obj("task", &Uuid::from_u128(i + 1).to_string()))
+            .collect();
+        let s = block_of(&many);
+        assert_eq!(split(&s), (s.clone(), vec![]));
+        let twenty = block_of(&many[..20]);
+        assert_eq!(split(&twenty).1.len(), 20);
+        let dup = block_of(&[obj("plan", A), obj("plan", A), obj("note", B)]);
+        assert_eq!(
+            split(&dup).1,
+            vec![r(RefKind::Plan, A), r(RefKind::Note, B)]
+        );
+    }
+
+    #[test]
+    fn an_upper_case_id_is_normalized() {
+        let s = block_of(&[obj("plan", &A.to_uppercase())]);
+        assert_eq!(split(&s).1, vec![r(RefKind::Plan, A)]);
+    }
+
+    #[test]
+    fn a_huge_block_is_not_even_parsed() {
+        let big: Vec<String> = (0..100_000u128)
+            .map(|i| obj("task", &Uuid::from_u128(i + 1).to_string()))
+            .collect();
+        let s = block_of(&big);
+        assert_eq!(split(&s), (s.clone(), vec![]));
     }
 }
