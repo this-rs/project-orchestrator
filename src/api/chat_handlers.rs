@@ -4372,8 +4372,6 @@ pub async fn switch_provider(
     Json(body): Json<SwitchProviderBody>,
 ) -> Result<Json<crate::chat::types::SwitchProviderResponse>, AppError> {
     use crate::chat::envelope;
-    use crate::chat::types::SwitchProviderError;
-
     let caller = envelope::identify_caller(
         claims.as_ref().map(|c| &c.0),
         envelope::session_header(&headers),
@@ -4398,15 +4396,7 @@ pub async fn switch_provider(
             claims.map(|c| c.0),
         )
         .await
-        .map_err(|e| match e.downcast_ref::<SwitchProviderError>() {
-            Some(SwitchProviderError::NotFound) => {
-                AppError::NotFound(format!("Session {session_id} not found"))
-            }
-            Some(refusal) => AppError::BadRequest(refusal.to_string()),
-            None => {
-                AppError::from_open_error(e, Some(crate::chat::provider::resolver::CLAUDE_CODE))
-            }
-        })?;
+        .map_err(|e| switch_error(e, &session_id.to_string()))?;
 
     state.event_bus.emit(
         CrudEvent::new(
@@ -4419,4 +4409,71 @@ pub async fn switch_provider(
         })),
     );
     Ok(Json(response))
+}
+
+/// How a refused or failed provider switch is told to the client: the switch's own
+/// refusals are 400 (404 for an unknown session); anything else came from opening
+/// the new session and keeps its typed open-failure status (consent, endpoint guard,
+/// security gate, unknown provider).
+fn switch_error(error: anyhow::Error, session_id: &str) -> AppError {
+    use crate::chat::types::SwitchProviderError;
+    match error.downcast_ref::<SwitchProviderError>() {
+        Some(SwitchProviderError::NotFound) => {
+            AppError::NotFound(format!("Session {session_id} not found"))
+        }
+        Some(refusal) => AppError::BadRequest(refusal.to_string()),
+        None => {
+            AppError::from_open_error(error, Some(crate::chat::provider::resolver::CLAUDE_CODE))
+        }
+    }
+}
+
+#[cfg(test)]
+mod switch_provider_tests {
+    use super::*;
+    use crate::chat::types::SwitchProviderError;
+
+    #[test]
+    fn an_unknown_session_is_a_404_that_names_it() {
+        let err = switch_error(anyhow::Error::new(SwitchProviderError::NotFound), "abc");
+        assert!(
+            matches!(&err, AppError::NotFound(m) if m.contains("abc")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_switchs_own_refusals_are_400_with_their_reason() {
+        for refusal in [
+            SwitchProviderError::InvalidSession,
+            SwitchProviderError::EmptyMessage,
+            SwitchProviderError::SameProvider("local".into()),
+        ] {
+            let text = refusal.to_string();
+            let err = switch_error(anyhow::Error::new(refusal), "abc");
+            assert!(
+                matches!(&err, AppError::BadRequest(m) if *m == text),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failure_of_opening_the_new_session_keeps_its_typed_status() {
+        let err = switch_error(
+            anyhow::Error::new(nexus_claude::agent::ProviderError::invalid(
+                "no default model",
+            )),
+            "abc",
+        );
+        assert!(
+            !matches!(&err, AppError::NotFound(_) | AppError::BadRequest(_) if false),
+            "{err:?}"
+        );
+        // It is not turned into the switch's own 400/404 text.
+        assert!(
+            !format!("{err:?}").contains("Session abc not found"),
+            "{err:?}"
+        );
+    }
 }
