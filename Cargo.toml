@@ -143,7 +143,7 @@ async-trait = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Chat / Claude Code SDK
-nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "fd304a0094359d4a5ff046892ab5528ac79906b0", features = ["memory", "auto-download", "provider-native", "provider-codex", "provider-acp"] }
+nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "5f12cc66c77cdf23e4f103a473f3e7386da319ba", features = ["memory", "auto-download", "provider-native", "provider-codex", "provider-acp"] }
 tokio-stream = { workspace = true }
 
 # Auth
@@ -248,6 +248,9 @@ tokio-test = "0.4"
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3.14"
 wiremock = "0.6.5"
+# The scripted provider of nexus (a harness that calls the session hooks), for the tests of
+# per-turn model routing. Same pin as the dependency above.
+nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "5f12cc66c77cdf23e4f103a473f3e7386da319ba", features = ["testkit"] }
 
 [[bin]]
 name = "orchestrator"

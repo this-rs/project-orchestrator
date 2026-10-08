@@ -1,6 +1,6 @@
 %% name: po-chat-agent-runtime
 %% covers: backend:src/chat/{agent_runtime,agent_hooks}.rs
-%% verified: 98130a5f
+%% verified: 2c4243c1
 %% ---
 %% PROUVE : le moteur « agent » du chat (tâche B13) : comment un AgentSession nexus est piloté, ce qu'il
 %%   diffuse et persiste, ce qu'il ne fait PAS encore. Le routage entre moteurs est dans po-chat-manager.
@@ -10,14 +10,14 @@
 %%                               set_model, set_policy_mode), mask_agent_event, degraded_features, retry,
 %%                               pump_out_of_band, BuiltinProviders, fake (tests)
 %%   src/chat/agent_hooks.rs — GraphSessionHooks (SessionHooks sur la table de hooks du chemin Claude)
-%%   src/chat/manager.rs (graph_hook_table, build_agent_spec) — la table partagée et sa remise au provider
+%%   src/chat/manager.rs (graph_hook_table, build_agent_spec, register_turn_router, apply_turn_directive) — la table partagée et sa remise au provider ; le routeur par tour
 %%   src/chat/provider/event_map.rs — EventMapper (AgentEvent vers ChatEvent)
 %% ---
 %% NON ETABLI :
 %%   jamais exercé contre le VRAI CLI Claude, un vrai endpoint ni un vrai Codex/ACP (faux provider, fake_openai,
 %%   fake_mcp seulement) ; file de messages, auto-continue, NATS, enrichissement : absents
 %%   (annoncés par degraded_features) ; hooks du graphe : écrits et testés, VIVANTS seulement après le relevé
-%%   de l'épingle nexus-claude (le natif épinglé 35acfbf n'appelle pas SessionHooks : PR nexus #71) ; la publication NATS de session_closed est faite par le manager, non testée.
+%%   de l'épingle nexus-claude (le natif épinglé 35acfbf n'appelle pas SessionHooks : PR nexus #71) ; before_turn : jamais avec un vrai provider ni le vrai décideur (CognitiveDecider, B-R4, non branché : ChatManager::with_turn_decider n'est appelé par personne), chemin hérité (CLI Claude) testé seulement par l'appel direct de apply_turn_directive ; la publication NATS de session_closed est faite par le manager, non testée.
 %% ---
 %% LEGENDE
 %%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans test / décidé non écrit  ⚪ amont ou autre domaine
@@ -49,6 +49,15 @@ flowchart TD
     LOST["🟠 NON porté : file de messages, auto-continue, NATS, enrichissement d'entités ; jamais contre un vrai fournisseur"]
     GHOOKS["✅ GraphSessionHooks (agent_hooks.rs) : SessionHooks sur la MÊME table que le chemin Claude (graph_hook_table) :<br/>before_tool = PreToolUse (contexte → AddContext, block / permissionDecision deny → Deny, updatedInput → ReplaceInput) ; after_tool = PostToolUse ; before_compaction = le `reason` du CompactionNotifier ; outil nommé comme Claude Code (canonical), entrée intacte ; hook en échec ignoré ; matcher honoré<br/>remis par build_agent_spec à Native et Claude Code seulement (ni Codex/ACP, ni session distante) ; runner : guidage de compaction seul ; le notifier de l'agent n'annonce pas la compaction (le provider émet la sienne)<br/><i>test : chat::agent_hooks::tests (9), the_agent_engine_gives_the_graph_hooks_only_to_providers_that_run_hooks, the_hook_table_has_the_per_tool_hooks_unless_the_session_is_a_runner, an_agent_engine_compaction_is_not_announced_twice. Rejoué SANS le correctif : spec.hooks jamais posé → 1 rouge ; contexte et refus ignorés → 4 rouges<br/>🟠 inerte avec l'épingle actuelle (le natif ignore SessionHooks) ; aucun hôte ni modèle réel</i>"]
     MGR --> GHOOKS
+
+    subgraph pert["Modèle par tour — mode full + étape auto (before_turn)"]
+        BT["✅ GraphSessionHooks::before_turn → directive_for_turn : rien sauf si mode = full, capacité set_model_live, modèle non nommé par la requête, aucun set_model manuel dans la session ; hors étape auto (ou tour qui suit un changement) le décideur est QUAND MÊME appelé pour que la décision soit enregistrée non appliquée ; signature = TaskSignature::from_chat_request(dernier message), candidats restreints au provider de la session (restrict_provider), current, turn_index, session_id ; TurnDirective::model seulement si décision appliquée, choisie, différente ; un changement par tour, jamais deux tours de suite ; erreur ou 2 s dépassées = aucune directive, le tour continue<br/>test : chat::agent_e2e_tests::turn_routing (9) — full_auto_a_simple_turn_then_a_debug_turn_changes_the_model_of_the_second (model_changed « big » au 2e tour, rien au 1er), without_set_model_live_there_is_no_directive_and_no_error, the_shadow_stage_records_the_decision_and_changes_nothing, mixed_and_primary_modes_leave_the_pilot_alone, a_model_named_by_the_request_is_never_replaced, never_two_changes_in_consecutive_turns, a_failing_or_hanging_decider_never_fails_the_turn, a_manual_model_change_ends_the_automatic_ones_for_the_session<br/>harnais : ScriptedProvider de nexus (appelle les hooks, honore set_model_live) sous l'id claude-code ; décideur FAUX (réponses scriptées)"]
+        BTLEG["✅ chemin hérité (CLI Claude) : ChatManager::send_message appelle apply_turn_directive avant d'écrire le message, même fonction ; modèle renvoyé = set_session_model (trame de contrôle set_model) + model_changed ; le texte du dernier message est posé dans le routeur (le hook ne voit que la longueur)<br/>test : the_legacy_engines_entry_point_applies_the_same_decision_as_a_set_model (SetModel enregistré par le provider, pas de 2e changement au tour suivant)<br/>🟠 la boucle send_message héritée n'est pas exercée de bout en bout (pas de faux CLI) ; model_changed n'a pas de champ reason (contrat inchangé)"]
+        BTGAP["🟠 NON branché : aucun décideur réel (CognitiveDecider, B-R4) ni PoolSource réel (ModelFacts du seul provider de la session) ; mode et étape lus UNE fois à l'ouverture (un changement de réglage ne touche pas les sessions ouvertes) ; session reprise : le routeur repart de zéro et ne sait pas si le modèle avait été nommé"]
+        BT --> BTLEG
+        BT -.-> BTGAP
+    end
+    GHOOKS --> BT
 
     MGR --> BUSY
     MGR --> CTL
