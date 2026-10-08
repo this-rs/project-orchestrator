@@ -6338,6 +6338,99 @@ impl ChatManager {
         self.set_session_model_inner(session_id, model, true).await
     }
 
+    /// Decisions are read and closed in pages of this size.
+    const DECISION_PAGE: usize = 100;
+
+    /// A manual switch to another model overrides the routed choice in force: when the
+    /// session's newest decision was applied and named a different model, it is flagged
+    /// so that its close counts the override. A decision already closed is too late.
+    async fn flag_manual_override(&self, session_id: &str, model: &str) {
+        use super::provider::cognitive::{feedback::mark_override, store::DecisionFilter};
+        let Some(routing) = self.cognitive_routing.as_ref() else {
+            return;
+        };
+        let Ok(uuid) = Uuid::parse_str(session_id) else {
+            return;
+        };
+        let filter = DecisionFilter {
+            session_id: Some(uuid),
+            limit: Some(1),
+            ..Default::default()
+        };
+        let newest = match routing.store.decisions(&filter).await {
+            Ok(found) => found.into_iter().next(),
+            Err(error) => {
+                warn!(session_id, error = %error, "decisions unreadable: the override is not counted");
+                return;
+            }
+        };
+        let Some(decision) = newest else {
+            return;
+        };
+        let overrides = decision.applied
+            && decision
+                .chosen
+                .as_ref()
+                .is_some_and(|pick| pick.model != model);
+        if !overrides {
+            return;
+        }
+        if let Err(error) = mark_override(routing.store.as_ref(), decision.id).await {
+            warn!(session_id, error = %error, "the override could not be flagged");
+        }
+    }
+
+    /// A session that ends closes its open decisions. The outcome of its work is not read
+    /// here, so each closes with an unknown success; the overrides flagged earlier count.
+    async fn close_session_decisions(&self, session_id: &str) {
+        use super::provider::cognitive::{
+            feedback::{close_decision, Outcome},
+            mode::RoutingSettings,
+            store::DecisionFilter,
+        };
+        let Some(routing) = self.cognitive_routing.as_ref() else {
+            return;
+        };
+        let Ok(uuid) = Uuid::parse_str(session_id) else {
+            return;
+        };
+        // The reward does not read the settings, so the defaults serve every scope.
+        let settings = RoutingSettings::default();
+        let mut offset = 0;
+        loop {
+            let filter = DecisionFilter {
+                session_id: Some(uuid),
+                limit: Some(Self::DECISION_PAGE),
+                offset,
+                ..Default::default()
+            };
+            let page = match routing.store.decisions(&filter).await {
+                Ok(page) => page,
+                Err(error) => {
+                    warn!(session_id, error = %error, "decisions unreadable: they stay open");
+                    return;
+                }
+            };
+            let full = page.len() == Self::DECISION_PAGE;
+            for decision in page {
+                if let Err(error) = close_decision(
+                    routing.store.as_ref(),
+                    &settings,
+                    decision.id,
+                    &Outcome::default(),
+                )
+                .await
+                {
+                    warn!(session_id, error = %error, "a decision could not be closed");
+                }
+            }
+            if !full {
+                return;
+            }
+            offset += Self::DECISION_PAGE;
+        }
+    }
+
     /// `manual`: the user asked for it, which ends the automatic model routing of the
     /// session. The router's own changes pass `false`.
     async fn set_session_model_inner(
@@ -6350,6 +6443,7 @@ impl ChatManager {
             if let Some(router) = self.turn_routing.get(session_id) {
                 router.mark_manual();
             }
+            self.flag_manual_override(session_id, model).await;
         }
         if let Some(handle) = self.agent_runtime.get(session_id).await {
             handle.set_model(model).await?;
@@ -8516,6 +8610,32 @@ impl ChatManager {
     /// The pool the cognitive router chooses from: every model of every
     /// reachable instance, with the capabilities and the price nexus reports,
     /// the health (one probe per instance per window) and the project's consent.
+    /// The candidates for a project, as the runner's routing asks for them. The
+    /// same pool a chat session is routed from, so both see one world.
+    pub(crate) async fn routing_facts(
+        &self,
+        routing: &super::provider::cognitive::decider::CognitiveRouting,
+        project_slug: Option<&str>,
+    ) -> Vec<super::provider::cognitive::candidates::ModelFacts> {
+        use super::provider::{catalog, store};
+        let instances = match store::instances(self.graph.as_ref()).await {
+            Ok(instances) => instances,
+            Err(error) => {
+                warn!(%error, "routing pool: instances unreadable, no candidates");
+                return Vec::new();
+            }
+        };
+        let consents = match project_slug {
+            Some(slug) => store::consents(self.graph.as_ref(), slug)
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let store_catalog =
+            catalog::StoreCatalog::new(instances.clone(), &consents, project_slug.is_some());
+        self.routing_pool(routing, &instances, &store_catalog).await
+    }
+
     async fn routing_pool(
         &self,
         routing: &super::provider::cognitive::decider::CognitiveRouting,
@@ -9305,6 +9425,7 @@ impl ChatManager {
     /// trigger SIGKILL via the Drop impl.
     pub async fn close_session(&self, session_id: &str) -> Result<()> {
         self.turn_routing.remove(session_id);
+        self.close_session_decisions(session_id).await;
         if self.agent_runtime.owns(session_id).await {
             crate::auth::agent_tokens::revoke_session(session_id);
             self.agent_runtime.close(session_id).await?;

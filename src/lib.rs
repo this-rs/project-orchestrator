@@ -1515,6 +1515,16 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         }
     };
 
+    // One cognitive router for the whole process: the chat manager, the plan runner
+    // and the decision routes read the same store and share the same probe memory.
+    // Arms and decisions persist in the graph, so the posteriors survive a restart.
+    let cognitive_store: Arc<dyn chat::provider::cognitive::store::RoutingArmStore> = Arc::new(
+        neo4j::routing::Neo4jRoutingStore::new(orchestrator.neo4j_arc()),
+    );
+    let cognitive_routing =
+        chat::provider::cognitive::decider::CognitiveRouting::new(cognitive_store.clone());
+    api::routing_handlers::set_routing_store(Some(cognitive_store.clone()));
+
     // Create chat manager (optional — requires Claude CLI)
     boot.start("chat");
     let chat_manager = {
@@ -1586,14 +1596,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             cm = cm.with_trajectory_collector(tc.clone());
         }
         cm = cm.with_nn_router(neural_router.clone(), config.neural_routing.enabled);
-        // Cognitive model routing: arms and decisions persist in the graph, so the
-        // posteriors survive a restart. Without this the provider is resolved from
-        // the declared rules only.
-        cm = cm.with_cognitive_routing(chat::provider::cognitive::decider::CognitiveRouting::new(
-            Arc::new(neo4j::routing::Neo4jRoutingStore::new(
-                orchestrator.neo4j_arc(),
-            )),
-        ));
+        // Without the router the provider is resolved from the declared rules only.
+        cm = cm.with_cognitive_routing(cognitive_routing.clone());
         if let Some(re) = orchestrator.reasoning_engine() {
             cm = cm.with_reasoning_engine(re.clone());
         }
@@ -1704,6 +1708,19 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // every RECONCILE_INTERVAL), so a "running" state is always a real one.
     {
         let graph = orchestrator.neo4j_arc();
+        // The plan runner decides each attempt through the same router, with the
+        // candidates of the chat manager. Installed once for the process.
+        let routing_handle = chat_manager.as_ref().map(|cm| {
+            Arc::new(runner::routing::RoutingHandle::new(
+                cognitive_routing.decider.clone(),
+                cognitive_store.clone(),
+                Arc::new(runner::routing::ChatRoutingPool {
+                    manager: cm.clone(),
+                    routing: cognitive_routing.clone(),
+                }),
+            ))
+        });
+        runner::routing::install(routing_handle.clone());
         let runner = chat_manager.as_ref().map(|cm| {
             let context_builder = orchestrator.context_builder().clone();
             let runner_config = orchestrator.runner_config();
@@ -1716,7 +1733,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                     runner_config,
                     event_tx,
                 )
-                .with_event_emitter(event_bus.clone() as std::sync::Arc<dyn events::EventEmitter>),
+                .with_event_emitter(event_bus.clone() as std::sync::Arc<dyn events::EventEmitter>)
+                .with_routing(routing_handle.clone()),
             )
         });
         let protocol_emitter = protocol_emitter_for_reconcile;

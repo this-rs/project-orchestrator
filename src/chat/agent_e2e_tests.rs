@@ -1083,6 +1083,68 @@ mod cognitive_routing {
         assert_eq!(all[0].session_id, Some(session));
     }
 
+    /// Routes one executor turn of `session` by auto, then returns the stored decision.
+    async fn routed_turn(
+        s: &Setup,
+        session: Uuid,
+    ) -> crate::chat::provider::cognitive::decision::CognitiveDecision {
+        let choice = s
+            .manager
+            .resolve_provider_choice_for(&executor_request(), Some("proj"), Some(session))
+            .await
+            .unwrap_or_else(|e| panic!("resolve failed: {e:#}"));
+        assert_eq!(choice.routed_by, RoutedBy::Auto);
+        let all = decisions(s).await;
+        assert_eq!(all.len(), 1);
+        assert!(all[0].applied, "the routed turn is applied");
+        all[0].clone()
+    }
+
+    #[tokio::test]
+    async fn a_manual_switch_to_another_model_counts_as_an_override_when_the_session_closes() {
+        let s = setup_with("mixed", "auto", true, false).await;
+        let session = Uuid::new_v4();
+        routed_turn(&s, session).await;
+
+        s.manager
+            .set_session_model(&session.to_string(), "some-other-model")
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+        // A session that never opened here has nothing else to close: the decisions
+        // are closed before the lookup that reports it.
+        let _ = s.manager.close_session(&session.to_string()).await;
+
+        let closed = decisions(&s).await;
+        let outcome = closed[0]
+            .outcome
+            .as_ref()
+            .expect("the close recorded an outcome");
+        assert!(outcome.overridden, "the switch by hand is counted");
+        assert!(outcome.reward.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_session_that_ends_closes_its_decisions_without_an_override() {
+        let s = setup_with("mixed", "auto", true, false).await;
+        let session = Uuid::new_v4();
+        routed_turn(&s, session).await;
+
+        // Naming the model the router chose is not a switch by hand.
+        s.manager
+            .set_session_model(&session.to_string(), "m")
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+        let _ = s.manager.close_session(&session.to_string()).await;
+
+        let closed = decisions(&s).await;
+        let outcome = closed[0]
+            .outcome
+            .as_ref()
+            .expect("the close recorded an outcome");
+        assert!(!outcome.overridden);
+        assert!(outcome.reward.is_some());
+    }
+
     #[tokio::test]
     async fn mixed_routes_an_executor_by_auto_and_leaves_the_pilot_on_the_primary() {
         let s = setup("mixed", "auto", true).await;
