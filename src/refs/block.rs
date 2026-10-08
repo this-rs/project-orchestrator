@@ -56,6 +56,33 @@ mod tests {
     const A: &str = "3adeffc9-c8b0-4e2f-a674-55bfcb293433";
     const B: &str = "57cf05c9-25b6-495d-ab07-de4b11d64736";
 
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn split_never_panics(s in any::<String>()) {
+                let _ = split(&s);
+            }
+
+            #[test]
+            fn encode_then_split_is_identity(
+                text in any::<String>(),
+                ids in proptest::collection::vec((0usize..5, any::<[u8; 16]>()), 0..8)
+            ) {
+                let refs: Vec<EntityRef> = ids
+                    .into_iter()
+                    .map(|(k, b)| EntityRef::new(RefKind::ALL[k], Uuid::from_bytes(b)))
+                    .collect();
+                let clean = text.replace(MARKER, NEUTRAL_MARKER);
+                let (back, got) = split(&encode(&text, &refs));
+                prop_assert_eq!(got, refs);
+                prop_assert_eq!(back, clean);
+            }
+        }
+    }
+
     #[test]
     fn round_trip() {
         let refs = vec![r(RefKind::Task, A), r(RefKind::Rfc, B)];

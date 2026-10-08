@@ -272,6 +272,40 @@ mod tests {
         );
     }
 
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn arbitrary_raw_refs_never_panic_and_stay_bounded(
+                items in proptest::collection::vec((any::<String>(), any::<String>()), 0..40)
+            ) {
+                let raw: Vec<RawRef> = items.into_iter().map(|(kind, id)| RawRef { kind, id }).collect();
+                if let Ok(valid) = validate_refs(&raw) {
+                    prop_assert!(valid.len() <= MAX_REFS_PER_MESSAGE);
+                    for r in &valid {
+                        prop_assert!(!r.id.is_nil());
+                    }
+                }
+            }
+
+            #[test]
+            fn arbitrary_tokens_and_searches_never_panic(s in any::<String>(), n in any::<Option<usize>>()) {
+                let _ = validate_token(&s);
+                let _ = validate_search(&s, n);
+            }
+
+            #[test]
+            fn a_valid_token_always_round_trips(kind in 0usize..5, bytes in any::<[u8; 16]>()) {
+                let id = Uuid::from_bytes(bytes);
+                prop_assume!(!id.is_nil());
+                let r = EntityRef::new(RefKind::ALL[kind], id);
+                prop_assert_eq!(validate_token(&r.token()), Ok(r));
+            }
+        }
+    }
+
     #[test]
     fn every_reason_has_a_message() {
         for r in [
