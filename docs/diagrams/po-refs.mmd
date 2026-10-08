@@ -1,0 +1,58 @@
+%% name: po-refs
+%% covers: backend:src/refs/**
+%% verified: c3e30b2d
+%% ---
+%% PROUVE : ce que le module src/refs/ fait aujourd'hui (PR 1 du plan « Chat : références #/@ ») :
+%%   valider une référence envoyée par un client, décider si l'appelant peut la lire, et la
+%%   replier dans le texte du message. Rien n'est branché au chat : le module n'est appelé par
+%%   personne en dehors de ses tests (le branchement est PR 3, derrière le drapeau refs_v1).
+%% ---
+%% SOURCES LUES :
+%%   src/refs/{mod,types,registry,validate,access,block,wire}.rs
+%%   tests/refs_contract.rs, tests/fixtures/refs/*.json
+%% ---
+%% NON ETABLI :
+%%   aucun RefSource sur GraphStore (PR 2) : resolve_checked n'est testé qu'avec un faux ;
+%%   aucun appelant HTTP/WS : /api/refs/search et la trame refs_resolved n'existent que comme
+%%   formes (wire.rs) figées par les fixtures ;
+%%   aucune ACL de lecture par entité n'existe dans le dépôt : OpenInstanceRule admet tout
+%%   appelant authentifié, ScopeRule est la couture où une règle projet/workspace se branchera.
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans appelant  ⚪ autre domaine
+
+flowchart TD
+    subgraph legend["Légende"]
+        direction LR
+        L1["✅ vérifié par test"]
+        L2["🟠 écrit, sans appelant"]
+        L3["⚪ autre domaine"]
+    end
+
+    CLIENT["⚪ client: refs[] = {kind, id} en chaînes"]
+    VALIDATE["✅ validate::validate_refs<br/>plafond 20 avant dédoublonnage ;<br/>kind inconnu / réservé / id nul ;<br/>test: the_limit_is_inclusive_and_counts_before_dedup"]
+    REGISTRY["✅ registry::lookup<br/>5 kinds actifs, persona et skill réservés (enabled=false) ;<br/>test: events_entity_type_is_fully_classified"]
+    ERR["✅ wire::RefsErrorBody<br/>400 {error, code: refs_invalid, reason, index?} ;<br/>test: error_fixture"]
+    ENTITYREF["✅ types::EntityRef {kind, id}<br/>sans label, champs inconnus refusés ;<br/>test: an_entity_ref_refuses_a_client_label"]
+    BLOCK["✅ block::encode<br/>bloc po-refs en fin de texte, avant po-attachments ;<br/>marqueur tapé par l'utilisateur neutralisé ;<br/>test: a_typed_marker_cannot_forge_a_block"]
+    SOURCE["🟠 access::RefSource::load_unchecked<br/>lecture brute (implémentée en PR 2)"]
+    POLICY{"✅ access::AccessPolicy::resolve_checked<br/>non authentifié refusé avant lecture ;<br/>erreur de store = Failed ;<br/>réponse pour une autre entité = NotFound ;<br/>test: a_source_answering_for_another_entity_is_not_found"}
+    RULE["✅ access::ScopeRule::allows<br/>OpenInstanceRule aujourd'hui ;<br/>test: denied_by_the_rule_is_forbidden_and_the_rule_spoke"]
+    DISCLOSE["✅ Resolution::to_wire(Disclosure::Uniform)<br/>refus, absence et erreur = not_found ;<br/>test: uniform_disclosure_makes_denied_and_missing_indistinguishable"]
+    EVENT["✅ wire::RefsEvent refs_resolved<br/>test: refs_resolved_fixture"]
+    SEARCH["🟠 wire::RefSearchResponse<br/>GET /api/refs/search, pas de handler<br/>test: search_fixture"]
+    GATE["✅ scripts/lcov_gate.rs<br/>énumère src/refs/ depuis le disque ;<br/>CI: étape Blocking coverage gate"]
+
+    CLIENT --> VALIDATE
+    VALIDATE --> REGISTRY
+    VALIDATE -- refus --> ERR
+    VALIDATE -- ok --> ENTITYREF
+    ENTITYREF --> BLOCK
+    ENTITYREF --> POLICY
+    POLICY --> SOURCE
+    POLICY --> RULE
+    POLICY --> DISCLOSE
+    DISCLOSE --> EVENT
+    SEARCH -. filtré par .-> POLICY
+    GATE -. mesure .-> VALIDATE
+    GATE -. mesure .-> POLICY
