@@ -27,6 +27,7 @@ pub mod models;
 pub mod persona;
 pub mod prompt;
 pub mod providers;
+pub mod routing;
 #[allow(clippy::module_inception)]
 pub mod runner;
 pub mod state;
