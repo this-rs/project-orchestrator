@@ -135,6 +135,10 @@ const CLOSED_ROUTE_PREFIXES: &[&str] = &[
     "/api/mcp-federation",
     "/api/lifecycle-hooks",
     "/api/vault",
+    // INTEGRATION ONLY — refs PR 2 adds GET /api/refs/search without classifying it, which fails
+    // route_table_is_classified. Closed (fail-closed) until the refs owner decides whether agents
+    // may search references. The human `#` composer is not affected by the restricted profile.
+    "/api/refs",
     "/api/protocols",
     "/api/environments",
     "/api/deployments",
@@ -794,6 +798,7 @@ mod tests {
             "/api/hooks",
             "/api/progress",
             "/api/reactor",
+            "/api/refs",
             "/api/registry",
             "/api/rfcs",
             "/api/setup-status",
