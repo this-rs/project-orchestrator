@@ -53,6 +53,12 @@ pub enum WsChatClientMessage {
         /// behaviour, a mid-stream message interrupts the running response.
         #[serde(default)]
         queue: bool,
+        /// References the message points at (`{kind, id}` objects). Checked and
+        /// folded into the message by `refs::compose`; ignored when `refs_v1` is
+        /// off. A malformed list is refused with an `error` frame
+        /// (`code: "refs_invalid"`).
+        #[serde(default)]
+        refs: Vec<serde_json::Value>,
     },
     /// Act on a message held for this session: `{"type":"queue_op","op":"edit",
     /// "id":…,"content":…}`, or `remove` / `prioritize` / `send_now` with an
@@ -178,7 +184,13 @@ async fn handle_ws_chat_preauthed(
 ) {
     let t0 = tokio::time::Instant::now();
     // Wait for client "ready" signal before sending auth_ok
-    super::ws_auth::wait_ready_then_auth_ok(&mut socket, &claims).await;
+    // Capabilities of this server (`refs_v1` unless switched off): absent from
+    // the frame when there are none, as on an older server.
+    let features = state
+        .chat_manager
+        .as_ref()
+        .and_then(|m| crate::refs::flag::features(m.refs_v1_enabled()));
+    super::ws_auth::wait_ready_then_auth_ok(&mut socket, &claims, features.as_deref()).await;
     debug!(
         session_id = %session_id,
         elapsed_ms = t0.elapsed().as_millis() as u64,
@@ -765,7 +777,7 @@ async fn handle_ws_chat_loop(
                         match serde_json::from_str::<WsChatClientMessage>(text_str) {
                             Ok(client_msg) => {
                                 match client_msg {
-                                    WsChatClientMessage::UserMessage { content, attachments, queue } => {
+                                    WsChatClientMessage::UserMessage { content, attachments, queue, refs } => {
                                         debug!(session_id = %session_id, queue, "WS: Received user_message");
 
                                         // T4.3: Extract code entities and create DISCUSSED relations (non-blocking)
@@ -776,20 +788,19 @@ async fn handle_ws_chat_loop(
                                         // Fold attached documents into the message text
                                         // (see chat::message_attachments). An unknown id
                                         // is refused, never silently dropped.
-                                        let content = match crate::chat::message_attachments::compose(
+                                        let content = match crate::refs::compose::compose_user_message(
                                             &state.orchestrator.neo4j_arc(),
                                             &content,
+                                            &refs,
                                             &attachments,
+                                            chat_manager.refs_v1_enabled(),
                                         )
                                         .await
                                         {
                                             Ok(c) => c,
                                             Err(e) => {
-                                                let err = serde_json::json!({
-                                                    "type": "error",
-                                                    "message": format!("Failed to attach documents: {}", e),
-                                                });
-                                                let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                                let err = serde_json::to_string(&e.to_ws_event()).unwrap_or_default();
+                                                let _ = ws_sender.send(Message::Text(err.into())).await;
                                                 continue;
                                             }
                                         };

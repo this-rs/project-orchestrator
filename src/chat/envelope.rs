@@ -517,6 +517,7 @@ mod tests {
         ChatRequest {
             routing_mode: None,
             attachments: Vec::new(),
+            refs: Vec::new(),
             message: "go".into(),
             session_id: None,
             cwd: cwd.into(),

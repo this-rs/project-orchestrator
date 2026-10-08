@@ -216,6 +216,7 @@ fn request(provider: Option<&str>, project: Option<&str>, mode: &str) -> ChatReq
     ChatRequest {
         routing_mode: None,
         attachments: Vec::new(),
+        refs: Vec::new(),
         message: "hi there".into(),
         session_id: None,
         cwd: std::env::temp_dir().display().to_string(),
@@ -2172,5 +2173,191 @@ mod provider_switch {
             Some(&SwitchProviderError::NotFound)
         );
         assert!(w.manager.is_session_active(&old).await);
+    }
+}
+
+// ============================================================================
+// References (`refs_v1`) on the native engine
+// ============================================================================
+//
+// A native session never goes through `stream_response`: it sends the text to
+// the model itself (`agent_runtime`). These tests prove the references reach
+// the model there too, as pointers, against the real wire of the fake server.
+
+mod refs_native {
+    use super::*;
+    use crate::refs::compose::compose_user_message;
+    use crate::refs::test_support::{world, World};
+
+    fn script_for(keys: &[&str]) -> Value {
+        let mut routes = script().as_array().cloned().unwrap();
+        for key in keys {
+            routes.push(sse_route(
+                key,
+                vec![
+                    delta(json!({"content": format!("answer to {key}")})),
+                    json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                    json!({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}),
+                    json!("[DONE]"),
+                ],
+            ));
+        }
+        Value::Array(routes)
+    }
+
+    async fn setup(keys: &[&str]) -> (FakeOpenAi, World, ChatManager) {
+        let fake = FakeOpenAi::start(script_for(keys));
+        let w = world().await;
+        store_instance(&w.graph, &instance(&fake, "none")).await;
+        consent(&w.graph, "proj", "local", &fake.origin()).await;
+        let manager = manager(w.graph.clone(), true);
+        (fake, w, manager)
+    }
+
+    async fn stored(w: &World, text: &str, refs: &[Value]) -> String {
+        let graph: Arc<dyn GraphStore> = w.graph.clone();
+        compose_user_message(&graph, text, refs, &[], true)
+            .await
+            .unwrap()
+    }
+
+    fn task_ref(w: &World) -> Value {
+        json!({"kind": "task", "id": w.task_a.id})
+    }
+
+    /// The body the model received for the turn named by `key`.
+    fn body_for(fake: &FakeOpenAi, key: &str) -> String {
+        fake.chat_requests()
+            .iter()
+            .map(|r| r["body"].to_string())
+            .find(|b| b.contains(key))
+            .unwrap_or_else(|| panic!("no request to the model mentions {key}"))
+    }
+
+    async fn persisted_types(w: &World, sid: &str) -> Vec<(i64, String)> {
+        w.graph
+            .get_chat_events(Uuid::parse_str(sid).unwrap(), 0, 200)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.seq, r.event_type))
+            .collect()
+    }
+
+    async fn wait_for_persisted(w: &World, sid: &str, event_type: &str, count: usize) {
+        for _ in 0..200 {
+            let n = persisted_types(w, sid)
+                .await
+                .iter()
+                .filter(|e| e.1 == event_type)
+                .count();
+            if n >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{count} {event_type} event(s) never persisted");
+    }
+
+    #[tokio::test]
+    async fn a_native_session_opened_with_references_gives_the_model_the_pointers() {
+        let (fake, w, manager) = setup(&["PINNED-ONE"]).await;
+        let mut req = request(Some("local"), Some("proj"), "default");
+        req.message = stored(&w, "PINNED-ONE #task:x", &[task_ref(&w)]).await;
+        let created = manager.create_session(&req).await.unwrap();
+        let sid = created.session_id;
+        wait_for_persisted(&w, &sid, "result", 1).await;
+
+        let body = body_for(&fake, "PINNED-ONE");
+        assert!(body.contains("po-context"), "{body}");
+        assert!(body.contains("Tâche alpha refs"), "{body}");
+        assert!(
+            !body.contains("po-refs"),
+            "the model must never see the raw block: {body}"
+        );
+        assert!(
+            !body.contains("Faire les refs"),
+            "pointer depth: no content"
+        );
+
+        // Stored and replayed: the message as written, then what it resolved to.
+        let events = persisted_types(&w, &sid).await;
+        let user = events.iter().find(|e| e.1 == "user_message").unwrap().0;
+        let resolved = events.iter().find(|e| e.1 == "refs_resolved").unwrap().0;
+        assert!(user < resolved);
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_native_session_that_is_sent_a_message_with_references_gives_the_model_the_pointers()
+    {
+        let (fake, w, manager) = setup(&["hi there", "PINNED-TWO"]).await;
+        let created = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap();
+        let sid = created.session_id;
+        wait_for_persisted(&w, &sid, "result", 1).await;
+
+        manager
+            .send_message(&sid, &stored(&w, "PINNED-TWO", &[task_ref(&w)]).await)
+            .await
+            .unwrap();
+        wait_for_persisted(&w, &sid, "result", 2).await;
+        let body = body_for(&fake, "PINNED-TWO");
+        assert!(
+            body.contains("po-context") && body.contains("Tâche alpha refs"),
+            "{body}"
+        );
+        assert!(!body.contains("po-refs"), "{body}");
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_native_message_without_references_is_sent_untouched() {
+        let (fake, w, manager) = setup(&["hi there"]).await;
+        let created = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap();
+        let sid = created.session_id;
+        wait_for_persisted(&w, &sid, "result", 1).await;
+        let body = body_for(&fake, "hi there");
+        assert!(!body.contains("po-context"), "{body}");
+        assert!(persisted_types(&w, &sid)
+            .await
+            .iter()
+            .all(|e| e.1 != "refs_resolved"));
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_resumed_native_session_expands_the_references_of_the_message_that_resumes_it() {
+        let (fake, w, manager) = setup(&["hi there", "PINNED-THREE"]).await;
+        let created = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap();
+        let sid = created.session_id;
+        wait_for_persisted(&w, &sid, "result", 1).await;
+        manager.close_session(&sid).await.unwrap();
+
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        manager
+            .resume_session(
+                &sid,
+                &stored(&w, "PINNED-THREE", &[task_ref(&w)]).await,
+                Some(&claims),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("resume failed: {e:#}"));
+        wait_for_persisted(&w, &sid, "result", 2).await;
+        let body = body_for(&fake, "PINNED-THREE");
+        assert!(
+            body.contains("po-context") && body.contains("Tâche alpha refs"),
+            "{body}"
+        );
+        assert!(!body.contains("po-refs"), "{body}");
+        manager.close_session(&sid).await.unwrap();
     }
 }

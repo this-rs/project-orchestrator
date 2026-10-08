@@ -40,6 +40,7 @@ fn every_fixture_declares_the_contract_version_first() {
         "search_response.json",
         "refs_resolved_event.json",
         "errors.json",
+        "auth_ok_features.json",
     ] {
         let path = format!("{}/tests/fixtures/refs/{name}", env!("CARGO_MANIFEST_DIR"));
         let text = std::fs::read_to_string(path).unwrap();
@@ -256,4 +257,35 @@ fn strict_fixture() {
         let s = bad.as_str().unwrap();
         assert_eq!(block::split(s), (s.to_string(), vec![]), "{s}");
     }
+}
+
+#[test]
+fn auth_ok_features_fixture_is_what_the_server_builds() {
+    use project_orchestrator::api::ws_auth::auth_ok_frame;
+    use project_orchestrator::auth::jwt::Claims;
+    let f = fixture("auth_ok_features.json");
+    let claims = Claims {
+        sub: f["auth_ok_on"]["user"]["id"].as_str().unwrap().into(),
+        email: f["auth_ok_on"]["user"]["email"].as_str().unwrap().into(),
+        name: f["auth_ok_on"]["user"]["name"].as_str().unwrap().into(),
+        iat: 0,
+        exp: 0,
+        token_type: None,
+        scope: None,
+        jti: None,
+    };
+    assert_eq!(
+        auth_ok_frame(
+            &claims,
+            project_orchestrator::refs::flag::features(true).as_deref()
+        ),
+        f["auth_ok_on"]
+    );
+    assert_eq!(
+        auth_ok_frame(
+            &claims,
+            project_orchestrator::refs::flag::features(false).as_deref()
+        ),
+        f["auth_ok_off"]
+    );
 }

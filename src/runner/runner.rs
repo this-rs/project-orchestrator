@@ -3129,6 +3129,7 @@ impl PlanRunner {
         let request = ChatRequest {
             routing_mode: None,
             attachments: Vec::new(),
+            refs: Vec::new(),
             message: prompt, // Send the full prompt directly in create_session — avoids the ghost empty message at seq 1
             session_id: None,
             cwd: cwd.to_string(),

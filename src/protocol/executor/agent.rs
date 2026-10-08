@@ -305,6 +305,7 @@ async fn execute_via_agent(
     let request = ChatRequest {
         routing_mode: None,
         attachments: Vec::new(),
+        refs: Vec::new(),
         message: String::new(), // sent separately via send_message
         session_id: None,
         cwd: cwd.to_string(),

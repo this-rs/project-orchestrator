@@ -44,10 +44,26 @@ pub struct MessageAttachment {
     pub size_bytes: u64,
 }
 
-/// Append the reference block. No attachments → `text` unchanged.
+const MARKER: &str = "<po-attachments>";
+/// What a typed `<po-attachments>` becomes in user text.
+const NEUTRAL_MARKER: &str = "&lt;po-attachments>";
+
+/// Turn a typed `<po-attachments>` into inert text.
+///
+/// [`split`] trusts any final block, so a user who types one at the end of a
+/// message (with no attachment at all) would otherwise get the chunks of any
+/// document whose id they know injected into the prompt. Every path that
+/// builds a stored message neutralizes the user's text first.
+pub fn neutralize(text: &str) -> String {
+    text.replace(MARKER, NEUTRAL_MARKER)
+}
+
+/// Append the reference block. No attachments → `text` with any typed marker
+/// neutralized (identical for every text that has none).
 pub fn encode(text: &str, attachments: &[MessageAttachment]) -> String {
+    let text = neutralize(text);
     if attachments.is_empty() {
-        return text.to_string();
+        return text;
     }
     let json = serde_json::to_string(attachments).unwrap_or_else(|_| "[]".to_string());
     // `<` is escaped so a filename can never spell the closing tag.
@@ -81,7 +97,7 @@ pub async fn compose(
     ids: &[Uuid],
 ) -> anyhow::Result<String> {
     if ids.is_empty() {
-        return Ok(text.to_string());
+        return Ok(neutralize(text));
     }
     let mut refs = Vec::with_capacity(ids.len());
     for id in ids {
@@ -108,12 +124,20 @@ pub async fn compose(
 /// message must still reach the agent.
 pub async fn expand_for_agent(graph: &Arc<dyn GraphStore>, content: &str) -> String {
     let (text, refs) = split(content);
-    if refs.is_empty() {
-        return text;
-    }
     let mut out = text;
+    out.push_str(&render_documents(graph, &refs).await);
+    out
+}
+
+/// The documents' text as the block that follows the message in the prompt;
+/// empty when there is no attachment. Never fails (see [`expand_for_agent`]).
+pub async fn render_documents(graph: &Arc<dyn GraphStore>, refs: &[MessageAttachment]) -> String {
+    if refs.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
     out.push_str("\n\n---\nAttached documents (uploaded by the user with this message):\n");
-    for r in &refs {
+    for r in refs {
         out.push_str(&format!("\n### {} (id {})\n", r.filename, r.id));
         match graph.get_document_chunks(r.id).await {
             Ok(chunks) if !chunks.is_empty() => {

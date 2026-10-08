@@ -19,9 +19,14 @@ const MAX_BLOCK_JSON_BYTES: usize = MAX_REFS_PER_MESSAGE * 128;
 /// What a typed `<po-refs>` becomes in user text, so a user cannot forge a block.
 const NEUTRAL_MARKER: &str = "&lt;po-refs>";
 
+/// Turn a typed `<po-refs>` into inert text, so a user cannot forge a block.
+pub fn neutralize(text: &str) -> String {
+    text.replace(MARKER, NEUTRAL_MARKER)
+}
+
 /// Append the block. No references → the text, with any forged marker neutralized.
 pub fn encode(text: &str, refs: &[EntityRef]) -> String {
-    let text = text.replace(MARKER, NEUTRAL_MARKER);
+    let text = neutralize(text);
     if refs.is_empty() {
         return text;
     }

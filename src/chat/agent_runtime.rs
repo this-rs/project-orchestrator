@@ -250,7 +250,15 @@ impl AgentSessionHandle {
             content: shown.to_string(),
         })
         .await;
-        let input = TurnInput::text(sent);
+        // The same expansion as `stream_response` (`refs::turn`): a message with
+        // `#` references reaches the model as its visible text plus the pointers,
+        // never as the raw block; one without is sent as it always was (a relayed
+        // history, if any, stays in front).
+        let turn = crate::refs::turn::expand_user_turn(&self.graph, shown).await;
+        if let Some(event) = turn.event() {
+            self.emit(event).await;
+        }
+        let input = TurnInput::text(turn.native_prompt(shown, sent));
         let stream = match self.session.send_turn(input.clone()).await {
             Ok(stream) => stream,
             Err(error) => {

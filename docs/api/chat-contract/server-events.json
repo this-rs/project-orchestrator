@@ -334,8 +334,11 @@
     "error": {
       "examples": {
         "full": {
+          "code": "refs_invalid",
+          "index": 2,
           "message": "Tool execution failed: permission denied",
           "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "reason": "unknown_kind",
           "type": "error"
         },
         "minimal": {
@@ -344,11 +347,23 @@
         }
       },
       "fields": {
+        "code": {
+          "required": false,
+          "type": "string"
+        },
+        "index": {
+          "required": false,
+          "type": "number"
+        },
         "message": {
           "required": true,
           "type": "string"
         },
         "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "reason": {
           "required": false,
           "type": "string"
         },
@@ -396,7 +411,17 @@
               "content": "Then update the changelog.",
               "id": "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
               "prioritized": true,
-              "queued_at": "2026-01-15T10:30:00Z"
+              "queued_at": "2026-01-15T10:30:00Z",
+              "refs": [
+                {
+                  "id": "57cf05c9-25b6-495d-ab07-de4b11d64736",
+                  "kind": "plan"
+                },
+                {
+                  "id": "2191fcb0-e07c-49c1-9f29-cb9f7441f914",
+                  "kind": "rfc"
+                }
+              ]
             }
           ],
           "type": "pending_queue"
@@ -517,6 +542,47 @@
         "tool": {
           "required": true,
           "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    "refs_resolved": {
+      "examples": {
+        "full": {
+          "refs": [
+            {
+              "entity_status": "in_progress",
+              "id": "57cf05c9-25b6-495d-ab07-de4b11d64736",
+              "kind": "plan",
+              "label": "Chat : références #/@",
+              "project": {
+                "id": "00333b5f-2d0a-4467-9c98-155e55d2b7e5",
+                "name": "Project Orchestrator",
+                "slug": "project-orchestrator"
+              },
+              "status": "ok",
+              "subtitle": "12 tâches"
+            },
+            {
+              "id": "3adeffc9-c8b0-4e2f-a674-55bfcb293433",
+              "kind": "task",
+              "status": "not_found"
+            }
+          ],
+          "type": "refs_resolved"
+        },
+        "minimal": {
+          "refs": [],
+          "type": "refs_resolved"
+        }
+      },
+      "fields": {
+        "refs": {
+          "required": true,
+          "type": "array"
         },
         "type": {
           "required": true,

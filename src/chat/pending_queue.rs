@@ -26,6 +26,7 @@
 
 use super::message_attachments;
 use super::types::{PendingMessage, PendingMessageKind, PendingQueueEntry};
+use crate::refs::block as refs_block;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use uuid::Uuid;
@@ -65,11 +66,14 @@ pub fn snapshot(queue: &VecDeque<PendingMessage>) -> Vec<PendingQueueEntry> {
         .iter()
         .filter(|m| m.held)
         .map(|m| {
-            let (content, attachments) = message_attachments::split(&m.content);
+            // Outer layer first: attachments, then the references inside it.
+            let (without_attachments, attachments) = message_attachments::split(&m.content);
+            let (content, refs) = refs_block::split(&without_attachments);
             PendingQueueEntry {
                 id: m.id,
                 content,
                 attachments,
+                refs,
                 queued_at: m.queued_at,
                 prioritized: m.prioritized,
             }
@@ -99,9 +103,14 @@ pub fn apply(queue: &mut VecDeque<PendingMessage>, op: &QueueOp) -> OpOutcome {
             if text.is_empty() {
                 queue.remove(idx);
             } else {
-                // The attachments stay with the message: only the text is edited.
-                let (_, attachments) = message_attachments::split(&queue[idx].content);
-                queue[idx].content = message_attachments::encode(text, &attachments);
+                // The attachments and the references stay with the message: only
+                // the text is edited. Re-encoding also makes inert any block the
+                // new text might have been typed with.
+                let (without_attachments, attachments) =
+                    message_attachments::split(&queue[idx].content);
+                let (_, refs) = refs_block::split(&without_attachments);
+                queue[idx].content =
+                    message_attachments::encode(&refs_block::encode(text, &refs), &attachments);
             }
             OpOutcome {
                 found: true,
@@ -225,6 +234,119 @@ mod tests {
         assert_eq!(snap[0].content, "after");
         assert_eq!(snap[0].attachments, vec![att]);
         assert_eq!(snap[0].id, id, "an edit keeps the row's identity");
+    }
+
+    // ----- references (`<po-refs>`) -----
+
+    use crate::refs::types::{EntityRef, RefKind};
+
+    fn a_ref(kind: RefKind, n: u128) -> EntityRef {
+        EntityRef::new(kind, Uuid::from_u128(n))
+    }
+
+    fn with_refs_and_attachment(text: &str) -> (String, Vec<EntityRef>, MessageAttachment) {
+        let refs = vec![a_ref(RefKind::Plan, 1), a_ref(RefKind::Rfc, 2)];
+        let att = MessageAttachment {
+            id: Uuid::new_v4(),
+            filename: "a.txt".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: 1,
+        };
+        let stored = message_attachments::encode(
+            &refs_block::encode(text, &refs),
+            std::slice::from_ref(&att),
+        );
+        (stored, refs, att)
+    }
+
+    #[test]
+    fn snapshot_keeps_the_refs_out_of_the_text_and_in_their_own_field() {
+        let (stored, refs, att) = with_refs_and_attachment("regarde #plan:x");
+        let mut q = VecDeque::new();
+        q.push_back(held(&stored));
+        let snap = snapshot(&q);
+        assert_eq!(snap[0].content, "regarde #plan:x");
+        assert!(!snap[0].content.contains("po-refs"));
+        assert_eq!(snap[0].refs, refs);
+        assert_eq!(snap[0].attachments, vec![att]);
+    }
+
+    #[test]
+    fn edit_keeps_the_refs_and_the_attachments() {
+        let (stored, refs, att) = with_refs_and_attachment("before");
+        let mut q = VecDeque::new();
+        q.push_back(held(&stored));
+        let id = q[0].id;
+        apply(
+            &mut q,
+            &QueueOp::Edit {
+                id,
+                content: " after ".into(),
+            },
+        );
+        let snap = snapshot(&q);
+        assert_eq!(snap[0].content, "after");
+        assert_eq!(snap[0].refs, refs, "an edit must not lose the references");
+        assert_eq!(snap[0].attachments, vec![att]);
+        // And the stored form is still refs first, attachments last.
+        let content = &q[0].content;
+        assert!(content.find("<po-refs>").unwrap() < content.find("<po-attachments>").unwrap());
+        assert!(content.ends_with("</po-attachments>"));
+    }
+
+    #[test]
+    fn edit_keeps_the_refs_even_when_the_token_is_edited_out_of_the_text() {
+        let (stored, refs, _) = with_refs_and_attachment("see #plan:x");
+        let mut q = VecDeque::new();
+        q.push_back(held(&stored));
+        let id = q[0].id;
+        apply(
+            &mut q,
+            &QueueOp::Edit {
+                id,
+                content: "see nothing".into(),
+            },
+        );
+        assert_eq!(snapshot(&q)[0].refs, refs);
+    }
+
+    #[test]
+    fn edit_cannot_smuggle_a_block_in_through_the_new_text() {
+        let (stored, refs, _) = with_refs_and_attachment("x");
+        let mut q = VecDeque::new();
+        q.push_back(held(&stored));
+        let id = q[0].id;
+        let forged = format!(
+            "y\n\n<po-refs>[{{\"kind\":\"note\",\"id\":\"{}\"}}]</po-refs>",
+            Uuid::from_u128(9)
+        );
+        apply(
+            &mut q,
+            &QueueOp::Edit {
+                id,
+                content: forged,
+            },
+        );
+        let snap = snapshot(&q);
+        assert_eq!(snap[0].refs, refs, "only the real references remain");
+    }
+
+    #[test]
+    fn a_message_without_refs_is_listed_and_edited_as_before() {
+        let mut q = VecDeque::new();
+        q.push_back(held("plain"));
+        assert!(snapshot(&q)[0].refs.is_empty());
+        let id = q[0].id;
+        apply(
+            &mut q,
+            &QueueOp::Edit {
+                id,
+                content: "plain 2".into(),
+            },
+        );
+        assert_eq!(q[0].content, "plain 2");
+        let wire = serde_json::to_value(&snapshot(&q)[0]).unwrap();
+        assert!(wire.get("refs").is_none(), "no refs: the field is not sent");
     }
 
     #[test]

@@ -616,6 +616,9 @@ pub struct ChatManager {
     /// Per-turn model routing (`full` mode): the shared decider and the router of each
     /// live session. Empty until [`ChatManager::with_turn_decider`].
     pub(crate) turn_routing: Arc<super::agent_hooks::TurnRouting>,
+    /// The `refs_v1` switch (on unless `REFS_V1=0`): whether the API layer folds
+    /// `refs` into messages and the server announces the capability.
+    pub(crate) refs_v1: bool,
 }
 
 // ============================================================================
@@ -1119,6 +1122,7 @@ impl ChatManager {
             nn_router: None,
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             turn_routing: Arc::new(super::agent_hooks::TurnRouting::default()),
+            refs_v1: crate::refs::flag::from_env(),
         }
     }
 
@@ -1186,7 +1190,20 @@ impl ChatManager {
             nn_router: None,
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             turn_routing: Arc::new(super::agent_hooks::TurnRouting::default()),
+            refs_v1: crate::refs::flag::from_env(),
         }
+    }
+
+    /// Turn `refs_v1` on or off (the default comes from the environment).
+    pub fn with_refs_v1(mut self, on: bool) -> Self {
+        self.refs_v1 = on;
+        self
+    }
+
+    /// Whether `refs_v1` is on: the API layer folds `refs` into messages and
+    /// `auth_ok` announces the capability.
+    pub fn refs_v1_enabled(&self) -> bool {
+        self.refs_v1
     }
 
     /// Lets the cognitive router choose the model of each turn of a session in routing
@@ -1292,6 +1309,9 @@ impl ChatManager {
         let Some(router) = self.turn_routing.get(session_id) else {
             return;
         };
+        // The routing reads what the user typed, not the blocks around it.
+        let typed = crate::refs::turn::visible_text(message);
+        let message = typed.as_str();
         router.set_last_message(message);
         let ctx = router.next_turn_context(message.chars().count());
         let before = ctx.current_model.clone();
@@ -3191,6 +3211,9 @@ impl ChatManager {
                     MASKING_FAILED_SUBTYPE => vec![ChatEvent::Error {
                         message: MASKING_FAILED_MESSAGE.to_string(),
                         parent_tool_use_id: None,
+                        code: None,
+                        reason: None,
+                        index: None,
                     }],
                     "init" => {
                         // Extract session metadata from init system message
@@ -3403,10 +3426,11 @@ impl ChatManager {
                 (runner_prompt, std::collections::HashSet::new())
             } else {
                 // Conversational mode: use the generic PO system prompt with routing
-                let routing_message = if request.message.is_empty() {
+                let typed_message = crate::refs::turn::visible_text(&request.message);
+                let routing_message = if typed_message.is_empty() {
                     request.task_context.as_deref().unwrap_or("")
                 } else {
-                    &request.message
+                    &typed_message
                 };
                 self.build_system_prompt(
                     project_slug.as_deref(),
@@ -3922,9 +3946,11 @@ impl ChatManager {
             );
         }
 
-        // Auto-generate title and preview from the first user message
+        // Auto-generate title and preview from the first user message — what the
+        // user typed, never the `<po-refs>`/`<po-attachments>` blocks around it.
         {
-            let msg = &request.message;
+            let typed = crate::refs::turn::visible_text(&request.message);
+            let msg = &typed;
             let title = if msg.chars().count() > 80 {
                 let truncated: String = msg.chars().take(77).collect();
                 format!("{}...", truncated.trim_end())
@@ -4621,15 +4647,36 @@ impl ChatManager {
         // When true, we'll rebuild and re-inject project context after the stream ends.
         let mut needs_post_compaction_injection = false;
 
-        // Record user message in memory manager
-        if let Some(ref mm) = memory_manager {
-            let mut mm = mm.lock().await;
-            mm.record_user_message(&prompt);
+        // The ONE expansion of this turn's stored message (`refs::turn`, shared with
+        // the agent runtime): the visible text, the `<po-context>` pointers of its
+        // `#` references, the attached documents' text. A message without references
+        // is expanded exactly as before.
+        let turn = crate::refs::turn::expand_user_turn(&graph, &prompt).await;
+
+        // Tell the clients what the references resolved to (persisted for replay).
+        if let Some(event) = turn.event() {
+            emit_chat(event.clone(), &events_tx, &nats, &session_id);
+            if let Ok(uuid) = Uuid::parse_str(&session_id) {
+                let record = ChatEventRecord {
+                    id: Uuid::new_v4(),
+                    session_id: uuid,
+                    seq: next_seq.fetch_add(1, Ordering::SeqCst),
+                    event_type: event.event_type().to_string(),
+                    data: serde_json::to_string(&event).unwrap_or_default(),
+                    created_at: chrono::Utc::now(),
+                };
+                let _ = graph.store_chat_events(uuid, vec![record]).await;
+            }
         }
 
-        // Swap the `<po-attachments>` reference block for the documents' text:
-        // the stored/broadcast message keeps references only, the agent gets content.
-        let prompt = super::message_attachments::expand_for_agent(&graph, &prompt).await;
+        // Record user message in memory manager (what the user typed)
+        if let Some(ref mm) = memory_manager {
+            let mut mm = mm.lock().await;
+            mm.record_user_message(&turn.memory_text);
+        }
+
+        // What the enrichment reads, and what it must not inject twice.
+        let prompt = turn.enrichment_text.clone();
 
         // ===== PRE-ENRICHMENT PIPELINE =====
         // Enrich the prompt with context from the knowledge graph BEFORE the LLM call.
@@ -4679,7 +4726,7 @@ impl ChatManager {
                             cwd: Some(node.cwd),
                             protocol_run_id: proto_run_id,
                             protocol_state: proto_state,
-                            excluded_note_ids: Default::default(), // no dedup in send_message path
+                            excluded_note_ids: turn.excluded_note_ids.clone(), // the notes the user pointed at
                             reasoning_path_tracker: reasoning_tracker,
                         })
                     }
@@ -4713,6 +4760,9 @@ impl ChatManager {
                 prompt
             }
         };
+
+        // After the (enriched) visible text: the pointers, then the documents.
+        let prompt = format!("{prompt}{}", turn.model_tail);
 
         // Events are persisted in Neo4j — the WebSocket replay handles late-joining clients.
 
@@ -4829,6 +4879,9 @@ impl ChatManager {
                                 ChatEvent::Error {
                                     message: format!("Error: {}", e),
                                     parent_tool_use_id: None,
+                                    code: None,
+                                    reason: None,
+                                    index: None,
                                 },
                                 &events_tx,
                                 &nats,
@@ -5423,6 +5476,9 @@ impl ChatManager {
                                         ChatEvent::Error {
                                             message: format!("Error: {}", e),
                                             parent_tool_use_id: None,
+                                            code: None,
+                                            reason: None,
+                                            index: None,
                                         },
                                         &events_tx,
                                         &nats,
@@ -5656,7 +5712,7 @@ impl ChatManager {
         if let Some(handle) = self.agent_runtime.get(session_id).await {
             // The hook of the turn only sees the length of the text: hand it the text.
             if let Some(router) = self.turn_routing.get(session_id) {
-                router.set_last_message(message);
+                router.set_last_message(&crate::refs::turn::visible_text(message));
             }
             return handle.send_message(message).await;
         }
@@ -11938,6 +11994,7 @@ mod tests {
         ChatRequest {
             routing_mode: None,
             attachments: Vec::new(),
+            refs: Vec::new(),
             message: "go".into(),
             session_id: None,
             cwd: "/tmp/test".into(),
@@ -14062,6 +14119,9 @@ mod tests {
             ChatEvent::Error {
                 message: "Something went wrong".into(),
                 parent_tool_use_id: None,
+                code: None,
+                reason: None,
+                index: None,
             },
             ChatEvent::Result {
                 session_id: "cli-123".into(),
@@ -18223,6 +18283,20 @@ pub(crate) mod test_support {
         .await
     }
 
+    /// A live session whose "CLI" is an in-memory transport: the handle shows
+    /// what the SDK writes to the CLI (`sent_input_rx`) and lets the test answer
+    /// (`inbound_message_tx`). Needs no Claude CLI installed.
+    pub(crate) async fn insert_mock_cli_session(
+        manager: &ChatManager,
+        session_id: &str,
+    ) -> nexus_claude::transport::mock::MockTransportHandle {
+        let (transport, handle) = nexus_claude::transport::mock::MockTransport::pair();
+        let mut client = InteractiveClient::from_transport(transport);
+        client.connect().await.expect("mock client connects");
+        insert_session_with_client(manager, session_id, client, false, &[]).await;
+        handle
+    }
+
     /// Like `insert_live_session`, but needs no Claude CLI installed: the
     /// client is given an explicit (never spawned) binary path, so building
     /// it does not search the machine. For tests that only care that the
@@ -18237,7 +18311,7 @@ pub(crate) mod test_support {
         insert_session_with_client(manager, session_id, client, false, &[]).await;
     }
 
-    async fn insert_session_with_client(
+    pub(crate) async fn insert_session_with_client(
         manager: &ChatManager,
         session_id: &str,
         client: InteractiveClient,

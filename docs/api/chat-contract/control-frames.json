@@ -24,6 +24,9 @@
     "auth_ok": {
       "examples": {
         "full": {
+          "features": [
+            "refs_v1"
+          ],
           "type": "auth_ok",
           "user": {
             "email": "dev@example.com",
@@ -41,6 +44,10 @@
         }
       },
       "fields": {
+        "features": {
+          "required": false,
+          "type": "array"
+        },
         "type": {
           "required": true,
           "type": "string"
@@ -50,7 +57,7 @@
           "type": "object"
         }
       },
-      "source": "api::ws_auth::send_auth_ok"
+      "source": "api::ws_auth::auth_ok_frame"
     },
     "events_lagged": {
       "examples": {

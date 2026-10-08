@@ -38,7 +38,8 @@ diagrams:
     status: verified
     file: docs/diagrams/po-chat-manager.mmd
     covers:
-      - "backend:src/chat/{mod,manager,cost,agent_e2e_tests,tree,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments,pending_queue,relay}.rs"
+      - "backend:src/chat/{mod,manager,cost,agent_e2e_tests,tree,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments,pending_queue,relay,refs_wiring_tests}.rs"
+      - "backend:src/refs/{compose,flag,turn}.rs"
   - name: po-spawn-envelope
     owner: theotime
     status: verified
@@ -84,7 +85,7 @@ diagrams:
     status: verified
     file: docs/diagrams/po-chat-transport.mmd
     covers:
-      - "backend:src/api/ws_chat_handler.rs"
+      - "backend:src/api/{ws_chat_handler,refs_ws_tests}.rs"
       - "backend:src/chat/wire_contract.rs"
   - name: po-p2p-transport
     owner: theotime

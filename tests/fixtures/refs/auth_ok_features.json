@@ -1,0 +1,24 @@
+{
+  "_contract_version": 1,
+  "_description": "ADDITIVE fixture (PR 3). The WebSocket auth_ok frame gains `features`: the capabilities of the server. `refs_v1` means a client may send `refs` (user_message frames, POST /api/chat/sessions, POST /api/chat/sessions/{id}/messages). The field is ABSENT (never an empty array) on a server that predates refs or has switched them off (REFS_V1=0): absent means 'do not send refs'. The REST twin, readable before any WebSocket exists, is GET /api/version -> features.refs_v1 (boolean).",
+  "feature": "refs_v1",
+  "auth_ok_on": {
+    "type": "auth_ok",
+    "user": { "id": "7d6c5b4a-3f2e-4d1c-8b0a-9f8e7d6c5b4a", "email": "dev@example.com", "name": "Example Developer" },
+    "features": ["refs_v1"]
+  },
+  "auth_ok_off": {
+    "type": "auth_ok",
+    "user": { "id": "7d6c5b4a-3f2e-4d1c-8b0a-9f8e7d6c5b4a", "email": "dev@example.com", "name": "Example Developer" }
+  },
+  "version_features_on": { "refs_v1": true },
+  "version_features_off": { "refs_v1": false },
+  "ws_error_frame_for_refs_invalid": {
+    "_note": "The WS `error` frame keeps `message` (older clients show it) and gains code/reason/index. REST uses the errors.json body (HTTP 400). forbidden is never emitted: a refused or failed lookup is not_found.",
+    "type": "error",
+    "message": "Invalid references: unknown reference kind",
+    "code": "refs_invalid",
+    "reason": "unknown_kind",
+    "index": 2
+  }
+}

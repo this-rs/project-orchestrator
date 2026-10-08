@@ -250,6 +250,9 @@ impl EventMapper {
                 vec![ChatEvent::Error {
                     message: MASKING_FAILED_MESSAGE.to_string(),
                     parent_tool_use_id: None,
+                    code: None,
+                    reason: None,
+                    index: None,
                 }]
             }
             // A notice is a diagnostic: nothing in a turn.
@@ -335,6 +338,9 @@ fn error_event(error: &ProviderError) -> ChatEvent {
     ChatEvent::Error {
         message: format!("Error: {}", open_failure(error, None).message),
         parent_tool_use_id: None,
+        code: None,
+        reason: None,
+        index: None,
     }
 }
 

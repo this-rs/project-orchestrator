@@ -264,8 +264,16 @@ async fn try_cookie_auth(
 /// Send an `auth_ok` message with user info through the WebSocket.
 ///
 /// Called after upgrade when authentication was done pre-upgrade (cookie).
-pub async fn send_auth_ok(socket: &mut WebSocket, claims: &Claims) {
-    let auth_ok = serde_json::json!({
+pub async fn send_auth_ok(socket: &mut WebSocket, claims: &Claims, features: Option<&[&str]>) {
+    let auth_ok = auth_ok_frame(claims, features);
+    let _ = socket.send(Message::Text(auth_ok.to_string().into())).await;
+}
+
+/// The `auth_ok` frame. `features` names what this server can do beyond the
+/// base protocol (`["refs_v1"]`); `None` omits the field, which is exactly the
+/// frame older servers send, so a client reads "absent" as "not supported".
+pub fn auth_ok_frame(claims: &Claims, features: Option<&[&str]>) -> serde_json::Value {
+    let mut frame = serde_json::json!({
         "type": "auth_ok",
         "user": {
             "id": claims.sub,
@@ -273,7 +281,10 @@ pub async fn send_auth_ok(socket: &mut WebSocket, claims: &Claims) {
             "name": claims.name,
         }
     });
-    let _ = socket.send(Message::Text(auth_ok.to_string().into())).await;
+    if let Some(features) = features {
+        frame["features"] = serde_json::json!(features);
+    }
+    frame
 }
 
 // ============================================================================
@@ -322,7 +333,11 @@ pub(crate) fn classify_ready_message(msg: &Result<Message, axum::Error>) -> Read
 ///
 /// If the client doesn't send `"ready"` within [`READY_TIMEOUT_SECS`],
 /// `auth_ok` is sent anyway as a fallback for older clients.
-pub async fn wait_ready_then_auth_ok(socket: &mut WebSocket, claims: &Claims) {
+pub async fn wait_ready_then_auth_ok(
+    socket: &mut WebSocket,
+    claims: &Claims,
+    features: Option<&[&str]>,
+) {
     use futures::StreamExt;
     use tokio::time::{timeout, Duration};
 
@@ -343,7 +358,7 @@ pub async fn wait_ready_then_auth_ok(socket: &mut WebSocket, claims: &Claims) {
     match wait.await {
         Ok(true) => {
             // Client sent "ready" — send auth_ok
-            send_auth_ok(socket, claims).await;
+            send_auth_ok(socket, claims, features).await;
         }
         Ok(false) => {
             // Client disconnected before sending ready
@@ -352,7 +367,7 @@ pub async fn wait_ready_then_auth_ok(socket: &mut WebSocket, claims: &Claims) {
         Err(_) => {
             // Timeout — send auth_ok anyway (fallback for older clients)
             warn!("WS: client did not send 'ready' within 5s, sending auth_ok anyway");
-            send_auth_ok(socket, claims).await;
+            send_auth_ok(socket, claims, features).await;
         }
     }
 }

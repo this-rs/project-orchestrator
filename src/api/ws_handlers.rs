@@ -182,7 +182,7 @@ async fn handle_ws_preauthed(
     claims: Claims,
 ) {
     // Wait for client "ready" signal before sending auth_ok
-    super::ws_auth::wait_ready_then_auth_ok(&mut socket, &claims).await;
+    super::ws_auth::wait_ready_then_auth_ok(&mut socket, &claims, None).await;
     handle_ws_loop(
         socket,
         state,
