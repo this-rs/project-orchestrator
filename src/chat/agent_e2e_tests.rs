@@ -1345,6 +1345,7 @@ mod turn_routing {
                 run_id: None,
                 turn_index: request.turn_index,
                 outcome: None,
+                used: None,
             };
             self.decisions.lock().unwrap().push(decision.clone());
             Ok(decision)

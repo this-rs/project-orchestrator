@@ -134,6 +134,7 @@ pub fn decide_with(
         run_id: request.run_id,
         turn_index: request.turn_index,
         outcome: None,
+        used: None,
     };
 
     let pool: Vec<ModelFacts> = request

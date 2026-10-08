@@ -192,6 +192,8 @@ pub fn outcome_of_attempt(closed: &AgentExecutionNode) -> Outcome {
         interrupted: closed.status == AgentExecutionStatus::Interrupted,
         user_overrode_model: false,
         verification_passed: verification_passed(closed.verification_json.as_deref()),
+        input_tokens: closed.tokens_in,
+        output_tokens: closed.tokens_out,
     }
 }
 
@@ -214,6 +216,8 @@ pub fn outcome_of_result(
         interrupted: false,
         user_overrode_model: false,
         verification_passed: None,
+        input_tokens: None,
+        output_tokens: None,
     }
 }
 
@@ -287,6 +291,7 @@ pub(crate) mod test_support {
                 run_id: request.run_id,
                 turn_index: None,
                 outcome: None,
+                used: None,
             };
             self.store.put_decision(&decision).await?;
             Ok(decision)
