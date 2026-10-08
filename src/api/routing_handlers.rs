@@ -41,7 +41,11 @@ use serde_json::Value;
 use super::handlers::{AppError, OrchestratorState};
 use super::provider_handlers::require_human;
 use crate::auth::jwt::Claims;
-use crate::chat::provider::cognitive::report::{build_report, RoutingDecisionView, RoutingReport};
+use crate::chat::provider::cognitive::candidates::ModelFacts;
+use crate::chat::provider::cognitive::decision::Pick;
+use crate::chat::provider::cognitive::report::{
+    build_report_with, PickPrice, PriceLookup, RoutingDecisionView, RoutingReport,
+};
 use crate::chat::provider::cognitive::store::{DecisionFilter, RoutingArmStore};
 use crate::chat::provider::cognitive::{
     self, parse_routing_settings, EffectiveRouting, RoutingError, RoutingScope, RoutingSettings,
@@ -249,17 +253,48 @@ pub async fn get_report(
 ) -> Result<Json<RoutingReport>, AppError> {
     require_human_reader(&state, &claims)?;
     let report = match routing_store() {
-        Some(store) => build_report(
-            store.as_ref(),
-            query.project_slug.as_deref(),
-            query.from,
-            query.to,
-        )
-        .await
-        .map_err(AppError::Internal)?,
+        Some(store) => {
+            let prices = PoolPrices(match &state.chat_manager {
+                Some(manager) => {
+                    manager
+                        .routing_pool_for(query.project_slug.as_deref())
+                        .await
+                }
+                None => Vec::new(),
+            });
+            build_report_with(
+                store.as_ref(),
+                &prices,
+                query.project_slug.as_deref(),
+                query.from,
+                query.to,
+            )
+            .await
+            .map_err(AppError::Internal)?
+        }
         None => cognitive::report::summarise(&[], &cognitive::report::NoPrices),
     };
     Ok(Json(report))
+}
+
+/// Prices read from the candidates the router sees now: the nexus catalogue of each
+/// instance. The price is today's, not the one in force when a decision was taken, so
+/// an estimate computed from it is labelled as such by the report.
+struct PoolPrices(Vec<ModelFacts>);
+
+impl PriceLookup for PoolPrices {
+    fn price(&self, pick: &Pick) -> Option<PickPrice> {
+        let fact = self
+            .0
+            .iter()
+            .find(|f| f.provider_id == pick.provider_id && f.model == pick.model)?;
+        let price = fact.price?;
+        Some(PickPrice {
+            input_per_mtok: price.input_per_mtok,
+            output_per_mtok: price.output_per_mtok,
+            basis: fact.cost_basis,
+        })
+    }
 }
 
 fn require_human_reader(state: &OrchestratorState, claims: &Claims) -> Result<(), AppError> {
@@ -652,5 +687,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page["limit"], 200, "the page size is bounded");
+    }
+
+    #[test]
+    fn the_report_prices_a_pick_from_the_pool_or_not_at_all() {
+        use crate::chat::provider::cognitive::candidates::ModelFacts;
+        use crate::chat::provider::cognitive::decision::Pick;
+        use crate::chat::provider::cognitive::report::PriceLookup;
+        use nexus_claude::agent::{CostBasis, ModelPrice};
+
+        let fact = |provider: &str, model: &str, price: Option<ModelPrice>| ModelFacts {
+            provider_id: provider.into(),
+            model: model.into(),
+            supports_tools: true,
+            supports_images: false,
+            context_window: Some(100_000),
+            price,
+            cost_basis: CostBasis::Priced,
+            healthy: Some(true),
+            allowed_for_project: true,
+            sandboxed: false,
+        };
+        let priced = ModelPrice {
+            input_per_mtok: 3.0,
+            output_per_mtok: 15.0,
+            cache_read_per_mtok: None,
+            cache_write_per_mtok: None,
+        };
+        let lookup = super::PoolPrices(vec![
+            fact("cloud", "big", Some(priced)),
+            fact("cloud", "unknown", None),
+        ]);
+
+        let known = lookup
+            .price(&Pick::new("cloud", "big"))
+            .expect("a priced model is priced");
+        assert_eq!(known.input_per_mtok, 3.0);
+        assert_eq!(known.output_per_mtok, 15.0);
+        assert_eq!(known.basis, CostBasis::Priced);
+        // Unknown price stays unknown; a model the pool does not list is unknown too.
+        assert!(lookup.price(&Pick::new("cloud", "unknown")).is_none());
+        assert!(lookup.price(&Pick::new("cloud", "absent")).is_none());
+        assert!(lookup.price(&Pick::new("other", "big")).is_none());
     }
 }

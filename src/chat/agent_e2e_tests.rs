@@ -1084,6 +1084,98 @@ mod cognitive_routing {
     }
 
     #[tokio::test]
+    async fn a_manual_switch_to_another_model_counts_as_an_override_when_the_session_closes() {
+        let s = setup("full", "auto", true).await;
+        let session_id = open_routed_session(&s).await;
+
+        s.manager
+            .set_session_model(&session_id, "some-other-model")
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+        s.manager.close_session(&session_id).await.unwrap();
+
+        let closed = decisions(&s).await.remove(0);
+        let outcome = closed.outcome.expect("the close recorded an outcome");
+        assert!(outcome.overridden, "the switch by hand is counted");
+        assert!(outcome.reward.is_some(), "an override closes with a reward");
+    }
+
+    #[tokio::test]
+    async fn an_override_that_closes_a_losing_class_demotes_it_to_shadow() {
+        use crate::chat::provider::cognitive::{
+            decision::{CognitiveDecision, DecisionOutcome},
+            load_routing, LearningStage,
+        };
+        let s = setup("full", "auto", true).await;
+        // The smallest window the settings accept.
+        s.graph
+            .put_llm_setting(
+                GLOBAL,
+                "routing",
+                &json!({
+                    "mode": "full",
+                    "stage": "auto",
+                    "exploration_epsilon": 0.0,
+                    "demote_after": 5
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let session_id = open_routed_session(&s).await;
+        let routed = decisions(&s).await.remove(0);
+
+        // Same class as the session's decision: four learnt choices that did badly
+        // (the session's own, closed below, is the fifth) and five declarative ones
+        // that did well.
+        let store = Neo4jRoutingStore::new(s.graph.clone());
+        let seed = |applied: bool, reward: f64, age: i64| {
+            let mut d: CognitiveDecision = routed.clone();
+            d.id = Uuid::new_v4();
+            d.at = routed.at - ChronoDuration::seconds(age);
+            d.applied = applied;
+            d.stage = if applied {
+                LearningStage::Auto
+            } else {
+                LearningStage::Shadow
+            };
+            d.session_id = None;
+            d.outcome = Some(DecisionOutcome {
+                reward: Some(reward),
+                ..DecisionOutcome::default()
+            });
+            d
+        };
+        for age in 1..=4 {
+            store.put_decision(&seed(true, 0.2, age)).await.unwrap();
+        }
+        for age in 1..=5 {
+            store.put_decision(&seed(false, 0.9, age)).await.unwrap();
+        }
+
+        let before = load_routing(s.graph.as_ref(), Some("proj"))
+            .await
+            .unwrap()
+            .0;
+        assert!(before.stage == LearningStage::Auto);
+
+        s.manager
+            .set_session_model(&session_id, "some-other-model")
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+        s.manager.close_session(&session_id).await.unwrap();
+
+        let after = load_routing(s.graph.as_ref(), Some("proj"))
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            after.stage == LearningStage::Shadow,
+            "the override closed a class the router does worse on: demoted"
+        );
+    }
+
+    #[tokio::test]
     async fn mixed_routes_an_executor_by_auto_and_leaves_the_pilot_on_the_primary() {
         let s = setup("mixed", "auto", true).await;
         let executor = choose(&s, &executor_request()).await;
