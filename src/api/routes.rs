@@ -22,6 +22,7 @@ use super::project_handlers;
 use super::protocol_handlers;
 use super::provider_handlers;
 use super::reason_handlers;
+use super::refs_handlers;
 use super::registry_handlers;
 use super::rfc_handlers;
 use super::routing_handlers;
@@ -1439,6 +1440,8 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/registry/{id}/import",
             post(registry_handlers::import_from_registry),
         )
+        // Chat references: suggestions for the `#` picker (additive, read-only)
+        .route("/api/refs/search", get(refs_handlers::search_refs))
         // ================================================================
         // RFCs (Notes with note_type=rfc, frontend-friendly API)
         // ================================================================
