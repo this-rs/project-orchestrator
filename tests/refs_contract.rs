@@ -217,3 +217,43 @@ fn error_fixture() {
         "every reason has an example, in the declared order"
     );
 }
+
+#[test]
+fn strict_fixture() {
+    let v = fixture("strict.json");
+    for case in v["valid"].as_array().unwrap() {
+        let r = validate_token(case["token"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(r).unwrap(),
+            case["ref"],
+            "{}",
+            case["token"]
+        );
+    }
+    for case in v["invalid_tokens"].as_array().unwrap() {
+        let reason = validate_token(case["token"].as_str().unwrap()).unwrap_err();
+        assert_eq!(
+            serde_json::to_value(reason).unwrap(),
+            case["reason"],
+            "{}",
+            case["token"]
+        );
+    }
+    // Wire shapes that must be refused by every deserializer, not just the token path.
+    for bad in v["invalid_json"].as_array().unwrap() {
+        let s = bad.as_str().unwrap();
+        assert!(
+            serde_json::from_str::<EntityRef>(s).is_err(),
+            "EntityRef {s}"
+        );
+        // RawRef keeps any string for the id (validate_one names the failure) but not the shape.
+        match serde_json::from_str::<RawRef>(s) {
+            Ok(raw) => assert_eq!(validate_one(&raw), Err(InvalidReason::BadId), "RawRef {s}"),
+            Err(_) => assert!(s.starts_with('['), "RawRef {s}"),
+        }
+    }
+    for bad in v["invalid_blocks"].as_array().unwrap() {
+        let s = bad.as_str().unwrap();
+        assert_eq!(block::split(s), (s.to_string(), vec![]), "{s}");
+    }
+}

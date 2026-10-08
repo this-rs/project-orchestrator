@@ -3,10 +3,9 @@
 //! every branch.
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use super::registry::{lookup, Lookup};
-use super::types::{split_token, EntityRef, RawRef};
+use super::types::{parse_ref_id, split_token, EntityRef, RawRef};
 
 /// Most references one message may carry.
 pub const MAX_REFS_PER_MESSAGE: usize = 20;
@@ -64,9 +63,9 @@ pub fn validate_one(raw: &RawRef) -> Result<EntityRef, InvalidReason> {
         Lookup::Reserved(_) => return Err(InvalidReason::KindDisabled),
         Lookup::Unknown => return Err(InvalidReason::UnknownKind),
     };
-    match Uuid::parse_str(&raw.id) {
-        Ok(id) if !id.is_nil() => Ok(EntityRef::new(kind, id)),
-        _ => Err(InvalidReason::BadId),
+    match parse_ref_id(&raw.id) {
+        Some(id) => Ok(EntityRef::new(kind, id)),
+        None => Err(InvalidReason::BadId),
     }
 }
 
@@ -298,7 +297,7 @@ mod tests {
 
             #[test]
             fn a_valid_token_always_round_trips(kind in 0usize..5, bytes in any::<[u8; 16]>()) {
-                let id = Uuid::from_bytes(bytes);
+                let id = uuid::Uuid::from_bytes(bytes);
                 prop_assume!(!id.is_nil());
                 let r = EntityRef::new(RefKind::ALL[kind], id);
                 prop_assert_eq!(validate_token(&r.token()), Ok(r));
@@ -319,5 +318,34 @@ mod tests {
         ] {
             assert!(!r.message().is_empty());
         }
+    }
+
+    #[test]
+    fn only_the_hyphenated_uuid_is_an_id() {
+        for bad in [
+            "3adeffc9c8b04e2fa67455bfcb293433",
+            "{3adeffc9-c8b0-4e2f-a674-55bfcb293433}",
+            "urn:uuid:3adeffc9-c8b0-4e2f-a674-55bfcb293433",
+            " 3adeffc9-c8b0-4e2f-a674-55bfcb293433",
+            "3adeffc9-c8b0-4e2f-a674-55bfcb29343",
+            "３adeffc9-c8b0-4e2f-a674-55bfcb293433",
+        ] {
+            assert_eq!(
+                validate_one(&raw("plan", bad)),
+                Err(InvalidReason::BadId),
+                "{bad}"
+            );
+            assert_eq!(
+                validate_token(&format!("#plan:{bad}")),
+                Err(InvalidReason::BadId),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_upper_case_id_is_accepted_and_lowered() {
+        let r = validate_one(&raw("plan", &ID_A.to_uppercase())).unwrap();
+        assert_eq!(r.id.to_string(), ID_A);
     }
 }

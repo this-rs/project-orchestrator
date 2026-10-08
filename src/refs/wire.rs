@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::types::RefKind;
+use super::types::{de_ref_id, MapOnly, RefKind};
 use super::validate::{InvalidReason, RefsInvalid};
 
 /// The outcome of resolving one reference, as the user sees it.
@@ -33,6 +33,7 @@ pub struct ScopeLabel {
 #[serde(deny_unknown_fields)]
 pub struct RefSearchItem {
     pub kind: RefKind,
+    #[serde(deserialize_with = "de_ref_id")]
     pub id: Uuid,
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -46,10 +47,17 @@ pub struct RefSearchItem {
     pub entity_status: Option<String>,
 }
 
+/// The rows as objects only: a positional row is refused.
+fn de_items<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<RefSearchItem>, D::Error> {
+    let rows = Vec::<MapOnly<RefSearchItem>>::deserialize(d)?;
+    Ok(rows.into_iter().map(|MapOnly(r)| r).collect())
+}
+
 /// Body of `GET /api/refs/search`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RefSearchResponse {
+    #[serde(deserialize_with = "de_items")]
     pub items: Vec<RefSearchItem>,
 }
 
@@ -150,6 +158,27 @@ mod tests {
         ];
         for (s, name) in all {
             assert_eq!(serde_json::to_value(s).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn a_search_item_is_an_object_with_a_real_hyphenated_id() {
+        let id = "3adeffc9-c8b0-4e2f-a674-55bfcb293433";
+        let ok = format!(r#"{{"items":[{{"kind":"plan","id":"{id}","label":"L"}}]}}"#);
+        assert_eq!(
+            serde_json::from_str::<RefSearchResponse>(&ok)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        for bad in [
+            r#"{"items":[["plan","3adeffc9-c8b0-4e2f-a674-55bfcb293433","L"]]}"#.to_string(),
+            r#"{"items":[{"kind":"plan","id":"00000000-0000-0000-0000-000000000000","label":"L"}]}"#.to_string(),
+            format!(r#"{{"items":[{{"kind":"plan","id":"{}","label":"L"}}]}}"#, id.replace('-', "")),
+            format!(r#"{{"items":[{{"kind":"plan","id":"{{{id}}}","label":"L"}}]}}"#),
+        ] {
+            assert!(serde_json::from_str::<RefSearchResponse>(&bad).is_err(), "{bad}");
         }
     }
 }
