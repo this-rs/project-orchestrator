@@ -963,6 +963,11 @@ mod cognitive_routing {
     }
 
     async fn setup(mode: &str, stage: &str, wired: bool) -> Setup {
+        setup_with(mode, stage, wired, true).await
+    }
+
+    /// `warm` opens one session first, which probes the instance as a side effect.
+    async fn setup_with(mode: &str, stage: &str, wired: bool, warm: bool) -> Setup {
         let fake = FakeOpenAi::start(script());
         let graph = Arc::new(MockGraphStore::new());
         store_instance(&graph, &instance(&fake, "none")).await;
@@ -979,12 +984,14 @@ mod cognitive_routing {
         // The router only trusts what an instance is KNOWN to do: a provider that
         // was never probed reports no tools and an unknown window. Opening one
         // session on the instance probes it and keeps the probe in the cache.
-        let warm = manager
-            .create_session(&request(Some("local"), Some("proj"), "default"))
-            .await
-            .unwrap_or_else(|e| panic!("warm-up failed: {e:#}"));
-        let mut rx = manager.subscribe(&warm.session_id).await.unwrap();
-        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        if warm {
+            let opened = manager
+                .create_session(&request(Some("local"), Some("proj"), "default"))
+                .await
+                .unwrap_or_else(|e| panic!("warm-up failed: {e:#}"));
+            let mut rx = manager.subscribe(&opened.session_id).await.unwrap();
+            next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        }
         if wired {
             let store = Arc::new(Neo4jRoutingStore::new(graph.clone()));
             manager = manager.with_cognitive_routing(CognitiveRouting::new(store));
@@ -1053,6 +1060,27 @@ mod cognitive_routing {
             assert_eq!(all.len(), 2, "primary/{stage}");
             assert!(all.iter().all(|d| !d.applied && d.chosen.is_some()));
         }
+    }
+
+    #[tokio::test]
+    async fn an_unprobed_instance_is_probed_before_the_first_decision_and_the_decision_names_its_session(
+    ) {
+        let s = setup_with("mixed", "auto", true, false).await;
+        let session = Uuid::new_v4();
+        let choice = s
+            .manager
+            .resolve_provider_choice_for(&executor_request(), Some("proj"), Some(session))
+            .await
+            .unwrap_or_else(|e| panic!("resolve failed: {e:#}"));
+        assert_eq!(
+            choice.routed_by,
+            RoutedBy::Auto,
+            "the probe made local/m eligible"
+        );
+        assert_eq!(choice.provider_id, "local");
+        let all = decisions(&s).await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].session_id, Some(session));
     }
 
     #[tokio::test]

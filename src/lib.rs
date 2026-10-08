@@ -1586,6 +1586,14 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             cm = cm.with_trajectory_collector(tc.clone());
         }
         cm = cm.with_nn_router(neural_router.clone(), config.neural_routing.enabled);
+        // Cognitive model routing: arms and decisions persist in the graph, so the
+        // posteriors survive a restart. Without this the provider is resolved from
+        // the declared rules only.
+        cm = cm.with_cognitive_routing(chat::provider::cognitive::decider::CognitiveRouting::new(
+            Arc::new(neo4j::routing::Neo4jRoutingStore::new(
+                orchestrator.neo4j_arc(),
+            )),
+        ));
         if let Some(re) = orchestrator.reasoning_engine() {
             cm = cm.with_reasoning_engine(re.clone());
         }
