@@ -28,20 +28,38 @@
 //!
 //! A hook that fails is skipped (logged): a hook observes and advises, it never
 //! takes the turn down.
+//!
+//! ## Per-turn routing (`before_turn`)
+//!
+//! In routing mode `full` with the learning stage `auto`, the model of a turn is chosen
+//! by the cognitive router, among the models of the session's OWN provider (a session
+//! keeps its provider). [`TurnRouter`] holds what that needs for one session and
+//! [`directive_for_turn`] is the one decision function: the agent engine reaches it
+//! through [`GraphSessionHooks::before_turn`], the legacy engine (Claude Code CLI) calls
+//! it from `ChatManager::send_message` and sends the `set_model` control frame itself.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use nexus_claude::agent::{
-    CompactionInfo, HookVerdict, SessionHooks, ToolCallInfo, ToolResultInfo,
+    CompactionInfo, HookVerdict, SessionHooks, ToolCallInfo, ToolResultInfo, TurnContext,
+    TurnDirective,
 };
 use nexus_claude::{
     HookContext, HookInput, HookJSONOutput, HookMatcher, PostToolUseHookInput, PreCompactHookInput,
     PreToolUseHookInput,
 };
 use serde_json::Value;
-use tracing::warn;
+use tracing::{debug, warn};
+use uuid::Uuid;
+
+use super::provider::cognitive::candidates::ModelFacts;
+use super::provider::cognitive::decision::{DecideRequest, Decider, Pick};
+use super::provider::cognitive::signature::{ContextHints, TaskSignature};
+use super::provider::cognitive::{LearningStage, ProviderRoutingMode, RoutingSettings};
 
 /// The table the Claude path hands to its CLI: event name → matchers.
 pub(crate) type HookTable = HashMap<String, Vec<HookMatcher>>;
@@ -56,6 +74,8 @@ pub(crate) struct GraphSessionHooks {
     session_id: String,
     cwd: String,
     permission_mode: Option<String>,
+    /// Per-turn model routing; `None` when no decider is configured.
+    router: Option<Arc<TurnRouter>>,
 }
 
 impl GraphSessionHooks {
@@ -70,7 +90,14 @@ impl GraphSessionHooks {
             session_id: session_id.into(),
             cwd: cwd.into(),
             permission_mode,
+            router: None,
         }
+    }
+
+    /// Lets the cognitive router choose the model of each turn.
+    pub(crate) fn with_turn_router(mut self, router: Option<Arc<TurnRouter>>) -> Self {
+        self.router = router;
+        self
     }
 
     /// The callbacks registered for `event` whose matcher accepts `tool`.
@@ -254,6 +281,234 @@ impl SessionHooks for GraphSessionHooks {
             }
         }
         joined(reasons)
+    }
+
+    async fn before_turn(&self, ctx: &TurnContext) -> TurnDirective {
+        match &self.router {
+            Some(router) => directive_for_turn(router, ctx).await,
+            None => TurnDirective::none(),
+        }
+    }
+}
+
+/// How long the decider may take before the turn goes on without it.
+pub(crate) const DECIDE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The models a provider instance offers, with their facts (the candidates of a
+/// per-turn decision are restricted to the session's provider).
+#[async_trait]
+pub trait PoolSource: Send + Sync {
+    /// Facts of the models of `provider_id` only.
+    async fn pool(&self, provider_id: &str) -> Vec<ModelFacts>;
+}
+
+struct TurnState {
+    current_model: String,
+    last_change_turn: Option<u32>,
+    /// Turn counter of the legacy engine, which has no harness to count turns.
+    next_turn: u32,
+}
+
+/// What the per-turn decision of ONE session needs.
+pub(crate) struct TurnRouter {
+    decider: Arc<dyn Decider>,
+    pool: Arc<dyn PoolSource>,
+    /// Mode and stage, read once when the session opened.
+    routing: RoutingSettings,
+    provider_id: String,
+    session_id: Option<Uuid>,
+    project_slug: Option<String>,
+    trust: bool,
+    /// The request named its model: it is never replaced.
+    explicit_model: bool,
+    /// The session can switch model between turns (known once it is open).
+    set_model_live: AtomicBool,
+    /// The user changed the model by hand: no more automatic change.
+    manual: AtomicBool,
+    last_message: Mutex<Option<String>>,
+    state: Mutex<TurnState>,
+    timeout: Duration,
+}
+
+/// What opens a [`TurnRouter`].
+pub(crate) struct TurnRouterSpec {
+    pub decider: Arc<dyn Decider>,
+    pub pool: Arc<dyn PoolSource>,
+    pub routing: RoutingSettings,
+    pub provider_id: String,
+    pub session_id: Option<Uuid>,
+    pub project_slug: Option<String>,
+    pub trust: bool,
+    pub explicit_model: bool,
+    pub current_model: String,
+    /// Index the next turn counted by the router itself gets (legacy engine).
+    pub next_turn: u32,
+}
+
+fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl TurnRouter {
+    pub(crate) fn new(spec: TurnRouterSpec) -> Self {
+        Self {
+            decider: spec.decider,
+            pool: spec.pool,
+            routing: spec.routing,
+            provider_id: spec.provider_id,
+            session_id: spec.session_id,
+            project_slug: spec.project_slug,
+            trust: spec.trust,
+            explicit_model: spec.explicit_model,
+            set_model_live: AtomicBool::new(false),
+            manual: AtomicBool::new(false),
+            last_message: Mutex::new(None),
+            state: Mutex::new(TurnState {
+                current_model: spec.current_model,
+                last_change_turn: None,
+                next_turn: spec.next_turn,
+            }),
+            timeout: DECIDE_TIMEOUT,
+        }
+    }
+
+    /// The text the next turn will carry: the hook only sees its length.
+    pub(crate) fn set_last_message(&self, message: &str) {
+        *locked(&self.last_message) = Some(message.to_owned());
+    }
+
+    /// Whether the session can switch model between turns.
+    pub(crate) fn set_model_live(&self, live: bool) {
+        self.set_model_live.store(live, Ordering::SeqCst);
+    }
+
+    /// The user changed the model by hand: the router leaves the session alone.
+    pub(crate) fn mark_manual(&self) {
+        self.manual.store(true, Ordering::SeqCst);
+    }
+
+    /// The context of the next turn of a session whose turns the router counts itself.
+    pub(crate) fn next_turn_context(&self, input_chars: usize) -> TurnContext {
+        let mut state = locked(&self.state);
+        let mut ctx = TurnContext::new(state.next_turn, state.current_model.clone());
+        ctx.input_chars = input_chars;
+        state.next_turn += 1;
+        ctx
+    }
+
+    /// An applied change that could not be sent: the model did not change.
+    pub(crate) fn forget_change(&self, model_before: &str) {
+        let mut state = locked(&self.state);
+        state.current_model = model_before.to_owned();
+        state.last_change_turn = None;
+    }
+}
+
+/// The model of the turn about to start, `none` when it stays as it is.
+///
+/// * not `full` mode, a model named by the request, a model changed by hand, a session
+///   that cannot switch model live: nothing is asked and nothing changes;
+/// * `full` mode before the `auto` stage (and the turn right after a change): the decider
+///   is still asked, so the decision is recorded, but nothing is applied;
+/// * `full` + `auto`: the pick is used when the decision is applied and differs from the
+///   current model. A failing or slow decider (2 s) never fails the turn.
+pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -> TurnDirective {
+    // The harness knows the model the turn would run on, whoever changed it.
+    locked(&router.state).current_model = ctx.current_model.clone();
+    if router.routing.mode != ProviderRoutingMode::Full
+        || router.explicit_model
+        || router.manual.load(Ordering::SeqCst)
+        || !router.set_model_live.load(Ordering::SeqCst)
+    {
+        return TurnDirective::none();
+    }
+    // Never two changes in consecutive turns: the turn right after one is only recorded.
+    let just_changed = locked(&router.state)
+        .last_change_turn
+        .is_some_and(|turn| turn.checked_add(1) == Some(ctx.turn_index));
+    let apply = router.routing.stage == LearningStage::Auto && !just_changed;
+    let mut settings = router.routing.clone();
+    if !apply {
+        settings.stage = match settings.stage {
+            LearningStage::Auto => LearningStage::Shadow,
+            other => other,
+        };
+    }
+    let message = locked(&router.last_message).clone().unwrap_or_default();
+    let signature = TaskSignature::from_chat_request(
+        &message,
+        false,
+        router.project_slug.as_deref(),
+        ContextHints::default(),
+    );
+    let decision = tokio::time::timeout(router.timeout, async {
+        let pool = router.pool.pool(&router.provider_id).await;
+        let mut request = DecideRequest::new(signature, settings, pool);
+        request.trust = router.trust;
+        request.restrict_provider = Some(router.provider_id.clone());
+        request.current = Some(Pick::new(&router.provider_id, &ctx.current_model));
+        request.session_id = router.session_id;
+        request.turn_index = Some(ctx.turn_index);
+        router.decider.decide(&request).await
+    })
+    .await;
+    let decision = match decision {
+        Ok(Ok(decision)) => decision,
+        Ok(Err(error)) => {
+            warn!(provider = %router.provider_id, error = %error, "turn routing failed: the model stays");
+            return TurnDirective::none();
+        }
+        Err(_) => {
+            warn!(provider = %router.provider_id, "turn routing timed out: the model stays");
+            return TurnDirective::none();
+        }
+    };
+    if !apply || !decision.applied {
+        return TurnDirective::none();
+    }
+    match decision.chosen {
+        Some(pick) if pick.provider_id == router.provider_id && pick.model != ctx.current_model => {
+            debug!(model = %pick.model, turn = ctx.turn_index, reason = %decision.reason, "turn routing changes the model");
+            let mut state = locked(&router.state);
+            state.current_model = pick.model.clone();
+            state.last_change_turn = Some(ctx.turn_index);
+            TurnDirective::model(pick.model)
+        }
+        _ => TurnDirective::none(),
+    }
+}
+
+/// The decider shared by the sessions and the pool it chooses in.
+pub(crate) type SharedDecider = (Arc<dyn Decider>, Arc<dyn PoolSource>);
+
+/// The routers of the live sessions, and the decider they share.
+#[derive(Default)]
+pub(crate) struct TurnRouting {
+    decider: Mutex<Option<SharedDecider>>,
+    routers: Mutex<HashMap<String, Arc<TurnRouter>>>,
+}
+
+impl TurnRouting {
+    pub(crate) fn configure(&self, decider: Arc<dyn Decider>, pool: Arc<dyn PoolSource>) {
+        *locked(&self.decider) = Some((decider, pool));
+    }
+
+    pub(crate) fn configured(&self) -> Option<SharedDecider> {
+        locked(&self.decider).clone()
+    }
+
+    pub(crate) fn insert(&self, session_id: &str, router: Arc<TurnRouter>) {
+        locked(&self.routers).insert(session_id.to_owned(), router);
+    }
+
+    pub(crate) fn get(&self, session_id: &str) -> Option<Arc<TurnRouter>> {
+        locked(&self.routers).get(session_id).cloned()
+    }
+
+    pub(crate) fn remove(&self, session_id: &str) {
+        locked(&self.routers).remove(session_id);
     }
 }
 
