@@ -540,6 +540,15 @@ impl Neo4jClient {
             "CREATE INDEX alert_priority IF NOT EXISTS FOR (a:Alert) ON (a.priority)",
             "CREATE INDEX alert_type_idx IF NOT EXISTS FOR (a:Alert) ON (a.alert_type)",
             "CREATE INDEX alert_project IF NOT EXISTS FOR (a:Alert) ON (a.project_id)",
+            // Cognitive routing: one arm per (class, provider, model); decisions
+            // looked up by id and listed by project, session, task, run and time.
+            "CREATE CONSTRAINT routing_arm_key IF NOT EXISTS FOR (a:RoutingArm) REQUIRE (a.class, a.provider_id, a.model) IS UNIQUE",
+            "CREATE CONSTRAINT routing_decision_id IF NOT EXISTS FOR (d:RoutingDecision) REQUIRE d.id IS UNIQUE",
+            "CREATE INDEX routing_decision_project IF NOT EXISTS FOR (d:RoutingDecision) ON (d.project_slug)",
+            "CREATE INDEX routing_decision_session IF NOT EXISTS FOR (d:RoutingDecision) ON (d.session_id)",
+            "CREATE INDEX routing_decision_task IF NOT EXISTS FOR (d:RoutingDecision) ON (d.task_id)",
+            "CREATE INDEX routing_decision_run IF NOT EXISTS FOR (d:RoutingDecision) ON (d.run_id)",
+            "CREATE INDEX routing_decision_at IF NOT EXISTS FOR (d:RoutingDecision) ON (d.at)",
         ];
 
         // Vector indexes (require Neo4j 5.13+ — gracefully skip if not supported)

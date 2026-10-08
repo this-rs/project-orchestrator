@@ -3117,6 +3117,56 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<Vec<TopologyViolation>>;
 
     // ========================================================================
+    // Cognitive routing (bandit arms and decisions)
+    // ========================================================================
+
+    /// One bandit arm, `None` when it was never observed.
+    async fn get_routing_arm(
+        &self,
+        key: &crate::chat::provider::cognitive::store::ArmKey,
+    ) -> Result<Option<crate::chat::provider::cognitive::store::ArmStats>>;
+
+    /// Every arm of a class of work.
+    async fn list_routing_arms(
+        &self,
+        class: &str,
+    ) -> Result<Vec<crate::chat::provider::cognitive::store::ArmStats>>;
+
+    /// Records one observation, creating the arm with Beta(1, 1) when absent;
+    /// returns the arm as updated. Atomic per arm.
+    async fn observe_routing_arm(
+        &self,
+        key: &crate::chat::provider::cognitive::store::ArmKey,
+        observation: &crate::chat::provider::cognitive::store::ArmObservation,
+    ) -> Result<crate::chat::provider::cognitive::store::ArmStats>;
+
+    /// Stores or replaces a routing decision, linked best effort to its
+    /// session, task and run when they exist.
+    async fn put_routing_decision(
+        &self,
+        decision: &crate::chat::provider::cognitive::decision::CognitiveDecision,
+    ) -> Result<()>;
+
+    /// One routing decision.
+    async fn get_routing_decision(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<crate::chat::provider::cognitive::decision::CognitiveDecision>>;
+
+    /// Routing decisions, newest first.
+    async fn list_routing_decisions(
+        &self,
+        filter: &crate::chat::provider::cognitive::store::DecisionFilter,
+    ) -> Result<Vec<crate::chat::provider::cognitive::decision::CognitiveDecision>>;
+
+    /// Fills the outcome of a decision; `false` when it is unknown.
+    async fn set_routing_decision_outcome(
+        &self,
+        id: Uuid,
+        outcome: crate::chat::provider::cognitive::decision::DecisionOutcome,
+    ) -> Result<bool>;
+
+    // ========================================================================
     // Health check
     // ========================================================================
 
