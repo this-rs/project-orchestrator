@@ -210,7 +210,12 @@ mod tests {
             .lock()
             .unwrap()
             .insert("list_plans_filtered");
-        let (status, body) = get(app(w.graph.clone()).await, "/api/refs/search", true).await;
+        let (status, body) = get(
+            app(w.graph.clone()).await,
+            "/api/refs/search?kinds=plan",
+            true,
+        )
+        .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!body.to_string().contains("injected"));
     }

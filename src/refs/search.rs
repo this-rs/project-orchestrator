@@ -3,14 +3,16 @@
 //! policy lets this principal see, and shape the answer the golden fixture
 //! `tests/fixtures/refs/search_response.json` pins.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Deserialize;
 use uuid::Uuid;
 
-use super::access::{AccessPolicy, Principal, RefMeta, RefSource};
+use super::access::{AccessPolicy, Principal, RefMeta, RefSource, Resolution};
 use super::registry::{lookup, Lookup};
-use super::resolvers::{Candidates, GraphRefSource, Memo};
+use super::resolvers::{Candidates, GraphRefSource, KindResolver, Memo};
 use super::types::{EntityRef, RefKind};
 use super::validate::{validate_search, InvalidReason, RefsInvalid};
 use super::wire::{RefSearchItem, RefSearchResponse};
@@ -141,7 +143,7 @@ fn item(meta: RefMeta) -> RefSearchItem {
 
 /// Take one from each kind in turn, so a kind with many hits does not starve
 /// the others, until `limit`.
-fn interleave(mut lists: Vec<std::collections::VecDeque<RefMeta>>, limit: usize) -> Vec<RefMeta> {
+fn interleave(mut lists: Vec<VecDeque<RefMeta>>, limit: usize) -> Vec<RefMeta> {
     let mut out = Vec::new();
     while out.len() < limit && lists.iter().any(|l| !l.is_empty()) {
         for l in lists.iter_mut() {
@@ -156,6 +158,33 @@ fn interleave(mut lists: Vec<std::collections::VecDeque<RefMeta>>, limit: usize)
     out
 }
 
+/// How long one kind may take before it is left out of the page.
+pub const KIND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What one kind contributes: its candidates in scope that the policy lets
+/// `principal` see.
+async fn one_kind(
+    resolver: &dyn KindResolver,
+    candidates: &Candidates,
+    query: &SearchQuery,
+    policy: &AccessPolicy,
+    principal: &Principal,
+) -> anyhow::Result<VecDeque<RefMeta>> {
+    let mut memo = Memo::default();
+    let mut kept = VecDeque::new();
+    for meta in resolver.candidates(candidates, &mut memo).await? {
+        if !in_scope(&meta, query.project_id, query.workspace_slug.as_deref()) {
+            continue;
+        }
+        let r = EntityRef::new(meta.kind, meta.id);
+        let verdict = policy.resolve_checked(principal, &Loaded(meta), &r).await;
+        if let Resolution::Found(found) = verdict {
+            kept.push_back(*found);
+        }
+    }
+    Ok(kept)
+}
+
 /// Run a validated search for `principal`.
 pub async fn search(
     graph: Arc<dyn GraphStore>,
@@ -164,7 +193,33 @@ pub async fn search(
     query: &SearchQuery,
 ) -> anyhow::Result<RefSearchResponse> {
     let source = GraphRefSource::new(graph);
-    let mut memo = Memo::default();
+    search_with(
+        &|k| source.resolver(k),
+        policy,
+        principal,
+        query,
+        KIND_TIMEOUT,
+    )
+    .await
+}
+
+/// [`search`] over any source of resolvers, with an explicit per-kind timeout.
+///
+/// The kinds are asked concurrently. A kind that fails or exceeds `timeout` is
+/// left out (and logged): the picker still shows the others. Only when every
+/// requested kind failed is the search an error, so an outage is never an
+/// empty list.
+pub async fn search_with<'s, F>(
+    resolver_of: &F,
+    policy: &AccessPolicy,
+    principal: &Principal,
+    query: &SearchQuery,
+    timeout: Duration,
+) -> anyhow::Result<RefSearchResponse>
+where
+    F: Fn(RefKind) -> &'s dyn KindResolver,
+    F: Sync,
+{
     // Twice the page, capped: room for what the scope or the policy drops.
     let candidates = Candidates {
         needle: query.q.to_lowercase(),
@@ -173,26 +228,41 @@ pub async fn search(
         fetch: (query.limit * 2).min(100),
     };
 
-    let mut lists = Vec::with_capacity(query.kinds.len());
-    for kind in &query.kinds {
-        let resolver = source.resolver(*kind);
-        let mut kept = std::collections::VecDeque::new();
-        for meta in resolver.candidates(&candidates, &mut memo).await? {
-            if !in_scope(&meta, query.project_id, query.workspace_slug.as_deref()) {
-                continue;
+    let asked = query.kinds.iter().map(|kind| {
+        let resolver = resolver_of(*kind);
+        let candidates = &candidates;
+        async move {
+            tokio::time::timeout(
+                timeout,
+                one_kind(resolver, candidates, query, policy, principal),
+            )
+            .await
+        }
+    });
+    let answers = futures::future::join_all(asked).await;
+
+    let mut lists = Vec::with_capacity(answers.len());
+    let mut failed = 0;
+    for (kind, answer) in query.kinds.iter().zip(answers) {
+        match answer {
+            Ok(Ok(kept)) => lists.push(kept),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, %kind, "reference search failed for a kind");
+                failed += 1;
             }
-            let r = EntityRef::new(meta.kind, meta.id);
-            let verdict = policy.resolve_checked(principal, &Loaded(meta), &r).await;
-            if let super::access::Resolution::Found(found) = verdict {
-                kept.push_back(*found);
+            Err(_) => {
+                tracing::warn!(%kind, "reference search timed out for a kind");
+                failed += 1;
             }
         }
-        lists.push(kept);
+    }
+    if failed > 0 && lists.is_empty() {
+        anyhow::bail!("reference search failed for every requested kind");
     }
 
     let mut items = Vec::new();
     for mut meta in interleave(lists, query.limit) {
-        source.resolver(meta.kind).finish(&mut meta).await?;
+        resolver_of(meta.kind).finish(&mut meta).await?;
         items.push(item(meta));
     }
     Ok(RefSearchResponse { items })
@@ -604,21 +674,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_store_failure_is_an_error_never_a_silent_empty_page() {
+    async fn a_store_failure_costs_the_page_one_kind_but_never_all_of_it_silently() {
         let w = world().await;
         w.graph
             .fail_reads
             .lock()
             .unwrap()
             .insert("list_plans_filtered");
-        let r = search(
-            w.graph.clone(),
-            &AccessPolicy::open_instance(),
-            &user(),
-            &parsed(RefSearchParams::default()),
-        )
-        .await;
-        assert!(r.is_err());
+        let run_kinds = |kinds: Vec<RefKind>| {
+            let graph = w.graph.clone();
+            async move {
+                search(
+                    graph,
+                    &AccessPolicy::open_instance(),
+                    &user(),
+                    &SearchQuery {
+                        kinds,
+                        ..parsed(RefSearchParams::default())
+                    },
+                )
+                .await
+            }
+        };
+        let partial = run_kinds(RefKind::ALL.to_vec()).await.unwrap();
+        assert!(!partial.items.is_empty());
+        assert!(partial.items.iter().all(|i| i.kind != RefKind::Plan));
+        assert!(run_kinds(vec![RefKind::Plan]).await.is_err());
     }
 
     #[tokio::test]
@@ -637,5 +718,139 @@ mod tests {
         .unwrap();
         let v = serde_json::to_value(&out).unwrap();
         assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), ["items"]);
+    }
+}
+
+#[cfg(test)]
+mod fan_out_tests {
+    use super::*;
+    use crate::refs::resolvers::Candidates;
+    use crate::refs::test_support::{user, world};
+
+    /// A kind that never answers.
+    struct Hangs;
+    /// A kind whose store is down.
+    struct Down;
+
+    #[async_trait::async_trait]
+    impl KindResolver for Hangs {
+        fn kind(&self) -> RefKind {
+            RefKind::Task
+        }
+        async fn load(&self, _: Uuid, _: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+            std::future::pending().await
+        }
+        async fn candidates(&self, _: &Candidates, _: &mut Memo) -> anyhow::Result<Vec<RefMeta>> {
+            std::future::pending().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl KindResolver for Down {
+        fn kind(&self) -> RefKind {
+            RefKind::Task
+        }
+        async fn load(&self, _: Uuid, _: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+            anyhow::bail!("down")
+        }
+        async fn candidates(&self, _: &Candidates, _: &mut Memo) -> anyhow::Result<Vec<RefMeta>> {
+            anyhow::bail!("down")
+        }
+    }
+
+    fn query(kinds: Vec<RefKind>) -> SearchQuery {
+        SearchQuery {
+            kinds,
+            ..RefSearchParams::default().into_query().unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_kind_that_times_out_is_left_out_and_the_others_still_answer() {
+        let w = world().await;
+        let source = GraphRefSource::new(w.graph.clone());
+        let hangs = Hangs;
+        let started = std::time::Instant::now();
+        let out = search_with(
+            &|k| {
+                if k == RefKind::Task {
+                    &hangs
+                } else {
+                    source.resolver(k)
+                }
+            },
+            &AccessPolicy::open_instance(),
+            &user(),
+            &query(vec![RefKind::Task, RefKind::Plan, RefKind::Rfc]),
+            Duration::from_millis(60),
+        )
+        .await
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let kinds: Vec<_> = out.items.iter().map(|i| i.kind).collect();
+        assert!(kinds.contains(&RefKind::Plan) && kinds.contains(&RefKind::Rfc));
+        assert!(!kinds.contains(&RefKind::Task));
+    }
+
+    #[tokio::test]
+    async fn a_kind_in_error_is_left_out_and_the_others_still_answer() {
+        let w = world().await;
+        let source = GraphRefSource::new(w.graph.clone());
+        let down = Down;
+        let out = search_with(
+            &|k| {
+                if k == RefKind::Task {
+                    &down
+                } else {
+                    source.resolver(k)
+                }
+            },
+            &AccessPolicy::open_instance(),
+            &user(),
+            &query(vec![RefKind::Task, RefKind::Plan]),
+            KIND_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.items.len(), 2);
+        assert!(out.items.iter().all(|i| i.kind == RefKind::Plan));
+    }
+
+    #[tokio::test]
+    async fn when_every_kind_fails_the_search_fails_instead_of_looking_empty() {
+        let down = Down;
+        let hangs = Hangs;
+        for (resolver, timeout) in [
+            (&down as &dyn KindResolver, KIND_TIMEOUT),
+            (&hangs as &dyn KindResolver, Duration::from_millis(30)),
+        ] {
+            let r = search_with(
+                &|_| resolver,
+                &AccessPolicy::open_instance(),
+                &user(),
+                &query(vec![RefKind::Task]),
+                timeout,
+            )
+            .await;
+            assert!(r.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_kind_that_is_down_does_not_mask_a_page_that_is_legitimately_empty() {
+        let w = world().await;
+        let source = GraphRefSource::new(w.graph.clone());
+        let mut q = query(vec![RefKind::Plan]);
+        q.q = "nothing matches this".into();
+        let out = search_with(
+            &|k| source.resolver(k),
+            &AccessPolicy::open_instance(),
+            &user(),
+            &q,
+            KIND_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert!(out.items.is_empty());
     }
 }
