@@ -91,3 +91,10 @@ flowchart TD
     SIG --> FILTER
     FACTSGAP["🟠 ModelFacts::from_capabilities existe mais le listing et les prix nexus ne l'appellent pas encore : branchement dans resolve_provider_choice (B-R4)"]
     FILTER -.-> FACTSGAP
+
+    subgraph perturn["Par tour (B-R6) — GraphSessionHooks::before_turn, voir po-chat-agent-runtime"]
+        TURN["✅ mode full + étape auto + set_model_live : le décideur (Arc&lt;dyn Decider&gt;) reçoit DecideRequest {signature du dernier message, pool du SEUL provider de la session, restrict_provider, current, turn_index, session_id} ; directive = modèle choisi si appliquée et différente ; un changement par tour, pas deux tours de suite (le tour suivant est décidé en shadow donc enregistré non appliqué) ; erreur / 2 s = aucun changement<br/>test : chat::agent_e2e_tests::turn_routing (décideur FAUX)"]
+        TURNGAP["🟠 le décideur réel (CognitiveDecider) et la source de pool réelle ne sont pas branchés : ChatManager::with_turn_decider est sans appelant"]
+        TURN -.-> TURNGAP
+    end
+    FACTSGAP -.-> TURN
