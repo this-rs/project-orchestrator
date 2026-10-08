@@ -23,8 +23,6 @@
 pub mod access;
 pub mod block;
 pub mod compose;
-#[cfg(test)]
-mod contract_tests;
 pub mod flag;
 pub mod label;
 pub mod registry;

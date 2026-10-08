@@ -6509,6 +6509,7 @@ impl ChatManager {
         let request = ChatRequest {
             routing_mode: None,
             attachments: Vec::new(),
+            refs: Vec::new(),
             message: message.to_string(),
             session_id: None,
             cwd: node.cwd.clone(),

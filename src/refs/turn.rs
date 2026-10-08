@@ -681,6 +681,34 @@ mod tests {
     }
 
     #[test]
+    fn a_relay_stays_in_front_of_the_expanded_prompt_and_is_untouched_without_refs() {
+        let shown = "regarde #task:x";
+        let sent = format!("RELAY HISTORY\n\n{shown}");
+        let none = TurnExpansion::default();
+        assert_eq!(none.native_prompt(shown, &sent), sent, "no refs: as before");
+        let with = TurnExpansion {
+            enrichment_text: shown.to_string(),
+            model_tail: "\n\n<po-context nonce=\"n\">\n</po-context>".to_string(),
+            resolved: vec![RefResolution {
+                kind: RefKind::Task,
+                id: Uuid::from_u128(1),
+                status: RefStatus::NotFound,
+                label: None,
+                subtitle: None,
+                project: None,
+                workspace: None,
+                entity_status: None,
+            }],
+            ..TurnExpansion::default()
+        };
+        let got = with.native_prompt(shown, &sent);
+        assert!(got.starts_with("RELAY HISTORY\n\nregarde #task:x\n\n<po-context"));
+        assert_eq!(got.matches("regarde").count(), 1);
+        // Without a relay the relay part is empty.
+        assert!(with.native_prompt(shown, shown).starts_with("regarde"));
+    }
+
+    #[test]
     fn the_context_block_is_deterministic_and_golden() {
         let id = Uuid::parse_str("3adeffc9-c8b0-4e2f-a674-55bfcb293433").unwrap();
         let ok = RefResolution {

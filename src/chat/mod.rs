@@ -36,9 +36,9 @@ pub(crate) mod post_tool_hook;
 pub mod prompt;
 pub mod prompt_sections;
 pub mod provider;
-pub mod relay;
 #[cfg(test)]
 mod refs_wiring_tests;
+pub mod relay;
 pub mod routing;
 pub(crate) mod skill_hook;
 pub mod stages;
