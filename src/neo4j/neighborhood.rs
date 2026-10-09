@@ -253,7 +253,20 @@ impl Neo4jClient {
                 }
             }
 
-            frontier = next_frontier(&best, params.frontier_cap);
+            // Rank by PUBLIC id, like the in-memory walk: an elementId is an internal
+            // counter, so breaking ties on it made the walk depend on creation order.
+            let by_pid: HashMap<String, (f64, f64)> = best
+                .iter()
+                .map(|(eid, v)| (known[eid].0.clone(), *v))
+                .collect();
+            let eid_of: HashMap<&str, &String> = best
+                .keys()
+                .map(|eid| (known[eid].0.as_str(), eid))
+                .collect();
+            frontier = next_frontier(&by_pid, params.frontier_cap)
+                .iter()
+                .map(|pid| eid_of[pid.as_str()].clone())
+                .collect();
             if frontier.is_empty() {
                 break;
             }
