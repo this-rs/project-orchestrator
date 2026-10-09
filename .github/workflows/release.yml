@@ -242,23 +242,6 @@ jobs:
         if: "!matrix.use_cross"
         run: cargo build --release --target ${{ matrix.target }} ${{ matrix.legacy && '--no-default-features' || '' }}
 
-      # The point of the legacy build, checked on the binaries themselves: a floor of 10.15 or lower and no ONNX Runtime.
-      - name: Verify legacy binaries (light)
-        if: matrix.legacy
-        shell: bash
-        run: |
-          for bin in orchestrator orch mcp_server; do
-            f="target/${{ matrix.target }}/release/${bin}"
-            minos=$(vtool -show-build "$f" | awk '$1=="minos" || $1=="version" {print $2; exit}')
-            echo "${bin}: minos ${minos}"
-            if [ -z "$minos" ] || [ "$(printf '%s\n%s\n' "$minos" 10.15 | sort -V | tail -1)" != "10.15" ]; then
-              echo "::error::${bin} requires macOS ${minos:-?}, expected 10.15 or lower"; exit 1
-            fi
-            if otool -L "$f" | grep -qi onnxruntime; then
-              echo "::error::${bin} still links ONNX Runtime"; exit 1
-            fi
-          done
-
       - name: Build light variant (cross)
         if: matrix.use_cross
         run: cross build --release --features vendored-openssl --target ${{ matrix.target }}
@@ -329,22 +312,6 @@ jobs:
         if: "!matrix.use_cross"
         run: cargo build --release --features embedded-frontend --target ${{ matrix.target }} ${{ matrix.legacy && '--no-default-features' || '' }}
 
-      - name: Verify legacy binaries (full)
-        if: matrix.legacy
-        shell: bash
-        run: |
-          for bin in orchestrator orch mcp_server; do
-            f="target/${{ matrix.target }}/release/${bin}"
-            minos=$(vtool -show-build "$f" | awk '$1=="minos" || $1=="version" {print $2; exit}')
-            echo "${bin}: minos ${minos}"
-            if [ -z "$minos" ] || [ "$(printf '%s\n%s\n' "$minos" 10.15 | sort -V | tail -1)" != "10.15" ]; then
-              echo "::error::${bin} requires macOS ${minos:-?}, expected 10.15 or lower"; exit 1
-            fi
-            if otool -L "$f" | grep -qi onnxruntime; then
-              echo "::error::${bin} still links ONNX Runtime"; exit 1
-            fi
-          done
-
       - name: Build full variant (cross)
         if: matrix.use_cross
         run: cross build --release --features embedded-frontend,vendored-openssl --target ${{ matrix.target }}
@@ -376,6 +343,14 @@ jobs:
           cd staging
           tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
           echo "ARCHIVE_FULL=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_ENV"
+
+      # Compare what the archives REQUIRE (macOS minimum version, glibc) with what we promise (scripts/check-os-floor.sh).
+      # Runs on every non-Windows target, light and full: a runner upgrade or a new native dependency that raises the floor
+      # fails here instead of at a user's launch. Windows is not measured (no equivalent check yet).
+      - name: Check OS floor (archives)
+        if: matrix.os != 'windows'
+        shell: bash
+        run: scripts/check-os-floor.sh "${{ matrix.os }}-${{ matrix.arch }}" staging
 
       - name: Package full (Windows)
         if: matrix.os == 'windows'
@@ -961,25 +936,6 @@ jobs:
         # Legacy: arguments after `--` go to cargo. `custom-protocol` is what makes the app load its embedded frontend.
         run: cargo tauri build --target ${{ matrix.tauri_target }} ${{ matrix.bundles && format('--bundles {0}', matrix.bundles) || '' }} ${{ matrix.legacy && '-- --no-default-features --features custom-protocol' || '' }}
 
-      # Checked on the built app, before signing: floor 10.15 or lower, no ONNX Runtime inside.
-      - name: Verify legacy bundle
-        if: matrix.legacy
-        shell: bash
-        run: |
-          APP=$(find "target/${{ matrix.target }}/release/bundle/macos" -maxdepth 1 -name "*.app" | head -1)
-          [ -n "$APP" ] || { echo "::error::no .app bundle built"; exit 1; }
-          for f in "$APP"/Contents/MacOS/* "$APP/Contents/Resources/mcp_server"; do
-            [ -f "$f" ] || continue
-            minos=$(vtool -show-build "$f" | awk '$1=="minos" || $1=="version" {print $2; exit}')
-            echo "$(basename "$f"): minos ${minos}"
-            if [ -z "$minos" ] || [ "$(printf '%s\n%s\n' "$minos" 10.15 | sort -V | tail -1)" != "10.15" ]; then
-              echo "::error::$(basename "$f") requires macOS ${minos:-?}, expected 10.15 or lower"; exit 1
-            fi
-            if otool -L "$f" | grep -qi onnxruntime; then echo "::error::$(basename "$f") links ONNX Runtime"; exit 1; fi
-          done
-          if find "$APP" -iname 'libonnxruntime*' | grep -q .; then echo "::error::ONNX Runtime found inside the legacy app"; exit 1; fi
-          echo "✅ legacy app: floor <= 10.15, no ONNX Runtime"
-
       # Free disk space after Tauri build completes.
       # The cargo build output (deps/, build/, .fingerprint/, incremental/) can
       # consume 5-10 GB on macOS runners. We only need the bundle/ directory
@@ -1049,6 +1005,20 @@ jobs:
           for binary in "$APP_PATH/Contents/MacOS/"*; do
             [ -f "$binary" ] && otool -l "$binary" | grep -A2 LC_RPATH || true
           done
+
+      # What the app REQUIRES vs what we PROMISE (scripts/check-os-floor.sh), after ONNX Runtime is bundled and before signing.
+      # macOS: every Mach-O's minimum, and the .app's LSMinimumSystemVersion must not be lower than that (the 0.0.17 lie).
+      - name: Check OS floor (macOS app)
+        if: runner.os == 'macOS'
+        run: scripts/check-os-floor.sh "macos-${{ matrix.artifact_arch }}" "target/${{ matrix.target }}/release/bundle/macos"
+
+      # Linux: the binaries inside the .deb (the AppImage and .rpm are built from the same ones).
+      - name: Check OS floor (Linux app)
+        if: runner.os == 'Linux'
+        run: |
+          rm -rf "$RUNNER_TEMP/debx" && mkdir -p "$RUNNER_TEMP/debx"
+          dpkg-deb -x target/${{ matrix.target }}/release/bundle/deb/*.deb "$RUNNER_TEMP/debx"
+          scripts/check-os-floor.sh "linux-${{ matrix.artifact_arch }}" "$RUNNER_TEMP/debx"
 
       # Verify the built bundle contains the correct frontend.
       # This catches any issue where Tauri silently bundles stale frontend files.

@@ -81,6 +81,8 @@ Download the desktop app for your platform. Every link below goes through [proje
 
 > All releases are available on the [Releases page](https://github.com/this-rs/project-orchestrator/releases/latest).
 
+**Linux.** The Linux binaries and packages are built on Ubuntu 24.04 and need **glibc 2.39 or later**: Ubuntu 24.04+, Debian 13+, Fedora 40+, RHEL 10+. Ubuntu 22.04, Debian 12 and RHEL 9 are older and will refuse to start them (`GLIBC_2.39 not found`). The release build now fails if this requirement ever rises without the promise being updated (`scripts/check-os-floor.sh`). **Windows** is not measured yet.
+
 **Which Mac do I have?** Apple menu → *About This Mac*: a chip named *Apple M1…* is Apple Silicon, a *processor* named Intel is Intel. The same window gives your macOS version.
 
 **Intel Mac on macOS 10.15 to 13.3 (older Intel build).** The standard Intel build bundles ONNX Runtime, which needs macOS 13.4; on an older macOS it stops at launch with `Symbol not found … basic_stringbuf`. The older-Intel build is compiled without it, so it runs from macOS 10.15, but it has **no local embeddings**: semantic search needs an HTTP embedding provider such as Ollama (`embeddings.provider: http`). It updates from its own feed, so it is never offered the standard build. The install script (`install.sh`) and `/install/` pick between the two from your macOS version.
