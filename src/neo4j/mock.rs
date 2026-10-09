@@ -6416,16 +6416,40 @@ impl GraphStore for MockGraphStore {
 
     async fn get_propagated_notes(
         &self,
-        _entity_type: &EntityType,
-        _entity_id: &str,
+        entity_type: &EntityType,
+        entity_id: &str,
         _max_depth: u32,
-        _min_score: f64,
+        min_score: f64,
         _relation_types: Option<&[String]>,
-        _source_project_id: Option<Uuid>,
-        _force_cross_project: bool,
+        source_project_id: Option<Uuid>,
+        force_cross_project: bool,
     ) -> Result<Vec<PropagatedNote>> {
-        // Simplified: propagation requires graph traversal; return empty
-        Ok(vec![])
+        // Simplified: no graph traversal; the candidates are the notes anchored
+        // directly on the entity (distance 0). The scope is applied BEFORE the
+        // top-20 cut, exactly like the Cypher of the real client.
+        let scope =
+            crate::notes::PropagationScope::from_params(source_project_id, force_cross_project);
+        let mut out: Vec<PropagatedNote> = self
+            .get_notes_for_entity(entity_type, entity_id)
+            .await?
+            .into_iter()
+            .filter(|n| n.status == NoteStatus::Active && scope.admits(n.project_id))
+            .map(|n| PropagatedNote {
+                relevance_score: n.importance.weight() * (0.4 + n.energy * 0.6),
+                source_entity: entity_id.to_string(),
+                propagation_path: vec![],
+                distance: 0,
+                path_pagerank: None,
+                relation_path: vec![],
+                path_rel_weight: None,
+                scar_intensity: n.scar_intensity,
+                note: n,
+            })
+            .filter(|pn| pn.relevance_score >= min_score)
+            .collect();
+        out.sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
+        out.truncate(20);
+        Ok(out)
     }
 
     async fn get_workspace_notes_for_project(

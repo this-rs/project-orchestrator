@@ -2803,6 +2803,9 @@ impl ToolHandler {
                 if let Some(v) = args.get("relation_types").and_then(|v| v.as_str()) {
                     query.push(("relation_types".to_string(), v.to_string()));
                 }
+                if let Some(v) = args.get("source_project_id").and_then(|v| v.as_str()) {
+                    query.push(("source_project_id".to_string(), v.to_string()));
+                }
                 let result = http
                     .get_with_query("/api/notes/propagated-knowledge", &query)
                     .await?;

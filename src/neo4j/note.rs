@@ -1503,6 +1503,7 @@ impl Neo4jClient {
             {}
             MATCH path = (n:Note)-[:LINKED_TO]->(source)-[:{}*0..{}]->(target)
             WHERE n.status = 'active'
+              AND (NOT $scoped OR coalesce(n.project_id, '') IN ['', $scope_project])
             WITH n, source, path, length(path) - 1 AS distance,
                  [node IN nodes(path) | coalesce(node.name, node.path, node.id)] AS path_names,
                  [r IN relationships(path) | type(r)] AS rel_types,
@@ -1550,9 +1551,14 @@ impl Neo4jClient {
             target_match, rel_pattern, max_depth
         );
 
+        let scope =
+            crate::notes::PropagationScope::from_params(source_project_id, force_cross_project);
+        let scope_project = scope.cypher_project().map(|p| p.to_string());
         let q = query(&cypher)
             .param("entity_id", match_value.clone())
-            .param("min_score", min_score);
+            .param("min_score", min_score)
+            .param("scoped", scope_project.is_some())
+            .param("scope_project", scope_project.clone().unwrap_or_default());
 
         let mut result = self.graph.execute(q).await?;
         let mut propagated_notes = Vec::new();
@@ -1616,6 +1622,7 @@ impl Neo4jClient {
             {}
             MATCH (n:Note)-[t:LINKED_TO_TRANSITIVE]->(target)
             WHERE n.status = 'active'
+              AND (NOT $scoped OR coalesce(n.project_id, '') IN ['', $scope_project])
             WITH n, t,
                  CASE n.importance
                      WHEN 'critical' THEN 1.0
@@ -1642,7 +1649,9 @@ impl Neo4jClient {
 
         let tq = query(&transitive_cypher)
             .param("entity_id", match_value)
-            .param("min_score", min_score);
+            .param("min_score", min_score)
+            .param("scoped", scope_project.is_some())
+            .param("scope_project", scope_project.unwrap_or_default());
 
         if let Ok(mut tresult) = self.graph.execute(tq).await {
             while let Ok(Some(row)) = tresult.next().await {
@@ -1682,11 +1691,17 @@ impl Neo4jClient {
         });
         propagated_notes.truncate(20);
 
+        // Defence in depth: the Cypher already applied the scope before LIMIT; this
+        // re-check can only drop notes, never widen the result.
+        propagated_notes.retain(|pn| scope.admits(pn.note.project_id));
+
         // Cross-project coupling weighting (biomimicry P2P coupling)
         // If source_project_id is set, weight notes from other projects by coupling_strength.
         // Projects with coupling < 0.2 are suppressed unless force_cross_project is true.
-        if let Some(src_pid) = source_project_id {
-            let mut coupling_cache: std::collections::HashMap<Uuid, f64> =
+        if let (Some(src_pid), crate::notes::PropagationScope::CrossProject(_)) =
+            (source_project_id, scope)
+        {
+            let mut coupling_cache: std::collections::HashMap<Uuid, Option<f64>> =
                 std::collections::HashMap::new();
             let mut filtered_notes = Vec::with_capacity(propagated_notes.len());
 
@@ -1698,14 +1713,25 @@ impl Neo4jClient {
                         let coupling = match coupling_cache.get(&pid) {
                             Some(&c) => c,
                             None => {
-                                let c = self
-                                    .get_pairwise_coupling(src_pid, pid)
-                                    .await
-                                    .unwrap_or(0.0);
+                                let c = match self.get_pairwise_coupling(src_pid, pid).await {
+                                    Ok(c) => Some(c),
+                                    Err(e) => {
+                                        // Fail closed: unknown coupling means the
+                                        // foreign note is dropped, and we say so.
+                                        tracing::warn!(
+                                            source_project = %src_pid,
+                                            note_project = %pid,
+                                            error = %e,
+                                            "Coupling computation failed; dropping cross-project notes of this project"
+                                        );
+                                        None
+                                    }
+                                };
                                 coupling_cache.insert(pid, c);
                                 c
                             }
                         };
+                        let Some(coupling) = coupling else { continue };
 
                         if coupling < 0.2 && !force_cross_project {
                             // Suppress low-coupling cross-project propagation

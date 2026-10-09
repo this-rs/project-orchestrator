@@ -1118,7 +1118,9 @@ impl NoteManager {
             .get_notes_for_entity(entity_type, entity_id)
             .await?;
 
+        // Scoped to the owning project when it can be resolved (project + global notes).
         // Get propagated notes from graph traversal (default relations)
+        let owner_project = self.resolve_entity_project(entity_type, entity_id).await;
         let mut propagated_notes = self
             .neo4j
             .get_propagated_notes(
@@ -1127,7 +1129,7 @@ impl NoteManager {
                 max_depth,
                 min_score,
                 None,
-                None,
+                owner_project,
                 false,
             )
             .await?;
@@ -1223,6 +1225,55 @@ impl NoteManager {
         })
     }
 
+    /// Project that owns an entity, when it can be determined server-side
+    /// (a `Project` is itself; a `File` belongs to the project that CONTAINS it).
+    /// Other entity kinds, and relative file paths, return `None`.
+    pub async fn resolve_entity_project(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Option<Uuid> {
+        match entity_type {
+            EntityType::Project => entity_id.parse::<Uuid>().ok(),
+            EntityType::File => self
+                .neo4j
+                .get_file(entity_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|f| f.project_id),
+            _ => None,
+        }
+    }
+
+    /// Decide the project scope of a propagation requested by an API/MCP client.
+    ///
+    /// The HTTP API has no caller identity, so a client-supplied
+    /// `source_project_id` is never trusted to *widen* anything:
+    /// - the project that owns the entity (resolved server-side) wins; a client
+    ///   value that names another project is rejected (`Err`), not honoured;
+    /// - if the owner cannot be resolved, the client value is used as a
+    ///   single-project narrowing scope (it can only restrict to one project,
+    ///   never cross projects);
+    /// - with neither, the propagation is unscoped (legacy).
+    ///
+    /// `force_cross_project` is NOT accepted from clients; see the handlers.
+    pub async fn resolve_propagation_scope(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+        requested: Option<Uuid>,
+    ) -> std::result::Result<Option<Uuid>, String> {
+        let owner = self.resolve_entity_project(entity_type, entity_id).await;
+        match (owner, requested) {
+            (Some(o), Some(r)) if o != r => Err(format!(
+                "source_project_id {r} does not match the project {o} that owns the entity"
+            )),
+            (Some(o), _) => Ok(Some(o)),
+            (None, r) => Ok(r),
+        }
+    }
+
     /// Get enriched propagated knowledge for an entity.
     ///
     /// Unlike `get_context_notes` (direct + propagated notes only), this returns:
@@ -1238,6 +1289,7 @@ impl NoteManager {
         max_depth: u32,
         min_score: f64,
         relation_types: Option<&[String]>,
+        source_project_id: Option<Uuid>,
     ) -> Result<crate::notes::PropagatedKnowledge> {
         // Cap max_depth at 3 to prevent unbounded traversal
         let capped_depth = max_depth.min(3);
@@ -1250,7 +1302,7 @@ impl NoteManager {
                 capped_depth,
                 min_score,
                 relation_types,
-                None,
+                source_project_id,
                 false,
             )
             .await?;
@@ -3261,5 +3313,214 @@ mod tests {
         assert!(!note.content.contains("## Problem"));
         // And no rfc-run tag
         assert!(!note.tags.iter().any(|t| t.starts_with("rfc-run:")));
+    }
+
+    // ====================================================================
+    // T0b: project boundary of note propagation
+    // ====================================================================
+
+    const BOUNDARY_FILE: &str = "/src/boundary.rs";
+
+    /// Create an active note of the given project (None = global) and anchor it
+    /// on `BOUNDARY_FILE`. Returns its id.
+    async fn anchored_note(
+        mgr: &NoteManager,
+        project_id: Option<Uuid>,
+        importance: NoteImportance,
+        content: &str,
+    ) -> Uuid {
+        let mut req = make_create_request(Uuid::nil(), content);
+        req.project_id = project_id;
+        req.importance = Some(importance);
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+        mgr.link_note_to_entity(
+            note.id,
+            &LinkNoteRequest {
+                entity_type: EntityType::File,
+                entity_id: BOUNDARY_FILE.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        note.id
+    }
+
+    #[tokio::test]
+    async fn test_propagation_foreign_neighbours_do_not_evict_local_notes() {
+        let (mgr, local_pid) = create_note_manager().await;
+        let foreign_pid = Uuid::new_v4();
+
+        // 25 higher-scoring notes of another project, 5 weaker local ones.
+        for i in 0..25 {
+            anchored_note(
+                &mgr,
+                Some(foreign_pid),
+                NoteImportance::Critical,
+                &format!("foreign {i}"),
+            )
+            .await;
+        }
+        let mut local_ids = Vec::new();
+        for i in 0..5 {
+            local_ids.push(
+                anchored_note(
+                    &mgr,
+                    Some(local_pid),
+                    NoteImportance::Low,
+                    &format!("local {i}"),
+                )
+                .await,
+            );
+        }
+
+        let got = mgr
+            .get_propagated_notes(
+                &EntityType::File,
+                BOUNDARY_FILE,
+                2,
+                0.0,
+                None,
+                Some(local_pid),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let mut got_ids: Vec<Uuid> = got.iter().map(|p| p.note.id).collect();
+        got_ids.sort();
+        local_ids.sort();
+        assert_eq!(
+            got_ids, local_ids,
+            "the 5 local notes must survive the top-20 cut"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_propagation_global_notes_are_included_by_explicit_rule() {
+        let (mgr, local_pid) = create_note_manager().await;
+        let foreign_pid = Uuid::new_v4();
+
+        let local = anchored_note(&mgr, Some(local_pid), NoteImportance::Low, "local").await;
+        let global = anchored_note(&mgr, None, NoteImportance::Low, "global guideline").await;
+        let foreign =
+            anchored_note(&mgr, Some(foreign_pid), NoteImportance::Critical, "foreign").await;
+
+        let got = mgr
+            .get_propagated_notes(
+                &EntityType::File,
+                BOUNDARY_FILE,
+                2,
+                0.0,
+                None,
+                Some(local_pid),
+                false,
+            )
+            .await
+            .unwrap();
+        let ids: Vec<Uuid> = got.iter().map(|p| p.note.id).collect();
+        assert!(ids.contains(&local));
+        assert!(
+            ids.contains(&global),
+            "global notes are admitted by PropagationScope::Project"
+        );
+        assert!(!ids.contains(&foreign));
+    }
+
+    #[tokio::test]
+    async fn test_propagation_knowledge_is_scoped_to_the_given_project() {
+        let (mgr, local_pid) = create_note_manager().await;
+        let foreign_pid = Uuid::new_v4();
+        for i in 0..25 {
+            anchored_note(
+                &mgr,
+                Some(foreign_pid),
+                NoteImportance::Critical,
+                &format!("foreign {i}"),
+            )
+            .await;
+        }
+        let local = anchored_note(&mgr, Some(local_pid), NoteImportance::Low, "local").await;
+
+        let k = mgr
+            .get_propagated_knowledge(
+                &EntityType::File,
+                BOUNDARY_FILE,
+                2,
+                0.0,
+                None,
+                Some(local_pid),
+            )
+            .await
+            .unwrap();
+        let ids: Vec<Uuid> = k.notes.iter().map(|p| p.note.id).collect();
+        assert_eq!(ids, vec![local]);
+    }
+
+    #[tokio::test]
+    async fn test_chat_path_scope_is_the_session_project() {
+        // knowledge_injection calls the store with (session project, force=false).
+        let (mgr, session_pid) = create_note_manager().await;
+        let foreign_pid = Uuid::new_v4();
+        for i in 0..25 {
+            anchored_note(
+                &mgr,
+                Some(foreign_pid),
+                NoteImportance::Critical,
+                &format!("f{i}"),
+            )
+            .await;
+        }
+        let local = anchored_note(&mgr, Some(session_pid), NoteImportance::Low, "l").await;
+        let got = mgr
+            .get_propagated_notes(
+                &EntityType::File,
+                BOUNDARY_FILE,
+                2,
+                0.15,
+                None,
+                Some(session_pid),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            got.iter().map(|p| p.note.id).collect::<Vec<_>>(),
+            vec![local]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_client_source_project_cannot_widen_scope() {
+        let (mgr, _pid) = create_note_manager().await;
+        let (owner, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let pid = owner.to_string();
+
+        // Owner resolvable (Project entity): a mismatching client value is rejected.
+        assert!(mgr
+            .resolve_propagation_scope(&EntityType::Project, &pid, Some(other))
+            .await
+            .is_err());
+        // Matching or absent client value: the owner is the scope.
+        assert_eq!(
+            mgr.resolve_propagation_scope(&EntityType::Project, &pid, Some(owner))
+                .await,
+            Ok(Some(owner))
+        );
+        assert_eq!(
+            mgr.resolve_propagation_scope(&EntityType::Project, &pid, None)
+                .await,
+            Ok(Some(owner))
+        );
+        // Owner unresolvable: the client value narrows to one project; none = unscoped.
+        assert_eq!(
+            mgr.resolve_propagation_scope(&EntityType::Function, "f", Some(other))
+                .await,
+            Ok(Some(other))
+        );
+        assert_eq!(
+            mgr.resolve_propagation_scope(&EntityType::Function, "f", None)
+                .await,
+            Ok(None)
+        );
     }
 }

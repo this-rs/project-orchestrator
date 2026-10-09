@@ -994,6 +994,56 @@ pub struct PropagatedNote {
     pub scar_intensity: f64,
 }
 
+/// Project boundary of a note propagation (`get_propagated_notes`).
+///
+/// This is the single source of truth for which notes a propagation may
+/// return. The Cypher in `neo4j/note.rs` applies the same rule *before*
+/// `LIMIT` (so foreign neighbours can never evict local notes from the top
+/// 20), the mock applies it through [`PropagationScope::admits`], and the
+/// Rust side re-checks it as defence in depth.
+///
+/// Rule for **global notes** (`project_id` absent or empty): they are ALWAYS
+/// admitted by `Project` and `CrossProject`, because they carry cross-cutting
+/// guidelines. Only `Unscoped` is "admit everything" and it is never reachable
+/// from a chat session or from the HTTP/MCP API when a project can be resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropagationScope {
+    /// Notes of this project, plus global notes. Nothing from other projects.
+    Project(Uuid),
+    /// Like `Project`, but notes of other projects are admitted too, weighted
+    /// by pairwise coupling (internal callers only; `force_cross_project`).
+    CrossProject(Uuid),
+    /// No project boundary (legacy; only when no project is known at all).
+    Unscoped,
+}
+
+impl PropagationScope {
+    /// Map the historical `(source_project_id, force_cross_project)` pair.
+    pub fn from_params(source_project_id: Option<Uuid>, force_cross_project: bool) -> Self {
+        match (source_project_id, force_cross_project) {
+            (Some(p), false) => Self::Project(p),
+            (Some(p), true) => Self::CrossProject(p),
+            (None, _) => Self::Unscoped,
+        }
+    }
+
+    /// Project used as the Cypher filter (`None` = no filter in the query).
+    pub fn cypher_project(&self) -> Option<Uuid> {
+        match self {
+            Self::Project(p) => Some(*p),
+            Self::CrossProject(_) | Self::Unscoped => None,
+        }
+    }
+
+    /// Whether a note owned by `note_project` (None = global) may be returned.
+    pub fn admits(&self, note_project: Option<Uuid>) -> bool {
+        match (self, note_project) {
+            (Self::Project(p), Some(n)) => *p == n,
+            _ => true, // global notes, CrossProject, Unscoped
+        }
+    }
+}
+
 // ============================================================================
 // DTOs for API
 // ============================================================================
@@ -1174,6 +1224,28 @@ pub struct MigrationTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_propagation_scope_rule_for_global_and_foreign_notes() {
+        let (me, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let project = PropagationScope::from_params(Some(me), false);
+        assert_eq!(project, PropagationScope::Project(me));
+        assert!(project.admits(Some(me)));
+        assert!(
+            project.admits(None),
+            "global notes are admitted by explicit rule"
+        );
+        assert!(!project.admits(Some(other)));
+        assert_eq!(project.cypher_project(), Some(me));
+
+        let cross = PropagationScope::from_params(Some(me), true);
+        assert!(cross.admits(Some(other)));
+        assert_eq!(cross.cypher_project(), None);
+
+        let none = PropagationScope::from_params(None, false);
+        assert_eq!(none, PropagationScope::Unscoped);
+        assert!(none.admits(Some(other)) && none.admits(None));
+    }
 
     #[test]
     fn test_note_type_display_and_parse() {
