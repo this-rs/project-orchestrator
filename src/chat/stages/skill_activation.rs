@@ -172,7 +172,12 @@ impl SkillActivationStage {
     /// filled in, and summaries of notes that may since have been
     /// superseded — old instructions kept coming back. Without current
     /// members, only the skill's name and description are given.
-    async fn render_skill_context(&self, skill: &SkillNode, confidence: f64) -> String {
+    async fn render_skill_context(
+        &self,
+        skill: &SkillNode,
+        confidence: f64,
+        project: Option<&str>,
+    ) -> String {
         match crate::skills::activation::current_skill_members(self.graph.as_ref(), skill.id).await
         {
             Ok((notes, decisions)) if !notes.is_empty() || !decisions.is_empty() => {
@@ -187,7 +192,7 @@ impl SkillActivationStage {
                 // Skill name, notes and decisions are graph content: data.
                 crate::chat::untrusted::wrap_random(
                     &context,
-                    crate::chat::untrusted::Origin::new("skill", None),
+                    crate::chat::untrusted::Origin::new("skill", project),
                 )
             }
             _ => {
@@ -202,7 +207,7 @@ impl SkillActivationStage {
                 }
                 crate::chat::untrusted::wrap_random(
                     &body,
-                    crate::chat::untrusted::Origin::new("skill", None),
+                    crate::chat::untrusted::Origin::new("skill", project),
                 )
             }
         }
@@ -245,7 +250,9 @@ impl ParallelEnrichmentStage for SkillActivationStage {
         let mut skill_ids_to_boost: Vec<Uuid> = Vec::new();
 
         for (skill, confidence) in &matches {
-            let section = self.render_skill_context(skill, *confidence).await;
+            let section = self
+                .render_skill_context(skill, *confidence, input.project_slug.as_deref())
+                .await;
             content_parts.push(section);
             skill_ids_to_boost.push(skill.id);
         }
@@ -474,7 +481,7 @@ mod tests {
         }
 
         let stage = SkillActivationStage::new(store.clone());
-        let ctx = stage.render_skill_context(&skill, 0.8).await;
+        let ctx = stage.render_skill_context(&skill, 0.8, None).await;
         assert!(!ctx.contains("{{"), "no unfilled placeholder: {ctx}");
         assert!(
             ctx.contains("use the NEW way"),
@@ -490,7 +497,7 @@ mod tests {
         bare.description = "what it covers".into();
         bare.context_template = Some("{{activated_notes}}".into());
         store.create_skill(&bare).await.unwrap();
-        let ctx = stage.render_skill_context(&bare, 0.6).await;
+        let ctx = stage.render_skill_context(&bare, 0.6, None).await;
         assert!(
             ctx.contains("what it covers") && !ctx.contains("{{"),
             "{ctx}"

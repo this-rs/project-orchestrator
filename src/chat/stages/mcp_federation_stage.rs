@@ -31,7 +31,7 @@ impl McpFederationStage {
 
 #[async_trait::async_trait]
 impl ParallelEnrichmentStage for McpFederationStage {
-    async fn execute(&self, _input: &EnrichmentInput) -> Result<StageOutput> {
+    async fn execute(&self, input: &EnrichmentInput) -> Result<StageOutput> {
         let mut output = StageOutput::new(self.name());
 
         // Read lock — non-blocking if no writers
@@ -96,7 +96,16 @@ impl ParallelEnrichmentStage for McpFederationStage {
                     .count()
             );
 
-        let content = format!("{}\n{}", header, sections.join("\n\n"));
+        // Server and tool names and descriptions are written by third parties: data.
+        let content = format!(
+            "{}\n{}",
+            header,
+            crate::chat::untrusted::wrap_graph(
+                &sections.join("\n\n"),
+                "mcp_federation",
+                input.project_slug.as_deref(),
+            )
+        );
 
         debug!(
             "[mcp_federation] Injecting {} servers, {} total tools into prompt",

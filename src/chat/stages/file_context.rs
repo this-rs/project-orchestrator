@@ -224,7 +224,13 @@ impl ParallelEnrichmentStage for FileContextStage {
         }
 
         if !profiles.is_empty() {
-            let content = profiles.join("\n\n");
+            // Paths, community labels and co-changers come from the analysed
+            // repository: data.
+            let content = crate::chat::untrusted::wrap_graph(
+                &profiles.join("\n\n"),
+                "file_context",
+                input.project_slug.as_deref(),
+            );
             output.add_section(
                 "File Intelligence".to_string(),
                 content,

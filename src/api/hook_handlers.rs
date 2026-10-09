@@ -193,6 +193,25 @@ pub async fn activate_hook(
             // Build enriched response with redirect suggestion + file profile
             let mut response = serde_json::to_value(&outcome.response).unwrap_or_default();
 
+            // The context is graph content on its way into a prompt (the hook
+            // script injects it): data, inside a container.
+            if crate::chat::skill_hook::skill_has_body(&outcome.response.context) {
+                if let Some(obj) = response.as_object_mut() {
+                    obj.insert(
+                        "context".to_string(),
+                        serde_json::Value::String(format!(
+                            "{}\n\n{}",
+                            crate::chat::untrusted::HOOK_PREAMBLE,
+                            crate::chat::untrusted::wrap_graph(
+                                &outcome.response.context,
+                                "skill",
+                                Some(&req.project_id.to_string()),
+                            )
+                        )),
+                    );
+                }
+            }
+
             // Generate redirect suggestion for Grep/Bash (best-effort)
             if let Some(suggestion) = crate::skills::hook_extractor::generate_redirect_suggestion(
                 &req.tool_name,

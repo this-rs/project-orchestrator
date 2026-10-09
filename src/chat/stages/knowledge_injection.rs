@@ -847,6 +847,7 @@ impl KnowledgeInjectionStage {
     }
 
     /// Render notes, decisions, predicted files, and workspace guidelines into markdown sections.
+    #[cfg(test)]
     fn render_knowledge(
         &self,
         notes: &[ScoredNote],
@@ -854,6 +855,26 @@ impl KnowledgeInjectionStage {
         predictions: &[PredictedFile],
         workspace_notes: &[ScoredNote],
         max_content_chars: usize,
+    ) -> Option<String> {
+        self.render_knowledge_in(
+            notes,
+            decisions,
+            predictions,
+            workspace_notes,
+            max_content_chars,
+            None,
+        )
+    }
+
+    /// [`Self::render_knowledge`] with the project slug carried by the containers.
+    fn render_knowledge_in(
+        &self,
+        notes: &[ScoredNote],
+        decisions: &[ScoredDecision],
+        predictions: &[PredictedFile],
+        workspace_notes: &[ScoredNote],
+        max_content_chars: usize,
+        project: Option<&str>,
     ) -> Option<String> {
         if notes.is_empty()
             && decisions.is_empty()
@@ -883,7 +904,7 @@ impl KnowledgeInjectionStage {
                 group.push_str(&entry);
                 chars_used += entry.len();
             }
-            content.push_str(&untrusted_group("note", &group));
+            content.push_str(&untrusted_group("note", &group, project));
             content.push('\n');
         }
 
@@ -904,7 +925,7 @@ impl KnowledgeInjectionStage {
                 group.push_str(&entry);
                 chars_used += entry.len();
             }
-            content.push_str(&untrusted_group("note", &group));
+            content.push_str(&untrusted_group("note", &group, project));
             content.push('\n');
         }
 
@@ -924,13 +945,14 @@ impl KnowledgeInjectionStage {
                 group.push_str(&entry);
                 chars_used += entry.len();
             }
-            content.push_str(&untrusted_group("decision", &group));
+            content.push_str(&untrusted_group("decision", &group, project));
         }
 
         // Render predicted context (WorldModel biomimicry T7)
         if !predictions.is_empty() && chars_used < max_content_chars {
             content.push_str("\n### Predicted Context (WorldModel)\n");
             content.push_str("_Files you may also need (based on co-change patterns):_\n");
+            let mut group = String::new();
             for pred in predictions.iter().take(5) {
                 let entry = format!(
                     "- `{}` (score: {:.2}, source: {})\n",
@@ -939,9 +961,11 @@ impl KnowledgeInjectionStage {
                 if chars_used + entry.len() > max_content_chars {
                     break;
                 }
-                content.push_str(&entry);
+                group.push_str(&entry);
                 chars_used += entry.len();
             }
+            // Paths come from the graph (file names are attacker-chosen): data.
+            content.push_str(&untrusted_group("predicted_path", &group, project));
         }
 
         if content.is_empty() {
@@ -955,13 +979,13 @@ impl KnowledgeInjectionStage {
 /// Wrap a group of rendered entries (note or decision text from the graph) in
 /// an untrusted-data container. The character budget counts the entries only,
 /// not the few dozen characters of the container tags.
-fn untrusted_group(source: &str, entries: &str) -> String {
+fn untrusted_group(source: &str, entries: &str, project: Option<&str>) -> String {
     if entries.is_empty() {
         return String::new();
     }
     let mut wrapped = crate::chat::untrusted::wrap_random(
         entries,
-        crate::chat::untrusted::Origin::new(source, None),
+        crate::chat::untrusted::Origin::new(source, project),
     );
     wrapped.push('\n');
     wrapped
@@ -1192,12 +1216,13 @@ impl ParallelEnrichmentStage for KnowledgeInjectionStage {
         }
 
         // Render and inject into output
-        if let Some(content) = self.render_knowledge(
+        if let Some(content) = self.render_knowledge_in(
             &notes,
             &decisions,
             &predictions,
             &workspace_notes,
             effective_config.max_content_chars,
+            input.project_slug.as_deref(),
         ) {
             output.add_section(
                 "Relevant Knowledge",
@@ -2021,6 +2046,7 @@ mod tests {
 
     #[test]
     fn test_intent_reweighting_debug_gotcha_above_guideline() {
+        let _env = crate::chat::stages::intent_weights::lock_env();
         // Simulate: 1 guideline (score 0.9), 1 gotcha (score 0.7), 1 pattern (score 0.8)
         // With "debug" intent: gotcha×1.5=1.05, pattern×1.0=0.8, guideline×0.7=0.63
         // Expected ranking: gotcha > pattern > guideline
@@ -2086,6 +2112,7 @@ mod tests {
 
     #[test]
     fn test_intent_reweighting_general_preserves_order() {
+        let _env = crate::chat::stages::intent_weights::lock_env();
         // With "general" intent, all weights are 1.0 → original order preserved
         let mut notes = vec![
             ScoredNote {
@@ -2127,6 +2154,7 @@ mod tests {
 
     #[test]
     fn test_intent_reweighting_unknown_type_gets_one() {
+        let _env = crate::chat::stages::intent_weights::lock_env();
         let mut notes = vec![ScoredNote {
             id: "custom".to_string(),
             note_type: "unknown_custom_type".to_string(),
@@ -2336,6 +2364,7 @@ mod tests {
 
     #[test]
     fn test_intent_reweighting_planning_boosts_guideline() {
+        let _env = crate::chat::stages::intent_weights::lock_env();
         let mut notes = vec![
             ScoredNote {
                 id: "gotcha-1".to_string(),

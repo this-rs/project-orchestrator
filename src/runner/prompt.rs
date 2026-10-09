@@ -206,6 +206,10 @@ impl PromptBuilder {
                 }
             }
         }
+        if crate::chat::untrusted::contains_container(&prompt) {
+            prompt.push_str(crate::chat::untrusted::UNTRUSTED_PREAMBLE);
+            prompt.push_str("\n\n");
+        }
         prompt
     }
 
