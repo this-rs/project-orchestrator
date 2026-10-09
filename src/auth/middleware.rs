@@ -792,6 +792,59 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_read_only_token_reaches_the_rest_api_for_reads_only() {
+        let state = make_server_state(Some(test_auth_config())).await;
+        async fn ok_handler() -> &'static str {
+            "ok"
+        }
+        let app = Router::new()
+            .route("/api/notes", get(ok_handler).post(ok_handler))
+            .route("/api/notes/{id}", axum::routing::put(ok_handler))
+            .route("/api/reason", axum::routing::post(ok_handler))
+            .route(
+                "/api/code/processes/detect",
+                axum::routing::post(ok_handler),
+            )
+            .layer(from_fn_with_state(state.clone(), require_auth))
+            .with_state(state);
+        let sid = uuid::Uuid::new_v4().to_string();
+        let binding = crate::auth::jwt::AgentSessionBinding {
+            session_id: sid.clone(),
+            ceiling: Some("default".to_string()),
+            tool_profile: Some("read_only".to_string()),
+            third_party: false,
+        };
+        let (token, jti) = crate::auth::jwt::generate_session_token(
+            &Claims::service_account("runner:t"),
+            Some(&binding),
+            TEST_SECRET,
+            3600,
+        )
+        .unwrap();
+        crate::auth::agent_tokens::register(&jti, Some(&sid));
+
+        for (method, uri) in [
+            ("POST", "/api/notes"),
+            ("PUT", "/api/notes/n1"),
+            ("POST", "/api/code/processes/detect"),
+        ] {
+            assert_eq!(
+                status_of(app.clone(), method, uri, &token).await,
+                StatusCode::FORBIDDEN,
+                "read-only profile must get 403 on {method} {uri}"
+            );
+        }
+        for (method, uri) in [("GET", "/api/notes"), ("POST", "/api/reason")] {
+            assert_eq!(
+                status_of(app.clone(), method, uri, &token).await,
+                StatusCode::OK,
+                "read-only profile keeps {method} {uri}"
+            );
+        }
+        crate::auth::agent_tokens::revoke_session(&sid);
+    }
+
     /// H6: `full` is what a third party gets IN TRUST. Its token is minted once, when
     /// the session opens; a person who lowers the mode afterwards (trust → ask)
     /// must not leave the model with `plan run`, `delegate_task` or `admin`, which the
