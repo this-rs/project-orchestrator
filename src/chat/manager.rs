@@ -1393,6 +1393,21 @@ pub(crate) fn spec_tool_profile(
     }
 }
 
+/// Whether a session about to open has no file, shell or web tool because its
+/// `nexus-tools` server was not attached (executable not found, or not runnable): a
+/// native provider brings none of its own. Claude Code, Codex and ACP bring theirs, so
+/// they are never reported. Read on the spec the session is opened with, the one place
+/// that shows what was really attached.
+pub(crate) fn lacks_nexus_tools(
+    kind: nexus_claude::agent::ProviderKind,
+    spec: &nexus_claude::agent::SessionSpec,
+) -> bool {
+    kind == nexus_claude::agent::ProviderKind::Native
+        && !spec
+            .mcp_servers
+            .contains_key(nexus_claude::providers::native::NEXUS_TOOLS_SERVER)
+}
+
 /// Refuses a model whose context window cannot hold the tool schemas of the
 /// session's `profile` with room to work: the schemas must take at most half of
 /// it. A window that is not known is not a refusal (nothing is invented).
@@ -10834,8 +10849,9 @@ impl ChatManager {
                 None => tracing::warn!(
                     session_id,
                     configured = ?self.config.nexus_tools_path,
-                    "nexus-tools not found or not executable (set NEXUS_TOOLS_PATH): this native \
-                     session has no file or shell tools"
+                    "nexus-tools not found or not executable (set NEXUS_TOOLS_PATH, or put it \
+                     next to the server or on the PATH): this native session has no file, \
+                     shell or web tool, and reports the `nexus_tools` feature as missing"
                 ),
             }
         }
@@ -11006,6 +11022,7 @@ impl ChatManager {
             }
         }
         let tool_profile = spec_tool_profile(&spec);
+        let nexus_missing = lacks_nexus_tools(provider.kind(), &spec);
         let session = provider.open(spec).await.map_err(|e| {
             // Nothing will ever use this session's token.
             crate::auth::agent_tokens::revoke_session(&sid);
@@ -11021,8 +11038,16 @@ impl ChatManager {
                 return Err(anyhow::Error::new(e));
             }
         }
-        self.finish_agent_open(&sid, provider_id, provider.kind(), session, 1, tool_policy)
-            .await;
+        self.finish_agent_open(
+            &sid,
+            provider_id,
+            provider.kind(),
+            session,
+            1,
+            tool_policy,
+            nexus_missing,
+        )
+        .await;
         if let Some(handle) = self.agent_runtime.get(&sid).await {
             // As on Claude Code: a runner always continues, at most five times; an
             // interactive session follows the configuration, with no limit.
@@ -11069,7 +11094,10 @@ impl ChatManager {
     }
 
     /// Records what the provider reported (frozen capabilities, resume token)
-    /// and registers the live session.
+    /// and registers the live session. `nexus_missing`: the session was opened without
+    /// its `nexus-tools` server ([`lacks_nexus_tools`]), which it reports as a feature it
+    /// does not have rather than leaving only a line in the server's log.
+    #[allow(clippy::too_many_arguments)]
     async fn finish_agent_open(
         &self,
         session_id: &str,
@@ -11078,6 +11106,7 @@ impl ChatManager {
         session: Arc<dyn nexus_claude::agent::AgentSession>,
         first_seq: i64,
         tool_policy: serde_json::Value,
+        nexus_missing: bool,
     ) {
         self.warn_if_forced(provider_id, session.as_ref());
         if let Some(router) = self.turn_routing.get(session_id) {
@@ -11098,9 +11127,14 @@ impl ChatManager {
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_else(|| "claude_code".to_string());
+        let extra_degraded = if nexus_missing {
+            vec![super::agent_runtime::NEXUS_TOOLS_FEATURE.to_string()]
+        } else {
+            Vec::new()
+        };
         let handle = self
             .agent_runtime
-            .adopt(
+            .adopt_with(
                 session_id,
                 provider_id,
                 session,
@@ -11108,6 +11142,7 @@ impl ChatManager {
                 &kind_name,
                 tool_policy,
                 Some(self.turn_services()),
+                extra_degraded,
             )
             .await;
         self.spawn_agent_nats_listeners(handle);
@@ -11324,6 +11359,7 @@ impl ChatManager {
             .resume_token
             .as_deref()
             .and_then(|raw| nexus_claude::agent::ResumeToken::from_wire(raw).ok());
+        let nexus_missing = lacks_nexus_tools(provider.kind(), &spec);
         let session = match token {
             Some(token) => provider.resume(spec, token).await,
             None => provider.open(spec).await,
@@ -11341,6 +11377,7 @@ impl ChatManager {
             session,
             latest + 1,
             tool_policy,
+            nexus_missing,
         )
         .await;
         let handle = self
@@ -13625,6 +13662,24 @@ mod tests {
                 !crate::auth::agent_tokens::tools_live(sid),
                 "{sid}: nothing minted"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_native_session_opened_without_its_nexus_server_is_reported_as_lacking_it() {
+        use nexus_claude::agent::ProviderKind;
+        let graph = || Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        // (kind, remote, binary configured, session, lacks the file/shell/web tools)
+        for (kind, remote, configured, sid, lacks) in [
+            (ProviderKind::Native, None, true, "b40-has", false),
+            (ProviderKind::Native, None, false, "b40-lacks", true),
+            // Claude Code and Codex bring their own tools: never reported.
+            (ProviderKind::ClaudeCode, None, false, "b40-cc-own", false),
+            (ProviderKind::Codex, None, false, "b40-codex-own", false),
+        ] {
+            let spec = nexus_tools_spec(kind, remote, configured, graph(), sid, None).await;
+            assert_eq!(lacks_nexus_tools(kind, &spec), lacks, "{sid}");
+            crate::auth::agent_tokens::revoke_session(sid);
         }
     }
 
