@@ -343,16 +343,30 @@ impl AgentSessionHandle {
         shown: &str,
         sent: &str,
     ) -> Result<()> {
-        let first = match self.open_turn(kind, shown, sent).await {
-            Ok(turn) => turn,
-            Err(error) => {
-                self.is_streaming.store(false, Ordering::SeqCst);
-                return Err(anyhow::Error::new(error));
+        match self.open_turn(kind, shown, sent).await {
+            Ok(first) => {
+                let me = Arc::clone(self);
+                tokio::spawn(async move { me.drive(Some(first)).await });
+                Ok(())
             }
-        };
-        let me = Arc::clone(self);
-        tokio::spawn(async move { me.drive(first).await });
-        Ok(())
+            Err(error) => {
+                // A message queued while this turn was being opened (the enrichment
+                // awaits) still runs: the run goes on without this turn. Nothing
+                // queued: the session stops streaming, decided under the queue lock.
+                let queued = {
+                    let queue = self.pending.lock().await;
+                    if queue.is_empty() {
+                        self.is_streaming.store(false, Ordering::SeqCst);
+                    }
+                    !queue.is_empty()
+                };
+                if queued {
+                    let me = Arc::clone(self);
+                    tokio::spawn(async move { me.drive(None).await });
+                }
+                Err(anyhow::Error::new(error))
+            }
+        }
     }
 
     /// Shows the message of a turn and sends the turn to the provider.
@@ -396,8 +410,9 @@ impl AgentSessionHandle {
 
     /// Plays turns until the queue is empty: the turn given, then each message
     /// queued meanwhile, highest priority first (`drain::pop_next_after_turn`).
-    async fn drive(self: Arc<Self>, first: (nexus_claude::agent::EventStream, TurnInput)) {
-        let mut turn = Some(first);
+    /// `None`: the first turn could not be opened, only the queue is played.
+    async fn drive(self: Arc<Self>, first: Option<(nexus_claude::agent::EventStream, TurnInput)>) {
+        let mut turn = first;
         loop {
             if let Some((stream, input)) = turn.take() {
                 self.play(stream, input).await;
@@ -764,6 +779,8 @@ pub(crate) mod fake {
         pub oob_tx: StdMutex<Option<UnboundedSender<AgentEvent>>>,
         pub opened_specs: StdMutex<Vec<SessionSpec>>,
         pub resumed_with: StdMutex<Vec<ResumeToken>>,
+        /// The next `send_turn` fails with this error.
+        pub fail_next_turn: StdMutex<Option<ProviderError>>,
     }
 
     impl FakeState {
@@ -805,6 +822,9 @@ pub(crate) mod fake {
             Some(ResumeToken::claude_code_session("fake-provider-session"))
         }
         async fn send_turn(&self, input: TurnInput) -> Result<EventStream, ProviderError> {
+            if let Some(error) = self.state.fail_next_turn.lock().unwrap().take() {
+                return Err(error);
+            }
             let text = input
                 .blocks
                 .iter()
@@ -885,7 +905,7 @@ pub(crate) mod fake {
                 caps: Arc::new(StdMutex::new(Capabilities::none())),
             }
         }
-        fn session(&self) -> Arc<FakeSession> {
+        pub(crate) fn session(&self) -> Arc<FakeSession> {
             let (tx, rx) = unbounded();
             *self.state.oob_tx.lock().unwrap() = Some(tx);
             Arc::new(FakeSession {
@@ -1088,5 +1108,86 @@ mod mask_tests {
             error: ProviderError::Overloaded
         })
         .is_some());
+    }
+}
+
+/// Races between a turn being opened (the enrichment awaits) and what reaches the
+/// session meanwhile.
+#[cfg(test)]
+mod turn_race_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+    use std::sync::atomic::AtomicBool as StdAtomicBool;
+    use tokio::sync::Notify;
+
+    /// Holds the first `prepare` until the test lets it go: the time an
+    /// enrichment of the knowledge graph takes.
+    #[derive(Default)]
+    struct Gate {
+        entered: Notify,
+        release: Notify,
+        passed: StdAtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl TurnServices for Gate {
+        async fn prepare(&self, _session_id: &str, _shown: &str, sent: &str) -> String {
+            if !self.passed.swap(true, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            sent.to_string()
+        }
+    }
+
+    async fn rig() -> (FakeProvider, Arc<Gate>, Arc<AgentSessionHandle>) {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let gate = Arc::new(Gate::default());
+        let handle = runtime
+            .adopt(
+                "not-a-uuid",
+                "claude-code",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                Some(Arc::clone(&gate) as Arc<dyn TurnServices>),
+            )
+            .await;
+        (provider, gate, handle)
+    }
+
+    async fn turns_reach(provider: &FakeProvider, n: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let turns = provider.state.turns_started.lock().unwrap().clone();
+            if turns.len() >= n || std::time::Instant::now() > deadline {
+                return turns;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// A message held while the first turn is being opened waits behind it; when the
+    /// provider then refuses that first turn, the held message still runs.
+    #[tokio::test]
+    async fn a_message_held_while_a_turn_opens_runs_even_when_that_turn_fails() {
+        let (provider, gate, handle) = rig().await;
+        *provider.state.fail_next_turn.lock().unwrap() = Some(ProviderError::EndpointUnreachable {
+            detail: "down for a moment".into(),
+        });
+        let first = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move { handle.send_message("first").await })
+        };
+        gate.entered.notified().await;
+        assert!(handle.queue_message("second").await.unwrap(), "held");
+        gate.release.notify_one();
+        assert!(first.await.unwrap().is_err(), "the first turn was refused");
+
+        let turns = turns_reach(&provider, 1).await;
+        assert_eq!(turns, ["second"], "the queued message is not stranded");
     }
 }
