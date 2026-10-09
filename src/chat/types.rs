@@ -1,5 +1,6 @@
 //! Chat types — request/response/event types for the chat system
 
+use crate::neo4j::models::ExecutionPlace;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -184,7 +185,7 @@ impl RunnerContext {
 }
 
 /// Request to send a chat message
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatRequest {
     /// The user's message
     pub message: String,
@@ -202,7 +203,10 @@ pub struct ChatRequest {
     /// Session ID to resume (optional — creates new session if None)
     #[serde(default)]
     pub session_id: Option<String>,
-    /// Working directory for Claude Code CLI
+    /// Working directory for Claude Code CLI. Absent or empty: the session has no
+    /// project directory and the host gives it a neutral one of its own
+    /// (`execution_place: "neutral"`, see `chat::neutral_place`).
+    #[serde(default)]
     pub cwd: String,
     /// Project slug to associate with the session
     #[serde(default)]
@@ -1059,6 +1063,10 @@ pub struct ChatSession {
     pub workspace_slug: Option<String>,
     /// Working directory
     pub cwd: String,
+    /// Where the session runs (`project` | `neutral`). Left off the wire for `project`,
+    /// which is also what every session written before the field reads as.
+    #[serde(default, skip_serializing_if = "ExecutionPlace::is_project")]
+    pub execution_place: ExecutionPlace,
     /// Session title (auto-generated or user-provided)
     #[serde(default)]
     pub title: Option<String>,
@@ -1185,10 +1193,17 @@ pub struct ChatLinkedRfc {
 }
 
 /// Response when creating a session
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CreateSessionResponse {
     pub session_id: String,
     pub stream_url: String,
+    /// `neutral` when the host made the working directory (no `cwd` was given).
+    #[serde(default, skip_serializing_if = "ExecutionPlace::is_project")]
+    pub execution_place: ExecutionPlace,
+    /// Things the caller should know about how the session was opened (for example
+    /// that it has no project, hence no graph context). Left off when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
 }
 
 /// Why a provider switch was refused before anything was opened (B-SW).
@@ -2374,6 +2389,7 @@ mod tests {
         let resp = CreateSessionResponse {
             session_id: "abc-123".into(),
             stream_url: "/api/chat/sessions/abc-123/stream".into(),
+            ..Default::default()
         };
         let json = serde_json::to_string(&resp).unwrap();
         let deserialized: CreateSessionResponse = serde_json::from_str(&json).unwrap();
@@ -2425,6 +2441,7 @@ mod tests {
             provider_id: None,
             capabilities: None,
             routed_by: None,
+            execution_place: Default::default(),
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -2647,6 +2664,7 @@ mod tests {
             provider_id: None,
             capabilities: None,
             routed_by: None,
+            execution_place: Default::default(),
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -3359,5 +3377,37 @@ mod tests {
         let back: BackgroundTaskInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, "recovered-42424");
         assert!(back.parent_tool_use_id.is_none());
+    }
+
+    #[test]
+    fn an_old_payload_with_a_cwd_still_deserializes_as_before() {
+        let req: ChatRequest =
+            serde_json::from_str(r#"{"message":"hi","cwd":"/home/dev/project"}"#).unwrap();
+        assert_eq!(req.cwd, "/home/dev/project");
+    }
+
+    #[test]
+    fn a_request_without_cwd_or_with_an_empty_one_is_accepted() {
+        let absent: ChatRequest = serde_json::from_str(r#"{"message":"hi"}"#).unwrap();
+        assert_eq!(absent.cwd, "");
+        let empty: ChatRequest = serde_json::from_str(r#"{"message":"hi","cwd":""}"#).unwrap();
+        assert_eq!(empty.cwd, "");
+    }
+
+    #[test]
+    fn execution_place_is_left_off_the_wire_for_a_project_and_read_back_as_project() {
+        let mut resp = CreateSessionResponse::default();
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json.get("execution_place").is_none());
+        assert!(json.get("notices").is_none());
+        // A payload written before the field existed.
+        let old: CreateSessionResponse =
+            serde_json::from_str(r#"{"session_id":"a","stream_url":"/ws/chat/a"}"#).unwrap();
+        assert_eq!(old.execution_place, ExecutionPlace::Project);
+        resp.execution_place = ExecutionPlace::Neutral;
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["execution_place"], "neutral");
+        let back: CreateSessionResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back.execution_place, ExecutionPlace::Neutral);
     }
 }

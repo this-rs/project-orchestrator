@@ -27,6 +27,7 @@ pub(crate) mod hook_ledger;
 pub mod manager;
 pub mod message_attachments;
 pub mod model_catalog;
+pub mod neutral_place;
 pub mod observation_detector;
 pub(crate) mod oob_listener;
 pub mod path_detect;
