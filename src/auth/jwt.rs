@@ -13,6 +13,9 @@ use uuid::Uuid;
 /// Generated from Uuid::nil() — always `00000000-0000-0000-0000-000000000000`.
 pub const ANONYMOUS_USER_ID: Uuid = Uuid::nil();
 
+/// Email of the server's own claims ([`Claims::service_account`]).
+pub const SERVICE_ACCOUNT_EMAIL: &str = "runner@system.local";
+
 /// Marker value for `Claims::token_type` identifying MCP access tokens.
 pub const TOKEN_TYPE_MCP: &str = "mcp";
 
@@ -71,7 +74,7 @@ impl Claims {
         let now = chrono::Utc::now().timestamp();
         Self {
             sub: identity.to_string(),
-            email: "runner@system.local".to_string(),
+            email: SERVICE_ACCOUNT_EMAIL.to_string(),
             name: "Service Account".to_string(),
             iat: now,
             exp: now + 86400, // 24 h
@@ -79,6 +82,14 @@ impl Claims {
             scope: None,
             jti: None,
         }
+    }
+
+    /// The server's own claims ([`Claims::service_account`]): an internal caller
+    /// (protocol run, delegation, a plan run without its caller), not a person.
+    /// Never presented over HTTP; a session token minted from them is an
+    /// `agent_session` token, which this is false for.
+    pub fn is_service_account(&self) -> bool {
+        self.token_type.is_none() && self.email == SERVICE_ACCOUNT_EMAIL
     }
 
     /// True when these claims describe a long-lived MCP token (which must be
@@ -144,11 +155,18 @@ pub struct AgentSessionBinding {
     pub ceiling: Option<String>,
     /// MCP tool profile of the session (`None` = the default, full profile).
     pub tool_profile: Option<String>,
+    /// The session runs on a provider other than Claude Code, or was opened by
+    /// such a session (`lineage:third_party` in the scope). A session opened
+    /// with this token as its caller gets the restricted profile whatever its
+    /// own provider and mode: a third-party model in `trust` may delegate once,
+    /// never in a loop.
+    pub third_party: bool,
 }
 
 const AGENT_SCOPE_SESSION: &str = "session:";
 const AGENT_SCOPE_CEILING: &str = "ceiling:";
 const AGENT_SCOPE_TOOLS: &str = "tools:";
+const AGENT_SCOPE_THIRD_PARTY: &str = "lineage:third_party";
 
 /// Generate the session token handed to a chat session's MCP subprocess
 /// (`PO_AUTH_TOKEN`).
@@ -177,6 +195,9 @@ pub fn generate_session_token(
         }
         if let Some(t) = b.tool_profile.as_deref().filter(|t| !t.is_empty()) {
             parts.push(format!("{AGENT_SCOPE_TOOLS}{t}"));
+        }
+        if b.third_party {
+            parts.push(AGENT_SCOPE_THIRD_PARTY.to_string());
         }
         parts.join(" ")
     });
@@ -210,8 +231,11 @@ pub fn agent_session_binding(claims: &Claims) -> Option<AgentSessionBinding> {
     let mut session_id = None;
     let mut ceiling = None;
     let mut tool_profile = None;
+    let mut third_party = false;
     for part in scope.split_whitespace() {
-        if let Some(v) = part.strip_prefix(AGENT_SCOPE_SESSION) {
+        if part == AGENT_SCOPE_THIRD_PARTY {
+            third_party = true;
+        } else if let Some(v) = part.strip_prefix(AGENT_SCOPE_SESSION) {
             session_id = Some(v.to_string());
         } else if let Some(v) = part.strip_prefix(AGENT_SCOPE_CEILING) {
             ceiling = Some(v.to_string());
@@ -223,6 +247,7 @@ pub fn agent_session_binding(claims: &Claims) -> Option<AgentSessionBinding> {
         session_id: session_id.filter(|s| !s.is_empty())?,
         ceiling,
         tool_profile,
+        third_party,
     })
 }
 
@@ -473,6 +498,7 @@ mod tests {
             session_id: "11111111-2222-3333-4444-555555555555".to_string(),
             ceiling: Some("acceptEdits".to_string()),
             tool_profile: Some("restricted".to_string()),
+            third_party: false,
         };
         let (token, jti) =
             generate_session_token(&human, Some(&binding), TEST_SECRET, 600).unwrap();
@@ -480,6 +506,20 @@ mod tests {
         assert_eq!(decoded.jti.as_deref(), Some(jti.as_str()));
         assert!(decoded.is_agent_session());
         assert!(!decoded.is_human());
+        assert_eq!(agent_session_binding(&decoded), Some(binding));
+    }
+
+    #[test]
+    fn the_third_party_lineage_is_signed_into_the_session_token() {
+        let human = Claims::service_account("runner:t");
+        let binding = AgentSessionBinding {
+            session_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            ceiling: Some("bypassPermissions".to_string()),
+            tool_profile: Some("full".to_string()),
+            third_party: true,
+        };
+        let (token, _) = generate_session_token(&human, Some(&binding), TEST_SECRET, 600).unwrap();
+        let decoded = decode_jwt(&token, TEST_SECRET).unwrap();
         assert_eq!(agent_session_binding(&decoded), Some(binding));
     }
 

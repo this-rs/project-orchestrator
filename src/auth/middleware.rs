@@ -76,8 +76,16 @@ pub async fn require_auth(
     //     subprocess: the routes behind the tools a profile withholds answer
     //     403 whatever the agent sends (the profile is signed into the token).
     if let Some(binding) = crate::auth::jwt::agent_session_binding(&claims) {
-        let profile =
-            crate::auth::tool_profile::ToolProfile::from_name(binding.tool_profile.as_deref());
+        use crate::auth::tool_profile::ToolProfile;
+        let mut profile = ToolProfile::from_name(binding.tool_profile.as_deref());
+        // A third party's `full` is what trust grants (H6): out of trust since
+        // the token was minted, it is restricted again.
+        if binding.third_party
+            && profile == ToolProfile::Full
+            && crate::auth::agent_tokens::is_out_of_trust(&binding.session_id)
+        {
+            profile = ToolProfile::Restricted;
+        }
         if profile.route_forbidden(req.method(), req.uri().path()) {
             return Err(AppError::Forbidden(format!(
                 "tool_not_in_profile: this route is not available to this session (tool profile: {})",
@@ -600,6 +608,7 @@ mod tests {
             session_id: session_id.to_string(),
             ceiling: Some("default".to_string()),
             tool_profile: None,
+            third_party: false,
         };
         let (token, jti) =
             crate::auth::jwt::generate_session_token(&human, Some(&binding), TEST_SECRET, 3600)
@@ -729,12 +738,13 @@ mod tests {
             .layer(from_fn_with_state(state.clone(), require_auth))
             .with_state(state);
 
-        let mint = |profile: Option<&str>| {
+        let mint = |profile: Option<&str>, third_party: bool| {
             let sid = uuid::Uuid::new_v4().to_string();
             let binding = crate::auth::jwt::AgentSessionBinding {
                 session_id: sid.clone(),
                 ceiling: Some("default".to_string()),
                 tool_profile: profile.map(str::to_string),
+                third_party,
             };
             let (token, jti) = crate::auth::jwt::generate_session_token(
                 &Claims::service_account("runner:t"),
@@ -746,8 +756,10 @@ mod tests {
             crate::auth::agent_tokens::register(&jti, Some(&sid));
             token
         };
-        let restricted = mint(Some("restricted"));
-        let full = mint(None);
+        let restricted = mint(Some("restricted"), true);
+        let full = mint(None, false);
+        // H6: a third-party session opened in trust signs `full` explicitly.
+        let third_party_full = mint(Some("full"), true);
 
         for (method, uri) in [
             ("POST", "/api/chat/sessions"),
@@ -765,6 +777,11 @@ mod tests {
                 StatusCode::OK,
                 "a session without a profile keeps {method} {uri}"
             );
+            assert_eq!(
+                status_of(app.clone(), method, uri, &third_party_full).await,
+                StatusCode::OK,
+                "a third party in trust keeps {method} {uri}"
+            );
         }
         for (method, uri) in [("GET", "/api/chat/sessions"), ("POST", "/api/notes")] {
             assert_eq!(
@@ -773,6 +790,116 @@ mod tests {
                 "restricted profile keeps {method} {uri}"
             );
         }
+    }
+
+    /// H6: `full` is what a third party gets IN TRUST. Its token is minted once, when
+    /// the session opens; a person who lowers the mode afterwards (trust → ask)
+    /// must not leave the model with `plan run`, `delegate_task` or `admin`, which the
+    /// allow list `mcp__project-orchestrator__*` then runs without asking. Back to
+    /// trust, the profile comes back.
+    #[tokio::test]
+    async fn a_third_party_token_loses_the_full_profile_while_its_session_is_out_of_trust() {
+        use axum::routing::post;
+        let state = make_server_state(Some(test_auth_config())).await;
+        async fn ok_handler() -> &'static str {
+            "ok"
+        }
+        let app = Router::new()
+            .route("/api/plans/{id}/tasks/{tid}/delegate", post(ok_handler))
+            .route("/api/notes", post(ok_handler))
+            .layer(from_fn_with_state(state.clone(), require_auth))
+            .with_state(state);
+
+        // A live session on the agent path, opened in trust.
+        let graph: Arc<dyn crate::neo4j::GraphStore> =
+            Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let config = crate::chat::config::ChatConfig {
+            provider_path: crate::chat::config::ProviderPath::Agent,
+            mcp_server_path: std::path::PathBuf::from("/nonexistent/mcp"),
+            nexus_tools_path: None,
+            max_sessions: 4,
+            ..Default::default()
+        };
+        let manager =
+            crate::chat::ChatManager::new_without_memory(graph, mock_app_state().meili, config)
+                .with_provider_source(Arc::new(
+                    crate::chat::agent_runtime::fake::FakeProvider::new(),
+                ));
+        let created = manager
+            .create_session(&crate::chat::types::ChatRequest {
+                routing_mode: None,
+                attachments: Vec::new(),
+                message: String::new(),
+                session_id: None,
+                cwd: "/tmp".into(),
+                project_slug: None,
+                model: None,
+                provider: None,
+                task_alias: None,
+                run_provider: None,
+                run_model: None,
+                max_tokens: None,
+                task_class: None,
+                permission_mode: Some("bypassPermissions".into()),
+                add_dirs: None,
+                workspace_slug: None,
+                user_claims: None,
+                spawned_by: None,
+                task_context: None,
+                scaffolding_override: None,
+                runner_context: None,
+                routing_decision_id: None,
+            })
+            .await
+            .unwrap();
+        let sid = created.session_id;
+
+        // The token a third party in trust is given.
+        let binding = crate::auth::jwt::AgentSessionBinding {
+            session_id: sid.clone(),
+            ceiling: Some("bypassPermissions".to_string()),
+            tool_profile: Some("full".to_string()),
+            third_party: true,
+        };
+        let (token, jti) = crate::auth::jwt::generate_session_token(
+            &Claims::service_account("runner:t"),
+            Some(&binding),
+            TEST_SECRET,
+            3600,
+        )
+        .unwrap();
+        crate::auth::agent_tokens::register(&jti, Some(&sid));
+        let delegate = "/api/plans/p1/tasks/t1/delegate";
+        assert_eq!(
+            status_of(app.clone(), "POST", delegate, &token).await,
+            StatusCode::OK
+        );
+
+        manager
+            .set_session_permission_mode(&sid, "default")
+            .await
+            .unwrap();
+        assert_eq!(
+            status_of(app.clone(), "POST", delegate, &token).await,
+            StatusCode::FORBIDDEN,
+            "out of trust, the third party is restricted again"
+        );
+        assert_eq!(
+            status_of(app.clone(), "POST", "/api/notes", &token).await,
+            StatusCode::OK,
+            "the restricted profile keeps its tools"
+        );
+
+        manager
+            .set_session_permission_mode(&sid, "bypassPermissions")
+            .await
+            .unwrap();
+        assert_eq!(
+            status_of(app.clone(), "POST", delegate, &token).await,
+            StatusCode::OK,
+            "back in trust"
+        );
+        crate::auth::agent_tokens::revoke_session(&sid);
     }
 
     #[test]
