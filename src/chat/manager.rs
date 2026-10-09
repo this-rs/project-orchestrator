@@ -7285,6 +7285,7 @@ impl ChatManager {
             model: model.map(str::to_string),
             provider: Some(provider.to_string()),
             task_alias: None,
+            persona_alias: None,
             run_provider: None,
             run_model: None,
             max_tokens: None,
@@ -9545,6 +9546,9 @@ impl ChatManager {
             &project,
             &aliases,
         );
+        // The persona level (A16): the persona's preference goes through the alias
+        // table like the task alias; one the table does not know is no level.
+        input.persona = catalog::alias_candidate(request.persona_alias.as_deref(), &aliases);
         // The cognitive router (R2): a decision is always taken and stored; it
         // fills the project-rule level only when the mode and the stage say so.
         // Never fatal: any failure leaves the declarative resolution untouched.
@@ -9965,6 +9969,7 @@ impl ChatManager {
         let named = request.provider.is_some()
             || request.model.as_deref().is_some_and(|m| !m.is_empty())
             || request.task_alias.is_some()
+            || request.persona_alias.is_some()
             || request.run_provider.is_some();
         let mut decide = DecideRequest::new(signature, settings, pool);
         decide.slot = if named {
@@ -14209,6 +14214,7 @@ mod tests {
             model: None,
             provider: None,
             task_alias: None,
+            persona_alias: None,
             run_provider: None,
             run_model: None,
             max_tokens: None,

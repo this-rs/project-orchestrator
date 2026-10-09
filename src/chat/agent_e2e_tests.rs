@@ -227,6 +227,7 @@ fn request(provider: Option<&str>, project: Option<&str>, mode: &str) -> ChatReq
         model: None,
         provider: provider.map(str::to_string),
         task_alias: None,
+        persona_alias: None,
         run_provider: None,
         run_model: None,
         max_tokens: None,
@@ -1477,6 +1478,69 @@ mod cognitive_routing {
         assert_eq!(all.len(), 4, "persisted in every case");
         assert!(all.iter().all(|d| !d.applied && d.chosen.is_none()));
         assert!(all.iter().all(|d| d.reason.contains("explicit")));
+    }
+
+    async fn put_aliases(s: &Setup, aliases: serde_json::Value) {
+        s.graph
+            .put_llm_setting(GLOBAL, "model_aliases", &aliases.to_string())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_persona_level_sits_between_the_task_alias_and_the_run() {
+        let s = setup("full", "auto", true).await;
+        put_aliases(
+            &s,
+            json!([
+                {"alias": "fast", "provider": "local", "model": "m"},
+                {"alias": "deep", "provider": "local", "model": "m-deep"}
+            ]),
+        )
+        .await;
+        // Persona alone: it is the persona level and names its model.
+        let mut persona = executor_request();
+        persona.persona_alias = Some("fast".into());
+        let c = choose(&s, &persona).await;
+        assert_eq!(
+            (c.routed_by, c.provider_id.as_str(), c.model.as_deref()),
+            (RoutedBy::Persona, "local", Some("m"))
+        );
+        // Persona beats the run.
+        let mut over_run = persona.clone();
+        over_run.run_provider = Some("claude-code".into());
+        assert_eq!(choose(&s, &over_run).await.routed_by, RoutedBy::Persona);
+        // The task alias beats the persona.
+        let mut over_persona = persona.clone();
+        over_persona.task_alias = Some("deep".into());
+        let c = choose(&s, &over_persona).await;
+        assert_eq!(
+            (c.routed_by, c.model.as_deref()),
+            (RoutedBy::Task, Some("m-deep"))
+        );
+        // The user's request beats everything.
+        let mut requested = persona.clone();
+        requested.provider = Some("claude-code".into());
+        assert_eq!(choose(&s, &requested).await.routed_by, RoutedBy::Request);
+        // Nothing the router chose replaced a named model.
+        assert!(decisions(&s).await.iter().all(|d| !d.applied));
+    }
+
+    #[tokio::test]
+    async fn a_preference_no_alias_maps_falls_through_and_never_reaches_a_decision() {
+        let s = setup("full", "auto", true).await;
+        let sentinel = "SENTINEL-persona-free-text-7f3a";
+        let mut r = executor_request();
+        r.persona_alias = Some(sentinel.into());
+        let c = choose(&s, &r).await;
+        // The choice stays the persona's to make: the router does not take over.
+        assert_ne!(c.routed_by, RoutedBy::Auto);
+        assert_ne!(c.routed_by, RoutedBy::Persona);
+        assert!(!format!("{c:?}").contains(sentinel));
+        let all = decisions(&s).await;
+        assert!(!all.is_empty());
+        assert!(all.iter().all(|d| !d.applied && d.chosen.is_none()));
+        assert!(!serde_json::to_string(&all).unwrap().contains(sentinel));
     }
 
     #[tokio::test]

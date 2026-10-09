@@ -3086,6 +3086,19 @@ impl PlanRunner {
             .ok()
             .flatten()
             .filter(|a| !a.is_empty());
+        // The preference of the persona the task names (A16 level "persona"). A
+        // persona that names no model leaves the choice to the router.
+        let persona_alias = match task_node.as_ref().and_then(|t| t.persona.as_deref()) {
+            Some(persona) => {
+                crate::runner::routing::persona_preference(
+                    self.graph.as_ref(),
+                    project_id_for_skills,
+                    persona,
+                )
+                .await
+            }
+            None => None,
+        };
         // Cognitive routing (B-R7): decide BEFORE the request is built. The
         // decision only travels as an id; provider and model stay untouched and
         // the resolver turns an applied decision into the project_rule slot.
@@ -3112,7 +3125,7 @@ impl PlanRunner {
                 let explicit = task_alias.is_some()
                     || self.run_provider.is_some()
                     || self.run_model.is_some()
-                    || task_node.as_ref().is_some_and(|t| t.persona.is_some());
+                    || persona_alias.is_some();
                 routing
                     .decide(
                         self.graph.as_ref(),
@@ -3138,6 +3151,7 @@ impl PlanRunner {
             model: None,
             provider: None,
             task_alias: task_alias.clone(),
+            persona_alias: persona_alias.clone(),
             run_provider: self.run_provider.clone(),
             run_model: self.run_model.clone(),
             max_tokens: self.run_max_tokens,
@@ -9247,6 +9261,82 @@ mod tests {
         assert_eq!(
             runner.request_spy.lock().unwrap()[1].task_class.as_deref(),
             Some("retry")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_persona_that_names_no_model_leaves_the_slot_automatic() {
+        use crate::chat::provider::cognitive::candidates::Slot;
+        use crate::runner::routing::test_support::FakeDecider;
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (decider, handle) = FakeDecider::handle(true);
+        let (runner, graph, fake) = routed_runner(Some(handle)).await;
+        let (plan_id, run_id) = seed_run(&graph).await;
+        graph
+            .create_persona(&crate::test_helpers::test_persona("generalist", None))
+            .await
+            .unwrap();
+        let mut task = crate::test_helpers::test_task();
+        task.persona = Some("generalist".into());
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        use nexus_claude::agent::CostBasis;
+        run_attempt(
+            &runner,
+            &fake,
+            plan_id,
+            run_id,
+            &task,
+            1,
+            CostBasis::Reported,
+        )
+        .await;
+        reset_globals().await;
+
+        assert_eq!(decider.requests()[0].slot, Slot::Automatic);
+        assert_eq!(runner.request_spy.lock().unwrap()[0].persona_alias, None);
+    }
+
+    #[tokio::test]
+    async fn a_persona_that_names_a_model_keeps_the_slot_explicit_and_feeds_the_resolver() {
+        use crate::chat::provider::cognitive::candidates::Slot;
+        use crate::runner::routing::test_support::FakeDecider;
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (decider, handle) = FakeDecider::handle(true);
+        let (runner, graph, fake) = routed_runner(Some(handle)).await;
+        let (plan_id, run_id) = seed_run(&graph).await;
+        graph
+            .create_persona(&crate::test_helpers::test_persona(
+                "rust-expert",
+                Some("opus"),
+            ))
+            .await
+            .unwrap();
+        let mut task = crate::test_helpers::test_task();
+        task.persona = Some("rust-expert".into());
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        use nexus_claude::agent::CostBasis;
+        run_attempt(
+            &runner,
+            &fake,
+            plan_id,
+            run_id,
+            &task,
+            1,
+            CostBasis::Reported,
+        )
+        .await;
+        reset_globals().await;
+
+        assert_eq!(decider.requests()[0].slot, Slot::Explicit);
+        assert_eq!(
+            runner.request_spy.lock().unwrap()[0]
+                .persona_alias
+                .as_deref(),
+            Some("opus")
         );
     }
 

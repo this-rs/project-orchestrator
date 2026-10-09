@@ -892,6 +892,7 @@ mod tests {
                 model: None,
                 provider: None,
                 task_alias: None,
+                persona_alias: None,
                 run_provider: None,
                 run_model: None,
                 max_tokens: None,

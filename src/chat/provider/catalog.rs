@@ -136,6 +136,16 @@ pub fn policy_pick(
     })
 }
 
+/// The candidate an alias names, through the alias table. Empty or undefined
+/// alias: no level. Shared by the task level and the persona level (A16), so a
+/// persona preference is matched exactly like a task alias.
+pub fn alias_candidate(alias: Option<&str>, aliases: &[ModelAlias]) -> Option<Candidate> {
+    alias
+        .filter(|a| !a.is_empty())
+        .and_then(|alias| aliases.iter().find(|a| a.alias == alias))
+        .map(|a| Candidate::new(a.provider.clone(), Some(a.model.clone())))
+}
+
 /// Fills the resolver input from the stored roles: the project's role is the
 /// project rule, the global one the global rule (A16). An explicit request is
 /// the caller's.
@@ -161,10 +171,7 @@ pub fn resolve_input<'a>(
         .filter(|p| !p.is_empty())
         .map(|p| Candidate::new(p, None));
     // The task's alias goes through the alias table; an undefined one is no level.
-    input.task = task_alias
-        .filter(|a| !a.is_empty())
-        .and_then(|alias| aliases.iter().find(|a| a.alias == alias))
-        .map(|a| Candidate::new(a.provider.clone(), Some(a.model.clone())));
+    input.task = alias_candidate(task_alias, aliases);
     input.run = run
         .filter(|(p, _)| !p.is_empty())
         .map(|(p, m)| Candidate::new(p, m.map(str::to_string)));
