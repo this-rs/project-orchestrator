@@ -46,6 +46,9 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
 }
 
 /// In-memory mock implementation of GraphStore for testing.
+/// One `add_discussed` call: the session and the (label, identifier) pairs.
+pub type DiscussedCall = (Uuid, Vec<(String, String)>);
+
 pub struct MockGraphStore {
     // Entity stores
     pub projects: RwLock<HashMap<Uuid, ProjectNode>>,
@@ -76,7 +79,7 @@ pub struct MockGraphStore {
     /// Chunks keyed by their document's id (cascade deletion mirrors HAS_CHUNK)
     pub document_chunks: RwLock<HashMap<Uuid, Vec<DocumentChunk>>>,
     /// What `add_discussed` was asked, in order (the entity extraction of a chat message).
-    pub discussed_calls: RwLock<Vec<(Uuid, Vec<(String, String)>)>>,
+    pub discussed_calls: RwLock<Vec<DiscussedCall>>,
     /// LINKED_TO edges between a document and knowledge entities, stored
     /// undirected the way the Cypher reads them
     pub document_links: RwLock<HashMap<Uuid, Vec<(EntityType, String)>>>,
