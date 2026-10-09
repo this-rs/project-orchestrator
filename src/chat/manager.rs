@@ -7963,11 +7963,7 @@ impl ChatManager {
             } else {
                 nexus_claude::agent::InterruptScope::TurnOnly
             };
-            let outcome = handle
-                .session
-                .interrupt(scope)
-                .await
-                .map_err(anyhow::Error::new)?;
+            let outcome = handle.interrupt_scoped(scope).await?;
             let diagnostic = outcome.diagnostic;
             return Ok(InterruptOutcome {
                 delivered: true,
