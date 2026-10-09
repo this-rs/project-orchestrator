@@ -131,6 +131,13 @@ const CURATED_ORDER: &[(&str, &str, &str, &str, &str)] = &[
         "Best balance of speed and intelligence",
     ),
     (
+        "claude-haiku-5-5",
+        "haiku",
+        "5.5",
+        TIER_CURRENT,
+        "Fastest — near-frontier intelligence, latest generation",
+    ),
+    (
         "claude-haiku-4-5",
         "haiku",
         "4.5",
@@ -670,16 +677,14 @@ impl ModelCatalogCache {
 
     async fn fetch_live_catalog(&self) -> anyhow::Result<Vec<ModelDefinition>> {
         let credential = self.resolve_credential().await?;
+        let http = &self.http;
+        let credential = &credential;
 
-        let mut entries: Vec<AnthropicModelEntry> = Vec::new();
-        let mut after_id: Option<String> = None;
-
-        for _ in 0..MAX_PAGES {
-            let mut req = self
-                .http
+        let entries = collect_pages(|after_id| async move {
+            let mut req = http
                 .get(ANTHROPIC_MODELS_URL)
                 .header("anthropic-version", ANTHROPIC_VERSION);
-            req = match &credential {
+            req = match credential {
                 Credential::ApiKey(key) => req.header("x-api-key", key),
                 Credential::OAuth(token) => {
                     req.bearer_auth(token).header("anthropic-beta", OAUTH_BETA)
@@ -688,21 +693,40 @@ impl ModelCatalogCache {
             if let Some(cursor) = &after_id {
                 req = req.query(&[("after_id", cursor.as_str())]);
             }
-
             let resp = req.send().await?.error_for_status()?;
             let page: AnthropicModelsResponse = resp.json().await?;
-            let has_more = page.has_more;
-            let last_id = page.last_id.clone();
-            entries.extend(page.data);
-
-            if !has_more || last_id.is_none() {
-                break;
-            }
-            after_id = last_id;
-        }
+            Ok::<_, anyhow::Error>(page)
+        })
+        .await?;
 
         Ok(merge_catalog(&entries))
     }
+}
+
+/// Walk the paginated Models API listing: each page is requested with the
+/// previous page's `last_id` as `after_id`, until `has_more` is false. Every
+/// page's entries are kept, in order. Stops after `MAX_PAGES` pages, and
+/// logs when the listing is still not exhausted at that point.
+async fn collect_pages<F, Fut>(mut fetch: F) -> anyhow::Result<Vec<AnthropicModelEntry>>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<AnthropicModelsResponse>>,
+{
+    let mut entries = Vec::new();
+    let mut after_id: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let page = fetch(after_id.take()).await?;
+        entries.extend(page.data);
+        match page.last_id {
+            Some(last) if page.has_more => after_id = Some(last),
+            _ => return Ok(entries),
+        }
+    }
+    tracing::warn!(
+        max_pages = MAX_PAGES,
+        "Claude model listing still has more pages after the cap; the catalog may be incomplete"
+    );
+    Ok(entries)
 }
 
 /// Merge the live Models API listing with local curation.
@@ -910,13 +934,17 @@ mod tests {
             entry("claude-sonnet-5-5", "Claude Sonnet 5.5"),
             entry("claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
         ]);
-        let haikus: Vec<_> = models.iter().filter(|m| m.family == "haiku").collect();
+        // Curated Haiku 5.5 is always listed now, so count Haiku 4.5 by ID.
+        let haiku45: Vec<_> = models
+            .iter()
+            .filter(|m| m.id == "claude-haiku-4-5")
+            .collect();
         assert_eq!(
-            haikus.len(),
+            haiku45.len(),
             1,
             "dated snapshot must not duplicate the curated alias"
         );
-        assert_eq!(haikus[0].id, "claude-haiku-4-5");
+        assert_eq!(haiku45[0].family, "haiku");
     }
 
     #[test]
@@ -942,6 +970,101 @@ mod tests {
         let models = merge_catalog(&[entry("claude-opus-6", "Claude Opus 6")]);
         let opus55 = models.iter().find(|m| m.id == "claude-opus-5-5").unwrap();
         assert_eq!(opus55.tier, TIER_CURRENT);
+    }
+
+    #[test]
+    fn test_static_fallback_includes_haiku_5_5_as_current() {
+        // The fallback is what a user sees with no key, or when the live
+        // fetch fails before anything was cached: Haiku 5.5 must be in it.
+        let models = static_fallback_models();
+        let haiku = models
+            .iter()
+            .find(|m| m.id == "claude-haiku-5-5")
+            .expect("Haiku 5.5 missing from the static fallback");
+        assert_eq!(haiku.tier, TIER_CURRENT);
+        assert_eq!(haiku.full_label, "Claude Haiku 5.5");
+        assert!(!haiku.description.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_served_catalog_without_key_includes_haiku_5_5() {
+        // The path `GET /api/chat/models` takes with no key.
+        let models = ModelCatalogCache::new(None).get_models().await;
+        assert!(models.iter().any(|m| m.id == "claude-haiku-5-5"));
+    }
+
+    #[test]
+    fn test_merge_catalog_api_haiku_5_5_gets_curated_entry() {
+        let models = merge_catalog(&[entry("claude-haiku-5-5", "Claude Haiku 5.5")]);
+        let pos = models
+            .iter()
+            .position(|m| m.id == "claude-haiku-5-5")
+            .expect("API-listed Haiku 5.5 must be present");
+        assert_eq!(
+            models.iter().filter(|m| m.id == "claude-haiku-5-5").count(),
+            1
+        );
+        // Curated, not derived: it carries the curated description and sits
+        // in curated order, ahead of Haiku 4.5.
+        assert!(
+            !models[pos].description.is_empty(),
+            "Haiku 5.5 was derived instead of curated"
+        );
+        let haiku45 = models
+            .iter()
+            .position(|m| m.id == "claude-haiku-4-5")
+            .unwrap();
+        assert!(pos < haiku45, "Haiku 5.5 must come before Haiku 4.5");
+    }
+
+    /// One page of the Models API listing with `n` entries starting at `from`.
+    fn listing_page(from: usize, n: usize, has_more: bool) -> AnthropicModelsResponse {
+        let ids: Vec<String> = (from..from + n)
+            .map(|i| format!("claude-test-{i}"))
+            .collect();
+        AnthropicModelsResponse {
+            data: ids.iter().map(|id| entry(id, id)).collect(),
+            has_more,
+            last_id: ids.last().cloned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pagination_keeps_every_model_beyond_the_first_page() {
+        let mut cursors: Vec<Option<String>> = Vec::new();
+        let entries = collect_pages(|after| {
+            cursors.push(after.clone());
+            let resp = match after.as_deref() {
+                None => listing_page(0, 20, true),
+                Some("claude-test-19") => listing_page(20, 5, false),
+                other => panic!("unexpected cursor {other:?}"),
+            };
+            std::future::ready(Ok(resp))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(entries.len(), 25, "no model may be lost across pages");
+        assert_eq!(entries[0].id, "claude-test-0");
+        assert_eq!(entries[24].id, "claude-test-24");
+        assert_eq!(
+            cursors,
+            vec![None, Some("claude-test-19".to_string())],
+            "the second page must be requested after the first page's last_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pagination_is_capped_at_max_pages() {
+        let mut calls: u8 = 0;
+        let entries = collect_pages(|_| {
+            calls += 1;
+            std::future::ready(Ok(listing_page(0, 1, true)))
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls, MAX_PAGES, "a has_more loop must stop at the cap");
+        assert_eq!(entries.len(), MAX_PAGES as usize);
     }
 
     #[test]
