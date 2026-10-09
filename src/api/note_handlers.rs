@@ -101,10 +101,11 @@ pub struct ContextNotesQuery {
     /// E.g. "CONTAINS,IMPORTS,CALLS,CO_CHANGED,IMPLEMENTS_TRAIT"
     /// If absent, defaults to CONTAINS|IMPORTS|CALLS (backward compatible).
     pub relation_types: Option<String>,
-    /// Source project UUID for cross-project coupling weighting.
-    /// When set, notes from other projects are weighted by P2P coupling strength.
+    /// Project scope of the propagation (project + global notes only). Cannot
+    /// widen the scope: it must match the entity's owning project when that is
+    /// resolvable, otherwise it is used as a single-project narrowing filter.
     pub source_project_id: Option<Uuid>,
-    /// Force cross-project propagation even when coupling < 0.2
+    /// Deprecated and ignored: cross-project propagation is not available from the API.
     pub force_cross_project: Option<bool>,
 }
 
@@ -623,6 +624,29 @@ pub async fn get_context_notes(
     Ok(Json(response))
 }
 
+/// Project scope of a propagation request. The HTTP API (and the MCP tools that
+/// proxy it) has no caller identity, so `source_project_id` can only narrow:
+/// the entity's owning project wins and a mismatching value is a 400;
+/// `force_cross_project` is ignored (logged) because it would widen the scope.
+async fn resolve_scope(
+    state: &OrchestratorState,
+    entity_type: &EntityType,
+    query: &ContextNotesQuery,
+) -> Result<Option<Uuid>, AppError> {
+    if query.force_cross_project == Some(true) {
+        tracing::warn!(
+            entity_id = %query.entity_id,
+            "force_cross_project ignored on the HTTP API: cross-project propagation is internal-only"
+        );
+    }
+    state
+        .orchestrator
+        .note_manager()
+        .resolve_propagation_scope(entity_type, &query.entity_id, query.source_project_id)
+        .await
+        .map_err(AppError::BadRequest)
+}
+
 /// Get propagated notes for an entity
 pub async fn get_propagated_notes(
     State(state): State<OrchestratorState>,
@@ -641,6 +665,8 @@ pub async fn get_propagated_notes(
             .collect()
     });
 
+    let scope_project = resolve_scope(&state, &entity_type, &query).await?;
+
     let notes = state
         .orchestrator
         .note_manager()
@@ -650,8 +676,8 @@ pub async fn get_propagated_notes(
             query.max_depth.unwrap_or(3),
             query.min_score.unwrap_or(0.1),
             relation_types.as_deref(),
-            query.source_project_id,
-            query.force_cross_project.unwrap_or(false),
+            scope_project,
+            false, // never widened from the HTTP API (see resolve_scope)
         )
         .await?;
 
@@ -700,6 +726,8 @@ pub async fn get_propagated_knowledge(
             .collect()
     });
 
+    let scope_project = resolve_scope(&state, &entity_type, &query).await?;
+
     let result = state
         .orchestrator
         .note_manager()
@@ -709,6 +737,7 @@ pub async fn get_propagated_knowledge(
             query.max_depth.unwrap_or(3),
             query.min_score.unwrap_or(0.1),
             relation_types.as_deref(),
+            scope_project,
         )
         .await?;
 
@@ -1918,6 +1947,17 @@ mod tests {
         // NoteContextResponse has direct_notes and propagated_notes
         assert!(json["direct_notes"].is_array());
         assert!(json["propagated_notes"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_get_propagated_notes_rejects_foreign_source_project() {
+        let app = test_app().await;
+        let (owner, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let uri = format!(
+            "/api/notes/propagated?entity_type=project&entity_id={owner}&source_project_id={other}"
+        );
+        let resp = app.oneshot(auth_get(&uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     // ====================================================================
