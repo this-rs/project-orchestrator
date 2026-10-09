@@ -292,6 +292,27 @@ pub(crate) async fn load_project_entries(
     Ok(entries)
 }
 
+/// Adds `projects` to the process-wide resolve cache and makes it fresh.
+///
+/// The cache is shared by every graph store of the process: in the test binary,
+/// whichever test fills it first decides what the others resolve for five
+/// minutes. A test that needs a hook to resolve ITS project seeds it here; the
+/// entries already cached are kept, so the other tests see no change.
+#[cfg(test)]
+pub(crate) fn seed_resolve_cache_for_tests(projects: &[crate::neo4j::models::ProjectNode]) {
+    let mut cache = RESOLVE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut entries = match cache.take() {
+        Some((entries, _)) => entries,
+        None => Vec::new(),
+    };
+    for entry in entries_for_projects(projects) {
+        if !entries.iter().any(|e| e.project_id == entry.project_id) {
+            entries.push(entry);
+        }
+    }
+    *cache = Some((entries, Instant::now()));
+}
+
 /// Resolve a project_id from a tool call context.
 ///
 /// Tries to find a matching project by:

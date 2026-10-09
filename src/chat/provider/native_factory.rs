@@ -20,6 +20,66 @@ use super::credentials::VaultCredentialResolver;
 use super::settings::InstanceRecord;
 use crate::vault::VaultService;
 
+/// How the native harness reads a policy's `allow` list. The server's list
+/// (`PermissionConfig::allowed_tools`, `mcp__project-orchestrator__*` by
+/// default) has Claude Code's meaning — what runs WITHOUT asking — not nexus's
+/// strict one — the ONLY tools offered. Strict, the default list would hide
+/// every `nexus` tool (Bash, Read, Edit...) from every native session (B40).
+pub(crate) const STRICT_TOOL_EXPOSURE: bool = false;
+
+/// `nexus-tools` tools no native session gets yet: they send requests to any
+/// origin, and the per-origin network consent they need does not exist (B40).
+pub(crate) const NEXUS_TOOLS_WITHHELD: &[&str] = &["WebFetch", "WebSearch"];
+
+/// `program` as `nexus-tools` can be launched: its absolute, resolved path, when
+/// it is an executable file. Checked at every opening (the file may have gone
+/// since the server started). Absolute because the server is launched in the
+/// session's directory: a relative path (`./nexus-tools`, a `.` or empty entry of
+/// the PATH) would name a file of the project, which the model can write.
+pub(crate) fn runnable_nexus_tools(program: &std::path::Path) -> Option<std::path::PathBuf> {
+    let path = std::fs::canonicalize(program).ok()?;
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+    }
+    Some(path)
+}
+
+/// The `nexus` MCP server of a native session: `nexus-tools` over stdio,
+/// scoped to the session's directories and bounded at launch (`--tools`, N27)
+/// by what its policy can ever expose (`nexus_tools_bound`), minus
+/// [`NEXUS_TOOLS_WITHHELD`]. `None` when nothing is left to serve. Its argv
+/// holds directories and tool names only, its environment nothing (the launch
+/// applies the session's allow-listed environment): no secret.
+pub(crate) fn nexus_tools_server(
+    program: &std::path::Path,
+    spec: &nexus_claude::agent::SessionSpec,
+) -> Option<nexus_claude::agent::McpServerSpec> {
+    let mut server = nexus_claude::providers::native::DefaultTools::new(program)
+        .server_for(spec, STRICT_TOOL_EXPOSURE);
+    let nexus_claude::agent::McpServerSpec::Stdio { args, .. } = &mut server else {
+        return None;
+    };
+    let at = args.iter().position(|arg| arg == "--tools")? + 1;
+    let tools: Vec<&str> = args
+        .get(at)?
+        .split(',')
+        .filter(|tool| !tool.is_empty() && !NEXUS_TOOLS_WITHHELD.contains(tool))
+        .collect();
+    if tools.is_empty() {
+        return None;
+    }
+    args[at] = tools.join(",");
+    Some(server)
+}
+
 /// What a connection test found out about an instance (A30): can it be
 /// reached, which models it lists, can the chosen model call a tool, and how
 /// large its context window is.
@@ -147,6 +207,7 @@ fn build_native(
 
     let mut config = NativeConfig::new(record.id.clone());
     config.default_model = record.default_model.clone();
+    config.strict_tool_exposure = STRICT_TOOL_EXPOSURE;
     // Only "free" is known without a price table; the rest stays `unknown`
     // (no amount) until a price is configured (A21: never an invented price).
     if record.cost_source == "free" {

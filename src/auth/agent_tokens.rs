@@ -11,22 +11,49 @@
 //! every agent subprocess that held one (they are children of the server and
 //! each resume mints a fresh token).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, RwLock};
 
 /// `jti` → session id (`None` for a token minted without a session).
 static LIVE: LazyLock<RwLock<HashMap<String, Option<String>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Sessions taken out of `trust` after their token was minted (H6). A third
+/// party's `full` profile is what trust grants it: the token, minted once, keeps
+/// saying `full`, so the REST boundary reads this set to apply the restricted
+/// profile while the session is out of trust.
+static OUT_OF_TRUST: LazyLock<RwLock<HashSet<String>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
+
 /// Register a freshly minted token. Minting a token for a session supersedes
 /// the tokens that session held before: a new token is minted only when the
-/// agent process is (re)spawned, so the previous holder is gone.
+/// agent process is (re)spawned, so the previous holder is gone. The new token
+/// is minted for the session's current mode: it is no longer out of trust.
 pub fn register(jti: &str, session_id: Option<&str>) {
     let mut live = LIVE.write().unwrap_or_else(|e| e.into_inner());
     if let Some(sid) = session_id {
         live.retain(|_, s| s.as_deref() != Some(sid));
+        set_out_of_trust(sid, false);
     }
     live.insert(jti.to_string(), session_id.map(str::to_string));
+}
+
+/// Record that a live session left `trust` (`true`) or came back to it.
+pub fn set_out_of_trust(session_id: &str, out: bool) {
+    let mut set = OUT_OF_TRUST.write().unwrap_or_else(|e| e.into_inner());
+    if out {
+        set.insert(session_id.to_string());
+    } else {
+        set.remove(session_id);
+    }
+}
+
+/// Whether the session left `trust` after its token was minted.
+pub fn is_out_of_trust(session_id: &str) -> bool {
+    OUT_OF_TRUST
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(session_id)
 }
 
 /// Whether a token is still usable.
@@ -38,6 +65,7 @@ pub fn is_live(jti: &str) -> bool {
 
 /// Revoke every token minted for a session. Returns how many were revoked.
 pub fn revoke_session(session_id: &str) -> usize {
+    set_out_of_trust(session_id, false);
     let mut live = LIVE.write().unwrap_or_else(|e| e.into_inner());
     let before = live.len();
     live.retain(|_, s| s.as_deref() != Some(session_id));

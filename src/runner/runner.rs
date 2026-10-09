@@ -5437,6 +5437,7 @@ mod tests {
         let chat_config = ChatConfig {
             provider_path: Default::default(),
             mcp_server_path: std::path::PathBuf::from("/dev/null"),
+            nexus_tools_path: None,
             default_model: "test".into(),
             max_sessions: 1,
             session_timeout: std::time::Duration::from_secs(10),
@@ -6018,6 +6019,7 @@ mod tests {
         let chat_config = ChatConfig {
             provider_path: Default::default(),
             mcp_server_path: std::path::PathBuf::from("/dev/null"),
+            nexus_tools_path: None,
             default_model: "test".into(),
             max_sessions: 1,
             session_timeout: std::time::Duration::from_secs(10),
@@ -8782,6 +8784,7 @@ mod tests {
         let chat_config = ChatConfig {
             provider_path: ProviderPath::Agent,
             mcp_server_path: std::path::PathBuf::from("/dev/null"),
+            nexus_tools_path: None,
             default_model: "test".into(),
             max_sessions: 4,
             session_timeout: std::time::Duration::from_secs(30),
@@ -8935,6 +8938,7 @@ mod tests {
         let chat_config = ChatConfig {
             provider_path: ProviderPath::Agent,
             mcp_server_path: std::path::PathBuf::from("/dev/null"),
+            nexus_tools_path: None,
             default_model: "test".into(),
             max_sessions: 4,
             session_timeout: std::time::Duration::from_secs(30),

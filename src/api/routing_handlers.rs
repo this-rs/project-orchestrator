@@ -400,6 +400,7 @@ mod tests {
             session_id: session.to_string(),
             ceiling: Some("default".into()),
             tool_profile: Some("restricted".into()),
+            third_party: false,
         };
         let (token, jti) = crate::auth::jwt::generate_session_token(
             &claims,
