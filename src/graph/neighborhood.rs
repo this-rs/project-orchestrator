@@ -681,6 +681,19 @@ pub fn expand_in_memory(
     center_id: &str,
     params: &NeighborhoodParams,
 ) -> Option<RawNeighborhood> {
+    expand_in_memory_admitting(graph, center_type, center_id, params, &|_| true)
+}
+
+/// [`expand_in_memory`] where only the neighbours `admit` accepts are candidates.
+/// The test runs BEFORE the per-node fan-out cut, like the `WHERE` of the scoped
+/// Cypher hop: a rejected neighbour cannot take the place of an accepted one.
+fn expand_in_memory_admitting(
+    graph: &InMemoryGraph,
+    center_type: &str,
+    center_id: &str,
+    params: &NeighborhoodParams,
+    admit: &dyn Fn(&RawNode) -> bool,
+) -> Option<RawNeighborhood> {
     let center = graph
         .nodes
         .get(center_id)
@@ -725,7 +738,7 @@ pub fn expand_in_memory(
                     } else {
                         &e.source
                     };
-                    graph.nodes.get(other).map(|n| (i, n))
+                    graph.nodes.get(other).filter(|n| admit(n)).map(|n| (i, n))
                 })
                 .collect();
             cands.sort_by(|a, b| {
@@ -761,6 +774,106 @@ pub fn expand_in_memory(
         center: Some(center),
         nodes,
         edges,
+    })
+}
+
+// ============================================================================
+// Project-scoped expansion (anchor resolver)
+// ============================================================================
+
+/// The v1 containment hierarchy, the ONLY steps a scope may climb or descend:
+/// `File -> Project -> Workspace` and `Workspace -> Component -> Project`.
+/// (`Module` / `Feature -> Component` do not exist in v1.)
+pub const HIERARCHY_V1: &[(&str, &str)] = &[
+    ("file", "project"),
+    ("project", "workspace"),
+    ("workspace", "component"),
+    ("component", "project"),
+];
+
+/// Whether `from -> to` is a step of [`HIERARCHY_V1`].
+pub fn hierarchy_step_allowed(from: &str, to: &str) -> bool {
+    HIERARCHY_V1.iter().any(|(f, t)| *f == from && *t == to)
+}
+
+/// Projects whose nodes a scoped walk may traverse (ids as stored). A node whose
+/// owner is unknown, or not listed, is never traversed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectFilter {
+    pub project_ids: Vec<String>,
+}
+
+impl ProjectFilter {
+    pub fn only(project_id: impl Into<String>) -> Self {
+        Self {
+            project_ids: vec![project_id.into()],
+        }
+    }
+
+    pub fn contains(&self, project_id: &str) -> bool {
+        self.project_ids.iter().any(|p| p == project_id)
+    }
+}
+
+/// A candidate node with its owner and own consent (code nodes: `NotSet`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopedNode {
+    pub node: RawNode,
+    /// Owning project id; `None` = unknown (the consent predicate refuses it).
+    pub project_id: Option<String>,
+    pub consent: crate::episodes::distill_models::SharingConsent,
+}
+
+/// Output of a scoped walk. The centre is always returned (with its owner) so
+/// the caller can run the consent predicate on it.
+#[derive(Debug, Clone, Default)]
+pub struct ScopedNeighborhood {
+    pub center: Option<ScopedNode>,
+    pub nodes: Vec<ScopedNode>,
+    pub edges: Vec<RawEdge>,
+}
+
+/// Ownership of the nodes of an [`InMemoryGraph`] (mock store + tests).
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryOwnership {
+    pub project_of: HashMap<String, String>,
+    pub consent_of: HashMap<String, crate::episodes::distill_models::SharingConsent>,
+}
+
+impl InMemoryOwnership {
+    pub fn owner_of(&self, node: &RawNode) -> Option<String> {
+        if node.node_type == "project" {
+            return Some(node.id.clone());
+        }
+        self.project_of.get(&node.id).cloned()
+    }
+
+    fn scoped(&self, node: &RawNode) -> ScopedNode {
+        ScopedNode {
+            project_id: self.owner_of(node),
+            consent: self.consent_of.get(&node.id).copied().unwrap_or_default(),
+            node: node.clone(),
+        }
+    }
+}
+
+/// [`expand_in_memory`] with the project filter applied at every hop, before the
+/// fan-out cut (same contract as the scoped Cypher query).
+pub fn expand_in_memory_scoped(
+    graph: &InMemoryGraph,
+    ownership: &InMemoryOwnership,
+    center_type: &str,
+    center_id: &str,
+    params: &NeighborhoodParams,
+    filter: &ProjectFilter,
+) -> Option<ScopedNeighborhood> {
+    let raw = expand_in_memory_admitting(graph, center_type, center_id, params, &|n| {
+        ownership.owner_of(n).is_some_and(|p| filter.contains(&p))
+    })?;
+    Some(ScopedNeighborhood {
+        center: raw.center.as_ref().map(|c| ownership.scoped(c)),
+        nodes: raw.nodes.iter().map(|n| ownership.scoped(n)).collect(),
+        edges: raw.edges,
     })
 }
 
