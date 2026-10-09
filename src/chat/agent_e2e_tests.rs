@@ -2807,6 +2807,7 @@ mod parity {
             message,
             Default::default(),
             Default::default(),
+            r.manager.anchor_mode,
         )
         .await
         .expect("the graph has context for this message");
@@ -3199,6 +3200,7 @@ mod parity {
             typed,
             Default::default(),
             Default::default(),
+            r.manager.anchor_mode,
         )
         .await
         .expect("the graph has context for this message");
