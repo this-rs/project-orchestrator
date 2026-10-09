@@ -101,6 +101,20 @@ pub fn visible_text(stored: &str) -> String {
 
 /// Expand the stored content of a user message for one turn.
 pub async fn expand_user_turn(graph: &Arc<dyn GraphStore>, stored: &str) -> TurnExpansion {
+    expand_user_turn_if(graph, stored, super::flag::from_env()).await
+}
+
+/// [`expand_user_turn`] with the `refs_v1` switch given. Off, a stored block is
+/// just text: nothing is resolved, injected or announced, the turn is the one
+/// from before references existed.
+pub async fn expand_user_turn_if(
+    graph: &Arc<dyn GraphStore>,
+    stored: &str,
+    enabled: bool,
+) -> TurnExpansion {
+    if !enabled {
+        return legacy_turn(graph, stored).await;
+    }
     let source = GraphRefSource::new(graph.clone());
     expand_with(
         graph,
@@ -133,11 +147,7 @@ pub async fn expand_with(
     let refs = distinct_capped(refs);
     if refs.is_empty() {
         // Rule 5: exactly the pre-references behaviour.
-        return TurnExpansion {
-            memory_text: stored.to_string(),
-            enrichment_text: message_attachments::expand_for_agent(graph, stored).await,
-            ..TurnExpansion::default()
-        };
+        return legacy_turn(graph, stored).await;
     }
 
     let deadline = tokio::time::Instant::now() + timeout;
@@ -170,6 +180,15 @@ pub async fn expand_with(
         model_tail,
         excluded_note_ids,
         resolved,
+    }
+}
+
+/// The turn as it was before references: the attachments expanded, nothing else.
+async fn legacy_turn(graph: &Arc<dyn GraphStore>, stored: &str) -> TurnExpansion {
+    TurnExpansion {
+        memory_text: stored.to_string(),
+        enrichment_text: message_attachments::expand_for_agent(graph, stored).await,
+        ..TurnExpansion::default()
     }
 }
 
@@ -607,6 +626,25 @@ mod tests {
             assert_eq!(t.model_tail, "");
             assert!(t.excluded_note_ids.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn with_the_switch_off_a_stored_block_is_only_text() {
+        let w = world().await;
+        let g = graph_of(&w);
+        let content = stored("t", &[EntityRef::new(RefKind::Plan, w.plan_a.id)]);
+        let on = expand_user_turn_if(&g, &content, true).await;
+        assert_eq!(
+            on.resolved.len(),
+            1,
+            "control: the same message resolves when on"
+        );
+        let off = expand_user_turn_if(&g, &content, false).await;
+        assert!(off.resolved.is_empty() && off.event().is_none());
+        assert_eq!(off.model_tail, "");
+        assert!(off.excluded_note_ids.is_empty());
+        assert_eq!(off.memory_text, content);
+        assert_eq!(off.native_prompt(&content, &content), content);
     }
 
     #[tokio::test]
