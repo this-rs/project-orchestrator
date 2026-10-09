@@ -28,6 +28,7 @@ pub mod flag;
 pub mod kinds;
 pub mod label;
 pub mod link;
+pub mod rank;
 pub mod registry;
 pub mod resolvers;
 pub mod resolvers_ext;
