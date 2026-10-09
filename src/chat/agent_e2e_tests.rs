@@ -205,6 +205,7 @@ fn manager(graph: Arc<MockGraphStore>, secure: bool) -> ChatManager {
     let config = super::config::ChatConfig {
         provider_path: ProviderPath::Agent,
         mcp_server_path: fake_bin("fake_mcp"),
+        nexus_tools_path: None,
         jwt_secret: secure.then(|| "test-secret-test-secret-test-secret".to_string()),
         max_sessions: 10,
         ..Default::default()
@@ -1615,6 +1616,7 @@ mod turn_routing {
         let config = super::super::config::ChatConfig {
             provider_path: ProviderPath::Agent,
             mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            nexus_tools_path: None,
             max_sessions: 10,
             ..Default::default()
         };

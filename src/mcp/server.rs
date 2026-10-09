@@ -234,7 +234,7 @@ impl McpServer {
 
 /// Why this call is outside the session's tool profile, if it is. Refusal by
 /// default: a withheld tool, or a withheld action of a tool that stays.
-fn profile_refusal(profile: ToolProfile, params: &ToolCallParams) -> Option<String> {
+pub(crate) fn profile_refusal(profile: ToolProfile, params: &ToolCallParams) -> Option<String> {
     let action = params
         .arguments
         .as_ref()

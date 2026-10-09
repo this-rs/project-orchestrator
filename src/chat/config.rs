@@ -159,6 +159,10 @@ pub struct ChatConfig {
     pub provider_path: ProviderPath,
     /// Path to the MCP server binary
     pub mcp_server_path: PathBuf,
+    /// The `nexus-tools` executable (Read, Edit, Bash... over MCP) attached to every
+    /// native session as its `nexus` server (B40). `None`: not found at start, the
+    /// native sessions have the project-orchestrator tools only.
+    pub nexus_tools_path: Option<PathBuf>,
     /// Default model to use when not specified in request
     pub default_model: String,
     /// Maximum number of concurrent active sessions
@@ -205,6 +209,9 @@ pub struct ChatConfig {
 
 /// Environment variable selecting the [`ProviderPath`].
 pub const PROVIDER_PATH_VAR: &str = "CHAT_PROVIDER_PATH";
+
+/// Variable naming the `nexus-tools` executable of the native sessions (B40).
+pub const NEXUS_TOOLS_PATH_VAR: &str = "NEXUS_TOOLS_PATH";
 
 /// Engine that drives Claude Code sessions (decision A18 / task B38).
 ///
@@ -253,6 +260,7 @@ impl ChatConfig {
         Self {
             provider_path: ProviderPath::parse(std::env::var(PROVIDER_PATH_VAR).ok().as_deref()),
             mcp_server_path,
+            nexus_tools_path: Self::detect_nexus_tools_path(),
             default_model: std::env::var("CHAT_DEFAULT_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-5".into()),
             max_sessions: std::env::var("CHAT_MAX_SESSIONS")
@@ -332,6 +340,18 @@ impl ChatConfig {
         Self::detect_mcp_server_path()
     }
 
+    /// Where `nexus-tools` is: `NEXUS_TOOLS_PATH` when set (an operator's choice,
+    /// taken as is), else next to the server's executable, else on the `PATH`
+    /// (`DefaultTools::locate` of nexus). Nothing downloads it: it ships with the
+    /// server or is installed by the operator (`cargo install --git
+    /// https://github.com/this-rs/nexus nexus-tools`).
+    pub fn detect_nexus_tools_path() -> Option<PathBuf> {
+        if let Some(path) = std::env::var_os(NEXUS_TOOLS_PATH_VAR).filter(|p| !p.is_empty()) {
+            return Some(PathBuf::from(path));
+        }
+        nexus_claude::providers::native::DefaultTools::locate().map(|tools| tools.program)
+    }
+
     fn detect_mcp_server_path() -> PathBuf {
         // Try environment variable first
         if let Ok(path) = std::env::var("MCP_SERVER_PATH") {
@@ -376,6 +396,7 @@ mod tests {
         let config = ChatConfig {
             provider_path: Default::default(),
             mcp_server_path: PathBuf::from("/usr/bin/mcp_server"),
+            nexus_tools_path: None,
             default_model: "claude-sonnet-4-6".into(),
             max_sessions: 10,
             session_timeout: Duration::from_secs(1800),

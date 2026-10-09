@@ -684,6 +684,7 @@ mod tests {
             session_id: s.to_string(),
             ceiling: ceiling.map(str::to_string),
             tool_profile: None,
+            third_party: false,
         });
         let secret = "test-secret-key-minimum-32-chars!!";
         let (token, _) =

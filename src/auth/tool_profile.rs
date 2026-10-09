@@ -33,7 +33,9 @@ pub enum ToolProfile {
     /// Every tool, every action.
     Full,
     /// No tool that opens a session, runs a plan or reconfigures the server.
-    /// The default for any provider other than Claude Code (decision A35).
+    /// The default for any provider other than Claude Code (decision A35),
+    /// except a session a person opened in `trust` (H6); always the profile of
+    /// a session opened by a third-party session.
     Restricted,
 }
 
@@ -445,6 +447,7 @@ mod tests {
                 session_id: "sess".into(),
                 ceiling: None,
                 tool_profile: profile.map(str::to_string),
+                third_party: false,
             };
             crate::auth::jwt::generate_session_token(&human, Some(&binding), secret, 60)
                 .unwrap()

@@ -600,6 +600,7 @@ mod tests {
             session_id: session_id.to_string(),
             ceiling: Some("default".to_string()),
             tool_profile: None,
+            third_party: false,
         };
         let (token, jti) =
             crate::auth::jwt::generate_session_token(&human, Some(&binding), TEST_SECRET, 3600)
@@ -729,12 +730,13 @@ mod tests {
             .layer(from_fn_with_state(state.clone(), require_auth))
             .with_state(state);
 
-        let mint = |profile: Option<&str>| {
+        let mint = |profile: Option<&str>, third_party: bool| {
             let sid = uuid::Uuid::new_v4().to_string();
             let binding = crate::auth::jwt::AgentSessionBinding {
                 session_id: sid.clone(),
                 ceiling: Some("default".to_string()),
                 tool_profile: profile.map(str::to_string),
+                third_party,
             };
             let (token, jti) = crate::auth::jwt::generate_session_token(
                 &Claims::service_account("runner:t"),
@@ -746,8 +748,10 @@ mod tests {
             crate::auth::agent_tokens::register(&jti, Some(&sid));
             token
         };
-        let restricted = mint(Some("restricted"));
-        let full = mint(None);
+        let restricted = mint(Some("restricted"), true);
+        let full = mint(None, false);
+        // H6: a third-party session opened in trust signs `full` explicitly.
+        let third_party_full = mint(Some("full"), true);
 
         for (method, uri) in [
             ("POST", "/api/chat/sessions"),
@@ -764,6 +768,11 @@ mod tests {
                 status_of(app.clone(), method, uri, &full).await,
                 StatusCode::OK,
                 "a session without a profile keeps {method} {uri}"
+            );
+            assert_eq!(
+                status_of(app.clone(), method, uri, &third_party_full).await,
+                StatusCode::OK,
+                "a third party in trust keeps {method} {uri}"
             );
         }
         for (method, uri) in [("GET", "/api/chat/sessions"), ("POST", "/api/notes")] {
