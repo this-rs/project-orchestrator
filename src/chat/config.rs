@@ -163,6 +163,9 @@ pub struct ChatConfig {
     /// native session as its `nexus` server (B40). `None`: not found at start, the
     /// native sessions have the project-orchestrator tools only.
     pub nexus_tools_path: Option<PathBuf>,
+    /// The browser (Obscura, N23) found on the `PATH` at start. Found is not authorised:
+    /// a project must authorise it (`nexus_tools::BROWSER_KEY`) before a session gets it.
+    pub nexus_browser_path: Option<PathBuf>,
     /// Default model to use when not specified in request
     pub default_model: String,
     /// Maximum number of concurrent active sessions
@@ -261,6 +264,8 @@ impl ChatConfig {
             provider_path: ProviderPath::parse(std::env::var(PROVIDER_PATH_VAR).ok().as_deref()),
             mcp_server_path,
             nexus_tools_path: Self::detect_nexus_tools_path(),
+            nexus_browser_path: nexus_claude::providers::native::BrowserTools::locate()
+                .map(|browser| browser.program),
             default_model: std::env::var("CHAT_DEFAULT_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-5".into()),
             max_sessions: std::env::var("CHAT_MAX_SESSIONS")
@@ -397,6 +402,7 @@ mod tests {
             provider_path: Default::default(),
             mcp_server_path: PathBuf::from("/usr/bin/mcp_server"),
             nexus_tools_path: None,
+            nexus_browser_path: None,
             default_model: "claude-sonnet-4-6".into(),
             max_sessions: 10,
             session_timeout: Duration::from_secs(1800),

@@ -63,13 +63,43 @@ pub fn is_live(jti: &str) -> bool {
         .contains_key(jti)
 }
 
-/// Revoke every token minted for a session. Returns how many were revoked.
+/// Sessions whose `nexus-tools` profile token (B40) is live. Kept apart from [`LIVE`]: that map
+/// is keyed by `jti` and a new entry there supersedes the session's other tokens, which would
+/// revoke the project-orchestrator token of the very same session.
+static TOOLS_LIVE: LazyLock<RwLock<std::collections::HashSet<String>>> =
+    LazyLock::new(|| RwLock::new(std::collections::HashSet::new()));
+
+/// Registers the `nexus-tools` profile token minted for a session. A new one (the session is
+/// resumed, the process restarted) replaces the previous: the key is per process.
+pub fn register_tools(session_id: &str) {
+    TOOLS_LIVE
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(session_id.to_string());
+}
+
+/// Whether the session's `nexus-tools` token is still usable.
+pub fn tools_live(session_id: &str) -> bool {
+    TOOLS_LIVE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(session_id)
+}
+
+/// Revoke every token minted for a session: the `agent_session` JWTs and the `nexus-tools`
+/// profile token. Returns how many were revoked.
 pub fn revoke_session(session_id: &str) -> usize {
     set_out_of_trust(session_id, false);
+    let tools = usize::from(
+        TOOLS_LIVE
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id),
+    );
     let mut live = LIVE.write().unwrap_or_else(|e| e.into_inner());
     let before = live.len();
     live.retain(|_, s| s.as_deref() != Some(session_id));
-    before - live.len()
+    before - live.len() + tools
 }
 
 #[cfg(test)]
