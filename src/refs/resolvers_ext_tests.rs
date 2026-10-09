@@ -600,3 +600,89 @@ async fn files_are_suggested_only_inside_a_scope() {
     assert!(!suggest(&e, "file", "mod", Some(e.w.a)).await.is_empty());
     assert!(suggest(&e, "file", "mod", Some(e.w.b)).await.is_empty());
 }
+
+#[tokio::test]
+async fn a_file_is_read_only_by_the_project_the_graph_says_owns_it() {
+    let e = ext().await;
+    // A file whose path lies under alpha's root but that the graph attaches to
+    // BETA (a moved checkout, a wrong link, or a forged id): the id claims
+    // alpha, the graph says beta.
+    let path = format!("{ROOT_A}/src/shared.rs");
+    let f = FileNode {
+        path: path.clone(),
+        language: "rust".into(),
+        hash: "h".into(),
+        last_parsed: chrono::Utc::now(),
+        project_id: Some(e.w.b),
+    };
+    e.w.graph.batch_upsert_files(&[f]).await.unwrap();
+    e.w.graph.link_file_to_project(&path, e.w.b).await.unwrap();
+    let claimed_by_alpha = file_id(e.w.a, "src/shared.rs");
+    // read from alpha's own session: not found, the owner is not alpha
+    let r = resolve(
+        &e,
+        &in_project(e.w.a, None),
+        RefKind::File,
+        claimed_by_alpha.clone(),
+    )
+    .await;
+    assert_eq!(r, Resolution::NotFound);
+    // the SAME file, once it belongs to alpha, is found by the same session
+    let mut mine = e.w.graph.get_file(&path).await.unwrap().unwrap();
+    mine.project_id = Some(e.w.a);
+    e.w.graph.batch_upsert_files(&[mine]).await.unwrap();
+    let m = found(
+        resolve(
+            &e,
+            &in_project(e.w.a, None),
+            RefKind::File,
+            claimed_by_alpha.clone(),
+        )
+        .await,
+    );
+    assert_eq!(m.label, "shared.rs");
+    // and a session of beta still cannot read it through alpha's id
+    assert!(not_readable(
+        &resolve(
+            &e,
+            &in_project(e.w.b, None),
+            RefKind::File,
+            claimed_by_alpha
+        )
+        .await
+    ));
+}
+
+#[tokio::test]
+async fn a_hidden_file_listed_by_the_graph_is_not_suggested_either() {
+    // The picker path, apart from the resolve path.
+    let e = ext().await;
+    assert!(suggest(&e, "file", "mod.rs", Some(e.w.a)).await.len() == 1);
+    assert!(suggest(&e, "file", ".env", Some(e.w.a)).await.is_empty());
+    assert!(suggest(&e, "file", "local", Some(e.w.a)).await.is_empty());
+}
+
+#[tokio::test]
+async fn without_text_each_kind_is_listed_newest_first() {
+    use crate::refs::test_support::note_with;
+    let e = ext().await;
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let n = note_with(
+            Some(e.w.a),
+            crate::notes::NoteType::Tip,
+            &format!("note {i}"),
+            vec![],
+        );
+        e.w.graph.create_note(&n).await.unwrap();
+        ids.push(n.id.to_string());
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let got: Vec<String> = suggest(&e, "note", "", Some(e.w.a))
+        .await
+        .into_iter()
+        .filter(|i| ids.contains(i))
+        .collect();
+    ids.reverse();
+    assert_eq!(got, ids, "empty text: no relevance, the most recent first");
+}
