@@ -107,6 +107,10 @@ pub struct MockGraphStore {
     pub task_sessions: RwLock<HashMap<Uuid, Vec<crate::neo4j::plan::TaskSessionSummary>>>,
     /// Number of `get_session_link_rows` calls (query-count assertions)
     pub session_link_reads: std::sync::atomic::AtomicUsize,
+    /// Reads of the stores the anchor resolver goes through (sessions, anchors,
+    /// projects, workspaces, sharing policies, scoped neighborhoods): the measure
+    /// of the cost of a turn in anchor mode.
+    pub store_reads: std::sync::atomic::AtomicUsize,
     /// Log of the grouped reads the cockpit aggregator performs, in order
     /// (query-count assertions: one entry per store call).
     pub read_log: std::sync::Mutex<Vec<&'static str>>,
@@ -285,6 +289,12 @@ pub struct MockGraphStore {
 
 #[allow(dead_code)]
 impl MockGraphStore {
+    /// One counted read of a store the anchor resolver goes through.
+    pub fn count_read(&self) {
+        self.store_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Create a new empty MockGraphStore.
     pub fn new() -> Self {
         Self {
@@ -323,6 +333,7 @@ impl MockGraphStore {
             session_link_rows: RwLock::new(Vec::new()),
             task_sessions: RwLock::new(HashMap::new()),
             session_link_reads: std::sync::atomic::AtomicUsize::new(0),
+            store_reads: std::sync::atomic::AtomicUsize::new(0),
             read_log: std::sync::Mutex::new(Vec::new()),
             fail_reads: std::sync::Mutex::new(std::collections::HashSet::new()),
             chat_events: RwLock::new(HashMap::new()),
@@ -635,10 +646,12 @@ impl GraphStore for MockGraphStore {
     }
 
     async fn get_project(&self, id: Uuid) -> Result<Option<ProjectNode>> {
+        self.count_read();
         Ok(self.projects.read().await.get(&id).cloned())
     }
 
     async fn get_project_by_slug(&self, slug: &str) -> Result<Option<ProjectNode>> {
+        self.count_read();
         Ok(self
             .projects
             .read()
@@ -737,6 +750,7 @@ impl GraphStore for MockGraphStore {
     }
 
     async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceNode>> {
+        self.count_read();
         Ok(self.workspaces.read().await.get(&id).cloned())
     }
 
@@ -832,6 +846,7 @@ impl GraphStore for MockGraphStore {
     }
 
     async fn list_workspace_projects(&self, workspace_id: Uuid) -> Result<Vec<ProjectNode>> {
+        self.count_read();
         let wp = self.workspace_projects.read().await;
         let projects = self.projects.read().await;
         let ids = wp.get(&workspace_id).cloned().unwrap_or_default();
@@ -7538,6 +7553,7 @@ impl GraphStore for MockGraphStore {
     }
 
     async fn get_chat_session(&self, id: Uuid) -> Result<Option<ChatSessionNode>> {
+        self.count_read();
         Ok(self.chat_sessions.read().await.get(&id).cloned())
     }
 
@@ -7947,6 +7963,7 @@ impl GraphStore for MockGraphStore {
         &self,
         session_id: Uuid,
     ) -> Result<Vec<crate::chat::anchor::Anchor>> {
+        self.count_read();
         let store = self.anchor_store.read().await;
         let mut v: Vec<_> = store
             .anchors
@@ -12144,6 +12161,7 @@ impl GraphStore for MockGraphStore {
         &self,
         project_id: Uuid,
     ) -> anyhow::Result<Option<crate::episodes::distill_models::SharingPolicy>> {
+        self.count_read();
         Ok(self.sharing_policies.read().await.get(&project_id).cloned())
     }
 
@@ -12699,6 +12717,7 @@ impl GraphStore for MockGraphStore {
         params: &crate::graph::neighborhood::NeighborhoodParams,
         filter: &crate::graph::neighborhood::ProjectFilter,
     ) -> Result<Option<crate::graph::neighborhood::ScopedNeighborhood>> {
+        self.count_read();
         let graph = self.neighborhood_graph.read().await;
         let ownership = self.neighborhood_ownership.read().await;
         Ok(crate::graph::neighborhood::expand_in_memory_scoped(

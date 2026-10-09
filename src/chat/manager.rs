@@ -170,6 +170,9 @@ impl LiveSessionSnapshot {
 
 /// An active chat session with a live Claude CLI subprocess
 pub struct ActiveSession {
+    /// The anchor mode of the session, fixed when it was opened or resumed, and the
+    /// cache its turns share: nothing re-reads the environment per turn.
+    pub anchor: super::anchor_resolver::AnchorSession,
     /// Persistent broadcast sender — one per session lifetime, NOT replaced per message
     pub events_tx: broadcast::Sender<ChatEvent>,
     /// When the session was last active
@@ -628,6 +631,8 @@ pub struct ChatManager {
     pub(crate) refs_v1: bool,
     /// How far the anchor resolver drives the context (`PO_ANCHOR_CONTEXT`, default `shadow`).
     pub(crate) anchor_mode: super::anchor_resolver::AnchorContextMode,
+    /// What the turns of every session share in anchor mode (resolutions, shadow runs).
+    pub(crate) anchor_cache: Arc<super::anchor_resolver::AnchorCache>,
 }
 
 // ============================================================================
@@ -965,21 +970,29 @@ pub(crate) async fn infer_session_project(
 
 /// Run the resolver beside the historical path (mode `shadow`) without ever
 /// delaying or breaking it: a detached task that journals and swallows errors.
+/// It is not even started while the last run of the session is recent, and it
+/// journals only when the anchors changed (see `AnchorCache`).
 pub(crate) fn spawn_anchor_shadow(
     graph: Arc<dyn GraphStore>,
+    cache: Arc<super::anchor_resolver::AnchorCache>,
     session_id: Uuid,
     explicit_slug: Option<String>,
     place: super::neutral_place::ExecutionPlace,
     cwd: String,
     legacy_project: Option<String>,
 ) {
+    // Decided before spawning: a turn that is not due costs no task at all.
+    if !cache.claim_shadow(session_id) {
+        return;
+    }
     tokio::spawn(async move {
         let inputs = super::anchor_resolver::ProjectInputs {
             explicit_slug: explicit_slug.as_deref(),
             place,
             cwd: &cwd,
         };
-        let _ = super::anchor_resolver::run_shadow(
+        let _ = super::anchor_resolver::run_shadow_cached(
+            &cache,
             graph.as_ref(),
             session_id,
             &inputs,
@@ -1005,28 +1018,47 @@ pub(crate) async fn enrichment_for_turn(
     message: &str,
     protocol: TurnProtocol,
     excluded_note_ids: std::collections::HashSet<String>,
-    mode: super::anchor_resolver::AnchorContextMode,
+    anchor: &super::anchor_resolver::AnchorSession,
 ) -> Option<String> {
     use super::anchor_resolver::AnchorContextMode;
+    let mode = anchor.mode;
     let uuid = Uuid::parse_str(session_id).ok()?;
     let node = graph.get_chat_session(uuid).await.ok().flatten()?;
     // Mode `on`: the anchor precedence decides the project, and its live block
     // opens the enrichment. Else the historical path decides (a session persisted
-    // without a slug is inferred from its cwd).
+    // without a slug is inferred from its cwd). The resolution is cached for the
+    // session while its anchors and consent are unchanged, but always checked
+    // against the current anchors: an anchor put since the last turn is in this
+    // turn's live block.
     let mut live_block = String::new();
     let mut resolved: Option<Option<String>> = None;
     if mode == AnchorContextMode::On {
-        match super::anchor_resolver::resolve_with_precedence(
-            graph.as_ref(),
-            uuid,
-            &super::anchor_resolver::ProjectInputs::of_session(&node),
-            &super::anchor_resolver::GraphCwdInference(graph.as_ref()),
-        )
-        .await
+        match anchor
+            .cache
+            .resolve(
+                graph.as_ref(),
+                uuid,
+                &super::anchor_resolver::ProjectInputs::of_session(&node),
+                &super::anchor_resolver::GraphCwdInference(graph.as_ref()),
+            )
+            .await
         {
-            Ok(r) => {
+            Ok((r, _)) => {
                 live_block = r.live_block();
-                resolved = Some(r.decision.project.map(|p| p.slug));
+                let mut slug = r.decision.project.as_ref().map(|p| p.slug.clone());
+                // An explicit `project_slug` that does not resolve to a project is
+                // kept as it is for the enrichment, as before the resolver existed
+                // (a warning, once per session). It never widens the resolver's own
+                // scope: the decision above does not use it.
+                if let Some(explicit) = node.project_slug.as_deref().filter(|s| !s.is_empty()) {
+                    if r.decision.source != super::anchor_resolver::ProjectSource::Explicit {
+                        if anchor.cache.first_time(uuid, "unresolved_explicit_slug") {
+                            warn!(session_id = %session_id, slug = %explicit, "the project_slug of the session does not resolve to a project: kept as is for the enrichment");
+                        }
+                        slug = Some(explicit.to_string());
+                    }
+                }
+                resolved = Some(slug);
             }
             Err(e) => {
                 warn!(session_id = %session_id, error = %e, "anchor resolver failed, historical context used")
@@ -1049,6 +1081,7 @@ pub(crate) async fn enrichment_for_turn(
     if mode == AnchorContextMode::Shadow {
         spawn_anchor_shadow(
             graph.clone(),
+            anchor.cache.clone(),
             uuid,
             node.project_slug.clone(),
             node.execution_place,
@@ -1102,7 +1135,8 @@ pub(crate) struct ManagerTurnServices {
     enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
     turn_routing: Arc<super::agent_hooks::TurnRouting>,
     nats: Option<Arc<crate::events::NatsEmitter>>,
-    anchor_mode: super::anchor_resolver::AnchorContextMode,
+    /// The anchor state of the manager when these services were built.
+    anchor: super::anchor_resolver::AnchorSession,
 }
 
 #[async_trait::async_trait]
@@ -1136,7 +1170,7 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             &turn.enrichment_text,
             TurnProtocol::default(),
             turn.excluded_note_ids.clone(),
-            self.anchor_mode,
+            &self.anchor,
         )
         .await
         {
@@ -1499,6 +1533,7 @@ impl ChatManager {
             turn_routing: Arc::new(super::agent_hooks::TurnRouting::default()),
             refs_v1: crate::refs::flag::from_env(),
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
+            anchor_cache: Arc::default(),
         }
     }
 
@@ -1575,7 +1610,15 @@ impl ChatManager {
             turn_routing: Arc::new(super::agent_hooks::TurnRouting::default()),
             refs_v1: crate::refs::flag::from_env(),
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
+            anchor_cache: Arc::default(),
         }
+    }
+
+    /// The anchor state a session opened or resumed NOW gets: the mode is fixed here,
+    /// once, and the session keeps it for its whole life (the environment is read
+    /// only when the manager is built).
+    pub(crate) fn anchor_session(&self) -> super::anchor_resolver::AnchorSession {
+        super::anchor_resolver::AnchorSession::new(self.anchor_mode, self.anchor_cache.clone())
     }
 
     /// Set the anchor-context mode (the default comes from `PO_ANCHOR_CONTEXT`).
@@ -2811,6 +2854,7 @@ impl ChatManager {
             AnchorContextMode::Shadow => {
                 spawn_anchor_shadow(
                     self.graph.clone(),
+                    self.anchor_cache.clone(),
                     uuid,
                     project_slug.map(str::to_string),
                     place,
@@ -2825,15 +2869,17 @@ impl ChatManager {
                     place,
                     cwd,
                 };
-                match super::anchor_resolver::resolve_with_precedence(
-                    self.graph.as_ref(),
-                    uuid,
-                    &inputs,
-                    &super::anchor_resolver::GraphCwdInference(self.graph.as_ref()),
-                )
-                .await
+                match self
+                    .anchor_cache
+                    .resolve(
+                        self.graph.as_ref(),
+                        uuid,
+                        &inputs,
+                        &super::anchor_resolver::GraphCwdInference(self.graph.as_ref()),
+                    )
+                    .await
                 {
-                    Ok(r) => (format!("{prompt}\n\n---\n\n{}", r.map()), ids),
+                    Ok((r, _)) => (format!("{prompt}\n\n---\n\n{}", r.map()), ids),
                     Err(e) => {
                         warn!(session_id = %session_id, error = %e, "anchor map not built, prompt unchanged");
                         (prompt, ids)
@@ -4456,6 +4502,7 @@ impl ChatManager {
             sessions.insert(
                 session_id.to_string(),
                 ActiveSession {
+                    anchor: self.anchor_session(),
                     events_tx: events_tx.clone(),
                     last_activity: Instant::now(),
                     cli_session_id: None,
@@ -5365,16 +5412,23 @@ impl ChatManager {
         // If the pipeline has no stages or all fail, the original prompt is used unchanged.
         // The agent engine runs the same function (`enrichment_for_turn`): one logic.
         let prompt = {
-            let protocol = {
+            let (protocol, anchor) = {
                 let sessions = active_sessions.read().await;
-                sessions
+                // The anchor mode is the session's own, fixed when it was opened or
+                // resumed: never read from the environment per turn.
+                let anchor = sessions
+                    .get(&session_id)
+                    .map(|s| s.anchor.clone())
+                    .unwrap_or_default();
+                let protocol = sessions
                     .get(&session_id)
                     .map(|s| TurnProtocol {
                         run_id: s.protocol_run_id,
                         state: s.protocol_state.clone(),
                         reasoning_path_tracker: Some(s.reasoning_path_tracker.clone()),
                     })
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                (protocol, anchor)
             };
             match enrichment_for_turn(
                 &graph,
@@ -5383,7 +5437,7 @@ impl ChatManager {
                 &prompt,
                 protocol,
                 turn.excluded_note_ids.clone(),
-                super::anchor_resolver::AnchorContextMode::from_env(),
+                &anchor,
             )
             .await
             {
@@ -7581,10 +7635,10 @@ impl ChatManager {
             return None;
         }
         let id = Uuid::parse_str(session_id).ok()?;
-        Some(Arc::new(super::anchor_resolver::SessionProject::new(
-            self.graph.clone(),
-            id,
-        )))
+        Some(Arc::new(
+            super::anchor_resolver::SessionProject::new(self.graph.clone(), id)
+                .with_anchor_cache(self.anchor_cache.clone()),
+        ))
     }
 
     fn redirect_hook(
@@ -7961,6 +8015,7 @@ impl ChatManager {
             sessions.insert(
                 session_id.to_string(),
                 ActiveSession {
+                    anchor: self.anchor_session(),
                     events_tx: events_tx.clone(),
                     last_activity: Instant::now(),
                     cli_session_id: cli_session_id.map(|s| s.to_string()),
@@ -10510,7 +10565,7 @@ impl ChatManager {
             enrichment_pipeline: self.enrichment_pipeline.clone(),
             turn_routing: Arc::clone(&self.turn_routing),
             nats: self.nats.clone(),
-            anchor_mode: self.anchor_mode,
+            anchor: self.anchor_session(),
         })
     }
 
@@ -10785,6 +10840,9 @@ impl ChatManager {
     }
 
     async fn close_session_inner(&self, session_id: &str) -> Result<()> {
+        if let Ok(uuid) = Uuid::parse_str(session_id) {
+            self.anchor_cache.forget(uuid);
+        }
         self.turn_routing.remove(session_id);
         self.close_routing_decision(session_id).await;
         if self.agent_runtime.owns(session_id).await {
@@ -11746,6 +11804,10 @@ mod tests {
 
     use crate::chat::anchor_resolver::AnchorContextMode;
 
+    fn anchor_in(mode: AnchorContextMode) -> crate::chat::anchor_resolver::AnchorSession {
+        crate::chat::anchor_resolver::AnchorSession::new(mode, Default::default())
+    }
+
     fn manager_in(mode: AnchorContextMode, state: &crate::AppState) -> ChatManager {
         ChatManager::new_without_memory(state.neo4j.clone(), state.meili.clone(), test_config())
             .with_anchor_context_mode(mode)
@@ -11829,7 +11891,7 @@ mod tests {
             "hello",
             Default::default(),
             Default::default(),
-            AnchorContextMode::On,
+            &anchor_in(AnchorContextMode::On),
         )
         .await
         .expect("a neutral session without anchor gets the notice");
@@ -11845,7 +11907,7 @@ mod tests {
                 "hello",
                 Default::default(),
                 Default::default(),
-                mode,
+                &anchor_in(mode),
             )
             .await;
             assert!(
@@ -11886,6 +11948,292 @@ mod tests {
         .await;
         assert_eq!(slug, None);
     }
+    /// Records the project slug each enrichment is handed.
+    struct SlugProbe(Arc<std::sync::Mutex<Vec<Option<String>>>>);
+
+    #[async_trait::async_trait]
+    impl crate::chat::enrichment::ParallelEnrichmentStage for SlugProbe {
+        async fn execute(
+            &self,
+            input: &crate::chat::enrichment::EnrichmentInput,
+        ) -> anyhow::Result<crate::chat::enrichment::StageOutput> {
+            self.0.lock().unwrap().push(input.project_slug.clone());
+            Ok(crate::chat::enrichment::StageOutput::new("slug-probe"))
+        }
+        fn name(&self) -> &str {
+            "slug-probe"
+        }
+        fn is_enabled(&self, _config: &crate::chat::enrichment::EnrichmentConfig) -> bool {
+            true
+        }
+    }
+
+    fn neutral_session() -> crate::neo4j::models::ChatSessionNode {
+        let mut s = crate::test_helpers::test_chat_session(None);
+        s.execution_place = crate::chat::neutral_place::ExecutionPlace::Neutral;
+        s.cwd = crate::chat::neutral_place::root()
+            .join(s.id.to_string())
+            .display()
+            .to_string();
+        s
+    }
+
+    async fn anchor_plan(graph: &Arc<dyn GraphStore>, session: Uuid, plan: String) {
+        use crate::chat::anchor::{AnchorActor, AnchorOp, AnchorRole, AnchorTargetType, NewAnchor};
+        graph
+            .apply_anchor_op(
+                session,
+                AnchorOp::Add(NewAnchor::new(
+                    AnchorTargetType::Plan,
+                    plan,
+                    [AnchorRole::Focus],
+                    AnchorActor::User,
+                    "t",
+                )),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn human_anchors_project(
+        graph: &Arc<dyn GraphStore>,
+        session: Uuid,
+        project: Uuid,
+        by: crate::chat::anchor::AnchorActor,
+    ) {
+        use crate::chat::anchor::{AnchorOp, AnchorRole, AnchorTargetType, NewAnchor};
+        graph
+            .apply_anchor_op(
+                session,
+                AnchorOp::Add(NewAnchor::new(
+                    AnchorTargetType::Project,
+                    project.to_string(),
+                    [AnchorRole::Focus],
+                    by,
+                    "t",
+                )),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The environment is read when the manager is built, nowhere else: a turn
+    /// takes the mode of its session (`ActiveSession::anchor`), which the manager
+    /// fixed when the session was opened or resumed.
+    #[tokio::test]
+    async fn the_anchor_mode_is_fixed_per_session_and_the_environment_is_not_read_per_turn() {
+        let state = mock_app_state();
+        let m = manager_in(AnchorContextMode::On, &state);
+        assert_eq!(m.anchor_session().mode, AnchorContextMode::On);
+        // every other call site of the environment reader would be a per-turn read
+        let source = include_str!("manager.rs");
+        let needle = concat!("AnchorContextMode::", "from_env()");
+        assert_eq!(
+            source.matches(needle).count(),
+            2,
+            "only the two constructors read the environment"
+        );
+        // a live session keeps the mode it was opened with
+        assert_eq!(
+            manager_in(AnchorContextMode::Off, &state)
+                .anchor_session()
+                .mode,
+            AnchorContextMode::Off
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_slug_that_resolves_to_no_project_is_kept_for_the_enrichment_in_on_mode() {
+        let state = mock_app_state();
+        let mut s = neutral_session();
+        s.project_slug = Some("ghost".into());
+        state.neo4j.create_chat_session(&s).await.unwrap();
+        let graph: Arc<dyn GraphStore> = state.neo4j.clone();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut pipeline = crate::chat::enrichment::EnrichmentPipeline::new(Default::default());
+        pipeline.add_parallel_stage(Box::new(SlugProbe(seen.clone())));
+        let anchor = anchor_in(AnchorContextMode::On);
+        let sid = s.id.to_string();
+        let live = enrichment_for_turn(
+            &graph,
+            &pipeline,
+            &sid,
+            "hello",
+            Default::default(),
+            Default::default(),
+            &anchor,
+        )
+        .await
+        .expect("the notice");
+        // as before the resolver: the slug reaches the stages as it is
+        assert_eq!(
+            seen.lock().unwrap().last().unwrap().as_deref(),
+            Some("ghost")
+        );
+        // ... without widening the resolver: no project, the neutral notice
+        assert!(
+            live.contains(crate::chat::anchor_resolver::NOTICE_NO_CONTEXT),
+            "{live}"
+        );
+        // the warning is given once per session
+        assert!(!anchor.cache.first_time(s.id, "unresolved_explicit_slug"));
+        enrichment_for_turn(
+            &graph,
+            &pipeline,
+            &sid,
+            "again",
+            Default::default(),
+            Default::default(),
+            &anchor,
+        )
+        .await;
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_anchor_put_mid_session_is_in_the_next_turn_the_hooks_and_the_next_map() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project = test_project();
+        mock.create_project(&project).await.unwrap();
+        let plan = crate::test_helpers::seed_plan_with_task(&mock, project.id).await;
+        let s = neutral_session();
+        mock.create_chat_session(&s).await.unwrap();
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        let pipeline = crate::chat::enrichment::EnrichmentPipeline::new(Default::default());
+        let m =
+            ChatManager::new_without_memory(graph.clone(), mock_app_state().meili, test_config())
+                .with_anchor_context_mode(AnchorContextMode::On);
+        let anchor = m.anchor_session();
+        let sid = s.id.to_string();
+        let hooks = m.hook_session_project(&sid).expect("mode on");
+        let turn = |text: &'static str| {
+            enrichment_for_turn(
+                &graph,
+                &pipeline,
+                &sid,
+                text,
+                Default::default(),
+                Default::default(),
+                &anchor,
+            )
+        };
+        let system = || async {
+            m.build_system_prompt_anchored(
+                s.execution_place,
+                &s.cwd,
+                None,
+                "hello",
+                None,
+                &sid,
+                None,
+            )
+            .await
+            .0
+        };
+        // turn 1: nothing anchored
+        let first = turn("one").await.expect("the notice");
+        assert!(first.contains(crate::chat::anchor_resolver::NOTICE_NO_CONTEXT));
+        assert_eq!(hooks.project_id().await, None);
+        let map_before = system().await;
+        assert!(!map_before.contains("Plan mid"));
+
+        human_anchors_project(
+            &graph,
+            s.id,
+            project.id,
+            crate::chat::anchor::AnchorActor::User,
+        )
+        .await;
+        anchor_plan(&graph, s.id, plan).await;
+
+        // the very next turn: live block with the new anchor, hooks on the new project
+        let second = turn("two").await.expect("live block");
+        assert!(second.contains("Task mid"), "{second}");
+        assert!(!second.contains(crate::chat::anchor_resolver::NOTICE_NO_CONTEXT));
+        assert_eq!(hooks.project_id().await, Some(project.id), "no 30 s wait");
+        // the system prompt is rebuilt at the next prompt rebuild (resume,
+        // compaction) with the current anchors
+        let map_after = system().await;
+        assert!(map_after.contains("Plan mid"), "{map_after}");
+    }
+
+    #[tokio::test]
+    async fn on_mode_turn_cost_in_store_reads_with_and_without_the_cache() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project = test_project();
+        mock.create_project(&project).await.unwrap();
+        let s = neutral_session();
+        mock.create_chat_session(&s).await.unwrap();
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        human_anchors_project(
+            &graph,
+            s.id,
+            project.id,
+            crate::chat::anchor::AnchorActor::User,
+        )
+        .await;
+        let plan = crate::test_helpers::seed_plan_with_task(&mock, project.id).await;
+        anchor_plan(&graph, s.id, plan).await;
+        let pipeline = crate::chat::enrichment::EnrichmentPipeline::new(Default::default());
+        let reads = || mock.store_reads.load(std::sync::atomic::Ordering::Relaxed);
+        let sid = s.id.to_string();
+        let mut per_turn = Vec::new();
+        // a cache of its own for every turn = no cache
+        for _ in 0..3 {
+            let b = reads();
+            enrichment_for_turn(
+                &graph,
+                &pipeline,
+                &sid,
+                "x",
+                Default::default(),
+                Default::default(),
+                &anchor_in(AnchorContextMode::On),
+            )
+            .await;
+            per_turn.push(reads() - b);
+        }
+        let shared = anchor_in(AnchorContextMode::On);
+        let mut cached = Vec::new();
+        for _ in 0..3 {
+            let b = reads();
+            enrichment_for_turn(
+                &graph,
+                &pipeline,
+                &sid,
+                "x",
+                Default::default(),
+                Default::default(),
+                &shared,
+            )
+            .await;
+            cached.push(reads() - b);
+        }
+        eprintln!("on-mode reads per turn: without cache {per_turn:?}, with cache {cached:?}");
+        assert!(cached[1] < per_turn[1], "{cached:?} vs {per_turn:?}");
+        assert_eq!(cached[1], cached[2], "a stable cost once cached");
+        // the shadow, in the same conditions: only the first turn reads
+        let shadow = anchor_in(AnchorContextMode::Shadow);
+        let mut sh = Vec::new();
+        for _ in 0..3 {
+            let b = reads();
+            enrichment_for_turn(
+                &graph,
+                &pipeline,
+                &sid,
+                "x",
+                Default::default(),
+                Default::default(),
+                &shadow,
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            sh.push(reads() - b);
+        }
+        eprintln!("shadow reads per turn (turn included): {sh:?}");
+        assert_eq!(sh[1], sh[2], "the shadow adds nothing after the first run");
+    }
+
     #[tokio::test]
     async fn test_build_system_prompt_with_project() {
         let state = mock_app_state();
@@ -12255,7 +12603,7 @@ mod tests {
         use nexus_claude::agent::{McpServerSpec, ProviderKind};
         use std::os::unix::fs::PermissionsExt;
         let crate_root = std::env::current_dir().unwrap();
-        let dir = tempfile::TempDir::new_in(crate_root.join("target")).unwrap();
+        let dir = tempfile::TempDir::new_in(&crate_root).unwrap();
         let program = dir.path().join("nexus-tools");
         std::fs::write(&program, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -16013,6 +16361,7 @@ mod tests {
         let pending_messages = Arc::new(Mutex::new(VecDeque::<PendingMessage>::new()));
 
         let session = ActiveSession {
+            anchor: Default::default(),
             events_tx: tx,
             last_activity: Instant::now(),
             cli_session_id: None,
@@ -17261,6 +17610,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel(16);
 
         let session = ActiveSession {
+            anchor: Default::default(),
             events_tx: tx,
             last_activity: Instant::now(),
             cli_session_id: None,
@@ -20686,6 +21036,7 @@ pub(crate) mod test_support {
             pending.insert((*id).to_string(), serde_json::json!({ "command": "ls" }));
         }
         let session = ActiveSession {
+            anchor: Default::default(),
             events_tx,
             last_activity: Instant::now(),
             cli_session_id: None,
@@ -20838,7 +21189,7 @@ mod refs_turn_services_tests {
             enrichment_pipeline: Arc::new(pipeline),
             turn_routing: Arc::default(),
             nats: None,
-            anchor_mode: crate::chat::anchor_resolver::AnchorContextMode::Off,
+            anchor: Default::default(),
         };
 
         let note = Uuid::new_v4();

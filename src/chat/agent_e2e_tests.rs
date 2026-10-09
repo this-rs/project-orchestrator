@@ -2637,6 +2637,18 @@ mod parity {
         turns: Vec<Vec<Step>>,
         nats: Option<Arc<crate::events::NatsEmitter>>,
     ) -> Rig {
+        rig_full(kind, turns, nats, None, false).await
+    }
+
+    /// [`rig_with`], the manager in the given anchor mode (`None`: the default) and
+    /// the session opened without project nor cwd (a neutral session) when `neutral`.
+    pub(super) async fn rig_full(
+        kind: ProviderKind,
+        turns: Vec<Vec<Step>>,
+        nats: Option<Arc<crate::events::NatsEmitter>>,
+        anchor_mode: Option<crate::chat::anchor_resolver::AnchorContextMode>,
+        neutral: bool,
+    ) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let graph = Arc::new(MockGraphStore::new());
         let mut project = crate::test_helpers::test_project();
@@ -2667,9 +2679,16 @@ mod parity {
         if let Some(nats) = nats {
             manager = manager.with_nats(nats);
         }
+        if let Some(mode) = anchor_mode {
+            manager = manager.with_anchor_context_mode(mode);
+        }
         let mut req = request(None, Some(&project.slug), "default");
         req.message = String::new();
         req.cwd = project.root_path.clone();
+        if neutral {
+            req.project_slug = None;
+            req.cwd = String::new();
+        }
         let created = manager.create_session(&req).await.unwrap();
         let rx = manager.subscribe(&created.session_id).await.unwrap();
         Rig {
@@ -2807,7 +2826,7 @@ mod parity {
             message,
             Default::default(),
             Default::default(),
-            r.manager.anchor_mode,
+            &r.manager.anchor_session(),
         )
         .await
         .expect("the graph has context for this message");
@@ -3200,7 +3219,7 @@ mod parity {
             typed,
             Default::default(),
             Default::default(),
-            r.manager.anchor_mode,
+            &r.manager.anchor_session(),
         )
         .await
         .expect("the graph has context for this message");
@@ -3233,5 +3252,153 @@ mod parity {
 
         // The router of the session reads the typed text of the queued turn.
         assert_eq!(router.last_message().as_deref(), Some(typed));
+    }
+
+    // ── Anchor context (PO_ANCHOR_CONTEXT) through a whole turn ────────────
+
+    use crate::chat::anchor::{AnchorActor, AnchorOp, AnchorRole, AnchorTargetType, NewAnchor};
+    use crate::chat::anchor_resolver::AnchorContextMode;
+
+    /// A plan of the project with a task beside it.
+    async fn anchor_plan(r: &Rig, by: AnchorActor) {
+        let plan = crate::test_helpers::seed_plan_with_task(&r.graph, r.project.id).await;
+        r.graph
+            .apply_anchor_op(
+                Uuid::parse_str(&r.sid).unwrap(),
+                AnchorOp::Add(NewAnchor::new(
+                    AnchorTargetType::Plan,
+                    plan,
+                    [role_of(by)],
+                    by,
+                    "e2e",
+                )),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// An agent can only mention; a human focuses.
+    fn role_of(by: AnchorActor) -> AnchorRole {
+        if by == AnchorActor::Agent {
+            AnchorRole::Mention
+        } else {
+            AnchorRole::Focus
+        }
+    }
+
+    async fn anchor_project(r: &Rig, by: AnchorActor) {
+        r.graph
+            .apply_anchor_op(
+                Uuid::parse_str(&r.sid).unwrap(),
+                AnchorOp::Add(NewAnchor::new(
+                    AnchorTargetType::Project,
+                    r.project.id.to_string(),
+                    [role_of(by)],
+                    by,
+                    "e2e",
+                )),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The system prompt the manager builds for the session of `r` now.
+    async fn system_prompt_of(r: &Rig) -> String {
+        let node = r
+            .graph
+            .get_chat_session(Uuid::parse_str(&r.sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        r.manager
+            .build_system_prompt_anchored(
+                node.execution_place,
+                &node.cwd,
+                node.project_slug.as_deref(),
+                "hello",
+                None,
+                &r.sid,
+                None,
+            )
+            .await
+            .0
+    }
+
+    /// Opens a neutral session in `mode`, optionally anchors the project, plays one
+    /// turn; returns (the rig, the prompt of the turn, the system prompt built after).
+    async fn anchored_turn(
+        mode: AnchorContextMode,
+        anchored_by: Option<AnchorActor>,
+    ) -> (Rig, String, String) {
+        let mut r = rig_full(ProviderKind::Native, vec![], None, Some(mode), true).await;
+        if let Some(by) = anchored_by {
+            anchor_project(&r, by).await;
+            anchor_plan(&r, by).await;
+        }
+        r.manager.send_message(&r.sid, "hello").await.unwrap();
+        r.turn_end().await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let prompt = sent[0].clone();
+        let system = system_prompt_of(&r).await;
+        (r, prompt, system)
+    }
+
+    /// A neutral session whose project is anchored by a human, in mode `on`: the
+    /// turn carries the live block at its head, the system prompt the map in the
+    /// untrusted container; the same anchor put by an agent decides nothing.
+    #[tokio::test]
+    async fn on_mode_a_human_project_anchor_reaches_the_turn_and_an_agent_one_does_not() {
+        let (r, prompt, system) =
+            anchored_turn(AnchorContextMode::On, Some(AnchorActor::User)).await;
+        assert!(
+            prompt.starts_with("<untrusted_data"),
+            "the live block opens the turn: {prompt}"
+        );
+        assert!(prompt.contains(&r.project.name), "{prompt}");
+        assert!(
+            !prompt.contains(crate::chat::anchor_resolver::NOTICE_NO_CONTEXT),
+            "{prompt}"
+        );
+        let map_at = system
+            .find("anchor_map")
+            .expect("the map is in the system prompt");
+        assert!(
+            system[..map_at].contains("<untrusted_data"),
+            "the map sits in the untrusted container: {system}"
+        );
+
+        let (r2, prompt2, system2) =
+            anchored_turn(AnchorContextMode::On, Some(AnchorActor::Agent)).await;
+        // an agent's mention decides no project: nothing of the project reaches the turn
+        assert!(
+            !prompt2.contains("Task mid") && !prompt2.contains("anchor_context"),
+            "an agent's project anchor decides no project: {prompt2}"
+        );
+        assert!(!prompt2.contains(&r2.project.name), "{prompt2}");
+        assert!(!system2.contains(&r2.project.name), "{system2}");
+    }
+
+    /// Mode `shadow` is invisible: the turn and the system prompt are the very bytes
+    /// of mode `off` (the resolver only journals).
+    #[tokio::test]
+    async fn shadow_mode_turn_and_system_prompt_are_byte_identical_to_off() {
+        let mut seen = Vec::new();
+        for mode in [AnchorContextMode::Off, AnchorContextMode::Shadow] {
+            let (r, prompt, system) = anchored_turn(mode, Some(AnchorActor::User)).await;
+            let norm = |s: &str| {
+                crate::chat::untrusted::mask_nonces(s)
+                    .replace(&r.sid, "<sid>")
+                    .replace(&r.project.id.to_string(), "<pid>")
+            };
+            seen.push((norm(&prompt), norm(&system)));
+        }
+        assert_eq!(seen[0].0.as_bytes(), seen[1].0.as_bytes(), "the turn");
+        assert_eq!(
+            seen[0].1.as_bytes(),
+            seen[1].1.as_bytes(),
+            "the system prompt"
+        );
+        assert!(!seen[1].0.contains("anchor_context"), "{}", seen[1].0);
     }
 }
