@@ -972,6 +972,7 @@ pub(crate) async fn enrichment_for_turn(
 pub(crate) struct ManagerTurnServices {
     graph: Arc<dyn GraphStore>,
     enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
+    turn_routing: Arc<super::agent_hooks::TurnRouting>,
 }
 
 #[async_trait::async_trait]
@@ -980,7 +981,7 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         // Attachments: references in the conversation, content for the model.
         let sent = super::message_attachments::expand_for_agent(&self.graph, sent).await;
         let message = super::message_attachments::expand_for_agent(&self.graph, shown).await;
-        match enrichment_for_turn(
+        let prepared = match enrichment_for_turn(
             &self.graph,
             &self.enrichment_pipeline,
             session_id,
@@ -991,7 +992,14 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         {
             Some(md) => prepend_enrichment(&md, &sent),
             None => sent,
+        };
+        // The hook of the turn only sees the length of the text: hand it the text of
+        // THIS turn, whatever started it (a message, the queue, a hint, another
+        // instance), right before it is sent.
+        if let Some(router) = self.turn_routing.get(session_id) {
+            router.set_last_message(shown);
         }
+        prepared
     }
 }
 
@@ -5833,10 +5841,8 @@ impl ChatManager {
     /// Send a follow-up message to an existing session
     pub async fn send_message(&self, session_id: &str, message: &str) -> Result<()> {
         if let Some(handle) = self.agent_runtime.get(session_id).await {
-            // The hook of the turn only sees the length of the text: hand it the text.
-            if let Some(router) = self.turn_routing.get(session_id) {
-                router.set_last_message(message);
-            }
+            // The turn router learns the text when the turn is prepared
+            // (`ManagerTurnServices::prepare`): a queued message must not overwrite it.
             return handle.send_message(message).await;
         }
         // Check is_streaming with read lock first — if streaming, queue the message
@@ -9770,6 +9776,7 @@ impl ChatManager {
         Arc::new(ManagerTurnServices {
             graph: self.graph.clone(),
             enrichment_pipeline: self.enrichment_pipeline.clone(),
+            turn_routing: Arc::clone(&self.turn_routing),
         })
     }
 

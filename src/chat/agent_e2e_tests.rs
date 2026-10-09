@@ -1767,6 +1767,35 @@ mod turn_routing {
     const SIMPLE: &str = "rename this variable";
     const DEBUG: &str = "why does this crash with a stack trace error";
 
+    /// A turn the queue starts (a held message sent to an idle session here) is
+    /// routed on ITS text, not on the message sent before it.
+    #[tokio::test]
+    async fn a_turn_started_by_a_held_message_is_routed_on_its_own_text() {
+        use crate::chat::provider::cognitive::signature::{ContextHints, TaskSignature};
+        let mut r = rig("full", "shadow", true, None, vec![Answer::Stay]).await;
+        r.turn(SIMPLE).await;
+        let held = r.manager.queue_user_message(&r.sid, DEBUG).await.unwrap();
+        assert!(!held, "an idle session sends it at once");
+        next_event(&mut r.rx, |e| {
+            matches!(
+                e,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            )
+        })
+        .await;
+        let requests = r.decider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let expected =
+            TaskSignature::from_chat_request(DEBUG, false, None, ContextHints::default());
+        assert_eq!(
+            format!("{:?}", requests[1].signature),
+            format!("{expected:?}"),
+            "the second turn is routed on its own message"
+        );
+    }
+
     #[tokio::test]
     async fn full_auto_a_simple_turn_then_a_debug_turn_changes_the_model_of_the_second() {
         let mut r = rig(
