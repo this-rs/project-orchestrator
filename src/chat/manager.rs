@@ -973,24 +973,59 @@ pub(crate) fn third_party_tool_profile(
     })
 }
 
-/// Rough size, in tokens, of the tool schemas a third-party session is given
-/// (the restricted profile's tool list, as JSON, at four characters a token).
-pub(crate) fn restricted_tool_schema_tokens() -> u64 {
-    let tools = crate::auth::tool_profile::ToolProfile::Restricted
-        .filter_tools(crate::mcp::tools::all_tools());
+/// The provider of the session a session was spawned by (H6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnParent {
+    /// No parent session.
+    None,
+    ClaudeCode,
+    /// Another provider, or a parent that cannot be read.
+    ThirdParty,
+}
+
+/// Where a session comes from ([`ChatManager::session_origin`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionOrigin {
+    pub opened_by_third_party: bool,
+    pub origin_known: bool,
+}
+
+/// Rough size, in tokens, of the project-orchestrator tool schemas a session
+/// with `profile` is given (its tool list, as JSON, at four characters a token).
+pub(crate) fn tool_schema_tokens(profile: crate::auth::tool_profile::ToolProfile) -> u64 {
+    let tools = profile.filter_tools(crate::mcp::tools::all_tools());
     (serde_json::to_string(&tools).map_or(0, |s| s.len()) / 4) as u64
 }
 
-/// Refuses a model whose context window cannot hold the tool schemas with room
-/// to work: the schemas must take at most half of it. A window that is not known
-/// is not a refusal (nothing is invented).
+/// The tool profile the window check measures for `spec`: the one signed into the
+/// token of its project-orchestrator server. Without a token (no signing key, or
+/// no caller) the server shows every tool but none of them is authorised: the
+/// check keeps measuring the restricted profile there, as before H6.
+pub(crate) fn spec_tool_profile(
+    spec: &nexus_claude::agent::SessionSpec,
+) -> crate::auth::tool_profile::ToolProfile {
+    use crate::auth::tool_profile::ToolProfile;
+    match spec.mcp_servers.get("project-orchestrator") {
+        Some(nexus_claude::agent::McpServerSpec::Stdio { env, .. }) => env
+            .get("PO_AUTH_TOKEN")
+            .map_or(ToolProfile::Restricted, |t| {
+                ToolProfile::from_unverified_token(t)
+            }),
+        _ => ToolProfile::Restricted,
+    }
+}
+
+/// Refuses a model whose context window cannot hold the tool schemas of the
+/// session's `profile` with room to work: the schemas must take at most half of
+/// it. A window that is not known is not a refusal (nothing is invented).
 pub(crate) fn window_holds_the_tools(
     caps: &nexus_claude::agent::Capabilities,
+    profile: crate::auth::tool_profile::ToolProfile,
 ) -> Result<(), nexus_claude::agent::ProviderError> {
     let Some(window) = caps.context_window.as_ref().map(|w| w.value) else {
         return Ok(());
     };
-    let needed = restricted_tool_schema_tokens() * 2;
+    let needed = tool_schema_tokens(profile) * 2;
     if window < needed {
         return Err(nexus_claude::agent::ProviderError::ContextTooSmall {
             needed: Some(needed),
@@ -2821,29 +2856,16 @@ impl ChatManager {
         Vec::new()
     }
 
-    /// Whether a session was opened by a third-party session (H6): its caller's
-    /// signed token says so (delegation, `chat send_message`, `plan run`: the
-    /// request carries the caller's claims), or the session it was spawned by
-    /// (`spawned_by.parent_session_id`, read from the graph — a resume by a
-    /// person still knows) runs on a provider other than Claude Code. A parent
-    /// that cannot be read counts as third-party: refusing a tool is
-    /// recoverable, a delegation loop is not.
-    pub(crate) async fn opened_by_third_party(
-        &self,
-        user_claims: Option<&crate::auth::jwt::Claims>,
-        session_id: Option<&str>,
-    ) -> bool {
-        if user_claims
-            .and_then(crate::auth::jwt::agent_session_binding)
-            .is_some_and(|b| b.third_party)
-        {
-            return true;
-        }
+    /// The provider of the session `session_id` was spawned by
+    /// (`spawned_by.parent_session_id`, read from the graph — a resume by a person
+    /// still knows). A parent that cannot be read counts as third-party: refusing
+    /// a tool is recoverable, a delegation loop is not.
+    async fn spawn_parent(&self, session_id: Option<&str>) -> SpawnParent {
         let Some(sid) = session_id.and_then(|s| Uuid::parse_str(s).ok()) else {
-            return false;
+            return SpawnParent::None;
         };
         let Ok(Some(node)) = self.graph.get_chat_session(sid).await else {
-            return false;
+            return SpawnParent::None;
         };
         let Some(parent) = node
             .spawned_by
@@ -2851,17 +2873,48 @@ impl ChatManager {
             .and_then(parse_spawned_by)
             .and_then(|ctx| ctx.parent_session_id)
         else {
-            return false;
+            return SpawnParent::None;
         };
         let Ok(parent) = Uuid::parse_str(&parent) else {
-            return true;
+            return SpawnParent::ThirdParty;
         };
         match self.graph.get_chat_session(parent).await {
-            Ok(Some(parent)) => parent
-                .provider_id
-                .as_deref()
-                .is_some_and(|p| p != super::provider::resolver::CLAUDE_CODE),
-            _ => true,
+            Ok(Some(parent))
+                if parent
+                    .provider_id
+                    .as_deref()
+                    .is_none_or(|p| p == super::provider::resolver::CLAUDE_CODE) =>
+            {
+                SpawnParent::ClaudeCode
+            }
+            _ => SpawnParent::ThirdParty,
+        }
+    }
+
+    /// Where a session comes from, for its tool profile (H6).
+    ///
+    /// `opened_by_third_party`: its caller's signed token carries the lineage
+    /// (`chat send_message`, `plan run`: the request carries the caller's claims),
+    /// or its parent session runs on a provider other than Claude Code.
+    ///
+    /// `origin_known`: a person or a session is behind it. A session opened under
+    /// the server's own service account (a protocol run, a plan run resumed after a
+    /// restart, a delegation) has lost its caller: only a Claude Code parent
+    /// vouches for it. Without that, a third party in `trust` could start a
+    /// protocol whose third-party agent is `full` again, and so on.
+    pub(crate) async fn session_origin(
+        &self,
+        user_claims: Option<&crate::auth::jwt::Claims>,
+        session_id: Option<&str>,
+    ) -> SessionOrigin {
+        let parent = self.spawn_parent(session_id).await;
+        let lineage = user_claims
+            .and_then(crate::auth::jwt::agent_session_binding)
+            .is_some_and(|b| b.third_party);
+        SessionOrigin {
+            opened_by_third_party: lineage || parent == SpawnParent::ThirdParty,
+            origin_known: user_claims.is_some_and(|c| !c.is_service_account())
+                || parent == SpawnParent::ClaudeCode,
         }
     }
 
@@ -2874,7 +2927,9 @@ impl ChatManager {
     /// `tool_profile` is what the session's own provider and mode grant it;
     /// `third_party` whether that provider is not Claude Code. A session opened
     /// by a third-party session gets the restricted profile whatever it was
-    /// granted ([`Self::opened_by_third_party`]), and carries the lineage on.
+    /// granted, and carries the lineage on; a third party whose origin is unknown
+    /// (the service account, no Claude Code parent) is restricted too
+    /// ([`Self::session_origin`]).
     pub(crate) async fn po_mcp_env(
         &self,
         permission_mode_override: Option<&str>,
@@ -2884,8 +2939,13 @@ impl ChatManager {
         third_party: bool,
     ) -> HashMap<String, String> {
         let mut env = HashMap::new();
-        let opened_by_third_party = self.opened_by_third_party(user_claims, session_id).await;
-        let tool_profile = if opened_by_third_party {
+        let SessionOrigin {
+            opened_by_third_party,
+            origin_known,
+        } = self.session_origin(user_claims, session_id).await;
+        // A third party gets `full` (trust) only when a person or a Claude Code
+        // session is behind it.
+        let tool_profile = if opened_by_third_party || (third_party && !origin_known) {
             Some(crate::auth::tool_profile::RESTRICTED)
         } else {
             tool_profile
@@ -6388,7 +6448,14 @@ impl ChatManager {
             // Refused for a mode the provider's ceiling does not allow: the
             // session's token was signed with that ceiling at open.
             let native = super::provider::policy::to_legacy(mode);
-            return handle.set_policy_mode(pair.neutral, native).await;
+            handle.set_policy_mode(pair.neutral, native).await?;
+            // A third party's `full` profile holds in trust only (H6): its token
+            // cannot change, the REST boundary reads this.
+            crate::auth::agent_tokens::set_out_of_trust(
+                session_id,
+                pair.neutral != nexus_claude::agent::PolicyMode::Trust,
+            );
+            return Ok(());
         }
         // Validate mode: the Claude strings or the neutral names (A43). The CLI
         // only understands its own strings, so a neutral name is translated.
@@ -9445,10 +9512,15 @@ impl ChatManager {
         // tools are `nexus-tools`, attached as the `nexus` server and bounded by
         // the policy just set (B40). Claude Code (local or remote) has its own.
         if kind == nexus_claude::agent::ProviderKind::Native && remote_cwd.is_none() {
-            match self.config.nexus_tools_path.as_deref() {
+            let program = self
+                .config
+                .nexus_tools_path
+                .as_deref()
+                .and_then(super::provider::native_factory::runnable_nexus_tools);
+            match program {
                 Some(program) => {
                     if let Some(server) =
-                        super::provider::native_factory::nexus_tools_server(program, &spec)
+                        super::provider::native_factory::nexus_tools_server(&program, &spec)
                     {
                         spec.mcp_servers.insert(
                             nexus_claude::providers::native::NEXUS_TOOLS_SERVER.to_string(),
@@ -9458,8 +9530,9 @@ impl ChatManager {
                 }
                 None => tracing::warn!(
                     session_id,
-                    "nexus-tools not found (set NEXUS_TOOLS_PATH): this native session has no \
-                     file or shell tools"
+                    configured = ?self.config.nexus_tools_path,
+                    "nexus-tools not found or not executable (set NEXUS_TOOLS_PATH): this native \
+                     session has no file or shell tools"
                 ),
             }
         }
@@ -9607,6 +9680,7 @@ impl ChatManager {
                 )));
             }
         }
+        let tool_profile = spec_tool_profile(&spec);
         let session = provider.open(spec).await.map_err(|e| {
             // Nothing will ever use this session's token.
             crate::auth::agent_tokens::revoke_session(&sid);
@@ -9616,7 +9690,7 @@ impl ChatManager {
         // ... and does the model's window hold the tool schemas the session was
         // given, with room left to work? (known only once the provider has probed)
         if provider_id != super::provider::resolver::CLAUDE_CODE {
-            if let Err(e) = window_holds_the_tools(session.capabilities()) {
+            if let Err(e) = window_holds_the_tools(session.capabilities(), tool_profile) {
                 let _ = session.close().await;
                 crate::auth::agent_tokens::revoke_session(&sid);
                 return Err(anyhow::Error::new(e));
@@ -10941,7 +11015,14 @@ mod tests {
         let state = mock_app_state();
         let mut config = test_config();
         config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
-        config.nexus_tools_path = Some(std::path::PathBuf::from("/opt/nexus/nexus-tools"));
+        let bin = tempfile::TempDir::new().unwrap();
+        let program = bin.path().join("nexus-tools");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        config.nexus_tools_path = Some(program.clone());
         config.permission.disallowed_tools = vec!["Monitor".into()];
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
         let claims = crate::auth::jwt::Claims::service_account("nexus");
@@ -10975,7 +11056,10 @@ mod tests {
         else {
             panic!("a stdio `nexus` server expected");
         };
-        assert_eq!(command, "/opt/nexus/nexus-tools");
+        assert_eq!(
+            std::path::Path::new(command),
+            program.canonicalize().unwrap()
+        );
         assert!(env.is_empty(), "nothing from the host's environment");
         let tools_at = args.iter().position(|a| a == "--tools").unwrap() + 1;
         let tools: Vec<&str> = args[tools_at].split(',').collect();
@@ -11000,6 +11084,55 @@ mod tests {
             .await
             .mcp_servers
             .contains_key("nexus"));
+    }
+
+    /// `nexus-tools` is launched with the session's directory as its working
+    /// directory: a relative program path (NEXUS_TOOLS_PATH=./nexus-tools, a `.` or
+    /// empty entry of the PATH) would then name a file of the PROJECT, which the
+    /// model can write. The server is always launched by its absolute path.
+    #[tokio::test]
+    async fn the_nexus_tools_server_is_launched_by_its_absolute_path() {
+        use nexus_claude::agent::{McpServerSpec, ProviderKind};
+        use std::os::unix::fs::PermissionsExt;
+        let crate_root = std::env::current_dir().unwrap();
+        let dir = tempfile::TempDir::new_in(crate_root.join("target")).unwrap();
+        let program = dir.path().join("nexus-tools");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let relative = program.strip_prefix(&crate_root).unwrap().to_path_buf();
+        assert!(relative.is_relative());
+        let state = mock_app_state();
+        let mut config = test_config();
+        config.nexus_tools_path = Some(relative);
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let spec = manager
+            .build_agent_spec(AgentSpecInput {
+                cwd: "/tmp",
+                model: "m",
+                system_prompt: "p",
+                permission_mode: Some("default"),
+                add_dirs: &[],
+                user_claims: None,
+                session_id: "nexus-rel",
+                third_party: true,
+                max_tokens: None,
+                kind: ProviderKind::Native,
+                remote_cwd: None,
+                hooks: None,
+            })
+            .await
+            .unwrap();
+        let Some(McpServerSpec::Stdio { command, .. }) = spec.mcp_servers.get("nexus") else {
+            panic!("a stdio `nexus` server expected");
+        };
+        assert!(
+            std::path::Path::new(command).is_absolute(),
+            "launched as {command}"
+        );
+        assert_eq!(
+            std::path::Path::new(command),
+            program.canonicalize().unwrap()
+        );
     }
 
     /// Without `nexus-tools`, a native session opens with the PO tools only.
@@ -11075,6 +11208,20 @@ mod tests {
         env.get("PO_AUTH_TOKEN").expect("a session token").clone()
     }
 
+    /// The claims of a person signed in (a user JWT), not the server's service account.
+    fn person_claims() -> crate::auth::jwt::Claims {
+        crate::auth::jwt::Claims {
+            sub: Uuid::new_v4().to_string(),
+            email: "alice@example.com".into(),
+            name: "Alice".into(),
+            iat: 0,
+            exp: 0,
+            token_type: None,
+            scope: None,
+            jti: None,
+        }
+    }
+
     fn signed_manager(state: crate::AppState) -> ChatManager {
         let mut config = test_config();
         config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
@@ -11111,7 +11258,7 @@ mod tests {
         use crate::auth::tool_profile::ToolProfile;
         use crate::mcp::protocol::ToolCallParams;
         let manager = signed_manager(mock_app_state());
-        let claims = crate::auth::jwt::Claims::service_account("trust");
+        let claims = person_claims();
         for mode in ["bypassPermissions", "trust"] {
             let token = agent_spec_token(&manager, &claims, true, Some(mode), "trust-s1").await;
             let profile = ToolProfile::from_unverified_token(&token);
@@ -11146,7 +11293,7 @@ mod tests {
     async fn a_session_opened_by_a_third_party_session_is_restricted() {
         use crate::auth::tool_profile::ToolProfile;
         let manager = signed_manager(mock_app_state());
-        let person = crate::auth::jwt::Claims::service_account("person");
+        let person = person_claims();
         let parent_token =
             agent_spec_token(&manager, &person, true, Some("trust"), "parent-s1").await;
         let parent =
@@ -11230,7 +11377,7 @@ mod tests {
         ] {
             graph.create_chat_session(&n).await.unwrap();
         }
-        let person = crate::auth::jwt::Claims::service_account("person");
+        let person = person_claims();
         let profile_of = |sid: Uuid| {
             let manager = &manager;
             let person = &person;
@@ -11243,6 +11390,106 @@ mod tests {
         assert_eq!(profile_of(child_of_third).await, ToolProfile::Restricted);
         assert_eq!(profile_of(child_of_claude).await, ToolProfile::Full);
         assert_eq!(profile_of(third).await, ToolProfile::Full);
+    }
+
+    /// H6 guard, origin unknown: a session opened under the server's own service
+    /// account (a protocol run, a plan run resumed after a restart) carries no
+    /// lineage and has no parent session. A third-party session in `trust` could
+    /// otherwise start a protocol whose third-party agent is `full` again and starts
+    /// the next one: the loop the guard is there to break. Such a session is
+    /// restricted; a delegation whose parent is a Claude Code session keeps `full`.
+    #[tokio::test]
+    async fn a_third_party_session_opened_by_the_service_account_without_a_known_parent_is_restricted(
+    ) {
+        use crate::auth::tool_profile::ToolProfile;
+        let state = mock_app_state();
+        let graph = state.neo4j.clone();
+        let manager = signed_manager(state);
+        let node = |id: Uuid, provider: &str, spawned_by: Option<String>| {
+            serde_json::from_value::<ChatSessionNode>(serde_json::json!({
+                "id": id,
+                "cwd": "/tmp",
+                "model": "m",
+                "created_at": "2026-10-09T00:00:00Z",
+                "updated_at": "2026-10-09T00:00:00Z",
+                "message_count": 0,
+                "total_cost_usd": 0.0,
+                "provider_id": provider,
+                "spawned_by": spawned_by,
+            }))
+            .unwrap()
+        };
+        let (protocol_agent, recovered_runner_agent, claude_parent, delegated) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let runner_spawn = serde_json::json!({
+            "type": "runner",
+            "run_id": Uuid::new_v4().to_string(),
+            "plan_id": Uuid::new_v4().to_string(),
+            "task_id": Uuid::new_v4().to_string(),
+        })
+        .to_string();
+        let protocol_spawn = serde_json::json!({
+            "type": "protocol_runner",
+            "run_id": Uuid::new_v4().to_string(),
+            "protocol_id": Uuid::new_v4().to_string(),
+            "state_name": "s",
+        })
+        .to_string();
+        let delegation = crate::chat::types::SpawnedBy::Delegation {
+            plan_id: Uuid::new_v4(),
+            task_id: Uuid::new_v4(),
+            parent_session_id: Some(claude_parent),
+            scaffolding_level: None,
+        }
+        .to_json_string();
+        for n in [
+            node(protocol_agent, "deepseek", Some(protocol_spawn)),
+            node(recovered_runner_agent, "deepseek", Some(runner_spawn)),
+            node(claude_parent, "claude-code", None),
+            node(delegated, "deepseek", Some(delegation)),
+        ] {
+            graph.create_chat_session(&n).await.unwrap();
+        }
+        let profile_of = |claims: crate::auth::jwt::Claims, sid: Uuid| {
+            let manager = &manager;
+            async move {
+                ToolProfile::from_unverified_token(
+                    &agent_spec_token(
+                        manager,
+                        &claims,
+                        true,
+                        Some("bypassPermissions"),
+                        &sid.to_string(),
+                    )
+                    .await,
+                )
+            }
+        };
+        let service = |who: &str| crate::auth::jwt::Claims::service_account(who);
+        assert_eq!(
+            profile_of(service("protocol-agent:r1"), protocol_agent).await,
+            ToolProfile::Restricted,
+            "a protocol agent has no known origin"
+        );
+        assert_eq!(
+            profile_of(service("runner-agent:r2"), recovered_runner_agent).await,
+            ToolProfile::Restricted,
+            "a run resumed after a restart lost its caller"
+        );
+        assert_eq!(
+            profile_of(service("delegate-agent:t1"), delegated).await,
+            ToolProfile::Full,
+            "a delegation by a Claude Code session keeps what trust grants"
+        );
+        // A plan run a person started carries that person's claims.
+        assert_eq!(
+            profile_of(person_claims(), recovered_runner_agent).await,
+            ToolProfile::Full
+        );
     }
 
     #[tokio::test]

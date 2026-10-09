@@ -31,6 +31,27 @@ pub(crate) const STRICT_TOOL_EXPOSURE: bool = false;
 /// origin, and the per-origin network consent they need does not exist (B40).
 pub(crate) const NEXUS_TOOLS_WITHHELD: &[&str] = &["WebFetch", "WebSearch"];
 
+/// `program` as `nexus-tools` can be launched: its absolute, resolved path, when
+/// it is an executable file. Checked at every opening (the file may have gone
+/// since the server started). Absolute because the server is launched in the
+/// session's directory: a relative path (`./nexus-tools`, a `.` or empty entry of
+/// the PATH) would name a file of the project, which the model can write.
+pub(crate) fn runnable_nexus_tools(program: &std::path::Path) -> Option<std::path::PathBuf> {
+    let path = std::fs::canonicalize(program).ok()?;
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+    }
+    Some(path)
+}
+
 /// The `nexus` MCP server of a native session: `nexus-tools` over stdio,
 /// scoped to the session's directories and bounded at launch (`--tools`, N27)
 /// by what its policy can ever expose (`nexus_tools_bound`), minus

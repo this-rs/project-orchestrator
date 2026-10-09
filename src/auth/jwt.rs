@@ -13,6 +13,9 @@ use uuid::Uuid;
 /// Generated from Uuid::nil() — always `00000000-0000-0000-0000-000000000000`.
 pub const ANONYMOUS_USER_ID: Uuid = Uuid::nil();
 
+/// Email of the server's own claims ([`Claims::service_account`]).
+pub const SERVICE_ACCOUNT_EMAIL: &str = "runner@system.local";
+
 /// Marker value for `Claims::token_type` identifying MCP access tokens.
 pub const TOKEN_TYPE_MCP: &str = "mcp";
 
@@ -71,7 +74,7 @@ impl Claims {
         let now = chrono::Utc::now().timestamp();
         Self {
             sub: identity.to_string(),
-            email: "runner@system.local".to_string(),
+            email: SERVICE_ACCOUNT_EMAIL.to_string(),
             name: "Service Account".to_string(),
             iat: now,
             exp: now + 86400, // 24 h
@@ -79,6 +82,14 @@ impl Claims {
             scope: None,
             jti: None,
         }
+    }
+
+    /// The server's own claims ([`Claims::service_account`]): an internal caller
+    /// (protocol run, delegation, a plan run without its caller), not a person.
+    /// Never presented over HTTP; a session token minted from them is an
+    /// `agent_session` token, which this is false for.
+    pub fn is_service_account(&self) -> bool {
+        self.token_type.is_none() && self.email == SERVICE_ACCOUNT_EMAIL
     }
 
     /// True when these claims describe a long-lived MCP token (which must be

@@ -788,29 +788,125 @@ async fn a_window_too_small_for_the_tool_schemas_refuses_the_session_after_the_p
     );
 }
 
+/// H6: a third party a person opens in trust is given the FULL profile, whose
+/// schemas are larger than the restricted ones. The window check measures what
+/// the session is actually given: a window that holds the restricted schemas but
+/// not the full ones refuses a session in trust and still opens one in ask.
+#[tokio::test]
+async fn the_window_check_measures_the_profile_the_session_is_given() {
+    let restricted = crate::auth::tool_profile::ToolProfile::Restricted
+        .filter_tools(crate::mcp::tools::all_tools());
+    let full =
+        crate::auth::tool_profile::ToolProfile::Full.filter_tools(crate::mcp::tools::all_tools());
+    let tokens = |tools: &Vec<crate::mcp::protocol::ToolDefinition>| {
+        (serde_json::to_string(tools).unwrap().len() / 4) as u64
+    };
+    let window = tokens(&restricted) * 2 + 1;
+    assert!(
+        window < tokens(&full) * 2,
+        "the full profile must be larger for this test"
+    );
+    let mut routes = script().as_array().unwrap().clone();
+    routes[1] = json!({"method": "GET", "path": "/v1/models", "status": 200,
+        "body": {"object": "list", "data": [{"id": "m", "context_length": window}]}});
+    let fake = FakeOpenAi::start(Value::Array(routes));
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    let manager = manager(graph.clone(), true);
+    let person = crate::auth::jwt::Claims {
+        sub: Uuid::new_v4().to_string(),
+        email: "alice@example.com".into(),
+        name: "Alice".into(),
+        iat: 0,
+        exp: 0,
+        token_type: None,
+        scope: None,
+        jti: None,
+    };
+    let mut ask = request(Some("local"), Some("proj"), "default");
+    ask.user_claims = Some(person.clone());
+    ask.message = String::new();
+    manager
+        .create_session(&ask)
+        .await
+        .unwrap_or_else(|e| panic!("the restricted schemas fit: {e:#}"));
+    let mut trust = request(Some("local"), Some("proj"), "bypassPermissions");
+    trust.user_claims = Some(person);
+    trust.message = String::new();
+    let err = manager.create_session(&trust).await.unwrap_err();
+    assert_eq!(failure(&err), (422, "context_too_small"));
+}
+
+/// B40: a `nexus-tools` that cannot be run (NEXUS_TOOLS_PATH naming a file that is
+/// gone, or not executable) leaves the native session with the project-orchestrator
+/// tools only. It never refuses the session.
+#[tokio::test]
+async fn a_nexus_tools_that_cannot_run_does_not_refuse_the_native_session() {
+    let fake = FakeOpenAi::start(script());
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "proj", "local", &fake.origin()).await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let not_executable = dir.path().join("nexus-tools");
+    std::fs::write(&not_executable, "#!/bin/sh\nexit 1\n").unwrap();
+    for program in [dir.path().join("missing/nexus-tools"), not_executable] {
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: Some(program.clone()),
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config);
+        let mut req = request(Some("local"), Some("proj"), "default");
+        req.message = String::new();
+        manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e:#}", program.display()));
+    }
+}
+
 #[test]
 fn the_tool_schemas_have_a_size_and_an_unknown_window_is_not_a_refusal() {
     use nexus_claude::agent::{Capabilities, ContextWindow, ContextWindowSource};
-    let tokens = super::manager::restricted_tool_schema_tokens();
+    let tokens =
+        super::manager::tool_schema_tokens(crate::auth::tool_profile::ToolProfile::Restricted);
     assert!(
         tokens > 500,
         "the restricted profile still has tools: {tokens}"
     );
     let mut caps = Capabilities::none();
     assert!(
-        super::manager::window_holds_the_tools(&caps).is_ok(),
+        super::manager::window_holds_the_tools(
+            &caps,
+            crate::auth::tool_profile::ToolProfile::Restricted
+        )
+        .is_ok(),
         "unknown window"
     );
     caps.context_window = Some(ContextWindow {
         value: tokens * 2 + 1,
         source: ContextWindowSource::Probed,
     });
-    assert!(super::manager::window_holds_the_tools(&caps).is_ok());
+    assert!(super::manager::window_holds_the_tools(
+        &caps,
+        crate::auth::tool_profile::ToolProfile::Restricted
+    )
+    .is_ok());
     caps.context_window = Some(ContextWindow {
         value: tokens,
         source: ContextWindowSource::Probed,
     });
-    assert!(super::manager::window_holds_the_tools(&caps).is_err());
+    assert!(super::manager::window_holds_the_tools(
+        &caps,
+        crate::auth::tool_profile::ToolProfile::Restricted
+    )
+    .is_err());
 }
 
 #[tokio::test]
