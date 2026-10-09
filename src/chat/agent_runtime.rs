@@ -117,12 +117,13 @@ fn retry_delay_ms(error: &ProviderError, attempt: u32) -> u64 {
 ///
 /// Two sources, kept apart on purpose:
 /// - what THIS ENGINE (the backend) has not ported, whatever the provider can do:
-///   message queue, auto-continue, retry, NATS fan-out, entity enrichment;
+///   message queue, auto-continue, NATS fan-out;
 /// - what THE SESSION's capabilities say it cannot do: `images`, and `compaction`
 ///   when the provider emits no compaction signal.
 pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
     // `retry` is NOT listed: the engine retries a retryable `done.error` (B15).
-    let mut missing = vec!["message_queue", "auto_continue", "nats", "enrichment"];
+    // `enrichment` is NOT listed: every turn gets the graph context (`TurnServices::prepare`).
+    let mut missing = vec!["message_queue", "auto_continue", "nats"];
     // The knowledge-graph hooks are served to a provider that runs hooks in its own loop
     // (`GraphSessionHooks`). A session that cannot carry an MCP server is the remote Claude
     // Code, which is given none: it keeps the entry.
@@ -141,6 +142,16 @@ pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
         missing.push("project_orchestrator_tools");
     }
     missing.into_iter().map(str::to_string).collect()
+}
+
+/// What the host does around a turn of the agent engine, that the Claude Code
+/// engine does around its own (`ChatManager::stream_response`). The manager
+/// implements it; the runtime stays free of graph and transport concerns.
+#[async_trait::async_trait]
+pub trait TurnServices: Send + Sync {
+    /// What the model receives for a turn: `sent` (the user's message `shown`,
+    /// possibly behind a relayed history) with the knowledge graph's context.
+    async fn prepare(&self, session_id: &str, shown: &str, sent: &str) -> String;
 }
 
 /// Where the runtime finds a provider instance by identifier. The nexus
@@ -178,6 +189,8 @@ pub struct AgentSessionHandle {
     mapper: Mutex<EventMapper>,
     graph: Arc<dyn GraphStore>,
     uuid: Option<Uuid>,
+    /// What the host does around a turn (`None`: nothing, the bare provider).
+    services: Option<Arc<dyn TurnServices>>,
 }
 
 impl AgentSessionHandle {
@@ -250,6 +263,11 @@ impl AgentSessionHandle {
             content: shown.to_string(),
         })
         .await;
+        // The knowledge graph's context, as the Claude Code engine gives it to its turns.
+        let sent = match &self.services {
+            Some(services) => services.prepare(&self.session_id, shown, sent).await,
+            None => sent.to_string(),
+        };
         let input = TurnInput::text(sent);
         let stream = match self.session.send_turn(input.clone()).await {
             Ok(stream) => stream,
@@ -422,6 +440,7 @@ impl AgentRuntime {
 
     /// Registers a session just opened by a provider and starts its
     /// out-of-turn pump. `first_seq` is the next event number to persist.
+    #[allow(clippy::too_many_arguments)]
     pub async fn adopt(
         &self,
         session_id: &str,
@@ -430,6 +449,7 @@ impl AgentRuntime {
         first_seq: i64,
         provider_kind: &str,
         tool_policy: serde_json::Value,
+        services: Option<Arc<dyn TurnServices>>,
     ) -> Arc<AgentSessionHandle> {
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let handle = Arc::new(AgentSessionHandle {
@@ -448,6 +468,7 @@ impl AgentRuntime {
             mapper: Mutex::new(EventMapper::new()),
             graph: Arc::clone(&self.graph),
             uuid: Uuid::parse_str(session_id).ok(),
+            services,
         });
         if let Some(oob) = session.out_of_band() {
             let pump = Arc::clone(&handle);
@@ -860,6 +881,18 @@ mod mask_tests {
             !degraded_features(&caps).iter().any(|f| f == "retry"),
             "the agent engine retries a retryable done.error: {:?}",
             degraded_features(&caps)
+        );
+    }
+
+    /// What the engine ports is no longer announced as missing, whatever the provider.
+    #[test]
+    fn the_ported_features_are_not_announced_as_missing() {
+        let caps = Capabilities::none();
+        let degraded = degraded_features(&caps);
+        let ported = ["enrichment"];
+        assert!(
+            !degraded.iter().any(|f| ported.contains(&f.as_str())),
+            "{degraded:?}"
         );
     }
 

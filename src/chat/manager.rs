@@ -904,6 +904,102 @@ async fn enrichment_project_id(
         .map(|p| p.id)
 }
 
+/// The protocol context of a turn (what the Claude Code engine knows of a session
+/// that runs inside a protocol FSM). Empty for a session that runs in none.
+#[derive(Default)]
+pub(crate) struct TurnProtocol {
+    pub run_id: Option<Uuid>,
+    pub state: Option<String>,
+    pub reasoning_path_tracker: Option<super::feedback::ReasoningPathTracker>,
+}
+
+/// The knowledge graph's context for one turn whose message is `message`, as the
+/// markdown put in front of it (`None`: nothing to add). Both engines call it
+/// before every turn — the Claude Code engine in `stream_response`, the agent
+/// engine through [`ManagerTurnServices`] — so a message gets the same context
+/// whatever drives the session.
+pub(crate) async fn enrichment_for_turn(
+    graph: &Arc<dyn GraphStore>,
+    pipeline: &super::enrichment::EnrichmentPipeline,
+    session_id: &str,
+    message: &str,
+    protocol: TurnProtocol,
+) -> Option<String> {
+    let uuid = Uuid::parse_str(session_id).ok()?;
+    let node = graph.get_chat_session(uuid).await.ok().flatten()?;
+    // Sessions persisted without a slug (all-projects mode, before cwd inference
+    // existed) still get graph context.
+    let project_slug = match node.project_slug {
+        Some(slug) => Some(slug),
+        None => {
+            crate::skills::project_resolver::infer_project_slug_for_cwd(graph.as_ref(), &node.cwd)
+                .await
+        }
+    };
+    // Resolve the project id once for every stage: stages that only read
+    // `project_id` (reflex) were skipped for every chat message.
+    let project_id = enrichment_project_id(graph.as_ref(), project_slug.as_deref()).await;
+    let input = super::enrichment::EnrichmentInput {
+        message: message.to_string(),
+        session_id: uuid,
+        project_slug,
+        project_id,
+        cwd: Some(node.cwd),
+        protocol_run_id: protocol.run_id,
+        protocol_state: protocol.state,
+        excluded_note_ids: Default::default(), // no dedup in send_message path
+        reasoning_path_tracker: protocol.reasoning_path_tracker,
+    };
+    let ctx = pipeline.execute(&input).await;
+    if !ctx.has_content() {
+        return None;
+    }
+    debug!(
+        "[enrichment] Prompt enriched: {} sections, {}ms (hints: {:?})",
+        ctx.sections.len(),
+        ctx.total_time_ms,
+        ctx.hints.keys().collect::<Vec<_>>()
+    );
+    // Clean markdown prepended to the user message (replaces the old XML-wrapped
+    // <enrichment_context> format).
+    let md = ctx.to_system_prompt_markdown();
+    (!md.is_empty()).then_some(md)
+}
+
+/// What the manager does around a turn of the agent engine
+/// ([`super::agent_runtime::TurnServices`]), with the same functions as the
+/// Claude Code engine.
+pub(crate) struct ManagerTurnServices {
+    graph: Arc<dyn GraphStore>,
+    enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
+}
+
+#[async_trait::async_trait]
+impl super::agent_runtime::TurnServices for ManagerTurnServices {
+    async fn prepare(&self, session_id: &str, shown: &str, sent: &str) -> String {
+        // Attachments: references in the conversation, content for the model.
+        let sent = super::message_attachments::expand_for_agent(&self.graph, sent).await;
+        let message = super::message_attachments::expand_for_agent(&self.graph, shown).await;
+        match enrichment_for_turn(
+            &self.graph,
+            &self.enrichment_pipeline,
+            session_id,
+            &message,
+            TurnProtocol::default(),
+        )
+        .await
+        {
+            Some(md) => prepend_enrichment(&md, &sent),
+            None => sent,
+        }
+    }
+}
+
+/// `prompt` with the turn's enrichment in front of it.
+pub(crate) fn prepend_enrichment(enrichment_md: &str, prompt: &str) -> String {
+    format!("{}\n\n---\n\n{}", enrichment_md, prompt)
+}
+
 /// Server secrets an agent must not inherit, among those present.
 ///
 /// Not listed on purpose: `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` —
@@ -4776,83 +4872,24 @@ impl ChatManager {
         // ===== PRE-ENRICHMENT PIPELINE =====
         // Enrich the prompt with context from the knowledge graph BEFORE the LLM call.
         // If the pipeline has no stages or all fail, the original prompt is used unchanged.
+        // The agent engine runs the same function (`enrichment_for_turn`): one logic.
         let prompt = {
-            let session_uuid = Uuid::parse_str(&session_id).ok();
-            let enrichment_input = if let Some(uuid) = session_uuid {
-                // Load session node to get project_slug
-                match graph.get_chat_session(uuid).await {
-                    Ok(Some(node)) => {
-                        // Read protocol context from the active session (if any)
-                        let (proto_run_id, proto_state, reasoning_tracker) = {
-                            let sessions = active_sessions.read().await;
-                            sessions
-                                .get(&uuid.to_string())
-                                .map(|s| {
-                                    (
-                                        s.protocol_run_id,
-                                        s.protocol_state.clone(),
-                                        Some(s.reasoning_path_tracker.clone()),
-                                    )
-                                })
-                                .unwrap_or((None, None, None))
-                        };
-                        // Sessions persisted without a slug (all-projects mode,
-                        // before cwd inference existed) still get graph context.
-                        let project_slug = match node.project_slug {
-                            Some(slug) => Some(slug),
-                            None => {
-                                crate::skills::project_resolver::infer_project_slug_for_cwd(
-                                    graph.as_ref(),
-                                    &node.cwd,
-                                )
-                                .await
-                            }
-                        };
-                        // Resolve the project id once for every stage: stages
-                        // that only read `project_id` (reflex) were skipped
-                        // for every chat message.
-                        let project_id =
-                            enrichment_project_id(graph.as_ref(), project_slug.as_deref()).await;
-                        Some(super::enrichment::EnrichmentInput {
-                            message: prompt.clone(),
-                            session_id: uuid,
-                            project_slug,
-                            project_id,
-                            cwd: Some(node.cwd),
-                            protocol_run_id: proto_run_id,
-                            protocol_state: proto_state,
-                            excluded_note_ids: Default::default(), // no dedup in send_message path
-                            reasoning_path_tracker: reasoning_tracker,
-                        })
-                    }
-                    _ => None,
-                }
-            } else {
-                None
+            let protocol = {
+                let sessions = active_sessions.read().await;
+                sessions
+                    .get(&session_id)
+                    .map(|s| TurnProtocol {
+                        run_id: s.protocol_run_id,
+                        state: s.protocol_state.clone(),
+                        reasoning_path_tracker: Some(s.reasoning_path_tracker.clone()),
+                    })
+                    .unwrap_or_default()
             };
-
-            if let Some(input) = enrichment_input {
-                let ctx = enrichment_pipeline.execute(&input).await;
-                if ctx.has_content() {
-                    debug!(
-                        "[enrichment] Prompt enriched: {} sections, {}ms (hints: {:?})",
-                        ctx.sections.len(),
-                        ctx.total_time_ms,
-                        ctx.hints.keys().collect::<Vec<_>>()
-                    );
-                    // Integrate enrichment as clean markdown prepended to user message
-                    // (replaces old XML-wrapped <enrichment_context> format)
-                    let enrichment_md = ctx.to_system_prompt_markdown();
-                    if enrichment_md.is_empty() {
-                        prompt
-                    } else {
-                        format!("{}\n\n---\n\n{}", enrichment_md, prompt)
-                    }
-                } else {
-                    prompt
-                }
-            } else {
-                prompt
+            match enrichment_for_turn(&graph, &enrichment_pipeline, &session_id, &prompt, protocol)
+                .await
+            {
+                Some(enrichment_md) => prepend_enrichment(&enrichment_md, &prompt),
+                None => prompt,
             }
         };
 
@@ -9714,6 +9751,15 @@ impl ChatManager {
         })
     }
 
+    /// What a session of the agent engine gets around its turns, built from the
+    /// manager as it is configured NOW (the pipeline is replaced after construction).
+    pub(crate) fn turn_services(&self) -> Arc<dyn super::agent_runtime::TurnServices> {
+        Arc::new(ManagerTurnServices {
+            graph: self.graph.clone(),
+            enrichment_pipeline: self.enrichment_pipeline.clone(),
+        })
+    }
+
     /// Records what the provider reported (frozen capabilities, resume token)
     /// and registers the live session.
     async fn finish_agent_open(
@@ -9752,6 +9798,7 @@ impl ChatManager {
                 first_seq,
                 &kind_name,
                 tool_policy,
+                Some(self.turn_services()),
             )
             .await;
     }
@@ -13157,15 +13204,15 @@ mod tests {
         let degraded: Vec<String> =
             serde_json::from_value(wire["degraded_features"].clone()).expect("a list");
         // What the backend does not do on this engine, whatever the provider says...
-        for lost in [
-            "hooks",
-            "message_queue",
-            "auto_continue",
-            "nats",
-            "enrichment",
-        ] {
+        for lost in ["hooks", "message_queue", "auto_continue", "nats"] {
             assert!(degraded.iter().any(|d| d == lost), "{lost}: {degraded:?}");
         }
+        // ...what the engine ported is not claimed missing...
+        let ported = ["enrichment"];
+        assert!(
+            !degraded.iter().any(|d| ported.contains(&d.as_str())),
+            "{degraded:?}"
+        );
         // ...and what the provider covers is not claimed missing.
         assert!(
             !degraded.iter().any(|d| d == "images" || d == "compaction"),
