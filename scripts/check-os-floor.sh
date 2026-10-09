@@ -20,11 +20,11 @@ case "$id" in
   macos-arm64)         kind=macos;  promise=11.0  ;;
   macos-x86_64)        kind=macos;  promise=13.4  ;; # ONNX Runtime (libonnxruntime) is built for 13.4
   macos-x86_64-legacy) kind=macos;  promise=10.15 ;; # no ONNX Runtime at all
-  # Linux: this is what the build produces today (ubuntu-latest = 24.04, glibc 2.39), written down so that a runner upgrade
-  # cannot raise it silently. Ubuntu 22.04 (2.35), Debian 12 (2.36) and RHEL 9 (2.34) are below it: lowering it means
-  # building on an older runner, and then changing this line.
-  linux-x86_64)        kind=linux;  promise=2.39  ;;
-  linux-arm64)         kind=linux;  promise=2.39  ;;
+  # Linux: the release builds on Ubuntu 22.04 runners (glibc 2.35), so the files run on Ubuntu 22.04+, Debian 12+ (2.36),
+  # Fedora 36+. A runner upgrade cannot raise this silently: the check fails. RHEL 9 (2.34) is just below; going lower needs
+  # a build in an older image (manylinux_2_28), a separate decision.
+  linux-x86_64)        kind=linux;  promise=2.35  ;;
+  linux-arm64)         kind=linux;  promise=2.35  ;;
   *) echo "::error::unknown id '$id'" >&2; exit 2 ;;
 esac
 

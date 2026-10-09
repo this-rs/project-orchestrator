@@ -81,7 +81,7 @@ Download the desktop app for your platform. Every link below goes through [proje
 
 > All releases are available on the [Releases page](https://github.com/this-rs/project-orchestrator/releases/latest).
 
-**Linux.** The Linux binaries and packages are built on Ubuntu 24.04 and need **glibc 2.39 or later**: Ubuntu 24.04+, Debian 13+, Fedora 40+, RHEL 10+. Ubuntu 22.04, Debian 12 and RHEL 9 are older and will refuse to start them (`GLIBC_2.39 not found`). The release build now fails if this requirement ever rises without the promise being updated (`scripts/check-os-floor.sh`). **Windows** is not measured yet.
+**Linux.** The binaries and packages are built on Ubuntu 22.04 and need **glibc 2.35 or later**: Ubuntu 22.04+, Debian 12+, Fedora 36+, RHEL 10+. RHEL 9 (glibc 2.34), Ubuntu 20.04 and Debian 11 are older and refuse to start them (`GLIBC_2.35 not found`). The desktop app also needs WebKitGTK 4.1 (present on those systems). The release build fails if this requirement ever rises without the promise being updated (`scripts/check-os-floor.sh`). **Windows**: built for Windows 10 or later (Rust's own minimum); the executable headers carry no usable floor, so it is not measured by the build.
 
 **Which Mac do I have?** Apple menu → *About This Mac*: a chip named *Apple M1…* is Apple Silicon, a *processor* named Intel is Intel. The same window gives your macOS version.
 
