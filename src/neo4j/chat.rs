@@ -72,7 +72,8 @@ impl Neo4jClient {
                     routed_by: $routed_by,
                     routing_mode: $routing_mode,
                     capabilities: $capabilities,
-                    resume_token: $resume_token
+                    resume_token: $resume_token,
+                    execution_place: $execution_place
                 })
                 WITH s
                 OPTIONAL MATCH (p:Project {slug: $project_slug})
@@ -105,7 +106,8 @@ impl Neo4jClient {
                     routed_by: $routed_by,
                     routing_mode: $routing_mode,
                     capabilities: $capabilities,
-                    resume_token: $resume_token
+                    resume_token: $resume_token,
+                    execution_place: $execution_place
                 })
                 "#,
             )
@@ -164,7 +166,8 @@ impl Neo4jClient {
                     .param(
                         "resume_token",
                         session.resume_token.clone().unwrap_or_default(),
-                    ),
+                    )
+                    .param("execution_place", session.execution_place.as_str()),
             )
             .await?;
         Ok(())
@@ -987,6 +990,9 @@ impl Neo4jClient {
             routing_mode: non_empty("routing_mode"),
             capabilities: non_empty("capabilities"),
             resume_token: non_empty("resume_token"),
+            execution_place: ExecutionPlace::parse_stored(
+                &node.get::<String>("execution_place").unwrap_or_default(),
+            ),
         })
     }
 

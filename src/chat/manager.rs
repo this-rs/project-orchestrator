@@ -1409,6 +1409,13 @@ impl ChatManager {
             auto_update_cli: config.auto_update_cli,
             auto_update_app: config.auto_update_app,
         }));
+        // Neutral chat directories a crash left behind (sessions that were never closed).
+        tokio::task::spawn_blocking(|| {
+            let n = super::neutral_place::sweep_orphans(super::neutral_place::ORPHAN_MAX_AGE);
+            if n > 0 {
+                info!(removed = n, "swept orphan neutral chat directories");
+            }
+        });
         let enrichment_pipeline =
             Self::build_enrichment_pipeline(&graph, &search, None, None, None);
         let agent_runtime = Arc::new(super::agent_runtime::AgentRuntime::new(graph.clone()));
@@ -3313,6 +3320,10 @@ impl ChatManager {
         session_id: Option<&str>,
         access: super::provider::policy::SessionAccess,
     ) -> ClaudeCodeOptions {
+        // A neutral directory of the host is made on demand: a new session and a resume alike.
+        if let Err(e) = super::neutral_place::ensure(cwd) {
+            warn!(cwd = %cwd, error = %e, "could not create the neutral chat directory");
+        }
         // Expand tilde in cwd (shell doesn't expand ~ when passed via Command)
         let cwd = expand_tilde(cwd);
         let mcp_path = self.config.mcp_server_path.to_string_lossy().to_string();
@@ -3719,6 +3730,50 @@ impl ChatManager {
         request: &ChatRequest,
         relay: Option<&str>,
     ) -> Result<CreateSessionResponse> {
+        let session_id = Uuid::new_v4();
+        if !request.cwd.trim().is_empty() {
+            return self
+                .create_session_in_place(request, relay, session_id)
+                .await;
+        }
+        // No `cwd`: the host gives the session a neutral working directory of its own,
+        // derived from the id the session is persisted under (a resume finds it again).
+        // Nothing is created here: `build_options` / `build_agent_spec` make it, so a
+        // refused open leaves nothing behind.
+        let placed = ChatRequest {
+            cwd: super::neutral_place::dir_for(session_id)
+                .to_string_lossy()
+                .into_owned(),
+            ..request.clone()
+        };
+        let mut response = self
+            .create_session_in_place(&placed, relay, session_id)
+            .await?;
+        response.execution_place = super::neutral_place::ExecutionPlace::Neutral;
+        if placed.project_slug.is_none() {
+            // Never silent: every graph stage is keyed on the project, and none was named.
+            warn!(
+                session_id = %response.session_id,
+                execution_place = "neutral",
+                graph_context = "none",
+                "neutral session without project_slug: it gets no knowledge-graph context"
+            );
+            response.notices.push(
+                "no cwd and no project_slug: this session is not tied to a project, so it gets no knowledge-graph context (notes, skills, personas, status). Pass project_slug to scope it."
+                    .to_string(),
+            );
+        }
+        Ok(response)
+    }
+
+    /// [`Self::create_session_relayed`] once `request.cwd` is settled (a project's, or
+    /// the neutral directory of `session_id`).
+    async fn create_session_in_place(
+        &self,
+        request: &ChatRequest,
+        relay: Option<&str>,
+        session_id: Uuid,
+    ) -> Result<CreateSessionResponse> {
         // Check max sessions
         {
             let sessions = self.active_sessions.read().await;
@@ -3729,8 +3784,6 @@ impl ChatManager {
                 ));
             }
         }
-
-        let session_id = Uuid::new_v4();
 
         // Resolve scaffolding override: explicit field takes priority,
         // fallback to spawned_by JSON if present (for MCP callers)
@@ -3859,6 +3912,11 @@ impl ChatManager {
             routing_mode: request.routing_mode.map(|m| m.as_str().to_owned()),
             capabilities: None,
             resume_token: None,
+            execution_place: if super::neutral_place::is_neutral_path(&request.cwd) {
+                super::neutral_place::ExecutionPlace::Neutral
+            } else {
+                super::neutral_place::ExecutionPlace::Project
+            },
         };
         self.graph
             .create_chat_session(&session_node)
@@ -4319,7 +4377,8 @@ impl ChatManager {
                 &session_id.to_string(),
                 serde_json::json!({
                     "project_slug": request.project_slug,
-                    "cwd": request.cwd,
+                    "execution_place": if super::neutral_place::is_neutral_path(&request.cwd) { "neutral" } else { "project" },
+                    "cwd": if super::neutral_place::is_neutral_path(&request.cwd) { serde_json::Value::Null } else { serde_json::json!(request.cwd) },
                     "model": model,
                 }),
                 None,
@@ -4400,6 +4459,8 @@ impl ChatManager {
         Ok(CreateSessionResponse {
             session_id: session_id.to_string(),
             stream_url: format!("/ws/chat/{}", session_id),
+            execution_place: Default::default(),
+            notices: Vec::new(),
         })
     }
 
@@ -6853,13 +6914,19 @@ impl ChatManager {
             relay::budget_for_window(window),
         );
 
+        // A neutral session continues in a neutral place of its own (a new session, a new directory).
+        let relay_cwd = if node.execution_place == super::neutral_place::ExecutionPlace::Neutral {
+            String::new()
+        } else {
+            node.cwd.clone()
+        };
         let request = ChatRequest {
             routing_mode: None,
             attachments: Vec::new(),
             refs: Vec::new(),
             message: message.to_string(),
             session_id: None,
-            cwd: node.cwd.clone(),
+            cwd: relay_cwd,
             project_slug: node.project_slug.clone(),
             model: model.map(str::to_string),
             provider: Some(provider.to_string()),
@@ -9705,6 +9772,12 @@ impl ChatManager {
             remote_cwd,
             hooks,
         } = i;
+        // A neutral directory of the host is made on demand (new session or resume).
+        if remote_cwd.is_none() {
+            if let Err(e) = super::neutral_place::ensure(cwd) {
+                warn!(cwd = %cwd, error = %e, "could not create the neutral chat directory");
+            }
+        }
         use nexus_claude::agent::{
             EnvSpec, McpServerSpec, SessionSpec, SystemPromptMode, SystemPromptSpec,
         };
@@ -10043,6 +10116,8 @@ impl ChatManager {
         Ok(CreateSessionResponse {
             session_id: sid.clone(),
             stream_url: format!("/ws/chat/{sid}"),
+            execution_place: Default::default(),
+            notices: Vec::new(),
         })
     }
 
@@ -10313,6 +10388,14 @@ impl ChatManager {
     /// disconnect with a 5s timeout — if the CLI hangs, drop the client to
     /// trigger SIGKILL via the Drop impl.
     pub async fn close_session(&self, session_id: &str) -> Result<()> {
+        let closed = self.close_session_inner(session_id).await;
+        // The neutral directory (if the session had one) goes with the session; a resume
+        // makes it again.
+        super::neutral_place::remove_for(session_id);
+        closed
+    }
+
+    async fn close_session_inner(&self, session_id: &str) -> Result<()> {
         self.turn_routing.remove(session_id);
         self.close_routing_decision(session_id).await;
         if self.agent_runtime.owns(session_id).await {
@@ -13701,6 +13784,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_session_without_cwd_runs_in_a_neutral_directory_of_the_host_and_resumes_in_it() {
+        let (manager, graph, fake) = agent_manager();
+        let mut req = agent_request("hello");
+        req.cwd = String::new();
+        let created = manager.create_session(&req).await.unwrap();
+        let sid = created.session_id.clone();
+        let id = Uuid::parse_str(&sid).unwrap();
+
+        // The marker is on the response and on the node; the cwd is the host's directory.
+        assert_eq!(
+            created.execution_place,
+            crate::chat::neutral_place::ExecutionPlace::Neutral
+        );
+        let expected = crate::chat::neutral_place::dir_for(id);
+        let node = graph.get_chat_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            node.execution_place,
+            crate::chat::neutral_place::ExecutionPlace::Neutral
+        );
+        assert_eq!(node.cwd, expected.to_string_lossy());
+        // Real, empty, and what the provider was given.
+        assert!(expected.is_dir());
+        assert_eq!(std::fs::read_dir(&expected).unwrap().count(), 0);
+        let spec = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+        assert_eq!(spec.cwd, expected);
+        // No project named: the lack of graph context is said, not silent.
+        assert!(node.project_slug.is_none());
+        assert_eq!(created.notices.len(), 1);
+        assert!(created.notices[0].contains("project_slug"));
+
+        // Closing removes the directory; a resume makes the same one again.
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+        assert!(!expected.exists());
+        manager.resume_session(&sid, "again", None).await.unwrap();
+        assert!(expected.is_dir());
+        let spec = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+        assert_eq!(spec.cwd, expected);
+
+        manager.close_session(&sid).await.unwrap();
+        assert!(!expected.exists());
+    }
+
+    #[tokio::test]
+    async fn a_session_with_a_cwd_stays_a_project_session_without_notice() {
+        let (manager, graph, _fake) = agent_manager();
+        let created = manager
+            .create_session(&agent_request("hello"))
+            .await
+            .unwrap();
+        assert_eq!(
+            created.execution_place,
+            crate::chat::neutral_place::ExecutionPlace::Project
+        );
+        assert!(created.notices.is_empty());
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&created.session_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            node.execution_place,
+            crate::chat::neutral_place::ExecutionPlace::Project
+        );
+        manager.close_session(&created.session_id).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn agent_path_resumes_from_the_persisted_token_and_out_of_turn_output_regroups() {
         use nexus_claude::agent::AgentEvent;
         let (manager, graph, fake) = agent_manager();
@@ -14450,6 +14601,7 @@ mod tests {
             routed_by: None,
             capabilities: None,
             resume_token: None,
+            execution_place: Default::default(),
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -14816,6 +14968,7 @@ mod tests {
             routed_by: None,
             capabilities: None,
             resume_token: None,
+            execution_place: Default::default(),
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -14852,6 +15005,7 @@ mod tests {
             routed_by: None,
             capabilities: None,
             resume_token: None,
+            execution_place: Default::default(),
         };
 
         let json = serde_json::to_string(&session).unwrap();

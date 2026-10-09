@@ -34,6 +34,15 @@
         "required": false,
         "doc": "même instantané que system_init.capabilities ; présent sur GET /api/chat/sessions/{id}"
       },
+      "execution_place": {
+        "type": "string",
+        "required": false,
+        "enum": [
+          "project",
+          "neutral"
+        ],
+        "doc": "où tourne la session : project (défaut ; absent = project, y compris pour les anciennes sessions) ou neutral (aucun cwd fourni : l'hôte a créé un répertoire vide, cwd pointe dessus). N'accorde aucun droit"
+      },
       "routed_by": {
         "type": "string",
         "required": false,
@@ -69,10 +78,31 @@
       }
     },
     "CreateSessionRequest": {
+      "cwd": {
+        "type": "string",
+        "required": false,
+        "doc": "optionnel : absent ou vide = répertoire neutre créé par l'hôte (execution_place = neutral). Sans project_slug, une session neutre n'a aucun contexte graphe (signalé dans notices)"
+      },
       "provider": {
         "type": "string",
         "required": false,
         "doc": "id d'instance ; sur une session existante, un provider différent → 409 provider_conflict"
+      }
+    },
+    "CreateSessionResponse": {
+      "execution_place": {
+        "type": "string",
+        "required": false,
+        "enum": [
+          "project",
+          "neutral"
+        ],
+        "doc": "absent = project"
+      },
+      "notices": {
+        "type": "array<string>",
+        "required": false,
+        "doc": "à lire par l'appelant, absent si vide (ex. session neutre sans project_slug : pas de contexte graphe)"
       }
     },
     "GET /api/chat/providers": {

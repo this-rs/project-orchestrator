@@ -4053,7 +4053,10 @@ impl ToolHandler {
                     "message".to_string(),
                     json!(extract_string(args, "message")?),
                 );
-                body.insert("cwd".to_string(), json!(extract_string(args, "cwd")?));
+                // Optional: without it the host gives the session a neutral directory.
+                if let Some(v) = args.get("cwd").and_then(|v| v.as_str()) {
+                    body.insert("cwd".to_string(), json!(v));
+                }
                 if let Some(v) = args.get("session_id").and_then(|v| v.as_str()) {
                     body.insert("session_id".to_string(), json!(v));
                 }

@@ -902,7 +902,7 @@ fn chat_tool() -> ToolDefinition {
                 },
                 "session_id": {"type": "string", "description": "Session UUID. For send_message: resume this existing session instead of creating a new one (omit to start a new conversation)"},
                 "message": {"type": "string", "description": "Message to send (send_message)"},
-                "cwd": {"type": "string", "description": "Working directory (send_message)"},
+                "cwd": {"type": "string", "description": "Working directory (send_message). Optional: omit it for a session that belongs to no project - the server then makes a neutral empty directory for it (execution_place: neutral) and, without project_slug, the session has no knowledge-graph context"},
                 "project_slug": {"type": "string", "description": "Project filter (list_sessions/send_message)"},
                 "plan_id": {"type": "string", "description": "Plan UUID filter (list_sessions) — returns sessions linked to this plan"},
                 "task_id": {"type": "string", "description": "Task UUID filter (list_sessions) — returns sessions linked to this task"},

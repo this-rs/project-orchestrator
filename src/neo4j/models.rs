@@ -152,6 +152,41 @@ pub struct WorkspaceNode {
 // Chat Session Node
 // ============================================================================
 
+/// Where a chat session runs. It says what the working directory IS; it grants
+/// nothing (tool permissions never read it).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPlace {
+    /// The session was given a working directory by its caller (usually a project root).
+    #[default]
+    Project,
+    /// The caller gave none: the host made an empty directory of its own for the session.
+    Neutral,
+}
+
+impl ExecutionPlace {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Neutral => "neutral",
+        }
+    }
+
+    /// Parses a stored value; anything unknown (or absent) is `project`.
+    pub fn parse_stored(raw: &str) -> Self {
+        if raw == "neutral" {
+            Self::Neutral
+        } else {
+            Self::Project
+        }
+    }
+
+    /// For `skip_serializing_if`: the default is left off the wire.
+    pub fn is_project(&self) -> bool {
+        *self == Self::Project
+    }
+}
+
 /// A chat session with Claude Code CLI
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatSessionNode {
@@ -214,6 +249,10 @@ pub struct ChatSessionNode {
     /// Opaque provider resume token (A3), JSON.
     #[serde(default)]
     pub resume_token: Option<String>,
+    /// Where the session runs: a project's directory, or the neutral directory the
+    /// host made for it. Absent on every session written before it existed: `project`.
+    #[serde(default)]
+    pub execution_place: ExecutionPlace,
 }
 
 // ============================================================================
@@ -3446,6 +3485,7 @@ mod tests {
             routed_by: None,
             capabilities: None,
             resume_token: None,
+            execution_place: Default::default(),
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -3479,6 +3519,7 @@ mod tests {
             routed_by: None,
             capabilities: None,
             resume_token: None,
+            execution_place: Default::default(),
         };
 
         let json = serde_json::to_string(&session).unwrap();
