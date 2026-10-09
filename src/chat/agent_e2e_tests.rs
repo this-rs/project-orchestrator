@@ -206,6 +206,7 @@ fn manager(graph: Arc<MockGraphStore>, secure: bool) -> ChatManager {
         provider_path: ProviderPath::Agent,
         mcp_server_path: fake_bin("fake_mcp"),
         nexus_tools_path: None,
+        nexus_browser_path: None,
         jwt_secret: secure.then(|| "test-secret-test-secret-test-secret".to_string()),
         max_sessions: 10,
         ..Default::default()
@@ -857,6 +858,7 @@ async fn a_nexus_tools_that_cannot_run_does_not_refuse_the_native_session() {
             provider_path: ProviderPath::Agent,
             mcp_server_path: fake_bin("fake_mcp"),
             nexus_tools_path: Some(program.clone()),
+            nexus_browser_path: None,
             jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
             max_sessions: 10,
             ..Default::default()
@@ -1713,6 +1715,7 @@ mod turn_routing {
             provider_path: ProviderPath::Agent,
             mcp_server_path: PathBuf::from("/nonexistent/mcp"),
             nexus_tools_path: None,
+            nexus_browser_path: None,
             max_sessions: 10,
             ..Default::default()
         };
