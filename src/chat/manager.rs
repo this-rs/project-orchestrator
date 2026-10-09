@@ -3282,6 +3282,37 @@ impl ChatManager {
         user_claims: Option<&crate::auth::jwt::Claims>,
         session_id: Option<&str>,
     ) -> ClaudeCodeOptions {
+        self.build_options_with_access(
+            cwd,
+            model,
+            system_prompt,
+            resume_id,
+            permission_mode_override,
+            hooks,
+            add_dirs,
+            user_claims,
+            session_id,
+            super::provider::policy::SessionAccess::Normal,
+        )
+        .await
+    }
+
+    /// [`Self::build_options`] for a session of the given access: the read-only deny list
+    /// is added to `disallowed_tools` (the CLI refuses it whatever the permission mode).
+    #[allow(deprecated, clippy::too_many_arguments)]
+    pub async fn build_options_with_access(
+        &self,
+        cwd: &str,
+        model: &str,
+        system_prompt: &str,
+        resume_id: Option<&str>,
+        permission_mode_override: Option<&str>,
+        hooks: Option<std::collections::HashMap<String, Vec<nexus_claude::HookMatcher>>>,
+        add_dirs: &[String],
+        user_claims: Option<&crate::auth::jwt::Claims>,
+        session_id: Option<&str>,
+        access: super::provider::policy::SessionAccess,
+    ) -> ClaudeCodeOptions {
         // Expand tilde in cwd (shell doesn't expand ~ when passed via Command)
         let cwd = expand_tilde(cwd);
         let mcp_path = self.config.mcp_server_path.to_string_lossy().to_string();
@@ -3345,8 +3376,10 @@ impl ChatManager {
         if !perm_config.allowed_tools.is_empty() {
             builder = builder.allowed_tools(perm_config.allowed_tools.clone());
         }
-        if !perm_config.disallowed_tools.is_empty() {
-            builder = builder.disallowed_tools(perm_config.disallowed_tools.clone());
+        // The harness decides what a read-only session cannot call; the prompt plays no part.
+        let disallowed = access.merge_disallowed(&perm_config.disallowed_tools);
+        if !disallowed.is_empty() {
+            builder = builder.disallowed_tools(disallowed);
         }
 
         if let Some(id) = resume_id {
@@ -9647,6 +9680,17 @@ impl ChatManager {
         &self,
         i: AgentSpecInput<'_>,
     ) -> Result<nexus_claude::agent::SessionSpec> {
+        self.build_agent_spec_with_access(i, super::provider::policy::SessionAccess::Normal)
+            .await
+    }
+
+    /// [`Self::build_agent_spec`] for a session of the given access: the read-only deny list
+    /// is part of the neutral policy, so it wins over every mode, `trust` included.
+    pub(crate) async fn build_agent_spec_with_access(
+        &self,
+        i: AgentSpecInput<'_>,
+        access: super::provider::policy::SessionAccess,
+    ) -> Result<nexus_claude::agent::SessionSpec> {
         let AgentSpecInput {
             cwd,
             model,
@@ -9674,12 +9718,13 @@ impl ChatManager {
                 perm.disallowed_tools.clone(),
             )
         };
-        let policy = super::provider::policy::tool_policy(&mode, &allowed, &disallowed)
-            .ok_or_else(|| {
-                anyhow::Error::new(nexus_claude::agent::ProviderError::invalid(
-                    "unknown permission mode or malformed tool pattern",
-                ))
-            })?;
+        let policy =
+            super::provider::policy::tool_policy_with_access(&mode, &allowed, &disallowed, access)
+                .ok_or_else(|| {
+                    anyhow::Error::new(nexus_claude::agent::ProviderError::invalid(
+                        "unknown permission mode or malformed tool pattern",
+                    ))
+                })?;
         // The project is read before the hooks scope is consumed: it is what the consent of
         // the network tools is tied to (A28).
         let project_slug = hooks.as_ref().and_then(|scope| scope.project_slug.clone());
@@ -10925,6 +10970,120 @@ mod tests {
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
         assert_eq!(opts.allowed_tools, vec!["mcp__project-orchestrator__*"]);
         assert!(opts.disallowed_tools.is_empty());
+    }
+
+    // ── read-only sessions: the harness refuses, the prompt is not involved ──
+
+    #[tokio::test]
+    async fn read_only_access_adds_the_deny_list_to_the_cli_options_and_keeps_the_mode() {
+        use crate::chat::provider::policy::SessionAccess;
+        let state = mock_app_state();
+        let mut config = test_config();
+        config.permission.disallowed_tools = vec!["Bash(rm -rf *)".into()];
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        for mode in [Some("bypassPermissions"), Some("plan"), None] {
+            let opts = manager
+                .build_options_with_access(
+                    "/tmp",
+                    "m",
+                    "p",
+                    Some("resume-id"),
+                    mode,
+                    None,
+                    &[],
+                    None,
+                    None,
+                    SessionAccess::ReadOnly,
+                )
+                .await;
+            for tool in ["Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "Task"] {
+                assert!(opts.disallowed_tools.iter().any(|d| d == tool), "{tool}");
+            }
+            assert!(opts.disallowed_tools.iter().any(|d| d == "Bash(rm -rf *)"));
+            // The mode itself is not rewritten: the deny list is what protects.
+            if mode == Some("bypassPermissions") {
+                assert!(matches!(
+                    opts.permission_mode,
+                    PermissionMode::BypassPermissions
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_access_leaves_the_cli_options_as_build_options_makes_them() {
+        use crate::chat::provider::policy::SessionAccess;
+        let state = mock_app_state();
+        let mut config = test_config();
+        config.permission.disallowed_tools = vec!["Bash(rm -rf *)".into()];
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let plain = manager
+            .build_options("/tmp", "m", "p", None, None, None, &[], None, None)
+            .await;
+        let with = manager
+            .build_options_with_access(
+                "/tmp",
+                "m",
+                "p",
+                None,
+                None,
+                None,
+                &[],
+                None,
+                None,
+                SessionAccess::Normal,
+            )
+            .await;
+        assert_eq!(plain.disallowed_tools, with.disallowed_tools);
+        assert_eq!(plain.disallowed_tools, vec!["Bash(rm -rf *)"]);
+    }
+
+    #[tokio::test]
+    async fn a_read_only_agent_spec_denies_writes_in_trust_and_a_normal_one_does_not() {
+        use crate::chat::provider::policy::SessionAccess;
+        use nexus_claude::agent::{PolicyDecision, ProviderKind, ToolCategory};
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let spec_for = |access: SessionAccess| {
+            let manager = &manager;
+            async move {
+                manager
+                    .build_agent_spec_with_access(
+                        AgentSpecInput {
+                            cwd: "/tmp",
+                            model: "m",
+                            system_prompt: "p",
+                            permission_mode: Some("bypassPermissions"),
+                            add_dirs: &[],
+                            user_claims: None,
+                            session_id: "ro-s1",
+                            third_party: false,
+                            max_tokens: None,
+                            kind: ProviderKind::ClaudeCode,
+                            remote_cwd: None,
+                            hooks: None,
+                        },
+                        access,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let read_only = spec_for(SessionAccess::ReadOnly).await;
+        let normal = spec_for(SessionAccess::Normal).await;
+        // A tool the prompt never mentions: the policy refuses it all the same.
+        let write = |spec: &nexus_claude::agent::SessionSpec| {
+            spec.policy
+                .decide("Write", Some("/tmp/x"), ToolCategory::Edit)
+        };
+        assert_eq!(write(&read_only), PolicyDecision::Deny);
+        assert_eq!(write(&normal), PolicyDecision::Allow);
+        assert_eq!(
+            read_only
+                .policy
+                .decide("Read", Some("/tmp/x"), ToolCategory::Read),
+            PolicyDecision::Allow
+        );
     }
 
     #[tokio::test]

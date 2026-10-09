@@ -109,6 +109,101 @@ pub fn tool_policy(mode: &str, allowed: &[String], disallowed: &[String]) -> Opt
     Some(policy)
 }
 
+/// What a session may do to the world, decided by the harness for the whole
+/// life of the session (open AND every resume).
+///
+/// `ReadOnly` is not a permission mode: modes decide who is asked, and `Trust`
+/// asks nobody. It is a deny list computed here, merged into the session's
+/// `disallowed_tools`; a deny entry wins over the mode (Trust included) and over
+/// the allow list, both in the nexus policy ([`ToolPolicy::decide`]) and in the
+/// Claude CLI (`--disallowedTools`). Nothing in the prompt is involved: a tool
+/// the prompt never mentions is refused all the same.
+///
+/// Trust: `trust` (`bypassPermissions`) only means "ask nobody". A read-only
+/// session in `trust` still has every tool of the deny list refused, because
+/// `deny` is checked before the mode and before `allow`. `plan_only` is stricter
+/// in another way (it refuses every MCP tool, reads included), which is why
+/// read-only is a deny list on top of a mode and not a mode.
+///
+/// Where the read-only flag comes from (API, runner) is not decided here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionAccess {
+    /// The configured policy, untouched.
+    #[default]
+    Normal,
+    /// No tool that writes, runs a command, spawns an agent or administers the server.
+    ReadOnly,
+}
+
+/// Claude Code tools of the `Edit` category (nexus `tool_category`): they write files.
+const READ_ONLY_DENIED_FILE_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+/// Claude Code tools of the `Command` category: a shell command cannot be told
+/// read from write from outside, so the whole category is refused.
+const READ_ONLY_DENIED_COMMAND_TOOLS: &[&str] = &["Bash", "BashOutput", "KillShell"];
+
+/// Tools that spawn a sub-agent (category `Agent`): the child would not be read-only.
+const READ_ONLY_DENIED_AGENT_TOOLS: &[&str] = &["Task", "Agent"];
+
+/// Name of the project-orchestrator MCP server as the CLI spells it.
+const PO_MCP_PREFIX: &str = "mcp__project-orchestrator__";
+
+impl SessionAccess {
+    /// The tool patterns this access refuses, in the syntax of `disallowed_tools`.
+    ///
+    /// For the project-orchestrator MCP server: every mega-tool the restricted
+    /// profile withholds (admin, vault, protocol, sharing, ...: [`ToolProfile`])
+    /// plus `chat` (its `send_message` opens sessions). The list is computed from
+    /// the real tool list, so a tool added tomorrow is refused until the profile
+    /// admits it. The other mega-tools (task, plan, note, ...) mix reads and
+    /// writes under one name selected by an `action` argument, which a tool
+    /// pattern cannot see: they stay callable (documented limit; the action-level boundary is the REST profile of a later task).
+    pub fn denied_tools(self) -> Vec<String> {
+        match self {
+            Self::Normal => Vec::new(),
+            Self::ReadOnly => {
+                let native = READ_ONLY_DENIED_FILE_TOOLS
+                    .iter()
+                    .chain(READ_ONLY_DENIED_COMMAND_TOOLS)
+                    .chain(READ_ONLY_DENIED_AGENT_TOOLS)
+                    .map(|name| (*name).to_string());
+                let mcp = crate::mcp::tools::all_tools()
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .filter(|name| {
+                        name == "chat"
+                            || !crate::auth::tool_profile::ToolProfile::Restricted.allows_tool(name)
+                    })
+                    .map(|name| format!("{PO_MCP_PREFIX}{name}"));
+                native.chain(mcp).collect()
+            }
+        }
+    }
+
+    /// `disallowed` plus what this access refuses, without duplicates, the
+    /// configured entries first.
+    pub fn merge_disallowed(self, disallowed: &[String]) -> Vec<String> {
+        let mut merged = disallowed.to_vec();
+        for denied in self.denied_tools() {
+            if !merged.contains(&denied) {
+                merged.push(denied);
+            }
+        }
+        merged
+    }
+}
+
+/// [`tool_policy`] for a session of the given access: the read-only deny list
+/// is merged into `disallowed` before the patterns are parsed.
+pub fn tool_policy_with_access(
+    mode: &str,
+    allowed: &[String],
+    disallowed: &[String],
+    access: SessionAccess,
+) -> Option<ToolPolicy> {
+    tool_policy(mode, allowed, &access.merge_disallowed(disallowed))
+}
+
 /// JSON carried by `system_init.tool_policy`: the nexus serde form, unchanged.
 pub fn wire_tool_policy(policy: &ToolPolicy) -> serde_json::Value {
     serde_json::to_value(policy).unwrap_or(serde_json::Value::Null)
@@ -271,6 +366,120 @@ mod tests {
     fn a_malformed_pattern_is_none_never_skipped() {
         assert!(tool_policy("ask", &strings(&["Read"]), &strings(&["Bash("])).is_none());
         assert!(tool_policy("ask", &strings(&["Bash()"]), &[]).is_none());
+    }
+
+    const WRITE_TOOLS: [(&str, ToolCategory, Option<&str>); 9] = [
+        ("Edit", ToolCategory::Edit, Some("/repo/a.rs")),
+        ("Write", ToolCategory::Edit, Some("/repo/a.rs")),
+        ("MultiEdit", ToolCategory::Edit, Some("/repo/a.rs")),
+        ("NotebookEdit", ToolCategory::Edit, Some("/repo/n.ipynb")),
+        ("Bash", ToolCategory::Command, Some("ls")),
+        ("BashOutput", ToolCategory::Command, None),
+        ("Task", ToolCategory::Agent, None),
+        ("mcp__project-orchestrator__admin", ToolCategory::Mcp, None),
+        ("mcp__project-orchestrator__chat", ToolCategory::Mcp, None),
+    ];
+
+    const MODES: [&str; 4] = ["ask", "auto_edits", "plan_only", "trust"];
+
+    fn po_allowed() -> Vec<String> {
+        strings(&["mcp__project-orchestrator__*", "Edit", "Write", "Bash"])
+    }
+
+    /// Replay of the audit: without a read-only access, what each mode does to the write tools.
+    #[test]
+    fn without_read_only_only_plan_only_refuses_the_write_tools_and_trust_allows_them() {
+        for mode in MODES {
+            let policy =
+                tool_policy_with_access(mode, &po_allowed(), &[], SessionAccess::Normal).unwrap();
+            for (tool, category, arg) in WRITE_TOOLS {
+                let decision = policy.decide(tool, arg, category);
+                match mode {
+                    "plan_only" => assert_eq!(decision, PolicyDecision::Deny, "{mode} {tool}"),
+                    "trust" => assert_eq!(decision, PolicyDecision::Allow, "{mode} {tool}"),
+                    _ => assert_ne!(decision, PolicyDecision::Deny, "{mode} {tool}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_only_session_refuses_every_write_tool_in_every_mode_trust_included() {
+        for mode in MODES.iter().chain(LEGACY_MODES.iter()) {
+            let policy =
+                tool_policy_with_access(mode, &po_allowed(), &[], SessionAccess::ReadOnly).unwrap();
+            for (tool, category, arg) in WRITE_TOOLS {
+                assert_eq!(
+                    policy.decide(tool, arg, category),
+                    PolicyDecision::Deny,
+                    "{mode} {tool}"
+                );
+            }
+            // An argument-less call is refused too (fail closed).
+            assert_eq!(
+                policy.decide("Edit", None, ToolCategory::Edit),
+                PolicyDecision::Deny
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_only_session_still_reads_and_keeps_the_mutating_free_mcp_tools() {
+        let policy =
+            tool_policy_with_access("trust", &po_allowed(), &[], SessionAccess::ReadOnly).unwrap();
+        assert_eq!(
+            policy.decide("Read", Some("/repo/a.rs"), ToolCategory::Read),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            policy.decide("Grep", None, ToolCategory::Search),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            policy.decide("mcp__project-orchestrator__code", None, ToolCategory::Mcp),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn the_read_only_deny_list_is_computed_from_the_tool_list_and_keeps_configured_entries() {
+        let denied = SessionAccess::ReadOnly.denied_tools();
+        for expected in [
+            "Edit",
+            "Write",
+            "MultiEdit",
+            "NotebookEdit",
+            "Bash",
+            "mcp__project-orchestrator__admin",
+            "mcp__project-orchestrator__vault",
+            "mcp__project-orchestrator__chat",
+        ] {
+            assert!(denied.iter().any(|d| d == expected), "{expected}");
+        }
+        assert!(!denied
+            .iter()
+            .any(|d| d == "mcp__project-orchestrator__code"));
+        let configured = strings(&["Bash(rm -rf *)", "Edit"]);
+        let merged = SessionAccess::ReadOnly.merge_disallowed(&configured);
+        assert_eq!(&merged[..2], &configured[..]);
+        assert_eq!(merged.iter().filter(|d| *d == "Edit").count(), 1);
+    }
+
+    #[test]
+    fn the_normal_access_changes_nothing() {
+        assert_eq!(SessionAccess::default(), SessionAccess::Normal);
+        let disallowed = strings(&["Bash(rm -rf *)"]);
+        assert_eq!(
+            SessionAccess::Normal.merge_disallowed(&disallowed),
+            disallowed
+        );
+        for mode in MODES {
+            let plain = tool_policy(mode, &po_allowed(), &disallowed).unwrap();
+            let with =
+                tool_policy_with_access(mode, &po_allowed(), &disallowed, SessionAccess::Normal)
+                    .unwrap();
+            assert_eq!(plain, with, "{mode}");
+        }
     }
 
     #[test]
