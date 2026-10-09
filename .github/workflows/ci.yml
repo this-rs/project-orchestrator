@@ -45,7 +45,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  CACHE_VERSION: v1
+  CACHE_VERSION: v2
   CACHE_FRESH: ${{ (github.event_name == 'schedule' || inputs.fresh) && format('-fresh-{0}', github.run_id) || '' }}
   CACHE_SAVE: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
 
@@ -100,10 +100,13 @@ jobs:
           shared-key: "ci-build"
           save-if: false
 
+      # Prebuilt binaries: `cargo install` compiled both tools from source on every run
+      # (200-280 s). Being prebuilt also removes the rustc-version trap noted at the top of
+      # this file (an unlocked install resolving a dependency that needs a newer rustc).
       - name: Install cargo-audit and cargo-deny
-        run: |
-          cargo install cargo-audit --locked
-          cargo install cargo-deny --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
 
       - name: Clean stale lockfile entries
         run: cargo generate-lockfile
@@ -219,6 +222,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
+      - uses: ./.github/actions/test-profile
+
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
@@ -292,6 +297,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
+      - uses: ./.github/actions/test-profile
+
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
@@ -361,6 +368,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: ./.github/actions/test-profile
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
@@ -454,6 +463,8 @@ jobs:
         uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: llvm-tools-preview
+
+      - uses: ./.github/actions/test-profile
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
@@ -575,6 +586,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: ./.github/actions/test-profile
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
