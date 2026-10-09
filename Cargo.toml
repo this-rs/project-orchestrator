@@ -257,6 +257,9 @@ nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "5dbee3d549
 # token the backend signs is the one the server accepts, and that a tool outside it never runs.
 # Dev-only, pure Rust, same pin as above (which contains nexus-tools, #68).
 nexus-tools = { git = "https://github.com/this-rs/nexus.git", rev = "5dbee3d54997d5c5c1e9797588516ccb99776463", features = ["test-tools"] }
+# A real WebSocket client, to test the chat handler end to end (already in the lock
+# tree through axum).
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 
 [[bin]]
 name = "orchestrator"

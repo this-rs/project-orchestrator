@@ -193,6 +193,12 @@ pub struct ChatRequest {
     /// before it reaches the manager.
     #[serde(default)]
     pub attachments: Vec<uuid::Uuid>,
+    /// References (`#kind:id`) the message points at, as the client sent them:
+    /// raw `{kind, id}` objects, checked and folded into `message` as a
+    /// `<po-refs>` block by the API layer (see `refs::compose`). Ignored when
+    /// the `refs_v1` switch is off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<serde_json::Value>,
     /// Session ID to resume (optional — creates new session if None)
     #[serde(default)]
     pub session_id: Option<String>,
@@ -380,6 +386,14 @@ pub struct BackgroundTaskInfo {
 pub enum ChatEvent {
     /// A user message (emitted so multi-tab clients see it)
     UserMessage { content: String },
+    /// What the references of the preceding `user_message` resolved to, sent
+    /// once per turn that carries references, before the first assistant
+    /// event. It belongs to the LAST `user_message` before it in the stream
+    /// (a `user_message` has no id); persisted like any event, so a replay
+    /// has it. `refs_resolved` is the wire name.
+    RefsResolved {
+        refs: Vec<crate::refs::wire::RefResolution>,
+    },
     /// A system-generated hint (post-compaction context, guard hints, auto-continue).
     /// NOT a user message — frontends should render this differently (or hide it).
     /// Does NOT increment the session's message_count.
@@ -524,6 +538,16 @@ pub enum ChatEvent {
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_tool_use_id: Option<String>,
+        /// Stable machine code, when the error has one (`refs_invalid`).
+        /// `message` stays the readable line older clients show.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        /// What exactly was wrong, for a client to switch on (`too_many`, `bad_id`...).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// 0-based index of the offending element of a list, when one is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
     },
     /// User's decision on a permission request (allow or deny).
     /// Persisted alongside the original PermissionRequest so the decision
@@ -776,6 +800,7 @@ impl ChatEvent {
     pub fn event_type(&self) -> &'static str {
         match self {
             ChatEvent::UserMessage { .. } => "user_message",
+            ChatEvent::RefsResolved { .. } => "refs_resolved",
             ChatEvent::SystemHint { .. } => "system_hint",
             ChatEvent::AssistantText { .. } => "assistant_text",
             ChatEvent::Thinking { .. } => "thinking",
@@ -864,6 +889,14 @@ impl ChatEvent {
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 content.hash(&mut hasher);
                 Some(format!("user_message:{}", hasher.finish()))
+            }
+            ChatEvent::RefsResolved { refs } => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                serde_json::to_string(refs)
+                    .unwrap_or_default()
+                    .hash(&mut hasher);
+                Some(format!("refs_resolved:{}", hasher.finish()))
             }
             ChatEvent::SystemHint { content } => {
                 use std::hash::{Hash, Hasher};
@@ -1396,6 +1429,10 @@ pub struct PendingQueueEntry {
     /// The documents attached to it (what a chip needs to be drawn).
     #[serde(default)]
     pub attachments: Vec<super::message_attachments::MessageAttachment>,
+    /// The references attached to it (ids only; the label is the client's to
+    /// look up, as for any chip).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<crate::refs::EntityRef>,
     pub queued_at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub prioritized: bool,
@@ -1914,6 +1951,9 @@ mod tests {
             ChatEvent::Error {
                 message: "CLI not found".into(),
                 parent_tool_use_id: None,
+                code: None,
+                reason: None,
+                index: None,
             },
             ChatEvent::PermissionDecision {
                 id: "pr_1".into(),
@@ -2272,6 +2312,9 @@ mod tests {
             ChatEvent::Error {
                 message: "err".into(),
                 parent_tool_use_id: Some("p4".into()),
+                code: None,
+                reason: None,
+                index: None,
             },
             ChatEvent::PermissionRequest {
                 id: "pr1".into(),

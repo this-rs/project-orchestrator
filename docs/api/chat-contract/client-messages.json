@@ -192,6 +192,16 @@
           ],
           "content": "Add a retry to the upload client.",
           "queue": true,
+          "refs": [
+            {
+              "id": "57cf05c9-25b6-495d-ab07-de4b11d64736",
+              "kind": "plan"
+            },
+            {
+              "id": "2191fcb0-e07c-49c1-9f29-cb9f7441f914",
+              "kind": "rfc"
+            }
+          ],
           "type": "user_message"
         },
         "minimal": {
@@ -211,6 +221,10 @@
         "queue": {
           "required": false,
           "type": "boolean"
+        },
+        "refs": {
+          "required": false,
+          "type": "array"
         },
         "type": {
           "required": true,

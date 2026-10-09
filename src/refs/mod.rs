@@ -22,6 +22,9 @@
 
 pub mod access;
 pub mod block;
+pub mod cite;
+pub mod compose;
+pub mod flag;
 pub mod label;
 pub mod registry;
 pub mod resolvers;
@@ -30,6 +33,7 @@ pub mod search;
 mod search_contract;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod turn;
 pub mod types;
 pub mod validate;
 pub mod wire;

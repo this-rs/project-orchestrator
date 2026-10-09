@@ -155,7 +155,15 @@ pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
 pub trait TurnServices: Send + Sync {
     /// What the model receives for a turn: `sent` (the user's message `shown`,
     /// possibly behind a relayed history) with the knowledge graph's context.
-    async fn prepare(&self, session_id: &str, shown: &str, sent: &str) -> String;
+    /// `turn` is the expansion of `shown` (`refs::turn::expand_user_turn`), made
+    /// once by the runtime: its `#` references, its attachments.
+    async fn prepare(
+        &self,
+        session_id: &str,
+        shown: &str,
+        sent: &str,
+        turn: &crate::refs::turn::TurnExpansion,
+    ) -> String;
     /// The system hint a turn continued automatically starts with
     /// (`post_stream::continuation_message`).
     async fn continuation(&self, session_id: &str) -> String;
@@ -416,10 +424,19 @@ impl AgentSessionHandle {
                 .await
             }
         }
+        // The same expansion as `stream_response` (`refs::turn`), for every turn
+        // whatever started it (a message, the queue, auto-continue, another
+        // instance): a message with `#` references reaches the model as its visible
+        // text plus the pointers, never as the raw block; one without is sent as it
+        // always was (a relayed history, if any, stays in front).
+        let turn = crate::refs::turn::expand_user_turn(&self.graph, shown).await;
+        if let Some(event) = turn.event() {
+            self.emit(event).await;
+        }
         // The knowledge graph's context, as the Claude Code engine gives it to its turns.
         let sent = match &self.services {
-            Some(services) => services.prepare(&self.session_id, shown, sent).await,
-            None => sent.to_string(),
+            Some(services) => services.prepare(&self.session_id, shown, sent, &turn).await,
+            None => turn.native_prompt(shown, sent),
         };
         // A Stop while the turn was prepared (the enrichment awaits) found no turn
         // to interrupt at the provider: it stops this one before it is sent.
@@ -1243,7 +1260,13 @@ mod turn_race_tests {
 
     #[async_trait::async_trait]
     impl TurnServices for Gate {
-        async fn prepare(&self, _session_id: &str, _shown: &str, sent: &str) -> String {
+        async fn prepare(
+            &self,
+            _session_id: &str,
+            _shown: &str,
+            sent: &str,
+            _turn: &crate::refs::turn::TurnExpansion,
+        ) -> String {
             if !self.passed.swap(true, Ordering::SeqCst) {
                 self.entered.notify_one();
                 self.release.notified().await;

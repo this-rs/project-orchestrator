@@ -107,7 +107,7 @@ struct TrackedSession {
 async fn handle_run_ws(socket: WebSocket, state: OrchestratorState, run_id: Uuid, claims: Claims) {
     // Wait for client "ready" signal (must be done before split)
     let mut socket = socket;
-    super::ws_auth::wait_ready_then_auth_ok(&mut socket, &claims).await;
+    super::ws_auth::wait_ready_then_auth_ok(&mut socket, &claims, None).await;
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
     // Subscribe to CrudEvents (RunnerEvents are bridged here)

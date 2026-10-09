@@ -169,3 +169,51 @@ pub async fn world() -> World {
         decision_b,
     }
 }
+
+/// A store holding one uploaded document, with `text` as its only chunk (or
+/// none, for a file whose text could not be extracted).
+pub async fn store_with_document(text: Option<&str>) -> (Arc<MockGraphStore>, Uuid) {
+    let mock = MockGraphStore::new();
+    let id = add_document(&mock, text).await;
+    (Arc::new(mock), id)
+}
+
+/// Add such a document to an existing store.
+pub async fn add_document(mock: &MockGraphStore, text: Option<&str>) -> Uuid {
+    use crate::documents::DocumentFormat;
+    use crate::neo4j::document::{Document, DocumentChunk};
+    let id = Uuid::new_v4();
+    mock.documents.write().await.insert(
+        id,
+        Document {
+            id,
+            filename: "notes.txt".to_string(),
+            format: DocumentFormat::PlainText,
+            sha256: "0".repeat(64),
+            size_bytes: 11,
+            page_count: 0,
+            chunk_count: usize::from(text.is_some()),
+            warnings: vec![],
+            created_at: chrono::Utc::now(),
+            project_id: None,
+            session_id: None,
+            extracted: text.is_some(),
+            mime_type: Some("text/plain".to_string()),
+        },
+    );
+    if let Some(t) = text {
+        mock.document_chunks.write().await.insert(
+            id,
+            vec![DocumentChunk {
+                id: Uuid::new_v4(),
+                text: t.to_string(),
+                start_byte: 0,
+                end_byte: t.len(),
+                page: None,
+                ordinal: 0,
+                embedding: None,
+            }],
+        );
+    }
+    id
+}

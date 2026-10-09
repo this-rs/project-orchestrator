@@ -40,6 +40,7 @@ fn every_fixture_declares_the_contract_version_first() {
         "search_response.json",
         "refs_resolved_event.json",
         "errors.json",
+        "auth_ok_features.json",
     ] {
         let path = format!("{}/tests/fixtures/refs/{name}", env!("CARGO_MANIFEST_DIR"));
         let text = std::fs::read_to_string(path).unwrap();
@@ -256,4 +257,61 @@ fn strict_fixture() {
         let s = bad.as_str().unwrap();
         assert_eq!(block::split(s), (s.to_string(), vec![]), "{s}");
     }
+}
+
+#[test]
+fn auth_ok_features_fixture_is_what_the_server_builds() {
+    use project_orchestrator::api::ws_auth::auth_ok_frame;
+    use project_orchestrator::auth::jwt::Claims;
+    let f = fixture("auth_ok_features.json");
+    let claims = Claims {
+        sub: f["auth_ok_on"]["user"]["id"].as_str().unwrap().into(),
+        email: f["auth_ok_on"]["user"]["email"].as_str().unwrap().into(),
+        name: f["auth_ok_on"]["user"]["name"].as_str().unwrap().into(),
+        iat: 0,
+        exp: 0,
+        token_type: None,
+        scope: None,
+        jti: None,
+    };
+    assert_eq!(
+        auth_ok_frame(
+            &claims,
+            project_orchestrator::refs::flag::features(true).as_deref()
+        ),
+        f["auth_ok_on"]
+    );
+    assert_eq!(
+        auth_ok_frame(
+            &claims,
+            project_orchestrator::refs::flag::features(false).as_deref()
+        ),
+        f["auth_ok_off"]
+    );
+}
+
+#[test]
+fn the_prompt_section_teaches_exactly_the_fixture_kinds_and_the_token_shape() {
+    let section = project_orchestrator::refs::cite::prompt_section();
+    let kinds = fixture("entity_ref.json");
+    for k in kinds["kinds"].as_array().expect("kinds") {
+        assert!(
+            section.contains(k.as_str().unwrap()),
+            "{k} missing: {section}"
+        );
+    }
+    for k in kinds["reserved_kinds_refused_as_kind_disabled"]
+        .as_array()
+        .expect("reserved")
+    {
+        assert!(!section.contains(k.as_str().unwrap()), "{k} is reserved");
+    }
+    // The shape it teaches is the one the golden tokens have: `#kind:` + a 36-character id.
+    let tokens = fixture("tokens.json");
+    for t in tokens["valid"].as_array().expect("valid") {
+        let token = t["token"].as_str().unwrap();
+        assert_eq!(token.len(), 1 + token.find(':').unwrap() + 36, "{token}");
+        assert!(validate_token(token).is_ok(), "{token}");
+    }
+    assert!(section.contains("#kind:uuid") && section.contains("36"));
 }

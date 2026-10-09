@@ -651,6 +651,9 @@ mod tests {
             ChatEvent::Error {
                 message: "fail".into(),
                 parent_tool_use_id: None,
+                code: None,
+                reason: None,
+                index: None,
             },
         ];
 

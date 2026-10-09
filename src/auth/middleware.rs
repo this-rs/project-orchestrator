@@ -830,6 +830,7 @@ mod tests {
             .create_session(&crate::chat::types::ChatRequest {
                 routing_mode: None,
                 attachments: Vec::new(),
+                refs: Vec::new(),
                 message: String::new(),
                 session_id: None,
                 cwd: "/tmp".into(),

@@ -37,6 +37,12 @@ pub enum Principal {
     User(Uuid),
     /// No-auth mode: the instance is open by configuration.
     LocalOpen,
+    /// The session that is answering a turn. The message was authenticated
+    /// when the API took it in; after that (queue, drain, another instance)
+    /// no identity travels with it, so the turn acts as the session itself.
+    /// Today that reads what a signed-in user reads; the day a project or
+    /// workspace rule exists it is the seam where the session's envelope goes.
+    Session,
     /// No usable identity. Never allowed.
     Unauthenticated,
 }
@@ -86,7 +92,10 @@ pub struct OpenInstanceRule;
 
 impl ScopeRule for OpenInstanceRule {
     fn allows(&self, principal: &Principal, _meta: &RefMeta) -> bool {
-        matches!(principal, Principal::User(_) | Principal::LocalOpen)
+        matches!(
+            principal,
+            Principal::User(_) | Principal::LocalOpen | Principal::Session
+        )
     }
 }
 
@@ -406,6 +415,7 @@ mod tests {
         let m = meta_for(&rf(RefKind::Plan, A));
         assert!(OpenInstanceRule.allows(&user(), &m));
         assert!(OpenInstanceRule.allows(&Principal::LocalOpen, &m));
+        assert!(OpenInstanceRule.allows(&Principal::Session, &m));
         assert!(!OpenInstanceRule.allows(&Principal::Unauthenticated, &m));
     }
 

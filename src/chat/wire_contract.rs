@@ -21,6 +21,8 @@
 use crate::api::ws_chat_handler::WsChatClientMessage;
 use crate::chat::message_attachments::MessageAttachment;
 use crate::chat::types::{BackgroundTaskInfo, BackgroundTaskKind, ChatEvent, PendingQueueEntry};
+use crate::refs::wire::{RefResolution, RefStatus, ScopeLabel};
+use crate::refs::{EntityRef, RefKind};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -44,7 +46,7 @@ const UPDATE_COMMAND: &str = "UPDATE_CHAT_CONTRACT=1 cargo test --lib chat::wire
 
 /// Every `ChatEvent` tag the examples must cover. Adding a variant means
 /// adding its tag here AND its examples in [`server_examples`].
-const EXPECTED_SERVER_TAGS: [&str; 33] = [
+const EXPECTED_SERVER_TAGS: [&str; 34] = [
     "active_tasks_update",
     "ask_user_question",
     "assistant_text",
@@ -60,6 +62,7 @@ const EXPECTED_SERVER_TAGS: [&str; 33] = [
     "permission_decision",
     "permission_mode_changed",
     "permission_request",
+    "refs_resolved",
     "result",
     "retrying",
     "secret_request",
@@ -105,6 +108,7 @@ const EXPECTED_CLIENT_TAGS: [&str; 9] = [
 fn variant_tag(e: &ChatEvent) -> &'static str {
     match e {
         ChatEvent::UserMessage { .. } => "user_message",
+        ChatEvent::RefsResolved { .. } => "refs_resolved",
         ChatEvent::SystemHint { .. } => "system_hint",
         ChatEvent::AssistantText { .. } => "assistant_text",
         ChatEvent::Thinking { .. } => "thinking",
@@ -179,6 +183,9 @@ const PARENT_TOOL_USE_ID: &str = "toolu_01ParentTask0000000000";
 const TOOL_USE_ID: &str = "toolu_01Example0000000000000";
 const QUEUED_MESSAGE_ID: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
 const DOCUMENT_ID: &str = "9f8e7d6c-5b4a-4c3d-9e2f-1a0b9c8d7e6f";
+const PLAN_ID: &str = "57cf05c9-25b6-495d-ab07-de4b11d64736";
+const RFC_ID: &str = "2191fcb0-e07c-49c1-9f29-cb9f7441f914";
+const PROJECT_ID: &str = "00333b5f-2d0a-4467-9c98-155e55d2b7e5";
 
 /// The two example frames of one `ChatEvent` variant.
 struct ServerExample {
@@ -392,6 +399,10 @@ fn server_examples() -> Vec<ServerExample> {
                         mime_type: s("application/pdf"),
                         size_bytes: 182_044,
                     }],
+                    refs: vec![
+                        EntityRef::new(RefKind::Plan, fixed_uuid(PLAN_ID)),
+                        EntityRef::new(RefKind::Rfc, fixed_uuid(RFC_ID)),
+                    ],
                     queued_at: ts("2026-01-15T10:30:00Z"),
                     prioritized: true,
                 }],
@@ -402,11 +413,49 @@ fn server_examples() -> Vec<ServerExample> {
             ChatEvent::Error {
                 message: s("Tool execution failed: permission denied"),
                 parent_tool_use_id: parent(),
+                // Only a refused `refs` carries them (`refs_invalid`).
+                code: Some(s("refs_invalid")),
+                reason: Some(s("unknown_kind")),
+                index: Some(2),
             },
             ChatEvent::Error {
                 message: s("Tool execution failed: permission denied"),
                 parent_tool_use_id: None,
+                code: None,
+                reason: None,
+                index: None,
             },
+        ),
+        ServerExample::new(
+            ChatEvent::RefsResolved {
+                refs: vec![
+                    RefResolution {
+                        kind: RefKind::Plan,
+                        id: fixed_uuid(PLAN_ID),
+                        status: RefStatus::Ok,
+                        label: Some(s("Chat : références #/@")),
+                        subtitle: Some(s("12 tâches")),
+                        project: Some(ScopeLabel {
+                            id: fixed_uuid(PROJECT_ID),
+                            slug: s("project-orchestrator"),
+                            name: s("Project Orchestrator"),
+                        }),
+                        workspace: None,
+                        entity_status: Some(s("in_progress")),
+                    },
+                    RefResolution {
+                        kind: RefKind::Task,
+                        id: fixed_uuid("3adeffc9-c8b0-4e2f-a674-55bfcb293433"),
+                        status: RefStatus::NotFound,
+                        label: None,
+                        subtitle: None,
+                        project: None,
+                        workspace: None,
+                        entity_status: None,
+                    },
+                ],
+            },
+            ChatEvent::RefsResolved { refs: vec![] },
         ),
         ServerExample::same(ChatEvent::PermissionDecision {
             id: s("perm_0001"),
@@ -608,7 +657,11 @@ fn client_examples() -> Vec<ClientExample> {
                 "type": "user_message",
                 "content": "Add a retry to the upload client.",
                 "attachments": [DOCUMENT_ID],
-                "queue": true
+                "queue": true,
+                "refs": [
+                    { "kind": "plan", "id": PLAN_ID },
+                    { "kind": "rfc", "id": RFC_ID }
+                ]
             }),
             minimal: json!({
                 "type": "user_message",
@@ -691,10 +744,20 @@ impl ControlFrame {
 fn control_frames() -> Vec<ControlFrame> {
     vec![
         // api::ws_auth::send_auth_ok (called by wait_ready_then_auth_ok)
-        ControlFrame::same(
-            "auth_ok",
-            "api::ws_auth::send_auth_ok",
-            json!({
+        // `features` is absent on a server that predates (or has switched off) refs_v1.
+        ControlFrame {
+            tag: "auth_ok",
+            source: "api::ws_auth::auth_ok_frame",
+            full: json!({
+                "type": "auth_ok",
+                "user": {
+                    "id": "7d6c5b4a-3f2e-4d1c-8b0a-9f8e7d6c5b4a",
+                    "email": "dev@example.com",
+                    "name": "Example Developer"
+                },
+                "features": ["refs_v1"]
+            }),
+            minimal: json!({
                 "type": "auth_ok",
                 "user": {
                     "id": "7d6c5b4a-3f2e-4d1c-8b0a-9f8e7d6c5b4a",
@@ -702,7 +765,7 @@ fn control_frames() -> Vec<ControlFrame> {
                     "name": "Example Developer"
                 }
             }),
-        ),
+        },
         // api::ws_chat_handler::handle_ws_chat_loop — mid-stream join snapshot
         ControlFrame::same(
             "partial_text",
@@ -1123,4 +1186,32 @@ fn rendering_is_stable_and_sorted() {
         "{\n  \"a\": null,\n  \"b\": {\n    \"a\": [\n      {\n        \"x\": 3,\n        \"y\": 2\n      }\n    ],\n    \"z\": 1\n  }\n}\n"
     );
     assert_eq!(generated_files(), generated_files());
+}
+
+/// The `auth_ok` examples are static copies; tie them to the function that
+/// builds the frame, with and without the capability.
+#[test]
+fn auth_ok_examples_are_what_the_server_builds() {
+    let claims = crate::auth::jwt::Claims {
+        sub: "7d6c5b4a-3f2e-4d1c-8b0a-9f8e7d6c5b4a".into(),
+        email: "dev@example.com".into(),
+        name: "Example Developer".into(),
+        iat: 0,
+        exp: 0,
+        token_type: None,
+        scope: None,
+        jti: None,
+    };
+    let frame = control_frames()
+        .into_iter()
+        .find(|f| f.tag == "auth_ok")
+        .expect("auth_ok example");
+    assert_eq!(
+        crate::api::ws_auth::auth_ok_frame(&claims, Some(&["refs_v1"])),
+        frame.full
+    );
+    assert_eq!(
+        crate::api::ws_auth::auth_ok_frame(&claims, None),
+        frame.minimal
+    );
 }

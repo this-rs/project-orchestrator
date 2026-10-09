@@ -294,6 +294,10 @@ pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json
 pub struct VersionFeatures {
     pub embedded_frontend: bool,
     pub serve_frontend: bool,
+    /// Chat references (`#kind:id`) are understood: a client may send `refs`.
+    /// The REST twin of `auth_ok.features: ["refs_v1"]`, readable before any
+    /// WebSocket exists (the first message of a fresh app).
+    pub refs_v1: bool,
 }
 
 /// Build metadata exposed in the version endpoint
@@ -321,6 +325,10 @@ pub async fn get_version(State(state): State<OrchestratorState>) -> Json<Version
         features: VersionFeatures {
             embedded_frontend: cfg!(feature = "embedded-frontend"),
             serve_frontend: state.serve_frontend,
+            refs_v1: state
+                .chat_manager
+                .as_ref()
+                .is_some_and(|m| m.refs_v1_enabled()),
         },
         build: VersionBuild {
             target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
@@ -1201,7 +1209,11 @@ pub async fn delegate_task(
 
     tokio::spawn(async move {
         // Send the prompt
-        if let Err(e) = cm.send_message(&sid, &prompt).await {
+        // Task text is not a composed message: no block may ride on it.
+        if let Err(e) = cm
+            .send_message(&sid, &crate::refs::compose::inert(&prompt))
+            .await
+        {
             tracing::error!(
                 session_id = %sid,
                 task_id = %ev_task_id,
@@ -1335,6 +1347,7 @@ fn delegation_chat_request(
     let mut request = crate::chat::types::ChatRequest {
         routing_mode: None,
         attachments: Vec::new(),
+        refs: Vec::new(),
         message: String::new(), // prompt sent via send_message
         session_id: None,
         cwd,
@@ -6783,6 +6796,22 @@ pub enum AppError {
     /// carries its own status, a stable `code`, the provider concerned and a
     /// suggested action (decision A29).
     Provider(Box<crate::chat::provider::errors::OpenFailure>),
+    /// The `refs` of a chat message are malformed: HTTP 400 with the body
+    /// `{error, code: "refs_invalid", reason, index?}` pinned by
+    /// `tests/fixtures/refs/errors.json`. A variant of its own because every
+    /// other error here is `{error}` with no `code`.
+    RefsInvalid(Box<crate::refs::wire::RefsErrorBody>),
+}
+
+impl From<crate::refs::compose::ComposeError> for AppError {
+    fn from(e: crate::refs::compose::ComposeError) -> Self {
+        match e {
+            crate::refs::compose::ComposeError::Refs(body) => AppError::RefsInvalid(Box::new(body)),
+            crate::refs::compose::ComposeError::Attachments(e) => {
+                AppError::BadRequest(e.to_string())
+            }
+        }
+    }
 }
 
 impl AppError {
@@ -6813,6 +6842,9 @@ impl IntoResponse for AppError {
                 let status = StatusCode::from_u16(failure.status)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 return (status, Json(failure.to_json())).into_response();
+            }
+            AppError::RefsInvalid(body) => {
+                return (StatusCode::BAD_REQUEST, Json(*body)).into_response();
             }
             AppError::Internal(e) => {
                 // Never leak internal details (DB errors, paths, queries) to the client.

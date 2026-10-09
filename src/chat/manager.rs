@@ -617,6 +617,9 @@ pub struct ChatManager {
     /// Per-turn model routing (`full` mode): the shared decider and the router of each
     /// live session. Empty until [`ChatManager::with_turn_decider`].
     pub(crate) turn_routing: Arc<super::agent_hooks::TurnRouting>,
+    /// The `refs_v1` switch (on unless `REFS_V1=0`): whether the API layer folds
+    /// `refs` into messages and the server announces the capability.
+    pub(crate) refs_v1: bool,
 }
 
 // ============================================================================
@@ -918,12 +921,16 @@ pub(crate) struct TurnProtocol {
 /// before every turn — the Claude Code engine in `stream_response`, the agent
 /// engine through [`ManagerTurnServices`] — so a message gets the same context
 /// whatever drives the session.
+///
+/// `excluded_note_ids`: the notes the user pointed at with `#` (`refs::turn`): the
+/// knowledge injection does not repeat them.
 pub(crate) async fn enrichment_for_turn(
     graph: &Arc<dyn GraphStore>,
     pipeline: &super::enrichment::EnrichmentPipeline,
     session_id: &str,
     message: &str,
     protocol: TurnProtocol,
+    excluded_note_ids: std::collections::HashSet<String>,
 ) -> Option<String> {
     let uuid = Uuid::parse_str(session_id).ok()?;
     let node = graph.get_chat_session(uuid).await.ok().flatten()?;
@@ -947,7 +954,7 @@ pub(crate) async fn enrichment_for_turn(
         cwd: Some(node.cwd),
         protocol_run_id: protocol.run_id,
         protocol_state: protocol.state,
-        excluded_note_ids: Default::default(), // no dedup in send_message path
+        excluded_note_ids,
         reasoning_path_tracker: protocol.reasoning_path_tracker,
     };
     let ctx = pipeline.execute(&input).await;
@@ -978,27 +985,47 @@ pub(crate) struct ManagerTurnServices {
 
 #[async_trait::async_trait]
 impl super::agent_runtime::TurnServices for ManagerTurnServices {
-    async fn prepare(&self, session_id: &str, shown: &str, sent: &str) -> String {
-        // Attachments: references in the conversation, content for the model.
-        let sent = super::message_attachments::expand_for_agent(&self.graph, sent).await;
-        let message = super::message_attachments::expand_for_agent(&self.graph, shown).await;
+    async fn prepare(
+        &self,
+        session_id: &str,
+        shown: &str,
+        sent: &str,
+        turn: &crate::refs::turn::TurnExpansion,
+    ) -> String {
+        // What follows the enrichment. No references: the attachments expanded
+        // (references in the conversation, content for the model), a relayed
+        // history kept in front. References: the relay, the visible text, its
+        // `<po-context>` pointers, then the documents (`TurnExpansion::native_prompt`).
+        let body = if turn.resolved.is_empty() {
+            if sent == shown {
+                turn.enrichment_text.clone()
+            } else {
+                super::message_attachments::expand_for_agent(&self.graph, sent).await
+            }
+        } else {
+            turn.native_prompt(shown, sent)
+        };
+        // The enrichment reads what the user typed (the attachments' text, without
+        // references), and does not inject again the notes the user pointed at.
         let prepared = match enrichment_for_turn(
             &self.graph,
             &self.enrichment_pipeline,
             session_id,
-            &message,
+            &turn.enrichment_text,
             TurnProtocol::default(),
+            turn.excluded_note_ids.clone(),
         )
         .await
         {
-            Some(md) => prepend_enrichment(&md, &sent),
-            None => sent,
+            Some(md) => prepend_enrichment(&md, &body),
+            None => body,
         };
         // The hook of the turn only sees the length of the text: hand it the text of
         // THIS turn, whatever started it (a message, the queue, a hint, another
-        // instance), right before it is sent.
+        // instance), right before it is sent — what the user typed, not the
+        // `<po-refs>`/`<po-attachments>` blocks around it.
         if let Some(router) = self.turn_routing.get(session_id) {
-            router.set_last_message(shown);
+            router.set_last_message(&crate::refs::turn::visible_text(shown));
         }
         prepared
     }
@@ -1347,6 +1374,7 @@ impl ChatManager {
             nn_router: None,
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             turn_routing: Arc::new(super::agent_hooks::TurnRouting::default()),
+            refs_v1: crate::refs::flag::from_env(),
         }
     }
 
@@ -1414,7 +1442,20 @@ impl ChatManager {
             nn_router: None,
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             turn_routing: Arc::new(super::agent_hooks::TurnRouting::default()),
+            refs_v1: crate::refs::flag::from_env(),
         }
+    }
+
+    /// Turn `refs_v1` on or off (the default comes from the environment).
+    pub fn with_refs_v1(mut self, on: bool) -> Self {
+        self.refs_v1 = on;
+        self
+    }
+
+    /// Whether `refs_v1` is on: the API layer folds `refs` into messages and
+    /// `auth_ok` announces the capability.
+    pub fn refs_v1_enabled(&self) -> bool {
+        self.refs_v1
     }
 
     /// Lets the cognitive router choose the model of each turn of a session in routing
@@ -1520,6 +1561,9 @@ impl ChatManager {
         let Some(router) = self.turn_routing.get(session_id) else {
             return;
         };
+        // The routing reads what the user typed, not the blocks around it.
+        let typed = crate::refs::turn::visible_text(message);
+        let message = typed.as_str();
         router.set_last_message(message);
         let ctx = router.next_turn_context(message.chars().count());
         let before = ctx.current_model.clone();
@@ -2613,7 +2657,10 @@ impl ChatManager {
 
         // No project → compose with defaults (L0, no FSM, no dynamic context)
         let Some(slug) = project_slug else {
-            let input = ComposerInput::default();
+            let input = ComposerInput {
+                cite_refs: self.refs_v1,
+                ..Default::default()
+            };
             return (FsmPromptComposer::compose(&input), empty_ids);
         };
 
@@ -2625,7 +2672,10 @@ impl ChatManager {
                     "Failed to fetch project context for '{}': {} — using base prompt only",
                     slug, e
                 );
-                let input = ComposerInput::default();
+                let input = ComposerInput {
+                    cite_refs: self.refs_v1,
+                    ..Default::default()
+                };
                 return (FsmPromptComposer::compose(&input), empty_ids);
             }
         };
@@ -2802,6 +2852,7 @@ impl ChatManager {
             model: model.unwrap_or(""),
             message_embedding: message_embedding.as_ref(),
             external_tools_available,
+            cite_refs: self.refs_v1,
         };
 
         // Use compose_with_record to get the routing decision for trajectory tracking.
@@ -3507,6 +3558,9 @@ impl ChatManager {
                     MASKING_FAILED_SUBTYPE => vec![ChatEvent::Error {
                         message: MASKING_FAILED_MESSAGE.to_string(),
                         parent_tool_use_id: None,
+                        code: None,
+                        reason: None,
+                        index: None,
                     }],
                     "init" => {
                         // Extract session metadata from init system message
@@ -3719,10 +3773,11 @@ impl ChatManager {
                 (runner_prompt, std::collections::HashSet::new())
             } else {
                 // Conversational mode: use the generic PO system prompt with routing
-                let routing_message = if request.message.is_empty() {
+                let typed_message = crate::refs::turn::visible_text(&request.message);
+                let routing_message = if typed_message.is_empty() {
                     request.task_context.as_deref().unwrap_or("")
                 } else {
-                    &request.message
+                    &typed_message
                 };
                 self.build_system_prompt(
                     project_slug.as_deref(),
@@ -3888,7 +3943,7 @@ impl ChatManager {
                     explicit_model: request.model.is_some(),
                     routing_mode: request.routing_mode,
                     permission_mode: request.permission_mode.as_deref(),
-                    message: &request.message,
+                    message: &crate::refs::turn::visible_text(&request.message),
                     next_turn: 1,
                 },
             )
@@ -4238,9 +4293,11 @@ impl ChatManager {
             );
         }
 
-        // Auto-generate title and preview from the first user message
+        // Auto-generate title and preview from the first user message — what the
+        // user typed, never the `<po-refs>`/`<po-attachments>` blocks around it.
         {
-            let msg = &request.message;
+            let typed = crate::refs::turn::visible_text(&request.message);
+            let msg = &typed;
             let title = if msg.chars().count() > 80 {
                 let truncated: String = msg.chars().take(77).collect();
                 format!("{}...", truncated.trim_end())
@@ -4937,15 +4994,36 @@ impl ChatManager {
         // When true, we'll rebuild and re-inject project context after the stream ends.
         let mut needs_post_compaction_injection = false;
 
-        // Record user message in memory manager
-        if let Some(ref mm) = memory_manager {
-            let mut mm = mm.lock().await;
-            mm.record_user_message(&prompt);
+        // The ONE expansion of this turn's stored message (`refs::turn`, shared with
+        // the agent runtime): the visible text, the `<po-context>` pointers of its
+        // `#` references, the attached documents' text. A message without references
+        // is expanded exactly as before.
+        let turn = crate::refs::turn::expand_user_turn(&graph, &prompt).await;
+
+        // Tell the clients what the references resolved to (persisted for replay).
+        if let Some(event) = turn.event() {
+            emit_chat(event.clone(), &events_tx, &nats, &session_id);
+            if let Ok(uuid) = Uuid::parse_str(&session_id) {
+                let record = ChatEventRecord {
+                    id: Uuid::new_v4(),
+                    session_id: uuid,
+                    seq: next_seq.fetch_add(1, Ordering::SeqCst),
+                    event_type: event.event_type().to_string(),
+                    data: serde_json::to_string(&event).unwrap_or_default(),
+                    created_at: chrono::Utc::now(),
+                };
+                let _ = graph.store_chat_events(uuid, vec![record]).await;
+            }
         }
 
-        // Swap the `<po-attachments>` reference block for the documents' text:
-        // the stored/broadcast message keeps references only, the agent gets content.
-        let prompt = super::message_attachments::expand_for_agent(&graph, &prompt).await;
+        // Record user message in memory manager (what the user typed)
+        if let Some(ref mm) = memory_manager {
+            let mut mm = mm.lock().await;
+            mm.record_user_message(&turn.memory_text);
+        }
+
+        // What the enrichment reads, and what it must not inject twice.
+        let prompt = turn.enrichment_text.clone();
 
         // ===== PRE-ENRICHMENT PIPELINE =====
         // Enrich the prompt with context from the knowledge graph BEFORE the LLM call.
@@ -4963,13 +5041,23 @@ impl ChatManager {
                     })
                     .unwrap_or_default()
             };
-            match enrichment_for_turn(&graph, &enrichment_pipeline, &session_id, &prompt, protocol)
-                .await
+            match enrichment_for_turn(
+                &graph,
+                &enrichment_pipeline,
+                &session_id,
+                &prompt,
+                protocol,
+                turn.excluded_note_ids.clone(),
+            )
+            .await
             {
                 Some(enrichment_md) => prepend_enrichment(&enrichment_md, &prompt),
                 None => prompt,
             }
         };
+
+        // After the (enriched) visible text: the pointers, then the documents.
+        let prompt = format!("{prompt}{}", turn.model_tail);
 
         // Events are persisted in Neo4j — the WebSocket replay handles late-joining clients.
 
@@ -5086,6 +5174,9 @@ impl ChatManager {
                                 ChatEvent::Error {
                                     message: format!("Error: {}", e),
                                     parent_tool_use_id: None,
+                                    code: None,
+                                    reason: None,
+                                    index: None,
                                 },
                                 &events_tx,
                                 &nats,
@@ -5680,6 +5771,9 @@ impl ChatManager {
                                         ChatEvent::Error {
                                             message: format!("Error: {}", e),
                                             parent_tool_use_id: None,
+                                            code: None,
+                                            reason: None,
+                                            index: None,
                                         },
                                         &events_tx,
                                         &nats,
@@ -6729,6 +6823,7 @@ impl ChatManager {
         let request = ChatRequest {
             routing_mode: None,
             attachments: Vec::new(),
+            refs: Vec::new(),
             message: message.to_string(),
             session_id: None,
             cwd: node.cwd.clone(),
@@ -9323,7 +9418,7 @@ impl ChatManager {
             super::provider::cognitive::load_routing(self.graph.as_ref(), project_slug).await?;
         let signature = match role {
             super::provider::resolver::Role::Pilot => TaskSignature::from_chat_request(
-                &request.message,
+                &crate::refs::turn::visible_text(&request.message),
                 !request.attachments.is_empty(),
                 project_slug,
                 ContextHints::default(),
@@ -9806,7 +9901,7 @@ impl ChatManager {
                 explicit_model: request.model.is_some(),
                 routing_mode: request.routing_mode,
                 permission_mode: request.permission_mode.as_deref(),
-                message: &request.message,
+                message: &crate::refs::turn::visible_text(&request.message),
                 next_turn: 0,
             },
         )
@@ -12982,6 +13077,7 @@ mod tests {
         ChatRequest {
             routing_mode: None,
             attachments: Vec::new(),
+            refs: Vec::new(),
             message: "go".into(),
             session_id: None,
             cwd: "/tmp/test".into(),
@@ -15104,6 +15200,9 @@ mod tests {
             ChatEvent::Error {
                 message: "Something went wrong".into(),
                 parent_tool_use_id: None,
+                code: None,
+                reason: None,
+                index: None,
             },
             ChatEvent::Result {
                 session_id: "cli-123".into(),
@@ -19265,6 +19364,20 @@ pub(crate) mod test_support {
         .await
     }
 
+    /// A live session whose "CLI" is an in-memory transport: the handle shows
+    /// what the SDK writes to the CLI (`sent_input_rx`) and lets the test answer
+    /// (`inbound_message_tx`). Needs no Claude CLI installed.
+    pub(crate) async fn insert_mock_cli_session(
+        manager: &ChatManager,
+        session_id: &str,
+    ) -> nexus_claude::transport::mock::MockTransportHandle {
+        let (transport, handle) = nexus_claude::transport::mock::MockTransport::pair();
+        let mut client = InteractiveClient::from_transport(transport);
+        client.connect().await.expect("mock client connects");
+        insert_session_with_client(manager, session_id, client, false, &[]).await;
+        handle
+    }
+
     /// Like `insert_live_session`, but needs no Claude CLI installed: the
     /// client is given an explicit (never spawned) binary path, so building
     /// it does not search the machine. For tests that only care that the
@@ -19279,7 +19392,7 @@ pub(crate) mod test_support {
         insert_session_with_client(manager, session_id, client, false, &[]).await;
     }
 
-    async fn insert_session_with_client(
+    pub(crate) async fn insert_session_with_client(
         manager: &ChatManager,
         session_id: &str,
         client: InteractiveClient,
@@ -19390,5 +19503,87 @@ mod agent_env_tests {
                 "{secret} must be hidden from agents"
             );
         }
+    }
+}
+
+/// `ManagerTurnServices::prepare` × `refs::turn`: what the agent engine sends for
+/// a turn whose message carries `#` references (H3 enrichment + refs_v1).
+#[cfg(test)]
+mod refs_turn_services_tests {
+    use super::*;
+    use crate::chat::agent_runtime::TurnServices;
+    use crate::chat::enrichment::{
+        EnrichmentConfig, EnrichmentInput, EnrichmentPipeline, EnrichmentSource,
+        ParallelEnrichmentStage, StageOutput,
+    };
+    use crate::refs::types::{EntityRef, RefKind};
+    use std::sync::Mutex as StdMutex;
+
+    /// What one enrichment read: the message and the notes it must not inject.
+    type Seen = (String, std::collections::HashSet<String>);
+
+    /// Records what each enrichment reads, and answers one section.
+    #[derive(Default)]
+    struct Recording {
+        seen: Arc<StdMutex<Vec<Seen>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ParallelEnrichmentStage for Recording {
+        async fn execute(&self, input: &EnrichmentInput) -> anyhow::Result<StageOutput> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((input.message.clone(), input.excluded_note_ids.clone()));
+            let mut out = StageOutput::new("recording");
+            out.add_section("CTX", "graph context", "recording", EnrichmentSource::Other);
+            Ok(out)
+        }
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn is_enabled(&self, _config: &EnrichmentConfig) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_enriches_the_typed_text_once_and_sends_the_pointers_behind_the_relay() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let session = crate::test_helpers::test_chat_session(None);
+        mock.create_chat_session(&session).await.unwrap();
+        let graph: Arc<dyn GraphStore> = mock;
+        let stage = Recording::default();
+        let seen = Arc::clone(&stage.seen);
+        let mut pipeline = EnrichmentPipeline::new(EnrichmentConfig::default());
+        pipeline.add_parallel_stage(Box::new(stage));
+        let services = ManagerTurnServices {
+            graph: graph.clone(),
+            enrichment_pipeline: Arc::new(pipeline),
+            turn_routing: Arc::default(),
+            nats: None,
+        };
+
+        let note = Uuid::new_v4();
+        let typed = "look at #note:x";
+        let stored = crate::refs::block::encode(typed, &[EntityRef::new(RefKind::Note, note)]);
+        let sent = format!("RELAY HISTORY\n\n{stored}");
+        let turn = crate::refs::turn::expand_user_turn_if(&graph, &stored, true).await;
+        let out = services
+            .prepare(&session.id.to_string(), &stored, &sent, &turn)
+            .await;
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one enrichment per turn: {seen:?}");
+        assert_eq!(seen[0].0, typed, "the enrichment reads the typed text");
+        assert!(
+            seen[0].1.contains(&note.to_string()),
+            "the note pointed at is not injected again: {seen:?}"
+        );
+        assert!(
+            out.starts_with("## CTX\ngraph context\n\n---\n\nRELAY HISTORY\n\nlook at #note:x\n\n<po-context nonce=\""),
+            "{out}"
+        );
+        assert!(!out.contains("<po-refs>"), "{out}");
     }
 }

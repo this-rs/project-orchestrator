@@ -218,6 +218,7 @@ fn request(provider: Option<&str>, project: Option<&str>, mode: &str) -> ChatReq
     ChatRequest {
         routing_mode: None,
         attachments: Vec::new(),
+        refs: Vec::new(),
         message: "hi there".into(),
         session_id: None,
         cwd: std::env::temp_dir().display().to_string(),
@@ -2306,6 +2307,193 @@ mod provider_switch {
 }
 
 // ============================================================================
+// References (`refs_v1`) on the native engine
+// ============================================================================
+//
+// A native session never goes through `stream_response`: it sends the text to
+// the model itself (`agent_runtime`). These tests prove the references reach
+// the model there too, as pointers, against the real wire of the fake server.
+
+mod refs_native {
+    use super::*;
+    use crate::refs::compose::compose_user_message;
+    use crate::refs::test_support::{world, World};
+
+    fn script_for(keys: &[&str]) -> Value {
+        let mut routes = script().as_array().cloned().unwrap();
+        for key in keys {
+            routes.push(sse_route(
+                key,
+                vec![
+                    delta(json!({"content": format!("answer to {key}")})),
+                    json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                    json!({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}),
+                    json!("[DONE]"),
+                ],
+            ));
+        }
+        Value::Array(routes)
+    }
+
+    async fn setup(keys: &[&str]) -> (FakeOpenAi, World, ChatManager) {
+        let fake = FakeOpenAi::start(script_for(keys));
+        let w = world().await;
+        store_instance(&w.graph, &instance(&fake, "none")).await;
+        consent(&w.graph, "proj", "local", &fake.origin()).await;
+        let manager = manager(w.graph.clone(), true);
+        (fake, w, manager)
+    }
+
+    async fn stored(w: &World, text: &str, refs: &[Value]) -> String {
+        let graph: Arc<dyn GraphStore> = w.graph.clone();
+        compose_user_message(&graph, text, refs, &[], true)
+            .await
+            .unwrap()
+    }
+
+    fn task_ref(w: &World) -> Value {
+        json!({"kind": "task", "id": w.task_a.id})
+    }
+
+    /// The body the model received for the turn named by `key`.
+    fn body_for(fake: &FakeOpenAi, key: &str) -> String {
+        fake.chat_requests()
+            .iter()
+            .map(|r| r["body"].to_string())
+            .find(|b| b.contains(key))
+            .unwrap_or_else(|| panic!("no request to the model mentions {key}"))
+    }
+
+    async fn persisted_types(w: &World, sid: &str) -> Vec<(i64, String)> {
+        w.graph
+            .get_chat_events(Uuid::parse_str(sid).unwrap(), 0, 200)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.seq, r.event_type))
+            .collect()
+    }
+
+    async fn wait_for_persisted(w: &World, sid: &str, event_type: &str, count: usize) {
+        for _ in 0..200 {
+            let n = persisted_types(w, sid)
+                .await
+                .iter()
+                .filter(|e| e.1 == event_type)
+                .count();
+            if n >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{count} {event_type} event(s) never persisted");
+    }
+
+    #[tokio::test]
+    async fn a_native_session_opened_with_references_gives_the_model_the_pointers() {
+        let (fake, w, manager) = setup(&["PINNED-ONE"]).await;
+        let mut req = request(Some("local"), Some("proj"), "default");
+        req.message = stored(&w, "PINNED-ONE #task:x", &[task_ref(&w)]).await;
+        let created = manager.create_session(&req).await.unwrap();
+        let sid = created.session_id;
+        wait_for_persisted(&w, &sid, "result", 1).await;
+
+        let body = body_for(&fake, "PINNED-ONE");
+        assert!(body.contains("po-context"), "{body}");
+        assert!(body.contains("Tâche alpha refs"), "{body}");
+        assert!(
+            !body.contains("po-refs"),
+            "the model must never see the raw block: {body}"
+        );
+        assert!(
+            !body.contains("Faire les refs"),
+            "pointer depth: no content"
+        );
+
+        // Stored and replayed: the message as written, then what it resolved to.
+        let events = persisted_types(&w, &sid).await;
+        let user = events.iter().find(|e| e.1 == "user_message").unwrap().0;
+        let resolved = events.iter().find(|e| e.1 == "refs_resolved").unwrap().0;
+        assert!(user < resolved);
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_native_session_that_is_sent_a_message_with_references_gives_the_model_the_pointers()
+    {
+        let (fake, w, manager) = setup(&["hi there", "PINNED-TWO"]).await;
+        let created = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap();
+        let sid = created.session_id;
+        wait_for_persisted(&w, &sid, "result", 1).await;
+
+        manager
+            .send_message(&sid, &stored(&w, "PINNED-TWO", &[task_ref(&w)]).await)
+            .await
+            .unwrap();
+        wait_for_persisted(&w, &sid, "result", 2).await;
+        let body = body_for(&fake, "PINNED-TWO");
+        assert!(
+            body.contains("po-context") && body.contains("Tâche alpha refs"),
+            "{body}"
+        );
+        assert!(!body.contains("po-refs"), "{body}");
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_native_message_without_references_is_sent_untouched() {
+        let (fake, w, manager) = setup(&["hi there"]).await;
+        let created = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap();
+        let sid = created.session_id;
+        wait_for_persisted(&w, &sid, "result", 1).await;
+        let body = body_for(&fake, "hi there");
+        // The system prompt may NAME the block (citation section); no block was injected.
+        assert!(!body.contains("<po-context nonce="), "{body}");
+        assert!(persisted_types(&w, &sid)
+            .await
+            .iter()
+            .all(|e| e.1 != "refs_resolved"));
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_resumed_native_session_expands_the_references_of_the_message_that_resumes_it() {
+        let (fake, w, manager) = setup(&["hi there", "PINNED-THREE"]).await;
+        let created = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap();
+        let sid = created.session_id;
+        wait_for_persisted(&w, &sid, "result", 1).await;
+        manager.close_session(&sid).await.unwrap();
+
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        manager
+            .resume_session(
+                &sid,
+                &stored(&w, "PINNED-THREE", &[task_ref(&w)]).await,
+                Some(&claims),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("resume failed: {e:#}"));
+        wait_for_persisted(&w, &sid, "result", 2).await;
+        let body = body_for(&fake, "PINNED-THREE");
+        assert!(
+            body.contains("po-context") && body.contains("Tâche alpha refs"),
+            "{body}"
+        );
+        assert!(!body.contains("po-refs"), "{body}");
+        manager.close_session(&sid).await.unwrap();
+    }
+}
+
+// ============================================================================
 // Engine parity: what the Claude Code engine does around a turn, the agent
 // engine does too, on a scripted provider (no process, no network).
 // ============================================================================
@@ -2617,6 +2805,7 @@ mod parity {
             &r.sid,
             message,
             Default::default(),
+            Default::default(),
         )
         .await
         .expect("the graph has context for this message");
@@ -2894,5 +3083,147 @@ mod parity {
         let sent = r.sent();
         assert!(sent.len() == 2 && sent[1].ends_with("after"), "{sent:?}");
         assert_eq!(r.interrupts(), 1);
+    }
+
+    // ----- references (`refs_v1`) × the H3 queue of the agent engine -----
+
+    /// A decider that is never right: the router of the test only records the text.
+    struct NoDecider;
+
+    #[async_trait]
+    impl crate::chat::provider::cognitive::decision::Decider for NoDecider {
+        async fn decide(
+            &self,
+            _request: &crate::chat::provider::cognitive::decision::DecideRequest,
+        ) -> anyhow::Result<crate::chat::provider::cognitive::decision::CognitiveDecision> {
+            anyhow::bail!("not asked in this test")
+        }
+    }
+
+    struct NoPool;
+
+    #[async_trait]
+    impl crate::chat::agent_hooks::PoolSource for NoPool {
+        async fn pool(
+            &self,
+            _provider_id: &str,
+        ) -> Vec<crate::chat::provider::cognitive::candidates::ModelFacts> {
+            Vec::new()
+        }
+    }
+
+    /// refs × H3 message queue: a message HELD with `#` references while a turn
+    /// runs is listed with its references (not the raw block); when the queue plays
+    /// it, the model gets the typed text and the `<po-context>` pointers — never the
+    /// `<po-refs>` block — behind ONE enrichment computed on the typed text; the
+    /// `refs_resolved` event is stored; the turn router reads the typed text.
+    #[tokio::test]
+    async fn a_held_message_with_references_keeps_them_and_reaches_the_model_expanded() {
+        use crate::refs::types::{EntityRef, RefKind};
+
+        let mut r = rig(
+            ProviderKind::Native,
+            vec![vec![
+                Step::Sleep { ms: 300 },
+                steps::text("done"),
+                steps::done(&caps()),
+            ]],
+        )
+        .await;
+        let mut plan = crate::test_helpers::test_plan();
+        plan.title = "Wire the references".into();
+        plan.status = crate::neo4j::models::PlanStatus::InProgress;
+        plan.project_id = Some(r.project.id);
+        r.graph.create_plan(&plan).await.unwrap();
+        r.graph
+            .link_plan_to_project(plan.id, r.project.id)
+            .await
+            .unwrap();
+        let router = Arc::new(crate::chat::agent_hooks::TurnRouter::new(
+            crate::chat::agent_hooks::TurnRouterSpec {
+                decider: Arc::new(NoDecider),
+                pool: Arc::new(NoPool),
+                routing: Default::default(),
+                provider_id: "claude-code".into(),
+                session_id: Uuid::parse_str(&r.sid).ok(),
+                project_slug: None,
+                trust: false,
+                explicit_model: false,
+                current_model: "m".into(),
+                next_turn: 0,
+            },
+        ));
+        r.manager.turn_routing.insert(&r.sid, Arc::clone(&router));
+
+        r.manager.send_message(&r.sid, "first").await.unwrap();
+        r.turns_sent(1).await;
+        let typed = "after you, see #plan:wire";
+        let pointed = EntityRef::new(RefKind::Plan, plan.id);
+        let stored = crate::refs::block::encode(typed, &[pointed]);
+        assert!(r.manager.queue_user_message(&r.sid, &stored).await.unwrap());
+
+        // Listed with its references, the block kept out of the text.
+        let listed = next_event(&mut r.rx, |e| matches!(e, ChatEvent::PendingQueue { .. })).await;
+        let ChatEvent::PendingQueue { messages } = listed else {
+            unreachable!()
+        };
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, typed);
+        assert_eq!(messages[0].refs, vec![pointed]);
+
+        r.turn_end().await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        let second = &sent[1];
+        assert!(!second.contains("<po-refs>"), "the raw block: {second}");
+        assert!(second.contains("<po-context nonce=\""), "{second}");
+        assert!(
+            second.contains(&format!(
+                "- plan \"Wire the references\" [in_progress] id={}",
+                plan.id
+            )),
+            "the pointer: {second}"
+        );
+        assert_eq!(second.matches(typed).count(), 1, "{second}");
+
+        // One enrichment, on what the user typed, in front of the expanded text.
+        let graph: Arc<dyn GraphStore> = r.graph.clone();
+        let enrichment = super::super::manager::enrichment_for_turn(
+            &graph,
+            &r.manager.enrichment_pipeline,
+            &r.sid,
+            typed,
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .expect("the graph has context for this message");
+        assert!(
+            second.starts_with(&super::super::manager::prepend_enrichment(
+                &enrichment,
+                typed
+            )),
+            "{second}"
+        );
+
+        // What the references resolved to is stored for replay.
+        let stored_events = r
+            .graph
+            .get_chat_events(Uuid::parse_str(&r.sid).unwrap(), 0, 500)
+            .await
+            .unwrap();
+        assert!(
+            stored_events
+                .iter()
+                .any(|e| e.event_type == "refs_resolved" && e.data.contains(&plan.id.to_string())),
+            "{:?}",
+            stored_events
+                .iter()
+                .map(|e| &e.event_type)
+                .collect::<Vec<_>>()
+        );
+
+        // The router of the session reads the typed text of the queued turn.
+        assert_eq!(router.last_message().as_deref(), Some(typed));
     }
 }
