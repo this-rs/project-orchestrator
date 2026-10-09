@@ -972,6 +972,7 @@ pub(crate) async fn enrichment_for_turn(
 pub(crate) struct ManagerTurnServices {
     graph: Arc<dyn GraphStore>,
     enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
+    turn_routing: Arc<super::agent_hooks::TurnRouting>,
 }
 
 #[async_trait::async_trait]
@@ -980,7 +981,7 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         // Attachments: references in the conversation, content for the model.
         let sent = super::message_attachments::expand_for_agent(&self.graph, sent).await;
         let message = super::message_attachments::expand_for_agent(&self.graph, shown).await;
-        match enrichment_for_turn(
+        let prepared = match enrichment_for_turn(
             &self.graph,
             &self.enrichment_pipeline,
             session_id,
@@ -991,7 +992,14 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         {
             Some(md) => prepend_enrichment(&md, &sent),
             None => sent,
+        };
+        // The hook of the turn only sees the length of the text: hand it the text of
+        // THIS turn, whatever started it (a message, the queue, a hint, another
+        // instance), right before it is sent.
+        if let Some(router) = self.turn_routing.get(session_id) {
+            router.set_last_message(shown);
         }
+        prepared
     }
 }
 
@@ -5833,10 +5841,8 @@ impl ChatManager {
     /// Send a follow-up message to an existing session
     pub async fn send_message(&self, session_id: &str, message: &str) -> Result<()> {
         if let Some(handle) = self.agent_runtime.get(session_id).await {
-            // The hook of the turn only sees the length of the text: hand it the text.
-            if let Some(router) = self.turn_routing.get(session_id) {
-                router.set_last_message(message);
-            }
+            // The turn router learns the text when the turn is prepared
+            // (`ManagerTurnServices::prepare`): a queued message must not overwrite it.
             return handle.send_message(message).await;
         }
         // Check is_streaming with read lock first — if streaming, queue the message
@@ -6015,6 +6021,9 @@ impl ChatManager {
     /// post-compaction context re-injection) without killing child processes
     /// (cargo build, npm install, etc.).
     pub async fn inject_hint(&self, session_id: &str, message: &str) -> Result<()> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return handle.inject_hint(message).await;
+        }
         let sessions = self.active_sessions.read().await;
         let session = sessions
             .get(session_id)
@@ -6048,6 +6057,9 @@ impl ChatManager {
     /// Returns `true` when the message was held, `false` when the session was
     /// idle and the message was simply sent.
     pub async fn queue_user_message(&self, session_id: &str, message: &str) -> Result<bool> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return handle.queue_message(message).await;
+        }
         {
             let sessions = self.active_sessions.read().await;
             let session = sessions
@@ -6098,6 +6110,9 @@ impl ChatManager {
         &self,
         session_id: &str,
     ) -> Option<Vec<super::types::PendingQueueEntry>> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return Some(handle.queue_snapshot().await);
+        }
         let sessions = self.active_sessions.read().await;
         let session = sessions.get(session_id)?;
         let queue = session.pending_messages.lock().await;
@@ -6116,6 +6131,10 @@ impl ChatManager {
         session_id: &str,
         op: &super::pending_queue::QueueOp,
     ) -> Result<bool> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            handle.queue_op(op).await;
+            return Ok(true);
+        }
         {
             let sessions = self.active_sessions.read().await;
             if let Some(session) = sessions.get(session_id) {
@@ -9757,6 +9776,7 @@ impl ChatManager {
         Arc::new(ManagerTurnServices {
             graph: self.graph.clone(),
             enrichment_pipeline: self.enrichment_pipeline.clone(),
+            turn_routing: Arc::clone(&self.turn_routing),
         })
     }
 
@@ -12877,7 +12897,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_path_refuses_a_second_turn_while_one_runs_and_answers_permissions() {
+    async fn agent_path_queues_a_second_turn_while_one_runs_and_answers_permissions() {
         use nexus_claude::agent::AgentEvent;
         let (manager, _graph, fake) = agent_manager();
         let sid = manager
@@ -12887,11 +12907,18 @@ mod tests {
             .session_id;
         let mut rx = manager.subscribe(&sid).await.unwrap();
 
-        let err = manager.send_message(&sid, "second").await.unwrap_err();
-        let typed = err
-            .downcast_ref::<nexus_claude::agent::ProviderError>()
-            .expect("typed");
-        assert_eq!(typed.kind(), "turn_in_progress");
+        // Queued, not refused: the running turn is interrupted and the message read next.
+        manager.send_message(&sid, "second").await.unwrap();
+        assert_eq!(fake.state.interrupts.lock().unwrap().len(), 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while fake.state.turns_started.lock().unwrap().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the queued turn starts"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(fake.state.turns_started.lock().unwrap()[1].ends_with("second"));
 
         fake.state.push(AgentEvent::PermissionAsk {
             request_id: "perm-1".into(),
@@ -13150,14 +13177,7 @@ mod tests {
         assert_eq!(wire["engine"], "agent", "{wire}");
         let degraded: Vec<String> = serde_json::from_value(wire["degraded_features"].clone())
             .unwrap_or_else(|_| panic!("degraded_features missing: {wire}"));
-        for lost in [
-            "hooks",
-            "message_queue",
-            "auto_continue",
-            "compaction",
-            "nats",
-            "images",
-        ] {
+        for lost in ["hooks", "auto_continue", "compaction", "nats", "images"] {
             assert!(
                 degraded.iter().any(|d| d == lost),
                 "{lost} must be listed: {degraded:?}"
@@ -13204,11 +13224,11 @@ mod tests {
         let degraded: Vec<String> =
             serde_json::from_value(wire["degraded_features"].clone()).expect("a list");
         // What the backend does not do on this engine, whatever the provider says...
-        for lost in ["hooks", "message_queue", "auto_continue", "nats"] {
+        for lost in ["hooks", "auto_continue", "nats"] {
             assert!(degraded.iter().any(|d| d == lost), "{lost}: {degraded:?}");
         }
         // ...what the engine ported is not claimed missing...
-        let ported = ["enrichment"];
+        let ported = ["enrichment", "message_queue"];
         assert!(
             !degraded.iter().any(|d| ported.contains(&d.as_str())),
             "{degraded:?}"
