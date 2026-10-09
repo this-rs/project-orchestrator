@@ -102,9 +102,18 @@ async fn propagate_positive(
                 );
             }
 
+            // Decisions are not reinforced: reinforce_synapses only links Note nodes.
+            if matches!(target_type, FeedbackTarget::Decision) {
+                debug!(
+                    "[propagator] Decision {} — synapse reinforcement not supported (notes only)",
+                    target_id
+                );
+                return Ok(());
+            }
+
             // Reinforce synapses between this note and its neighbors
             let synapse_boost = POSITIVE_SYNAPSE_BOOST * score;
-            match graph.reinforce_synapses(&[target_id], synapse_boost).await {
+            match reinforce_known_neighbors(&graph, target_id, synapse_boost).await {
                 Ok(count) => {
                     debug!(
                         "[propagator] Reinforced {} synapses for {:?}/{}",
@@ -130,6 +139,47 @@ async fn propagate_positive(
     Ok(())
 }
 
+/// Maximum number of known neighbors reinforced around a target.
+const MAX_REINFORCED_NEIGHBORS: usize = 10;
+
+static NO_COACTIVATION_SET_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Reinforce the synapses between `note_id` and its already-known neighbors.
+///
+/// The co-activation set is `{note_id, neighbor}` for each neighbor returned by
+/// `get_synapses` (strongest first, capped). Pairs are reinforced one by one so
+/// that neighbors are not linked to each other. `reinforce_synapses` itself
+/// refuses cross-project pairs. Returns the number of synapses reinforced; when
+/// the target has no known neighbor nothing is reinforced and a single `warn`
+/// is logged per process.
+async fn reinforce_known_neighbors(
+    graph: &Arc<dyn GraphStore>,
+    note_id: Uuid,
+    boost: f64,
+) -> Result<usize> {
+    let neighbors = graph.get_synapses(note_id).await?;
+    if neighbors.is_empty() {
+        if !NO_COACTIVATION_SET_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            warn!(
+                "[propagator] no co-activation set for {} (no known synapse neighbors): \
+                 synapses are not reinforced (this warning is emitted once)",
+                note_id
+            );
+        }
+        return Ok(0);
+    }
+    let mut total = 0usize;
+    for (neighbor, _) in neighbors.into_iter().take(MAX_REINFORCED_NEIGHBORS) {
+        if neighbor == note_id {
+            continue;
+        }
+        total += graph
+            .reinforce_synapses(&[note_id, neighbor], boost)
+            .await?;
+    }
+    Ok(total)
+}
 /// Propagate negative feedback: apply scars + decay nearby synapses.
 ///
 /// Scar intensity is proportional to the absolute score.
@@ -365,10 +415,7 @@ async fn handle_high_activation(
     }
 
     // Reinforce synapses (the note is clearly valuable — strengthen its connections)
-    match graph
-        .reinforce_synapses(&[note_id], HIGH_ACTIVATION_SYNAPSE_BOOST)
-        .await
-    {
+    match reinforce_known_neighbors(&graph, note_id, HIGH_ACTIVATION_SYNAPSE_BOOST).await {
         Ok(count) => {
             debug!(
                 "[propagator] Reinforced {} synapses for high-activation note {}",
@@ -579,5 +626,74 @@ mod tests {
 
         // Should not error even if plan doesn't exist as a note
         propagate_signal(mock, &signal).await.unwrap();
+    }
+
+    fn note_in(project: Option<Uuid>, title: &str) -> Note {
+        let mut n = Note::new(project, NoteType::Guideline, title.into(), "test".into());
+        n.energy = 0.5;
+        n
+    }
+
+    #[tokio::test]
+    async fn test_positive_feedback_reinforces_existing_synapse() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project = Uuid::new_v4();
+        let a = note_in(Some(project), "a");
+        let b = note_in(Some(project), "b");
+        mock.create_note(&a).await.unwrap();
+        mock.create_note(&b).await.unwrap();
+        mock.create_synapses(a.id, &[(b.id, 0.5)]).await.unwrap();
+
+        let fb = ExplicitFeedback::new(FeedbackTarget::Note, a.id, 1.0, "t".into()).unwrap();
+        propagate_feedback(mock.clone(), &fb).await.unwrap();
+
+        let w = mock.get_synapses(a.id).await.unwrap();
+        let w = w.iter().find(|(id, _)| *id == b.id).unwrap().1;
+        assert!(w > 0.5, "synapse a-b must be reinforced, got {w}");
+    }
+
+    #[tokio::test]
+    async fn test_positive_feedback_without_neighbors_reinforces_nothing() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let a = note_in(Some(Uuid::new_v4()), "a");
+        mock.create_note(&a).await.unwrap();
+        let fb = ExplicitFeedback::new(FeedbackTarget::Note, a.id, 1.0, "t".into()).unwrap();
+        propagate_feedback(mock.clone(), &fb).await.unwrap();
+        assert!(mock.get_synapses(a.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reinforce_synapses_requires_two_ids() {
+        let mock = crate::neo4j::mock::MockGraphStore::new();
+        assert!(mock
+            .reinforce_synapses(&[Uuid::new_v4()], 0.1)
+            .await
+            .is_err());
+        assert!(mock.reinforce_synapses(&[], 0.1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_reinforce_synapses_refuses_cross_project_and_unknown_project() {
+        let mock = crate::neo4j::mock::MockGraphStore::new();
+        let a = note_in(Some(Uuid::new_v4()), "a");
+        let b = note_in(Some(Uuid::new_v4()), "b");
+        let c = note_in(None, "c");
+        let ghost = Uuid::new_v4();
+        for n in [&a, &b, &c] {
+            mock.create_note(n).await.unwrap();
+        }
+        assert_eq!(
+            mock.reinforce_synapses(&[a.id, b.id], 0.1).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            mock.reinforce_synapses(&[a.id, c.id], 0.1).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            mock.reinforce_synapses(&[a.id, ghost], 0.1).await.unwrap(),
+            0
+        );
+        assert!(mock.get_synapses(a.id).await.unwrap().is_empty());
     }
 }

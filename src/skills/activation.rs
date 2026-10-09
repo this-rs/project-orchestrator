@@ -2360,6 +2360,17 @@ mod tests {
         let note_a = Uuid::new_v4();
         let note_b = Uuid::new_v4();
         let note_c = Uuid::new_v4();
+        let pid = Uuid::new_v4();
+        for id in [note_a, note_b, note_c] {
+            let mut n = crate::notes::models::Note::new(
+                Some(pid),
+                crate::notes::models::NoteType::Guideline,
+                "n".into(),
+                "t".into(),
+            );
+            n.id = id;
+            graph.create_note(&n).await.unwrap();
+        }
 
         // Create cosine synapses (backfill path)
         graph
