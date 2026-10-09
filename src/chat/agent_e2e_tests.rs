@@ -2396,6 +2396,7 @@ mod parity {
 
     pub(super) struct Rig {
         pub manager: ChatManager,
+        pub graph: Arc<MockGraphStore>,
         pub provider: Tapped,
         pub sid: String,
         pub rx: broadcast::Receiver<ChatEvent>,
@@ -2440,6 +2441,7 @@ mod parity {
         let rx = manager.subscribe(&created.session_id).await.unwrap();
         Rig {
             manager,
+            graph,
             provider,
             sid: created.session_id,
             rx,
@@ -2546,5 +2548,43 @@ mod parity {
                 "{kind:?}: the compaction is told what the session works on: {guidance}"
             );
         }
+    }
+
+    /// H3 enrichment: a turn of the agent engine receives, in front of the message,
+    /// the knowledge graph context the Claude Code engine puts in front of the same
+    /// message (`enrichment_for_turn`, called by `stream_response`).
+    #[tokio::test]
+    async fn a_turn_of_the_agent_engine_gets_the_graph_context_of_a_claude_code_turn() {
+        let mut r = rig(ProviderKind::Native, vec![]).await;
+        let mut plan = crate::test_helpers::test_plan();
+        plan.title = "Port the enrichment".into();
+        plan.status = crate::neo4j::models::PlanStatus::InProgress;
+        plan.project_id = Some(r.project.id);
+        r.graph.create_plan(&plan).await.unwrap();
+        r.graph
+            .link_plan_to_project(plan.id, r.project.id)
+            .await
+            .unwrap();
+        let message = "what is left on the port?";
+        let graph: Arc<dyn GraphStore> = r.graph.clone();
+        let expected = super::super::manager::enrichment_for_turn(
+            &graph,
+            &r.manager.enrichment_pipeline,
+            &r.sid,
+            message,
+            Default::default(),
+        )
+        .await
+        .expect("the graph has context for this message");
+        assert!(expected.contains("Port the enrichment"), "{expected}");
+
+        r.manager.send_message(&r.sid, message).await.unwrap();
+        r.turn_end().await;
+        assert_eq!(
+            r.sent(),
+            vec![super::super::manager::prepend_enrichment(
+                &expected, message
+            )]
+        );
     }
 }
