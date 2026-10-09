@@ -353,9 +353,10 @@ impl AgentSessionHandle {
         sent: &str,
     ) -> Result<()> {
         match self.open_turn(kind, shown, sent).await {
+            // `None`: stopped while it was prepared, only the queue is left to play.
             Ok(first) => {
                 let me = Arc::clone(self);
-                tokio::spawn(async move { me.drive(Some(first)).await });
+                tokio::spawn(async move { me.drive(first).await });
                 Ok(())
             }
             Err(error) => {
@@ -378,13 +379,15 @@ impl AgentSessionHandle {
         }
     }
 
-    /// Shows the message of a turn and sends the turn to the provider.
+    /// Shows the message of a turn and sends the turn to the provider (`None`: the
+    /// turn was stopped before it could be sent).
     async fn open_turn(
         &self,
         kind: PendingMessageKind,
         shown: &str,
         sent: &str,
-    ) -> std::result::Result<(nexus_claude::agent::EventStream, TurnInput), ProviderError> {
+    ) -> std::result::Result<Option<(nexus_claude::agent::EventStream, TurnInput)>, ProviderError>
+    {
         // A Stop belongs to the turn it stopped: the new turn starts unstopped.
         self.interrupted.store(false, Ordering::SeqCst);
         match kind {
@@ -408,13 +411,19 @@ impl AgentSessionHandle {
             Some(services) => services.prepare(&self.session_id, shown, sent).await,
             None => sent.to_string(),
         };
+        // A Stop while the turn was prepared (the enrichment awaits) found no turn
+        // to interrupt at the provider: it stops this one before it is sent.
+        if self.interrupted.load(Ordering::SeqCst) {
+            tracing::info!(session_id = %self.session_id, "Turn stopped before it was sent");
+            return Ok(None);
+        }
         let input = TurnInput::text(sent);
         let stream = self.session.send_turn(input.clone()).await?;
         self.streaming_text.lock().await.clear();
         self.streaming_events.lock().await.clear();
         self.emit(ChatEvent::StreamingStatus { is_streaming: true })
             .await;
-        Ok((stream, input))
+        Ok(Some((stream, input)))
     }
 
     /// Plays turns until the queue is empty: the turn given, then each message
@@ -434,7 +443,7 @@ impl AgentSessionHandle {
                 .open_turn(next.kind, &next.content, &next.content)
                 .await
             {
-                Ok(opened) => turn = Some(opened),
+                Ok(opened) => turn = opened,
                 Err(error) => {
                     let event = AgentEvent::Error { error };
                     for chat_event in self.mapper.lock().await.map(&event) {
@@ -1269,5 +1278,35 @@ mod turn_race_tests {
 
         let turns = turns_reach(&provider, 1).await;
         assert_eq!(turns, ["second"], "the queued message is not stranded");
+    }
+
+    /// A Stop while the turn is being prepared (the enrichment awaits, the provider
+    /// has no turn to interrupt yet) stops that turn: it is not sent, and the
+    /// session stops streaming — the Claude Code engine breaks such a stream at once.
+    #[tokio::test]
+    async fn a_stop_while_a_turn_is_prepared_stops_that_turn() {
+        let (provider, gate, handle) = rig().await;
+        let first = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move { handle.send_message("first").await })
+        };
+        gate.entered.notified().await;
+        handle.interrupt().await.unwrap();
+        gate.release.notify_one();
+        first.await.unwrap().unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while handle.is_streaming.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let turns = provider.state.turns_started.lock().unwrap().clone();
+        assert!(
+            turns.is_empty(),
+            "the stopped turn went to the provider: {turns:?}"
+        );
+        assert!(
+            !handle.is_streaming.load(Ordering::SeqCst),
+            "the session stops streaming"
+        );
     }
 }
