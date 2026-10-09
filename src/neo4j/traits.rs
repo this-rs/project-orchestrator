@@ -2293,6 +2293,12 @@ pub trait GraphStore: Send + Sync {
     /// exactly one project. Idempotent.
     async fn backfill_project_anchors(&self) -> Result<crate::chat::anchor::BackfillReport>;
 
+    /// Migration (never run at startup): writes the `(:ChatSession)-[:SPAWNED_BY]->(:ChatSession)`
+    /// edge for every session whose `spawned_by` JSON names a parent session
+    /// and that has no such edge yet (sessions created before the edge existed).
+    /// Idempotent: a second run creates nothing. Returns the edges written.
+    async fn backfill_spawned_by_edges(&self) -> Result<usize>;
+
     /// Inverse of the backfill: deletes only the anchors it created and nobody
     /// modified since (inferred, by system, added by the migration, version 1),
     /// with their journal entries. Returns how many.

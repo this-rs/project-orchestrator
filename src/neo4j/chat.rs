@@ -227,7 +227,8 @@ impl Neo4jClient {
         let detached_filter = if include_detached {
             ""
         } else {
-            " AND (s.spawned_by IS NULL OR s.spawned_by = '')"
+            " AND (s.spawned_by IS NULL OR s.spawned_by = '') \
+             AND NOT EXISTS { (s)-[:SPAWNED_BY]->(:ChatSession) }"
         };
 
         let (data_query, count_query) = if let Some(slug) = project_slug {
@@ -581,14 +582,18 @@ impl Neo4jClient {
         }
     }
 
-    /// Get child sessions spawned by a parent session (identified by parent_id in spawned_by JSON).
+    /// Get child sessions spawned by a parent session (identified by the SPAWNED_BY edge, else by parent_id in the spawned_by JSON).
     pub async fn get_session_children(&self, parent_id: Uuid) -> Result<Vec<ChatSessionNode>> {
         let q = query(
             r#"
+            // The SPAWNED_BY edge is the lineage; the `spawned_by` JSON is only the
+            // fallback for sessions that have no edge at all (written before it).
             MATCH (s:ChatSession)
-            WHERE s.spawned_by IS NOT NULL
-              AND s.spawned_by <> ''
-              AND s.spawned_by CONTAINS $parent_id
+            WHERE EXISTS { (s)-[:SPAWNED_BY]->(:ChatSession {id: $parent_id}) }
+               OR (NOT EXISTS { (s)-[:SPAWNED_BY]->(:ChatSession) }
+                   AND s.spawned_by IS NOT NULL
+                   AND s.spawned_by <> ''
+                   AND s.spawned_by CONTAINS $parent_id)
             RETURN s ORDER BY s.created_at ASC
             "#,
         )
@@ -623,10 +628,14 @@ impl Neo4jClient {
             MATCH (parent:ChatSession {id: $parent_id})
             // MERGE: `create_chat_session` already writes the bare edge for a
             // session that carries a parent; this fills in the run metadata
-            // instead of adding a second edge.
+            // instead of adding a second edge. A call that carries a run is
+            // authoritative; one that does not (the conversation path) only fills
+            // what is missing, so it never erases the metadata of a run.
             MERGE (child)-[r:SPAWNED_BY]->(parent)
             ON CREATE SET r.created_at = datetime()
-            SET r.type = $spawn_type, r.run_id = $run_id, r.task_id = $task_id
+            SET r.type = CASE WHEN $run_id <> '' THEN $spawn_type ELSE coalesce(r.type, $spawn_type) END,
+                r.run_id = CASE WHEN $run_id <> '' THEN $run_id ELSE coalesce(r.run_id, $run_id) END,
+                r.task_id = CASE WHEN $task_id <> '' THEN $task_id ELSE coalesce(r.task_id, $task_id) END
             "#,
         )
         .param("child_id", child_session_id.to_string())
@@ -2165,6 +2174,7 @@ fn anchor_event_from_node(node: &neo4rs::Node) -> Result<crate::chat::anchor::An
     let json = |k: &str| anchor_opt(s(k)).and_then(|j| serde_json::from_str(&j).ok());
     Ok(AnchorEvent {
         id: s("id").parse()?,
+        seq: node.get::<i64>("seq").unwrap_or(0).max(0) as u64,
         session_id: s("session_id").parse()?,
         anchor_id: s("anchor_id").parse()?,
         kind: AnchorEventKind::parse(&s("kind")).ok_or_else(|| bad("kind"))?,
@@ -2208,15 +2218,20 @@ impl Neo4jClient {
                 &mut txn,
                 query(
                     "MATCH (s:ChatSession {id: $sid}) \
-                     SET s.anchor_lock = coalesce(s.anchor_lock, 0) + 1 \
-                     RETURN s.id AS id",
+                     SET s.anchor_lock = coalesce(s.anchor_lock, 0) + 1, \
+                         s.anchor_seq = coalesce(s.anchor_seq, 0) + 1 \
+                     RETURN s.anchor_seq AS seq",
                 )
                 .param("sid", sid.clone()),
             )
             .await?;
-            if locked.is_empty() {
+            let Some(locked) = locked.first() else {
                 return Err(AnchorError::SessionNotFound(session_id).into());
-            }
+            };
+            // The number this operation takes IF it writes an event (otherwise the
+            // transaction is rolled back below, so the number is not consumed:
+            // no gap). The lock above serializes writers, hence no duplicate.
+            let seq = locked.get::<i64>("seq")?.max(0) as u64;
             let rows = txn_rows(
                 &mut txn,
                 query("MATCH (a:Anchor {session_id: $sid}) RETURN a ORDER BY a.created_at, a.id")
@@ -2228,7 +2243,10 @@ impl Neo4jClient {
                 let node: neo4rs::Node = row.get("a")?;
                 existing.push(anchor_from_node(&node)?);
             }
-            let change = apply_op(session_id, &existing, op, chrono::Utc::now())?;
+            let mut change = apply_op(session_id, &existing, op, chrono::Utc::now())?;
+            if let Some(ev) = change.event.as_mut() {
+                ev.seq = seq;
+            }
             let a = &change.anchor;
             if change.deleted {
                 txn.run(
@@ -2276,12 +2294,13 @@ impl Neo4jClient {
                 txn.run(
                     query(
                         "CREATE (:AnchorEvent {id: $id, session_id: $sid, anchor_id: $aid, \
-                         kind: $kind, by: $by, actor: $actor, at: $at, \
+                         seq: $seq, kind: $kind, by: $by, actor: $actor, at: $at, \
                          before: $before, after: $after})",
                     )
                     .param("id", ev.id.to_string())
                     .param("sid", sid.clone())
                     .param("aid", ev.anchor_id.to_string())
+                    .param("seq", ev.seq as i64)
                     .param("kind", ev.kind.as_str())
                     .param("by", ev.by.as_str())
                     .param("actor", ev.actor.clone())
@@ -2296,7 +2315,12 @@ impl Neo4jClient {
         .await;
         match outcome {
             Ok(change) => {
-                txn.commit().await?;
+                if change.event.is_some() {
+                    txn.commit().await?;
+                } else {
+                    // nothing written: give back the lock and the number
+                    txn.rollback().await?;
+                }
                 Ok(change)
             }
             Err(e) => {
@@ -2365,7 +2389,8 @@ impl Neo4jClient {
         Ok(crate::chat::anchor::AnchorPage { items, next_cursor })
     }
 
-    /// The journal of a session, oldest first.
+    /// The journal of a session, oldest first: by `seq`. Events written before
+    /// numbering existed (no `seq`) come first, by `at` then id.
     pub async fn list_anchor_events(
         &self,
         session_id: Uuid,
@@ -2373,8 +2398,11 @@ impl Neo4jClient {
         let mut result = self
             .graph
             .execute(
-                query("MATCH (e:AnchorEvent {session_id: $sid}) RETURN e ORDER BY e.at, e.id")
-                    .param("sid", session_id.to_string()),
+                query(
+                    "MATCH (e:AnchorEvent {session_id: $sid}) RETURN e \
+                     ORDER BY coalesce(e.seq, 0), e.at, e.id",
+                )
+                .param("sid", session_id.to_string()),
             )
             .await?;
         let mut out = Vec::new();
@@ -2491,6 +2519,51 @@ impl Neo4jClient {
             }
         }
         Ok(report)
+    }
+
+    /// See `GraphStore::backfill_spawned_by_edges`.
+    pub async fn backfill_spawned_by_edges(&self) -> Result<usize> {
+        let mut result = self
+            .graph
+            .execute(query(
+                "MATCH (c:ChatSession) \
+                 WHERE c.spawned_by IS NOT NULL AND c.spawned_by <> '' \
+                   AND NOT EXISTS { (c)-[:SPAWNED_BY]->(:ChatSession) } \
+                 RETURN c.id AS id, c.spawned_by AS sb ORDER BY c.id",
+            ))
+            .await?;
+        let mut todo = Vec::new();
+        while let Some(row) = result.next().await? {
+            let sb: String = row.get("sb")?;
+            let parent = crate::chat::types::SpawnedBy::from_json_str(&sb)
+                .and_then(|sb| sb.parent_session_id());
+            if let Some(parent) = parent {
+                todo.push((row.get::<String>("id")?, parent.to_string()));
+            }
+        }
+        let mut created = 0;
+        for (child, parent) in todo {
+            // MERGE + the absence test above: a second run finds nothing to do,
+            // and an edge that appeared meanwhile is reused, never doubled.
+            let mut r = self
+                .graph
+                .execute(
+                    query(
+                        "MATCH (c:ChatSession {id: $c}) \
+                         MATCH (p:ChatSession {id: $p}) \
+                         MERGE (c)-[r:SPAWNED_BY]->(p) \
+                         ON CREATE SET r.created_at = datetime() \
+                         RETURN count(r) AS n",
+                    )
+                    .param("c", child)
+                    .param("p", parent),
+                )
+                .await?;
+            if let Some(row) = r.next().await? {
+                created += row.get::<i64>("n")?.max(0) as usize;
+            }
+        }
+        Ok(created)
     }
 
     /// See `GraphStore::revert_inferred_anchors`. One statement, hence atomic.
