@@ -469,7 +469,9 @@ async fn maybe_trigger_stream(
         // will pick it up after the active turn ends, prioritised below
         // any User/SystemHint that's also queued (cf drain.rs::pop_highest_priority).
         let mut queue = pending_messages.lock().await;
-        queue.push_back(PendingMessage::background_output(oob_content));
+        queue.push_back(PendingMessage::background_output(
+            crate::refs::compose::inert(&oob_content),
+        ));
         debug!(
             session_id = %session_id,
             "OOB listener: lost is_streaming race — queued for drain"
@@ -493,7 +495,8 @@ async fn maybe_trigger_stream(
     // untouched; any subsequent OOB events that arrive between this
     // point and the spawn (or during the spawn) push themselves to the
     // queue via the lost-race branch above and drain handles them after.
-    let prompt = oob_content;
+    // Tool output is not a composed message: no block may ride on it.
+    let prompt = crate::refs::compose::inert(&oob_content);
 
     // Spawn stream_response. Same call shape as in `spawn_nats_rpc_listener`.
     let session_id_for_spawn = session_id.to_string();

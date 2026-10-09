@@ -780,14 +780,12 @@ async fn handle_ws_chat_loop(
                                     WsChatClientMessage::UserMessage { content, attachments, queue, refs } => {
                                         debug!(session_id = %session_id, queue, "WS: Received user_message");
 
-                                        // T4.3: Extract code entities and create DISCUSSED relations (non-blocking)
-                                        spawn_entity_extraction(&state, &session_id, &content);
-
                                         // Same routing as POST /api/chat/sessions/{id}/messages:
                                         // local → remote (NATS RPC) → resume_session.
                                         // Fold attached documents into the message text
                                         // (see chat::message_attachments). An unknown id
                                         // is refused, never silently dropped.
+                                        let typed = content.clone();
                                         let content = match crate::refs::compose::compose_user_message(
                                             &state.orchestrator.neo4j_arc(),
                                             &content,
@@ -804,6 +802,9 @@ async fn handle_ws_chat_loop(
                                                 continue;
                                             }
                                         };
+                                        // T4.3: Extract code entities and create DISCUSSED relations
+                                        // (non-blocking) — only for an accepted message.
+                                        spawn_entity_extraction(&state, &session_id, &typed);
                                         let result = if queue {
                                             chat_manager
                                                 .route_queued_user_message(&session_id, &content, Some(&claims))
@@ -996,6 +997,8 @@ async fn handle_ws_chat_loop(
                                     WsChatClientMessage::InputResponse { content, .. } => {
                                         debug!(session_id = %session_id, "WS: Received input_response");
                                         // Try local → remote → error (no resume for responses)
+                                        // Not a composed message: no block may ride on it.
+                                        let content = crate::refs::compose::inert(&content);
                                         let send_result = if chat_manager.is_session_active(&session_id).await {
                                             chat_manager.send_message(&session_id, &content).await
                                         } else if chat_manager

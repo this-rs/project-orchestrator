@@ -1209,7 +1209,11 @@ pub async fn delegate_task(
 
     tokio::spawn(async move {
         // Send the prompt
-        if let Err(e) = cm.send_message(&sid, &prompt).await {
+        // Task text is not a composed message: no block may ride on it.
+        if let Err(e) = cm
+            .send_message(&sid, &crate::refs::compose::inert(&prompt))
+            .await
+        {
             tracing::error!(
                 session_id = %sid,
                 task_id = %ev_task_id,

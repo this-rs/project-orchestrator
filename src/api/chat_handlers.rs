@@ -946,9 +946,6 @@ pub async fn send_session_message(
 
     let sid = session_id.to_string();
     let claims = claims.map(|axum::Extension(c)| c);
-    // Same side effect as the WS path.
-    super::ws_chat_handler::spawn_entity_extraction(&state, &sid, &body.content);
-
     let content = crate::refs::compose::compose_user_message(
         &state.orchestrator.neo4j_arc(),
         &body.content,
@@ -957,6 +954,10 @@ pub async fn send_session_message(
         chat_manager.refs_v1_enabled(),
     )
     .await?;
+
+    // Same side effect as the WS path — only for a message that was accepted: a
+    // refused one must not feed the graph (DISCUSSED, neural reinforcement).
+    super::ws_chat_handler::spawn_entity_extraction(&state, &sid, &body.content);
 
     match chat_manager
         .route_user_message(&sid, &content, claims.as_ref())
@@ -3918,6 +3919,7 @@ mod tests {
         app: axum::Router,
         manager: Arc<ChatManager>,
         graph: Arc<dyn crate::neo4j::traits::GraphStore>,
+        mock: Arc<crate::neo4j::mock::MockGraphStore>,
     }
 
     async fn action_harness(cli_path: Option<&str>) -> ActionHarness {
@@ -3925,7 +3927,8 @@ mod tests {
     }
 
     async fn action_harness_with(cli_path: Option<&str>, refs_v1: bool) -> ActionHarness {
-        let app_state = mock_app_state();
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let app_state = crate::test_helpers::mock_app_state_with_graph(mock.clone());
         let graph = app_state.neo4j.clone();
         let mut config = test_support::chat_config();
         config.claude_cli_path = cli_path.map(str::to_string);
@@ -3973,6 +3976,7 @@ mod tests {
             app: create_router(state),
             manager,
             graph,
+            mock,
         }
     }
 
@@ -4331,6 +4335,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refused_message_leaves_no_trace_in_the_graph() {
+        // A message refused with a 400 must not have fed the knowledge graph
+        // (DISCUSSED relations, neural reinforcement) on its way out.
+        let h = action_harness(Some("/nonexistent/claude-cli")).await;
+        let sid = seed_session(&h).await;
+        let text = "regarde src/main.rs et Cargo.toml";
+        let body = serde_json::json!({
+            "content": text,
+            "refs": [{"kind": "workspace", "id": Uuid::new_v4()}]
+        })
+        .to_string();
+        let (status, _) = call(&h.app, auth_post(&msg_uri(sid), &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            h.mock.discussed_calls.read().await.is_empty(),
+            "a refused message must not write DISCUSSED relations"
+        );
+
+        // Control: the same words, accepted, DO reach the extraction (the check
+        // above is not vacuous).
+        let body = serde_json::json!({"content": text}).to_string();
+        let _ = call(&h.app, auth_post(&msg_uri(sid), &body)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!h.mock.discussed_calls.read().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn the_first_message_with_invalid_refs_creates_no_session() {
         let h = action_harness(Some("/nonexistent/claude-cli")).await;
         let body = r#"{"message":"x","cwd":"/tmp","refs":[{"kind":"skill","id":"3adeffc9-c8b0-4e2f-a674-55bfcb293433"}]}"#;
@@ -4353,7 +4385,9 @@ mod tests {
         // The same body that is a 400 with the switch on is not refused…
         let body = r#"{"content":"x","refs":[{"kind":"workspace","id":"nope"}]}"#;
         let (status, resp) = call(&h.app, auth_post(&msg_uri(sid), body)).await;
-        assert_ne!(status, StatusCode::BAD_REQUEST, "{resp}");
+        // Not refused: it went on to delivery, which fails here only because there
+        // is no CLI to resume (a 500), exactly like a message without refs.
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{resp}");
         // …and a valid ref is not folded into the text: the CLI sees the text only.
         let mut cli = test_support::insert_mock_cli_session(&h.manager, &sid.to_string()).await;
         let plan = Uuid::new_v4();

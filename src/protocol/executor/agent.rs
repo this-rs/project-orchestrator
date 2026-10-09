@@ -363,8 +363,9 @@ async fn execute_via_agent(
         .context("Failed to subscribe to agent session events")?;
 
     // 3. Send the prompt
+    // Protocol/task text is not a composed message: no block may ride on it.
     chat_manager
-        .send_message(&session_id, &prompt)
+        .send_message(&session_id, &crate::refs::compose::inert(&prompt))
         .await
         .context("Failed to send prompt to agent session")?;
 
