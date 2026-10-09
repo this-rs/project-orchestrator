@@ -737,6 +737,7 @@ fn note_tool() -> ToolDefinition {
                 "anchors": {"type": "array", "items": {"type": "object"}, "description": "Anchors to code entities, each {entity_type, entity_id} (create/supersede)"},
                 "assertion_rule": {"type": "object", "description": "Assertion rule for note_type=assertion (create/supersede)"},
                 "run_id": {"type": "string", "description": "Protocol run UUID for PRODUCED_DURING (create/supersede)"},
+                "sharing_consent": {"type": "string", "enum": ["not_set", "explicit_allow", "explicit_deny", "policy_auto"], "description": "Sharing consent persisted at creation (create/supersede); default not_set"},
                 "entity_type": {"type": "string", "description": "Entity type (link_to_entity/unlink_from_entity/get_context/get_entity)"},
                 "entity_id": {"type": "string", "description": "Entity identifier (link_to_entity/unlink_from_entity/get_context/get_entity)"},
                 "source_project_id": {"type": "string", "description": "Project scope of the propagation (get_propagated, get_propagated_knowledge): project + global notes only. Must match the entity owning project when resolvable; cannot widen."},

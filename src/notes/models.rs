@@ -1018,6 +1018,28 @@ pub enum PropagationScope {
 }
 
 impl PropagationScope {
+    /// Minimum coupling below which a foreign project's notes are suppressed
+    /// (unless `force`).
+    pub const MIN_COUPLING: f64 = 0.2;
+
+    /// Cross-project coupling rule, shared by the Neo4j client and the mock:
+    /// `None` coupling (unknown) drops the note (fail closed); a coupling below
+    /// `MIN_COUPLING` drops it unless `force`; otherwise the score is weighted by
+    /// the coupling and must still reach `min_score`.
+    pub fn weigh_foreign(
+        score: f64,
+        coupling: Option<f64>,
+        force: bool,
+        min_score: f64,
+    ) -> Option<f64> {
+        let coupling = coupling?;
+        if coupling < Self::MIN_COUPLING && !force {
+            return None;
+        }
+        let weighted = score * coupling;
+        (weighted >= min_score).then_some(weighted)
+    }
+
     /// Map the historical `(source_project_id, force_cross_project)` pair.
     pub fn from_params(source_project_id: Option<Uuid>, force_cross_project: bool) -> Self {
         match (source_project_id, force_cross_project) {
@@ -1071,6 +1093,9 @@ pub struct CreateNoteRequest {
     /// will be created automatically after note creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<Uuid>,
+    /// Sharing consent to persist at creation (default `NotSet`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharing_consent: Option<crate::episodes::distill_models::SharingConsent>,
 }
 
 /// Request to create an anchor

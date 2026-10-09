@@ -411,6 +411,9 @@ impl NoteManager {
             input.tags.unwrap_or_default(),
             created_by.to_string(),
         );
+        if let Some(consent) = input.sharing_consent {
+            note.sharing_consent = consent;
+        }
 
         // Apply project-level default_note_energy if set (homeostasis throttle).
         // When note_density is high, homeostasis sets a lower initial energy
@@ -2173,6 +2176,7 @@ mod tests {
     /// Helper: build a CreateNoteRequest with minimal required fields.
     fn make_create_request(project_id: Uuid, content: &str) -> CreateNoteRequest {
         CreateNoteRequest {
+            sharing_consent: None,
             project_id: Some(project_id),
             note_type: NoteType::Guideline,
             content: content.to_string(),
@@ -2207,6 +2211,40 @@ mod tests {
         let stored = mgr.get_note(note.id).await.unwrap();
         assert!(stored.is_some());
         assert_eq!(stored.unwrap().id, note.id);
+    }
+
+    #[tokio::test]
+    async fn test_create_note_persists_the_explicit_sharing_consent() {
+        use crate::episodes::distill_models::SharingConsent;
+        let (mgr, pid) = create_note_manager().await;
+        let mut req = make_create_request(pid, "shared on purpose");
+        req.sharing_consent = Some(SharingConsent::ExplicitAllow);
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+        assert_eq!(note.sharing_consent, SharingConsent::ExplicitAllow);
+        let stored = mgr.get_note(note.id).await.unwrap().unwrap();
+        assert_eq!(stored.sharing_consent, SharingConsent::ExplicitAllow);
+
+        // Old callers (no field): NotSet, unchanged.
+        let plain = mgr
+            .create_note(make_create_request(pid, "plain"), "agent-1")
+            .await
+            .unwrap();
+        assert_eq!(plain.sharing_consent, SharingConsent::NotSet);
+    }
+
+    #[test]
+    fn test_create_note_request_deserializes_sharing_consent_optionally() {
+        use crate::episodes::distill_models::SharingConsent;
+        let with: CreateNoteRequest = serde_json::from_value(serde_json::json!({
+            "note_type": "guideline", "content": "c", "sharing_consent": "explicit_deny"
+        }))
+        .unwrap();
+        assert_eq!(with.sharing_consent, Some(SharingConsent::ExplicitDeny));
+        let without: CreateNoteRequest = serde_json::from_value(serde_json::json!({
+            "note_type": "guideline", "content": "c"
+        }))
+        .unwrap();
+        assert_eq!(without.sharing_consent, None);
     }
 
     #[tokio::test]
@@ -2536,6 +2574,7 @@ mod tests {
 
     fn make_global_request(content: &str) -> CreateNoteRequest {
         CreateNoteRequest {
+            sharing_consent: None,
             project_id: None,
             note_type: NoteType::Guideline,
             content: content.to_string(),
@@ -3207,6 +3246,7 @@ mod tests {
         );
 
         let req = CreateNoteRequest {
+            sharing_consent: None,
             project_id: None, // No project
             note_type: NoteType::Tip,
             content: "Global tip without project".to_string(),
@@ -3259,6 +3299,7 @@ mod tests {
     async fn test_rfc_auto_template_empty_content() {
         let (mgr, pid) = create_note_manager().await;
         let req = CreateNoteRequest {
+            sharing_consent: None,
             project_id: Some(pid),
             note_type: NoteType::Rfc,
             content: "".to_string(),
@@ -3285,6 +3326,7 @@ mod tests {
         let (mgr, pid) = create_note_manager().await;
         let custom_content = "# My Custom RFC\n\nThis RFC is about X.".to_string();
         let req = CreateNoteRequest {
+            sharing_consent: None,
             project_id: Some(pid),
             note_type: NoteType::Rfc,
             content: custom_content.clone(),
@@ -3331,6 +3373,7 @@ mod tests {
 
         // Create an RFC note — should auto-start the run
         let req = CreateNoteRequest {
+            sharing_consent: None,
             project_id: Some(project_id),
             note_type: NoteType::Rfc,
             content: "".to_string(),
@@ -3379,6 +3422,7 @@ mod tests {
         // No rfc-lifecycle protocol seeded — should still create the note successfully
 
         let req = CreateNoteRequest {
+            sharing_consent: None,
             project_id: Some(pid),
             note_type: NoteType::Rfc,
             content: "".to_string(),
@@ -3402,6 +3446,7 @@ mod tests {
     async fn test_non_rfc_note_unaffected() {
         let (mgr, pid) = create_note_manager().await;
         let req = CreateNoteRequest {
+            sharing_consent: None,
             project_id: Some(pid),
             note_type: NoteType::Guideline,
             content: "".to_string(),

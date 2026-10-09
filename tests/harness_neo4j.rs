@@ -670,12 +670,8 @@ mod synapse_scope {
         consent: SharingConsent,
     ) -> Note {
         let n = note(project, importance, consent);
+        // create_note persists the consent carried by the note.
         e.client.create_note(&n).await.unwrap();
-        // create_note does not persist `sharing_consent`: set it explicitly.
-        e.client
-            .update_sharing_consent(n.id, &consent)
-            .await
-            .unwrap();
         n
     }
 

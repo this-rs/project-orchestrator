@@ -334,7 +334,8 @@ jobs:
           # harness_neo4j: the Cypher of the provider settings; REQUIRED here, so a
           # missing Neo4j fails instead of passing silently.
           HARNESS_NEO4J_REQUIRED=1 cargo test --test integration_tests --test data_migrations \
-            --test workspace_tests --test neo4j_store_tests --test harness_neo4j
+            --test workspace_tests --test neo4j_store_tests --test harness_neo4j \
+            --test neo4j_note_consent
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch

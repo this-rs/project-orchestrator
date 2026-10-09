@@ -697,6 +697,7 @@ mod tests {
         state.neo4j.create_project(&project).await.unwrap();
 
         let req = crate::notes::CreateNoteRequest {
+            sharing_consent: None,
             project_id: Some(project.id),
             note_type: NoteType::Tip,
             content: "Test note content".to_string(),

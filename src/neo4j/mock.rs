@@ -66,6 +66,11 @@ pub struct MockGraphStore {
     pub decisions: RwLock<HashMap<Uuid, DecisionNode>>,
     /// Sharing policy per project (what `Project.sharing_policy` holds in Neo4j).
     pub sharing_policies: RwLock<HashMap<Uuid, crate::episodes::distill_models::SharingPolicy>>,
+    /// Pairwise project coupling (sorted key), the mock's stand-in for the four
+    /// signals computed by `Neo4jClient::get_pairwise_coupling`. Unset pair = 0.0.
+    pub pairwise_coupling: RwLock<HashMap<(Uuid, Uuid), f64>>,
+    /// Isomorphic groups returned by `find_isomorphic_groups` (any project).
+    pub isomorphic_groups: RwLock<Vec<crate::graph::models::IsomorphicGroup>>,
     pub constraints: RwLock<HashMap<Uuid, ConstraintNode>>,
     pub commits: RwLock<HashMap<String, CommitNode>>,
     pub releases: RwLock<HashMap<Uuid, ReleaseNode>>,
@@ -305,6 +310,8 @@ impl MockGraphStore {
             steps: RwLock::new(HashMap::new()),
             decisions: RwLock::new(HashMap::new()),
             sharing_policies: RwLock::new(HashMap::new()),
+            pairwise_coupling: RwLock::new(HashMap::new()),
+            isomorphic_groups: RwLock::new(Vec::new()),
             constraints: RwLock::new(HashMap::new()),
             commits: RwLock::new(HashMap::new()),
             releases: RwLock::new(HashMap::new()),
@@ -438,6 +445,14 @@ impl MockGraphStore {
     // ========================================================================
 
     /// Seed a project into the store.
+    /// Declare the coupling between two projects (symmetric).
+    pub async fn set_pairwise_coupling(&self, a: Uuid, b: Uuid, coupling: f64) {
+        self.pairwise_coupling
+            .write()
+            .await
+            .insert(if a < b { (a, b) } else { (b, a) }, coupling);
+    }
+
     pub async fn with_project(self, project: ProjectNode) -> Self {
         self.projects.write().await.insert(project.id, project);
         self
@@ -6510,6 +6525,29 @@ impl GraphStore for MockGraphStore {
             })
             .filter(|pn| pn.relevance_score >= min_score)
             .collect();
+        // CrossProject: the coupling weights the score of foreign notes BEFORE the
+        // cut to 20, with the same rule as the Cypher client.
+        if let crate::notes::PropagationScope::CrossProject(src) = scope {
+            let couplings = self.pairwise_coupling.read().await.clone();
+            out = out
+                .into_iter()
+                .filter_map(|mut pn| match pn.note.project_id {
+                    Some(pid) if pid != src => {
+                        let key = if src < pid { (src, pid) } else { (pid, src) };
+                        let coupling = Some(couplings.get(&key).copied().unwrap_or(0.0));
+                        let weighted = crate::notes::PropagationScope::weigh_foreign(
+                            pn.relevance_score,
+                            coupling,
+                            force_cross_project,
+                            min_score,
+                        )?;
+                        pn.relevance_score = weighted;
+                        Some(pn)
+                    }
+                    _ => Some(pn),
+                })
+                .collect();
+        }
         out.sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
         out.truncate(20);
         Ok(out)
@@ -11227,8 +11265,8 @@ impl GraphStore for MockGraphStore {
         _project_id: &str,
         _min_group_size: usize,
     ) -> anyhow::Result<Vec<crate::graph::models::IsomorphicGroup>> {
-        // Mock: no isomorphic groups
-        Ok(Vec::new())
+        // Mock: the groups declared with `isomorphic_groups` (none by default)
+        Ok(self.isomorphic_groups.read().await.clone())
     }
 
     async fn has_context_cards(&self, _project_id: &str) -> anyhow::Result<bool> {
@@ -12197,16 +12235,25 @@ impl GraphStore for MockGraphStore {
 
     async fn get_sharing_consent(
         &self,
-        _note_id: Uuid,
+        note_id: Uuid,
     ) -> anyhow::Result<crate::episodes::distill_models::SharingConsent> {
-        Ok(crate::episodes::distill_models::SharingConsent::default())
+        Ok(self
+            .notes
+            .read()
+            .await
+            .get(&note_id)
+            .map(|n| n.sharing_consent)
+            .unwrap_or_default())
     }
 
     async fn update_sharing_consent(
         &self,
-        _note_id: Uuid,
-        _consent: &crate::episodes::distill_models::SharingConsent,
+        note_id: Uuid,
+        consent: &crate::episodes::distill_models::SharingConsent,
     ) -> anyhow::Result<()> {
+        if let Some(n) = self.notes.write().await.get_mut(&note_id) {
+            n.sharing_consent = *consent;
+        }
         Ok(())
     }
 
@@ -17482,5 +17529,134 @@ mod anchor_tests {
         assert!(store.list_anchor_events(s1).await.unwrap().is_empty());
         // reverting again is a no-op
         assert_eq!(store.revert_inferred_anchors().await.unwrap(), 0);
+    }
+}
+
+/// The mock and the Cypher client must apply the same cross-project rule
+/// (`PropagationScope::weigh_foreign`, cut AFTER the weighting). Runs the same
+/// graph through both; skipped when no Neo4j answers at `NEO4J_URI`
+/// (`HARNESS_NEO4J_REQUIRED=1` turns the skip into a failure).
+#[cfg(test)]
+mod cross_project_parity {
+    use super::MockGraphStore;
+    use crate::episodes::distill_models::SharingConsent;
+    use crate::neo4j::client::Neo4jClient;
+    use crate::neo4j::traits::GraphStore;
+    use crate::notes::{EntityType, Note, NoteImportance, NoteType};
+    use uuid::Uuid;
+
+    fn note(project: Uuid, imp: NoteImportance, energy: f64, tags: &[&str]) -> Note {
+        let mut n = Note::new(
+            Some(project),
+            NoteType::Guideline,
+            format!("t0f parity {}", Uuid::new_v4()),
+            String::new(),
+        );
+        n.importance = imp;
+        n.energy = energy;
+        n.tags = tags.iter().map(|t| t.to_string()).collect();
+        n
+    }
+
+    /// 19 local notes (coupling 1), 1 strongly coupled foreign note, 4 weakly
+    /// coupled foreign notes that outrank everything raw (critical). Weighted:
+    /// locals 0.5.., strong 1.0 * 0.2, weak 1.0 * 0.04. Cut at 20 after the
+    /// weighting: 19 locals + the strong one; the weak ones go.
+    fn graph() -> (Uuid, Vec<Note>, Uuid, Uuid) {
+        let (me, strong, weak) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut notes = Vec::new();
+        for i in 0..19 {
+            notes.push(note(
+                me,
+                NoteImportance::Medium,
+                0.5 + 0.01 * i as f64,
+                &["x", "y"],
+            ));
+        }
+        let mut s = note(strong, NoteImportance::Critical, 0.9, &["x", "y"]);
+        s.sharing_consent = SharingConsent::ExplicitAllow;
+        notes.push(s);
+        for _ in 0..4 {
+            let mut w = note(weak, NoteImportance::Critical, 0.9, &["x", "p", "q", "r"]);
+            w.sharing_consent = SharingConsent::ExplicitAllow;
+            notes.push(w);
+        }
+        (me, notes, strong, weak)
+    }
+
+    #[tokio::test]
+    async fn mock_and_neo4j_cut_after_the_coupling_weighting() {
+        let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:17687".into());
+        let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
+        let pass = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
+        let real = match Neo4jClient::new(&uri, &user, &pass).await {
+            Ok(c) => c,
+            Err(_) => {
+                assert!(
+                    std::env::var("HARNESS_NEO4J_REQUIRED").is_err(),
+                    "HARNESS_NEO4J_REQUIRED is set but no Neo4j answers at {uri}"
+                );
+                eprintln!("Skipping parity test: no Neo4j at {uri}");
+                return;
+            }
+        };
+        let raw = neo4rs::Graph::new(&uri, &user, &pass).await.unwrap();
+        let (me, notes, strong, weak) = graph();
+        let file = format!("/t0f/{}/p.rs", Uuid::new_v4());
+        raw.run(neo4rs::query("CREATE (:File {path: $p})").param("p", file.clone()))
+            .await
+            .unwrap();
+
+        let mock = MockGraphStore::new();
+        // Jaccard(tags) * W_TAGS (0.2): identical tags 1/1 -> 0.2; 1 shared of 5 -> 0.04.
+        mock.set_pairwise_coupling(me, strong, 0.2).await;
+        mock.set_pairwise_coupling(me, weak, 0.04).await;
+        for n in &notes {
+            for store in [&real as &dyn GraphStore, &mock as &dyn GraphStore] {
+                store.create_note(n).await.unwrap();
+                store
+                    .link_note_to_entity(n.id, &EntityType::File, &file, None, None)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let from_real = real
+            .get_propagated_notes(&EntityType::File, &file, 2, 0.0, None, Some(me), true)
+            .await
+            .unwrap();
+        let from_mock = mock
+            .get_propagated_notes(&EntityType::File, &file, 2, 0.0, None, Some(me), true)
+            .await
+            .unwrap();
+        let ids = |v: &[crate::notes::PropagatedNote]| -> Vec<Uuid> {
+            v.iter().map(|p| p.note.id).collect()
+        };
+
+        let cleanup = || async {
+            let all: Vec<String> = notes.iter().map(|n| n.id.to_string()).collect();
+            raw.run(
+                neo4rs::query("MATCH (n:Note) WHERE n.id IN $ids DETACH DELETE n")
+                    .param("ids", all),
+            )
+            .await
+            .unwrap();
+            raw.run(
+                neo4rs::query("MATCH (f:File {path: $p}) DETACH DELETE f").param("p", file.clone()),
+            )
+            .await
+            .unwrap();
+        };
+        let (r, m) = (ids(&from_real), ids(&from_mock));
+        cleanup().await;
+
+        assert_eq!(r.len(), 20, "real: cut at 20 after weighting");
+        assert_eq!(r, m, "mock and Neo4j return the same ordered top-20");
+        assert!(r.contains(&notes[19].id), "strongly coupled foreign kept");
+        assert_eq!(r.last(), Some(&notes[19].id), "weighted below the locals");
+        assert!(
+            notes[20..].iter().all(|w| !r.contains(&w.id)),
+            "weakly coupled foreign notes cut after the weighting"
+        );
     }
 }

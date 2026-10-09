@@ -59,6 +59,18 @@ pub async fn reinforce_per_project(
     }
 }
 
+/// Project of a chat session (its `project_slug` resolved), if any.
+pub async fn session_project_id(graph: &dyn GraphStore, session_id: Uuid) -> Option<Uuid> {
+    let session = graph.get_chat_session(session_id).await.ok().flatten()?;
+    let slug = session.project_slug?;
+    graph
+        .get_project_by_slug(&slug)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| p.id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
