@@ -170,6 +170,29 @@ impl Neo4jClient {
                     .param("execution_place", session.execution_place.as_str()),
             )
             .await?;
+
+        // Lineage as a real edge, written IN ADDITION to the `spawned_by` JSON
+        // property (reads still use the JSON). MERGE on the bare relationship so
+        // an edge already written by `create_spawned_by_relation` is reused.
+        if let Some(parent) = session
+            .spawned_by
+            .as_deref()
+            .and_then(crate::chat::types::SpawnedBy::from_json_str)
+            .and_then(|sb| sb.parent_session_id())
+        {
+            self.graph
+                .run(
+                    query(
+                        "MATCH (c:ChatSession {id: $child_id}) \
+                         MATCH (p:ChatSession {id: $parent_id}) \
+                         MERGE (c)-[r:SPAWNED_BY]->(p) \
+                         ON CREATE SET r.created_at = datetime()",
+                    )
+                    .param("child_id", session.id.to_string())
+                    .param("parent_id", parent.to_string()),
+                )
+                .await?;
+        }
         Ok(())
     }
 
@@ -537,6 +560,15 @@ impl Neo4jClient {
         let exists = check_result.next().await?.is_some();
 
         if exists {
+            // Anchors and their journal belong to the session; their targets do not.
+            for cypher in [
+                "MATCH (a:Anchor {session_id: $id}) DELETE a",
+                "MATCH (e:AnchorEvent {session_id: $id}) DELETE e",
+            ] {
+                self.graph
+                    .run(query(cypher).param("id", id.to_string()))
+                    .await?;
+            }
             let q = query("MATCH (s:ChatSession {id: $id}) DETACH DELETE s")
                 .param("id", id.to_string());
             self.graph.run(q).await?;
@@ -586,12 +618,12 @@ impl Neo4jClient {
             r#"
             MATCH (child:ChatSession {id: $child_id})
             MATCH (parent:ChatSession {id: $parent_id})
-            CREATE (child)-[:SPAWNED_BY {
-                type: $spawn_type,
-                run_id: $run_id,
-                task_id: $task_id,
-                created_at: datetime()
-            }]->(parent)
+            // MERGE: `create_chat_session` already writes the bare edge for a
+            // session that carries a parent; this fills in the run metadata
+            // instead of adding a second edge.
+            MERGE (child)-[r:SPAWNED_BY]->(parent)
+            ON CREATE SET r.created_at = datetime()
+            SET r.type = $spawn_type, r.run_id = $run_id, r.task_id = $task_id
             "#,
         )
         .param("child_id", child_session_id.to_string())
@@ -2076,6 +2108,408 @@ impl Neo4jClient {
         } else {
             Ok(None)
         }
+    }
+}
+
+// ============================================================================
+// Chat anchors (see `crate::chat::anchor`)
+// ============================================================================
+
+fn anchor_opt(s: String) -> Option<String> {
+    (!s.is_empty()).then_some(s)
+}
+
+fn parse_ts(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    Ok(chrono::DateTime::parse_from_rfc3339(s)?.with_timezone(&chrono::Utc))
+}
+
+fn anchor_from_node(node: &neo4rs::Node) -> Result<crate::chat::anchor::Anchor> {
+    use crate::chat::anchor::*;
+    let bad = |what: &str| anyhow::anyhow!("corrupt Anchor node: {what}");
+    let s = |k: &str| node.get::<String>(k).unwrap_or_default();
+    let roles: Vec<String> = node.get("roles").unwrap_or_default();
+    Ok(Anchor {
+        id: s("id").parse()?,
+        session_id: s("session_id").parse()?,
+        target_type: AnchorTargetType::parse(&s("target_type"))
+            .ok_or_else(|| bad("target_type"))?,
+        target_id: s("target_id"),
+        roles: roles
+            .iter()
+            .map(|r| AnchorRole::parse(r).ok_or_else(|| bad("role")))
+            .collect::<Result<_>>()?,
+        state: AnchorState::parse(&s("state")).ok_or_else(|| bad("state"))?,
+        by: AnchorActor::parse(&s("by")).ok_or_else(|| bad("by"))?,
+        inferred: node.get::<bool>("inferred").unwrap_or(false),
+        confidence: node.get::<f64>("confidence").unwrap_or(1.0),
+        snapshot_name: anchor_opt(s("snapshot_name")),
+        snapshot_path: anchor_opt(s("snapshot_path")),
+        snapshot_type: anchor_opt(s("snapshot_type")),
+        rev: anchor_opt(s("rev")),
+        version: node.get::<i64>("version").unwrap_or(1).max(1) as u64,
+        created_at: parse_ts(&s("created_at"))?,
+        updated_at: parse_ts(&s("updated_at"))?,
+    })
+}
+
+fn anchor_event_from_node(node: &neo4rs::Node) -> Result<crate::chat::anchor::AnchorEvent> {
+    use crate::chat::anchor::*;
+    let bad = |what: &str| anyhow::anyhow!("corrupt AnchorEvent node: {what}");
+    let s = |k: &str| node.get::<String>(k).unwrap_or_default();
+    let json = |k: &str| anchor_opt(s(k)).and_then(|j| serde_json::from_str(&j).ok());
+    Ok(AnchorEvent {
+        id: s("id").parse()?,
+        session_id: s("session_id").parse()?,
+        anchor_id: s("anchor_id").parse()?,
+        kind: AnchorEventKind::parse(&s("kind")).ok_or_else(|| bad("kind"))?,
+        by: AnchorActor::parse(&s("by")).ok_or_else(|| bad("by"))?,
+        actor: s("actor"),
+        at: parse_ts(&s("at"))?,
+        before: json("before"),
+        after: json("after"),
+    })
+}
+
+/// Run a statement inside a transaction and collect its rows.
+async fn txn_rows(txn: &mut neo4rs::Txn, q: neo4rs::Query) -> Result<Vec<neo4rs::Row>> {
+    let mut stream = txn.execute(q).await?;
+    let mut rows = Vec::new();
+    while let Some(row) = stream.next(txn.handle()).await? {
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+impl Neo4jClient {
+    /// Rules of `chat::anchor::apply_op`, persisted in one transaction.
+    ///
+    /// The transaction first writes `anchor_lock` on the `ChatSession` node:
+    /// that takes the node's write lock, so two concurrent operations on the
+    /// same session run one after the other and each reads the anchors the
+    /// previous one committed. The caps and the `version` check are therefore
+    /// evaluated on a consistent view. The unique constraint on
+    /// `(session_id, target_type, target_id)` is the backstop.
+    pub async fn apply_anchor_op(
+        &self,
+        session_id: Uuid,
+        op: crate::chat::anchor::AnchorOp,
+    ) -> Result<crate::chat::anchor::AnchorChange> {
+        use crate::chat::anchor::*;
+        let sid = session_id.to_string();
+        let mut txn = self.graph.start_txn().await?;
+        let outcome: Result<AnchorChange> = async {
+            let locked = txn_rows(
+                &mut txn,
+                query(
+                    "MATCH (s:ChatSession {id: $sid}) \
+                     SET s.anchor_lock = coalesce(s.anchor_lock, 0) + 1 \
+                     RETURN s.id AS id",
+                )
+                .param("sid", sid.clone()),
+            )
+            .await?;
+            if locked.is_empty() {
+                return Err(AnchorError::SessionNotFound(session_id).into());
+            }
+            let rows = txn_rows(
+                &mut txn,
+                query("MATCH (a:Anchor {session_id: $sid}) RETURN a ORDER BY a.created_at, a.id")
+                    .param("sid", sid.clone()),
+            )
+            .await?;
+            let mut existing = Vec::with_capacity(rows.len());
+            for row in rows {
+                let node: neo4rs::Node = row.get("a")?;
+                existing.push(anchor_from_node(&node)?);
+            }
+            let change = apply_op(session_id, &existing, op, chrono::Utc::now())?;
+            let a = &change.anchor;
+            if change.deleted {
+                txn.run(
+                    query("MATCH (a:Anchor {id: $id, session_id: $sid}) DELETE a")
+                        .param("id", a.id.to_string())
+                        .param("sid", sid.clone()),
+                )
+                .await?;
+            } else if change.event.is_some() {
+                let roles: Vec<String> = a.roles.iter().map(|r| r.to_string()).collect();
+                txn.run(
+                    query(
+                        "MERGE (a:Anchor {session_id: $sid, target_type: $tt, target_id: $tid}) \
+                         SET a.id = $id, a.roles = $roles, a.state = $state, a.by = $by, \
+                             a.inferred = $inferred, a.confidence = $confidence, \
+                             a.snapshot_name = $snapshot_name, a.snapshot_path = $snapshot_path, \
+                             a.snapshot_type = $snapshot_type, a.rev = $rev, \
+                             a.version = $version, \
+                             a.created_at = coalesce(a.created_at, $created_at), \
+                             a.updated_at = $updated_at",
+                    )
+                    .param("sid", sid.clone())
+                    .param("tt", a.target_type.as_str())
+                    .param("tid", a.target_id.clone())
+                    .param("id", a.id.to_string())
+                    .param("roles", roles)
+                    .param("state", a.state.as_str())
+                    .param("by", a.by.as_str())
+                    .param("inferred", a.inferred)
+                    .param("confidence", a.confidence)
+                    .param("snapshot_name", a.snapshot_name.clone().unwrap_or_default())
+                    .param("snapshot_path", a.snapshot_path.clone().unwrap_or_default())
+                    .param("snapshot_type", a.snapshot_type.clone().unwrap_or_default())
+                    .param("rev", a.rev.clone().unwrap_or_default())
+                    .param("version", a.version as i64)
+                    .param("created_at", format_ts(a.created_at))
+                    .param("updated_at", format_ts(a.updated_at)),
+                )
+                .await?;
+            }
+            if let Some(ev) = &change.event {
+                let json = |v: &Option<serde_json::Value>| {
+                    v.as_ref().map(|v| v.to_string()).unwrap_or_default()
+                };
+                txn.run(
+                    query(
+                        "CREATE (:AnchorEvent {id: $id, session_id: $sid, anchor_id: $aid, \
+                         kind: $kind, by: $by, actor: $actor, at: $at, \
+                         before: $before, after: $after})",
+                    )
+                    .param("id", ev.id.to_string())
+                    .param("sid", sid.clone())
+                    .param("aid", ev.anchor_id.to_string())
+                    .param("kind", ev.kind.as_str())
+                    .param("by", ev.by.as_str())
+                    .param("actor", ev.actor.clone())
+                    .param("at", format_ts(ev.at))
+                    .param("before", json(&ev.before))
+                    .param("after", json(&ev.after)),
+                )
+                .await?;
+            }
+            Ok(change)
+        }
+        .await;
+        match outcome {
+            Ok(change) => {
+                txn.commit().await?;
+                Ok(change)
+            }
+            Err(e) => {
+                let _ = txn.rollback().await;
+                Err(e)
+            }
+        }
+    }
+
+    /// All anchors of a session, oldest first.
+    pub async fn list_session_anchors(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<crate::chat::anchor::Anchor>> {
+        let mut result = self
+            .graph
+            .execute(
+                query("MATCH (a:Anchor {session_id: $sid}) RETURN a ORDER BY a.created_at, a.id")
+                    .param("sid", session_id.to_string()),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("a")?;
+            out.push(anchor_from_node(&node)?);
+        }
+        Ok(out)
+    }
+
+    /// Reverse query, keyset-paginated on the anchor id.
+    pub async fn list_sessions_for_target(
+        &self,
+        target_type: crate::chat::anchor::AnchorTargetType,
+        target_id: &str,
+        state: Option<crate::chat::anchor::AnchorState>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<crate::chat::anchor::AnchorPage> {
+        let limit = limit.clamp(1, 200);
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (a:Anchor {target_type: $tt, target_id: $tid}) \
+                     WHERE ($state = '' OR a.state = $state) AND ($after = '' OR a.id > $after) \
+                     RETURN a ORDER BY a.id LIMIT $limit",
+                )
+                .param("tt", target_type.as_str())
+                .param("tid", target_id.to_string())
+                .param("state", state.map(|s| s.as_str()).unwrap_or(""))
+                .param("after", cursor.unwrap_or("").to_string())
+                .param("limit", (limit + 1) as i64),
+            )
+            .await?;
+        let mut items = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("a")?;
+            items.push(anchor_from_node(&node)?);
+        }
+        let next_cursor = if items.len() > limit {
+            items.truncate(limit);
+            items.last().map(|a| a.id.to_string())
+        } else {
+            None
+        };
+        Ok(crate::chat::anchor::AnchorPage { items, next_cursor })
+    }
+
+    /// The journal of a session, oldest first.
+    pub async fn list_anchor_events(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<crate::chat::anchor::AnchorEvent>> {
+        let mut result = self
+            .graph
+            .execute(
+                query("MATCH (e:AnchorEvent {session_id: $sid}) RETURN e ORDER BY e.at, e.id")
+                    .param("sid", session_id.to_string()),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("e")?;
+            out.push(anchor_event_from_node(&node)?);
+        }
+        Ok(out)
+    }
+
+    /// Mark the anchors on a target `dangling` (one transaction per anchor).
+    pub async fn mark_anchors_dangling(
+        &self,
+        target_type: crate::chat::anchor::AnchorTargetType,
+        target_id: &str,
+    ) -> Result<usize> {
+        use crate::chat::anchor::*;
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (a:Anchor {target_type: $tt, target_id: $tid}) \
+                     WHERE a.state <> 'dangling' RETURN a.session_id AS sid, a.id AS id",
+                )
+                .param("tt", target_type.as_str())
+                .param("tid", target_id.to_string()),
+            )
+            .await?;
+        let mut todo = Vec::new();
+        while let Some(row) = result.next().await? {
+            let sid: String = row.get("sid")?;
+            let id: String = row.get("id")?;
+            todo.push((sid.parse::<Uuid>()?, id.parse::<Uuid>()?));
+        }
+        let mut changed = 0;
+        for (session_id, anchor_id) in todo {
+            let op = AnchorOp::SetState {
+                anchor_id,
+                state: AnchorState::Dangling,
+                expected_version: None,
+                by: AnchorActor::System,
+                actor: DANGLING_ACTOR.to_string(),
+            };
+            match self.apply_anchor_op(session_id, op).await {
+                Ok(c) if c.event.is_some() => changed += 1,
+                Ok(_) => {}
+                Err(e) => match e.downcast_ref::<AnchorError>() {
+                    // deleted between the scan and the write: nothing left to mark
+                    Some(AnchorError::NotFound(_) | AnchorError::SessionNotFound(_)) => {}
+                    _ => return Err(e),
+                },
+            }
+        }
+        Ok(changed)
+    }
+
+    /// See `GraphStore::backfill_project_anchors`.
+    pub async fn backfill_project_anchors(&self) -> Result<crate::chat::anchor::BackfillReport> {
+        use crate::chat::anchor::*;
+        let mut result = self
+            .graph
+            .execute(query(
+                "MATCH (s:ChatSession) WHERE s.project_slug IS NOT NULL AND s.project_slug <> '' \
+                 RETURN s.id AS id, s.project_slug AS slug ORDER BY s.id",
+            ))
+            .await?;
+        let mut sessions = Vec::new();
+        while let Some(row) = result.next().await? {
+            sessions.push((row.get::<String>("id")?, row.get::<String>("slug")?));
+        }
+        let mut report = BackfillReport::default();
+        let mut resolved: HashMap<String, Option<crate::neo4j::models::ProjectNode>> =
+            HashMap::new();
+        for (id, slug) in sessions {
+            let Ok(session_id) = id.parse::<Uuid>() else {
+                report.skipped_unresolved += 1;
+                continue;
+            };
+            if !resolved.contains_key(&slug) {
+                let mut r = self
+                    .graph
+                    .execute(
+                        query("MATCH (p:Project {slug: $slug}) RETURN count(p) AS n")
+                            .param("slug", slug.clone()),
+                    )
+                    .await?;
+                let n: i64 = match r.next().await? {
+                    Some(row) => row.get("n")?,
+                    None => 0,
+                };
+                let project = if n == 1 {
+                    self.get_project_by_slug(&slug).await?
+                } else {
+                    None
+                };
+                resolved.insert(slug.clone(), project);
+            }
+            let Some(Some(project)) = resolved.get(&slug) else {
+                report.skipped_unresolved += 1;
+                continue;
+            };
+            match self
+                .apply_anchor_op(session_id, AnchorOp::Add(backfill_new_anchor(project)))
+                .await
+            {
+                Ok(c) if c.created => report.created += 1,
+                Ok(_) => report.already_present += 1,
+                Err(e) => match e.downcast_ref::<AnchorError>() {
+                    Some(AnchorError::AlreadyAnchored { .. }) => report.already_present += 1,
+                    Some(AnchorError::SessionNotFound(_)) => report.skipped_unresolved += 1,
+                    Some(_) => report.skipped_by_rule += 1,
+                    None => return Err(e),
+                },
+            }
+        }
+        Ok(report)
+    }
+
+    /// See `GraphStore::revert_inferred_anchors`. One statement, hence atomic.
+    pub async fn revert_inferred_anchors(&self) -> Result<usize> {
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (a:Anchor) \
+                     WHERE a.inferred = true AND a.by = 'system' AND a.version = 1 \
+                       AND EXISTS { MATCH (x:AnchorEvent {anchor_id: a.id, kind: 'added', actor: $actor}) } \
+                     OPTIONAL MATCH (e:AnchorEvent {anchor_id: a.id}) \
+                     WITH a, collect(e) AS evs \
+                     FOREACH (e IN evs | DELETE e) \
+                     WITH a, a.id AS aid \
+                     DELETE a \
+                     RETURN count(aid) AS n",
+                )
+                .param("actor", crate::chat::anchor::BACKFILL_ACTOR),
+            )
+            .await?;
+        Ok(match result.next().await? {
+            Some(row) => row.get::<i64>("n")? as usize,
+            None => 0,
+        })
     }
 }
 

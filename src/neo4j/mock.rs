@@ -49,6 +49,13 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
 /// One `add_discussed` call: the session and the (label, identifier) pairs.
 pub type DiscussedCall = (Uuid, Vec<(String, String)>);
 
+/// Storage of the mock for chat anchors.
+#[derive(Debug, Default)]
+pub struct MockAnchorStore {
+    pub anchors: HashMap<Uuid, crate::chat::anchor::Anchor>,
+    pub events: Vec<crate::chat::anchor::AnchorEvent>,
+}
+
 pub struct MockGraphStore {
     // Entity stores
     pub projects: RwLock<HashMap<Uuid, ProjectNode>>,
@@ -84,6 +91,8 @@ pub struct MockGraphStore {
     /// undirected the way the Cypher reads them
     pub document_links: RwLock<HashMap<Uuid, Vec<(EntityType, String)>>>,
     pub chat_sessions: RwLock<HashMap<Uuid, ChatSessionNode>>,
+    /// Chat anchors and their journal (one lock: state and event change together).
+    pub anchor_store: RwLock<MockAnchorStore>,
     /// Provider harness settings, by (scope, key).
     pub llm_settings: RwLock<HashMap<(String, String), String>>,
     /// Test switch: writes to the `journal` scope (the send journal) fail, to prove
@@ -303,6 +312,7 @@ impl MockGraphStore {
             discussed_calls: RwLock::new(Vec::new()),
             document_links: RwLock::new(HashMap::new()),
             chat_sessions: RwLock::new(HashMap::new()),
+            anchor_store: RwLock::new(MockAnchorStore::default()),
             llm_settings: RwLock::new(HashMap::new()),
             fail_journal_writes: std::sync::atomic::AtomicBool::new(false),
             session_link_rows: RwLock::new(Vec::new()),
@@ -7791,7 +7801,207 @@ impl GraphStore for MockGraphStore {
     }
 
     async fn delete_chat_session(&self, id: Uuid) -> Result<bool> {
+        // Anchors and their journal go with the session; their targets stay.
+        let mut anchors = self.anchor_store.write().await;
+        anchors.anchors.retain(|_, a| a.session_id != id);
+        anchors.events.retain(|e| e.session_id != id);
+        drop(anchors);
         Ok(self.chat_sessions.write().await.remove(&id).is_some())
+    }
+
+    // Chat anchors — same rules as the Neo4j store (both call `anchor::apply_op`).
+
+    async fn apply_anchor_op(
+        &self,
+        session_id: Uuid,
+        op: crate::chat::anchor::AnchorOp,
+    ) -> Result<crate::chat::anchor::AnchorChange> {
+        use crate::chat::anchor::*;
+        // One lock over anchors + journal: state and event change together.
+        let mut store = self.anchor_store.write().await;
+        if !self.chat_sessions.read().await.contains_key(&session_id) {
+            return Err(AnchorError::SessionNotFound(session_id).into());
+        }
+        let existing: Vec<Anchor> = store
+            .anchors
+            .values()
+            .filter(|a| a.session_id == session_id)
+            .cloned()
+            .collect();
+        let change = apply_op(session_id, &existing, op, chrono::Utc::now())?;
+        if change.deleted {
+            store.anchors.remove(&change.anchor.id);
+        } else if change.event.is_some() {
+            store
+                .anchors
+                .insert(change.anchor.id, change.anchor.clone());
+        }
+        if let Some(ev) = &change.event {
+            store.events.push(ev.clone());
+        }
+        Ok(change)
+    }
+
+    async fn list_session_anchors(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<crate::chat::anchor::Anchor>> {
+        let store = self.anchor_store.read().await;
+        let mut v: Vec<_> = store
+            .anchors
+            .values()
+            .filter(|a| a.session_id == session_id)
+            .cloned()
+            .collect();
+        v.sort_by_key(|a| (a.created_at, a.id));
+        Ok(v)
+    }
+
+    async fn list_sessions_for_target(
+        &self,
+        target_type: crate::chat::anchor::AnchorTargetType,
+        target_id: &str,
+        state: Option<crate::chat::anchor::AnchorState>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<crate::chat::anchor::AnchorPage> {
+        let limit = limit.clamp(1, 200);
+        let after = cursor.unwrap_or("").to_string();
+        let store = self.anchor_store.read().await;
+        let mut items: Vec<_> = store
+            .anchors
+            .values()
+            .filter(|a| a.target_type == target_type && a.target_id == target_id)
+            .filter(|a| state.is_none_or(|s| a.state == s))
+            .filter(|a| after.is_empty() || a.id.to_string() > after)
+            .cloned()
+            .collect();
+        items.sort_by_key(|a| a.id.to_string());
+        items.truncate(limit + 1);
+        let next_cursor = if items.len() > limit {
+            items.truncate(limit);
+            items.last().map(|a| a.id.to_string())
+        } else {
+            None
+        };
+        Ok(crate::chat::anchor::AnchorPage { items, next_cursor })
+    }
+
+    async fn list_anchor_events(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<crate::chat::anchor::AnchorEvent>> {
+        let store = self.anchor_store.read().await;
+        Ok(store
+            .events
+            .iter()
+            .filter(|e| e.session_id == session_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn mark_anchors_dangling(
+        &self,
+        target_type: crate::chat::anchor::AnchorTargetType,
+        target_id: &str,
+    ) -> Result<usize> {
+        use crate::chat::anchor::*;
+        let todo: Vec<(Uuid, Uuid)> = self
+            .anchor_store
+            .read()
+            .await
+            .anchors
+            .values()
+            .filter(|a| {
+                a.target_type == target_type
+                    && a.target_id == target_id
+                    && a.state != AnchorState::Dangling
+            })
+            .map(|a| (a.session_id, a.id))
+            .collect();
+        let mut changed = 0;
+        for (session_id, anchor_id) in todo {
+            let op = AnchorOp::SetState {
+                anchor_id,
+                state: AnchorState::Dangling,
+                expected_version: None,
+                by: AnchorActor::System,
+                actor: DANGLING_ACTOR.to_string(),
+            };
+            if self.apply_anchor_op(session_id, op).await?.event.is_some() {
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    }
+
+    async fn backfill_project_anchors(&self) -> Result<crate::chat::anchor::BackfillReport> {
+        use crate::chat::anchor::*;
+        let mut sessions: Vec<(Uuid, String)> = self
+            .chat_sessions
+            .read()
+            .await
+            .values()
+            .filter_map(|s| {
+                s.project_slug
+                    .clone()
+                    .filter(|p| !p.is_empty())
+                    .map(|p| (s.id, p))
+            })
+            .collect();
+        sessions.sort();
+        let mut report = BackfillReport::default();
+        for (session_id, slug) in sessions {
+            let matches: Vec<ProjectNode> = self
+                .projects
+                .read()
+                .await
+                .values()
+                .filter(|p| p.slug == slug)
+                .cloned()
+                .collect();
+            let [project] = matches.as_slice() else {
+                report.skipped_unresolved += 1;
+                continue;
+            };
+            match self
+                .apply_anchor_op(session_id, AnchorOp::Add(backfill_new_anchor(project)))
+                .await
+            {
+                Ok(c) if c.created => report.created += 1,
+                Ok(_) => report.already_present += 1,
+                Err(e) => match e.downcast_ref::<AnchorError>() {
+                    Some(AnchorError::AlreadyAnchored { .. }) => report.already_present += 1,
+                    Some(AnchorError::SessionNotFound(_)) => report.skipped_unresolved += 1,
+                    Some(_) => report.skipped_by_rule += 1,
+                    None => return Err(e),
+                },
+            }
+        }
+        Ok(report)
+    }
+
+    async fn revert_inferred_anchors(&self) -> Result<usize> {
+        use crate::chat::anchor::*;
+        let mut store = self.anchor_store.write().await;
+        let doomed: Vec<Uuid> = store
+            .anchors
+            .values()
+            .filter(|a| {
+                let added_by = store
+                    .events
+                    .iter()
+                    .find(|e| e.anchor_id == a.id && e.kind == AnchorEventKind::Added)
+                    .map(|e| e.actor.as_str());
+                is_revertible_backfill(a, added_by)
+            })
+            .map(|a| a.id)
+            .collect();
+        for id in &doomed {
+            store.anchors.remove(id);
+        }
+        store.events.retain(|e| !doomed.contains(&e.anchor_id));
+        Ok(doomed.len())
     }
 
     // Chat event operations
@@ -16643,5 +16853,405 @@ mod tests {
             .unwrap()
             .expect("unblocked");
         assert_eq!(next.id, dependent);
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+    use crate::chat::anchor::*;
+    use crate::neo4j::traits::GraphStore;
+    use crate::test_helpers::{test_chat_session, test_project_named};
+
+    async fn session(store: &MockGraphStore, slug: Option<&str>) -> Uuid {
+        let s = test_chat_session(slug);
+        let id = s.id;
+        store.create_chat_session(&s).await.unwrap();
+        id
+    }
+
+    fn plan_id() -> String {
+        Uuid::new_v4().to_string()
+    }
+
+    fn err(e: anyhow::Error) -> AnchorError {
+        e.downcast::<AnchorError>().expect("a typed AnchorError")
+    }
+
+    fn user_add(t: AnchorTargetType, id: &str, roles: &[AnchorRole]) -> NewAnchor {
+        NewAnchor::new(t, id, roles.iter().copied(), AnchorActor::User, "u1")
+    }
+
+    #[tokio::test]
+    async fn anchor_add_promote_remove_with_journal() {
+        let store = MockGraphStore::new();
+        let sid = session(&store, None).await;
+        let a = store
+            .add_anchor(
+                sid,
+                user_add(AnchorTargetType::File, "src/a.rs", &[AnchorRole::Mention]),
+            )
+            .await
+            .unwrap();
+        assert_eq!((a.version, a.state), (1, AnchorState::Live));
+        let a = store
+            .promote_anchor_role(sid, a.id, AnchorRole::Focus, 1, AnchorActor::User, "u1")
+            .await
+            .unwrap();
+        assert_eq!(a.version, 2);
+        assert!(a.roles.contains(&AnchorRole::Focus) && a.roles.contains(&AnchorRole::Mention));
+        let a = store
+            .demote_anchor_role(sid, a.id, AnchorRole::Focus, 2, AnchorActor::User, "u1")
+            .await
+            .unwrap();
+        store
+            .remove_anchor(sid, a.id, a.version, AnchorActor::User, "u1")
+            .await
+            .unwrap();
+        assert!(store.list_session_anchors(sid).await.unwrap().is_empty());
+        let kinds: Vec<_> = store
+            .list_anchor_events(sid)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                AnchorEventKind::Added,
+                AnchorEventKind::Promoted,
+                AnchorEventKind::Demoted,
+                AnchorEventKind::Removed
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn anchor_stale_version_is_a_conflict_and_changes_nothing() {
+        let store = MockGraphStore::new();
+        let sid = session(&store, None).await;
+        let a = store
+            .add_anchor(
+                sid,
+                user_add(AnchorTargetType::Plan, &plan_id(), &[AnchorRole::Mention]),
+            )
+            .await
+            .unwrap();
+        store
+            .promote_anchor_role(sid, a.id, AnchorRole::Focus, 1, AnchorActor::User, "u1")
+            .await
+            .unwrap();
+        let e = store
+            .promote_anchor_role(sid, a.id, AnchorRole::Focus, 1, AnchorActor::User, "u2")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err(e),
+            AnchorError::VersionConflict {
+                expected: 1,
+                actual: 2
+            }
+        );
+        let e = store
+            .remove_anchor(sid, a.id, 1, AnchorActor::User, "u2")
+            .await
+            .unwrap_err();
+        assert!(matches!(err(e), AnchorError::VersionConflict { .. }));
+        assert_eq!(store.list_session_anchors(sid).await.unwrap().len(), 1);
+        assert_eq!(store.list_anchor_events(sid).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn anchor_rules_hold_through_the_store() {
+        let store = MockGraphStore::new();
+        let sid = session(&store, None).await;
+        // agent cannot focus
+        let mut n = user_add(AnchorTargetType::File, "a.rs", &[AnchorRole::Focus]);
+        n.by = AnchorActor::Agent;
+        assert_eq!(
+            err(store.add_anchor(sid, n).await.unwrap_err()),
+            AnchorError::AgentCannotFocus
+        );
+        // origin immutable
+        let origin = store
+            .add_anchor(
+                sid,
+                NewAnchor::new(
+                    AnchorTargetType::Plan,
+                    plan_id(),
+                    [AnchorRole::Origin],
+                    AnchorActor::System,
+                    "sys",
+                ),
+            )
+            .await
+            .unwrap();
+        let e = store
+            .remove_anchor(sid, origin.id, 1, AnchorActor::User, "u1")
+            .await
+            .unwrap_err();
+        assert_eq!(err(e), AnchorError::OriginImmutable);
+        // focus cap
+        for i in 0..3 {
+            store
+                .add_anchor(
+                    sid,
+                    user_add(
+                        AnchorTargetType::File,
+                        &format!("f{i}"),
+                        &[AnchorRole::Focus],
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let e = store
+            .add_anchor(
+                sid,
+                user_add(AnchorTargetType::File, "f9", &[AnchorRole::Focus]),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err(e), AnchorError::FocusCapReached { max: 3 });
+        // unknown session
+        let ghost = Uuid::new_v4();
+        let e = store
+            .add_anchor(
+                ghost,
+                user_add(AnchorTargetType::File, "x", &[AnchorRole::Mention]),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err(e), AnchorError::SessionNotFound(ghost));
+        // a refused operation leaves no journal entry
+        assert_eq!(store.list_anchor_events(sid).await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn anchor_reverse_query_is_paginated_and_filterable() {
+        let store = MockGraphStore::new();
+        let target = plan_id();
+        let mut sessions = vec![];
+        for _ in 0..5 {
+            let sid = session(&store, None).await;
+            store
+                .add_anchor(
+                    sid,
+                    user_add(AnchorTargetType::Plan, &target, &[AnchorRole::Mention]),
+                )
+                .await
+                .unwrap();
+            sessions.push(sid);
+        }
+        // another target must not leak in
+        let other = session(&store, None).await;
+        store
+            .add_anchor(
+                other,
+                user_add(AnchorTargetType::Plan, &plan_id(), &[AnchorRole::Mention]),
+            )
+            .await
+            .unwrap();
+
+        let mut seen = vec![];
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = store
+                .list_sessions_for_target(
+                    AnchorTargetType::Plan,
+                    &target,
+                    None,
+                    2,
+                    cursor.as_deref(),
+                )
+                .await
+                .unwrap();
+            pages += 1;
+            seen.extend(page.items.iter().map(|a| a.session_id));
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(pages, 3);
+        seen.sort();
+        sessions.sort();
+        assert_eq!(seen, sessions);
+
+        // state filter
+        let n = store
+            .mark_anchors_dangling(AnchorTargetType::Plan, &target)
+            .await
+            .unwrap();
+        assert_eq!(n, 5);
+        let live = store
+            .list_sessions_for_target(
+                AnchorTargetType::Plan,
+                &target,
+                Some(AnchorState::Live),
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(live.items.is_empty());
+        let dangling = store
+            .list_sessions_for_target(
+                AnchorTargetType::Plan,
+                &target,
+                Some(AnchorState::Dangling),
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dangling.items.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn anchor_mark_dangling_keeps_anchors_and_journals_once() {
+        let store = MockGraphStore::new();
+        let sid = session(&store, None).await;
+        let target = plan_id();
+        store
+            .add_anchor(
+                sid,
+                user_add(AnchorTargetType::Plan, &target, &[AnchorRole::Origin]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .mark_anchors_dangling(AnchorTargetType::Plan, &target)
+                .await
+                .unwrap(),
+            1
+        );
+        // second call changes nothing
+        assert_eq!(
+            store
+                .mark_anchors_dangling(AnchorTargetType::Plan, &target)
+                .await
+                .unwrap(),
+            0
+        );
+        let anchors = store.list_session_anchors(sid).await.unwrap();
+        assert_eq!(anchors.len(), 1, "never deleted, even the origin one");
+        assert_eq!(anchors[0].state, AnchorState::Dangling);
+        let evs = store.list_anchor_events(sid).await.unwrap();
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[1].kind, AnchorEventKind::StateChanged);
+        assert_eq!(evs[1].by, AnchorActor::System);
+    }
+
+    #[tokio::test]
+    async fn anchor_deleting_a_session_deletes_anchors_and_events_not_targets() {
+        let store = MockGraphStore::new();
+        let (keep, gone) = (session(&store, None).await, session(&store, None).await);
+        let target = plan_id();
+        for s in [keep, gone] {
+            store
+                .add_anchor(
+                    s,
+                    user_add(AnchorTargetType::Plan, &target, &[AnchorRole::Mention]),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(store.delete_chat_session(gone).await.unwrap());
+        assert!(store.list_session_anchors(gone).await.unwrap().is_empty());
+        assert!(store.list_anchor_events(gone).await.unwrap().is_empty());
+        assert_eq!(store.list_session_anchors(keep).await.unwrap().len(), 1);
+        assert_eq!(store.list_anchor_events(keep).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn anchor_backfill_is_idempotent_and_reversible() {
+        let store = MockGraphStore::new();
+        let project = test_project_named("alpha");
+        store.create_project(&project).await.unwrap();
+        let s1 = session(&store, Some("alpha")).await;
+        let s2 = session(&store, Some("alpha")).await;
+        let unresolved = session(&store, Some("no-such-project")).await;
+        let none = session(&store, None).await;
+
+        let r1 = store.backfill_project_anchors().await.unwrap();
+        assert_eq!(
+            r1,
+            BackfillReport {
+                created: 2,
+                already_present: 0,
+                skipped_unresolved: 1,
+                skipped_by_rule: 0
+            }
+        );
+        let snapshot = |store: &MockGraphStore| {
+            let anchors = store.anchor_store.try_read().unwrap();
+            let mut v: Vec<_> = anchors
+                .anchors
+                .values()
+                .map(|a| (a.session_id, a.target_id.clone(), a.version))
+                .collect();
+            v.sort();
+            (v, anchors.events.len())
+        };
+        let after_first = snapshot(&store);
+
+        let r2 = store.backfill_project_anchors().await.unwrap();
+        assert_eq!(
+            r2,
+            BackfillReport {
+                created: 0,
+                already_present: 2,
+                skipped_unresolved: 1,
+                skipped_by_rule: 0
+            }
+        );
+        assert_eq!(snapshot(&store), after_first, "two runs = same state");
+
+        let a = &store.list_session_anchors(s1).await.unwrap()[0];
+        assert_eq!(a.target_type, AnchorTargetType::Project);
+        assert_eq!(a.target_id, project.id.to_string());
+        assert!(a.inferred && a.by == AnchorActor::System && a.confidence == 1.0);
+        assert!(a.roles.contains(&AnchorRole::Focus));
+        assert_eq!(a.snapshot_name.as_deref(), Some("alpha"));
+        assert!(store
+            .list_session_anchors(unresolved)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store.list_session_anchors(none).await.unwrap().is_empty());
+
+        // a hand-made anchor and a modified inferred one survive the revert
+        let manual = store
+            .add_anchor(
+                none,
+                user_add(AnchorTargetType::Plan, &plan_id(), &[AnchorRole::Mention]),
+            )
+            .await
+            .unwrap();
+        store
+            .set_anchor_state(
+                s2,
+                store.list_session_anchors(s2).await.unwrap()[0].id,
+                AnchorState::Moved,
+                None,
+                AnchorActor::User,
+                "u1",
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.revert_inferred_anchors().await.unwrap(), 1);
+        assert!(store.list_session_anchors(s1).await.unwrap().is_empty());
+        assert_eq!(store.list_session_anchors(s2).await.unwrap().len(), 1);
+        assert_eq!(
+            store.list_session_anchors(none).await.unwrap()[0].id,
+            manual.id
+        );
+        assert!(store.list_anchor_events(s1).await.unwrap().is_empty());
+        // reverting again is a no-op
+        assert_eq!(store.revert_inferred_anchors().await.unwrap(), 0);
     }
 }

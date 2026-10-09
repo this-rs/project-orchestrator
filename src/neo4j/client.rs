@@ -361,6 +361,12 @@ impl Neo4jClient {
             // Chat constraints
             "CREATE CONSTRAINT chat_session_id IF NOT EXISTS FOR (s:ChatSession) REQUIRE s.id IS UNIQUE",
             "CREATE CONSTRAINT chat_event_id IF NOT EXISTS FOR (e:ChatEvent) REQUIRE e.id IS UNIQUE",
+            // Chat anchors: one Anchor per (session, target type, target id). The
+            // composite uniqueness form (Neo4j 5, Community included) is the one
+            // `routing_arm_key` already uses below.
+            "CREATE CONSTRAINT anchor_id IF NOT EXISTS FOR (a:Anchor) REQUIRE a.id IS UNIQUE",
+            "CREATE CONSTRAINT anchor_session_target IF NOT EXISTS FOR (a:Anchor) REQUIRE (a.session_id, a.target_type, a.target_id) IS UNIQUE",
+            "CREATE CONSTRAINT anchor_event_id IF NOT EXISTS FOR (e:AnchorEvent) REQUIRE e.id IS UNIQUE",
             // Milestone & Release constraints
             "CREATE CONSTRAINT milestone_id IF NOT EXISTS FOR (m:Milestone) REQUIRE m.id IS UNIQUE",
             "CREATE CONSTRAINT release_id IF NOT EXISTS FOR (r:Release) REQUIRE r.id IS UNIQUE",
@@ -449,6 +455,11 @@ impl Neo4jClient {
             // order (index-backed ORDER BY + LIMIT), instead of gathering every
             // event of the conversation via HAS_EVENT and sorting in memory.
             "CREATE INDEX chat_event_session_seq IF NOT EXISTS FOR (e:ChatEvent) ON (e.session_id, e.seq)",
+            // Anchor indexes: reverse query "sessions anchored on X", and per-session reads/journal
+            "CREATE INDEX anchor_target IF NOT EXISTS FOR (a:Anchor) ON (a.target_type, a.target_id)",
+            "CREATE INDEX anchor_session IF NOT EXISTS FOR (a:Anchor) ON (a.session_id)",
+            "CREATE INDEX anchor_event_session IF NOT EXISTS FOR (e:AnchorEvent) ON (e.session_id)",
+            "CREATE INDEX anchor_event_anchor IF NOT EXISTS FOR (e:AnchorEvent) ON (e.anchor_id)",
             // ChatSession indexes — queried by project_slug, workspace_slug, cli_session_id
             "CREATE INDEX chat_session_project IF NOT EXISTS FOR (s:ChatSession) ON (s.project_slug)",
             "CREATE INDEX chat_session_workspace IF NOT EXISTS FOR (s:ChatSession) ON (s.workspace_slug)",

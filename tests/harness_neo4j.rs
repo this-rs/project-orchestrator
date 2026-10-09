@@ -340,3 +340,301 @@ async fn routing_settings_project_override_wins_and_delete_returns_to_global() {
             .unwrap();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Chat anchors (typed context anchors) — the Cypher, on a real Neo4j.
+// ---------------------------------------------------------------------------
+
+mod anchors {
+    use super::*;
+    use project_orchestrator::chat::anchor::*;
+    use project_orchestrator::chat::types::SpawnedBy;
+
+    fn typed(e: anyhow::Error) -> AnchorError {
+        e.downcast::<AnchorError>().expect("a typed AnchorError")
+    }
+
+    fn user(t: AnchorTargetType, id: &str, roles: &[AnchorRole]) -> NewAnchor {
+        NewAnchor::new(t, id, roles.iter().copied(), AnchorActor::User, "harness")
+    }
+
+    #[tokio::test]
+    async fn anchors_follow_the_rules_and_the_journal_on_real_neo4j() {
+        let Some(e) = env().await else { return };
+        let store: &dyn GraphStore = &e.client;
+        let sid = Uuid::new_v4();
+        store.create_chat_session(&node(sid)).await.unwrap();
+
+        let plan = Uuid::new_v4().to_string();
+        let a = store
+            .add_anchor(
+                sid,
+                user(AnchorTargetType::Plan, &plan, &[AnchorRole::Mention]),
+            )
+            .await
+            .unwrap();
+        // adding the same thing again is idempotent
+        let again = store
+            .add_anchor(
+                sid,
+                user(AnchorTargetType::Plan, &plan, &[AnchorRole::Mention]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.id, a.id);
+        assert_eq!(store.list_session_anchors(sid).await.unwrap().len(), 1);
+
+        let promoted = store
+            .promote_anchor_role(
+                sid,
+                a.id,
+                AnchorRole::Focus,
+                1,
+                AnchorActor::User,
+                "harness",
+            )
+            .await
+            .unwrap();
+        assert_eq!(promoted.version, 2);
+        let stale = store
+            .promote_anchor_role(sid, a.id, AnchorRole::Focus, 1, AnchorActor::User, "x")
+            .await
+            .unwrap_err();
+        assert!(matches!(typed(stale), AnchorError::VersionConflict { .. }));
+
+        // origin is immutable
+        let origin = store
+            .add_anchor(
+                sid,
+                NewAnchor::new(
+                    AnchorTargetType::Project,
+                    Uuid::new_v4().to_string(),
+                    [AnchorRole::Origin],
+                    AnchorActor::System,
+                    "sys",
+                ),
+            )
+            .await
+            .unwrap();
+        let refused = store
+            .remove_anchor(sid, origin.id, 1, AnchorActor::User, "harness")
+            .await
+            .unwrap_err();
+        assert_eq!(typed(refused), AnchorError::OriginImmutable);
+
+        // dangling keeps the anchors; the journal has one entry per change
+        assert_eq!(
+            store
+                .mark_anchors_dangling(AnchorTargetType::Plan, &plan)
+                .await
+                .unwrap(),
+            1
+        );
+        let anchors = store.list_session_anchors(sid).await.unwrap();
+        assert_eq!(anchors.len(), 2);
+        assert!(anchors.iter().any(|x| x.state == AnchorState::Dangling));
+        let kinds: Vec<_> = store
+            .list_anchor_events(sid)
+            .await
+            .unwrap()
+            .iter()
+            .map(|ev| ev.kind)
+            .collect();
+        assert_eq!(kinds.len(), 4);
+        assert!(kinds.contains(&AnchorEventKind::StateChanged));
+
+        // the composite unique key backs the "one anchor per target" rule
+        let dup = e
+            .raw
+            .run(
+                query("CREATE (:Anchor {id: $id, session_id: $sid, target_type: 'plan', target_id: $tid})")
+                    .param("id", Uuid::new_v4().to_string())
+                    .param("sid", sid.to_string())
+                    .param("tid", plan.clone()),
+            )
+            .await;
+        assert!(
+            dup.is_err(),
+            "the unique constraint must refuse a duplicate"
+        );
+
+        // deleting the session deletes its anchors and journal
+        assert!(store.delete_chat_session(sid).await.unwrap());
+        assert!(store.list_session_anchors(sid).await.unwrap().is_empty());
+        assert!(store.list_anchor_events(sid).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_focus_adds_never_exceed_the_cap() {
+        let Some(e) = env().await else { return };
+        let store = std::sync::Arc::new(e.client);
+        let sid = Uuid::new_v4();
+        store.create_chat_session(&node(sid)).await.unwrap();
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..8 {
+            let s = store.clone();
+            set.spawn(async move {
+                s.add_anchor(
+                    sid,
+                    user(
+                        AnchorTargetType::File,
+                        &format!("src/f{i}.rs"),
+                        &[AnchorRole::Focus],
+                    ),
+                )
+                .await
+                .is_ok()
+            });
+        }
+        let mut ok = 0;
+        while let Some(r) = set.join_next().await {
+            ok += usize::from(r.unwrap());
+        }
+        assert_eq!(ok, MAX_FOCUS_ANCHORS);
+        assert_eq!(
+            store.list_session_anchors(sid).await.unwrap().len(),
+            MAX_FOCUS_ANCHORS
+        );
+        store.delete_chat_session(sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reverse_query_pages_on_real_neo4j() {
+        let Some(e) = env().await else { return };
+        let store: &dyn GraphStore = &e.client;
+        let target = Uuid::new_v4().to_string();
+        let mut sids = vec![];
+        for _ in 0..5 {
+            let sid = Uuid::new_v4();
+            store.create_chat_session(&node(sid)).await.unwrap();
+            store
+                .add_anchor(
+                    sid,
+                    user(AnchorTargetType::Note, &target, &[AnchorRole::Mention]),
+                )
+                .await
+                .unwrap();
+            sids.push(sid);
+        }
+        let mut seen = vec![];
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = store
+                .list_sessions_for_target(
+                    AnchorTargetType::Note,
+                    &target,
+                    None,
+                    2,
+                    cursor.as_deref(),
+                )
+                .await
+                .unwrap();
+            seen.extend(page.items.iter().map(|a| a.session_id));
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        seen.sort();
+        sids.sort();
+        assert_eq!(seen, sids);
+        for s in sids {
+            store.delete_chat_session(s).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn backfill_is_idempotent_and_revert_removes_only_its_anchors() {
+        let Some(e) = env().await else { return };
+        let store: &dyn GraphStore = &e.client;
+        let slug = format!("anchor-proj-{}", Uuid::new_v4().simple());
+        let project = project_orchestrator::neo4j::models::ProjectNode {
+            id: Uuid::new_v4(),
+            name: slug.clone(),
+            slug: slug.clone(),
+            root_path: "/tmp/anchor-harness".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+            watch_enabled: false,
+            profile: Default::default(),
+        };
+        store.create_project(&project).await.unwrap();
+        let sid = Uuid::new_v4();
+        let mut n = node(sid);
+        n.project_slug = Some(slug.clone());
+        store.create_chat_session(&n).await.unwrap();
+
+        store.backfill_project_anchors().await.unwrap();
+        let first = store.list_session_anchors(sid).await.unwrap();
+        store.backfill_project_anchors().await.unwrap();
+        let second = store.list_session_anchors(sid).await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first, second, "two runs = same state");
+        assert!(first[0].inferred && first[0].by == AnchorActor::System);
+        assert_eq!(first[0].target_id, project.id.to_string());
+        assert_eq!(store.list_anchor_events(sid).await.unwrap().len(), 1);
+
+        assert!(store.revert_inferred_anchors().await.unwrap() >= 1);
+        assert!(store.list_session_anchors(sid).await.unwrap().is_empty());
+        assert!(store.list_anchor_events(sid).await.unwrap().is_empty());
+        store.delete_chat_session(sid).await.unwrap();
+        store.delete_project(project.id, &slug).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_spawned_session_gets_the_edge_in_addition_to_the_json() {
+        let Some(e) = env().await else { return };
+        let store: &dyn GraphStore = &e.client;
+        let parent = Uuid::new_v4();
+        store.create_chat_session(&node(parent)).await.unwrap();
+        let child = Uuid::new_v4();
+        let mut c = node(child);
+        let sb = SpawnedBy::Conversation {
+            parent_session_id: parent,
+            tool_use_id: None,
+        };
+        c.spawned_by = Some(sb.to_json_string());
+        store.create_chat_session(&c).await.unwrap();
+        // the pipeline's own call afterwards must not add a second edge
+        store
+            .create_spawned_by_relation(
+                &child.to_string(),
+                &parent.to_string(),
+                "conversation",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut r = e
+            .raw
+            .execute(
+                query(
+                    "MATCH (:ChatSession {id: $c})-[r:SPAWNED_BY]->(:ChatSession {id: $p}) \
+                     RETURN count(r) AS n",
+                )
+                .param("c", child.to_string())
+                .param("p", parent.to_string()),
+            )
+            .await
+            .unwrap();
+        let n: i64 = r.next().await.unwrap().unwrap().get("n").unwrap();
+        assert_eq!(n, 1);
+        // the JSON is unchanged and reads still work
+        let read = store.get_chat_session(child).await.unwrap().unwrap();
+        assert_eq!(
+            read.spawned_by.as_deref(),
+            Some(sb.to_json_string().as_str())
+        );
+        assert_eq!(store.get_session_children(parent).await.unwrap().len(), 1);
+        store.delete_chat_session(child).await.unwrap();
+        store.delete_chat_session(parent).await.unwrap();
+    }
+}
