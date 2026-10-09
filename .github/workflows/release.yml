@@ -101,6 +101,18 @@ jobs:
             arch: x86_64
             use_cross: false
 
+          # macOS Intel "legacy" (macOS 10.15 to 13.3): the standard Intel build links libonnxruntime, which is
+          # built for macOS 13.4 and needs a libc++ symbol Catalina..Ventura- do not have (0.0.17 crashed at launch
+          # on 10.15.7: "Symbol not found: basic_stringbuf::str() const"). This one is built WITHOUT the
+          # `local-embeddings` feature: no ONNX Runtime at all, deployment target 10.15. Semantic search then needs an
+          # HTTP embedding provider (Ollama, OpenAI...). Archive: orchestrator-<v>-macos-x86_64-legacy.tar.gz.
+          - target: x86_64-apple-darwin
+            runner: macos-14
+            os: macos
+            arch: x86_64-legacy
+            use_cross: false
+            legacy: true
+
           # Linux x86_64 (native build — no need for cross since host == target)
           # ort-sys downloads prebuilt ONNX Runtime from pyke.io and statically links.
           - target: x86_64-unknown-linux-gnu
@@ -159,7 +171,7 @@ jobs:
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "release-${{ matrix.target }}"
+          shared-key: "release-${{ matrix.target }}${{ matrix.legacy && '-legacy' || '' }}"
 
       - name: Install cross-rs
         if: matrix.use_cross
@@ -184,8 +196,13 @@ jobs:
       # The .so/.dylib files are bundled alongside binaries in packaging steps.
       # -----------------------------------------------------------------------
 
+      # macOS legacy: lower the floor BEFORE anything compiles (rustc and every C dependency read it).
+      - name: macOS legacy settings (deployment target 10.15, no ONNX Runtime)
+        if: matrix.legacy
+        run: echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
+
       - name: Download ONNX Runtime for macOS x86_64
-        if: matrix.target == 'x86_64-apple-darwin'
+        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
         run: |
           ORT_VERSION="1.23.2"
           echo "Downloading ONNX Runtime ${ORT_VERSION} for macOS x86_64..."
@@ -223,7 +240,24 @@ jobs:
 
       - name: Build light variant (native)
         if: "!matrix.use_cross"
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.legacy && '--no-default-features' || '' }}
+
+      # The point of the legacy build, checked on the binaries themselves: a floor of 10.15 or lower and no ONNX Runtime.
+      - name: Verify legacy binaries (light)
+        if: matrix.legacy
+        shell: bash
+        run: |
+          for bin in orchestrator orch mcp_server; do
+            f="target/${{ matrix.target }}/release/${bin}"
+            minos=$(vtool -show-build "$f" | awk '$1=="minos" || $1=="version" {print $2; exit}')
+            echo "${bin}: minos ${minos}"
+            if [ -z "$minos" ] || [ "$(printf '%s\n%s\n' "$minos" 10.15 | sort -V | tail -1)" != "10.15" ]; then
+              echo "::error::${bin} requires macOS ${minos:-?}, expected 10.15 or lower"; exit 1
+            fi
+            if otool -L "$f" | grep -qi onnxruntime; then
+              echo "::error::${bin} still links ONNX Runtime"; exit 1
+            fi
+          done
 
       - name: Build light variant (cross)
         if: matrix.use_cross
@@ -293,7 +327,23 @@ jobs:
 
       - name: Build full variant (native)
         if: "!matrix.use_cross"
-        run: cargo build --release --features embedded-frontend --target ${{ matrix.target }}
+        run: cargo build --release --features embedded-frontend --target ${{ matrix.target }} ${{ matrix.legacy && '--no-default-features' || '' }}
+
+      - name: Verify legacy binaries (full)
+        if: matrix.legacy
+        shell: bash
+        run: |
+          for bin in orchestrator orch mcp_server; do
+            f="target/${{ matrix.target }}/release/${bin}"
+            minos=$(vtool -show-build "$f" | awk '$1=="minos" || $1=="version" {print $2; exit}')
+            echo "${bin}: minos ${minos}"
+            if [ -z "$minos" ] || [ "$(printf '%s\n%s\n' "$minos" 10.15 | sort -V | tail -1)" != "10.15" ]; then
+              echo "::error::${bin} requires macOS ${minos:-?}, expected 10.15 or lower"; exit 1
+            fi
+            if otool -L "$f" | grep -qi onnxruntime; then
+              echo "::error::${bin} still links ONNX Runtime"; exit 1
+            fi
+          done
 
       - name: Build full variant (cross)
         if: matrix.use_cross
@@ -562,6 +612,15 @@ jobs:
             artifact_os: macos
             artifact_arch: x86_64
 
+          # macOS Intel "legacy" (10.15 to 13.3): see build-backend. Own updater feed (latest-legacy.json) so a Catalina
+          # install is never offered the standard build; its .dmg and .app.tar.gz carry a "-legacy" suffix.
+          - target: x86_64-apple-darwin
+            runner: macos-14
+            tauri_target: x86_64-apple-darwin
+            artifact_os: macos
+            artifact_arch: x86_64-legacy
+            legacy: true
+
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             tauri_target: x86_64-unknown-linux-gnu
@@ -693,7 +752,7 @@ jobs:
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "tauri-${{ matrix.target }}"
+          shared-key: "tauri-${{ matrix.target }}${{ matrix.legacy && '-legacy' || '' }}"
           workspaces: ". -> target"
 
       - name: Install Linux dependencies
@@ -710,8 +769,21 @@ jobs:
 
       # x86_64-apple-darwin: provide ONNX Runtime for dynamic linking
       # (same rationale as build-backend — ort-sys has no prebuilt for macOS Intel)
+      - name: macOS legacy settings (deployment target 10.15, own updater feed)
+        if: matrix.legacy
+        run: |
+          echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
+          # Merged over tauri.conf.json by the Tauri CLI (arrays are replaced): the legacy app reads latest-legacy.json.
+          echo 'TAURI_CONFIG={"plugins":{"updater":{"endpoints":["https://github.com/this-rs/project-orchestrator/releases/latest/download/latest-legacy.json"]}}}' >> "$GITHUB_ENV"
+
+      # The standard Intel app links libonnxruntime (macOS 13.4+). Declare it, so an older Mac gets macOS's own
+      # "requires macOS 13.4" message instead of a crash at launch.
+      - name: macOS Intel standard settings (declare the real minimum, 13.4)
+        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
+        run: echo 'TAURI_CONFIG={"bundle":{"macOS":{"minimumSystemVersion":"13.4"}}}' >> "$GITHUB_ENV"
+
       - name: Download ONNX Runtime for macOS x86_64
-        if: matrix.target == 'x86_64-apple-darwin'
+        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
         run: |
           ORT_VERSION="1.23.2"
           echo "Downloading ONNX Runtime ${ORT_VERSION} for macOS x86_64..."
@@ -886,7 +958,27 @@ jobs:
           # Windows signing
           TAURI_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           TAURI_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-        run: cargo tauri build --target ${{ matrix.tauri_target }} ${{ matrix.bundles && format('--bundles {0}', matrix.bundles) || '' }}
+        # Legacy: arguments after `--` go to cargo. `custom-protocol` is what makes the app load its embedded frontend.
+        run: cargo tauri build --target ${{ matrix.tauri_target }} ${{ matrix.bundles && format('--bundles {0}', matrix.bundles) || '' }} ${{ matrix.legacy && '-- --no-default-features --features custom-protocol' || '' }}
+
+      # Checked on the built app, before signing: floor 10.15 or lower, no ONNX Runtime inside.
+      - name: Verify legacy bundle
+        if: matrix.legacy
+        shell: bash
+        run: |
+          APP=$(find "target/${{ matrix.target }}/release/bundle/macos" -maxdepth 1 -name "*.app" | head -1)
+          [ -n "$APP" ] || { echo "::error::no .app bundle built"; exit 1; }
+          for f in "$APP"/Contents/MacOS/* "$APP/Contents/Resources/mcp_server"; do
+            [ -f "$f" ] || continue
+            minos=$(vtool -show-build "$f" | awk '$1=="minos" || $1=="version" {print $2; exit}')
+            echo "$(basename "$f"): minos ${minos}"
+            if [ -z "$minos" ] || [ "$(printf '%s\n%s\n' "$minos" 10.15 | sort -V | tail -1)" != "10.15" ]; then
+              echo "::error::$(basename "$f") requires macOS ${minos:-?}, expected 10.15 or lower"; exit 1
+            fi
+            if otool -L "$f" | grep -qi onnxruntime; then echo "::error::$(basename "$f") links ONNX Runtime"; exit 1; fi
+          done
+          if find "$APP" -iname 'libonnxruntime*' | grep -q .; then echo "::error::ONNX Runtime found inside the legacy app"; exit 1; fi
+          echo "✅ legacy app: floor <= 10.15, no ONNX Runtime"
 
       # Free disk space after Tauri build completes.
       # The cargo build output (deps/, build/, .fingerprint/, incremental/) can
@@ -917,7 +1009,7 @@ jobs:
       # We place it in Contents/Frameworks/ (standard macOS location) and add
       # the matching rpath. The re-sign step below will codesign the dylib.
       - name: Bundle ONNX Runtime in Tauri app (macOS x86_64)
-        if: matrix.target == 'x86_64-apple-darwin'
+        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
         run: |
           BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
           APP_PATH=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
@@ -1258,11 +1350,23 @@ jobs:
           echo "Updater bundles after rename:"
           ls -la "$BUNDLE_DIR"/*.app.tar.gz* 2>/dev/null || echo "  (none)"
 
+      # The legacy .dmg is named like the standard Intel one (both are "..._x64.dmg"): without a suffix the release job
+      # would flatten one over the other. The site finds it by "_x64-legacy.dmg".
+      - name: Rename the legacy .dmg
+        if: matrix.legacy
+        shell: bash
+        run: |
+          for f in target/${{ matrix.target }}/release/bundle/dmg/*_x64.dmg; do
+            [ -f "$f" ] || { echo "::error::no _x64.dmg to rename"; exit 1; }
+            mv "$f" "${f%_x64.dmg}_x64-legacy.dmg"
+            echo "Renamed: $(basename "$f") → $(basename "${f%_x64.dmg}_x64-legacy.dmg")"
+          done
+
       - name: Upload Tauri artifacts (macOS)
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v7
         with:
-          name: tauri-${{ matrix.target }}
+          name: tauri-${{ matrix.target }}${{ matrix.legacy && '-legacy' || '' }}
           path: |
             target/${{ matrix.target }}/release/bundle/dmg/*.dmg
             target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
@@ -1473,6 +1577,29 @@ jobs:
 
           echo "=== Tauri updater latest.json ==="
           cat release-files/latest.json
+
+          # --- macOS Intel legacy: its own feed. The legacy app polls latest-legacy.json (see build-tauri), so a Mac on
+          # 10.15 to 13.3 is only ever offered the build that runs there. Not written when the legacy build is missing:
+          # the endpoint then 404s and that app simply sees no update, instead of being offered a file that cannot run.
+          LEGACY_URL=""
+          LEGACY_SIG=""
+          for f in release-files/*_x86_64-legacy.app.tar.gz; do
+            [ -f "$f" ] && LEGACY_URL="${BASE_URL}/$(gh_asset_name "$f")" && break
+          done
+          for f in release-files/*_x86_64-legacy.app.tar.gz.sig; do
+            [ -f "$f" ] && LEGACY_SIG=$(cat "$f") && break
+          done
+          if [ -n "$LEGACY_URL" ] && [ -n "$LEGACY_SIG" ]; then
+            jq -n \
+              --arg version "$VERSION" --arg notes "$NOTES" --arg pub_date "$PUB_DATE" \
+              --arg url "$LEGACY_URL" --arg sig "$LEGACY_SIG" \
+              '{ version: $version, notes: $notes, pub_date: $pub_date, platforms: { "darwin-x86_64": { url: $url, signature: $sig } } }' \
+              > release-files/latest-legacy.json
+            echo "=== macOS legacy updater latest-legacy.json ==="
+            cat release-files/latest-legacy.json
+          else
+            echo "::warning::macOS legacy updater bundle missing — latest-legacy.json not generated"
+          fi
 
       # Delete any existing release for this tag before creating a fresh one.
       # softprops/action-gh-release with generate_release_notes APPENDS notes
