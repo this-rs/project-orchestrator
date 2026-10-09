@@ -6899,8 +6899,20 @@ impl GraphStore for MockGraphStore {
 
     async fn reinforce_synapses(&self, note_ids: &[Uuid], boost: f64) -> Result<usize> {
         if note_ids.len() < 2 {
-            return Ok(0);
+            anyhow::bail!(
+                "reinforce_synapses needs at least 2 note ids (got {})",
+                note_ids.len()
+            );
         }
+
+        // Same rule as Cypher: both notes exist and share a known project.
+        let project_of: HashMap<Uuid, Option<Uuid>> = {
+            let notes = self.notes.read().await;
+            note_ids
+                .iter()
+                .map(|id| (*id, notes.get(id).and_then(|n| n.project_id)))
+                .collect()
+        };
 
         let mut synapses = self.note_synapses.write().await;
         let mut sources = self.synapse_sources.write().await;
@@ -6910,6 +6922,10 @@ impl GraphStore for MockGraphStore {
             for j in (i + 1)..note_ids.len() {
                 let a = note_ids[i];
                 let b = note_ids[j];
+                match (project_of[&a], project_of[&b]) {
+                    (Some(pa), Some(pb)) if pa == pb => {}
+                    _ => continue,
+                }
 
                 // Reinforce or create A → B
                 let entry_a = synapses.entry(a).or_default();

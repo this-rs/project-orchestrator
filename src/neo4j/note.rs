@@ -2826,6 +2826,12 @@ impl Neo4jClient {
     /// Reinforce synapses between co-activated notes (Hebbian learning).
     ///
     /// For every pair (i, j) in note_ids, MERGE a bidirectional SYNAPSE.
+    ///
+    /// Requires at least 2 ids (explicit error otherwise, never a silent no-op).
+    /// Only `:Note` nodes are linked (Decision ids match nothing: explicitly not
+    /// supported), and only pairs whose notes share the same non-null
+    /// `project_id` — cross-project pairs and unknown projects are skipped by
+    /// the query. The returned count is an upper bound (2 per candidate pair).
     /// Uses a single UNWIND query to batch all pairs instead of N*(N-1)/2
     /// individual queries, reducing 45 queries (10 notes) to 1.
     ///
@@ -2836,7 +2842,10 @@ impl Neo4jClient {
         use super::batch::{bolt_map, run_unwind_in_chunks_with, BoltMap};
 
         if note_ids.len() < 2 {
-            return Ok(0);
+            anyhow::bail!(
+                "reinforce_synapses needs at least 2 note ids (got {})",
+                note_ids.len()
+            );
         }
 
         // Build all unique pairs as BoltMaps for UNWIND
@@ -2858,6 +2867,7 @@ impl Neo4jClient {
             r#"
             UNWIND $items AS pair
             MATCH (a:Note {id: pair.a}), (b:Note {id: pair.b})
+            WHERE a.project_id IS NOT NULL AND a.project_id = b.project_id
             MERGE (a)-[s1:SYNAPSE]->(b)
               ON CREATE SET s1.weight = 0.5, s1.created_at = datetime(),
                 s1.last_reinforced_at = datetime(), s1.reinforcement_count = 1,

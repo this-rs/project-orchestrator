@@ -862,9 +862,10 @@ mod tests {
         let note1_id = Uuid::new_v4();
         let note2_id = Uuid::new_v4();
         let note3_id = Uuid::new_v4();
+        let pid = Uuid::new_v4();
         {
             let mut n1 = Note::new(
-                None,
+                Some(pid),
                 NoteType::Guideline,
                 "Test note 1".into(),
                 "test".into(),
@@ -874,13 +875,23 @@ mod tests {
             n1.energy = 0.5;
             mock.create_note(&n1).await.unwrap();
 
-            let mut n2 = Note::new(None, NoteType::Gotcha, "Test note 2".into(), "test".into());
+            let mut n2 = Note::new(
+                Some(pid),
+                NoteType::Gotcha,
+                "Test note 2".into(),
+                "test".into(),
+            );
             n2.id = note2_id;
             n2.importance = NoteImportance::High;
             n2.energy = 0.3;
             mock.create_note(&n2).await.unwrap();
 
-            let mut n3 = Note::new(None, NoteType::Pattern, "Test note 3".into(), "test".into());
+            let mut n3 = Note::new(
+                Some(pid),
+                NoteType::Pattern,
+                "Test note 3".into(),
+                "test".into(),
+            );
             n3.id = note3_id;
             n3.importance = NoteImportance::Medium;
             n3.energy = 0.2;
@@ -1308,7 +1319,19 @@ mod tests {
         assert_eq!(tracker.len().await, 1);
 
         // Reinforce using mock graph
+        // Seed the three notes in one project (reinforcement is per project).
         let mock = crate::neo4j::mock::MockGraphStore::new();
+        let pid = Uuid::new_v4();
+        for id in [node1, node2, node3] {
+            let mut n = crate::notes::models::Note::new(
+                Some(pid),
+                crate::notes::models::NoteType::Guideline,
+                "n".into(),
+                "t".into(),
+            );
+            n.id = id;
+            mock.create_note(&n).await.unwrap();
+        }
         let graph: Arc<dyn crate::neo4j::traits::GraphStore> = Arc::new(mock);
         let count = reinforce_tracked_paths(graph, &tracker).await;
 

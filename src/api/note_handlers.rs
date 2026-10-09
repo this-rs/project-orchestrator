@@ -1381,6 +1381,28 @@ pub struct ReinforceNeuronsBody {
     pub synapse_boost: Option<f64>,
 }
 
+/// All notes must exist and belong to one and the same known project: no
+/// synapse (nor energy boost) across projects or with an unknown `project_id`.
+/// `entries` holds `(note_id, project_id)` for notes that were found.
+fn ensure_single_project(entries: &[(Uuid, Option<Uuid>)]) -> Result<Uuid, AppError> {
+    let mut project: Option<Uuid> = None;
+    for (id, pid) in entries {
+        let pid = pid.ok_or_else(|| {
+            AppError::BadRequest(format!("note {id} has no project_id: cannot be reinforced"))
+        })?;
+        match project {
+            None => project = Some(pid),
+            Some(p) if p == pid => {}
+            Some(_) => {
+                return Err(AppError::BadRequest(
+                    "note_ids span several projects: reinforcement is per project".into(),
+                ))
+            }
+        }
+    }
+    project.ok_or_else(|| AppError::BadRequest("note_ids is empty".into()))
+}
+
 /// POST /api/notes/neurons/reinforce — Boost energy + reinforce synapses
 pub async fn reinforce_neurons(
     State(state): State<OrchestratorState>,
@@ -1397,6 +1419,19 @@ pub async fn reinforce_neurons(
     let synapse_boost = body.synapse_boost.unwrap_or(0.05);
 
     let neo4j = state.orchestrator.neo4j();
+
+    // Client-supplied ids: every note must exist and share one known project.
+    let mut entries = Vec::with_capacity(body.note_ids.len());
+    for note_id in &body.note_ids {
+        let note = neo4j
+            .get_note(*note_id)
+            .await
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::NotFound(format!("Note {note_id} not found")))?;
+        entries.push((*note_id, note.project_id));
+    }
+    ensure_single_project(&entries)?;
+
     let mut neurons_boosted = 0u64;
     for note_id in &body.note_ids {
         neo4j
@@ -1638,7 +1673,31 @@ mod tests {
 
     /// Build a test router with mock backends
     async fn test_app() -> axum::Router {
-        let app_state = mock_app_state();
+        test_app_with_state(mock_app_state()).await
+    }
+
+    /// Seed `n` notes in the given project (None = unknown project) and return the app and the ids.
+    async fn test_app_with_notes(
+        projects: &[Option<uuid::Uuid>],
+    ) -> (axum::Router, Vec<uuid::Uuid>) {
+        use crate::neo4j::traits::GraphStore;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let mut ids = Vec::new();
+        for p in projects {
+            let n = crate::notes::models::Note::new(
+                *p,
+                crate::notes::models::NoteType::Guideline,
+                "n".into(),
+                "t".into(),
+            );
+            graph.create_note(&n).await.unwrap();
+            ids.push(n.id);
+        }
+        let state = crate::test_helpers::mock_app_state_with_graph(graph);
+        (test_app_with_state(state).await, ids)
+    }
+
+    async fn test_app_with_state(app_state: crate::AppState) -> axum::Router {
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -2181,11 +2240,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_reinforce_neurons_valid() {
-        let app = test_app().await;
-        let id1 = uuid::Uuid::new_v4();
-        let id2 = uuid::Uuid::new_v4();
+        let p = uuid::Uuid::new_v4();
+        let (app, ids) = test_app_with_notes(&[Some(p), Some(p)]).await;
         let body = serde_json::json!({
-            "note_ids": [id1, id2],
+            "note_ids": ids,
             "energy_boost": 0.3,
             "synapse_boost": 0.1
         });
@@ -2196,18 +2254,17 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp).await;
         assert_eq!(json["neurons_boosted"], 2);
-        assert!(json["synapses_reinforced"].is_number());
+        assert_eq!(json["synapses_reinforced"], 2);
         assert_eq!(json["energy_boost"], 0.3);
         assert_eq!(json["synapse_boost"], 0.1);
     }
 
     #[tokio::test]
     async fn test_reinforce_neurons_defaults() {
-        let app = test_app().await;
-        let id1 = uuid::Uuid::new_v4();
-        let id2 = uuid::Uuid::new_v4();
+        let p = uuid::Uuid::new_v4();
+        let (app, ids) = test_app_with_notes(&[Some(p), Some(p)]).await;
         let body = serde_json::json!({
-            "note_ids": [id1, id2]
+            "note_ids": ids
         });
         let resp = app
             .oneshot(auth_post("/api/notes/neurons/reinforce", body))
@@ -2217,6 +2274,47 @@ mod tests {
         let json = body_json(resp).await;
         assert_eq!(json["energy_boost"], 0.2);
         assert_eq!(json["synapse_boost"], 0.05);
+    }
+
+    #[tokio::test]
+    async fn test_reinforce_neurons_cross_project_rejected() {
+        let (app, ids) =
+            test_app_with_notes(&[Some(uuid::Uuid::new_v4()), Some(uuid::Uuid::new_v4())]).await;
+        let resp = app
+            .oneshot(auth_post(
+                "/api/notes/neurons/reinforce",
+                serde_json::json!({ "note_ids": ids }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_reinforce_neurons_unknown_project_rejected() {
+        let (app, ids) = test_app_with_notes(&[Some(uuid::Uuid::new_v4()), None]).await;
+        let resp = app
+            .oneshot(auth_post(
+                "/api/notes/neurons/reinforce",
+                serde_json::json!({ "note_ids": ids }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_reinforce_neurons_unknown_note_is_404() {
+        let (app, mut ids) = test_app_with_notes(&[Some(uuid::Uuid::new_v4())]).await;
+        ids.push(uuid::Uuid::new_v4());
+        let resp = app
+            .oneshot(auth_post(
+                "/api/notes/neurons/reinforce",
+                serde_json::json!({ "note_ids": ids }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
