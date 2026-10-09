@@ -125,8 +125,19 @@ pub fn tool_policy(mode: &str, allowed: &[String], disallowed: &[String]) -> Opt
 /// in another way (it refuses every MCP tool, reads included), which is why
 /// read-only is a deny list on top of a mode and not a mode.
 ///
-/// Where the read-only flag comes from (API, runner) is not decided here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Where the flag comes from: the request (`access`), or the default of a session
+/// that runs in a neutral directory ([`SessionAccess::for_open`]). It is persisted
+/// on the session and a resume can only keep it or narrow it
+/// ([`SessionAccess::for_resume`]).
+///
+/// Two layers refuse. This one, by tool NAME (native tools and the mega-tools no
+/// read-only session may see). And the MCP server, by ACTION: the session token
+/// carries the `read_only` tool profile (`ToolProfile::ReadOnly`), under which
+/// a mixed mega-tool (`task`, `note`, ...) only runs its read actions.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionAccess {
     /// The configured policy, untouched.
     #[default]
@@ -149,15 +160,75 @@ const READ_ONLY_DENIED_AGENT_TOOLS: &[&str] = &["Task", "Agent"];
 const PO_MCP_PREFIX: &str = "mcp__project-orchestrator__";
 
 impl SessionAccess {
+    /// Wire and storage form: `normal` | `read_only`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::ReadOnly => "read_only",
+        }
+    }
+
+    /// Reads a stored value: absent or empty is `normal` (a session written before the
+    /// field existed). A value this server does not know was written to narrow the
+    /// session: it is never read as the wide access.
+    pub fn parse_stored(raw: &str) -> Self {
+        match raw {
+            "" | "normal" => Self::Normal,
+            _ => Self::ReadOnly,
+        }
+    }
+
+    /// For `skip_serializing_if`: `normal` is left off the wire.
+    pub fn is_normal(&self) -> bool {
+        *self == Self::Normal
+    }
+
+    /// The tool profile the session token carries for this access (`None`: the
+    /// profile the provider and mode grant, unchanged).
+    pub fn tool_profile(self) -> Option<&'static str> {
+        match self {
+            Self::Normal => None,
+            Self::ReadOnly => Some(crate::auth::tool_profile::READ_ONLY),
+        }
+    }
+
+    /// The narrower of two accesses.
+    pub fn narrowest(self, other: Self) -> Self {
+        if self == Self::ReadOnly || other == Self::ReadOnly {
+            Self::ReadOnly
+        } else {
+            Self::Normal
+        }
+    }
+
+    /// Access of a session being OPENED. `requested` is what the client asked
+    /// (`None`: nothing). A session that runs in the neutral directory of the host
+    /// (it belongs to no project) is read-only unless the client explicitly asks for
+    /// `normal`; a project session is `normal` unless the client asks for `read_only`.
+    pub fn for_open(requested: Option<Self>, neutral: bool) -> Self {
+        requested.unwrap_or(if neutral {
+            Self::ReadOnly
+        } else {
+            Self::Normal
+        })
+    }
+
+    /// Access of a session being RESUMED: the stored one, narrowed by what the
+    /// resuming call asks. A resume never widens (`read_only` stays `read_only`
+    /// whatever the request says).
+    pub fn for_resume(stored: Self, requested: Option<Self>) -> Self {
+        stored.narrowest(requested.unwrap_or_default())
+    }
+
     /// The tool patterns this access refuses, in the syntax of `disallowed_tools`.
     ///
     /// For the project-orchestrator MCP server: every mega-tool the restricted
-    /// profile withholds (admin, vault, protocol, sharing, ...: [`ToolProfile`])
-    /// plus `chat` (its `send_message` opens sessions). The list is computed from
-    /// the real tool list, so a tool added tomorrow is refused until the profile
-    /// admits it. The other mega-tools (task, plan, note, ...) mix reads and
-    /// writes under one name selected by an `action` argument, which a tool
-    /// pattern cannot see: they stay callable (documented limit; the action-level boundary is the REST profile of a later task).
+    /// profile withholds (admin, vault, protocol, sharing, ...: [`ToolProfile`]).
+    /// The list is computed from the real tool list, so a tool added tomorrow is
+    /// refused until the profile admits it. The other mega-tools (task, plan, note,
+    /// chat, ...) mix reads and writes under one name selected by an `action`
+    /// argument, which a tool pattern cannot see: the action-level refusal is the
+    /// `read_only` tool profile of the session token (see the type doc).
     pub fn denied_tools(self) -> Vec<String> {
         match self {
             Self::Normal => Vec::new(),
@@ -171,8 +242,7 @@ impl SessionAccess {
                     .into_iter()
                     .map(|tool| tool.name)
                     .filter(|name| {
-                        name == "chat"
-                            || !crate::auth::tool_profile::ToolProfile::Restricted.allows_tool(name)
+                        !crate::auth::tool_profile::ToolProfile::Restricted.allows_tool(name)
                     })
                     .map(|name| format!("{PO_MCP_PREFIX}{name}"));
                 native.chain(mcp).collect()
@@ -368,7 +438,7 @@ mod tests {
         assert!(tool_policy("ask", &strings(&["Bash()"]), &[]).is_none());
     }
 
-    const WRITE_TOOLS: [(&str, ToolCategory, Option<&str>); 9] = [
+    const WRITE_TOOLS: [(&str, ToolCategory, Option<&str>); 8] = [
         ("Edit", ToolCategory::Edit, Some("/repo/a.rs")),
         ("Write", ToolCategory::Edit, Some("/repo/a.rs")),
         ("MultiEdit", ToolCategory::Edit, Some("/repo/a.rs")),
@@ -377,7 +447,6 @@ mod tests {
         ("BashOutput", ToolCategory::Command, None),
         ("Task", ToolCategory::Agent, None),
         ("mcp__project-orchestrator__admin", ToolCategory::Mcp, None),
-        ("mcp__project-orchestrator__chat", ToolCategory::Mcp, None),
     ];
 
     const MODES: [&str; 4] = ["ask", "auto_edits", "plan_only", "trust"];
@@ -452,7 +521,6 @@ mod tests {
             "Bash",
             "mcp__project-orchestrator__admin",
             "mcp__project-orchestrator__vault",
-            "mcp__project-orchestrator__chat",
         ] {
             assert!(denied.iter().any(|d| d == expected), "{expected}");
         }
@@ -463,6 +531,71 @@ mod tests {
         let merged = SessionAccess::ReadOnly.merge_disallowed(&configured);
         assert_eq!(&merged[..2], &configured[..]);
         assert_eq!(merged.iter().filter(|d| *d == "Edit").count(), 1);
+    }
+
+    #[test]
+    fn the_access_has_a_wire_form_and_a_normal_default() {
+        assert_eq!(SessionAccess::default(), SessionAccess::Normal);
+        for access in [SessionAccess::Normal, SessionAccess::ReadOnly] {
+            assert_eq!(SessionAccess::parse_stored(access.as_str()), access);
+            let json = serde_json::to_value(access).unwrap();
+            assert_eq!(json, access.as_str());
+            assert_eq!(
+                serde_json::from_value::<SessionAccess>(json).unwrap(),
+                access
+            );
+        }
+        // Absent = normal (a session written before the field existed); a value this
+        // server does not know is never read as the wide access.
+        assert_eq!(SessionAccess::parse_stored(""), SessionAccess::Normal);
+        assert_eq!(
+            SessionAccess::parse_stored("locked_down"),
+            SessionAccess::ReadOnly
+        );
+        assert!(SessionAccess::Normal.is_normal() && !SessionAccess::ReadOnly.is_normal());
+        assert_eq!(SessionAccess::Normal.tool_profile(), None);
+        assert_eq!(
+            SessionAccess::ReadOnly.tool_profile(),
+            Some(crate::auth::tool_profile::READ_ONLY)
+        );
+    }
+
+    #[test]
+    fn a_neutral_session_is_read_only_by_default_and_a_project_session_is_normal() {
+        use SessionAccess::{Normal, ReadOnly};
+        assert_eq!(SessionAccess::for_open(None, true), ReadOnly);
+        assert_eq!(SessionAccess::for_open(None, false), Normal);
+        // A project session can be opened read-only on request.
+        assert_eq!(SessionAccess::for_open(Some(ReadOnly), false), ReadOnly);
+        assert_eq!(SessionAccess::for_open(Some(ReadOnly), true), ReadOnly);
+        // A client that explicitly asks for normal on a neutral session gets it (the
+        // read-only is a default, not a lock).
+        assert_eq!(SessionAccess::for_open(Some(Normal), true), Normal);
+    }
+
+    #[test]
+    fn a_resume_never_widens_the_access() {
+        use SessionAccess::{Normal, ReadOnly};
+        for requested in [None, Some(Normal), Some(ReadOnly)] {
+            assert_eq!(
+                SessionAccess::for_resume(ReadOnly, requested),
+                ReadOnly,
+                "read_only stays read_only whatever is asked ({requested:?})"
+            );
+        }
+        assert_eq!(SessionAccess::for_resume(Normal, None), Normal);
+        assert_eq!(SessionAccess::for_resume(Normal, Some(Normal)), Normal);
+        // A resume may narrow.
+        assert_eq!(SessionAccess::for_resume(Normal, Some(ReadOnly)), ReadOnly);
+    }
+
+    #[test]
+    fn the_mixed_mega_tools_are_not_denied_by_name_but_cut_at_the_action() {
+        let denied = SessionAccess::ReadOnly.denied_tools();
+        for mixed in ["chat", "task", "note", "plan", "step"] {
+            let name = format!("mcp__project-orchestrator__{mixed}");
+            assert!(!denied.contains(&name), "{name}");
+        }
     }
 
     #[test]

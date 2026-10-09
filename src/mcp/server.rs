@@ -242,13 +242,24 @@ pub(crate) fn profile_refusal(profile: ToolProfile, params: &ToolCallParams) -> 
         .and_then(|a| a.as_str());
     let allowed = match action {
         Some(action) => profile.allows_action(&params.name, action),
-        None => profile.allows_tool(&params.name),
+        None => profile.allows_call_without_action(&params.name),
     };
     (!allowed).then(|| {
-        format!(
-            "tool_not_in_profile: {}{} is not available to this session (tool profile: {})",
+        let call = format!(
+            "{}{}",
             params.name,
-            action.map(|a| format!(".{a}")).unwrap_or_default(),
+            action.map(|a| format!(".{a}")).unwrap_or_default()
+        );
+        if profile == ToolProfile::ReadOnly {
+            return format!(
+                "tool_not_in_profile: {call} is refused: this session is read-only \
+                 (session en lecture seule), only actions that read are available \
+                 (tool profile: {})",
+                profile.name()
+            );
+        }
+        format!(
+            "tool_not_in_profile: {call} is not available to this session (tool profile: {})",
             profile.name()
         )
     })
@@ -295,6 +306,90 @@ mod tests {
         }
         assert_eq!(profile_refusal(r, &call("plan", Some("get"))), None);
         assert_eq!(profile_refusal(r, &call("note", Some("create"))), None);
+    }
+
+    fn refusal_text(profile: ToolProfile, tool: &str, action: Option<&str>) -> Option<String> {
+        profile_refusal(profile, &call(tool, action))
+    }
+
+    /// One test over every mixed tool: a write action is refused with the
+    /// read-only message, a read action goes through. Driven by the table that
+    /// `every_action_of_the_tool_list_is_classified` keeps complete.
+    #[test]
+    fn a_read_only_session_runs_the_reads_of_every_mixed_tool_and_refuses_its_writes() {
+        use crate::auth::tool_profile::ACTION_CLASSES;
+        let r = ToolProfile::ReadOnly;
+        for (tool, reads, writes) in ACTION_CLASSES {
+            assert!(!reads.is_empty() && !writes.is_empty(), "{tool} is mixed");
+            for read in *reads {
+                let allowed = refusal_text(r, tool, Some(read));
+                // The restricted profile's own withholdings (rfc status) still apply.
+                if ToolProfile::Restricted.allows_action(tool, read) {
+                    assert_eq!(allowed, None, "{tool}.{read} reads");
+                }
+            }
+            for write in *writes {
+                let refusal = refusal_text(r, tool, Some(write)).unwrap_or_else(|| {
+                    panic!("{tool}.{write} writes and must be refused to a read-only session")
+                });
+                assert!(
+                    refusal.starts_with("tool_not_in_profile")
+                        && refusal.contains("read-only")
+                        && refusal.contains("session en lecture seule")
+                        && refusal.contains(&format!("{tool}.{write}")),
+                    "{refusal}"
+                );
+                // The same call is fine for a session that is not read-only.
+                assert_eq!(refusal_text(ToolProfile::Full, tool, Some(write)), None);
+            }
+        }
+    }
+
+    #[test]
+    fn the_named_mixed_tools_of_the_task_are_cut_at_the_action() {
+        let r = ToolProfile::ReadOnly;
+        for (tool, write, read) in [
+            ("task", "create", "list"),
+            ("plan", "update_status", "get"),
+            ("step", "update", "list"),
+            ("note", "create", "search"),
+            ("decision", "add", "get"),
+            ("milestone", "add_task", "get_progress"),
+            ("release", "create", "list"),
+            ("project", "sync", "get"),
+            ("workspace", "update", "get_overview"),
+            ("commit", "create", "get_file_history"),
+            ("constraint", "add", "list"),
+            ("resource", "create", "list"),
+            ("component", "create", "get"),
+            ("chat", "send_message", "list_messages"),
+        ] {
+            assert!(
+                refusal_text(r, tool, Some(write)).is_some(),
+                "{tool}.{write}"
+            );
+            assert_eq!(refusal_text(r, tool, Some(read)), None, "{tool}.{read}");
+        }
+    }
+
+    #[test]
+    fn a_read_only_session_refuses_what_it_cannot_classify() {
+        let r = ToolProfile::ReadOnly;
+        // No action, a non-string action, an unknown action, an unknown tool, a legacy
+        // alias that reaches the same handler, an external server's tool.
+        assert!(refusal_text(r, "task", None).is_some());
+        let numeric: ToolCallParams =
+            serde_json::from_value(json!({ "name": "task", "arguments": { "action": 7 } }))
+                .unwrap();
+        assert!(profile_refusal(r, &numeric).is_some());
+        assert!(refusal_text(r, "task", Some("an_action_added_tomorrow")).is_some());
+        assert!(refusal_text(r, "a_tool_added_tomorrow", Some("list")).is_some());
+        assert!(refusal_text(r, "create_task", Some("create")).is_some());
+        assert!(refusal_text(r, "list_tasks", None).is_some());
+        assert!(refusal_text(r, "other::create_thing", None).is_some());
+        // The tools the restricted profile withholds stay withheld.
+        assert!(refusal_text(r, "admin", Some("watch_status")).is_some());
+        assert!(refusal_text(r, "vault", Some("list_available")).is_some());
     }
 
     #[test]

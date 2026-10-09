@@ -1,6 +1,6 @@
 name: Build the nexus fake servers
 description: >
-  Installs `fake_openai` and `fake_mcp` of the nexus repository at the revision
+  Installs `fake_openai`, `fake_mcp` and `fake_claude` of the nexus repository at the revision
   Cargo.toml pins, and exports NEXUS_FAKES_DIR. src/chat/agent_e2e_tests.rs drives
   the agent engine against them and FAILS (naming this action) when they are missing.
 runs:
@@ -13,5 +13,5 @@ runs:
         test -n "$REV"
         cargo install --git https://github.com/this-rs/nexus.git --rev "$REV" \
           --features "provider-native testkit" --root "$RUNNER_TEMP/nexus-fakes" \
-          --bin fake_openai --bin fake_mcp nexus-claude
+          --bin fake_openai --bin fake_mcp --bin fake_claude nexus-claude
         echo "NEXUS_FAKES_DIR=$RUNNER_TEMP/nexus-fakes/bin" >> "$GITHUB_ENV"

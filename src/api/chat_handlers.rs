@@ -149,6 +149,7 @@ pub async fn create_session(
             session_id: sid.clone(),
             stream_url: format!("/ws/chat/{}", sid),
             execution_place: Default::default(),
+            access: Default::default(),
             notices: Vec::new(),
         }));
     }
@@ -312,6 +313,7 @@ fn session_node_to_response(s: crate::neo4j::models::ChatSessionNode) -> ChatSes
         capabilities: None,
         routed_by: s.routed_by,
         execution_place: s.execution_place,
+        access: s.access,
     }
 }
 
@@ -2506,6 +2508,7 @@ mod tests {
             nexus_claude::agent::ProviderKind::ClaudeCode
         );
         let request = crate::chat::types::ChatRequest {
+            access: None,
             routing_mode: None,
             attachments: Vec::new(),
             refs: Vec::new(),

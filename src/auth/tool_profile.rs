@@ -26,6 +26,13 @@ use axum::http::Method;
 pub const RESTRICTED: &str = "restricted";
 /// Name of the full profile (also what an absent profile means).
 pub const FULL: &str = "full";
+/// Name of the read-only profile: the restricted tool set, and of each tool only the
+/// actions that read.
+pub const READ_ONLY: &str = "read_only";
+/// Environment variable through which the harness repeats the read-only profile to
+/// the MCP subprocess, for the session that has no token (auth off). Presentation
+/// only, like the token read by the subprocess; the token is the signed one.
+pub const TOOL_PROFILE_ENV: &str = "PO_TOOL_PROFILE";
 
 /// Which mega-tools a session may use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +44,11 @@ pub enum ToolProfile {
     /// except a session a person opened in `trust` (H6); always the profile of
     /// a session opened by a third-party session.
     Restricted,
+    /// A session that may only look: the restricted tool set, and of each tool only
+    /// the actions listed as reads in [`ACTION_CLASSES`]. An action nobody
+    /// classified is refused, so a tool added tomorrow is closed until someone
+    /// decides. Every REST route rule of `Restricted` applies as well.
+    ReadOnly,
 }
 
 /// The ONLY tools the restricted profile sees. An allow-list: a tool added
@@ -85,6 +97,401 @@ const RESTRICTED_ACTIONS: &[(&str, &str)] = &[
     ("plan", "remove_trigger"),
     ("plan", "disable_trigger"),
 ];
+
+/// Which actions of each mega-tool READ and which WRITE, for the read-only profile:
+/// `(tool, reads, writes)`. One row per tool of the restricted allow-list.
+///
+/// * the read-only profile runs ONLY the `reads` (and never an action absent from
+///   both columns: unknown = refused);
+/// * `writes` exists so that the table is exhaustive: the test
+///   `every_action_of_the_tool_list_is_classified` fails on an action of
+///   `src/mcp/tools.rs` that is in neither column, so whoever adds an action has to
+///   say which it is. When in doubt, write.
+///
+/// "Read" means: nothing a person would call a change comes out of it (no entity
+/// created, edited, linked or deleted, no job started, no message sent). A read
+/// that only computes (`reason`, `predict_run`, the structural stress tests) is a
+/// read even when it is a POST. `skill.activate` and `persona.activate` return the
+/// context of the entity and are reads here, though the server may count the
+/// activation.
+pub(crate) const ACTION_CLASSES: &[(&str, &[&str], &[&str])] = &[
+    (
+        "project",
+        &[
+            "list",
+            "get",
+            "get_roadmap",
+            "list_plans",
+            "get_graph",
+            "get_intelligence_summary",
+            "get_embeddings_projection",
+            "get_scaffolding_level",
+            "get_health_dashboard",
+            "get_auto_roadmap",
+        ],
+        &[
+            "create",
+            "update",
+            "delete",
+            "sync",
+            "set_scaffolding_override",
+        ],
+    ),
+    (
+        "plan",
+        &[
+            "list",
+            "get",
+            "get_dependency_graph",
+            "get_critical_path",
+            "get_waves",
+            "run_status",
+            "list_triggers",
+            "list_runs",
+            "get_run",
+            "compare_runs",
+            "predict_run",
+            "get_sessions",
+        ],
+        &[
+            "create",
+            "update",
+            "update_status",
+            "delete",
+            "link_to_project",
+            "unlink_from_project",
+            "run",
+            "cancel_run",
+            "auto_pr",
+            "add_trigger",
+            "remove_trigger",
+            "enable_trigger",
+            "disable_trigger",
+            "enrich",
+            "delegate_task",
+        ],
+    ),
+    (
+        "task",
+        &[
+            "list",
+            "get",
+            "get_next",
+            "get_blockers",
+            "get_blocked_by",
+            "get_context",
+            "get_prompt",
+            "build_prompt",
+            "get_sessions",
+        ],
+        &[
+            "create",
+            "update",
+            "delete",
+            "add_dependencies",
+            "remove_dependency",
+            "enrich",
+        ],
+    ),
+    (
+        "step",
+        &["list", "get", "get_progress"],
+        &["create", "update", "delete"],
+    ),
+    (
+        "decision",
+        &[
+            "get",
+            "search",
+            "search_semantic",
+            "list_affects",
+            "get_affecting",
+            "get_timeline",
+        ],
+        &[
+            "add",
+            "update",
+            "delete",
+            "add_affects",
+            "remove_affects",
+            "supersede",
+        ],
+    ),
+    ("constraint", &["list", "get"], &["add", "update", "delete"]),
+    (
+        "release",
+        &["list", "get"],
+        &[
+            "create",
+            "update",
+            "delete",
+            "add_task",
+            "add_commit",
+            "remove_commit",
+        ],
+    ),
+    (
+        "milestone",
+        &["list", "get", "get_progress"],
+        &[
+            "create",
+            "update",
+            "delete",
+            "add_task",
+            "link_plan",
+            "unlink_plan",
+        ],
+    ),
+    (
+        "commit",
+        &[
+            "get_task_commits",
+            "get_plan_commits",
+            "get_commit_files",
+            "get_file_history",
+        ],
+        &["create", "link_to_task", "link_to_plan"],
+    ),
+    (
+        "note",
+        &[
+            "list",
+            "get",
+            "search",
+            "search_semantic",
+            "get_context",
+            "get_needing_review",
+            "list_project",
+            "get_propagated",
+            "get_propagated_knowledge",
+            "get_context_knowledge",
+            "get_entity",
+            "list_rfcs",
+            "get_rfc_status",
+        ],
+        &[
+            "create",
+            "update",
+            "delete",
+            "confirm",
+            "invalidate",
+            "supersede",
+            "link_to_entity",
+            "unlink_from_entity",
+            "advance_rfc",
+        ],
+    ),
+    (
+        "workspace",
+        &[
+            "list",
+            "get",
+            "get_overview",
+            "list_projects",
+            "get_topology",
+            "get_coupling_matrix",
+        ],
+        &[
+            "create",
+            "update",
+            "delete",
+            "add_project",
+            "remove_project",
+            "derive_topology",
+        ],
+    ),
+    (
+        "workspace_milestone",
+        &["list_all", "list", "get", "get_progress"],
+        &[
+            "create",
+            "update",
+            "delete",
+            "add_task",
+            "link_plan",
+            "unlink_plan",
+        ],
+    ),
+    (
+        "resource",
+        &["list", "get"],
+        &["create", "update", "delete", "link_to_project"],
+    ),
+    (
+        "component",
+        &["list", "get"],
+        &[
+            "create",
+            "update",
+            "delete",
+            "add_dependency",
+            "remove_dependency",
+            "map_to_project",
+        ],
+    ),
+    (
+        "chat",
+        &[
+            "list_sessions",
+            "get_session",
+            "get_children",
+            "list_messages",
+            "get_session_entities",
+            "get_session_tree",
+            "get_run_sessions",
+        ],
+        &[
+            "delete_session",
+            "send_message",
+            "add_discussed",
+            "associate_with",
+        ],
+    ),
+    (
+        "feature_graph",
+        &[
+            "list",
+            "get",
+            "get_statistics",
+            "compare",
+            "find_overlapping",
+        ],
+        &["create", "add_entity", "auto_build", "delete"],
+    ),
+    (
+        "code",
+        &[
+            "search",
+            "search_project",
+            "search_workspace",
+            "get_file_symbols",
+            "find_references",
+            "get_file_dependencies",
+            "get_call_graph",
+            "analyze_impact",
+            "get_architecture",
+            "find_similar",
+            "find_trait_implementations",
+            "find_type_traits",
+            "get_impl_blocks",
+            "get_communities",
+            "get_health",
+            "get_node_importance",
+            "plan_implementation",
+            "get_co_change_graph",
+            "get_file_co_changers",
+            "get_class_hierarchy",
+            "find_subclasses",
+            "find_interface_implementors",
+            "list_processes",
+            "get_process",
+            "get_entry_points",
+            "get_hotspots",
+            "get_knowledge_gaps",
+            "get_risk_assessment",
+            "get_homeostasis",
+            "get_structural_drift",
+            "get_bridge",
+            "check_topology",
+            "list_topology_rules",
+            "check_file_topology",
+            "get_structural_profile",
+            "find_structural_twins",
+            "cluster_dna",
+            "find_cross_project_twins",
+            "predict_missing_links",
+            "check_link_plausibility",
+            "stress_test_node",
+            "stress_test_edge",
+            "stress_test_cascade",
+            "find_bridges",
+            "get_context_card",
+            "get_fingerprint",
+            "find_isomorphic",
+            "suggest_structural_templates",
+            "get_learning_health",
+        ],
+        &[
+            "detect_processes",
+            "enrich_communities",
+            "create_topology_rule",
+            "delete_topology_rule",
+            "refresh_context_cards",
+        ],
+    ),
+    (
+        "episode",
+        &["list"],
+        &["collect", "anonymize", "export_artifact"],
+    ),
+    ("reasoning", &["reason"], &["reason_feedback"]),
+    ("analysis_profile", &["list", "get"], &["create", "delete"]),
+    (
+        "skill",
+        &[
+            "list",
+            "get",
+            "get_members",
+            "get_health",
+            "export",
+            "activate",
+        ],
+        &[
+            "create",
+            "update",
+            "delete",
+            "add_member",
+            "remove_member",
+            "import",
+            "split",
+            "merge",
+        ],
+    ),
+    (
+        "persona",
+        &[
+            "get",
+            "list",
+            "find_for_file",
+            "list_global",
+            "get_subgraph",
+            "export",
+            "activate",
+        ],
+        &[
+            "create",
+            "update",
+            "delete",
+            "add_skill",
+            "remove_skill",
+            "add_protocol",
+            "remove_protocol",
+            "add_file",
+            "remove_file",
+            "add_function",
+            "remove_function",
+            "add_note",
+            "remove_note",
+            "add_decision",
+            "remove_decision",
+            "scope_to_feature_graph",
+            "unscope_feature_graph",
+            "add_extends",
+            "remove_extends",
+            "import",
+            "auto_build",
+            "maintain",
+            "detect",
+        ],
+    ),
+];
+
+/// Whether `tool.action` is classified as a read. Not classified = not a read.
+fn is_read_action(tool: &str, action: &str) -> bool {
+    ACTION_CLASSES
+        .iter()
+        .any(|(t, reads, _)| *t == tool && reads.contains(&action))
+}
 
 /// How a REST route is treated by the restricted profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +627,7 @@ impl ToolProfile {
     pub fn from_name(name: Option<&str>) -> Self {
         match name {
             None | Some(FULL) => Self::Full,
+            Some(READ_ONLY) => Self::ReadOnly,
             Some(_) => Self::Restricted,
         }
     }
@@ -228,6 +636,7 @@ impl ToolProfile {
         match self {
             Self::Full => FULL,
             Self::Restricted => RESTRICTED,
+            Self::ReadOnly => READ_ONLY,
         }
     }
 
@@ -256,7 +665,7 @@ impl ToolProfile {
     pub fn allows_tool(self, tool: &str) -> bool {
         match self {
             Self::Full => true,
-            Self::Restricted => RESTRICTED_ALLOWED_TOOLS.contains(&tool),
+            Self::Restricted | Self::ReadOnly => RESTRICTED_ALLOWED_TOOLS.contains(&tool),
         }
     }
 
@@ -266,7 +675,17 @@ impl ToolProfile {
             && match self {
                 Self::Full => true,
                 Self::Restricted => !RESTRICTED_ACTIONS.contains(&(tool, action)),
+                Self::ReadOnly => {
+                    !RESTRICTED_ACTIONS.contains(&(tool, action)) && is_read_action(tool, action)
+                }
             }
+    }
+
+    /// Whether a call that names NO action may run. Only a profile that opens every
+    /// action of a tool says yes: a read-only session never runs a call whose action it
+    /// cannot read (a missing or non-string `action` included).
+    pub fn allows_call_without_action(self, tool: &str) -> bool {
+        self != Self::ReadOnly && self.allows_tool(tool)
     }
 
     /// The tool list this profile sees: withheld tools removed, withheld
@@ -818,5 +1237,241 @@ mod tests {
                 "{path} must stay closed to the restricted profile"
             );
         }
+    }
+
+    // ── read-only profile ──────────────────────────────────────────────────
+
+    /// The action enum of every tool of the real tool list.
+    fn real_actions() -> Vec<(String, Vec<String>)> {
+        let all = all_tools();
+        all.iter()
+            .map(|t| (t.name.clone(), actions_of(&all, &t.name)))
+            .collect()
+    }
+
+    /// A new action in `src/mcp/tools.rs` that nobody classified fails here: the
+    /// author must say whether it reads or writes. The same goes for a new tool
+    /// that the restricted profile admits.
+    #[test]
+    fn every_action_of_the_tool_list_is_classified() {
+        for (tool, actions) in real_actions() {
+            let row = ACTION_CLASSES.iter().find(|(t, _, _)| *t == tool);
+            if !ToolProfile::Restricted.allows_tool(&tool) {
+                assert!(
+                    row.is_none(),
+                    "{tool} is withheld from the restricted profile: it has no row, the read-only profile never sees it"
+                );
+                continue;
+            }
+            let (_, reads, writes) = row.unwrap_or_else(|| {
+                panic!(
+                    "{tool} is admitted by the restricted profile but has no row in ACTION_CLASSES"
+                )
+            });
+            assert!(!actions.is_empty(), "{tool} has no action enum");
+            for action in &actions {
+                let read = reads.contains(&action.as_str());
+                let write = writes.contains(&action.as_str());
+                assert!(
+                    read || write,
+                    "{tool}.{action} is not classified: add it to the reads or the writes of ACTION_CLASSES"
+                );
+                assert!(
+                    !(read && write),
+                    "{tool}.{action} is both a read and a write"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_classification_names_only_real_actions_once() {
+        let real = real_actions();
+        for (tool, reads, writes) in ACTION_CLASSES {
+            let actions = &real
+                .iter()
+                .find(|(t, _)| t == tool)
+                .unwrap_or_else(|| panic!("unknown tool {tool}"))
+                .1;
+            let mut seen = std::collections::HashSet::new();
+            for action in reads.iter().chain(writes.iter()) {
+                assert!(
+                    actions.iter().any(|a| a == action),
+                    "{tool}.{action} is not in the tool list"
+                );
+                assert!(seen.insert(*action), "{tool}.{action} is listed twice");
+            }
+        }
+        // One row per tool, no more.
+        let mut tools: Vec<_> = ACTION_CLASSES.iter().map(|(t, _, _)| *t).collect();
+        tools.sort_unstable();
+        tools.dedup();
+        assert_eq!(tools.len(), ACTION_CLASSES.len());
+    }
+
+    /// The writes people worry about are writes, whatever the tool.
+    #[test]
+    fn the_obvious_writes_are_not_classified_as_reads() {
+        for (tool, action) in [
+            ("task", "create"),
+            ("task", "update"),
+            ("task", "delete"),
+            ("plan", "run"),
+            ("plan", "delegate_task"),
+            ("plan", "update_status"),
+            ("step", "update"),
+            ("note", "create"),
+            ("note", "supersede"),
+            ("decision", "add"),
+            ("milestone", "add_task"),
+            ("release", "create"),
+            ("project", "sync"),
+            ("workspace", "delete"),
+            ("commit", "create"),
+            ("constraint", "add"),
+            ("resource", "create"),
+            ("component", "add_dependency"),
+            ("chat", "send_message"),
+            ("chat", "delete_session"),
+            ("code", "enrich_communities"),
+            ("episode", "collect"),
+            ("reasoning", "reason_feedback"),
+            ("skill", "create"),
+            ("persona", "maintain"),
+            ("feature_graph", "auto_build"),
+            ("analysis_profile", "create"),
+            ("workspace_milestone", "create"),
+        ] {
+            assert!(
+                !ToolProfile::ReadOnly.allows_action(tool, action),
+                "{tool}.{action} writes"
+            );
+            assert!(ToolProfile::Full.allows_action(tool, action));
+        }
+        for (tool, action) in [
+            ("task", "list"),
+            ("task", "get"),
+            ("plan", "get"),
+            ("step", "list"),
+            ("note", "search"),
+            ("note", "search_semantic"),
+            ("decision", "search"),
+            ("code", "search"),
+            ("code", "find_references"),
+            ("chat", "list_messages"),
+            ("project", "get"),
+            ("milestone", "get_progress"),
+            ("reasoning", "reason"),
+        ] {
+            assert!(
+                ToolProfile::ReadOnly.allows_action(tool, action),
+                "{tool}.{action} reads"
+            );
+        }
+    }
+
+    #[test]
+    fn the_read_only_profile_is_never_wider_than_the_restricted_one() {
+        for (tool, actions) in real_actions() {
+            for action in actions {
+                if ToolProfile::ReadOnly.allows_action(&tool, &action) {
+                    assert!(
+                        ToolProfile::Restricted.allows_action(&tool, &action),
+                        "{tool}.{action}"
+                    );
+                }
+            }
+        }
+        // An unknown action, an unknown tool and the tools the restricted profile
+        // withholds are all refused.
+        let r = ToolProfile::ReadOnly;
+        assert!(!r.allows_action("task", "an_action_added_tomorrow"));
+        assert!(!r.allows_action("a_tool_added_tomorrow", "list"));
+        assert!(!r.allows_action("vault", "list_available"));
+        assert!(!r.allows_action("admin", "watch_status"));
+        assert!(
+            !r.allows_action("create_task", "list"),
+            "a legacy alias is not a tool"
+        );
+        assert!(
+            !r.allows_action("other::list", "list"),
+            "no external server"
+        );
+        assert!(!r.allows_tool("admin"));
+        // A call with no action is refused (a tool whose reads cannot be told).
+        assert!(!r.allows_call_without_action("task"));
+        assert!(ToolProfile::Restricted.allows_call_without_action("task"));
+        assert!(ToolProfile::Full.allows_call_without_action("task"));
+    }
+
+    #[test]
+    fn the_read_only_tool_list_shows_only_reads() {
+        let seen = ToolProfile::ReadOnly.filter_tools(all_tools());
+        let names: Vec<_> = seen.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.iter().all(|n| RESTRICTED_ALLOWED_TOOLS.contains(n)));
+        for tool in ["task", "note", "plan", "chat", "code"] {
+            let actions = actions_of(&seen, tool);
+            assert!(!actions.is_empty(), "{tool} keeps its reads");
+            assert!(
+                actions.iter().all(|a| is_read_action(tool, a)),
+                "{tool}: {actions:?}"
+            );
+        }
+        assert!(!actions_of(&seen, "task").iter().any(|a| a == "create"));
+        assert!(actions_of(&seen, "task").iter().any(|a| a == "get"));
+    }
+
+    #[test]
+    fn the_profile_name_round_trips_and_the_read_only_name_is_known() {
+        assert_eq!(
+            ToolProfile::from_name(Some(READ_ONLY)),
+            ToolProfile::ReadOnly
+        );
+        assert_eq!(ToolProfile::ReadOnly.name(), READ_ONLY);
+        for profile in [
+            ToolProfile::Full,
+            ToolProfile::Restricted,
+            ToolProfile::ReadOnly,
+        ] {
+            assert_eq!(ToolProfile::from_name(Some(profile.name())), profile);
+        }
+    }
+
+    #[test]
+    fn the_read_only_profile_is_read_from_the_signed_token() {
+        let human = crate::auth::jwt::Claims::service_account("s");
+        let secret = "test-secret-key-minimum-32-chars!!";
+        let binding = crate::auth::jwt::AgentSessionBinding {
+            session_id: "sess".into(),
+            ceiling: None,
+            tool_profile: Some(READ_ONLY.to_string()),
+            third_party: true,
+        };
+        let (token, _) =
+            crate::auth::jwt::generate_session_token(&human, Some(&binding), secret, 60).unwrap();
+        assert_eq!(
+            ToolProfile::from_unverified_token(&token),
+            ToolProfile::ReadOnly
+        );
+        let decoded = crate::auth::jwt::decode_jwt(&token, secret).unwrap();
+        let back = crate::auth::jwt::agent_session_binding(&decoded).unwrap();
+        assert_eq!(back.tool_profile.as_deref(), Some(READ_ONLY));
+    }
+
+    #[test]
+    fn the_read_only_profile_closes_the_same_routes_as_the_restricted_one() {
+        for (method, path) in [
+            (Method::POST, "/api/chat/sessions"),
+            (Method::POST, "/api/plans/abc/run"),
+            (Method::GET, "/api/vault"),
+            (Method::GET, "/api/admin/backfill-embeddings/status"),
+            (Method::GET, "/api/a-route-nobody-classified"),
+        ] {
+            assert!(
+                ToolProfile::ReadOnly.route_forbidden(&method, path),
+                "{method} {path}"
+            );
+        }
+        assert!(!ToolProfile::ReadOnly.route_forbidden(&Method::GET, "/api/plans/abc"));
     }
 }

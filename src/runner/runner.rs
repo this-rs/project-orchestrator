@@ -3127,6 +3127,7 @@ impl PlanRunner {
             None => None,
         };
         let request = ChatRequest {
+            access: None,
             routing_mode: None,
             attachments: Vec::new(),
             refs: Vec::new(),

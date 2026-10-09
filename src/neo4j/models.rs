@@ -1,5 +1,6 @@
 //! Neo4j graph models representing code structure and plans
 
+use crate::chat::provider::policy::SessionAccess;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -253,6 +254,10 @@ pub struct ChatSessionNode {
     /// host made for it. Absent on every session written before it existed: `project`.
     #[serde(default)]
     pub execution_place: ExecutionPlace,
+    /// What the session may do to the world, fixed at open and kept by every resume
+    /// (`normal` | `read_only`). Absent on every session written before it existed: `normal`.
+    #[serde(default, skip_serializing_if = "SessionAccess::is_normal")]
+    pub access: SessionAccess,
 }
 
 // ============================================================================
@@ -3491,6 +3496,7 @@ mod tests {
             capabilities: None,
             resume_token: None,
             execution_place: Default::default(),
+            access: Default::default(),
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -3525,6 +3531,7 @@ mod tests {
             capabilities: None,
             resume_token: None,
             execution_place: Default::default(),
+            access: Default::default(),
         };
 
         let json = serde_json::to_string(&session).unwrap();

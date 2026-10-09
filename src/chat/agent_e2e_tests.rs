@@ -216,6 +216,7 @@ fn manager(graph: Arc<MockGraphStore>, secure: bool) -> ChatManager {
 
 fn request(provider: Option<&str>, project: Option<&str>, mode: &str) -> ChatRequest {
     ChatRequest {
+        access: None,
         routing_mode: None,
         attachments: Vec::new(),
         refs: Vec::new(),

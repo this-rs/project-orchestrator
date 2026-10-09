@@ -828,6 +828,7 @@ mod tests {
                 ));
         let created = manager
             .create_session(&crate::chat::types::ChatRequest {
+                access: None,
                 routing_mode: None,
                 attachments: Vec::new(),
                 refs: Vec::new(),
