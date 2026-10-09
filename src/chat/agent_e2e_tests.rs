@@ -2788,4 +2788,17 @@ mod parity {
         );
         assert_eq!(r.sent().len(), 1);
     }
+
+    /// A Stop of the user during the auto-continue pause cancels the continuation,
+    /// as on Claude Code (the Stop goes through the session handle, not around it).
+    #[tokio::test]
+    async fn a_stop_cancels_a_pending_auto_continue() {
+        let mut r = rig(ProviderKind::Native, vec![stopped_on_its_turn_limit()]).await;
+        r.manager.set_auto_continue(&r.sid, true).await.unwrap();
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        next_event(&mut r.rx, |e| matches!(e, ChatEvent::AutoContinue { .. })).await;
+        r.manager.interrupt(&r.sid).await.unwrap();
+        r.turn_end().await;
+        assert_eq!(r.sent().len(), 1, "{:?}", r.sent());
+    }
 }

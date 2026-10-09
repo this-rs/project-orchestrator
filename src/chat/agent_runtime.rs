@@ -607,11 +607,22 @@ impl AgentSessionHandle {
 
     /// Interrupts the turn and the tools it runs.
     pub async fn interrupt(&self) -> Result<()> {
-        self.interrupted.store(true, Ordering::SeqCst);
-        self.session
-            .interrupt(InterruptScope::TurnAndTools)
+        self.interrupt_scoped(InterruptScope::TurnAndTools)
             .await
             .map(|_| ())
+    }
+
+    /// Stops the turn (a Stop of the user): what the queue holds of automated
+    /// work (hints, a pending auto-continue) is dropped when the turn ends, as on
+    /// the Claude Code engine; the messages the user typed still run.
+    pub async fn interrupt_scoped(
+        &self,
+        scope: InterruptScope,
+    ) -> Result<nexus_claude::agent::InterruptOutcome> {
+        self.interrupted.store(true, Ordering::SeqCst);
+        self.session
+            .interrupt(scope)
+            .await
             .map_err(anyhow::Error::new)
     }
 
