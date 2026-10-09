@@ -1,20 +1,25 @@
 //! The agent→user direction of references: the system-prompt section that
 //! teaches the agent to write `#kind:uuid` when it names an entity.
 //!
-//! The kinds come from [`RefKind::ALL`], so the prompt, the wire and the
+//! The kinds come from the table of [`super::kinds`], so the prompt, the wire and the
 //! fixtures (`tests/fixtures/refs/`) cannot name different kinds. The section
 //! is added only when `refs_v1` is on; off, the prompt is unchanged byte for
 //! byte (see `FsmPromptComposer`).
 
-use super::types::RefKind;
+use super::types::{IdFormat, RefKind};
+
+/// The kinds the agent is taught to cite: data (`#`) with a plain UUID. An actor
+/// is cited with `@`, and a kind with a composite id (commit, file, link) is
+/// pasted or picked by the user, not written from memory by the agent.
+fn citable() -> impl Iterator<Item = RefKind> {
+    RefKind::ALL
+        .into_iter()
+        .filter(|k| k.class() == super::kinds::KindClass::Data && k.id_format() == IdFormat::Uuid)
+}
 
 /// The section appended to the system prompt when `refs_v1` is on.
 pub fn prompt_section() -> String {
-    let kinds = RefKind::ALL
-        .iter()
-        .map(|k| k.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let kinds = citable().map(|k| k.as_str()).collect::<Vec<_>>().join(", ");
     format!(
         "## Citing entities\n\n\
          To point at an entity of the system in your answer, write `#kind:uuid` \
@@ -37,16 +42,20 @@ mod tests {
     fn teaches_the_token_and_every_kind() {
         let s = prompt_section();
         assert!(s.contains("#kind:uuid"), "{s}");
-        for k in RefKind::ALL {
+        for k in citable() {
             assert!(s.contains(k.as_str()), "kind {k} missing: {s}");
         }
+        assert!(citable().count() >= 10);
     }
 
     #[test]
-    fn names_no_kind_the_server_refuses() {
+    fn names_no_actor_kind() {
         let s = prompt_section();
-        for reserved in ["persona", "skill"] {
-            assert!(!s.contains(reserved), "{reserved} is reserved: {s}");
+        for actor in ["persona", "skill"] {
+            assert!(
+                !s.contains(actor),
+                "{actor} is cited with @, not taught here: {s}"
+            );
         }
     }
 

@@ -41,6 +41,8 @@ fn every_fixture_declares_the_contract_version_first() {
         "refs_resolved_event.json",
         "errors.json",
         "auth_ok_features.json",
+        "kinds_response.json",
+        "kind_ids.json",
     ] {
         let path = format!("{}/tests/fixtures/refs/{name}", env!("CARGO_MANIFEST_DIR"));
         let text = std::fs::read_to_string(path).unwrap();
@@ -62,14 +64,25 @@ fn entity_ref_fixture() {
         .iter()
         .map(|k| k.as_str().unwrap())
         .collect();
+    let historical: Vec<&str> = RefKind::HISTORICAL.iter().map(|k| k.as_str()).collect();
+    assert_eq!(
+        kinds, historical,
+        "`kinds` is the fallback of a client: the first five"
+    );
+    let all: Vec<&str> = v["all_kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k.as_str().unwrap())
+        .collect();
     let ours: Vec<&str> = RefKind::ALL.iter().map(|k| k.as_str()).collect();
-    assert_eq!(kinds, ours);
+    assert_eq!(all, ours);
     assert_eq!(v["max_refs_per_message"], MAX_REFS_PER_MESSAGE as u64);
     for case in v["cases"].as_array().unwrap() {
         let parsed: EntityRef = serde_json::from_value(case["ref"].clone()).unwrap();
-        assert_eq!(serde_json::to_value(parsed).unwrap(), case["ref"]);
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), case["ref"]);
         let raw: RawRef = serde_json::from_value(case["ref"].clone()).unwrap();
-        assert_eq!(validate_one(&raw), Ok(parsed));
+        assert_eq!(validate_one(&raw), Ok(parsed.clone()));
     }
     for name in v["reserved_kinds_refused_as_kind_disabled"]
         .as_array()
@@ -88,7 +101,7 @@ fn token_fixture() {
     let v = fixture("tokens.json");
     for case in v["valid"].as_array().unwrap() {
         let r = validate_token(case["token"].as_str().unwrap()).unwrap();
-        assert_eq!(serde_json::to_value(r).unwrap(), case["ref"]);
+        assert_eq!(serde_json::to_value(&r).unwrap(), case["ref"]);
         assert_eq!(r.token(), case["token"].as_str().unwrap());
     }
     for case in v["invalid"].as_array().unwrap() {
@@ -177,7 +190,9 @@ fn uniform_disclosure_never_emits_forbidden() {
     // default policy must never produce it.
     let r = EntityRef::new(
         RefKind::Note,
-        "9f1c2b7e-4d3a-4e58-8a61-0b2c7d9e1a10".parse().unwrap(),
+        "9f1c2b7e-4d3a-4e58-8a61-0b2c7d9e1a10"
+            .parse::<uuid::Uuid>()
+            .unwrap(),
     );
     for res in [
         Resolution::Forbidden,
@@ -314,4 +329,96 @@ fn the_prompt_section_teaches_exactly_the_fixture_kinds_and_the_token_shape() {
         assert!(validate_token(token).is_ok(), "{token}");
     }
     assert!(section.contains("#kind:uuid") && section.contains("36"));
+}
+
+#[test]
+fn kinds_response_fixture_is_what_the_server_builds() {
+    use project_orchestrator::refs::wire::KindsResponse;
+    let v = fixture("kinds_response.json");
+    let parsed: KindsResponse = serde_json::from_value(v["response"].clone()).unwrap();
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), v["response"]);
+    assert_eq!(parsed, KindsResponse::active());
+    assert_eq!(parsed.contract_version, CONTRACT_VERSION);
+    let fallback: Vec<&str> = v["fallback_kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k.as_str().unwrap())
+        .collect();
+    let historical: Vec<&str> = RefKind::HISTORICAL.iter().map(|k| k.as_str()).collect();
+    assert_eq!(fallback, historical);
+    // every historical kind is announced: a new server never drops one.
+    for kind in RefKind::HISTORICAL {
+        assert!(parsed.kinds.iter().any(|k| k.kind == kind), "{kind}");
+    }
+    // the sensitive ones are exactly those the description names.
+    let sensitive: Vec<&str> = parsed
+        .kinds
+        .iter()
+        .filter(|k| k.sensitive)
+        .map(|k| k.kind.as_str())
+        .collect();
+    assert_eq!(sensitive, ["commit", "file"]);
+    // persona and skill are actors, cited with @; every other kind is data, cited with #.
+    for k in &parsed.kinds {
+        let actor = matches!(k.kind, RefKind::Persona | RefKind::Skill);
+        assert_eq!(k.sigil, if actor { "@" } else { "#" }, "{}", k.kind);
+    }
+    // only the link has nothing to search, and only it opens outside the app.
+    let unsearchable: Vec<_> = parsed
+        .kinds
+        .iter()
+        .filter(|k| !k.searchable)
+        .map(|k| k.kind)
+        .collect();
+    assert_eq!(unsearchable, [RefKind::Link]);
+    let external: Vec<_> = parsed
+        .kinds
+        .iter()
+        .filter(|k| k.opens_external)
+        .map(|k| k.kind)
+        .collect();
+    assert_eq!(external, [RefKind::Link]);
+}
+
+#[test]
+fn kind_ids_fixture() {
+    let v = fixture("kind_ids.json");
+    for case in v["valid"].as_array().unwrap() {
+        let token = case["token"].as_str().unwrap();
+        let r = validate_token(token).unwrap_or_else(|e| panic!("{token}: {e:?}"));
+        assert_eq!(serde_json::to_value(&r).unwrap(), case["ref"], "{token}");
+        assert_eq!(r.token(), token, "a valid token is its own canonical form");
+        // the wire form is accepted as is, and refused when the id is changed.
+        let back: EntityRef = serde_json::from_value(case["ref"].clone()).unwrap();
+        assert_eq!(back, r);
+    }
+    for case in v["normalized"].as_array().unwrap() {
+        let token = case["token"].as_str().unwrap();
+        let r = validate_token(token).unwrap_or_else(|e| panic!("{token}: {e:?}"));
+        assert_eq!(serde_json::to_value(&r).unwrap(), case["ref"], "{token}");
+        assert_ne!(r.token(), token, "{token} is not canonical");
+    }
+    for case in v["invalid"].as_array().unwrap() {
+        let token = case["token"].as_str().unwrap();
+        let reason = validate_token(token).unwrap_err();
+        assert_eq!(
+            serde_json::to_value(reason).unwrap(),
+            case["reason"],
+            "{token}"
+        );
+    }
+    let long = &v["link_too_long"];
+    let token = format!(
+        "#link:{}{}",
+        long["prefix"].as_str().unwrap(),
+        long["filler"]
+            .as_str()
+            .unwrap()
+            .repeat(long["count"].as_u64().unwrap() as usize)
+    );
+    assert_eq!(
+        serde_json::to_value(validate_token(&token).unwrap_err()).unwrap(),
+        long["reason"]
+    );
 }

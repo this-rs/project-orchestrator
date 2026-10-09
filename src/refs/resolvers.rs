@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use super::access::{RefMeta, RefSource};
 use super::label;
-use super::types::{EntityRef, RefKind};
+use super::types::{EntityRef, RefId, RefKind};
 use super::wire::ScopeLabel;
 use crate::neo4j::models::{DecisionNode, DecisionStatus, PlanNode, TaskWithPlan};
 use crate::neo4j::GraphStore;
@@ -99,7 +99,7 @@ pub trait KindResolver: Send + Sync {
     fn kind(&self) -> RefKind;
 
     /// The entity `id`, or `None`. Unchecked.
-    async fn load(&self, id: Uuid, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>>;
+    async fn load(&self, id: &RefId, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>>;
 
     /// Recent entities matching the needle, most recent first. Unchecked.
     async fn candidates(&self, c: &Candidates, memo: &mut Memo) -> anyhow::Result<Vec<RefMeta>>;
@@ -172,12 +172,17 @@ pub struct PlanResolver {
     graph: Arc<dyn GraphStore>,
 }
 
+/// The resolver of `plan`, for the table of kinds.
+pub fn plan(graph: Arc<dyn GraphStore>) -> Box<dyn KindResolver> {
+    Box::new(PlanResolver { graph })
+}
+
 impl PlanResolver {
     async fn meta(&self, p: &PlanNode, memo: &mut Memo) -> anyhow::Result<RefMeta> {
         let (project, workspace) = scope_of(self.graph.as_ref(), memo, p.project_id).await?;
         Ok(RefMeta {
             kind: RefKind::Plan,
-            id: p.id,
+            id: p.id.into(),
             label: label::derive("plan", &p.id, &[&p.title]),
             subtitle: None,
             project,
@@ -193,7 +198,10 @@ impl KindResolver for PlanResolver {
         RefKind::Plan
     }
 
-    async fn load(&self, id: Uuid, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+    async fn load(&self, id: &RefId, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+        let Some(id) = id.uuid() else {
+            return Ok(None);
+        };
         match self.graph.get_plan(id).await? {
             Some(p) => Ok(Some(self.meta(&p, memo).await?)),
             None => Ok(None),
@@ -225,7 +233,10 @@ impl KindResolver for PlanResolver {
     }
 
     async fn finish(&self, meta: &mut RefMeta) -> anyhow::Result<()> {
-        let n = self.graph.get_plan_tasks(meta.id).await?.len();
+        let Some(plan_id) = meta.id.uuid() else {
+            return Ok(());
+        };
+        let n = self.graph.get_plan_tasks(plan_id).await?.len();
         meta.subtitle = Some(match n {
             1 => "1 tâche".to_string(),
             n => format!("{n} tâches"),
@@ -242,6 +253,10 @@ pub struct TaskResolver {
     graph: Arc<dyn GraphStore>,
 }
 
+pub fn task(graph: Arc<dyn GraphStore>) -> Box<dyn KindResolver> {
+    Box::new(TaskResolver { graph })
+}
+
 impl TaskResolver {
     async fn meta(
         &self,
@@ -254,7 +269,7 @@ impl TaskResolver {
         let title = t.title.as_deref().unwrap_or("");
         Ok(RefMeta {
             kind: RefKind::Task,
-            id: t.id,
+            id: t.id.into(),
             label: label::derive("task", &t.id, &[title, &t.description]),
             subtitle: plan.map(|p| format!("Plan : {}", p.title)),
             project,
@@ -275,7 +290,10 @@ impl KindResolver for TaskResolver {
         RefKind::Task
     }
 
-    async fn load(&self, id: Uuid, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+    async fn load(&self, id: &RefId, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+        let Some(id) = id.uuid() else {
+            return Ok(None);
+        };
         let Some(t) = self.graph.get_task(id).await? else {
             return Ok(None);
         };
@@ -330,6 +348,14 @@ pub struct RfcResolver {
     graph: Arc<dyn GraphStore>,
 }
 
+pub fn note(graph: Arc<dyn GraphStore>) -> Box<dyn KindResolver> {
+    Box::new(NoteResolver { graph })
+}
+
+pub fn rfc(graph: Arc<dyn GraphStore>) -> Box<dyn KindResolver> {
+    Box::new(RfcResolver { graph })
+}
+
 async fn note_candidates(
     graph: &dyn GraphStore,
     c: &Candidates,
@@ -373,7 +399,7 @@ async fn note_meta(
     };
     Ok(RefMeta {
         kind,
-        id: n.id,
+        id: n.id.into(),
         label,
         subtitle,
         project,
@@ -397,7 +423,10 @@ impl KindResolver for NoteResolver {
         RefKind::Note
     }
 
-    async fn load(&self, id: Uuid, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+    async fn load(&self, id: &RefId, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+        let Some(id) = id.uuid() else {
+            return Ok(None);
+        };
         match self.graph.get_note(id).await? {
             Some(n) if n.note_type != NoteType::Rfc => Ok(Some(
                 note_meta(self.graph.as_ref(), RefKind::Note, &n, memo).await?,
@@ -422,7 +451,10 @@ impl KindResolver for RfcResolver {
         RefKind::Rfc
     }
 
-    async fn load(&self, id: Uuid, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+    async fn load(&self, id: &RefId, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+        let Some(id) = id.uuid() else {
+            return Ok(None);
+        };
         match self.graph.get_note(id).await? {
             Some(n) if n.note_type == NoteType::Rfc => Ok(Some(
                 note_meta(self.graph.as_ref(), RefKind::Rfc, &n, memo).await?,
@@ -449,6 +481,10 @@ pub struct DecisionResolver {
     graph: Arc<dyn GraphStore>,
 }
 
+pub fn decision(graph: Arc<dyn GraphStore>) -> Box<dyn KindResolver> {
+    Box::new(DecisionResolver { graph })
+}
+
 impl DecisionResolver {
     async fn meta(
         &self,
@@ -459,7 +495,7 @@ impl DecisionResolver {
         let (project, workspace) = scope_of(self.graph.as_ref(), memo, project_id).await?;
         Ok(RefMeta {
             kind: RefKind::Decision,
-            id: d.id,
+            id: d.id.into(),
             label: label::derive("decision", &d.id, &[&d.description]),
             subtitle: d.chosen_option.as_deref().and_then(label::first_line),
             project,
@@ -475,7 +511,10 @@ impl KindResolver for DecisionResolver {
         RefKind::Decision
     }
 
-    async fn load(&self, id: Uuid, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+    async fn load(&self, id: &RefId, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+        let Some(id) = id.uuid() else {
+            return Ok(None);
+        };
         let Some(d) = self.graph.get_decision(id).await? else {
             return Ok(None);
         };
@@ -525,42 +564,27 @@ impl KindResolver for DecisionResolver {
 /// The five resolvers over one store. Implements the raw read the access
 /// policy wraps.
 pub struct GraphRefSource {
-    plan: PlanResolver,
-    task: TaskResolver,
-    note: NoteResolver,
-    decision: DecisionResolver,
-    rfc: RfcResolver,
+    resolvers: HashMap<RefKind, Box<dyn KindResolver>>,
 }
 
 impl GraphRefSource {
+    /// Every resolver of the table of kinds, built over `graph`.
     pub fn new(graph: Arc<dyn GraphStore>) -> Self {
         Self {
-            plan: PlanResolver {
-                graph: graph.clone(),
-            },
-            task: TaskResolver {
-                graph: graph.clone(),
-            },
-            note: NoteResolver {
-                graph: graph.clone(),
-            },
-            decision: DecisionResolver {
-                graph: graph.clone(),
-            },
-            rfc: RfcResolver { graph },
+            resolvers: super::kinds::KINDS
+                .iter()
+                .map(|d| (d.kind, (d.resolver)(graph.clone())))
+                .collect(),
         }
     }
 
-    /// The resolver of `kind`. Exhaustive: a new kind does not compile until it
-    /// has one.
+    /// The resolver of `kind`. The table has one for every kind (a test pins
+    /// it); a kind it somehow lacks reads as absent.
     pub fn resolver(&self, kind: RefKind) -> &dyn KindResolver {
-        match kind {
-            RefKind::Plan => &self.plan,
-            RefKind::Task => &self.task,
-            RefKind::Note => &self.note,
-            RefKind::Decision => &self.decision,
-            RefKind::Rfc => &self.rfc,
-        }
+        self.resolvers
+            .get(&kind)
+            .map(|r| r.as_ref())
+            .unwrap_or(&super::resolvers_ext::Missing)
     }
 }
 
@@ -568,7 +592,7 @@ impl GraphRefSource {
 impl RefSource for GraphRefSource {
     async fn load_unchecked(&self, r: &EntityRef) -> anyhow::Result<Option<RefMeta>> {
         let resolver = self.resolver(r.kind);
-        let Some(mut meta) = resolver.load(r.id, &mut Memo::default()).await? else {
+        let Some(mut meta) = resolver.load(&r.id, &mut Memo::default()).await? else {
             return Ok(None);
         };
         resolver.finish(&mut meta).await?;

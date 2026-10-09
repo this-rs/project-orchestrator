@@ -25,9 +25,12 @@ pub mod block;
 pub mod cite;
 pub mod compose;
 pub mod flag;
+pub mod kinds;
 pub mod label;
+pub mod link;
 pub mod registry;
 pub mod resolvers;
+pub mod resolvers_ext;
 pub mod search;
 #[cfg(test)]
 mod search_contract;

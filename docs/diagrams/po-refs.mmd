@@ -1,6 +1,6 @@
 %% name: po-refs
 %% covers: backend:src/refs/** backend:src/api/refs_handlers.rs
-%% verified: e490da03
+%% verified: ccaf357d
 %% ---
 %% PROUVE : ce que le module src/refs/ fait aujourd'hui (PR 1 et PR 2 du plan « Chat : références #/@ ») :
 %%   valider une référence envoyée par un client, décider si l'appelant peut la lire, la replier dans
@@ -12,6 +12,9 @@
 %%   src/api/refs_handlers.rs (route dans api/routes.rs)
 %%   tests/refs_contract.rs, tests/fixtures/refs/*.json
 %% ---
+%% MISE A JOUR R2 : 16 genres derives de kinds::TABLE ; le sigil du jeton (# data, @ actor) est porte par le jeton ;
+%%   OpenInstanceRule borne une session a son projet/workspace (file et commit : sensibles) ;
+%%   les resolveurs des nouveaux genres suivent dans des commits separes.
 %% NON ETABLI :
 %%   aucun appelant WS : la trame refs_resolved n'existe que comme forme (wire.rs) figée par la fixture ;
 %%   aucune ACL de lecture par entité n'existe dans le dépôt : OpenInstanceRule admet tout
@@ -30,9 +33,12 @@ flowchart TD
         L3["⚪ autre domaine"]
     end
 
+    TABLE["✅ kinds::TABLE<br/>UNE entrée par genre : nom, classe data (#) ou actor (@), format d id, source du libellé, accès, recherche, route, icône, backing, résolveur ;<br/>test: every_variant_has_one_entry_and_every_entry_a_variant"]
     CLIENT["⚪ client: refs[] = {kind, id} en chaînes"]
     VALIDATE["✅ validate::validate_refs<br/>plafond 20 avant dédoublonnage ;<br/>kind inconnu / réservé / id nul ;<br/>test: the_limit_is_inclusive_and_counts_before_dedup"]
-    REGISTRY["✅ registry::lookup<br/>5 kinds actifs, persona et skill réservés (enabled=false) ;<br/>test: events_entity_type_is_fully_classified"]
+    REGISTRY["✅ registry::lookup<br/>16 kinds actifs (5 historiques + conversation, project, milestone, release, workspace, commit, protocol, persona, skill, file, link), plus aucun réservé ;<br/>test: events_entity_type_is_fully_classified"]
+    KINDS["✅ wire::KindsResponse + refs_handlers::ref_kinds<br/>GET /api/refs/kinds : les kinds que CE serveur résout ; un serveur ancien répond 404 et le client se replie sur les 5 historiques ;<br/>test: kinds_response_fixture_is_what_the_server_builds"]
+    IDS["✅ types::canonical_id<br/>id par kind : UUID, projet:hash, projet:chemin relatif, URL normalisée ;<br/>test: kind_ids_fixture"]
     ERR["✅ wire::RefsErrorBody<br/>400 {error, code: refs_invalid, reason, index?} ;<br/>test: error_fixture"]
     ENTITYREF["✅ types::EntityRef {kind, id}<br/>sans label, champs inconnus refusés ;<br/>test: an_entity_ref_refuses_a_client_label"]
     BLOCK["✅ block::encode<br/>bloc po-refs en fin de texte, avant po-attachments ;<br/>marqueur tapé par l'utilisateur neutralisé ;<br/>test: a_typed_marker_cannot_forge_a_block"]
@@ -46,6 +52,9 @@ flowchart TD
 
     CLIENT --> VALIDATE
     VALIDATE --> REGISTRY
+    VALIDATE --> IDS
+    TABLE --> REGISTRY
+    TABLE --> KINDS
     VALIDATE -- refus --> ERR
     VALIDATE -- ok --> ENTITYREF
     ENTITYREF --> BLOCK

@@ -60,7 +60,7 @@ impl RefSearchParams {
 
         let mut kinds: Vec<RefKind> = Vec::new();
         match self.kinds.as_deref().map(str::trim) {
-            None | Some("") => kinds.extend(RefKind::ALL),
+            None | Some("") => kinds.extend(RefKind::HISTORICAL),
             Some(list) => {
                 for (i, name) in list.split(',').enumerate() {
                     let kind = match lookup(name.trim()) {
@@ -170,13 +170,20 @@ async fn one_kind(
     policy: &AccessPolicy,
     principal: &Principal,
 ) -> anyhow::Result<VecDeque<RefMeta>> {
+    // A sensitive kind is searched inside a scope the caller names, never across the instance.
+    if resolver.kind().is_sensitive()
+        && query.project_id.is_none()
+        && query.workspace_slug.is_none()
+    {
+        return Ok(VecDeque::new());
+    }
     let mut memo = Memo::default();
     let mut kept = VecDeque::new();
     for meta in resolver.candidates(candidates, &mut memo).await? {
         if !in_scope(&meta, query.project_id, query.workspace_slug.as_deref()) {
             continue;
         }
-        let r = EntityRef::new(meta.kind, meta.id);
+        let r = EntityRef::new(meta.kind, meta.id.clone());
         let verdict = policy.resolve_checked(principal, &Loaded(meta), &r).await;
         if let Resolution::Found(found) = verdict {
             kept.push_back(*found);
@@ -296,15 +303,15 @@ mod tests {
     }
 
     fn ids(items: &[RefSearchItem]) -> Vec<Uuid> {
-        items.iter().map(|i| i.id).collect()
+        items.iter().map(|i| i.id.uuid().unwrap()).collect()
     }
 
     // ---- parsing -------------------------------------------------------
 
     #[test]
-    fn defaults_are_all_five_kinds_and_a_page_of_twenty() {
+    fn defaults_are_the_five_historical_kinds_and_a_page_of_twenty() {
         let q = parsed(RefSearchParams::default());
-        assert_eq!(q.kinds, RefKind::ALL.to_vec());
+        assert_eq!(q.kinds, RefKind::HISTORICAL.to_vec());
         assert_eq!(q.limit, 20);
         assert_eq!(q.q, "");
         assert!(q.project_id.is_none() && q.workspace_slug.is_none());
@@ -338,20 +345,13 @@ mod tests {
             .unwrap_err()
         };
         assert_eq!(
-            e("plan,workspace"),
+            e("plan,step"),
             RefsInvalid {
                 reason: InvalidReason::UnknownKind,
                 index: Some(1)
             }
         );
         assert_eq!(e("Plan").reason, InvalidReason::UnknownKind);
-        assert_eq!(
-            e("persona"),
-            RefsInvalid {
-                reason: InvalidReason::KindDisabled,
-                index: Some(0)
-            }
-        );
         assert_eq!(e("plan,,task").reason, InvalidReason::UnknownKind);
     }
 
@@ -410,7 +410,7 @@ mod tests {
         };
         RefMeta {
             kind: RefKind::Plan,
-            id: Uuid::new_v4(),
+            id: Uuid::new_v4().into(),
             label: "l".into(),
             subtitle: None,
             project: project.map(|p| label(p, "p")),
@@ -726,6 +726,7 @@ mod fan_out_tests {
     use super::*;
     use crate::refs::resolvers::Candidates;
     use crate::refs::test_support::{user, world};
+    use crate::refs::types::RefId;
 
     /// A kind that never answers.
     struct Hangs;
@@ -737,7 +738,7 @@ mod fan_out_tests {
         fn kind(&self) -> RefKind {
             RefKind::Task
         }
-        async fn load(&self, _: Uuid, _: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+        async fn load(&self, _: &RefId, _: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
             std::future::pending().await
         }
         async fn candidates(&self, _: &Candidates, _: &mut Memo) -> anyhow::Result<Vec<RefMeta>> {
@@ -750,7 +751,7 @@ mod fan_out_tests {
         fn kind(&self) -> RefKind {
             RefKind::Task
         }
-        async fn load(&self, _: Uuid, _: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+        async fn load(&self, _: &RefId, _: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
             anyhow::bail!("down")
         }
         async fn candidates(&self, _: &Candidates, _: &mut Memo) -> anyhow::Result<Vec<RefMeta>> {

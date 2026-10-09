@@ -431,7 +431,7 @@ fn server_examples() -> Vec<ServerExample> {
                 refs: vec![
                     RefResolution {
                         kind: RefKind::Plan,
-                        id: fixed_uuid(PLAN_ID),
+                        id: fixed_uuid(PLAN_ID).into(),
                         status: RefStatus::Ok,
                         label: Some(s("Chat : références #/@")),
                         subtitle: Some(s("12 tâches")),
@@ -445,7 +445,7 @@ fn server_examples() -> Vec<ServerExample> {
                     },
                     RefResolution {
                         kind: RefKind::Task,
-                        id: fixed_uuid("3adeffc9-c8b0-4e2f-a674-55bfcb293433"),
+                        id: fixed_uuid("3adeffc9-c8b0-4e2f-a674-55bfcb293433").into(),
                         status: RefStatus::NotFound,
                         label: None,
                         subtitle: None,

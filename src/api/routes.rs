@@ -1442,6 +1442,7 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         // Chat references: suggestions for the `#` picker (additive, read-only)
         .route("/api/refs/search", get(refs_handlers::search_refs))
+        .route("/api/refs/kinds", get(refs_handlers::ref_kinds))
         // ================================================================
         // RFCs (Notes with note_type=rfc, frontend-friendly API)
         // ================================================================

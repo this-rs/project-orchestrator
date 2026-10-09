@@ -6680,6 +6680,7 @@ dependencies = [
  "tree-sitter-swift",
  "tree-sitter-typescript",
  "tree-sitter-zig",
+ "url",
  "urlencoding",
  "uuid",
  "walkdir",

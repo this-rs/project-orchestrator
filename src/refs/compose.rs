@@ -219,7 +219,7 @@ mod tests {
     #[tokio::test]
     async fn the_switch_off_ignores_refs_like_an_older_server() {
         // Even a refs list that would be refused is ignored, not refused.
-        let refs = [wire("workspace", "nope")];
+        let refs = [wire("step", "nope")];
         let out = compose_user_message(&graph(), "hello", &refs, &[], false)
             .await
             .unwrap();
@@ -230,11 +230,15 @@ mod tests {
     async fn invalid_refs_are_refused_with_the_stable_reason_and_index() {
         let cases = [
             (
-                vec![wire("plan", A), wire("workspace", B)],
+                vec![wire("plan", A), wire("step", B)],
                 "unknown_kind",
                 Some(1),
             ),
-            (vec![wire("persona", A)], "kind_disabled", Some(0)),
+            (
+                vec![wire("link", "javascript:alert(1)")],
+                "bad_link",
+                Some(0),
+            ),
             (vec![wire("plan", "not-a-uuid")], "bad_id", Some(0)),
             // A client label: refused for what it is, with its index.
             (

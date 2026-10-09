@@ -4309,7 +4309,7 @@ mod tests {
         let plan = Uuid::new_v4();
         // unknown kind at index 2
         let body = format!(
-            r#"{{"content":"x","refs":[{{"kind":"plan","id":"{plan}"}},{{"kind":"note","id":"{plan}"}},{{"kind":"workspace","id":"{plan}"}}]}}"#
+            r#"{{"content":"x","refs":[{{"kind":"plan","id":"{plan}"}},{{"kind":"note","id":"{plan}"}},{{"kind":"step","id":"{plan}"}}]}}"#
         );
         let (status, resp) = call(&h.app, auth_post(&msg_uri(sid), &body)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
@@ -4324,10 +4324,10 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(resp, fixture_case("too many refs"));
 
-        // reserved kind, bad id
-        let body = format!(r#"{{"content":"x","refs":[{{"kind":"persona","id":"{plan}"}}]}}"#);
-        let (_, resp) = call(&h.app, auth_post(&msg_uri(sid), &body)).await;
-        assert_eq!(resp, fixture_case("reserved kind"));
+        // a link that is not allowed, bad id
+        let body = r#"{"content":"x","refs":[{"kind":"link","id":"javascript:alert(1)"}]}"#;
+        let (_, resp) = call(&h.app, auth_post(&msg_uri(sid), body)).await;
+        assert_eq!(resp, fixture_case("bad link"));
         let body =
             r#"{"content":"x","refs":[{"kind":"plan","id":"nope"},{"kind":"plan","id":"nope"}]}"#;
         let (_, resp) = call(&h.app, auth_post(&msg_uri(sid), body)).await;
@@ -4344,7 +4344,7 @@ mod tests {
         let text = "regarde src/main.rs et Cargo.toml";
         let body = serde_json::json!({
             "content": text,
-            "refs": [{"kind": "workspace", "id": Uuid::new_v4()}]
+            "refs": [{"kind": "step", "id": Uuid::new_v4()}]
         })
         .to_string();
         let (status, _) = call(&h.app, auth_post(&msg_uri(sid), &body)).await;
@@ -4366,11 +4366,11 @@ mod tests {
     #[tokio::test]
     async fn the_first_message_with_invalid_refs_creates_no_session() {
         let h = action_harness(Some("/nonexistent/claude-cli")).await;
-        let body = r#"{"message":"x","cwd":"/tmp","refs":[{"kind":"skill","id":"3adeffc9-c8b0-4e2f-a674-55bfcb293433"}]}"#;
+        let body = r#"{"message":"x","cwd":"/tmp","refs":[{"kind":"link","id":"http://127.0.0.1/admin"}]}"#;
         let (status, resp) = call(&h.app, auth_post("/api/chat/sessions", body)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
         assert_eq!(resp["code"], "refs_invalid");
-        assert_eq!(resp["reason"], "kind_disabled");
+        assert_eq!(resp["reason"], "bad_link");
         let sessions = h
             .graph
             .list_chat_sessions(None, None, 10, 0, true)
@@ -4384,7 +4384,7 @@ mod tests {
         let h = action_harness_with(Some("/nonexistent/claude-cli"), false).await;
         let sid = seed_session(&h).await;
         // The same body that is a 400 with the switch on is not refused…
-        let body = r#"{"content":"x","refs":[{"kind":"workspace","id":"nope"}]}"#;
+        let body = r#"{"content":"x","refs":[{"kind":"step","id":"nope"}]}"#;
         let (status, resp) = call(&h.app, auth_post(&msg_uri(sid), body)).await;
         // Not refused: it went on to delivery, which fails here only because there
         // is no CLI to resume (a 500), exactly like a message without refs.
