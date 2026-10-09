@@ -379,6 +379,12 @@ impl TurnRouter {
         *locked(&self.last_message) = Some(message.to_owned());
     }
 
+    /// The text the next turn will carry, as last set.
+    #[cfg(test)]
+    pub(crate) fn last_message(&self) -> Option<String> {
+        locked(&self.last_message).clone()
+    }
+
     /// Whether the session can switch model between turns.
     pub(crate) fn set_model_live(&self, live: bool) {
         self.set_model_live.store(live, Ordering::SeqCst);

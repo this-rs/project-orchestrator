@@ -241,7 +241,7 @@ pub(crate) async fn drain_pending_messages(
 /// produced by the very work the user just stopped and would re-arm the turn
 /// forever. Messages the human typed still run. Returns the message and how
 /// many automated entries were dropped.
-fn pop_next_after_turn(
+pub(crate) fn pop_next_after_turn(
     queue: &mut VecDeque<PendingMessage>,
     interrupted: bool,
 ) -> (Option<PendingMessage>, usize) {

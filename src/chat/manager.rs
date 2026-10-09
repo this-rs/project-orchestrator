@@ -907,6 +907,134 @@ async fn enrichment_project_id(
         .map(|p| p.id)
 }
 
+/// The protocol context of a turn (what the Claude Code engine knows of a session
+/// that runs inside a protocol FSM). Empty for a session that runs in none.
+#[derive(Default)]
+pub(crate) struct TurnProtocol {
+    pub run_id: Option<Uuid>,
+    pub state: Option<String>,
+    pub reasoning_path_tracker: Option<super::feedback::ReasoningPathTracker>,
+}
+
+/// The knowledge graph's context for one turn whose message is `message`, as the
+/// markdown put in front of it (`None`: nothing to add). Both engines call it
+/// before every turn — the Claude Code engine in `stream_response`, the agent
+/// engine through [`ManagerTurnServices`] — so a message gets the same context
+/// whatever drives the session.
+///
+/// `excluded_note_ids`: the notes the user pointed at with `#` (`refs::turn`): the
+/// knowledge injection does not repeat them.
+pub(crate) async fn enrichment_for_turn(
+    graph: &Arc<dyn GraphStore>,
+    pipeline: &super::enrichment::EnrichmentPipeline,
+    session_id: &str,
+    message: &str,
+    protocol: TurnProtocol,
+    excluded_note_ids: std::collections::HashSet<String>,
+) -> Option<String> {
+    let uuid = Uuid::parse_str(session_id).ok()?;
+    let node = graph.get_chat_session(uuid).await.ok().flatten()?;
+    // Sessions persisted without a slug (all-projects mode, before cwd inference
+    // existed) still get graph context.
+    let project_slug = match node.project_slug {
+        Some(slug) => Some(slug),
+        None => {
+            crate::skills::project_resolver::infer_project_slug_for_cwd(graph.as_ref(), &node.cwd)
+                .await
+        }
+    };
+    // Resolve the project id once for every stage: stages that only read
+    // `project_id` (reflex) were skipped for every chat message.
+    let project_id = enrichment_project_id(graph.as_ref(), project_slug.as_deref()).await;
+    let input = super::enrichment::EnrichmentInput {
+        message: message.to_string(),
+        session_id: uuid,
+        project_slug,
+        project_id,
+        cwd: Some(node.cwd),
+        protocol_run_id: protocol.run_id,
+        protocol_state: protocol.state,
+        excluded_note_ids,
+        reasoning_path_tracker: protocol.reasoning_path_tracker,
+    };
+    let ctx = pipeline.execute(&input).await;
+    if !ctx.has_content() {
+        return None;
+    }
+    debug!(
+        "[enrichment] Prompt enriched: {} sections, {}ms (hints: {:?})",
+        ctx.sections.len(),
+        ctx.total_time_ms,
+        ctx.hints.keys().collect::<Vec<_>>()
+    );
+    // Clean markdown prepended to the user message (replaces the old XML-wrapped
+    // <enrichment_context> format).
+    let md = ctx.to_system_prompt_markdown();
+    (!md.is_empty()).then_some(md)
+}
+
+/// What the manager does around a turn of the agent engine
+/// ([`super::agent_runtime::TurnServices`]), with the same functions as the
+/// Claude Code engine.
+pub(crate) struct ManagerTurnServices {
+    graph: Arc<dyn GraphStore>,
+    enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
+    turn_routing: Arc<super::agent_hooks::TurnRouting>,
+}
+
+#[async_trait::async_trait]
+impl super::agent_runtime::TurnServices for ManagerTurnServices {
+    async fn prepare(
+        &self,
+        session_id: &str,
+        shown: &str,
+        sent: &str,
+        turn: &crate::refs::turn::TurnExpansion,
+    ) -> String {
+        // What follows the enrichment. No references: the attachments expanded
+        // (references in the conversation, content for the model), a relayed
+        // history kept in front. References: the relay, the visible text, its
+        // `<po-context>` pointers, then the documents (`TurnExpansion::native_prompt`).
+        let body = if turn.resolved.is_empty() {
+            if sent == shown {
+                turn.enrichment_text.clone()
+            } else {
+                super::message_attachments::expand_for_agent(&self.graph, sent).await
+            }
+        } else {
+            turn.native_prompt(shown, sent)
+        };
+        // The enrichment reads what the user typed (the attachments' text, without
+        // references), and does not inject again the notes the user pointed at.
+        let prepared = match enrichment_for_turn(
+            &self.graph,
+            &self.enrichment_pipeline,
+            session_id,
+            &turn.enrichment_text,
+            TurnProtocol::default(),
+            turn.excluded_note_ids.clone(),
+        )
+        .await
+        {
+            Some(md) => prepend_enrichment(&md, &body),
+            None => body,
+        };
+        // The hook of the turn only sees the length of the text: hand it the text of
+        // THIS turn, whatever started it (a message, the queue, a hint, another
+        // instance), right before it is sent — what the user typed, not the
+        // `<po-refs>`/`<po-attachments>` blocks around it.
+        if let Some(router) = self.turn_routing.get(session_id) {
+            router.set_last_message(&crate::refs::turn::visible_text(shown));
+        }
+        prepared
+    }
+}
+
+/// `prompt` with the turn's enrichment in front of it.
+pub(crate) fn prepend_enrichment(enrichment_md: &str, prompt: &str) -> String {
+    format!("{}\n\n---\n\n{}", enrichment_md, prompt)
+}
+
 /// Server secrets an agent must not inherit, among those present.
 ///
 /// Not listed on purpose: `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` —
@@ -4823,83 +4951,31 @@ impl ChatManager {
         // ===== PRE-ENRICHMENT PIPELINE =====
         // Enrich the prompt with context from the knowledge graph BEFORE the LLM call.
         // If the pipeline has no stages or all fail, the original prompt is used unchanged.
+        // The agent engine runs the same function (`enrichment_for_turn`): one logic.
         let prompt = {
-            let session_uuid = Uuid::parse_str(&session_id).ok();
-            let enrichment_input = if let Some(uuid) = session_uuid {
-                // Load session node to get project_slug
-                match graph.get_chat_session(uuid).await {
-                    Ok(Some(node)) => {
-                        // Read protocol context from the active session (if any)
-                        let (proto_run_id, proto_state, reasoning_tracker) = {
-                            let sessions = active_sessions.read().await;
-                            sessions
-                                .get(&uuid.to_string())
-                                .map(|s| {
-                                    (
-                                        s.protocol_run_id,
-                                        s.protocol_state.clone(),
-                                        Some(s.reasoning_path_tracker.clone()),
-                                    )
-                                })
-                                .unwrap_or((None, None, None))
-                        };
-                        // Sessions persisted without a slug (all-projects mode,
-                        // before cwd inference existed) still get graph context.
-                        let project_slug = match node.project_slug {
-                            Some(slug) => Some(slug),
-                            None => {
-                                crate::skills::project_resolver::infer_project_slug_for_cwd(
-                                    graph.as_ref(),
-                                    &node.cwd,
-                                )
-                                .await
-                            }
-                        };
-                        // Resolve the project id once for every stage: stages
-                        // that only read `project_id` (reflex) were skipped
-                        // for every chat message.
-                        let project_id =
-                            enrichment_project_id(graph.as_ref(), project_slug.as_deref()).await;
-                        Some(super::enrichment::EnrichmentInput {
-                            message: prompt.clone(),
-                            session_id: uuid,
-                            project_slug,
-                            project_id,
-                            cwd: Some(node.cwd),
-                            protocol_run_id: proto_run_id,
-                            protocol_state: proto_state,
-                            excluded_note_ids: turn.excluded_note_ids.clone(), // the notes the user pointed at
-                            reasoning_path_tracker: reasoning_tracker,
-                        })
-                    }
-                    _ => None,
-                }
-            } else {
-                None
+            let protocol = {
+                let sessions = active_sessions.read().await;
+                sessions
+                    .get(&session_id)
+                    .map(|s| TurnProtocol {
+                        run_id: s.protocol_run_id,
+                        state: s.protocol_state.clone(),
+                        reasoning_path_tracker: Some(s.reasoning_path_tracker.clone()),
+                    })
+                    .unwrap_or_default()
             };
-
-            if let Some(input) = enrichment_input {
-                let ctx = enrichment_pipeline.execute(&input).await;
-                if ctx.has_content() {
-                    debug!(
-                        "[enrichment] Prompt enriched: {} sections, {}ms (hints: {:?})",
-                        ctx.sections.len(),
-                        ctx.total_time_ms,
-                        ctx.hints.keys().collect::<Vec<_>>()
-                    );
-                    // Integrate enrichment as clean markdown prepended to user message
-                    // (replaces old XML-wrapped <enrichment_context> format)
-                    let enrichment_md = ctx.to_system_prompt_markdown();
-                    if enrichment_md.is_empty() {
-                        prompt
-                    } else {
-                        format!("{}\n\n---\n\n{}", enrichment_md, prompt)
-                    }
-                } else {
-                    prompt
-                }
-            } else {
-                prompt
+            match enrichment_for_turn(
+                &graph,
+                &enrichment_pipeline,
+                &session_id,
+                &prompt,
+                protocol,
+                turn.excluded_note_ids.clone(),
+            )
+            .await
+            {
+                Some(enrichment_md) => prepend_enrichment(&enrichment_md, &prompt),
+                None => prompt,
             }
         };
 
@@ -5852,10 +5928,8 @@ impl ChatManager {
     /// Send a follow-up message to an existing session
     pub async fn send_message(&self, session_id: &str, message: &str) -> Result<()> {
         if let Some(handle) = self.agent_runtime.get(session_id).await {
-            // The hook of the turn only sees the length of the text: hand it the text.
-            if let Some(router) = self.turn_routing.get(session_id) {
-                router.set_last_message(&crate::refs::turn::visible_text(message));
-            }
+            // The turn router learns the text when the turn is prepared
+            // (`ManagerTurnServices::prepare`): a queued message must not overwrite it.
             return handle.send_message(message).await;
         }
         // Check is_streaming with read lock first — if streaming, queue the message
@@ -6034,6 +6108,9 @@ impl ChatManager {
     /// post-compaction context re-injection) without killing child processes
     /// (cargo build, npm install, etc.).
     pub async fn inject_hint(&self, session_id: &str, message: &str) -> Result<()> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return handle.inject_hint(message).await;
+        }
         let sessions = self.active_sessions.read().await;
         let session = sessions
             .get(session_id)
@@ -6067,6 +6144,9 @@ impl ChatManager {
     /// Returns `true` when the message was held, `false` when the session was
     /// idle and the message was simply sent.
     pub async fn queue_user_message(&self, session_id: &str, message: &str) -> Result<bool> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return handle.queue_message(message).await;
+        }
         {
             let sessions = self.active_sessions.read().await;
             let session = sessions
@@ -6117,6 +6197,9 @@ impl ChatManager {
         &self,
         session_id: &str,
     ) -> Option<Vec<super::types::PendingQueueEntry>> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return Some(handle.queue_snapshot().await);
+        }
         let sessions = self.active_sessions.read().await;
         let session = sessions.get(session_id)?;
         let queue = session.pending_messages.lock().await;
@@ -6135,6 +6218,10 @@ impl ChatManager {
         session_id: &str,
         op: &super::pending_queue::QueueOp,
     ) -> Result<bool> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            handle.queue_op(op).await;
+            return Ok(true);
+        }
         {
             let sessions = self.active_sessions.read().await;
             if let Some(session) = sessions.get(session_id) {
@@ -9771,6 +9858,16 @@ impl ChatManager {
         })
     }
 
+    /// What a session of the agent engine gets around its turns, built from the
+    /// manager as it is configured NOW (the pipeline is replaced after construction).
+    pub(crate) fn turn_services(&self) -> Arc<dyn super::agent_runtime::TurnServices> {
+        Arc::new(ManagerTurnServices {
+            graph: self.graph.clone(),
+            enrichment_pipeline: self.enrichment_pipeline.clone(),
+            turn_routing: Arc::clone(&self.turn_routing),
+        })
+    }
+
     /// Records what the provider reported (frozen capabilities, resume token)
     /// and registers the live session.
     async fn finish_agent_open(
@@ -9809,6 +9906,7 @@ impl ChatManager {
                 first_seq,
                 &kind_name,
                 tool_policy,
+                Some(self.turn_services()),
             )
             .await;
     }
@@ -12888,7 +12986,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_path_refuses_a_second_turn_while_one_runs_and_answers_permissions() {
+    async fn agent_path_queues_a_second_turn_while_one_runs_and_answers_permissions() {
         use nexus_claude::agent::AgentEvent;
         let (manager, _graph, fake) = agent_manager();
         let sid = manager
@@ -12898,11 +12996,18 @@ mod tests {
             .session_id;
         let mut rx = manager.subscribe(&sid).await.unwrap();
 
-        let err = manager.send_message(&sid, "second").await.unwrap_err();
-        let typed = err
-            .downcast_ref::<nexus_claude::agent::ProviderError>()
-            .expect("typed");
-        assert_eq!(typed.kind(), "turn_in_progress");
+        // Queued, not refused: the running turn is interrupted and the message read next.
+        manager.send_message(&sid, "second").await.unwrap();
+        assert_eq!(fake.state.interrupts.lock().unwrap().len(), 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while fake.state.turns_started.lock().unwrap().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the queued turn starts"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(fake.state.turns_started.lock().unwrap()[1].ends_with("second"));
 
         fake.state.push(AgentEvent::PermissionAsk {
             request_id: "perm-1".into(),
@@ -13161,14 +13266,7 @@ mod tests {
         assert_eq!(wire["engine"], "agent", "{wire}");
         let degraded: Vec<String> = serde_json::from_value(wire["degraded_features"].clone())
             .unwrap_or_else(|_| panic!("degraded_features missing: {wire}"));
-        for lost in [
-            "hooks",
-            "message_queue",
-            "auto_continue",
-            "compaction",
-            "nats",
-            "images",
-        ] {
+        for lost in ["hooks", "auto_continue", "compaction", "nats", "images"] {
             assert!(
                 degraded.iter().any(|d| d == lost),
                 "{lost} must be listed: {degraded:?}"
@@ -13215,15 +13313,15 @@ mod tests {
         let degraded: Vec<String> =
             serde_json::from_value(wire["degraded_features"].clone()).expect("a list");
         // What the backend does not do on this engine, whatever the provider says...
-        for lost in [
-            "hooks",
-            "message_queue",
-            "auto_continue",
-            "nats",
-            "enrichment",
-        ] {
+        for lost in ["hooks", "auto_continue", "nats"] {
             assert!(degraded.iter().any(|d| d == lost), "{lost}: {degraded:?}");
         }
+        // ...what the engine ported is not claimed missing...
+        let ported = ["enrichment", "message_queue"];
+        assert!(
+            !degraded.iter().any(|d| ported.contains(&d.as_str())),
+            "{degraded:?}"
+        );
         // ...and what the provider covers is not claimed missing.
         assert!(
             !degraded.iter().any(|d| d == "images" || d == "compaction"),
@@ -19025,5 +19123,86 @@ mod agent_env_tests {
                 "{secret} must be hidden from agents"
             );
         }
+    }
+}
+
+/// `ManagerTurnServices::prepare` × `refs::turn`: what the agent engine sends for
+/// a turn whose message carries `#` references (H3 enrichment + refs_v1).
+#[cfg(test)]
+mod refs_turn_services_tests {
+    use super::*;
+    use crate::chat::agent_runtime::TurnServices;
+    use crate::chat::enrichment::{
+        EnrichmentConfig, EnrichmentInput, EnrichmentPipeline, EnrichmentSource,
+        ParallelEnrichmentStage, StageOutput,
+    };
+    use crate::refs::types::{EntityRef, RefKind};
+    use std::sync::Mutex as StdMutex;
+
+    /// What one enrichment read: the message and the notes it must not inject.
+    type Seen = (String, std::collections::HashSet<String>);
+
+    /// Records what each enrichment reads, and answers one section.
+    #[derive(Default)]
+    struct Recording {
+        seen: Arc<StdMutex<Vec<Seen>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ParallelEnrichmentStage for Recording {
+        async fn execute(&self, input: &EnrichmentInput) -> anyhow::Result<StageOutput> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((input.message.clone(), input.excluded_note_ids.clone()));
+            let mut out = StageOutput::new("recording");
+            out.add_section("CTX", "graph context", "recording", EnrichmentSource::Other);
+            Ok(out)
+        }
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn is_enabled(&self, _config: &EnrichmentConfig) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_enriches_the_typed_text_once_and_sends_the_pointers_behind_the_relay() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let session = crate::test_helpers::test_chat_session(None);
+        mock.create_chat_session(&session).await.unwrap();
+        let graph: Arc<dyn GraphStore> = mock;
+        let stage = Recording::default();
+        let seen = Arc::clone(&stage.seen);
+        let mut pipeline = EnrichmentPipeline::new(EnrichmentConfig::default());
+        pipeline.add_parallel_stage(Box::new(stage));
+        let services = ManagerTurnServices {
+            graph: graph.clone(),
+            enrichment_pipeline: Arc::new(pipeline),
+            turn_routing: Arc::default(),
+        };
+
+        let note = Uuid::new_v4();
+        let typed = "look at #note:x";
+        let stored = crate::refs::block::encode(typed, &[EntityRef::new(RefKind::Note, note)]);
+        let sent = format!("RELAY HISTORY\n\n{stored}");
+        let turn = crate::refs::turn::expand_user_turn_if(&graph, &stored, true).await;
+        let out = services
+            .prepare(&session.id.to_string(), &stored, &sent, &turn)
+            .await;
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one enrichment per turn: {seen:?}");
+        assert_eq!(seen[0].0, typed, "the enrichment reads the typed text");
+        assert!(
+            seen[0].1.contains(&note.to_string()),
+            "the note pointed at is not injected again: {seen:?}"
+        );
+        assert!(
+            out.starts_with("## CTX\ngraph context\n\n---\n\nRELAY HISTORY\n\nlook at #note:x\n\n<po-context nonce=\""),
+            "{out}"
+        );
+        assert!(!out.contains("<po-refs>"), "{out}");
     }
 }

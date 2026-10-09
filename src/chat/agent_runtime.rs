@@ -26,7 +26,7 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use uuid::Uuid;
 
 use super::provider::event_map::{out_of_band_to_chat_events, EventMapper};
-use super::types::ChatEvent;
+use super::types::{ChatEvent, PendingMessage, PendingMessageKind};
 use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::GraphStore;
 
@@ -117,12 +117,14 @@ fn retry_delay_ms(error: &ProviderError, attempt: u32) -> u64 {
 ///
 /// Two sources, kept apart on purpose:
 /// - what THIS ENGINE (the backend) has not ported, whatever the provider can do:
-///   message queue, auto-continue, retry, NATS fan-out, entity enrichment;
+///   auto-continue, NATS fan-out;
 /// - what THE SESSION's capabilities say it cannot do: `images`, and `compaction`
 ///   when the provider emits no compaction signal.
 pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
     // `retry` is NOT listed: the engine retries a retryable `done.error` (B15).
-    let mut missing = vec!["message_queue", "auto_continue", "nats", "enrichment"];
+    // `enrichment` is NOT listed: every turn gets the graph context (`TurnServices::prepare`).
+    // `message_queue` is NOT listed: a message sent during a turn is queued (`pending`).
+    let mut missing = vec!["auto_continue", "nats"];
     // The knowledge-graph hooks are served to a provider that runs hooks in its own loop
     // (`GraphSessionHooks`). A session that cannot carry an MCP server is the remote Claude
     // Code, which is given none: it keeps the entry.
@@ -141,6 +143,24 @@ pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
         missing.push("project_orchestrator_tools");
     }
     missing.into_iter().map(str::to_string).collect()
+}
+
+/// What the host does around a turn of the agent engine, that the Claude Code
+/// engine does around its own (`ChatManager::stream_response`). The manager
+/// implements it; the runtime stays free of graph and transport concerns.
+#[async_trait::async_trait]
+pub trait TurnServices: Send + Sync {
+    /// What the model receives for a turn: `sent` (the user's message `shown`,
+    /// possibly behind a relayed history) with the knowledge graph's context.
+    /// `turn` is the expansion of `shown` (`refs::turn::expand_user_turn`), made
+    /// once by the runtime: its `#` references, its attachments.
+    async fn prepare(
+        &self,
+        session_id: &str,
+        shown: &str,
+        sent: &str,
+        turn: &crate::refs::turn::TurnExpansion,
+    ) -> String;
 }
 
 /// Where the runtime finds a provider instance by identifier. The nexus
@@ -178,6 +198,13 @@ pub struct AgentSessionHandle {
     mapper: Mutex<EventMapper>,
     graph: Arc<dyn GraphStore>,
     uuid: Option<Uuid>,
+    /// What the host does around a turn (`None`: nothing, the bare provider).
+    services: Option<Arc<dyn TurnServices>>,
+    /// Messages waiting for the running turn to end (`chat::pending_queue`).
+    pending: Mutex<std::collections::VecDeque<PendingMessage>>,
+    /// The running turn was stopped (by the user, or for a message sent now):
+    /// the automated entries of the queue are dropped when it ends.
+    interrupted: AtomicBool,
 }
 
 impl AgentSessionHandle {
@@ -228,9 +255,10 @@ impl AgentSessionHandle {
         }
         let _ = self.events_tx.send(event);
     }
-
-    /// Starts a turn and drives it to its terminal event in the background.
-    /// A turn already running is `turn_in_progress`.
+    /// Starts a turn and drives it to its terminal event in the background. A
+    /// turn already running does not refuse the message: it is queued and the
+    /// running turn interrupted so it is read sooner — what the Claude Code
+    /// engine does (`ChatManager::send_message`).
     pub async fn send_message(self: &Arc<Self>, text: &str) -> Result<()> {
         self.send_message_relayed(text, text).await
     }
@@ -239,100 +267,278 @@ impl AgentSessionHandle {
     /// relayed history (B-SW) goes in front of the user's message without becoming
     /// part of it.
     pub async fn send_message_relayed(self: &Arc<Self>, shown: &str, sent: &str) -> Result<()> {
-        if self
-            .is_streaming
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
         {
-            return Err(anyhow::Error::new(ProviderError::TurnInProgress));
+            // `is_streaming` is read and set under the queue lock, the lock the end
+            // of a turn holds to decide there is nothing left to drain: a message
+            // is either seen by the running turn or starts its own.
+            let mut queue = self.pending.lock().await;
+            if self.is_streaming.load(Ordering::SeqCst) {
+                queue.push_back(PendingMessage::user(shown.to_string()));
+                drop(queue);
+                self.interrupt_for_the_queue().await;
+                return Ok(());
+            }
+            self.is_streaming.store(true, Ordering::SeqCst);
         }
-        self.emit(ChatEvent::UserMessage {
-            content: shown.to_string(),
-        })
-        .await;
-        // The same expansion as `stream_response` (`refs::turn`): a message with
-        // `#` references reaches the model as its visible text plus the pointers,
-        // never as the raw block; one without is sent as it always was (a relayed
-        // history, if any, stays in front).
+        self.start(PendingMessageKind::User, shown, sent).await
+    }
+
+    /// Holds a user message until the running turn ends — it interrupts nothing
+    /// (`ChatManager::queue_user_message`). Returns `true` when the message was
+    /// held, `false` when the session was idle and the message simply sent.
+    pub async fn queue_message(self: &Arc<Self>, content: &str) -> Result<bool> {
+        {
+            let mut queue = self.pending.lock().await;
+            if self.is_streaming.load(Ordering::SeqCst) {
+                queue.push_back(PendingMessage::held_user(content.to_string()));
+                let messages = super::pending_queue::snapshot(&queue);
+                drop(queue);
+                self.emit(ChatEvent::PendingQueue { messages }).await;
+                return Ok(true);
+            }
+            self.is_streaming.store(true, Ordering::SeqCst);
+        }
+        self.start(PendingMessageKind::User, content, content)
+            .await
+            .map(|()| false)
+    }
+
+    /// Queues a system hint for after the running turn, without interrupting it;
+    /// an idle session gets it as a user message (`ChatManager::inject_hint`).
+    pub async fn inject_hint(self: &Arc<Self>, content: &str) -> Result<()> {
+        {
+            let mut queue = self.pending.lock().await;
+            if self.is_streaming.load(Ordering::SeqCst) {
+                queue.push_back(PendingMessage::system_hint(content.to_string()));
+                return Ok(());
+            }
+        }
+        self.send_message(content).await
+    }
+
+    /// The held messages, as clients see them.
+    pub async fn queue_snapshot(&self) -> Vec<super::types::PendingQueueEntry> {
+        super::pending_queue::snapshot(&*self.pending.lock().await)
+    }
+
+    /// Edits, drops, moves to the front or sends now one held message, then
+    /// publishes the list again (`ChatManager::pending_queue_op`).
+    pub async fn queue_op(&self, op: &super::pending_queue::QueueOp) {
+        let (outcome, messages) = {
+            let mut queue = self.pending.lock().await;
+            let outcome = super::pending_queue::apply(&mut queue, op);
+            (outcome, super::pending_queue::snapshot(&queue))
+        };
+        self.emit(ChatEvent::PendingQueue { messages }).await;
+        if outcome.interrupt && self.is_streaming.load(Ordering::SeqCst) {
+            self.interrupt_for_the_queue().await;
+        }
+    }
+
+    /// Cuts the running turn short so the message queued in front is read now.
+    async fn interrupt_for_the_queue(&self) {
+        self.interrupted.store(true, Ordering::SeqCst);
+        if let Err(e) = self.session.interrupt(InterruptScope::TurnAndTools).await {
+            tracing::warn!(session_id = %self.session_id, error = %e, "interrupting the turn for a queued message failed");
+        }
+    }
+
+    /// Opens the first turn of a run (`is_streaming` already claimed) and drives
+    /// it, then whatever the queue holds, in the background.
+    async fn start(
+        self: &Arc<Self>,
+        kind: PendingMessageKind,
+        shown: &str,
+        sent: &str,
+    ) -> Result<()> {
+        match self.open_turn(kind, shown, sent).await {
+            Ok(first) => {
+                let me = Arc::clone(self);
+                tokio::spawn(async move { me.drive(Some(first)).await });
+                Ok(())
+            }
+            Err(error) => {
+                // A message queued while this turn was being opened (the enrichment
+                // awaits) still runs: the run goes on without this turn. Nothing
+                // queued: the session stops streaming, decided under the queue lock.
+                let queued = {
+                    let queue = self.pending.lock().await;
+                    if queue.is_empty() {
+                        self.is_streaming.store(false, Ordering::SeqCst);
+                    }
+                    !queue.is_empty()
+                };
+                if queued {
+                    let me = Arc::clone(self);
+                    tokio::spawn(async move { me.drive(None).await });
+                }
+                Err(anyhow::Error::new(error))
+            }
+        }
+    }
+
+    /// Shows the message of a turn and sends the turn to the provider.
+    async fn open_turn(
+        &self,
+        kind: PendingMessageKind,
+        shown: &str,
+        sent: &str,
+    ) -> std::result::Result<(nexus_claude::agent::EventStream, TurnInput), ProviderError> {
+        // A Stop belongs to the turn it stopped: the new turn starts unstopped.
+        self.interrupted.store(false, Ordering::SeqCst);
+        match kind {
+            PendingMessageKind::SystemHint => {
+                self.emit(ChatEvent::SystemHint {
+                    content: shown.to_string(),
+                })
+                .await
+            }
+            // A background output was already shown when it arrived.
+            PendingMessageKind::BackgroundOutput => {}
+            PendingMessageKind::User => {
+                self.emit(ChatEvent::UserMessage {
+                    content: shown.to_string(),
+                })
+                .await
+            }
+        }
+        // The same expansion as `stream_response` (`refs::turn`), for every turn
+        // whatever started it (a message, the queue, auto-continue, another
+        // instance): a message with `#` references reaches the model as its visible
+        // text plus the pointers, never as the raw block; one without is sent as it
+        // always was (a relayed history, if any, stays in front).
         let turn = crate::refs::turn::expand_user_turn(&self.graph, shown).await;
         if let Some(event) = turn.event() {
             self.emit(event).await;
         }
-        let input = TurnInput::text(turn.native_prompt(shown, sent));
-        let stream = match self.session.send_turn(input.clone()).await {
-            Ok(stream) => stream,
-            Err(error) => {
-                self.is_streaming.store(false, Ordering::SeqCst);
-                return Err(anyhow::Error::new(error));
-            }
+        // The knowledge graph's context, as the Claude Code engine gives it to its turns.
+        let sent = match &self.services {
+            Some(services) => services.prepare(&self.session_id, shown, sent, &turn).await,
+            None => turn.native_prompt(shown, sent),
         };
+        let input = TurnInput::text(sent);
+        let stream = self.session.send_turn(input.clone()).await?;
         self.streaming_text.lock().await.clear();
         self.streaming_events.lock().await.clear();
         self.emit(ChatEvent::StreamingStatus { is_streaming: true })
             .await;
-        let me = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut stream = stream;
-            let mut attempt = 0u32;
-            loop {
-                // Did the turn already show the user anything? A turn that did is
-                // never replayed: it would repeat text or tool calls.
-                let mut shown = false;
-                let mut retry: Option<ProviderError> = None;
-                while let Some(event) = stream.next().await {
-                    // Terminal-ness is read on the original: a withheld terminal event
-                    // still ends the turn.
-                    let terminal = event.is_terminal();
-                    if !shown {
-                        retry = retryable_failure(&event).filter(|_| attempt < MAX_RETRIES);
-                        if retry.is_some() {
-                            break;
-                        }
-                    }
-                    shown |= shows_content(&event);
-                    let event = mask_agent_event(event);
-                    let chat_events = me.mapper.lock().await.map(&event);
-                    for chat_event in chat_events {
-                        me.emit(chat_event).await;
-                    }
-                    if terminal {
-                        break;
-                    }
-                }
-                let Some(error) = retry else { break };
-                attempt += 1;
-                let delay = retry_delay_ms(&error, attempt);
-                me.emit(ChatEvent::Retrying {
-                    attempt,
-                    max_attempts: MAX_RETRIES,
-                    delay_ms: delay,
-                    error_message: format!(
-                        "Error: {}",
-                        super::provider::errors::open_failure(&error, None).message
-                    ),
-                })
-                .await;
-                tokio::time::sleep(Duration::from_millis(delay)).await;
-                match me.session.send_turn(input.clone()).await {
-                    Ok(next) => stream = next,
-                    Err(e) => {
-                        let ev = AgentEvent::Error { error: e };
-                        for chat_event in me.mapper.lock().await.map(&ev) {
-                            me.emit(chat_event).await;
-                        }
-                        break;
+        Ok((stream, input))
+    }
+
+    /// Plays turns until the queue is empty: the turn given, then each message
+    /// queued meanwhile, highest priority first (`drain::pop_next_after_turn`).
+    /// `None`: the first turn could not be opened, only the queue is played.
+    async fn drive(self: Arc<Self>, first: Option<(nexus_claude::agent::EventStream, TurnInput)>) {
+        let mut turn = first;
+        loop {
+            if let Some((stream, input)) = turn.take() {
+                self.play(stream, input).await;
+            }
+            let Some(next) = self.next_queued().await else {
+                return;
+            };
+            match self
+                .open_turn(next.kind, &next.content, &next.content)
+                .await
+            {
+                Ok(opened) => turn = Some(opened),
+                Err(error) => {
+                    let event = AgentEvent::Error { error };
+                    for chat_event in self.mapper.lock().await.map(&event) {
+                        self.emit(chat_event).await;
                     }
                 }
             }
-            me.is_streaming.store(false, Ordering::SeqCst);
-            me.streaming_text.lock().await.clear();
-            me.streaming_events.lock().await.clear();
-            me.emit(ChatEvent::StreamingStatus {
+        }
+    }
+
+    /// The next queued message, or — nothing left — the end of the run: the
+    /// session stops streaming, decided under the queue lock.
+    async fn next_queued(&self) -> Option<PendingMessage> {
+        let (next, held_left) = {
+            let mut queue = self.pending.lock().await;
+            let interrupted = self.interrupted.load(Ordering::SeqCst);
+            let (next, dropped) = super::drain::pop_next_after_turn(&mut queue, interrupted);
+            if dropped > 0 {
+                tracing::info!(session_id = %self.session_id, dropped, "Stop requested: dropped automated queued messages");
+            }
+            if next.is_none() {
+                self.is_streaming.store(false, Ordering::SeqCst);
+            }
+            // A held message is leaving: the list clients show loses it now.
+            let held_left = next
+                .as_ref()
+                .filter(|m| m.held)
+                .map(|_| super::pending_queue::snapshot(&queue));
+            (next, held_left)
+        };
+        if let Some(messages) = held_left {
+            self.emit(ChatEvent::PendingQueue { messages }).await;
+        }
+        if next.is_none() {
+            self.streaming_text.lock().await.clear();
+            self.streaming_events.lock().await.clear();
+            self.emit(ChatEvent::StreamingStatus {
                 is_streaming: false,
             })
             .await;
-        });
-        Ok(())
+        }
+        next
+    }
+
+    /// Plays one turn to its terminal event, retrying a failure that showed nothing.
+    async fn play(&self, mut stream: nexus_claude::agent::EventStream, input: TurnInput) {
+        let mut attempt = 0u32;
+        loop {
+            // Did the turn already show the user anything? A turn that did is
+            // never replayed: it would repeat text or tool calls.
+            let mut shown = false;
+            let mut retry: Option<ProviderError> = None;
+            while let Some(event) = stream.next().await {
+                // Terminal-ness is read on the original: a withheld terminal event
+                // still ends the turn.
+                let terminal = event.is_terminal();
+                if !shown {
+                    retry = retryable_failure(&event).filter(|_| attempt < MAX_RETRIES);
+                    if retry.is_some() {
+                        break;
+                    }
+                }
+                shown |= shows_content(&event);
+                let event = mask_agent_event(event);
+                let chat_events = self.mapper.lock().await.map(&event);
+                for chat_event in chat_events {
+                    self.emit(chat_event).await;
+                }
+                if terminal {
+                    break;
+                }
+            }
+            let Some(error) = retry else { break };
+            attempt += 1;
+            let delay = retry_delay_ms(&error, attempt);
+            self.emit(ChatEvent::Retrying {
+                attempt,
+                max_attempts: MAX_RETRIES,
+                delay_ms: delay,
+                error_message: format!(
+                    "Error: {}",
+                    super::provider::errors::open_failure(&error, None).message
+                ),
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            match self.session.send_turn(input.clone()).await {
+                Ok(next) => stream = next,
+                Err(e) => {
+                    let ev = AgentEvent::Error { error: e };
+                    for chat_event in self.mapper.lock().await.map(&ev) {
+                        self.emit(chat_event).await;
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     /// Answers a permission request.
@@ -356,6 +562,7 @@ impl AgentSessionHandle {
 
     /// Interrupts the turn and the tools it runs.
     pub async fn interrupt(&self) -> Result<()> {
+        self.interrupted.store(true, Ordering::SeqCst);
         self.session
             .interrupt(InterruptScope::TurnAndTools)
             .await
@@ -430,6 +637,7 @@ impl AgentRuntime {
 
     /// Registers a session just opened by a provider and starts its
     /// out-of-turn pump. `first_seq` is the next event number to persist.
+    #[allow(clippy::too_many_arguments)]
     pub async fn adopt(
         &self,
         session_id: &str,
@@ -438,6 +646,7 @@ impl AgentRuntime {
         first_seq: i64,
         provider_kind: &str,
         tool_policy: serde_json::Value,
+        services: Option<Arc<dyn TurnServices>>,
     ) -> Arc<AgentSessionHandle> {
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let handle = Arc::new(AgentSessionHandle {
@@ -456,6 +665,9 @@ impl AgentRuntime {
             mapper: Mutex::new(EventMapper::new()),
             graph: Arc::clone(&self.graph),
             uuid: Uuid::parse_str(session_id).ok(),
+            services,
+            pending: Mutex::new(std::collections::VecDeque::new()),
+            interrupted: AtomicBool::new(false),
         });
         if let Some(oob) = session.out_of_band() {
             let pump = Arc::clone(&handle);
@@ -584,6 +796,8 @@ pub(crate) mod fake {
         pub oob_tx: StdMutex<Option<UnboundedSender<AgentEvent>>>,
         pub opened_specs: StdMutex<Vec<SessionSpec>>,
         pub resumed_with: StdMutex<Vec<ResumeToken>>,
+        /// The next `send_turn` fails with this error.
+        pub fail_next_turn: StdMutex<Option<ProviderError>>,
     }
 
     impl FakeState {
@@ -625,6 +839,9 @@ pub(crate) mod fake {
             Some(ResumeToken::claude_code_session("fake-provider-session"))
         }
         async fn send_turn(&self, input: TurnInput) -> Result<EventStream, ProviderError> {
+            if let Some(error) = self.state.fail_next_turn.lock().unwrap().take() {
+                return Err(error);
+            }
             let text = input
                 .blocks
                 .iter()
@@ -705,7 +922,7 @@ pub(crate) mod fake {
                 caps: Arc::new(StdMutex::new(Capabilities::none())),
             }
         }
-        fn session(&self) -> Arc<FakeSession> {
+        pub(crate) fn session(&self) -> Arc<FakeSession> {
             let (tx, rx) = unbounded();
             *self.state.oob_tx.lock().unwrap() = Some(tx);
             Arc::new(FakeSession {
@@ -871,6 +1088,18 @@ mod mask_tests {
         );
     }
 
+    /// What the engine ports is no longer announced as missing, whatever the provider.
+    #[test]
+    fn the_ported_features_are_not_announced_as_missing() {
+        let caps = Capabilities::none();
+        let degraded = degraded_features(&caps);
+        let ported = ["enrichment", "message_queue"];
+        assert!(
+            !degraded.iter().any(|f| ported.contains(&f.as_str())),
+            "{degraded:?}"
+        );
+    }
+
     #[test]
     fn only_a_retryable_failure_of_an_error_turn_is_retried() {
         let done = |is_error, error| AgentEvent::Done {
@@ -896,5 +1125,92 @@ mod mask_tests {
             error: ProviderError::Overloaded
         })
         .is_some());
+    }
+}
+
+/// Races between a turn being opened (the enrichment awaits) and what reaches the
+/// session meanwhile.
+#[cfg(test)]
+mod turn_race_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+    use std::sync::atomic::AtomicBool as StdAtomicBool;
+    use tokio::sync::Notify;
+
+    /// Holds the first `prepare` until the test lets it go: the time an
+    /// enrichment of the knowledge graph takes.
+    #[derive(Default)]
+    struct Gate {
+        entered: Notify,
+        release: Notify,
+        passed: StdAtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl TurnServices for Gate {
+        async fn prepare(
+            &self,
+            _session_id: &str,
+            _shown: &str,
+            sent: &str,
+            _turn: &crate::refs::turn::TurnExpansion,
+        ) -> String {
+            if !self.passed.swap(true, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            sent.to_string()
+        }
+    }
+
+    async fn rig() -> (FakeProvider, Arc<Gate>, Arc<AgentSessionHandle>) {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let gate = Arc::new(Gate::default());
+        let handle = runtime
+            .adopt(
+                "not-a-uuid",
+                "claude-code",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                Some(Arc::clone(&gate) as Arc<dyn TurnServices>),
+            )
+            .await;
+        (provider, gate, handle)
+    }
+
+    async fn turns_reach(provider: &FakeProvider, n: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let turns = provider.state.turns_started.lock().unwrap().clone();
+            if turns.len() >= n || std::time::Instant::now() > deadline {
+                return turns;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// A message held while the first turn is being opened waits behind it; when the
+    /// provider then refuses that first turn, the held message still runs.
+    #[tokio::test]
+    async fn a_message_held_while_a_turn_opens_runs_even_when_that_turn_fails() {
+        let (provider, gate, handle) = rig().await;
+        *provider.state.fail_next_turn.lock().unwrap() = Some(ProviderError::EndpointUnreachable {
+            detail: "down for a moment".into(),
+        });
+        let first = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move { handle.send_message("first").await })
+        };
+        gate.entered.notified().await;
+        assert!(handle.queue_message("second").await.unwrap(), "held");
+        gate.release.notify_one();
+        assert!(first.await.unwrap().is_err(), "the first turn was refused");
+
+        let turns = turns_reach(&provider, 1).await;
+        assert_eq!(turns, ["second"], "the queued message is not stranded");
     }
 }

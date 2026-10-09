@@ -1768,6 +1768,35 @@ mod turn_routing {
     const SIMPLE: &str = "rename this variable";
     const DEBUG: &str = "why does this crash with a stack trace error";
 
+    /// A turn the queue starts (a held message sent to an idle session here) is
+    /// routed on ITS text, not on the message sent before it.
+    #[tokio::test]
+    async fn a_turn_started_by_a_held_message_is_routed_on_its_own_text() {
+        use crate::chat::provider::cognitive::signature::{ContextHints, TaskSignature};
+        let mut r = rig("full", "shadow", true, None, vec![Answer::Stay]).await;
+        r.turn(SIMPLE).await;
+        let held = r.manager.queue_user_message(&r.sid, DEBUG).await.unwrap();
+        assert!(!held, "an idle session sends it at once");
+        next_event(&mut r.rx, |e| {
+            matches!(
+                e,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            )
+        })
+        .await;
+        let requests = r.decider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let expected =
+            TaskSignature::from_chat_request(DEBUG, false, None, ContextHints::default());
+        assert_eq!(
+            format!("{:?}", requests[1].signature),
+            format!("{expected:?}"),
+            "the second turn is routed on its own message"
+        );
+    }
+
     #[tokio::test]
     async fn full_auto_a_simple_turn_then_a_debug_turn_changes_the_model_of_the_second() {
         let mut r = rig(
@@ -2583,6 +2612,7 @@ mod parity {
 
     pub(super) struct Rig {
         pub manager: ChatManager,
+        pub graph: Arc<MockGraphStore>,
         pub provider: Tapped,
         pub sid: String,
         pub rx: broadcast::Receiver<ChatEvent>,
@@ -2627,6 +2657,7 @@ mod parity {
         let rx = manager.subscribe(&created.session_id).await.unwrap();
         Rig {
             manager,
+            graph,
             provider,
             sid: created.session_id,
             rx,
@@ -2733,5 +2764,287 @@ mod parity {
                 "{kind:?}: the compaction is told what the session works on: {guidance}"
             );
         }
+    }
+
+    /// H3 enrichment: a turn of the agent engine receives, in front of the message,
+    /// the knowledge graph context the Claude Code engine puts in front of the same
+    /// message (`enrichment_for_turn`, called by `stream_response`).
+    #[tokio::test]
+    async fn a_turn_of_the_agent_engine_gets_the_graph_context_of_a_claude_code_turn() {
+        let mut r = rig(ProviderKind::Native, vec![]).await;
+        let mut plan = crate::test_helpers::test_plan();
+        plan.title = "Port the enrichment".into();
+        plan.status = crate::neo4j::models::PlanStatus::InProgress;
+        plan.project_id = Some(r.project.id);
+        r.graph.create_plan(&plan).await.unwrap();
+        r.graph
+            .link_plan_to_project(plan.id, r.project.id)
+            .await
+            .unwrap();
+        let message = "what is left on the port?";
+        let graph: Arc<dyn GraphStore> = r.graph.clone();
+        let expected = super::super::manager::enrichment_for_turn(
+            &graph,
+            &r.manager.enrichment_pipeline,
+            &r.sid,
+            message,
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .expect("the graph has context for this message");
+        assert!(expected.contains("Port the enrichment"), "{expected}");
+
+        r.manager.send_message(&r.sid, message).await.unwrap();
+        r.turn_end().await;
+        assert_eq!(
+            r.sent(),
+            vec![super::super::manager::prepend_enrichment(
+                &expected, message
+            )]
+        );
+    }
+
+    impl Rig {
+        /// Waits until the provider was sent `n` turns.
+        async fn turns_sent(&self, n: usize) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while self.sent().len() < n {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{n} turns within 20 s: {:?}",
+                    self.sent()
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        fn interrupts(&self) -> usize {
+            self.provider
+                .inner
+                .calls()
+                .iter()
+                .filter(|c| matches!(c, RecordedCall::Interrupt(_)))
+                .count()
+        }
+    }
+
+    /// H3 message queue: a message sent while a turn runs is queued, and the turn
+    /// interrupted so it is read sooner — as on the Claude Code engine. It used to
+    /// be refused (`turn_in_progress`).
+    #[tokio::test]
+    async fn a_message_sent_during_a_turn_is_queued_and_read_next_not_refused() {
+        let mut r = rig(ProviderKind::Native, vec![vec![Step::AwaitInterrupt]]).await;
+        r.manager.send_message(&r.sid, "first").await.unwrap();
+        r.turns_sent(1).await;
+        r.manager
+            .send_message(&r.sid, "second")
+            .await
+            .expect("queued, not refused");
+        r.turn_end().await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent[1].ends_with("second"), "{sent:?}");
+        assert_eq!(r.interrupts(), 1, "the running turn is cut short");
+    }
+
+    /// H3 message queue: a HELD message (`queue_user_message`) waits for the turn
+    /// to end, is listed meanwhile, and interrupts nothing.
+    #[tokio::test]
+    async fn a_held_message_is_listed_waits_for_the_turn_and_interrupts_nothing() {
+        let mut r = rig(
+            ProviderKind::Native,
+            vec![vec![
+                Step::Sleep { ms: 300 },
+                steps::text("done"),
+                steps::done(&caps()),
+            ]],
+        )
+        .await;
+        r.manager.send_message(&r.sid, "first").await.unwrap();
+        r.turns_sent(1).await;
+        assert!(r
+            .manager
+            .queue_user_message(&r.sid, "after you")
+            .await
+            .unwrap());
+        let listed = next_event(&mut r.rx, |e| matches!(e, ChatEvent::PendingQueue { .. })).await;
+        assert!(
+            matches!(&listed, ChatEvent::PendingQueue { messages } if messages.len() == 1 && messages[0].content == "after you"),
+            "{listed:?}"
+        );
+        assert_eq!(r.sent().len(), 1, "it waits for the turn");
+        r.turn_end().await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent[1].ends_with("after you"), "{sent:?}");
+        assert_eq!(r.interrupts(), 0);
+        assert_eq!(r.manager.pending_queue_snapshot(&r.sid).await, Some(vec![]));
+    }
+
+    /// H3 message queue: "send now" on a held message interrupts the turn and
+    /// sends it next.
+    #[tokio::test]
+    async fn send_now_cuts_the_turn_short_for_the_held_message() {
+        let mut r = rig(ProviderKind::Native, vec![vec![Step::AwaitInterrupt]]).await;
+        r.manager.send_message(&r.sid, "first").await.unwrap();
+        r.turns_sent(1).await;
+        assert!(r.manager.queue_user_message(&r.sid, "later").await.unwrap());
+        let held = r.manager.pending_queue_snapshot(&r.sid).await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert!(r
+            .manager
+            .pending_queue_op(
+                &r.sid,
+                &crate::chat::pending_queue::QueueOp::SendNow { id: held[0].id }
+            )
+            .await
+            .unwrap());
+        r.turn_end().await;
+        let sent = r.sent();
+        assert!(sent.len() == 2 && sent[1].ends_with("later"), "{sent:?}");
+        assert_eq!(r.interrupts(), 1);
+    }
+
+    // ----- references (`refs_v1`) × the H3 queue of the agent engine -----
+
+    /// A decider that is never right: the router of the test only records the text.
+    struct NoDecider;
+
+    #[async_trait]
+    impl crate::chat::provider::cognitive::decision::Decider for NoDecider {
+        async fn decide(
+            &self,
+            _request: &crate::chat::provider::cognitive::decision::DecideRequest,
+        ) -> anyhow::Result<crate::chat::provider::cognitive::decision::CognitiveDecision> {
+            anyhow::bail!("not asked in this test")
+        }
+    }
+
+    struct NoPool;
+
+    #[async_trait]
+    impl crate::chat::agent_hooks::PoolSource for NoPool {
+        async fn pool(
+            &self,
+            _provider_id: &str,
+        ) -> Vec<crate::chat::provider::cognitive::candidates::ModelFacts> {
+            Vec::new()
+        }
+    }
+
+    /// refs × H3 message queue: a message HELD with `#` references while a turn
+    /// runs is listed with its references (not the raw block); when the queue plays
+    /// it, the model gets the typed text and the `<po-context>` pointers — never the
+    /// `<po-refs>` block — behind ONE enrichment computed on the typed text; the
+    /// `refs_resolved` event is stored; the turn router reads the typed text.
+    #[tokio::test]
+    async fn a_held_message_with_references_keeps_them_and_reaches_the_model_expanded() {
+        use crate::refs::types::{EntityRef, RefKind};
+
+        let mut r = rig(
+            ProviderKind::Native,
+            vec![vec![
+                Step::Sleep { ms: 300 },
+                steps::text("done"),
+                steps::done(&caps()),
+            ]],
+        )
+        .await;
+        let mut plan = crate::test_helpers::test_plan();
+        plan.title = "Wire the references".into();
+        plan.status = crate::neo4j::models::PlanStatus::InProgress;
+        plan.project_id = Some(r.project.id);
+        r.graph.create_plan(&plan).await.unwrap();
+        r.graph
+            .link_plan_to_project(plan.id, r.project.id)
+            .await
+            .unwrap();
+        let router = Arc::new(crate::chat::agent_hooks::TurnRouter::new(
+            crate::chat::agent_hooks::TurnRouterSpec {
+                decider: Arc::new(NoDecider),
+                pool: Arc::new(NoPool),
+                routing: Default::default(),
+                provider_id: "claude-code".into(),
+                session_id: Uuid::parse_str(&r.sid).ok(),
+                project_slug: None,
+                trust: false,
+                explicit_model: false,
+                current_model: "m".into(),
+                next_turn: 0,
+            },
+        ));
+        r.manager.turn_routing.insert(&r.sid, Arc::clone(&router));
+
+        r.manager.send_message(&r.sid, "first").await.unwrap();
+        r.turns_sent(1).await;
+        let typed = "after you, see #plan:wire";
+        let pointed = EntityRef::new(RefKind::Plan, plan.id);
+        let stored = crate::refs::block::encode(typed, &[pointed]);
+        assert!(r.manager.queue_user_message(&r.sid, &stored).await.unwrap());
+
+        // Listed with its references, the block kept out of the text.
+        let listed = next_event(&mut r.rx, |e| matches!(e, ChatEvent::PendingQueue { .. })).await;
+        let ChatEvent::PendingQueue { messages } = listed else {
+            unreachable!()
+        };
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, typed);
+        assert_eq!(messages[0].refs, vec![pointed]);
+
+        r.turn_end().await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        let second = &sent[1];
+        assert!(!second.contains("<po-refs>"), "the raw block: {second}");
+        assert!(second.contains("<po-context nonce=\""), "{second}");
+        assert!(
+            second.contains(&format!(
+                "- plan \"Wire the references\" [in_progress] id={}",
+                plan.id
+            )),
+            "the pointer: {second}"
+        );
+        assert_eq!(second.matches(typed).count(), 1, "{second}");
+
+        // One enrichment, on what the user typed, in front of the expanded text.
+        let graph: Arc<dyn GraphStore> = r.graph.clone();
+        let enrichment = super::super::manager::enrichment_for_turn(
+            &graph,
+            &r.manager.enrichment_pipeline,
+            &r.sid,
+            typed,
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .expect("the graph has context for this message");
+        assert!(
+            second.starts_with(&super::super::manager::prepend_enrichment(
+                &enrichment,
+                typed
+            )),
+            "{second}"
+        );
+
+        // What the references resolved to is stored for replay.
+        let stored_events = r
+            .graph
+            .get_chat_events(Uuid::parse_str(&r.sid).unwrap(), 0, 500)
+            .await
+            .unwrap();
+        assert!(
+            stored_events
+                .iter()
+                .any(|e| e.event_type == "refs_resolved" && e.data.contains(&plan.id.to_string())),
+            "{:?}",
+            stored_events
+                .iter()
+                .map(|e| &e.event_type)
+                .collect::<Vec<_>>()
+        );
+
+        // The router of the session reads the typed text of the queued turn.
+        assert_eq!(router.last_message().as_deref(), Some(typed));
     }
 }
