@@ -26,7 +26,6 @@ use crate::skills::activation::{
 use crate::skills::hook_extractor::{
     enrich_redirect_with_context_card, extract_file_context, generate_redirect_suggestion,
 };
-use crate::skills::project_resolver::resolve_project_from_context;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -82,6 +81,9 @@ pub(crate) struct SkillActivationHook {
     persona_index: RwLock<HashMap<Uuid, PersonaFileIndex>>,
     /// What this session has already been shown — see `hook_ledger`.
     ledger: Arc<HookLedger>,
+    /// The resolved project of the session (mode `on`); `None`: the historical
+    /// project-from-tool-cwd resolution.
+    session_project: Option<Arc<super::anchor_resolver::SessionProject>>,
 }
 
 impl SkillActivationHook {
@@ -100,7 +102,18 @@ impl SkillActivationHook {
             graph_store,
             persona_index: RwLock::new(HashMap::new()),
             ledger,
+            session_project: None,
         }
+    }
+
+    /// Work for the project the session resolved (anchor precedence) instead of
+    /// re-deducing one from the cwd of each tool.
+    pub fn with_session_project(
+        mut self,
+        session_project: Arc<super::anchor_resolver::SessionProject>,
+    ) -> Self {
+        self.session_project = Some(session_project);
+        self
     }
 
     /// Passthrough response — continue without injecting context.
@@ -457,7 +470,8 @@ impl nexus_claude::HookCallback for SkillActivationHook {
         self.ledger.begin_call();
 
         // 2. Resolve project from tool context (file path → project, or cwd → project)
-        let project_id = match resolve_project_from_context(
+        let project_id = match super::anchor_resolver::hook_project(
+            self.session_project.as_deref(),
             &*self.graph_store,
             &pre_tool.tool_name,
             &pre_tool.tool_input,

@@ -16,7 +16,6 @@ use crate::skills::hook_extractor::{
     enrich_redirect_with_context_card, extract_file_context, generate_redirect_suggestion,
     EnrichedRedirectSuggestion,
 };
-use crate::skills::project_resolver::resolve_project_from_context;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -35,6 +34,8 @@ pub(crate) struct PostToolUseRedirectHook {
     graph_store: Arc<dyn GraphStore>,
     /// Per-file throttle to avoid spamming suggestions.
     throttle: Mutex<HashMap<String, Instant>>,
+    /// The resolved project of the session (mode `on`); `None`: historical resolution.
+    session_project: Option<Arc<super::anchor_resolver::SessionProject>>,
 }
 
 impl PostToolUseRedirectHook {
@@ -42,7 +43,17 @@ impl PostToolUseRedirectHook {
         Self {
             graph_store,
             throttle: Mutex::new(HashMap::new()),
+            session_project: None,
         }
+    }
+
+    /// Work for the project the session resolved instead of the tool cwd's.
+    pub fn with_session_project(
+        mut self,
+        session_project: Arc<super::anchor_resolver::SessionProject>,
+    ) -> Self {
+        self.session_project = Some(session_project);
+        self
     }
 
     fn passthrough() -> nexus_claude::HookJSONOutput {
@@ -176,7 +187,8 @@ impl nexus_claude::HookCallback for PostToolUseRedirectHook {
         }
 
         // Resolve project
-        let project_id = match resolve_project_from_context(
+        let project_id = match super::anchor_resolver::hook_project(
+            self.session_project.as_deref(),
             &*self.graph_store,
             &post_tool.tool_name,
             &post_tool.tool_input,
