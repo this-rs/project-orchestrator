@@ -279,6 +279,8 @@ pub struct MockGraphStore {
     pub mock_fail_set_watch_enabled: std::sync::atomic::AtomicBool,
     /// Generic graph served by `get_entity_neighborhood` (seeded by tests).
     pub neighborhood_graph: RwLock<crate::graph::neighborhood::InMemoryGraph>,
+    /// Owners and consents of the nodes of `neighborhood_graph` (scoped walk).
+    pub neighborhood_ownership: RwLock<crate::graph::neighborhood::InMemoryOwnership>,
 }
 
 #[allow(dead_code)]
@@ -416,6 +418,7 @@ impl MockGraphStore {
             mock_has_context_cards: std::sync::atomic::AtomicBool::new(false),
             mock_fail_set_watch_enabled: std::sync::atomic::AtomicBool::new(false),
             neighborhood_graph: RwLock::new(Default::default()),
+            neighborhood_ownership: RwLock::new(Default::default()),
         }
     }
 
@@ -12629,6 +12632,25 @@ impl GraphStore for MockGraphStore {
             center_type,
             center_id,
             params,
+        ))
+    }
+
+    async fn get_scoped_entity_neighborhood(
+        &self,
+        center_type: &str,
+        center_id: &str,
+        params: &crate::graph::neighborhood::NeighborhoodParams,
+        filter: &crate::graph::neighborhood::ProjectFilter,
+    ) -> Result<Option<crate::graph::neighborhood::ScopedNeighborhood>> {
+        let graph = self.neighborhood_graph.read().await;
+        let ownership = self.neighborhood_ownership.read().await;
+        Ok(crate::graph::neighborhood::expand_in_memory_scoped(
+            &graph,
+            &ownership,
+            center_type,
+            center_id,
+            params,
+            filter,
         ))
     }
 }

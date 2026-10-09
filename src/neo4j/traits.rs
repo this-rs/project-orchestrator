@@ -4025,4 +4025,17 @@ pub trait GraphStore: Send + Sync {
         center_id: &str,
         params: &crate::graph::neighborhood::NeighborhoodParams,
     ) -> Result<Option<crate::graph::neighborhood::RawNeighborhood>>;
+
+    /// [`get_entity_neighborhood`](Self::get_entity_neighborhood) with the PROJECT
+    /// filter applied inside each hop, before the fan-out limit (a neighbour of
+    /// another project cannot evict a local one). The centre is always returned
+    /// with its owner; neighbours carry theirs and their own consent, for the
+    /// `may_read` post-filter. Used by the anchor resolver.
+    async fn get_scoped_entity_neighborhood(
+        &self,
+        center_type: &str,
+        center_id: &str,
+        params: &crate::graph::neighborhood::NeighborhoodParams,
+        filter: &crate::graph::neighborhood::ProjectFilter,
+    ) -> Result<Option<crate::graph::neighborhood::ScopedNeighborhood>>;
 }

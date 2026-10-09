@@ -4557,4 +4557,15 @@ impl GraphStore for Neo4jClient {
         self.get_entity_neighborhood(center_type, center_id, params)
             .await
     }
+
+    async fn get_scoped_entity_neighborhood(
+        &self,
+        center_type: &str,
+        center_id: &str,
+        params: &crate::graph::neighborhood::NeighborhoodParams,
+        filter: &crate::graph::neighborhood::ProjectFilter,
+    ) -> anyhow::Result<Option<crate::graph::neighborhood::ScopedNeighborhood>> {
+        self.get_scoped_entity_neighborhood(center_type, center_id, params, filter)
+            .await
+    }
 }

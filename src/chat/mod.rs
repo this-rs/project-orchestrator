@@ -19,6 +19,7 @@ mod agent_e2e_tests;
 pub(crate) mod agent_hooks;
 pub mod agent_runtime;
 pub mod anchor;
+pub mod anchor_resolver;
 pub mod cost;
 pub mod enrichment;
 pub mod entity_extractor;

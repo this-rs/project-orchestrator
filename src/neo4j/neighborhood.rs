@@ -10,7 +10,8 @@
 use super::client::Neo4jClient;
 use crate::graph::neighborhood::{
     all_labels, entity_kind, kind_for_labels, layer_of, next_frontier, rel_types_for,
-    NeighborhoodParams, NodeProps, RawEdge, RawNeighborhood, RawNode, EDGE_WEIGHT_CYPHER,
+    NeighborhoodParams, NodeProps, ProjectFilter, RawEdge, RawNeighborhood, RawNode,
+    ScopedNeighborhood, ScopedNode, EDGE_WEIGHT_CYPHER,
 };
 use anyhow::{anyhow, Result};
 use neo4rs::query;
@@ -30,6 +31,16 @@ const PROPS_PROJECTION: &str = "{\
     state_type: toString(m.state_type), constraint_type: toString(m.constraint_type), \
     protocol_category: toString(m.protocol_category), author: m.author}";
 
+/// Owning project id of node `m`, as the project filter reads it. A node carries
+/// `project_id` itself, is a Project, or hangs under a Plan of a Project (Plan,
+/// Task, Step). Anything else has no known owner (`null`): the filter refuses it.
+/// NOT run against a real database (written from the schema, see the PR).
+const OWNER_CYPHER: &str = "coalesce(m.project_id, \
+    CASE WHEN m:Project THEN m.id END, \
+    head([(op:Project)-[:HAS_PLAN]->(m) | op.id]), \
+    head([(op:Project)-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(m) | op.id]), \
+    head([(op:Project)-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(:Task)-[:HAS_STEP]->(m) | op.id]))";
+
 impl Neo4jClient {
     /// Bounded candidate neighbourhood around `(center_type, center_id)`.
     /// Returns `Ok(None)` when the centre does not exist.
@@ -39,13 +50,47 @@ impl Neo4jClient {
         center_id: &str,
         params: &NeighborhoodParams,
     ) -> Result<Option<RawNeighborhood>> {
+        Ok(self
+            .fetch_neighborhood(center_type, center_id, params, None)
+            .await?
+            .map(|s| RawNeighborhood {
+                center: s.center.map(|c| c.node),
+                nodes: s.nodes.into_iter().map(|n| n.node).collect(),
+                edges: s.edges,
+            }))
+    }
+
+    /// Same walk, with the PROJECT filter applied inside the hop query, before the
+    /// per-node `LIMIT`: a neighbour owned by another project (or by nobody known)
+    /// can never evict a local one. The centre is always returned, with its owner,
+    /// so the caller can run the consent predicate on it.
+    pub async fn get_scoped_entity_neighborhood(
+        &self,
+        center_type: &str,
+        center_id: &str,
+        params: &NeighborhoodParams,
+        filter: &ProjectFilter,
+    ) -> Result<Option<ScopedNeighborhood>> {
+        self.fetch_neighborhood(center_type, center_id, params, Some(filter))
+            .await
+    }
+
+    async fn fetch_neighborhood(
+        &self,
+        center_type: &str,
+        center_id: &str,
+        params: &NeighborhoodParams,
+        filter: Option<&ProjectFilter>,
+    ) -> Result<Option<ScopedNeighborhood>> {
         let kind = entity_kind(center_type)
             .ok_or_else(|| anyhow!("unsupported entity type '{}'", center_type))?;
 
         // --- centre ---
         let center_q = format!(
             "MATCH (m:{label} {{{prop}: $id}}) \
-             RETURN elementId(m) AS eid, m.{prop} AS pid, {props} AS props LIMIT 1",
+             RETURN elementId(m) AS eid, m.{prop} AS pid, {props} AS props, \
+             {owner} AS owner, toString(m.sharing_consent) AS consent LIMIT 1",
+            owner = OWNER_CYPHER,
             label = kind.label,
             prop = kind.id_prop,
             props = PROPS_PROJECTION,
@@ -60,11 +105,15 @@ impl Neo4jClient {
         let center_eid: String = row.get("eid")?;
         let center_pid: String = row.get("pid")?;
         let props: NodeProps = row.get("props").unwrap_or_default();
-        let center = RawNode::from_props(kind.api, center_pid.clone(), &props);
+        let center = ScopedNode {
+            node: RawNode::from_props(kind.api, center_pid.clone(), &props),
+            project_id: row.get::<String>("owner").ok(),
+            consent: parse_consent(row.get::<String>("consent").ok().as_deref()),
+        };
 
         let rels = rel_types_for(&params.layers);
         if rels.is_empty() {
-            return Ok(Some(RawNeighborhood {
+            return Ok(Some(ScopedNeighborhood {
                 center: Some(center),
                 ..Default::default()
             }));
@@ -79,7 +128,7 @@ impl Neo4jClient {
              CALL {{ \
                WITH n \
                MATCH (n)-[r:{rels}]-(m) \
-               WHERE {label_filter} \
+               WHERE ({label_filter}){project_filter} \
                WITH r, m, {weight} AS w \
                WHERE w >= $min_weight \
                WITH r, m, w \
@@ -90,7 +139,18 @@ impl Neo4jClient {
              }} \
              RETURN fid, elementId(m) AS mid, elementId(startNode(r)) = fid AS outgoing, \
                     type(r) AS rel, w, labels(m) AS labels, \
-                    coalesce(m.id, m.path, m.hash) AS pid, {props} AS props",
+                    coalesce(m.id, m.path, m.hash) AS pid, {props} AS props, \
+                    {owner_ret} AS owner, toString(m.sharing_consent) AS consent",
+            owner_ret = if filter.is_some() {
+                OWNER_CYPHER
+            } else {
+                "null"
+            },
+            project_filter = if filter.is_some() {
+                format!(" AND {OWNER_CYPHER} IN $projects")
+            } else {
+                String::new()
+            },
             rels = rels.join("|"),
             label_filter = all_labels()
                 .iter()
@@ -104,7 +164,8 @@ impl Neo4jClient {
         // elementId → (public id, api type)
         let mut known: HashMap<String, (String, &'static str)> = HashMap::new();
         known.insert(center_eid.clone(), (center_pid.clone(), kind.api));
-        let mut nodes: Vec<RawNode> = Vec::new();
+        let projects: Vec<String> = filter.map(|f| f.project_ids.clone()).unwrap_or_default();
+        let mut nodes: Vec<ScopedNode> = Vec::new();
         let mut edges: Vec<RawEdge> = Vec::new();
         let mut edge_keys: HashSet<(String, String, String)> = HashSet::new();
         let mut frontier: Vec<String> = vec![center_eid.clone()];
@@ -126,10 +187,13 @@ impl Neo4jClient {
                 break;
             }
 
-            let q = query(&hop_q)
+            let mut q = query(&hop_q)
                 .param("frontier", expandable)
                 .param("min_weight", params.min_weight)
                 .param("fanout", params.fanout_for_hop(hop) as i64);
+            if filter.is_some() {
+                q = q.param("projects", projects.clone());
+            }
             let mut res = self.graph.execute(q).await?;
 
             // new node elementId → (best incoming weight, salience)
@@ -167,6 +231,11 @@ impl Neo4jClient {
                     let props: NodeProps = row.get("props").unwrap_or_default();
                     let node = RawNode::from_props(mkind.api, pid.clone(), &props);
                     best.insert(mid.clone(), (w, node.weight));
+                    let node = ScopedNode {
+                        node,
+                        project_id: row.get::<String>("owner").ok(),
+                        consent: parse_consent(row.get::<String>("consent").ok().as_deref()),
+                    };
                     known.insert(mid.clone(), (pid.clone(), mkind.api));
                     nodes.push(node);
                 } else if let Some(entry) = best.get_mut(&mid) {
@@ -190,12 +259,18 @@ impl Neo4jClient {
             }
         }
 
-        Ok(Some(RawNeighborhood {
+        Ok(Some(ScopedNeighborhood {
             center: Some(center),
             nodes,
             edges,
         }))
     }
+}
+
+/// Stored `sharing_consent` -> enum. Unknown or absent is `NotSet` (never permissive).
+fn parse_consent(s: Option<&str>) -> crate::episodes::distill_models::SharingConsent {
+    s.and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
