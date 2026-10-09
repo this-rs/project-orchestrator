@@ -262,9 +262,15 @@ jobs:
   integration-tests:
     name: Integration Tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     services:
       neo4j:
-        image: neo4j:5
+        image: ghcr.io/this-rs/ci-mirror/neo4j:5.26.31@sha256:c7d25c0eeebfe125718d58b72ed5d663c85d0479047733845eb2237c67ce8069
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
         env:
           NEO4J_AUTH: neo4j/testpassword
           NEO4J_PLUGINS: '["apoc"]'
@@ -279,7 +285,10 @@ jobs:
           --health-start-period 30s
 
       meilisearch:
-        image: getmeili/meilisearch:v1.34
+        image: ghcr.io/this-rs/ci-mirror/meilisearch:v1.34.3@sha256:82767d2afc4fb6c3e4ebadb134ca6ef5687c894ae9e152928619393b1f331681
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
         env:
           MEILI_MASTER_KEY: test-master-key
           MEILI_NO_ANALYTICS: true
@@ -334,9 +343,15 @@ jobs:
     name: API Tests
     runs-on: ubuntu-latest
     needs: [build, lint]
+    permissions:
+      contents: read
+      packages: read
     services:
       neo4j:
-        image: neo4j:5
+        image: ghcr.io/this-rs/ci-mirror/neo4j:5.26.31@sha256:c7d25c0eeebfe125718d58b72ed5d663c85d0479047733845eb2237c67ce8069
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
         env:
           NEO4J_AUTH: neo4j/testpassword
           NEO4J_PLUGINS: '["apoc"]'
@@ -351,7 +366,10 @@ jobs:
           --health-start-period 30s
 
       meilisearch:
-        image: getmeili/meilisearch:v1.34
+        image: ghcr.io/this-rs/ci-mirror/meilisearch:v1.34.3@sha256:82767d2afc4fb6c3e4ebadb134ca6ef5687c894ae9e152928619393b1f331681
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
         env:
           MEILI_MASTER_KEY: test-master-key
           MEILI_NO_ANALYTICS: true
@@ -429,9 +447,15 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     services:
       neo4j:
-        image: neo4j:5
+        image: ghcr.io/this-rs/ci-mirror/neo4j:5.26.31@sha256:c7d25c0eeebfe125718d58b72ed5d663c85d0479047733845eb2237c67ce8069
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
         env:
           NEO4J_AUTH: neo4j/testpassword
           NEO4J_PLUGINS: '["apoc"]'
@@ -445,7 +469,10 @@ jobs:
           --health-retries 10
           --health-start-period 30s
       meilisearch:
-        image: getmeili/meilisearch:v1.34
+        image: ghcr.io/this-rs/ci-mirror/meilisearch:v1.34.3@sha256:82767d2afc4fb6c3e4ebadb134ca6ef5687c894ae9e152928619393b1f331681
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
         env:
           MEILI_MASTER_KEY: test-master-key
           MEILI_NO_ANALYTICS: true
