@@ -2119,6 +2119,174 @@ pub trait GraphStore: Send + Sync {
     /// Delete a chat session
     async fn delete_chat_session(&self, id: Uuid) -> Result<bool>;
 
+    // ------------------------------------------------------------------
+    // Chat anchors (typed context anchors of a conversation). See
+    // `crate::chat::anchor` for the model and the rules. Rule violations are
+    // `AnchorError`s inside the `anyhow::Error` (`err.downcast_ref::<AnchorError>()`).
+    // ------------------------------------------------------------------
+
+    /// Apply one operation to the anchors of `session_id`: the rules of
+    /// `crate::chat::anchor::apply_op`, the new state and its journal entry
+    /// written in ONE transaction. Fails with `SessionNotFound` if the
+    /// session does not exist.
+    async fn apply_anchor_op(
+        &self,
+        session_id: Uuid,
+        op: crate::chat::anchor::AnchorOp,
+    ) -> Result<crate::chat::anchor::AnchorChange>;
+
+    /// Anchor a session on an entity (idempotent for a role set already held).
+    async fn add_anchor(
+        &self,
+        session_id: Uuid,
+        new: crate::chat::anchor::NewAnchor,
+    ) -> Result<crate::chat::anchor::Anchor> {
+        Ok(self
+            .apply_anchor_op(session_id, crate::chat::anchor::AnchorOp::Add(new))
+            .await?
+            .anchor)
+    }
+
+    /// Give an anchor one more role (optimistic `expected_version`).
+    async fn promote_anchor_role(
+        &self,
+        session_id: Uuid,
+        anchor_id: Uuid,
+        role: crate::chat::anchor::AnchorRole,
+        expected_version: u64,
+        by: crate::chat::anchor::AnchorActor,
+        actor: &str,
+    ) -> Result<crate::chat::anchor::Anchor> {
+        Ok(self
+            .apply_anchor_op(
+                session_id,
+                crate::chat::anchor::AnchorOp::Promote {
+                    anchor_id,
+                    role,
+                    expected_version,
+                    by,
+                    actor: actor.to_string(),
+                },
+            )
+            .await?
+            .anchor)
+    }
+
+    /// Take one role away from an anchor (optimistic `expected_version`).
+    async fn demote_anchor_role(
+        &self,
+        session_id: Uuid,
+        anchor_id: Uuid,
+        role: crate::chat::anchor::AnchorRole,
+        expected_version: u64,
+        by: crate::chat::anchor::AnchorActor,
+        actor: &str,
+    ) -> Result<crate::chat::anchor::Anchor> {
+        Ok(self
+            .apply_anchor_op(
+                session_id,
+                crate::chat::anchor::AnchorOp::Demote {
+                    anchor_id,
+                    role,
+                    expected_version,
+                    by,
+                    actor: actor.to_string(),
+                },
+            )
+            .await?
+            .anchor)
+    }
+
+    /// Remove an anchor (never the origin one). The target is left alone.
+    async fn remove_anchor(
+        &self,
+        session_id: Uuid,
+        anchor_id: Uuid,
+        expected_version: u64,
+        by: crate::chat::anchor::AnchorActor,
+        actor: &str,
+    ) -> Result<()> {
+        self.apply_anchor_op(
+            session_id,
+            crate::chat::anchor::AnchorOp::Remove {
+                anchor_id,
+                expected_version,
+                by,
+                actor: actor.to_string(),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Move an anchor to another state (live -> moved -> dangling ...).
+    /// `expected_version = None` skips the optimistic check (system transitions).
+    async fn set_anchor_state(
+        &self,
+        session_id: Uuid,
+        anchor_id: Uuid,
+        state: crate::chat::anchor::AnchorState,
+        expected_version: Option<u64>,
+        by: crate::chat::anchor::AnchorActor,
+        actor: &str,
+    ) -> Result<crate::chat::anchor::Anchor> {
+        Ok(self
+            .apply_anchor_op(
+                session_id,
+                crate::chat::anchor::AnchorOp::SetState {
+                    anchor_id,
+                    state,
+                    expected_version,
+                    by,
+                    actor: actor.to_string(),
+                },
+            )
+            .await?
+            .anchor)
+    }
+
+    /// All anchors of a session, oldest first.
+    async fn list_session_anchors(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<crate::chat::anchor::Anchor>>;
+
+    /// Reverse query: the anchors (hence the sessions) on one entity, ordered
+    /// by anchor id, keyset-paginated (`cursor` = `next_cursor` of the previous page).
+    async fn list_sessions_for_target(
+        &self,
+        target_type: crate::chat::anchor::AnchorTargetType,
+        target_id: &str,
+        state: Option<crate::chat::anchor::AnchorState>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<crate::chat::anchor::AnchorPage>;
+
+    /// The journal of a session, oldest first.
+    async fn list_anchor_events(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<crate::chat::anchor::AnchorEvent>>;
+
+    /// Mark every anchor on a (deleted/archived) target `dangling`, with a
+    /// journal entry each. Returns how many changed. Not wired to entity
+    /// deletion yet. Anchors are never deleted by this.
+    async fn mark_anchors_dangling(
+        &self,
+        target_type: crate::chat::anchor::AnchorTargetType,
+        target_id: &str,
+    ) -> Result<usize>;
+
+    /// Migration (never run at startup): one inferred `project` anchor (focus,
+    /// by system, confidence 1.0) per session whose `project_slug` resolves to
+    /// exactly one project. Idempotent.
+    async fn backfill_project_anchors(&self) -> Result<crate::chat::anchor::BackfillReport>;
+
+    /// Inverse of the backfill: deletes only the anchors it created and nobody
+    /// modified since (inferred, by system, added by the migration, version 1),
+    /// with their journal entries. Returns how many.
+    async fn revert_inferred_anchors(&self) -> Result<usize>;
+
     // ========================================================================
     // Chat event operations (WebSocket replay & persistence)
     // ========================================================================

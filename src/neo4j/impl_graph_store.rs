@@ -2527,6 +2527,58 @@ impl GraphStore for Neo4jClient {
         self.delete_chat_session(id).await
     }
 
+    async fn apply_anchor_op(
+        &self,
+        session_id: Uuid,
+        op: crate::chat::anchor::AnchorOp,
+    ) -> anyhow::Result<crate::chat::anchor::AnchorChange> {
+        self.apply_anchor_op(session_id, op).await
+    }
+
+    async fn list_session_anchors(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::chat::anchor::Anchor>> {
+        self.list_session_anchors(session_id).await
+    }
+
+    async fn list_sessions_for_target(
+        &self,
+        target_type: crate::chat::anchor::AnchorTargetType,
+        target_id: &str,
+        state: Option<crate::chat::anchor::AnchorState>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> anyhow::Result<crate::chat::anchor::AnchorPage> {
+        self.list_sessions_for_target(target_type, target_id, state, limit, cursor)
+            .await
+    }
+
+    async fn list_anchor_events(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::chat::anchor::AnchorEvent>> {
+        self.list_anchor_events(session_id).await
+    }
+
+    async fn mark_anchors_dangling(
+        &self,
+        target_type: crate::chat::anchor::AnchorTargetType,
+        target_id: &str,
+    ) -> anyhow::Result<usize> {
+        self.mark_anchors_dangling(target_type, target_id).await
+    }
+
+    async fn backfill_project_anchors(
+        &self,
+    ) -> anyhow::Result<crate::chat::anchor::BackfillReport> {
+        self.backfill_project_anchors().await
+    }
+
+    async fn revert_inferred_anchors(&self) -> anyhow::Result<usize> {
+        self.revert_inferred_anchors().await
+    }
+
     // Chat event operations
 
     async fn store_chat_events(
