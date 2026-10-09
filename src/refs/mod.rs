@@ -32,6 +32,8 @@ pub mod rank;
 pub mod registry;
 pub mod resolvers;
 pub mod resolvers_ext;
+#[cfg(test)]
+mod resolvers_ext_tests;
 pub mod search;
 #[cfg(test)]
 mod search_contract;

@@ -100,6 +100,10 @@ pub struct Candidate {
     pub meta: RefMeta,
     /// The text of the entity beyond its title (description, content...).
     pub body: String,
+    /// The text the ranking treats as the TITLE when it is not the label (a
+    /// conversation with no title is labelled by its preview, but must not rank
+    /// as if the preview were its title).
+    pub title: Option<String>,
     /// When it was created or last decided: ties in relevance go to the latest.
     pub at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -113,8 +117,14 @@ impl Candidate {
         Self {
             meta,
             body: body.into(),
+            title: None,
             at,
         }
+    }
+
+    pub fn titled(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
     }
 }
 
@@ -154,13 +164,13 @@ pub trait KindResolver: Send + Sync {
 }
 
 /// The wire spelling of an enum (`in_progress`, `active`...).
-fn snake<T: Serialize>(v: &T) -> Option<String> {
+pub(super) fn snake<T: Serialize>(v: &T) -> Option<String> {
     serde_json::to_value(v)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
 }
 
-async fn scope_of(
+pub(super) async fn scope_of(
     graph: &dyn GraphStore,
     memo: &mut Memo,
     project_id: Option<Uuid>,

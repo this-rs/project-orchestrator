@@ -182,7 +182,11 @@ async fn one_kind(
     let mut kept = Vec::new();
     for cand in resolver.candidates(candidates, &mut memo).await? {
         // The text decides first: a row that does not match is not suggested.
-        let Some(score) = rank::score(&candidates.needle, &cand.meta.label, &cand.body) else {
+        let Some(score) = rank::score(
+            &candidates.needle,
+            cand.title.as_deref().unwrap_or(&cand.meta.label),
+            &cand.body,
+        ) else {
             continue;
         };
         let (meta, at) = (cand.meta, cand.at);
