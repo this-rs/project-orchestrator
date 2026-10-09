@@ -2436,6 +2436,15 @@ mod parity {
     /// A session of `kind` opened on a project, no opening message: the turns
     /// below are played in order by the scripted provider.
     pub(super) async fn rig(kind: ProviderKind, turns: Vec<Vec<Step>>) -> Rig {
+        rig_with(kind, turns, None).await
+    }
+
+    /// [`rig`], the manager connected to NATS when `nats` is given.
+    pub(super) async fn rig_with(
+        kind: ProviderKind,
+        turns: Vec<Vec<Step>>,
+        nats: Option<Arc<crate::events::NatsEmitter>>,
+    ) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let graph = Arc::new(MockGraphStore::new());
         let mut project = crate::test_helpers::test_project();
@@ -2461,8 +2470,11 @@ mod parity {
             kind,
             answers: Arc::default(),
         };
-        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
+        let mut manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
             .with_provider_source(Arc::new(provider.clone()));
+        if let Some(nats) = nats {
+            manager = manager.with_nats(nats);
+        }
         let mut req = request(None, Some(&project.slug), "default");
         req.message = String::new();
         req.cwd = project.root_path.clone();
@@ -2800,5 +2812,84 @@ mod parity {
         r.manager.interrupt(&r.sid).await.unwrap();
         r.turn_end().await;
         assert_eq!(r.sent().len(), 1, "{:?}", r.sent());
+    }
+
+    /// H3 NATS: another instance sees the session's events and reaches the session
+    /// (a message, a held message, a snapshot, an interrupt), as for a Claude
+    /// Code session. A real `async_nats` client against an in-process broker.
+    #[tokio::test]
+    async fn another_instance_sees_the_events_and_reaches_the_session_through_nats() {
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+        use futures::StreamExt;
+
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let mut r = rig_with(
+            ProviderKind::Native,
+            vec![vec![Step::AwaitInterrupt]],
+            Some(owner),
+        )
+        .await;
+        let other = NatsEmitter::new(broker.client().await, "events");
+        let mut seen = other.subscribe_chat_events(&r.sid).await.unwrap();
+        other.client().flush().await.unwrap();
+
+        // A message sent on the other instance runs here (the listener may still be
+        // subscribing: ask again until it answers).
+        let mut answered = None;
+        for _ in 0..5 {
+            answered = other
+                .request_send_message(&r.sid, "from afar", "user_message")
+                .await;
+            if answered.is_some() {
+                break;
+            }
+        }
+        assert!(answered.expect("the owner answers").success);
+        r.turns_sent(1).await;
+        assert!(r.sent()[0].ends_with("from afar"));
+
+        // Its events reach the other instance.
+        let shown = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(msg) = seen.next().await {
+                let event: ChatEvent = serde_json::from_slice(&msg.payload).unwrap();
+                if matches!(&event, ChatEvent::UserMessage { content } if content == "from afar") {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(shown, Ok(true), "the user message is published");
+
+        // A client joining there mid-turn gets the snapshot.
+        let snapshot = other
+            .request_streaming_snapshot(&r.sid)
+            .await
+            .expect("a snapshot");
+        assert!(snapshot.is_streaming);
+
+        // A message held from there waits here.
+        let held = other
+            .request_send_message(&r.sid, "after", "queued_user_message")
+            .await
+            .unwrap();
+        assert!(held.success, "{:?}", held.error);
+        assert_eq!(
+            r.manager
+                .pending_queue_snapshot(&r.sid)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // A Stop from there stops the turn here; the held message then runs.
+        other.publish_interrupt(&r.sid);
+        r.turn_end().await;
+        let sent = r.sent();
+        assert!(sent.len() == 2 && sent[1].ends_with("after"), "{sent:?}");
+        assert_eq!(r.interrupts(), 1);
     }
 }

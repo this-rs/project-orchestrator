@@ -76,6 +76,8 @@ mod bus;
 pub mod graph;
 mod hybrid;
 pub mod nats;
+#[cfg(test)]
+pub(crate) mod nats_broker_test;
 mod notifier;
 pub mod reactions;
 pub mod reactor;

@@ -117,7 +117,7 @@ fn retry_delay_ms(error: &ProviderError, attempt: u32) -> u64 {
 ///
 /// Two sources, kept apart on purpose:
 /// - what THIS ENGINE (the backend) has not ported, whatever the provider can do:
-///   NATS fan-out;
+///   nothing any more (enrichment, message queue, auto-continue, NATS are ported);
 /// - what THE SESSION's capabilities say it cannot do: `images`, and `compaction`
 ///   when the provider emits no compaction signal.
 pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
@@ -125,7 +125,9 @@ pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
     // `enrichment` is NOT listed: every turn gets the graph context (`TurnServices::prepare`).
     // `message_queue` is NOT listed: a message sent during a turn is queued (`pending`).
     // `auto_continue` is NOT listed: a turn stopped on its limit is continued (`auto_continue_after`).
-    let mut missing = vec!["nats"];
+    // `nats` is NOT listed: events are published and the session answers the other
+    // instances (`TurnServices::publish`, `ChatManager::spawn_agent_nats_listeners`).
+    let mut missing: Vec<&str> = Vec::new();
     // The knowledge-graph hooks are served to a provider that runs hooks in its own loop
     // (`GraphSessionHooks`). A session that cannot carry an MCP server is the remote Claude
     // Code, which is given none: it keeps the entry.
@@ -157,6 +159,9 @@ pub trait TurnServices: Send + Sync {
     /// The system hint a turn continued automatically starts with
     /// (`post_stream::continuation_message`).
     async fn continuation(&self, session_id: &str) -> String;
+    /// Hands an event of the session to the other instances (NATS), as the Claude
+    /// Code engine publishes each of its events. Default: nowhere.
+    fn publish(&self, _session_id: &str, _event: &ChatEvent) {}
 }
 
 /// Where the runtime finds a provider instance by identifier. The nexus
@@ -201,6 +206,8 @@ pub struct AgentSessionHandle {
     /// The running turn was stopped (by the user, or for a message sent now):
     /// the automated entries of the queue are dropped when it ends.
     interrupted: AtomicBool,
+    /// Cancelled when the session closes: ends what listens on its behalf (NATS).
+    pub closed: tokio_util::sync::CancellationToken,
     /// Continue a turn that stopped on its turn limit (`set_auto_continue`).
     pub auto_continue: AtomicBool,
     auto_continue_count: std::sync::atomic::AtomicU32,
@@ -253,6 +260,9 @@ impl AgentSessionHandle {
                 };
                 let _ = self.graph.store_chat_events(uuid, vec![record]).await;
             }
+        }
+        if let Some(services) = &self.services {
+            services.publish(&self.session_id, &event);
         }
         let _ = self.events_tx.send(event);
     }
@@ -733,6 +743,7 @@ impl AgentRuntime {
             services,
             pending: Mutex::new(std::collections::VecDeque::new()),
             interrupted: AtomicBool::new(false),
+            closed: tokio_util::sync::CancellationToken::new(),
             auto_continue: AtomicBool::new(false),
             auto_continue_count: std::sync::atomic::AtomicU32::new(0),
             max_auto_continues: std::sync::atomic::AtomicU32::new(0),
@@ -757,6 +768,7 @@ impl AgentRuntime {
             .await
             .remove(session_id)
             .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
+        handle.closed.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), handle.session.close()).await;
         handle
             .emit(ChatEvent::SessionClosed {
@@ -1161,7 +1173,7 @@ mod mask_tests {
     fn the_ported_features_are_not_announced_as_missing() {
         let caps = Capabilities::none();
         let degraded = degraded_features(&caps);
-        let ported = ["enrichment", "message_queue", "auto_continue"];
+        let ported = ["enrichment", "message_queue", "auto_continue", "nats"];
         assert!(
             !degraded.iter().any(|f| ported.contains(&f.as_str())),
             "{degraded:?}"
