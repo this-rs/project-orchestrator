@@ -264,7 +264,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       neo4j:
-        image: neo4j:5
+        image: mirror.gcr.io/library/neo4j:5
         env:
           NEO4J_AUTH: neo4j/testpassword
           NEO4J_PLUGINS: '["apoc"]'
@@ -279,7 +279,7 @@ jobs:
           --health-start-period 30s
 
       meilisearch:
-        image: getmeili/meilisearch:v1.34
+        image: mirror.gcr.io/getmeili/meilisearch:v1.34
         env:
           MEILI_MASTER_KEY: test-master-key
           MEILI_NO_ANALYTICS: true
@@ -336,7 +336,7 @@ jobs:
     needs: [build, lint]
     services:
       neo4j:
-        image: neo4j:5
+        image: mirror.gcr.io/library/neo4j:5
         env:
           NEO4J_AUTH: neo4j/testpassword
           NEO4J_PLUGINS: '["apoc"]'
@@ -351,7 +351,7 @@ jobs:
           --health-start-period 30s
 
       meilisearch:
-        image: getmeili/meilisearch:v1.34
+        image: mirror.gcr.io/getmeili/meilisearch:v1.34
         env:
           MEILI_MASTER_KEY: test-master-key
           MEILI_NO_ANALYTICS: true
@@ -431,7 +431,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       neo4j:
-        image: neo4j:5
+        image: mirror.gcr.io/library/neo4j:5
         env:
           NEO4J_AUTH: neo4j/testpassword
           NEO4J_PLUGINS: '["apoc"]'
@@ -445,7 +445,7 @@ jobs:
           --health-retries 10
           --health-start-period 30s
       meilisearch:
-        image: getmeili/meilisearch:v1.34
+        image: mirror.gcr.io/getmeili/meilisearch:v1.34
         env:
           MEILI_MASTER_KEY: test-master-key
           MEILI_NO_ANALYTICS: true

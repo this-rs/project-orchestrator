@@ -30,11 +30,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Run cargo-deny (advisories, bans, licenses, sources)
-        uses: EmbarkStudios/cargo-deny-action@v2
+      # No Docker: EmbarkStudios/cargo-deny-action builds a Dockerfile FROM rust:*-alpine
+      # on every run, an anonymous Docker Hub pull that hits HTTP 429. Prebuilt binary
+      # instead, installed like ci.yml's security-audit job.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
         with:
-          command: check advisories bans licenses sources
-          # Optional fast-fail short-circuit; leave default behaviour.
+          tool: cargo-deny
+
+      # Same checks and default arguments (--all-features) as the action ran.
+      - name: Run cargo-deny (advisories, bans, licenses, sources)
+        run: cargo deny --all-features check advisories bans licenses sources
 
   cargo-audit:
     name: cargo-audit
