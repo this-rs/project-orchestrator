@@ -2814,9 +2814,12 @@ mod parity {
         r.manager.send_message(&r.sid, message).await.unwrap();
         r.turn_end().await;
         assert_eq!(
-            r.sent(),
-            vec![super::super::manager::prepend_enrichment(
-                &expected, message
+            r.sent()
+                .iter()
+                .map(|s| crate::chat::untrusted::mask_nonces(s))
+                .collect::<Vec<_>>(),
+            vec![crate::chat::untrusted::mask_nonces(
+                &super::super::manager::prepend_enrichment(&expected, message)
             )]
         );
     }
@@ -3199,10 +3202,12 @@ mod parity {
         .await
         .expect("the graph has context for this message");
         assert!(
-            second.starts_with(&super::super::manager::prepend_enrichment(
-                &enrichment,
-                typed
-            )),
+            crate::chat::untrusted::mask_nonces(second).starts_with(
+                &crate::chat::untrusted::mask_nonces(&super::super::manager::prepend_enrichment(
+                    &enrichment,
+                    typed
+                ))
+            ),
             "{second}"
         );
 

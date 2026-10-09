@@ -536,7 +536,12 @@ impl ParallelEnrichmentStage for StatusInjectionStage {
         if let Some(content) = status_content {
             output.add_section(
                 "Work In Progress",
-                content,
+                // Plan and task titles are graph content: data.
+                crate::chat::untrusted::wrap_graph(
+                    &content,
+                    "plan_status",
+                    input.project_slug.as_deref(),
+                ),
                 self.name(),
                 crate::chat::enrichment::EnrichmentSource::StatusInjection,
             );
@@ -545,7 +550,12 @@ impl ParallelEnrichmentStage for StatusInjectionStage {
         if let Some(content) = protocol_content {
             output.add_section(
                 "Active Protocols",
-                content,
+                // Protocol names and status messages: data.
+                crate::chat::untrusted::wrap_graph(
+                    &content,
+                    "protocol",
+                    input.project_slug.as_deref(),
+                ),
                 self.name(),
                 crate::chat::enrichment::EnrichmentSource::StatusInjection,
             );

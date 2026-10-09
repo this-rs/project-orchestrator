@@ -84,7 +84,12 @@ impl ParallelEnrichmentStage for UserProfileStage {
         }
 
         // Format as concise markdown (< 50 tokens)
-        let markdown = profile.to_prompt_markdown();
+        // The language field is free text: data.
+        let markdown = crate::chat::untrusted::wrap_graph(
+            &profile.to_prompt_markdown(),
+            "user_profile",
+            input.project_slug.as_deref(),
+        );
         output.add_section(
             "User Profile",
             markdown,

@@ -111,34 +111,27 @@ impl IntentWeightMap {
     }
 }
 
+/// Serializes the tests that read or write `ENRICHMENT_INTENT_WEIGHTS_JSON`,
+/// in this module AND in the stages that call [`IntentWeightMap::for_intent`]:
+/// the lock used to be private to this module, so a test of
+/// `knowledge_injection` could observe the override set by
+/// `env_override_parse_and_fallback` (flaky `test_intent_reweighting_*`).
+#[cfg(test)]
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire the env lock, recovering from poisoning so a panicked previous test
+/// does not cascade-fail the rest.
+#[cfg(test)]
+pub(crate) fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    match ENV_LOCK.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
-
-    /// Serializes all tests in this module to prevent races on the
-    /// `ENRICHMENT_INTENT_WEIGHTS_JSON` env var.
-    ///
-    /// `env_override_parse_and_fallback` mutates the env var, while every
-    /// other test (which calls `IntentWeightMap::for_intent`) reads it via
-    /// `from_env_override`. Since cargo runs tests in parallel by default,
-    /// observing the env var in a partially-mutated state caused a flaky
-    /// failure on `debug_intent_boosts_gotcha` (got 2.0 from the override
-    /// instead of the expected 1.5 default).
-    ///
-    /// Holding this lock for the duration of every test in the module
-    /// effectively makes them sequential — at the cost of ~negligible
-    /// runtime since the suite is ~12 micro-tests.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Acquire the env lock, recovering from poisoning so a panicked
-    /// previous test doesn't cascade-fail the rest.
-    fn lock_env() -> MutexGuard<'static, ()> {
-        match ENV_LOCK.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        }
-    }
 
     /// RAII guard that always clears the env var on drop, even on panic.
     /// Prevents a failing `env_override` test from leaking the override

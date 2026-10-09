@@ -71,7 +71,12 @@ impl ParallelEnrichmentStage for ReflexStage {
         let suggestions = self.engine.suggest(&ref_ctx).await;
 
         if !suggestions.is_empty() {
-            let markdown = ReflexEngine::format_markdown(&suggestions);
+            // Scar and episode texts come from notes: data.
+            let markdown = crate::chat::untrusted::wrap_graph(
+                &ReflexEngine::format_markdown(&suggestions),
+                "reflex",
+                input.project_slug.as_deref(),
+            );
             output.add_section(
                 "Reflexes",
                 markdown,
