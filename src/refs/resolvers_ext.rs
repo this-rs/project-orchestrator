@@ -8,7 +8,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::access::RefMeta;
-use super::resolvers::{Candidates, KindResolver, Memo};
+use super::resolvers::{Candidate, Candidates, KindResolver, Memo};
 use super::types::{RefId, RefKind};
 use crate::neo4j::GraphStore;
 
@@ -26,7 +26,7 @@ impl KindResolver for Missing {
     async fn load(&self, _id: &RefId, _memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
         Ok(None)
     }
-    async fn candidates(&self, _c: &Candidates, _m: &mut Memo) -> anyhow::Result<Vec<RefMeta>> {
+    async fn candidates(&self, _c: &Candidates, _m: &mut Memo) -> anyhow::Result<Vec<Candidate>> {
         Ok(vec![])
     }
 }
@@ -42,7 +42,7 @@ impl KindResolver for NotYet {
     async fn load(&self, _id: &RefId, _memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
         Ok(None)
     }
-    async fn candidates(&self, _c: &Candidates, _m: &mut Memo) -> anyhow::Result<Vec<RefMeta>> {
+    async fn candidates(&self, _c: &Candidates, _m: &mut Memo) -> anyhow::Result<Vec<Candidate>> {
         Ok(vec![])
     }
 }

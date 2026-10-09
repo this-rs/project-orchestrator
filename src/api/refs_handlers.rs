@@ -156,12 +156,15 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let keys: Vec<_> = body.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["items"]);
-        let kinds: Vec<_> = body["items"]
+        // ranked by relevance, then recency: both match "refs" as a word, so
+        // the order between the two kinds is not what this test is about.
+        let mut kinds: Vec<_> = body["items"]
             .as_array()
             .unwrap()
             .iter()
             .map(|i| i["kind"].as_str().unwrap())
             .collect();
+        kinds.sort();
         assert_eq!(kinds, ["plan", "rfc"]);
     }
 

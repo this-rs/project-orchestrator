@@ -109,9 +109,12 @@ async fn plan_and_rfc_items_are_the_fixture_items() {
     let mut params = fixture_params(&f);
     params.kinds = Some("plan,rfc".into());
     let got = run(g, params).await;
-    assert_eq!(got["items"][0], *plan_item);
-    assert_eq!(got["items"][1], *rfc_item);
-    assert_eq!(got["items"].as_array().unwrap().len(), 2);
+    // equal relevance between the two: the order is the recency, not the kind.
+    let items = got["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    let by_kind = |k: &str| items.iter().find(|i| i["kind"] == k).unwrap();
+    assert_eq!(*by_kind("plan"), *plan_item);
+    assert_eq!(*by_kind("rfc"), *rfc_item);
 }
 
 #[tokio::test]
