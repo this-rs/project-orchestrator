@@ -2323,7 +2323,8 @@ mod refs_native {
         let sid = created.session_id;
         wait_for_persisted(&w, &sid, "result", 1).await;
         let body = body_for(&fake, "hi there");
-        assert!(!body.contains("po-context"), "{body}");
+        // The system prompt may NAME the block (citation section); no block was injected.
+        assert!(!body.contains("<po-context nonce="), "{body}");
         assert!(persisted_types(&w, &sid)
             .await
             .iter()
