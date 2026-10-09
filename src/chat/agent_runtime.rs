@@ -117,14 +117,17 @@ fn retry_delay_ms(error: &ProviderError, attempt: u32) -> u64 {
 ///
 /// Two sources, kept apart on purpose:
 /// - what THIS ENGINE (the backend) has not ported, whatever the provider can do:
-///   auto-continue, NATS fan-out;
+///   nothing any more (enrichment, message queue, auto-continue, NATS are ported);
 /// - what THE SESSION's capabilities say it cannot do: `images`, and `compaction`
 ///   when the provider emits no compaction signal.
 pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
     // `retry` is NOT listed: the engine retries a retryable `done.error` (B15).
     // `enrichment` is NOT listed: every turn gets the graph context (`TurnServices::prepare`).
     // `message_queue` is NOT listed: a message sent during a turn is queued (`pending`).
-    let mut missing = vec!["auto_continue", "nats"];
+    // `auto_continue` is NOT listed: a turn stopped on its limit is continued (`auto_continue_after`).
+    // `nats` is NOT listed: events are published and the session answers the other
+    // instances (`TurnServices::publish`, `ChatManager::spawn_agent_nats_listeners`).
+    let mut missing: Vec<&str> = Vec::new();
     // The knowledge-graph hooks are served to a provider that runs hooks in its own loop
     // (`GraphSessionHooks`). A session that cannot carry an MCP server is the remote Claude
     // Code, which is given none: it keeps the entry.
@@ -161,6 +164,12 @@ pub trait TurnServices: Send + Sync {
         sent: &str,
         turn: &crate::refs::turn::TurnExpansion,
     ) -> String;
+    /// The system hint a turn continued automatically starts with
+    /// (`post_stream::continuation_message`).
+    async fn continuation(&self, session_id: &str) -> String;
+    /// Hands an event of the session to the other instances (NATS), as the Claude
+    /// Code engine publishes each of its events. Default: nowhere.
+    fn publish(&self, _session_id: &str, _event: &ChatEvent) {}
 }
 
 /// Where the runtime finds a provider instance by identifier. The nexus
@@ -205,6 +214,13 @@ pub struct AgentSessionHandle {
     /// The running turn was stopped (by the user, or for a message sent now):
     /// the automated entries of the queue are dropped when it ends.
     interrupted: AtomicBool,
+    /// Cancelled when the session closes: ends what listens on its behalf (NATS).
+    pub closed: tokio_util::sync::CancellationToken,
+    /// Continue a turn that stopped on its turn limit (`set_auto_continue`).
+    pub auto_continue: AtomicBool,
+    auto_continue_count: std::sync::atomic::AtomicU32,
+    /// Continuations allowed before auto-continue switches itself off (0: no limit).
+    max_auto_continues: std::sync::atomic::AtomicU32,
 }
 
 impl AgentSessionHandle {
@@ -252,6 +268,9 @@ impl AgentSessionHandle {
                 };
                 let _ = self.graph.store_chat_events(uuid, vec![record]).await;
             }
+        }
+        if let Some(services) = &self.services {
+            services.publish(&self.session_id, &event);
         }
         let _ = self.events_tx.send(event);
     }
@@ -352,9 +371,10 @@ impl AgentSessionHandle {
         sent: &str,
     ) -> Result<()> {
         match self.open_turn(kind, shown, sent).await {
+            // `None`: stopped while it was prepared, only the queue is left to play.
             Ok(first) => {
                 let me = Arc::clone(self);
-                tokio::spawn(async move { me.drive(Some(first)).await });
+                tokio::spawn(async move { me.drive(first).await });
                 Ok(())
             }
             Err(error) => {
@@ -377,13 +397,15 @@ impl AgentSessionHandle {
         }
     }
 
-    /// Shows the message of a turn and sends the turn to the provider.
+    /// Shows the message of a turn and sends the turn to the provider (`None`: the
+    /// turn was stopped before it could be sent).
     async fn open_turn(
         &self,
         kind: PendingMessageKind,
         shown: &str,
         sent: &str,
-    ) -> std::result::Result<(nexus_claude::agent::EventStream, TurnInput), ProviderError> {
+    ) -> std::result::Result<Option<(nexus_claude::agent::EventStream, TurnInput)>, ProviderError>
+    {
         // A Stop belongs to the turn it stopped: the new turn starts unstopped.
         self.interrupted.store(false, Ordering::SeqCst);
         match kind {
@@ -416,13 +438,19 @@ impl AgentSessionHandle {
             Some(services) => services.prepare(&self.session_id, shown, sent, &turn).await,
             None => turn.native_prompt(shown, sent),
         };
+        // A Stop while the turn was prepared (the enrichment awaits) found no turn
+        // to interrupt at the provider: it stops this one before it is sent.
+        if self.interrupted.load(Ordering::SeqCst) {
+            tracing::info!(session_id = %self.session_id, "Turn stopped before it was sent");
+            return Ok(None);
+        }
         let input = TurnInput::text(sent);
         let stream = self.session.send_turn(input.clone()).await?;
         self.streaming_text.lock().await.clear();
         self.streaming_events.lock().await.clear();
         self.emit(ChatEvent::StreamingStatus { is_streaming: true })
             .await;
-        Ok((stream, input))
+        Ok(Some((stream, input)))
     }
 
     /// Plays turns until the queue is empty: the turn given, then each message
@@ -432,7 +460,8 @@ impl AgentSessionHandle {
         let mut turn = first;
         loop {
             if let Some((stream, input)) = turn.take() {
-                self.play(stream, input).await;
+                let hit_turn_limit = self.play(stream, input).await;
+                self.auto_continue_after(hit_turn_limit).await;
             }
             let Some(next) = self.next_queued().await else {
                 return;
@@ -441,7 +470,7 @@ impl AgentSessionHandle {
                 .open_turn(next.kind, &next.content, &next.content)
                 .await
             {
-                Ok(opened) => turn = Some(opened),
+                Ok(opened) => turn = opened,
                 Err(error) => {
                     let event = AgentEvent::Error { error };
                     for chat_event in self.mapper.lock().await.map(&event) {
@@ -487,8 +516,10 @@ impl AgentSessionHandle {
     }
 
     /// Plays one turn to its terminal event, retrying a failure that showed nothing.
-    async fn play(&self, mut stream: nexus_claude::agent::EventStream, input: TurnInput) {
+    /// Answers whether the turn stopped on its turn limit (`max_turns`).
+    async fn play(&self, mut stream: nexus_claude::agent::EventStream, input: TurnInput) -> bool {
         let mut attempt = 0u32;
+        let mut hit_turn_limit = false;
         loop {
             // Did the turn already show the user anything? A turn that did is
             // never replayed: it would repeat text or tool calls.
@@ -505,6 +536,13 @@ impl AgentSessionHandle {
                     }
                 }
                 shown |= shows_content(&event);
+                hit_turn_limit |= matches!(
+                    event,
+                    AgentEvent::Done {
+                        stop_reason: nexus_claude::agent::StopReason::MaxTurns,
+                        ..
+                    }
+                );
                 let event = mask_agent_event(event);
                 let chat_events = self.mapper.lock().await.map(&event);
                 for chat_event in chat_events {
@@ -539,6 +577,49 @@ impl AgentSessionHandle {
                 }
             }
         }
+        hit_turn_limit
+    }
+
+    /// Sets how this session continues a turn that stopped on its turn limit.
+    pub fn configure_auto_continue(&self, enabled: bool, max: u32) {
+        self.auto_continue.store(enabled, Ordering::Relaxed);
+        self.max_auto_continues.store(max, Ordering::Relaxed);
+    }
+
+    /// After a turn: when it stopped on its turn limit and auto-continue allows it,
+    /// announce the continuation, wait (a Stop cancels it), and queue the
+    /// "continue" hint the queue then plays — the Claude Code engine's
+    /// `PostStreamHandler::handle_auto_continue`, with the same decision and message.
+    async fn auto_continue_after(&self, hit_turn_limit: bool) {
+        use super::post_stream::{auto_continue_allowed, AUTO_CONTINUE_DELAY_MS};
+        let Some(services) = &self.services else {
+            return;
+        };
+        if !auto_continue_allowed(
+            &self.session_id,
+            hit_turn_limit,
+            &self.auto_continue,
+            self.interrupted.load(Ordering::SeqCst),
+            &self.auto_continue_count,
+            self.max_auto_continues.load(Ordering::Relaxed),
+        ) {
+            return;
+        }
+        self.emit(ChatEvent::AutoContinue {
+            session_id: self.session_id.clone(),
+            delay_ms: AUTO_CONTINUE_DELAY_MS,
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(AUTO_CONTINUE_DELAY_MS)).await;
+        if self.interrupted.load(Ordering::SeqCst) {
+            tracing::info!(session_id = %self.session_id, "Auto-continue cancelled by interrupt");
+            return;
+        }
+        let hint = services.continuation(&self.session_id).await;
+        self.pending
+            .lock()
+            .await
+            .push_back(PendingMessage::system_hint(hint));
     }
 
     /// Answers a permission request.
@@ -562,11 +643,22 @@ impl AgentSessionHandle {
 
     /// Interrupts the turn and the tools it runs.
     pub async fn interrupt(&self) -> Result<()> {
-        self.interrupted.store(true, Ordering::SeqCst);
-        self.session
-            .interrupt(InterruptScope::TurnAndTools)
+        self.interrupt_scoped(InterruptScope::TurnAndTools)
             .await
             .map(|_| ())
+    }
+
+    /// Stops the turn (a Stop of the user): what the queue holds of automated
+    /// work (hints, a pending auto-continue) is dropped when the turn ends, as on
+    /// the Claude Code engine; the messages the user typed still run.
+    pub async fn interrupt_scoped(
+        &self,
+        scope: InterruptScope,
+    ) -> Result<nexus_claude::agent::InterruptOutcome> {
+        self.interrupted.store(true, Ordering::SeqCst);
+        self.session
+            .interrupt(scope)
+            .await
             .map_err(anyhow::Error::new)
     }
 
@@ -668,15 +760,34 @@ impl AgentRuntime {
             services,
             pending: Mutex::new(std::collections::VecDeque::new()),
             interrupted: AtomicBool::new(false),
+            closed: tokio_util::sync::CancellationToken::new(),
+            auto_continue: AtomicBool::new(false),
+            auto_continue_count: std::sync::atomic::AtomicU32::new(0),
+            max_auto_continues: std::sync::atomic::AtomicU32::new(0),
         });
         if let Some(oob) = session.out_of_band() {
             let pump = Arc::clone(&handle);
             tokio::spawn(async move { pump_out_of_band(pump, oob).await });
         }
-        self.sessions
+        let replaced = self
+            .sessions
             .write()
             .await
             .insert(session_id.to_string(), Arc::clone(&handle));
+        // Two resumes raced for one session: the handle replaced is ended, or its
+        // listeners keep answering the session's NATS subjects next to the new ones
+        // (a message from another instance played twice) and its provider session
+        // stays open.
+        if let Some(old) = replaced {
+            tracing::warn!(
+                session_id,
+                "a live agent session was adopted again: the previous handle is closed"
+            );
+            old.closed.cancel();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(5), old.session.close()).await;
+            });
+        }
         handle
     }
 
@@ -689,6 +800,7 @@ impl AgentRuntime {
             .await
             .remove(session_id)
             .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
+        handle.closed.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), handle.session.close()).await;
         handle
             .emit(ChatEvent::SessionClosed {
@@ -1093,7 +1205,7 @@ mod mask_tests {
     fn the_ported_features_are_not_announced_as_missing() {
         let caps = Capabilities::none();
         let degraded = degraded_features(&caps);
-        let ported = ["enrichment", "message_queue"];
+        let ported = ["enrichment", "message_queue", "auto_continue", "nats"];
         assert!(
             !degraded.iter().any(|f| ported.contains(&f.as_str())),
             "{degraded:?}"
@@ -1161,6 +1273,10 @@ mod turn_race_tests {
             }
             sent.to_string()
         }
+
+        async fn continuation(&self, _session_id: &str) -> String {
+            String::new()
+        }
     }
 
     async fn rig() -> (FakeProvider, Arc<Gate>, Arc<AgentSessionHandle>) {
@@ -1212,5 +1328,81 @@ mod turn_race_tests {
 
         let turns = turns_reach(&provider, 1).await;
         assert_eq!(turns, ["second"], "the queued message is not stranded");
+    }
+
+    /// A Stop while the turn is being prepared (the enrichment awaits, the provider
+    /// has no turn to interrupt yet) stops that turn: it is not sent, and the
+    /// session stops streaming — the Claude Code engine breaks such a stream at once.
+    #[tokio::test]
+    async fn a_stop_while_a_turn_is_prepared_stops_that_turn() {
+        let (provider, gate, handle) = rig().await;
+        let first = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move { handle.send_message("first").await })
+        };
+        gate.entered.notified().await;
+        handle.interrupt().await.unwrap();
+        gate.release.notify_one();
+        first.await.unwrap().unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while handle.is_streaming.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let turns = provider.state.turns_started.lock().unwrap().clone();
+        assert!(
+            turns.is_empty(),
+            "the stopped turn went to the provider: {turns:?}"
+        );
+        assert!(
+            !handle.is_streaming.load(Ordering::SeqCst),
+            "the session stops streaming"
+        );
+    }
+}
+
+/// What happens to a live session when the same id is adopted again (two resumes
+/// racing for one session).
+#[cfg(test)]
+mod adopt_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+
+    /// The handle replaced is ended: its listeners (NATS) stop, its provider
+    /// session is closed. Otherwise both handles answer the same NATS subjects and
+    /// a message from another instance is played twice.
+    #[tokio::test]
+    async fn adopting_a_live_session_again_ends_the_handle_it_replaces() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let adopt = || {
+            runtime.adopt(
+                "s",
+                "claude-code",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+        };
+        let first = adopt().await;
+        let second = adopt().await;
+        assert!(
+            first.closed.is_cancelled(),
+            "the replaced handle's listeners stop"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !provider.state.closed.load(Ordering::SeqCst) && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            provider.state.closed.load(Ordering::SeqCst),
+            "the replaced provider session is closed"
+        );
+        assert!(!second.closed.is_cancelled());
+        assert!(Arc::ptr_eq(&runtime.get("s").await.unwrap(), &second));
     }
 }

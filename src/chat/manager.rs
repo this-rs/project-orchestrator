@@ -980,6 +980,7 @@ pub(crate) struct ManagerTurnServices {
     graph: Arc<dyn GraphStore>,
     enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
     turn_routing: Arc<super::agent_hooks::TurnRouting>,
+    nats: Option<Arc<crate::events::NatsEmitter>>,
 }
 
 #[async_trait::async_trait]
@@ -1027,6 +1028,75 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             router.set_last_message(&crate::refs::turn::visible_text(shown));
         }
         prepared
+    }
+
+    async fn continuation(&self, session_id: &str) -> String {
+        let ctx = super::post_stream::PostStreamContext::build(
+            &self.graph,
+            Uuid::parse_str(session_id).ok(),
+        )
+        .await;
+        // No work log on this engine: the hint carries the task/step context alone.
+        super::post_stream::continuation_message(&self.graph, ctx.project_slug.as_deref(), "").await
+    }
+
+    fn publish(&self, session_id: &str, event: &ChatEvent) {
+        if let Some(nats) = &self.nats {
+            nats.publish_chat_event(session_id, event.clone());
+        }
+    }
+}
+
+/// What another instance asks of a session of the agent engine this instance
+/// runs (NATS RPC `rpc.chat.{id}.send`): the message types the Claude Code
+/// listener (`spawn_nats_rpc_listener`) answers, served by the session handle.
+pub(crate) async fn agent_rpc(
+    handle: &Arc<super::agent_runtime::AgentSessionHandle>,
+    graph: &Arc<dyn GraphStore>,
+    request: &crate::events::ChatRpcRequest,
+) -> crate::events::ChatRpcResponse {
+    let message = &request.message;
+    let field = |name: &str| {
+        serde_json::from_str::<serde_json::Value>(message)
+            .ok()
+            .and_then(|v| v.get(name).cloned())
+    };
+    let outcome: Result<()> = match request.message_type.as_str() {
+        "control_response" => {
+            let allow = field("allow").and_then(|v| v.as_bool()).unwrap_or(false);
+            match field("request_id").and_then(|v| v.as_str().map(str::to_string)) {
+                Some(request_id) => handle.answer_permission(&request_id, allow).await,
+                None => Err(anyhow!("a permission answer needs its request_id")),
+            }
+        }
+        "set_auto_continue" => {
+            let enabled = field("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            handle.auto_continue.store(enabled, Ordering::Relaxed);
+            if let Ok(uuid) = Uuid::parse_str(&handle.session_id) {
+                let _ = graph.set_session_auto_continue(uuid, enabled).await;
+            }
+            Ok(())
+        }
+        "queue_op" => match serde_json::from_str::<super::pending_queue::QueueOp>(message) {
+            Ok(op) => {
+                handle.queue_op(&op).await;
+                Ok(())
+            }
+            Err(e) => Err(anyhow!("invalid queue op: {e}")),
+        },
+        "queued_user_message" => handle.queue_message(message).await.map(|_| ()),
+        // user_message, input_response, and what older instances send.
+        _ => handle.send_message(message).await,
+    };
+    match outcome {
+        Ok(()) => crate::events::ChatRpcResponse {
+            success: true,
+            error: None,
+        },
+        Err(e) => crate::events::ChatRpcResponse {
+            success: false,
+            error: Some(e.to_string()),
+        },
     }
 }
 
@@ -6518,7 +6588,8 @@ impl ChatManager {
         }
         // The message_type "control_response" tells the receiving instance to
         // use send_permission_response instead of send_message.
-        let payload = serde_json::json!({ "allow": allow }).to_string();
+        // `request_id`: what an agent-engine owner answers with (the CLI does not need it).
+        let payload = serde_json::json!({ "allow": allow, "request_id": request_id }).to_string();
         if self
             .try_remote_send(session_id, &payload, "control_response")
             .await
@@ -6957,14 +7028,19 @@ impl ChatManager {
     pub async fn set_auto_continue(&self, session_id: &str, enabled: bool) -> Result<()> {
         // Try to update in-memory state if session is active
         let maybe_events_tx = {
-            let sessions = self.active_sessions.read().await;
-            if let Some(session) = sessions.get(session_id) {
-                session
-                    .auto_continue
-                    .store(enabled, std::sync::atomic::Ordering::Relaxed);
-                Some(session.events_tx.clone())
+            if let Some(handle) = self.agent_runtime.get(session_id).await {
+                handle.auto_continue.store(enabled, Ordering::Relaxed);
+                Some(handle.events_tx.clone())
             } else {
-                None
+                let sessions = self.active_sessions.read().await;
+                if let Some(session) = sessions.get(session_id) {
+                    session
+                        .auto_continue
+                        .store(enabled, std::sync::atomic::Ordering::Relaxed);
+                    Some(session.events_tx.clone())
+                } else {
+                    None
+                }
             }
         };
 
@@ -7010,6 +7086,9 @@ impl ChatManager {
     ///
     /// Reads from the in-memory ActiveSession if local, otherwise falls back to Neo4j.
     pub async fn get_auto_continue_state(&self, session_id: &str) -> Result<bool> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return Ok(handle.auto_continue.load(Ordering::Relaxed));
+        }
         // Try local active session first
         let sessions = self.active_sessions.read().await;
         if let Some(session) = sessions.get(session_id) {
@@ -8033,11 +8112,7 @@ impl ChatManager {
             } else {
                 nexus_claude::agent::InterruptScope::TurnOnly
             };
-            let outcome = handle
-                .session
-                .interrupt(scope)
-                .await
-                .map_err(anyhow::Error::new)?;
+            let outcome = handle.interrupt_scoped(scope).await?;
             let diagnostic = outcome.diagnostic;
             return Ok(InterruptOutcome {
                 delivered: true,
@@ -9842,6 +9917,15 @@ impl ChatManager {
         }
         self.finish_agent_open(&sid, provider_id, provider.kind(), session, 1, tool_policy)
             .await;
+        if let Some(handle) = self.agent_runtime.get(&sid).await {
+            // As on Claude Code: a runner always continues, at most five times; an
+            // interactive session follows the configuration, with no limit.
+            let runner = request.runner_context.is_some();
+            handle.configure_auto_continue(
+                runner || self.config.auto_continue,
+                if runner { 5 } else { 0 },
+            );
+        }
         if !request.message.is_empty() {
             if let Some(handle) = self.agent_runtime.get(&sid).await {
                 handle
@@ -9865,6 +9949,7 @@ impl ChatManager {
             graph: self.graph.clone(),
             enrichment_pipeline: self.enrichment_pipeline.clone(),
             turn_routing: Arc::clone(&self.turn_routing),
+            nats: self.nats.clone(),
         })
     }
 
@@ -9898,7 +9983,8 @@ impl ChatManager {
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_else(|| "claude_code".to_string());
-        self.agent_runtime
+        let handle = self
+            .agent_runtime
             .adopt(
                 session_id,
                 provider_id,
@@ -9909,6 +9995,88 @@ impl ChatManager {
                 Some(self.turn_services()),
             )
             .await;
+        self.spawn_agent_nats_listeners(handle);
+    }
+
+    /// What the other instances can ask of a session of the agent engine this
+    /// instance runs, as for a Claude Code session (`spawn_nats_*_listener`):
+    /// an interrupt, a streaming snapshot (a client joining mid-turn there), and
+    /// the RPC send (a message, a held message, a queue op, a permission answer,
+    /// the auto-continue toggle). They end when the session closes.
+    fn spawn_agent_nats_listeners(&self, handle: Arc<super::agent_runtime::AgentSessionHandle>) {
+        let Some(nats) = self.nats.clone() else {
+            return;
+        };
+        let sid = handle.session_id.clone();
+        {
+            let (nats, handle, sid) = (nats.clone(), Arc::clone(&handle), sid.clone());
+            tokio::spawn(async move {
+                let Ok(mut sub) = nats.subscribe_interrupt(&sid).await else {
+                    warn!(session_id = %sid, "agent engine: NATS interrupt subscription failed");
+                    return;
+                };
+                loop {
+                    tokio::select! {
+                        _ = handle.closed.cancelled() => break,
+                        msg = sub.next() => {
+                            if msg.is_none() { break; }
+                            let _ = handle.interrupt().await;
+                        }
+                    }
+                }
+            });
+        }
+        {
+            let (nats, handle, sid) = (nats.clone(), Arc::clone(&handle), sid.clone());
+            tokio::spawn(async move {
+                let Ok(mut sub) = nats.subscribe_snapshot_requests(&sid).await else {
+                    warn!(session_id = %sid, "agent engine: NATS snapshot subscription failed");
+                    return;
+                };
+                loop {
+                    tokio::select! {
+                        _ = handle.closed.cancelled() => break,
+                        msg = sub.next() => {
+                            let Some(msg) = msg else { break };
+                            let Some(reply_to) = msg.reply else { continue };
+                            let snapshot = crate::events::StreamingSnapshot {
+                                is_streaming: handle.is_streaming.load(Ordering::SeqCst),
+                                partial_text: handle.streaming_text.lock().await.clone(),
+                                events: handle.streaming_events.lock().await.clone(),
+                            };
+                            if let Ok(payload) = serde_json::to_vec(&snapshot) {
+                                let _ = nats.client().publish(reply_to, payload.into()).await;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        let graph = self.graph.clone();
+        tokio::spawn(async move {
+            let Ok(mut sub) = nats.subscribe_rpc_send(&sid).await else {
+                warn!(session_id = %sid, "agent engine: NATS RPC subscription failed");
+                return;
+            };
+            loop {
+                tokio::select! {
+                    _ = handle.closed.cancelled() => break,
+                    msg = sub.next() => {
+                        let Some(msg) = msg else { break };
+                        let response = match serde_json::from_slice::<crate::events::ChatRpcRequest>(&msg.payload) {
+                            Ok(request) => agent_rpc(&handle, &graph, &request).await,
+                            Err(e) => crate::events::ChatRpcResponse {
+                                success: false,
+                                error: Some(format!("Invalid request: {e}")),
+                            },
+                        };
+                        if let (Some(reply_to), Ok(payload)) = (msg.reply, serde_json::to_vec(&response)) {
+                            let _ = nats.client().publish(reply_to, payload.into()).await;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Reopens a session of the agent engine that is no longer live, from its
@@ -10024,6 +10192,13 @@ impl ChatManager {
             .get(&sid)
             .await
             .ok_or_else(|| anyhow!("Session {sid} vanished while resuming"))?;
+        // A resumed session is interactive: its persisted toggle, no limit (as on Claude Code).
+        let auto_continue = self
+            .graph
+            .get_session_auto_continue(node.id)
+            .await
+            .unwrap_or(self.config.auto_continue);
+        handle.configure_auto_continue(auto_continue, 0);
         handle.send_message(message).await
     }
 
@@ -10038,17 +10213,9 @@ impl ChatManager {
         self.close_routing_decision(session_id).await;
         if self.agent_runtime.owns(session_id).await {
             crate::auth::agent_tokens::revoke_session(session_id);
+            // Every instance learns the session is gone, as on the legacy path: the
+            // `session_closed` the runtime emits is published like every event.
             self.agent_runtime.close(session_id).await?;
-            // Every instance learns the session is gone, as on the legacy path.
-            if let Some(ref nats) = self.nats {
-                nats.publish_chat_event(
-                    session_id,
-                    ChatEvent::SessionClosed {
-                        session_id: session_id.to_string(),
-                        reason: Some("closed".to_string()),
-                    },
-                );
-            }
             return Ok(());
         }
         // 0. The session's MCP token dies with it — before anything that can
@@ -13266,7 +13433,7 @@ mod tests {
         assert_eq!(wire["engine"], "agent", "{wire}");
         let degraded: Vec<String> = serde_json::from_value(wire["degraded_features"].clone())
             .unwrap_or_else(|_| panic!("degraded_features missing: {wire}"));
-        for lost in ["hooks", "auto_continue", "compaction", "nats", "images"] {
+        for lost in ["hooks", "compaction", "images"] {
             assert!(
                 degraded.iter().any(|d| d == lost),
                 "{lost} must be listed: {degraded:?}"
@@ -13312,12 +13479,10 @@ mod tests {
         assert_eq!(wire["engine"], "agent", "{wire}");
         let degraded: Vec<String> =
             serde_json::from_value(wire["degraded_features"].clone()).expect("a list");
-        // What the backend does not do on this engine, whatever the provider says...
-        for lost in ["hooks", "auto_continue", "nats"] {
-            assert!(degraded.iter().any(|d| d == lost), "{lost}: {degraded:?}");
-        }
+        // This provider runs no hooks in its loop: the graph hooks are listed...
+        assert!(degraded.iter().any(|d| d == "hooks"), "{degraded:?}");
         // ...what the engine ported is not claimed missing...
-        let ported = ["enrichment", "message_queue"];
+        let ported = ["enrichment", "message_queue", "auto_continue", "nats"];
         assert!(
             !degraded.iter().any(|d| ported.contains(&d.as_str())),
             "{degraded:?}"
@@ -19181,6 +19346,7 @@ mod refs_turn_services_tests {
             graph: graph.clone(),
             enrichment_pipeline: Arc::new(pipeline),
             turn_routing: Arc::default(),
+            nats: None,
         };
 
         let note = Uuid::new_v4();

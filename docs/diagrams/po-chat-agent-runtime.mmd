@@ -1,6 +1,6 @@
 %% name: po-chat-agent-runtime
 %% covers: backend:src/chat/{agent_runtime,agent_hooks}.rs
-%% verified: 2c4243c1
+%% verified: ab30d83b
 %% ---
 %% PROUVE : le moteur « agent » du chat (tâche B13) : comment un AgentSession nexus est piloté, ce qu'il
 %%   diffuse et persiste, ce qu'il ne fait PAS encore. Le routage entre moteurs est dans po-chat-manager.
@@ -15,9 +15,7 @@
 %% ---
 %% NON ETABLI :
 %%   jamais exercé contre le VRAI CLI Claude, un vrai endpoint ni un vrai Codex/ACP (faux provider, fake_openai,
-%%   fake_mcp seulement) ; file de messages, auto-continue, NATS, enrichissement : absents
-%%   (annoncés par degraded_features) ; hooks du graphe : écrits et testés, VIVANTS seulement après le relevé
-%%   de l'épingle nexus-claude (le natif épinglé 35acfbf n'appelle pas SessionHooks : PR nexus #71) ; before_turn : jamais avec un vrai provider ni le vrai décideur (CognitiveDecider, B-R4, non branché : ChatManager::with_turn_decider n'est appelé par personne), chemin hérité (CLI Claude) testé seulement par l'appel direct de apply_turn_directive ; la publication NATS de session_closed est faite par le manager, non testée.
+%%   fake_mcp seulement) ; NATS : testé contre un broker de test en processus (protocole coeur), jamais un vrai nats-server ni deux vraies instances ; annulation des outils (cancel_tools) par NATS : non portée (cancel_running_tools ne connaît pas le moteur agent) ; before_turn : jamais avec un vrai provider ni le vrai décideur (CognitiveDecider, B-R4, non branché : ChatManager::with_turn_decider n'est appelé par personne), chemin hérité (CLI Claude) testé seulement par l'appel direct de apply_turn_directive ; session_closed est publié par emit comme tout événement.
 %% ---
 %% LEGENDE
 %%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans test / décidé non écrit  ⚪ amont ou autre domaine
@@ -27,13 +25,17 @@ flowchart TD
     PROV["⚪ nexus AgentProvider / AgentSession (contrat) ; le provider est choisi par le manager (po-chat-provider)"]
 
     subgraph turn["Un tour — AgentSessionHandle::send_message"]
-        BUSY{"✅ un tour tourne déjà ?<br/>oui : ProviderError turn_in_progress (409), pas de file<br/>test : agent_path_refuses_a_second_turn_while_one_runs_and_answers_permissions"}
+        BUSY{"✅ un tour tourne déjà ? (décidé sous le verrou de la file)<br/>oui : send_message = mis en file + tour interrompu (comme Claude Code) ; queue_user_message = tenu, listé (pending_queue), n'interrompt rien ; queue_op (send now interrompt)<br/>test : a_message_sent_during_a_turn_is_queued_and_read_next_not_refused, a_held_message_is_listed_waits_for_the_turn_and_interrupts_nothing, send_now_cuts_the_turn_short_for_the_held_message, agent_path_queues_a_second_turn_while_one_runs_and_answers_permissions"}
+        ENR["✅ TurnServices::prepare (ManagerTurnServices) : pièces jointes développées + enrichment_for_turn (la MÊME fonction que stream_response) devant le message<br/>test : a_turn_of_the_agent_engine_gets_the_graph_context_of_a_claude_code_turn"]
+        DRAIN["✅ fin de tour : auto_continue_allowed + continuation_message (partagés avec post_stream) si done = max_turns et bascule active → auto_continue, 500 ms, indice en file ; puis drain::pop_next_after_turn jusqu'à file vide ; un Stop (interrupt_scoped) jette les entrées automatiques<br/>test : a_turn_stopped_on_its_limit_is_continued_when_auto_continue_is_on, a_turn_stopped_on_its_limit_stays_stopped_when_auto_continue_is_off, a_stop_cancels_a_pending_auto_continue"]
+        NATS["✅ NATS : emit publie chaque événement (TurnServices::publish) ; spawn_agent_nats_listeners répond à interrupt, snapshot, rpc send (user_message, queued_user_message, queue_op, control_response avec request_id, set_auto_continue) ; fermés avec la session<br/>test : another_instance_sees_the_events_and_reaches_the_session_through_nats (vrai client async_nats, broker de test)"]
         SEND["✅ UserMessage persisté, StreamingStatus true, session.send_turn<br/>test : agent_path_opens_a_session_persists_the_snapshot_and_streams_a_turn"]
         MASK["✅ chaque événement du provider est MASQUÉ (secrets du coffre) avant tout, en échec fermé : un événement non masquable devient un marqueur visible, un terminal retenu termine quand même le tour<br/>test : agent_path_masks_a_vault_secret_before_persisting_and_broadcasting, an_event_that_cannot_be_masked_is_withheld_not_passed_in_clear"]
         RETRY["✅ done.error / error retryable ET rien montré : Retrying puis le même tour, 3 essais, retry_after du provider sinon backoff ; sinon jamais rejoué<br/>test : a_retryable_done_error_before_any_output_is_retried_once_the_provider_says_when, a_turn_that_already_showed_output_or_failed_for_good_is_not_retried"]
         MAP["✅ EventMapper : AgentEvent vers ChatEvent (rejeu identique au chemin hérité sur 21 messages), tool_use puis tool_use_input_resolved, coût inconnu jamais 0<br/>test : replay_gives_the_same_chat_events_as_the_legacy_path"]
         EMIT["✅ emit : ajoute provider/capabilities/tool_policy/engine=agent/degraded_features à system_init, persiste (sauf stream_delta, streaming_status), diffuse, tient l'instantané de mi-flux<br/>test : the_agent_system_init_lists_what_the_session_capabilities_do_not_cover (lit le system_init réellement émis)"]
-        BUSY --> SEND --> MASK --> RETRY --> MAP --> EMIT
+        BUSY --> ENR --> SEND --> MASK --> RETRY --> MAP --> EMIT --> DRAIN
+        EMIT --> NATS
     end
 
     subgraph oob["Hors tour"]
@@ -45,9 +47,9 @@ flowchart TD
         CLOSE["✅ close : ferme le provider (5 s max), émet session_closed, oublie la session<br/>test : agent_path_interrupt_model_mode_and_close_reach_the_provider"]
     end
 
-    DEGR["✅ degraded_features(Capabilities) : ce que le moteur n'a pas porté (message_queue, auto_continue, nats, enrichment) ; `hooks` seulement si le provider ne les exécute pas (capacité in_protocol ET MCP par session) + images, compaction et project_orchestrator_tools (pas de MCP par session : Claude Code distant) selon la session<br/>test : hooks_are_degraded_only_where_the_provider_does_not_run_them, the_agent_system_init_lists_what_the_session_capabilities_do_not_cover, a_session_without_per_session_mcp_reports_the_missing_po_tools"]
-    LOST["🟠 NON porté : file de messages, auto-continue, NATS, enrichissement d'entités ; jamais contre un vrai fournisseur"]
-    GHOOKS["✅ GraphSessionHooks (agent_hooks.rs) : SessionHooks sur la MÊME table que le chemin Claude (graph_hook_table) :<br/>before_tool = PreToolUse (contexte → AddContext, block / permissionDecision deny → Deny, updatedInput → ReplaceInput) ; after_tool = PostToolUse ; before_compaction = le `reason` du CompactionNotifier ; outil nommé comme Claude Code (canonical), entrée intacte ; hook en échec ignoré ; matcher honoré<br/>remis par build_agent_spec à Native et Claude Code seulement (ni Codex/ACP, ni session distante) ; runner : guidage de compaction seul ; le notifier de l'agent n'annonce pas la compaction (le provider émet la sienne)<br/><i>test : chat::agent_hooks::tests (9), the_agent_engine_gives_the_graph_hooks_only_to_providers_that_run_hooks, the_hook_table_has_the_per_tool_hooks_unless_the_session_is_a_runner, an_agent_engine_compaction_is_not_announced_twice. Rejoué SANS le correctif : spec.hooks jamais posé → 1 rouge ; contexte et refus ignorés → 4 rouges<br/>🟠 inerte avec l'épingle actuelle (le natif ignore SessionHooks) ; aucun hôte ni modèle réel</i>"]
+    DEGR["✅ degraded_features(Capabilities) : plus rien de non porté (enrichment, message_queue, auto_continue, nats retirés, chacun par le commit qui le porte) ; `hooks` seulement si le provider ne les exécute pas (capacité in_protocol ET MCP par session) + images, compaction et project_orchestrator_tools (pas de MCP par session : Claude Code distant) selon la session<br/>test : hooks_are_degraded_only_where_the_provider_does_not_run_them, the_agent_system_init_lists_what_the_session_capabilities_do_not_cover, a_session_without_per_session_mcp_reports_the_missing_po_tools"]
+    LOST["🟠 restent : cancel_tools par NATS ; journal de travail (work log) vide sur ce moteur (l'indice d'auto-continue n'a que le contexte tâche/étape) ; jamais contre un vrai fournisseur"]
+    GHOOKS["✅ GraphSessionHooks (agent_hooks.rs) : SessionHooks sur la MÊME table que le chemin Claude (graph_hook_table) :<br/>before_tool = PreToolUse (contexte → AddContext, block / permissionDecision deny → Deny, updatedInput → ReplaceInput) ; after_tool = PostToolUse ; before_compaction = le `reason` du CompactionNotifier ; outil nommé comme Claude Code (canonical), entrée intacte ; hook en échec ignoré ; matcher honoré<br/>remis par build_agent_spec à Native et Claude Code seulement (ni Codex/ACP, ni session distante) ; runner : guidage de compaction seul ; le notifier de l'agent n'annonce pas la compaction (le provider émet la sienne)<br/><i>test : chat::agent_hooks::tests (9), the_agent_engine_gives_the_graph_hooks_only_to_providers_that_run_hooks, the_hook_table_has_the_per_tool_hooks_unless_the_session_is_a_runner, an_agent_engine_compaction_is_not_announced_twice, the_graph_hooks_answer_after_a_tool_and_before_a_compaction (provider scripté, natif ET Claude Code). Rejoué SANS le correctif : spec.hooks jamais posé → 1 rouge ; contexte et refus ignorés → 4 rouges<br/>🟠 aucun hôte ni modèle réel</i>"]
     MGR --> GHOOKS
 
     subgraph pert["Modèle par tour — mode full + étape auto (before_turn)"]
