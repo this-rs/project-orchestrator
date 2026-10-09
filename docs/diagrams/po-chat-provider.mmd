@@ -1,5 +1,5 @@
 %% name: po-chat-provider
-%% covers: backend:src/chat/provider/{catalog,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,policy,resolver,settings,store}.rs
+%% covers: backend:src/chat/provider/{catalog,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,nexus_tools,policy,resolver,settings,store}.rs
 %% verified: 82099513
 %% ---
 %% PROUVE : le RÉSOLVEUR backend de provider (décisions A1, A16, A18, A29, A43) : quel
@@ -17,6 +17,8 @@
 %%   src/chat/provider/errors.rs   — OpenFailure, open_failure, resolve_failure, classify_open_error (ProviderError et ResolveError)
 %%   src/chat/provider/event_map.rs — EventMapper, out_of_band_to_chat_events ; listing.rs — ProviderListing, assemble
 %%   src/chat/provider/credentials.rs — VaultCredentialResolver ; src/vault/service.rs — read_for_provider
+%%   src/chat/provider/nexus_tools.rs — attach, sign_profile, SessionToolsToken, check_call, ToolAccessHooks, ToolAccessError, resolve_search_key ;
+%%                                   ChatManager::build_agent_spec (point d attache) ; src/auth/agent_tokens.rs — register_tools, tools_live
 %%   src/chat/provider/policy.rs   — parse_mode, to_legacy, neutral_name, legacy_name,
 %%                                   tool_policy, wire_tool_policy
 %%   nexus_claude::agent           — ProviderError, PolicyMode, ToolPolicy (contrat nexus)
@@ -103,6 +105,21 @@ flowchart TD
         CRED["✅ vault:&lt;nom&gt; → VaultService::read_for_provider sous grant Provider(instance) ;<br/>vault verrouillé → credentials_locked (pas de repli) ; pas de grant → auth_required + quoi faire ;<br/>env:&lt;VAR&gt; lu du serveur et enregistré au masqueur, SERVER_ONLY_SECRETS refusés ; none → aucun<br/>test : a_locked_vault_is_credentials_locked_never_no_credential,<br/>the_servers_own_secrets_cannot_be_used_as_a_provider_credential,<br/>the_server_reads_a_provider_key_only_under_a_provider_grant_for_that_instance (vault)"]
     end
     NEXUS -.-> CRED
+    subgraph nxt["nexus_tools.rs — nexus-tools attaché à une session native (B40)"]
+        NXATT["✅ attach : un serveur MCP `nexus` par session (--cwd, --add-dir, --tools = ce que la politique peut exposer),<br/>profil dans un jeton signé v1 (HMAC-SHA256) lu par le VRAI nexus_tools::verify ; clé propre à la session ;<br/>clé et jeton dans l'ENVIRONNEMENT du processus, jamais sur argv ni dans Debug ; pas de --trust-harness ;<br/>lancé par son chemin ABSOLU (native_factory::runnable_nexus_tools, #598), comme le navigateur ; binaire absent = session ouverte sans `nexus`<br/>test : attach_gives_the_server_a_signed_profile_in_the_environment_and_never_on_argv ;<br/>a_native_session_starts_with_nexus_tools_next_to_the_po_server_and_its_profile_in_the_token"]
+        NXPROF["✅ un outil hors profil n'est ni listé ni exécuté (serveur nexus-tools en mémoire, jeton du backend, compteur d'exécution à 0)<br/>test : a_tool_outside_the_profile_is_neither_listed_nor_run_by_the_server"]
+        NXREV["✅ jeton lié à la session et révocable : agent_tokens::register_tools / tools_live, revoke_session (tous les chemins de fermeture) ;<br/>ToolAccessHooks refuse tout outil `nexus` d'une session révoquée<br/>test : a_revoked_token_stops_every_nexus_tool_call_of_the_session"]
+        NXCONS["✅ WebFetch / WebSearch / browser_navigate : consentement du PROJET lié à l'ORIGINE (tool_origin:&lt;origine&gt;), lu à chaque appel ;<br/>WebFetch offert seulement si le projet a consenti à au moins une origine, WebSearch seulement avec un moteur d origine consentie ;<br/>refus typé tool_origin_not_allowed AVANT l'outil (HookVerdict::Deny) ; http exige aussi l'origine https (montée en https) ; échec de lecture = refus<br/>test : webfetch_to_an_origin_without_consent_is_refused_with_a_typed_error ;<br/>the_session_hooks_refuse_webfetch_to_an_origin_the_project_did_not_consent_to"]
+        NXKEY["✅ clé d'un moteur de recherche : read_for_provider sous le grant Provider(tool:&lt;id&gt;), jamais session ni harnais ;<br/>coffre verrouillé → credentials_locked, pas de grant → tool_credential_required, moteur écarté et WebSearch retiré du jeton<br/>test : the_search_key_is_read_for_the_tool_provider_never_for_the_session_or_the_harness"]
+        NXBR["✅ navigateur : offert seulement si l'exécutable est trouvé ET autorisé pour le projet (document `browser`) ; aucun argument : jamais --stealth<br/>test : the_browser_is_offered_only_if_detected_and_authorised_for_the_project"]
+        NXTODO["🟠 pas de route HTTP pour créer un moteur, consentir à une origine ou autoriser le navigateur (documents lus, pas écrits) ;<br/>nexus-tools ne connaît pas la révocation (signature + expiration) : elle est appliquée côté hôte ;<br/>le binaire nexus-tools (feature tls) n'est ni construit ni livré par ce dépôt (NEXUS_TOOLS_PATH, à côté de l'exécutable, PATH)"]
+    end
+    NXATT --> NXPROF
+    NXATT --> NXREV
+    NXATT --> NXKEY
+    NXATT --> NXBR
+    NXREV --> NXCONS
+    NXCONS -.-> NXTODO
     TODO["🟠 non branché : create_session / resume_session / runner n'appellent pas encore resolve ;<br/>system_init ne porte pas tool_policy ; VaultCredentialResolver n'est passé à aucun registre"]
     BUILTIN -.-> TODO
     OPEN -.-> TODO

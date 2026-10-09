@@ -817,6 +817,7 @@ mod tests {
             provider_path: crate::chat::config::ProviderPath::Agent,
             mcp_server_path: std::path::PathBuf::from("/nonexistent/mcp"),
             nexus_tools_path: None,
+            nexus_browser_path: None,
             max_sessions: 4,
             ..Default::default()
         };

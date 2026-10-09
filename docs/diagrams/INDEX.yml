@@ -67,7 +67,7 @@ diagrams:
     # Resolveur backend seulement : le registre des providers et la table de prix sont dans nexus (A1).
     # Arbitrage : src/chat/provider/cognitive/** (routage cognitif, R2) appartient a po-cognitive-routing.
     covers:
-      - "backend:src/chat/provider/{catalog,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,policy,resolver,settings,store}.rs"
+      - "backend:src/chat/provider/{catalog,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,nexus_tools,policy,resolver,settings,store}.rs"
   - name: po-cognitive-routing
     owner: theotime
     status: verified

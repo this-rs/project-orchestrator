@@ -9680,6 +9680,9 @@ impl ChatManager {
                     "unknown permission mode or malformed tool pattern",
                 ))
             })?;
+        // The project is read before the hooks scope is consumed: it is what the consent of
+        // the network tools is tied to (A28).
+        let project_slug = hooks.as_ref().and_then(|scope| scope.project_slug.clone());
         let env = self
             .po_mcp_env(
                 Some(&mode),
@@ -9734,25 +9737,59 @@ impl ChatManager {
         if !is_acp && remote_cwd.is_none() {
             spec.extra_dirs = add_dirs.iter().map(std::path::PathBuf::from).collect();
         }
-        // The native harness has no tool of its own: its file, search and shell
-        // tools are `nexus-tools`, attached as the `nexus` server and bounded by
-        // the policy just set (B40). Claude Code (local or remote) has its own.
+        // The native harness has no tool of its own: its files, shell and web are `nexus-tools`,
+        // one process per session attached as the `nexus` server (B40). Not for Claude Code,
+        // Codex or ACP (they bring their own), nor for a remote session (its paths are another
+        // machine's). The executable is launched by its absolute path, checked at every
+        // opening (#598); its profile is signed into a per-session token, its network tools
+        // follow the project's consent by origin and the browser its authorisation (#596).
+        let mut gate: Option<Vec<String>> = None;
         if kind == nexus_claude::agent::ProviderKind::Native && remote_cwd.is_none() {
-            let program = self
+            use super::provider::native_factory::runnable_nexus_tools;
+            use super::provider::nexus_tools as nt;
+            match self
                 .config
                 .nexus_tools_path
                 .as_deref()
-                .and_then(super::provider::native_factory::runnable_nexus_tools);
-            match program {
+                .and_then(runnable_nexus_tools)
+            {
                 Some(program) => {
-                    if let Some(server) =
-                        super::provider::native_factory::nexus_tools_server(&program, &spec)
-                    {
-                        spec.mcp_servers.insert(
-                            nexus_claude::providers::native::NEXUS_TOOLS_SERVER.to_string(),
-                            server,
+                    // The browser is held to the same rule: an absolute, executable path.
+                    let browser = self
+                        .config
+                        .nexus_browser_path
+                        .as_deref()
+                        .and_then(runnable_nexus_tools)
+                        .map(nexus_claude::providers::native::BrowserTools::new);
+                    let attachment = nt::attach(
+                        &nt::NexusToolsConfig { program, browser },
+                        &nt::GraphConsents(self.graph.clone()),
+                        self.vault.as_deref(),
+                        nt::AttachInput {
+                            session_id,
+                            cwd: &spec.cwd,
+                            extra_dirs: &spec.extra_dirs,
+                            policy: &spec.policy,
+                            ceiling: spec.policy_ceiling.as_ref(),
+                            project: project_slug.as_deref(),
+                            ttl_secs: self.config.session_token_expiry_secs,
+                            now: chrono::Utc::now(),
+                        },
+                    )
+                    .await;
+                    for (engine, why) in &attachment.skipped_engines {
+                        warn!(
+                            session_id,
+                            engine = %engine,
+                            code = why.code(),
+                            "search engine left out of the session"
                         );
                     }
+                    for (name, server) in attachment.servers {
+                        // A session that already names its own server keeps it.
+                        spec.mcp_servers.entry(name).or_insert(server);
+                    }
+                    gate = Some(attachment.search_origins);
                 }
                 None => tracing::warn!(
                     session_id,
@@ -9799,6 +9836,21 @@ impl ChatManager {
                     Some(mode.clone()),
                 )
                 .with_turn_router(self.turn_routing.get(session_id)),
+            ));
+        }
+        // The consent of the project and the revocation of the token are checked before ANY
+        // other hook, and whether or not the session has the knowledge-graph hooks.
+        if let Some(search_origins) = gate {
+            spec.hooks = Some(Arc::new(
+                super::provider::nexus_tools::ToolAccessHooks::new(
+                    spec.hooks.take(),
+                    Arc::new(super::provider::nexus_tools::GraphConsents(
+                        self.graph.clone(),
+                    )),
+                    session_id,
+                    project_slug,
+                    search_origins,
+                ),
             ));
         }
         Ok(spec)
@@ -10792,7 +10844,9 @@ mod tests {
         assert_eq!(enrichment_project_id(&store, None).await, None);
     }
     use crate::neo4j::models::ChatSessionNode;
-    use crate::test_helpers::{mock_app_state, test_chat_session, test_project};
+    use crate::test_helpers::{
+        mock_app_state, mock_app_state_with_graph, test_chat_session, test_project,
+    };
     use nexus_claude::{
         AssistantMessage, ContentBlock, ContentValue, PermissionMode, TextContent, ThinkingContent,
         ToolResultContent, ToolUseContent,
@@ -10805,6 +10859,7 @@ mod tests {
             provider_path: Default::default(),
             mcp_server_path: PathBuf::from("/usr/bin/mcp_server"),
             nexus_tools_path: None,
+            nexus_browser_path: None,
             default_model: "claude-sonnet-4-6".into(),
             max_sessions: 10,
             session_timeout: Duration::from_secs(1800),
@@ -11336,21 +11391,15 @@ mod tests {
     // ── nexus-tools on a native session (B40) ───────────────────────────────
 
     /// A native session starts with the `nexus` server (`nexus-tools` over stdio),
-    /// bounded by its policy: a denied tool and the web tools (no network consent
-    /// yet) are not in its `--tools`. Claude Code has its own tools: no `nexus`.
+    /// bounded by its policy: a denied tool and the web tools (no project, so no
+    /// network consent) are not in its `--tools`. Claude Code has its own tools: no `nexus`.
     #[tokio::test]
     async fn a_native_session_gets_the_nexus_tools_server_bounded_by_its_policy() {
         use nexus_claude::agent::{McpServerSpec, ProviderKind};
         let state = mock_app_state();
         let mut config = test_config();
         config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
-        let bin = tempfile::TempDir::new().unwrap();
-        let program = bin.path().join("nexus-tools");
-        std::fs::write(&program, "#!/bin/sh\n").unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let (_bin, program) = fake_nexus_tools();
         config.nexus_tools_path = Some(program.clone());
         config.permission.disallowed_tools = vec!["Monitor".into()];
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
@@ -11389,7 +11438,14 @@ mod tests {
             std::path::Path::new(command),
             program.canonicalize().unwrap()
         );
-        assert!(env.is_empty(), "nothing from the host's environment");
+        // Nothing from the host's environment: only the session's own key and the profile
+        // it signs (#596), never on argv.
+        assert_eq!(
+            env.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["NEXUS_TOOLS_KEY", "NEXUS_TOOLS_PROFILE"]
+        );
+        assert!(!args.contains(&env["NEXUS_TOOLS_PROFILE"]));
+        assert!(!args.iter().any(|a| a == "--trust-harness"));
         let tools_at = args.iter().position(|a| a == "--tools").unwrap() + 1;
         let tools: Vec<&str> = args[tools_at].split(',').collect();
         for tool in ["Read", "Write", "Edit", "Glob", "Grep", "Bash"] {
@@ -11819,6 +11875,158 @@ mod tests {
             profile_of(person_claims(), recovered_runner_agent).await,
             ToolProfile::Full
         );
+    }
+
+    /// An executable `nexus-tools` stand-in (it is never started here) and its directory.
+    fn fake_nexus_tools() -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = tempfile::TempDir::new().unwrap();
+        let program = bin.path().join("nexus-tools");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (bin, program)
+    }
+
+    // ── nexus-tools on a native session (B40) ───────────────────────────────
+
+    async fn nexus_tools_spec(
+        kind: nexus_claude::agent::ProviderKind,
+        remote_cwd: Option<&'static str>,
+        configured: bool,
+        graph: Arc<crate::neo4j::mock::MockGraphStore>,
+        sid: &str,
+        permission_mode: Option<&str>,
+    ) -> nexus_claude::agent::SessionSpec {
+        let state = mock_app_state_with_graph(graph);
+        let mut config = test_config();
+        config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
+        // The stand-in lives until the spec is built: its path is resolved at the opening.
+        let (_bin, program) = fake_nexus_tools();
+        config.nexus_tools_path = configured.then_some(program);
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let claims = crate::auth::jwt::Claims::service_account("b40");
+        manager
+            .build_agent_spec(AgentSpecInput {
+                cwd: "/work/app",
+                model: "m",
+                system_prompt: "p",
+                permission_mode,
+                add_dirs: &[],
+                user_claims: Some(&claims),
+                session_id: sid,
+                third_party: true,
+                max_tokens: None,
+                kind,
+                remote_cwd,
+                hooks: Some(AgentHookScope {
+                    project_slug: Some("proj".into()),
+                    task_id: None,
+                    runner: false,
+                }),
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_native_session_starts_with_nexus_tools_next_to_the_po_server_and_its_profile_in_the_token(
+    ) {
+        use nexus_claude::agent::{McpServerSpec, ProviderKind};
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let spec = nexus_tools_spec(ProviderKind::Native, None, true, graph, "b40-s1", None).await;
+        assert!(spec.mcp_servers.contains_key("project-orchestrator"));
+        let Some(McpServerSpec::Stdio { command, args, env }) = spec.mcp_servers.get("nexus")
+        else {
+            panic!("nexus-tools must be attached to a native session");
+        };
+        let command = std::path::Path::new(command);
+        assert!(command.is_absolute() && command.ends_with("nexus-tools"));
+        assert!(env.contains_key("NEXUS_TOOLS_PROFILE") && env.contains_key("NEXUS_TOOLS_KEY"));
+        assert!(args.windows(2).any(|w| w == ["--cwd", "/work/app"]));
+        assert!(
+            args.iter().all(|a| !a.starts_with("v1.")),
+            "no token on argv"
+        );
+        assert!(!format!("{spec:?}").contains(&env["NEXUS_TOOLS_PROFILE"]));
+        assert!(spec.hooks.is_some(), "the consent gate is on the session");
+        crate::auth::agent_tokens::revoke_session("b40-s1");
+    }
+
+    #[tokio::test]
+    async fn nexus_tools_is_not_attached_to_other_harnesses_to_a_remote_session_or_without_the_binary(
+    ) {
+        use nexus_claude::agent::ProviderKind;
+        let graph = || Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        for (kind, remote, configured, sid) in [
+            (ProviderKind::ClaudeCode, None, true, "b40-cc"),
+            (ProviderKind::Codex, None, true, "b40-codex"),
+            (ProviderKind::Native, Some("~/w"), true, "b40-remote"),
+            (ProviderKind::Native, None, false, "b40-nobin"),
+        ] {
+            let spec = nexus_tools_spec(kind, remote, configured, graph(), sid, None).await;
+            assert!(!spec.mcp_servers.contains_key("nexus"), "{sid}");
+            assert!(
+                !crate::auth::agent_tokens::tools_live(sid),
+                "{sid}: nothing minted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_session_hooks_refuse_webfetch_to_an_origin_the_project_did_not_consent_to() {
+        use nexus_claude::agent::{HookVerdict, ProviderKind, ToolCallInfo};
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let spec = nexus_tools_spec(
+            ProviderKind::Native,
+            None,
+            true,
+            graph.clone(),
+            "b40-gate",
+            None,
+        )
+        .await;
+        let hooks = spec.hooks.clone().expect("hooks");
+        let fetch = ToolCallInfo {
+            id: None,
+            name: "mcp__nexus__WebFetch".into(),
+            canonical: Some("WebFetch".into()),
+            category: nexus_claude::agent::ToolCategory::Web,
+            input: serde_json::json!({"url": "https://docs.rs/serde"}),
+        };
+        let HookVerdict::Deny { reason } = hooks.before_tool(&fetch).await else {
+            panic!("an origin without consent must be refused");
+        };
+        assert!(reason.starts_with("tool_origin_not_allowed:"), "{reason}");
+        // The project consents; the same call is no longer this gate's refusal.
+        graph
+            .put_llm_setting(
+                "project:proj",
+                "tool_origin:https://docs.rs",
+                &serde_json::json!({
+                    "origin": "https://docs.rs",
+                    "consented_by": "me@example.com",
+                    "consented_at": "2026-10-08T10:00:00Z"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(!matches!(
+            hooks.before_tool(&fetch).await,
+            HookVerdict::Deny { .. }
+        ));
+        // The session is closed: its token is revoked and its nexus tools stop.
+        crate::auth::agent_tokens::revoke_session("b40-gate");
+        let read = ToolCallInfo {
+            name: "mcp__nexus__Read".into(),
+            canonical: Some("Read".into()),
+            input: serde_json::json!({"file_path": "/work/app/a"}),
+            ..fetch
+        };
+        assert!(matches!(
+            hooks.before_tool(&read).await,
+            HookVerdict::Deny { .. }
+        ));
     }
 
     #[tokio::test]

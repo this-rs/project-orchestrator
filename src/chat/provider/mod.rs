@@ -14,6 +14,7 @@ pub mod errors;
 pub mod event_map;
 pub mod listing;
 pub mod native_factory;
+pub mod nexus_tools;
 pub mod policy;
 pub mod resolver;
 pub mod settings;

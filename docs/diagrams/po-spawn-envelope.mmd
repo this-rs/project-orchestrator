@@ -10,7 +10,7 @@
 %% SOURCES LUES :
 %%   src/auth/jwt.rs          — generate_session_token, agent_session_binding, AgentSessionBinding,
 %%                              Claims::is_agent_session, Claims::is_human
-%%   src/auth/agent_tokens.rs — register, is_live, revoke_session
+%%   src/auth/agent_tokens.rs — register, is_live, revoke_session, register_tools, tools_live (jeton de profil nexus-tools, B40 : révoqué avec la session)
 %%   src/auth/tool_profile.rs — ToolProfile (from_name, from_unverified_token, filter_tools,
 %%                              allows_action, route_forbidden) ; src/mcp/server.rs — profile_refusal
 %%   src/auth/middleware.rs   — require_auth, enforce_token_policy, is_human_only_mutation (po-api)
