@@ -14556,7 +14556,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(node.capabilities.is_some(), "frozen capability snapshot");
-        assert!(node.resume_token.is_some(), "resume token");
+        // Like the Claude Code façade, the provider has named no session yet.
+        assert_eq!(
+            node.resume_token, None,
+            "no resume token before the provider names one"
+        );
         assert_eq!(node.provider_id.as_deref(), Some("claude-code"));
 
         fake.state.push(AgentEvent::Text {
@@ -14595,6 +14599,20 @@ mod tests {
         })
         .await;
         assert!(!manager.is_session_streaming(&sid).await);
+
+        // The session id the turn named is persisted, without waiting for a reopen.
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let token = nexus_claude::agent::ResumeToken::from_wire(
+            node.resume_token
+                .as_deref()
+                .expect("resume token after the turn"),
+        )
+        .unwrap();
+        assert_eq!(token.data()["session_id"], "p-1");
 
         // The events were persisted for replay (never the transient ones).
         let events = graph
@@ -15168,6 +15186,18 @@ mod tests {
             .await
             .unwrap()
             .session_id;
+        // The provider names its session during the first turn, never at open.
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        let mut done = done_event(false, None);
+        if let AgentEvent::Done {
+            provider_session_id,
+            ..
+        } = &mut done
+        {
+            *provider_session_id = Some("fake-provider-session".into());
+        }
+        fake.state.push(done);
+        next_matching(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
         fake.state.end_turn();
         manager.agent_runtime.close(&sid).await.unwrap();
         assert!(!manager.is_session_active(&sid).await);

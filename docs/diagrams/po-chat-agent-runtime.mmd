@@ -1,6 +1,6 @@
 %% name: po-chat-agent-runtime
 %% covers: backend:src/chat/{agent_runtime,agent_hooks}.rs
-%% verified: ab30d83b
+%% verified: 343e1c32
 %% ---
 %% PROUVE : le moteur « agent » du chat (tâche B13) : comment un AgentSession nexus est piloté, ce qu'il
 %%   diffuse et persiste, ce qu'il ne fait PAS encore. Le routage entre moteurs est dans po-chat-manager.
@@ -8,13 +8,13 @@
 %% SOURCES LUES :
 %%   src/chat/agent_runtime.rs — AgentRuntime, AgentSessionHandle (send_message, answer_permission, interrupt,
 %%                               set_model, set_policy_mode), mask_agent_event, degraded_features, retry,
-%%                               pump_out_of_band, BuiltinProviders, fake (tests)
+%%                               pump_out_of_band, BuiltinProviders, fake (tests), sync_resume_token
 %%   src/chat/agent_hooks.rs — GraphSessionHooks (SessionHooks sur la table de hooks du chemin Claude)
 %%   src/chat/manager.rs (graph_hook_table, build_agent_spec, register_turn_router, apply_turn_directive) — la table partagée et sa remise au provider ; le routeur par tour
 %%   src/chat/provider/event_map.rs — EventMapper (AgentEvent vers ChatEvent)
 %% ---
 %% NON ETABLI :
-%%   jamais exercé contre le VRAI CLI Claude, un vrai endpoint ni un vrai Codex/ACP (faux provider, fake_openai,
+%%   jamais exercé contre le VRAI CLI Claude (seulement la façade Claude Code de nexus contre son fake_claude, pour le jeton de reprise), un vrai endpoint ni un vrai Codex/ACP (faux provider, fake_openai,
 %%   fake_mcp seulement) ; NATS : testé contre un broker de test en processus (protocole coeur), jamais un vrai nats-server ni deux vraies instances ; annulation des outils (cancel_tools) par NATS : non portée (cancel_running_tools ne connaît pas le moteur agent) ; before_turn : jamais avec un vrai provider ni le vrai décideur (CognitiveDecider, B-R4, non branché : ChatManager::with_turn_decider n'est appelé par personne), chemin hérité (CLI Claude) testé seulement par l'appel direct de apply_turn_directive ; session_closed est publié par emit comme tout événement.
 %% ---
 %% LEGENDE
@@ -34,17 +34,19 @@ flowchart TD
         RETRY["✅ done.error / error retryable ET rien montré : Retrying puis le même tour, 3 essais, retry_after du provider sinon backoff ; sinon jamais rejoué<br/>test : a_retryable_done_error_before_any_output_is_retried_once_the_provider_says_when, a_turn_that_already_showed_output_or_failed_for_good_is_not_retried"]
         MAP["✅ EventMapper : AgentEvent vers ChatEvent (rejeu identique au chemin hérité sur 21 messages), tool_use puis tool_use_input_resolved, coût inconnu jamais 0<br/>test : replay_gives_the_same_chat_events_as_the_legacy_path"]
         EMIT["✅ emit : ajoute provider/capabilities/tool_policy/engine=agent/degraded_features à system_init, persiste (sauf stream_delta, streaming_status), diffuse, tient l'instantané de mi-flux<br/>test : the_agent_system_init_lists_what_the_session_capabilities_do_not_cover (lit le system_init réellement émis)"]
+        TOKEN["✅ jeton de reprise : finish_agent_open n'écrit que celui connu à l'ouverture (AUCUN pour Claude Code : le CLI ne nomme sa session qu'au system/init et au result du 1er tour) ; sync_resume_token relit session.resume_token() à session_started, à chaque événement terminal (AVANT de l'émettre), après chaque lot hors tour et à close ; écrit (update_chat_session_harness, capacités intactes) seulement s'il a changé ; échec = réessayé au suivant. Codex, ACP, natif : jeton fixé à l'ouverture (thread/start, session/new, transcript), rien ne change<br/>test : a_claude_code_session_resumes_the_cli_session_it_learned_after_open (vraie façade nexus + fake_claude : jeton en base après le 1er tour, reprise = --resume &lt;id&gt; ; ROUGE sans le correctif), agent_path_opens_a_session_persists_the_snapshot_and_streams_a_turn, agent_path_resumes_from_the_persisted_token_and_out_of_turn_output_regroups (faux provider SANS jeton à l'ouverture, comme la façade)"]
         BUSY --> ENR --> SEND --> MASK --> RETRY --> MAP --> EMIT --> DRAIN
+        MAP --> TOKEN
         EMIT --> NATS
     end
 
     subgraph oob["Hors tour"]
-        OOB["✅ pump_out_of_band : regroupe par numéro de message du provider, masque, émet background_output<br/>test : agent_path_resumes_from_the_persisted_token_and_out_of_turn_output_regroups"]
+        OOB["✅ pump_out_of_band : regroupe par numéro de message du provider, masque, émet background_output, puis sync_resume_token<br/>test : agent_path_resumes_from_the_persisted_token_and_out_of_turn_output_regroups"]
     end
 
     subgraph ctl["Commandes de session"]
         CTL["✅ answer_permission (PermissionDecision émis), interrupt (TurnAndTools), set_model (ModelChanged), set_policy_mode (PermissionModeChanged avec policy_mode neutre)<br/>test : agent_path_interrupt_model_mode_and_close_reach_the_provider"]
-        CLOSE["✅ close : ferme le provider (5 s max), émet session_closed, oublie la session<br/>test : agent_path_interrupt_model_mode_and_close_reach_the_provider"]
+        CLOSE["✅ close : sync_resume_token, ferme le provider (5 s max), émet session_closed, oublie la session<br/>test : agent_path_interrupt_model_mode_and_close_reach_the_provider"]
     end
 
     DEGR["✅ degraded_features(Capabilities) : plus rien de non porté (enrichment, message_queue, auto_continue, nats retirés, chacun par le commit qui le porte) ; `hooks` seulement si le provider ne les exécute pas (capacité in_protocol ET MCP par session) + images, compaction et project_orchestrator_tools (pas de MCP par session : Claude Code distant) selon la session<br/>test : hooks_are_degraded_only_where_the_provider_does_not_run_them, the_agent_system_init_lists_what_the_session_capabilities_do_not_cover, a_session_without_per_session_mcp_reports_the_missing_po_tools"]

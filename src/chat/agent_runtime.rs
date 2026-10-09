@@ -221,6 +221,10 @@ pub struct AgentSessionHandle {
     auto_continue_count: std::sync::atomic::AtomicU32,
     /// Continuations allowed before auto-continue switches itself off (0: no limit).
     max_auto_continues: std::sync::atomic::AtomicU32,
+    /// The resume token (wire form) the graph holds for this session, as far as this
+    /// handle knows: what the opener persisted, then each change [`Self::sync_resume_token`]
+    /// wrote. Held across the write, so two writers never store an older token last.
+    persisted_token: Mutex<Option<String>>,
 }
 
 impl AgentSessionHandle {
@@ -274,6 +278,38 @@ impl AgentSessionHandle {
         }
         let _ = self.events_tx.send(event);
     }
+
+    /// Persists the provider's resume token when it is not the one the graph holds.
+    ///
+    /// A provider may name its session only after the session opened: the Claude Code
+    /// CLI gives its session id with its first `system/init` and each `result`, so at
+    /// open the token is still `None`. Called where the token can appear or change (the
+    /// session's start, the end of each turn, a batch of out-of-turn events, the close):
+    /// one read of the provider's token each time, a graph write only when it changed.
+    /// A failed write is retried at the next call.
+    pub(crate) async fn sync_resume_token(&self) {
+        let Some(uuid) = self.uuid else { return };
+        let Some(token) = self.session.resume_token().map(|t| t.to_wire()) else {
+            return;
+        };
+        let mut persisted = self.persisted_token.lock().await;
+        if persisted.as_deref() == Some(token.as_str()) {
+            return;
+        }
+        match self
+            .graph
+            .update_chat_session_harness(uuid, None, Some(&token))
+            .await
+        {
+            Ok(()) => *persisted = Some(token),
+            Err(e) => tracing::warn!(
+                session_id = %self.session_id,
+                error = %e,
+                "Failed to persist the resume token (retried at the next turn)"
+            ),
+        }
+    }
+
     /// Starts a turn and drives it to its terminal event in the background. A
     /// turn already running does not refuse the message: it is queued and the
     /// running turn interrupted so it is read sooner — what the Claude Code
@@ -529,6 +565,12 @@ impl AgentSessionHandle {
                 // Terminal-ness is read on the original: a withheld terminal event
                 // still ends the turn.
                 let terminal = event.is_terminal();
+                // The provider may have just named its session: stored before the
+                // terminal event goes out, so a client that saw the turn end can
+                // count on a resume.
+                if terminal || matches!(event, AgentEvent::SessionStarted { .. }) {
+                    self.sync_resume_token().await;
+                }
                 if !shown {
                     retry = retryable_failure(&event).filter(|_| attempt < MAX_RETRIES);
                     if retry.is_some() {
@@ -764,6 +806,8 @@ impl AgentRuntime {
             auto_continue: AtomicBool::new(false),
             auto_continue_count: std::sync::atomic::AtomicU32::new(0),
             max_auto_continues: std::sync::atomic::AtomicU32::new(0),
+            // What the opener persisted with the snapshot (`ChatManager::finish_agent_open`).
+            persisted_token: Mutex::new(session.resume_token().map(|t| t.to_wire())),
         });
         if let Some(oob) = session.out_of_band() {
             let pump = Arc::clone(&handle);
@@ -801,6 +845,8 @@ impl AgentRuntime {
             .remove(session_id)
             .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
         handle.closed.cancel();
+        // Last chance for a token the provider named outside any turn end.
+        handle.sync_resume_token().await;
         let _ = tokio::time::timeout(Duration::from_secs(5), handle.session.close()).await;
         handle
             .emit(ChatEvent::SessionClosed {
@@ -857,6 +903,8 @@ async fn flush(handle: &AgentSessionHandle, batch: &mut Vec<nexus_claude::agent:
     for event in chat_events {
         handle.emit(event).await;
     }
+    // An out-of-turn `init` (the CLI repeats it) may carry a new session id.
+    handle.sync_resume_token().await;
 }
 
 /// The built-in provider instances: Claude Code, with the CLI path of the
@@ -910,10 +958,26 @@ pub(crate) mod fake {
         pub resumed_with: StdMutex<Vec<ResumeToken>>,
         /// The next `send_turn` fails with this error.
         pub fail_next_turn: StdMutex<Option<ProviderError>>,
+        /// The session id the provider has named, as the Claude Code façade knows it:
+        /// none at open, the one of the first `session_started` / `done` that carries
+        /// one, the token's at resume.
+        pub provider_session_id: StdMutex<Option<String>>,
     }
 
     impl FakeState {
         pub fn push(&self, event: AgentEvent) {
+            // As the façade does, the id is known before the event reaches the turn.
+            if let AgentEvent::SessionStarted {
+                provider_session_id: Some(id),
+                ..
+            }
+            | AgentEvent::Done {
+                provider_session_id: Some(id),
+                ..
+            } = &event
+            {
+                *self.provider_session_id.lock().unwrap() = Some(id.clone());
+            }
             self.turn_tx
                 .lock()
                 .unwrap()
@@ -948,7 +1012,12 @@ pub(crate) mod fake {
             &self.caps
         }
         fn resume_token(&self) -> Option<ResumeToken> {
-            Some(ResumeToken::claude_code_session("fake-provider-session"))
+            self.state
+                .provider_session_id
+                .lock()
+                .unwrap()
+                .clone()
+                .map(ResumeToken::claude_code_session)
         }
         async fn send_turn(&self, input: TurnInput) -> Result<EventStream, ProviderError> {
             if let Some(error) = self.state.fail_next_turn.lock().unwrap().take() {
@@ -1066,6 +1135,7 @@ pub(crate) mod fake {
             if let Some(e) = self.fail_open.lock().unwrap().take() {
                 return Err(e);
             }
+            *self.state.provider_session_id.lock().unwrap() = None;
             self.state.opened_specs.lock().unwrap().push(spec);
             Ok(self.session())
         }
@@ -1074,6 +1144,11 @@ pub(crate) mod fake {
             spec: SessionSpec,
             token: ResumeToken,
         ) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            *self.state.provider_session_id.lock().unwrap() = token
+                .data()
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
             self.state.resumed_with.lock().unwrap().push(token);
             self.state.opened_specs.lock().unwrap().push(spec);
             Ok(self.session())
