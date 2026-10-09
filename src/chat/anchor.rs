@@ -189,6 +189,11 @@ impl Anchor {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnchorEvent {
     pub id: Uuid,
+    /// Position in the journal of the session, 1-based, assigned by the store in
+    /// the transaction that writes the event. 0 = not numbered (pure rule output,
+    /// or an event written before numbering existed).
+    #[serde(default)]
+    pub seq: u64,
     pub session_id: Uuid,
     pub anchor_id: Uuid,
     pub kind: AnchorEventKind,
@@ -423,6 +428,7 @@ fn event(
 ) -> AnchorEvent {
     AnchorEvent {
         id: Uuid::new_v4(),
+        seq: 0,
         session_id: anchor.session_id,
         anchor_id: anchor.id,
         kind,
@@ -994,6 +1000,93 @@ mod tests {
             ),
             Err(AnchorError::AgentRoleForbidden(Focus))
         );
+    }
+
+    /// What the agent-facing API relies on: an agent never takes `origin`, and
+    /// never removes or demotes a `focus` anchor, whatever the route.
+    #[test]
+    fn an_agent_cannot_take_origin_nor_drop_or_downgrade_focus() {
+        let sid = Uuid::new_v4();
+        let mut set = vec![];
+        let focus = add(sid, &mut set, T::File, "f.rs", &[Mention, Focus], User).unwrap();
+        let focus_only = add(sid, &mut set, T::File, "g.rs", &[Focus], User).unwrap();
+        let mention = add(sid, &mut set, T::File, "m.rs", &[Mention], User).unwrap();
+        let origin = add(sid, &mut set, T::Plan, &uuid_s(), &[Origin], System).unwrap();
+        let by_agent = |op| apply_op(sid, &set, op, now());
+
+        // taking origin: at creation, by promotion, on an anchor or on the existing origin
+        assert_eq!(
+            add(sid, &mut set.clone(), T::Task, &uuid_s(), &[Origin], Agent),
+            Err(AnchorError::AgentRoleForbidden(Origin))
+        );
+        for id in [mention.id, focus.id, origin.id] {
+            assert_eq!(
+                by_agent(AnchorOp::Promote {
+                    anchor_id: id,
+                    role: Origin,
+                    expected_version: 1,
+                    by: Agent,
+                    actor: "a".into()
+                }),
+                Err(AnchorError::OriginImmutable)
+            );
+        }
+        // dropping or downgrading focus
+        for id in [focus.id, focus_only.id] {
+            assert_eq!(
+                by_agent(AnchorOp::Remove {
+                    anchor_id: id,
+                    expected_version: 1,
+                    by: Agent,
+                    actor: "a".into()
+                }),
+                Err(AnchorError::AgentRoleForbidden(Focus))
+            );
+        }
+        assert_eq!(
+            by_agent(AnchorOp::Demote {
+                anchor_id: focus.id,
+                role: Focus,
+                expected_version: 1,
+                by: Agent,
+                actor: "a".into()
+            }),
+            Err(AnchorError::AgentRoleForbidden(Focus))
+        );
+        assert_eq!(
+            by_agent(AnchorOp::Demote {
+                anchor_id: focus.id,
+                role: Mention,
+                expected_version: 1,
+                by: Agent,
+                actor: "a".into()
+            }),
+            Err(AnchorError::AgentRoleForbidden(Focus))
+        );
+        // nor the origin, by any route
+        assert_eq!(
+            by_agent(AnchorOp::Remove {
+                anchor_id: origin.id,
+                expected_version: 1,
+                by: Agent,
+                actor: "a".into()
+            }),
+            Err(AnchorError::OriginImmutable)
+        );
+        // the user, for the same operations on focus, is allowed
+        assert!(apply_op(
+            sid,
+            &set,
+            AnchorOp::Demote {
+                anchor_id: focus.id,
+                role: Focus,
+                expected_version: 1,
+                by: User,
+                actor: "u".into()
+            },
+            now()
+        )
+        .is_ok());
     }
 
     #[test]

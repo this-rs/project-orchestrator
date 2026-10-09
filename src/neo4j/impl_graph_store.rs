@@ -2583,6 +2583,10 @@ impl GraphStore for Neo4jClient {
         self.backfill_project_anchors().await
     }
 
+    async fn backfill_spawned_by_edges(&self) -> anyhow::Result<usize> {
+        self.backfill_spawned_by_edges().await
+    }
+
     async fn revert_inferred_anchors(&self) -> anyhow::Result<usize> {
         self.revert_inferred_anchors().await
     }

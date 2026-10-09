@@ -940,3 +940,350 @@ mod synapse_scope {
         cleanup(&e, &ids, Some(&file)).await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Follow-ups of the anchor model: lineage read from the edge, edge metadata,
+// edge backfill, journal order.
+// ---------------------------------------------------------------------------
+
+mod anchor_followups {
+    use super::*;
+    use project_orchestrator::chat::types::SpawnedBy;
+
+    fn spawned(parent: Uuid) -> String {
+        SpawnedBy::Conversation {
+            parent_session_id: parent,
+            tool_use_id: None,
+        }
+        .to_json_string()
+    }
+
+    async fn edge_count(e: &Env, child: Uuid, parent: Uuid) -> i64 {
+        let mut r = e
+            .raw
+            .execute(
+                query(
+                    "MATCH (:ChatSession {id: $c})-[r:SPAWNED_BY]->(:ChatSession {id: $p}) \
+                     RETURN count(r) AS n",
+                )
+                .param("c", child.to_string())
+                .param("p", parent.to_string()),
+            )
+            .await
+            .unwrap();
+        r.next().await.unwrap().unwrap().get("n").unwrap()
+    }
+
+    async fn drop_edges(e: &Env, child: Uuid) {
+        e.raw
+            .run(
+                query("MATCH (:ChatSession {id: $c})-[r:SPAWNED_BY]->() DELETE r")
+                    .param("c", child.to_string()),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A mixed set: `with_both` (JSON + edge), `legacy` (JSON only, no edge),
+    /// `edge_only` (edge written by the pipeline, no JSON).
+    #[tokio::test]
+    async fn lineage_reads_the_edge_and_falls_back_to_the_json_without_duplicates() {
+        let Some(e) = env().await else { return };
+        let store: &dyn GraphStore = &e.client;
+        let slug = format!("lineage-{}", Uuid::new_v4().simple());
+        let (parent, with_both, legacy, edge_only) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let mut p = node(parent);
+        p.project_slug = Some(slug.clone());
+        store.create_chat_session(&p).await.unwrap();
+        for (id, json) in [(with_both, true), (legacy, true), (edge_only, false)] {
+            let mut c = node(id);
+            c.project_slug = Some(slug.clone());
+            if json {
+                c.spawned_by = Some(spawned(parent));
+            }
+            store.create_chat_session(&c).await.unwrap();
+        }
+        drop_edges(&e, legacy).await; // a session written before the edge existed
+        store
+            .create_spawned_by_relation(
+                &edge_only.to_string(),
+                &parent.to_string(),
+                "conversation",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        // pipeline call on a session that already has its edge: still one edge
+        store
+            .create_spawned_by_relation(
+                &with_both.to_string(),
+                &parent.to_string(),
+                "conversation",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut kids: Vec<Uuid> = store
+            .get_session_children(parent)
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        kids.sort();
+        let mut want = vec![with_both, legacy, edge_only];
+        want.sort();
+        assert_eq!(kids, want, "edge, JSON-only and edge-only, each once");
+
+        // detached sessions stay out of the default list, all three of them
+        let (listed, total) = store
+            .list_chat_sessions(Some(&slug), None, 50, 0, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            listed.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![parent]
+        );
+        assert_eq!(total, 1);
+        let (all, total) = store
+            .list_chat_sessions(Some(&slug), None, 50, 0, true)
+            .await
+            .unwrap();
+        assert_eq!((all.len(), total), (4, 4));
+
+        for id in [with_both, legacy, edge_only, parent] {
+            store.delete_chat_session(id).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn run_metadata_of_the_edge_survives_merge_and_later_calls() {
+        let Some(e) = env().await else { return };
+        let store: &dyn GraphStore = &e.client;
+        let (parent, child) = (Uuid::new_v4(), Uuid::new_v4());
+        let (run, task) = (Uuid::new_v4(), Uuid::new_v4());
+        store.create_chat_session(&node(parent)).await.unwrap();
+        let mut c = node(child);
+        c.spawned_by = Some(spawned(parent));
+        store.create_chat_session(&c).await.unwrap();
+        store
+            .create_spawned_by_relation(
+                &child.to_string(),
+                &parent.to_string(),
+                "plan_runner",
+                Some(run),
+                Some(task),
+            )
+            .await
+            .unwrap();
+        async fn props(e: &Env, child: Uuid) -> (String, String, String, bool) {
+            let mut r = e
+                .raw
+                .execute(
+                    query(
+                        "MATCH (:ChatSession {id: $c})-[r:SPAWNED_BY]->() \
+                         RETURN r.type AS t, r.run_id AS run, r.task_id AS task, \
+                                r.created_at IS NOT NULL AS has_created",
+                    )
+                    .param("c", child.to_string()),
+                )
+                .await
+                .unwrap();
+            let row = r.next().await.unwrap().unwrap();
+            (
+                row.get("t").unwrap_or_default(),
+                row.get("run").unwrap_or_default(),
+                row.get("task").unwrap_or_default(),
+                row.get("has_created").unwrap(),
+            )
+        }
+        let expected = (
+            "plan_runner".to_string(),
+            run.to_string(),
+            task.to_string(),
+            true,
+        );
+        assert_eq!(props(&e, child).await, expected);
+        // a later call that carries no run (the conversation path) must not erase it
+        store
+            .create_spawned_by_relation(
+                &child.to_string(),
+                &parent.to_string(),
+                "conversation",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(props(&e, child).await, expected, "metadata kept");
+        assert_eq!(edge_count(&e, child, parent).await, 1);
+        store.delete_chat_session(child).await.unwrap();
+        store.delete_chat_session(parent).await.unwrap();
+    }
+    #[tokio::test]
+    async fn backfill_of_the_edges_is_idempotent() {
+        let Some(e) = env().await else { return };
+        let store: &dyn GraphStore = &e.client;
+        let (parent, child, orphan) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        store.create_chat_session(&node(parent)).await.unwrap();
+        let mut c = node(child);
+        c.spawned_by = Some(spawned(parent));
+        store.create_chat_session(&c).await.unwrap();
+        // the parent of this one is not in the graph: nothing to link
+        let mut o = node(orphan);
+        o.spawned_by = Some(spawned(Uuid::new_v4()));
+        store.create_chat_session(&o).await.unwrap();
+        drop_edges(&e, child).await; // written before the edge existed
+
+        async fn state(e: &Env, ids: [Uuid; 2]) -> (i64, i64, String) {
+            let mut r = e
+                .raw
+                .execute(
+                    query(
+                        "MATCH (s:ChatSession) WHERE s.id IN $ids \
+                         OPTIONAL MATCH (s)-[r:SPAWNED_BY]->(:ChatSession) \
+                         RETURN count(r) AS edges, count(DISTINCT s) AS sessions, \
+                                coalesce(toString(max(r.created_at)), '') AS created",
+                    )
+                    .param("ids", ids.map(|i| i.to_string()).to_vec()),
+                )
+                .await
+                .unwrap();
+            let row = r.next().await.unwrap().unwrap();
+            (
+                row.get("edges").unwrap(),
+                row.get("sessions").unwrap(),
+                row.get("created").unwrap(),
+            )
+        }
+        assert_eq!(state(&e, [child, orphan]).await.0, 0);
+        let first = store.backfill_spawned_by_edges().await.unwrap();
+        assert!(first >= 1, "the legacy child gets its edge");
+        let after_first = state(&e, [child, orphan]).await;
+        assert_eq!((after_first.0, after_first.1), (1, 2));
+        assert_eq!(edge_count(&e, child, parent).await, 1);
+        store.backfill_spawned_by_edges().await.unwrap();
+        assert_eq!(
+            state(&e, [child, orphan]).await,
+            after_first,
+            "two runs = same state (edge count and created_at)"
+        );
+        // lineage reads see it through the edge
+        let kids = store.get_session_children(parent).await.unwrap();
+        assert_eq!(kids.iter().map(|s| s.id).collect::<Vec<_>>(), vec![child]);
+        for id in [child, orphan, parent] {
+            store.delete_chat_session(id).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_events_of_one_session_get_gapless_increasing_seq() {
+        use project_orchestrator::chat::anchor::*;
+        let Some(e) = env().await else { return };
+        let store = std::sync::Arc::new(e.client);
+        let sid = Uuid::new_v4();
+        store.create_chat_session(&node(sid)).await.unwrap();
+        const N: usize = 30;
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..N {
+            let s = store.clone();
+            set.spawn(async move {
+                s.apply_anchor_op(
+                    sid,
+                    AnchorOp::Add(NewAnchor::new(
+                        AnchorTargetType::File,
+                        format!("src/seq{i}.rs"),
+                        [AnchorRole::Mention],
+                        AnchorActor::User,
+                        "harness",
+                    )),
+                )
+                .await
+                .unwrap()
+                .event
+                .unwrap()
+                .seq
+            });
+        }
+        let mut returned = Vec::new();
+        while let Some(r) = set.join_next().await {
+            returned.push(r.unwrap());
+        }
+        returned.sort();
+        let want: Vec<u64> = (1..=N as u64).collect();
+        assert_eq!(returned, want, "no gap, no duplicate in what was returned");
+        let journal = store.list_anchor_events(sid).await.unwrap();
+        assert_eq!(
+            journal.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            want,
+            "the journal comes back ordered by seq"
+        );
+        store.delete_chat_session(sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn events_without_seq_sort_first_by_time_then_the_numbered_ones() {
+        use project_orchestrator::chat::anchor::*;
+        let Some(e) = env().await else { return };
+        let store: &dyn GraphStore = &e.client;
+        let sid = Uuid::new_v4();
+        store.create_chat_session(&node(sid)).await.unwrap();
+        let add = |t: &'static str| {
+            NewAnchor::new(
+                AnchorTargetType::File,
+                t,
+                [AnchorRole::Mention],
+                AnchorActor::User,
+                "harness",
+            )
+        };
+        let a = store
+            .apply_anchor_op(sid, AnchorOp::Add(add("a.rs")))
+            .await
+            .unwrap()
+            .anchor
+            .id;
+        let b = store
+            .apply_anchor_op(sid, AnchorOp::Add(add("b.rs")))
+            .await
+            .unwrap()
+            .anchor
+            .id;
+        // turn them into events written before numbering: no seq, b older than a
+        e.raw
+            .run(
+                query(
+                    "MATCH (e:AnchorEvent {session_id: $sid}) REMOVE e.seq \
+                     SET e.at = CASE e.anchor_id WHEN $a THEN '2020-01-02T00:00:00.000000Z' \
+                                                 ELSE '2020-01-01T00:00:00.000000Z' END",
+                )
+                .param("sid", sid.to_string())
+                .param("a", a.to_string()),
+            )
+            .await
+            .unwrap();
+        let c = store
+            .apply_anchor_op(sid, AnchorOp::Add(add("c.rs")))
+            .await
+            .unwrap()
+            .anchor
+            .id;
+        let order: Vec<Uuid> = store
+            .list_anchor_events(sid)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.anchor_id)
+            .collect();
+        assert_eq!(order, vec![b, a, c]);
+        store.delete_chat_session(sid).await.unwrap();
+    }
+}

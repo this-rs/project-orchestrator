@@ -8,6 +8,61 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+/// Names of the uniqueness constraints `create_schema` must leave in place.
+const EXPECTED_CONSTRAINTS: &[&str] = &[
+    "project_id",
+    "project_slug",
+    "file_path",
+    "function_id",
+    "struct_id",
+    "trait_id",
+    "enum_id",
+    "impl_id",
+    "import_id",
+    "commit_hash",
+    "plan_id",
+    "task_id",
+    "step_id",
+    "decision_id",
+    "constraint_id",
+    "agent_id",
+    "note_id",
+    "document_id",
+    "document_chunk_id",
+    "workspace_id",
+    "workspace_slug",
+    "workspace_milestone_id",
+    "resource_id",
+    "component_id",
+    "chat_session_id",
+    "chat_event_id",
+    "milestone_id",
+    "release_id",
+    "environment_id",
+    "deployment_id",
+    "feature_graph_id",
+    "user_id",
+    "refresh_token_hash",
+    // GraIL node labels
+    "topology_rule_id",
+    "predicted_link_id",
+    "analysis_profile_id",
+    // Chat anchors
+    "anchor_id",
+    "anchor_session_target",
+    "anchor_event_id",
+    // Skills, protocols, personas, alerts, routing
+    "skill_id",
+    "protocol_id",
+    "protocol_state_id",
+    "protocol_transition_id",
+    "protocol_run_id",
+    "persona_id",
+    "alert_dedup_key",
+    "routing_arm_key",
+    "routing_decision_id",
+];
+
 /// Client for Neo4j operations
 pub struct Neo4jClient {
     pub(crate) graph: Arc<Graph>,
@@ -460,6 +515,8 @@ impl Neo4jClient {
             "CREATE INDEX anchor_session IF NOT EXISTS FOR (a:Anchor) ON (a.session_id)",
             "CREATE INDEX anchor_event_session IF NOT EXISTS FOR (e:AnchorEvent) ON (e.session_id)",
             "CREATE INDEX anchor_event_anchor IF NOT EXISTS FOR (e:AnchorEvent) ON (e.anchor_id)",
+            // Journal order: `seq` is the per-session sequence number (see apply_anchor_op)
+            "CREATE INDEX anchor_event_session_seq IF NOT EXISTS FOR (e:AnchorEvent) ON (e.session_id, e.seq)",
             // ChatSession indexes — queried by project_slug, workspace_slug, cli_session_id
             "CREATE INDEX chat_session_project IF NOT EXISTS FOR (s:ChatSession) ON (s.project_slug)",
             "CREATE INDEX chat_session_workspace IF NOT EXISTS FOR (s:ChatSession) ON (s.workspace_slug)",
@@ -695,45 +752,7 @@ impl Neo4jClient {
         }
 
         // Verify all constraints were created successfully
-        let expected_constraints = vec![
-            "project_id",
-            "project_slug",
-            "file_path",
-            "function_id",
-            "struct_id",
-            "trait_id",
-            "enum_id",
-            "impl_id",
-            "import_id",
-            "commit_hash",
-            "plan_id",
-            "task_id",
-            "step_id",
-            "decision_id",
-            "constraint_id",
-            "agent_id",
-            "note_id",
-            "document_id",
-            "document_chunk_id",
-            "workspace_id",
-            "workspace_slug",
-            "workspace_milestone_id",
-            "resource_id",
-            "component_id",
-            "chat_session_id",
-            "chat_event_id",
-            "milestone_id",
-            "release_id",
-            "environment_id",
-            "deployment_id",
-            "feature_graph_id",
-            "user_id",
-            "refresh_token_hash",
-            // GraIL node labels
-            "topology_rule_id",
-            "predicted_link_id",
-            "analysis_profile_id",
-        ];
+        let expected_constraints = EXPECTED_CONSTRAINTS;
         match self
             .graph
             .execute(query(
@@ -744,7 +763,7 @@ impl Neo4jClient {
             Ok(mut result) => {
                 if let Ok(Some(row)) = result.next().await {
                     let names: Vec<String> = row.get("names").unwrap_or_default();
-                    for expected in &expected_constraints {
+                    for expected in expected_constraints {
                         if !names.iter().any(|n| n == *expected) {
                             tracing::error!(
                                 "MISSING CONSTRAINT: {} — MERGE operations will do full label scans. \
@@ -984,6 +1003,36 @@ mod where_builder_tests {
             let wb = crate::neo4j::note::build_note_where(p, ws, &f);
             assert_coherent(&wb, label);
             assert!(!wb.build().contains("OR 1=1"), "{label}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod schema_expectation_tests {
+    use super::EXPECTED_CONSTRAINTS;
+
+    /// Every `CREATE CONSTRAINT <name>` of this file must be in the list that
+    /// `verify_schema` checks, or a constraint that silently failed to be
+    /// created (duplicates in the data) would never be reported.
+    #[test]
+    fn verify_schema_expects_every_constraint_it_creates() {
+        let src = include_str!("client.rs");
+        let created: Vec<&str> = src
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("\"CREATE CONSTRAINT "))
+            .filter_map(|l| l.split_whitespace().next())
+            .collect();
+        assert!(
+            created.len() > 30,
+            "parsed too few constraints: {created:?}"
+        );
+        let missing: Vec<&&str> = created
+            .iter()
+            .filter(|n| !EXPECTED_CONSTRAINTS.contains(n))
+            .collect();
+        assert!(missing.is_empty(), "not verified: {missing:?}");
+        for anchor in ["anchor_id", "anchor_session_target", "anchor_event_id"] {
+            assert!(EXPECTED_CONSTRAINTS.contains(&anchor), "{anchor}");
         }
     }
 }

@@ -7929,7 +7929,18 @@ impl GraphStore for MockGraphStore {
             .filter(|a| a.session_id == session_id)
             .cloned()
             .collect();
-        let change = apply_op(session_id, &existing, op, chrono::Utc::now())?;
+        let mut change = apply_op(session_id, &existing, op, chrono::Utc::now())?;
+        let next_seq = store
+            .events
+            .iter()
+            .filter(|e| e.session_id == session_id)
+            .map(|e| e.seq)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        if let Some(ev) = change.event.as_mut() {
+            ev.seq = next_seq;
+        }
         if change.deleted {
             store.anchors.remove(&change.anchor.id);
         } else if change.event.is_some() {
@@ -7993,12 +8004,14 @@ impl GraphStore for MockGraphStore {
         session_id: Uuid,
     ) -> Result<Vec<crate::chat::anchor::AnchorEvent>> {
         let store = self.anchor_store.read().await;
-        Ok(store
+        let mut out: Vec<_> = store
             .events
             .iter()
             .filter(|e| e.session_id == session_id)
             .cloned()
-            .collect())
+            .collect();
+        out.sort_by_key(|e| (e.seq, e.at, e.id));
+        Ok(out)
     }
 
     async fn mark_anchors_dangling(
@@ -8080,6 +8093,11 @@ impl GraphStore for MockGraphStore {
             }
         }
         Ok(report)
+    }
+
+    async fn backfill_spawned_by_edges(&self) -> Result<usize> {
+        // The mock keeps no edges: its only lineage is the `spawned_by` JSON.
+        Ok(0)
     }
 
     async fn revert_inferred_anchors(&self) -> Result<usize> {
@@ -17313,6 +17331,50 @@ mod anchor_tests {
         assert!(store.list_anchor_events(gone).await.unwrap().is_empty());
         assert_eq!(store.list_session_anchors(keep).await.unwrap().len(), 1);
         assert_eq!(store.list_anchor_events(keep).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn anchor_journal_is_numbered_per_session_without_gaps() {
+        use crate::chat::anchor::*;
+        let store = MockGraphStore::new();
+        let (a, b) = (session(&store, None).await, session(&store, None).await);
+        let add = |t: &str| {
+            AnchorOp::Add(NewAnchor::new(
+                AnchorTargetType::File,
+                t,
+                [AnchorRole::Mention],
+                AnchorActor::User,
+                "t",
+            ))
+        };
+        let mut seqs = vec![];
+        for (s, t) in [(a, "1"), (b, "1"), (a, "2"), (a, "3")] {
+            seqs.push(
+                store
+                    .apply_anchor_op(s, add(t))
+                    .await
+                    .unwrap()
+                    .event
+                    .unwrap()
+                    .seq,
+            );
+        }
+        assert_eq!(seqs, vec![1, 1, 2, 3]);
+        // an operation that writes no event takes no number
+        assert!(store
+            .apply_anchor_op(a, add("2"))
+            .await
+            .map_or(true, |c| c.event.is_none()));
+        let last = store.apply_anchor_op(a, add("4")).await.unwrap();
+        assert_eq!(last.event.unwrap().seq, 4);
+        let journal: Vec<u64> = store
+            .list_anchor_events(a)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(journal, vec![1, 2, 3, 4]);
     }
 
     #[tokio::test]
