@@ -323,8 +323,8 @@ impl KnowledgeInjectionStage {
                 && bytes[i + 18] == b'-'
                 && bytes[i + 23] == b'-'
             {
-                let candidate = &message[i..i + 36];
-                if let Ok(uuid) = Uuid::parse_str(candidate) {
+                let candidate = message.get(i..i + 36);
+                if let Some(Ok(uuid)) = candidate.map(Uuid::parse_str) {
                     uuids.push(uuid);
                     i += 36;
                     continue;
@@ -1578,8 +1578,21 @@ mod tests {
 
     // ── Full stage tests with mocks ─────────────────────────────────────
 
+    #[test]
+    fn extract_uuids_does_not_panic_on_multibyte_text() {
+        // Dashes at the probed offsets, multi-byte characters under the slice.
+        let msg = "é-éé-éé-éé-éééééééééééééééééé 日本語日本語日本語-日本語日本語日本語日本語日本語日本語日本語 🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀";
+        assert!(KnowledgeInjectionStage::extract_uuids(msg).is_empty());
+        let id = "123e4567-e89b-42d3-a456-426614174000";
+        let found = KnowledgeInjectionStage::extract_uuids(&format!("é日 {id} 🦀"));
+        assert_eq!(found.len(), 1);
+    }
+
     #[tokio::test]
+    // One thread per test: a std guard held across await cannot self-deadlock.
+    #[allow(clippy::await_holding_lock)]
     async fn test_stage_no_project_skips() {
+        let _env = crate::chat::stages::intent_weights::lock_env();
         use crate::chat::enrichment::ParallelEnrichmentStage;
         let stage = make_test_stage();
         let input = EnrichmentInput {
@@ -1625,7 +1638,10 @@ mod tests {
     }
 
     #[tokio::test]
+    // One thread per test: a std guard held across await cannot self-deadlock.
+    #[allow(clippy::await_holding_lock)]
     async fn test_stage_with_project_runs_queries() {
+        let _env = crate::chat::stages::intent_weights::lock_env();
         use crate::chat::enrichment::ParallelEnrichmentStage;
         let stage = make_test_stage();
         let input = EnrichmentInput {
@@ -1646,7 +1662,10 @@ mod tests {
     }
 
     #[tokio::test]
+    // One thread per test: a std guard held across await cannot self-deadlock.
+    #[allow(clippy::await_holding_lock)]
     async fn test_stage_with_protocol_context_propagates_to_decision_record() {
+        let _env = crate::chat::stages::intent_weights::lock_env();
         use crate::chat::enrichment::ParallelEnrichmentStage;
         let stage = make_test_stage();
         let proto_run_id = Uuid::new_v4();

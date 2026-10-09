@@ -1328,7 +1328,7 @@ mod tests {
         assert!(
             buf.trim_end().ends_with('>'),
             "container cut: {}",
-            &buf[buf.len() - 40..]
+            buf.chars().rev().take(40).collect::<String>()
         );
         assert!(!buf.contains("</untrusted_data id=\"x\""));
         assert!(!buf.contains("\n## SYSTEM"));
