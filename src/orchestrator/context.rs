@@ -1378,6 +1378,7 @@ mod tests {
                 embedding: None,
                 embedding_model: None,
                 scar_intensity: 0.0,
+                sharing_consent: Default::default(),
             }],
             target_files: vec![],
             similar_code: vec![],
@@ -1857,6 +1858,7 @@ mod tests {
             embedding: None,
             embedding_model: None,
             scar_intensity: 0.0,
+            sharing_consent: Default::default(),
         };
         let front = vec![mk("f1"), mk("f2"), mk("f3")];
         let back = vec![mk("b1"), mk("b2")];

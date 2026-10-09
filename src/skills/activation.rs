@@ -1770,6 +1770,7 @@ mod tests {
             embedding: None,
             embedding_model: None,
             scar_intensity: 0.0,
+            sharing_consent: Default::default(),
         }
     }
 
@@ -4248,6 +4249,7 @@ mod tests {
             embedding: None,
             embedding_model: None,
             scar_intensity: 0.0,
+            sharing_consent: Default::default(),
         };
 
         let result = auto_anchor_decision(&store, &decision, Some("/tmp/project")).await;
@@ -4286,6 +4288,7 @@ mod tests {
             embedding: None,
             embedding_model: None,
             scar_intensity: 0.0,
+            sharing_consent: Default::default(),
         };
 
         let result = auto_anchor_decision(&store, &decision, Some("/tmp/project")).await;

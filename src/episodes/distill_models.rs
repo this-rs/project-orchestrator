@@ -134,6 +134,54 @@ pub enum SharingConsent {
     PolicyAuto,
 }
 
+impl SharingConsent {
+    /// Stable storage form (same string as the serde representation; what
+    /// `n.sharing_consent` / `d.sharing_consent` hold in Neo4j).
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            Self::NotSet => "not_set",
+            Self::ExplicitAllow => "explicit_allow",
+            Self::ExplicitDeny => "explicit_deny",
+            Self::PolicyAuto => "policy_auto",
+        }
+    }
+
+    /// Parse the storage form. An absent or unknown value is `NotSet`
+    /// (existing nodes have no property: they stay `NotSet`, never rewritten).
+    pub fn from_db_str(s: &str) -> Self {
+        match s {
+            "explicit_allow" => Self::ExplicitAllow,
+            "explicit_deny" => Self::ExplicitDeny,
+            "policy_auto" => Self::PolicyAuto,
+            _ => Self::NotSet,
+        }
+    }
+}
+
+/// Population of notes per consent value (see `count_notes_by_consent`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsentCounts {
+    pub not_set: u64,
+    pub explicit_allow: u64,
+    pub explicit_deny: u64,
+    pub policy_auto: u64,
+}
+
+impl ConsentCounts {
+    pub fn add(&mut self, c: SharingConsent, n: u64) {
+        match c {
+            SharingConsent::NotSet => self.not_set += n,
+            SharingConsent::ExplicitAllow => self.explicit_allow += n,
+            SharingConsent::ExplicitDeny => self.explicit_deny += n,
+            SharingConsent::PolicyAuto => self.policy_auto += n,
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.not_set + self.explicit_allow + self.explicit_deny + self.policy_auto
+    }
+}
+
 /// Audit trail entry for a sharing event (GDPR Art. 30).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharingEvent {

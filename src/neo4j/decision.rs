@@ -55,6 +55,11 @@ impl Neo4jClient {
             embedding: None,
             embedding_model: node.get::<String>("embedding_model").ok(),
             scar_intensity: node.get("scar_intensity").unwrap_or(0.0),
+            sharing_consent: node
+                .get::<String>("sharing_consent")
+                .ok()
+                .map(|s| crate::episodes::distill_models::SharingConsent::from_db_str(&s))
+                .unwrap_or_default(),
         })
     }
 
@@ -71,7 +76,8 @@ impl Neo4jClient {
                 chosen_option: $chosen_option,
                 decided_by: $decided_by,
                 decided_at: datetime($decided_at),
-                status: $status
+                status: $status,
+                sharing_consent: $sharing_consent
             })
             CREATE (t)-[:INFORMED_BY]->(d)
             RETURN d.id AS created_id
@@ -88,7 +94,11 @@ impl Neo4jClient {
         )
         .param("decided_by", decision.decided_by.clone())
         .param("decided_at", decision.decided_at.to_rfc3339())
-        .param("status", decision.status.to_string());
+        .param("status", decision.status.to_string())
+        .param(
+            "sharing_consent",
+            decision.sharing_consent.as_db_str().to_string(),
+        );
 
         let mut result = self.graph.execute(q).await?;
         if result.next().await?.is_none() {
@@ -903,7 +913,8 @@ impl Neo4jClient {
             RETURN d.id AS id, d.description AS description, d.rationale AS rationale,
                    d.alternatives AS alternatives, d.chosen_option AS chosen_option,
                    d.decided_by AS decided_by, d.decided_at AS decided_at,
-                   d.status AS status
+                   d.status AS status,
+                   d.sharing_consent AS sharing_consent
             "#,
         )
         .param("pid", project_id.to_string());
@@ -940,6 +951,11 @@ impl Neo4jClient {
                 embedding: None,
                 embedding_model: None,
                 scar_intensity: row.get("scar_intensity").unwrap_or(0.0),
+                sharing_consent: row
+                    .get::<String>("sharing_consent")
+                    .ok()
+                    .map(|s| crate::episodes::distill_models::SharingConsent::from_db_str(&s))
+                    .unwrap_or_default(),
             });
         }
 
@@ -978,6 +994,7 @@ mod parent_existence_tests {
             embedding: None,
             embedding_model: None,
             scar_intensity: 0.0,
+            sharing_consent: Default::default(),
         }
     }
 

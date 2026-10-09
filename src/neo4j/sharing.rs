@@ -1,7 +1,7 @@
 //! Neo4j Sharing & Privacy operations
 
 use super::client::Neo4jClient;
-use crate::episodes::distill_models::{SharingConsent, SharingEvent, SharingPolicy};
+use crate::episodes::distill_models::{ConsentCounts, SharingConsent, SharingEvent, SharingPolicy};
 use crate::reception::anchor::SignedTombstone;
 use anyhow::{Context, Result};
 use neo4rs::query;
@@ -101,6 +101,41 @@ impl Neo4jClient {
 
         self.graph.run(q).await?;
         Ok(())
+    }
+
+    /// Set the sharing consent of a decision.
+    pub async fn update_decision_sharing_consent(
+        &self,
+        decision_id: Uuid,
+        consent: &SharingConsent,
+    ) -> Result<()> {
+        let q = query("MATCH (d:Decision {id: $id}) SET d.sharing_consent = $consent")
+            .param("id", decision_id.to_string())
+            .param("consent", consent.as_db_str().to_string());
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Count notes per consent value (all statuses), for one project or all.
+    /// A missing property counts as `NotSet`. Read-only.
+    pub async fn count_notes_by_consent(&self, project_id: Option<Uuid>) -> Result<ConsentCounts> {
+        let q = query(
+            r#"
+            MATCH (n:Note)
+            WHERE $pid = '' OR n.project_id = $pid
+            RETURN coalesce(n.sharing_consent, 'not_set') AS consent, count(n) AS k
+            "#,
+        )
+        .param("pid", project_id.map(|p| p.to_string()).unwrap_or_default());
+
+        let mut counts = ConsentCounts::default();
+        let mut result = self.graph.execute(q).await?;
+        while let Some(row) = result.next().await? {
+            let consent: String = row.get("consent").unwrap_or_default();
+            let k: i64 = row.get("k").unwrap_or(0);
+            counts.add(SharingConsent::from_db_str(&consent), k.max(0) as u64);
+        }
+        Ok(counts)
     }
 
     // ========================================================================

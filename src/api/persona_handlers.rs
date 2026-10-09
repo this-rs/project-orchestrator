@@ -1163,6 +1163,7 @@ pub async fn import_persona(
             embedding: None,
             embedding_model: None,
             scar_intensity: 0.0,
+            sharing_consent: Default::default(),
         };
 
         // Create decision with a nil task_id (the trait requires it, but it just creates the node)

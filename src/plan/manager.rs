@@ -325,6 +325,7 @@ impl PlanManager {
             embedding: None,
             embedding_model: None,
             scar_intensity: 0.0,
+            sharing_consent: Default::default(),
         };
 
         self.neo4j.create_decision(task_id, &decision).await?;
@@ -632,6 +633,7 @@ impl PlanManager {
                 embedding: None,
                 embedding_model: None,
                 scar_intensity: 0.0,
+                sharing_consent: Default::default(),
             })
             .collect();
 
@@ -664,6 +666,7 @@ impl PlanManager {
                 embedding: None,
                 embedding_model: None,
                 scar_intensity: 0.0,
+                sharing_consent: Default::default(),
             })
             .collect();
 

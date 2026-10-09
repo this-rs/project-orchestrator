@@ -4250,6 +4250,22 @@ impl GraphStore for Neo4jClient {
         self.update_sharing_consent(note_id, consent).await
     }
 
+    async fn update_decision_sharing_consent(
+        &self,
+        decision_id: Uuid,
+        consent: &crate::episodes::distill_models::SharingConsent,
+    ) -> anyhow::Result<()> {
+        self.update_decision_sharing_consent(decision_id, consent)
+            .await
+    }
+
+    async fn count_notes_by_consent(
+        &self,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<crate::episodes::distill_models::ConsentCounts> {
+        self.count_notes_by_consent(project_id).await
+    }
+
     async fn create_sharing_event(
         &self,
         event: &crate::episodes::distill_models::SharingEvent,

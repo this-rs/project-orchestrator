@@ -3766,6 +3766,20 @@ pub trait GraphStore: Send + Sync {
         consent: &crate::episodes::distill_models::SharingConsent,
     ) -> Result<()>;
 
+    /// Set the sharing consent of a decision (`NotSet` for every pre-existing one).
+    async fn update_decision_sharing_consent(
+        &self,
+        decision_id: Uuid,
+        consent: &crate::episodes::distill_models::SharingConsent,
+    ) -> Result<()>;
+
+    /// Count notes per consent value, optionally for one project. Measures the
+    /// real `NotSet` population (read-only; no data is changed).
+    async fn count_notes_by_consent(
+        &self,
+        project_id: Option<Uuid>,
+    ) -> Result<crate::episodes::distill_models::ConsentCounts>;
+
     /// Create a sharing event (audit trail).
     async fn create_sharing_event(
         &self,

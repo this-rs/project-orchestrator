@@ -902,6 +902,11 @@ pub struct DecisionNode {
     /// Biomimicry: Elun HypersphereIdentity.Scar — penalizes decisions in search scoring.
     #[serde(default)]
     pub scar_intensity: f64,
+    /// Consent to share this decision beyond its project. `NotSet` for every
+    /// node written before this field existed (absent property); the project
+    /// policy decides for cross-project reads, see `sharing::consent_gate::may_read`.
+    #[serde(default)]
+    pub sharing_consent: crate::episodes::distill_models::SharingConsent,
 }
 
 fn default_decision_status() -> DecisionStatus {

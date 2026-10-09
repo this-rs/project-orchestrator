@@ -825,6 +825,7 @@ mod tests {
             decided_at: Utc::now(),
             decided_by: "agent".to_string(),
             scar_intensity: 0.0,
+            sharing_consent: Default::default(),
             embedding: None,
             embedding_model: None,
         };
@@ -886,6 +887,7 @@ mod tests {
             decided_at: Utc::now(),
             decided_by: "agent".to_string(),
             scar_intensity: 0.0,
+            sharing_consent: Default::default(),
             embedding: None,
             embedding_model: None,
         };
@@ -1254,6 +1256,7 @@ mod tests {
             decided_at: Utc::now(),
             decided_by: "agent".to_string(),
             scar_intensity: 0.0,
+            sharing_consent: Default::default(),
             embedding: None,
             embedding_model: None,
         };
@@ -1267,6 +1270,7 @@ mod tests {
             decided_at: Utc::now(),
             decided_by: "agent".to_string(),
             scar_intensity: 0.0,
+            sharing_consent: Default::default(),
             embedding: None,
             embedding_model: None,
         };
@@ -1487,6 +1491,7 @@ mod tests {
             decided_at: Utc::now(),
             decided_by: "agent".to_string(),
             scar_intensity: 0.0,
+            sharing_consent: Default::default(),
             embedding: None,
             embedding_model: None,
         };
