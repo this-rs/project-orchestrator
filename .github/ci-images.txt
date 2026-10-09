@@ -1,0 +1,9 @@
+# Third-party images mirrored to ghcr.io by .github/workflows/mirror-ci-images.yml.
+# One entry per line:  <source>@sha256:<index digest>  <target>
+# The digest is that of the multi-architecture INDEX; the mirror preserves it.
+# See docs/ci-images.md for how to update an entry.
+#
+# docker.io/library/neo4j:5 == 5.26.31 (linux/amd64 + linux/arm64), resolved 2026-10-09
+docker.io/library/neo4j@sha256:c7d25c0eeebfe125718d58b72ed5d663c85d0479047733845eb2237c67ce8069 ghcr.io/this-rs/ci-mirror/neo4j:5.26.31
+# docker.io/getmeili/meilisearch:v1.34 == v1.34.3 (linux/amd64 + linux/arm64), resolved 2026-10-09
+docker.io/getmeili/meilisearch@sha256:82767d2afc4fb6c3e4ebadb134ca6ef5687c894ae9e152928619393b1f331681 ghcr.io/this-rs/ci-mirror/meilisearch:v1.34.3
