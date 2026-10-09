@@ -3596,7 +3596,7 @@ impl ChatManager {
                     explicit_model: request.model.is_some(),
                     routing_mode: request.routing_mode,
                     permission_mode: request.permission_mode.as_deref(),
-                    message: &request.message,
+                    message: &crate::refs::turn::visible_text(&request.message),
                     next_turn: 1,
                 },
             )
@@ -9100,7 +9100,7 @@ impl ChatManager {
             super::provider::cognitive::load_routing(self.graph.as_ref(), project_slug).await?;
         let signature = match role {
             super::provider::resolver::Role::Pilot => TaskSignature::from_chat_request(
-                &request.message,
+                &crate::refs::turn::visible_text(&request.message),
                 !request.attachments.is_empty(),
                 project_slug,
                 ContextHints::default(),
@@ -9505,7 +9505,7 @@ impl ChatManager {
                 explicit_model: request.model.is_some(),
                 routing_mode: request.routing_mode,
                 permission_mode: request.permission_mode.as_deref(),
-                message: &request.message,
+                message: &crate::refs::turn::visible_text(&request.message),
                 next_turn: 0,
             },
         )

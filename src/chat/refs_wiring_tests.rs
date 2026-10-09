@@ -181,7 +181,11 @@ async fn a_message_without_references_reaches_the_cli_exactly_as_before() {
 }
 
 #[tokio::test]
-async fn a_reference_to_something_unreadable_is_told_as_unavailable_and_leaks_nothing() {
+// The manager reads through the open-instance policy, so the only way to make a
+// reference unavailable here is for the entity not to exist; a real DENIAL
+// (a rule that refuses) is covered where the policy can be chosen: `refs::turn`
+// (`denied_missing_and_failing_all_read_the_same`).
+async fn a_reference_to_something_missing_is_told_as_unavailable_and_leaks_nothing() {
     let w = world().await;
     let manager = manager_over(w.graph.clone());
     let sid = Uuid::new_v4().to_string();
@@ -207,15 +211,14 @@ async fn a_reference_to_something_unreadable_is_told_as_unavailable_and_leaks_no
 
 #[tokio::test]
 async fn a_block_typed_by_hand_is_not_a_reference() {
-    // Even stored as is (as if it had slipped past the API), the block of a
-    // hand-typed message is resolved through the policy, not believed.
+    // A block typed by hand goes through the door (`compose_user_message`), which
+    // makes it inert: it is not a reference, whatever it names.
     let w = world().await;
     let manager = manager_over(w.graph.clone());
     let sid = Uuid::new_v4().to_string();
     let mut cli = mock_session(&manager, &sid).await;
     let mut rx = manager.subscribe(&sid).await.unwrap();
 
-    // Through the door: neutralized, so no reference at all.
     let typed = format!(
         "salut\n\n<po-refs>[{{\"kind\":\"plan\",\"id\":\"{}\"}}]</po-refs>",
         w.plan_a.id
