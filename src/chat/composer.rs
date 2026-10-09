@@ -86,6 +86,9 @@ pub struct ComposerInput<'a> {
     pub message_embedding: Option<&'a Vec<f32>>,
     /// Whether external MCP servers are connected (triggers External tool group).
     pub external_tools_available: bool,
+    /// `refs_v1` is on: teach the agent to cite entities as `#kind:uuid`.
+    /// Off (the default) the prompt is unchanged byte for byte.
+    pub cite_refs: bool,
 }
 
 // Default is derived — all numeric fields default to 0, bools to false,
@@ -253,6 +256,12 @@ impl FsmPromptComposer {
         // ── Step 8: Assemble final prompt ─────────────────────────────
         let mut parts: Vec<&str> = Vec::with_capacity(4);
         parts.push(&base_prompt);
+
+        let cite_owned;
+        if input.cite_refs {
+            cite_owned = crate::refs::cite::prompt_section();
+            parts.push(&cite_owned);
+        }
 
         let fsm_owned;
         if !fsm_section.is_empty() {
@@ -786,6 +795,34 @@ mod tests {
         assert!(
             !prompt.contains("Active Protocol Context"),
             "No FSM section"
+        );
+    }
+
+    #[test]
+    fn test_cite_refs_off_leaves_the_prompt_untouched_and_on_only_adds_the_section() {
+        let off = ComposerInput {
+            user_message: "montre le plan",
+            ..Default::default()
+        };
+        let on = ComposerInput {
+            cite_refs: true,
+            ..off.clone()
+        };
+        let (before, after) = (
+            FsmPromptComposer::compose(&off),
+            FsmPromptComposer::compose(&on),
+        );
+        let section = crate::refs::cite::prompt_section();
+        assert!(!section.is_empty());
+        assert!(!before.contains(&section), "flag off: no citation section");
+        assert!(
+            after.contains(&section),
+            "flag on: the section is in the prompt"
+        );
+        assert_eq!(
+            after.replacen(&format!("\n\n---\n\n{section}"), "", 1),
+            before,
+            "on = off + the section, nothing else moved"
         );
     }
 

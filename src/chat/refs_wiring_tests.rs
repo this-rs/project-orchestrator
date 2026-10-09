@@ -307,3 +307,32 @@ async fn a_held_message_keeps_its_references_through_the_queue_an_edit_and_the_d
     next_event(&mut rx, |e| matches!(e, ChatEvent::RefsResolved { .. })).await;
     cli.inbound_message_tx.send(turn_over()).unwrap();
 }
+
+#[tokio::test]
+async fn the_system_prompt_teaches_citations_only_when_refs_v1_is_on() {
+    let section = crate::refs::cite::prompt_section();
+    let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+    let on = manager_over(graph.clone()).with_refs_v1(true);
+    let (prompt_on, _) = on
+        .build_system_prompt(None, "bonjour", None, None, None)
+        .await;
+    assert!(
+        prompt_on.contains(&section),
+        "flag on: the agent is taught the token"
+    );
+
+    let off = manager_over(graph).with_refs_v1(false);
+    let (prompt_off, _) = off
+        .build_system_prompt(None, "bonjour", None, None, None)
+        .await;
+    assert!(
+        !prompt_off.contains("#kind:uuid"),
+        "flag off: no trace of the feature"
+    );
+    assert_eq!(
+        prompt_on.replacen(&format!("\n\n---\n\n{section}"), "", 1),
+        prompt_off,
+        "flag off is the prompt as it was, byte for byte"
+    );
+}

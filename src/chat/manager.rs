@@ -2657,7 +2657,10 @@ impl ChatManager {
 
         // No project → compose with defaults (L0, no FSM, no dynamic context)
         let Some(slug) = project_slug else {
-            let input = ComposerInput::default();
+            let input = ComposerInput {
+                cite_refs: self.refs_v1,
+                ..Default::default()
+            };
             return (FsmPromptComposer::compose(&input), empty_ids);
         };
 
@@ -2669,7 +2672,10 @@ impl ChatManager {
                     "Failed to fetch project context for '{}': {} — using base prompt only",
                     slug, e
                 );
-                let input = ComposerInput::default();
+                let input = ComposerInput {
+                    cite_refs: self.refs_v1,
+                    ..Default::default()
+                };
                 return (FsmPromptComposer::compose(&input), empty_ids);
             }
         };
@@ -2846,6 +2852,7 @@ impl ChatManager {
             model: model.unwrap_or(""),
             message_embedding: message_embedding.as_ref(),
             external_tools_available,
+            cite_refs: self.refs_v1,
         };
 
         // Use compose_with_record to get the routing decision for trajectory tracking.

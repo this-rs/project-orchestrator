@@ -22,6 +22,7 @@
 
 pub mod access;
 pub mod block;
+pub mod cite;
 pub mod compose;
 pub mod flag;
 pub mod label;
