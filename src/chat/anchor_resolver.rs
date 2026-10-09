@@ -830,15 +830,100 @@ pub fn render_live_block(scope: &ResolvedScope) -> String {
 // Wiring: mode, project precedence, shadow report
 // ----------------------------------------------------------------------------
 
-/// Project epoch of the anchor-map cache key. The project is re-read each time
-/// the map is built (session open, resume, rebuild after a compaction) and the
-/// map is never rebuilt between two turns, so no counter tracks the project yet:
-/// constant 0.
-pub const PROJECT_EPOCH: u64 = 0;
-/// Consent epoch of the anchor-map cache key. The consent predicate has no
-/// versioned state yet: constant 0 (a change of consent takes effect at the next
-/// rebuild of the map, like a change of project).
-pub const CONSENT_EPOCH: u64 = 0;
+/// First 8 bytes of the SHA-256 of `s`: a stable (process-independent) hash.
+fn h64(s: &str) -> u64 {
+    let d = Sha256::digest(s.as_bytes());
+    u64::from_be_bytes(d[..8].try_into().expect("a digest has 32 bytes"))
+}
+
+/// Version of the anchors of a session: their number, the highest `version` and
+/// the latest `updated_at` among them. Any add, removal, role change, state change
+/// or move changes it; it is read off the anchors a turn already needs.
+pub fn anchor_epoch(anchors: &[Anchor]) -> u64 {
+    let max_version = anchors.iter().map(|a| a.version).max().unwrap_or(0);
+    let latest = anchors
+        .iter()
+        .map(|a| a.updated_at.timestamp_micros())
+        .max()
+        .unwrap_or(0);
+    h64(&format!("anchors|{}|{max_version}|{latest}", anchors.len()))
+}
+
+/// Stable text of a sharing policy (the override map is sorted).
+fn policy_fingerprint(p: &crate::episodes::distill_models::SharingPolicy) -> String {
+    let mut overrides: Vec<String> = p
+        .type_overrides
+        .iter()
+        .map(|(k, v)| format!("{k}={v:?}"))
+        .collect();
+    overrides.sort();
+    format!(
+        "{:?}|{}|{}|{:?}|{}",
+        p.mode,
+        overrides.join(","),
+        p.l3_scan_enabled,
+        p.min_shareability_score,
+        p.enabled
+    )
+}
+
+/// Consent epoch: the fingerprint of the sharing policies of the projects the
+/// session reads through (its own project and the projects it anchors). Any change
+/// of one of those policies changes it; reading the same policies gives the same
+/// value. (The policies of projects reached only through a node of another
+/// project are not in it: the age cap of the cache covers them.)
+pub async fn consent_epoch(
+    store: &dyn GraphStore,
+    project: Option<Uuid>,
+    anchors: &[Anchor],
+) -> Result<u64> {
+    let mut ids: BTreeSet<Uuid> = project.into_iter().collect();
+    ids.extend(
+        anchors
+            .iter()
+            .filter(|a| a.target_type == AnchorTargetType::Project)
+            .filter_map(|a| Uuid::parse_str(&a.target_id).ok()),
+    );
+    let mut s = String::from("consent");
+    for id in ids {
+        let fp = store
+            .get_sharing_policy(id)
+            .await?
+            .map(|p| policy_fingerprint(&p))
+            .unwrap_or_else(|| "unset".into());
+        s.push_str(&format!("|{id}={fp}"));
+    }
+    Ok(h64(&s))
+}
+
+/// The three epochs of an anchor map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Epochs {
+    /// [`anchor_epoch`] of the anchors.
+    pub anchor: u64,
+    /// Hash of the decided project (id and source) and of the anchor epoch.
+    pub project: u64,
+    /// [`consent_epoch`].
+    pub consent: u64,
+}
+
+impl Epochs {
+    fn of(decision: &ProjectDecision, anchor: u64, consent: u64) -> Self {
+        let pid = decision
+            .project
+            .as_ref()
+            .map(|p| p.id.to_string())
+            .unwrap_or_else(|| "-".into());
+        Self {
+            anchor,
+            project: h64(&format!(
+                "project|{pid}|{}|{anchor}",
+                decision.source.as_str()
+            )),
+            consent,
+        }
+    }
+}
 
 /// Environment variable selecting the [`AnchorContextMode`].
 pub const MODE_ENV: &str = "PO_ANCHOR_CONTEXT";
@@ -1032,11 +1117,12 @@ pub struct Resolution {
     pub decision: ProjectDecision,
     pub scope: ResolvedScope,
     pub anchors: Vec<Anchor>,
+    pub epochs: Epochs,
 }
 
 impl Resolution {
     pub fn cache_key(&self) -> String {
-        anchor_map_cache_key(&self.anchors, PROJECT_EPOCH, CONSENT_EPOCH)
+        anchor_map_cache_key(&self.anchors, self.epochs.project, self.epochs.consent)
     }
     /// The anchor map, for the cacheable prefix of the system prompt.
     pub fn map(&self) -> String {
@@ -1071,7 +1157,23 @@ pub async fn resolve_with_precedence(
     infer: &dyn CwdInference,
 ) -> Result<Resolution> {
     let anchors = store.list_session_anchors(session_id).await?;
+    resolve_from_anchors(store, session_id, inputs, infer, anchors).await
+}
+
+/// [`resolve_with_precedence`] on anchors already read.
+pub async fn resolve_from_anchors(
+    store: &dyn GraphStore,
+    session_id: Uuid,
+    inputs: &ProjectInputs<'_>,
+    infer: &dyn CwdInference,
+    anchors: Vec<Anchor>,
+) -> Result<Resolution> {
     let decision = decide_project(store, inputs, &anchors, infer).await?;
+    let epochs = Epochs::of(
+        &decision,
+        anchor_epoch(&anchors),
+        consent_epoch(store, decision.project.as_ref().map(|p| p.id), &anchors).await?,
+    );
     let scope = resolve_anchors(
         store,
         decision.project.clone(),
@@ -1083,6 +1185,7 @@ pub async fn resolve_with_precedence(
         decision,
         scope,
         anchors,
+        epochs,
     })
 }
 
@@ -1143,8 +1246,19 @@ pub async fn run_shadow_with(
             return None;
         }
     };
+    let report = shadow_report(&res, session_id, legacy_project, started);
+    journal_shadow(&report);
+    Some(report)
+}
+
+fn shadow_report(
+    res: &Resolution,
+    session_id: Uuid,
+    legacy_project: Option<&str>,
+    started: std::time::Instant,
+) -> ShadowReport {
     let resolver_project = res.decision.project.as_ref().map(|p| p.slug.clone());
-    let report = ShadowReport {
+    ShadowReport {
         session_id: session_id.to_string(),
         duration_ms: started.elapsed().as_millis() as u64,
         diverges: resolver_project.as_deref() != legacy_project,
@@ -1157,14 +1271,194 @@ pub async fn run_shadow_with(
         map_tokens: est_tokens(&res.map()),
         live_tokens: est_tokens(&res.live_block()),
         cache_key: res.cache_key(),
-    };
-    match serde_json::to_string(&report) {
+    }
+}
+
+fn journal_shadow(report: &ShadowReport) {
+    match serde_json::to_string(report) {
         Ok(json) => tracing::info!(target: "anchor_shadow", "{json}"),
         Err(e) => {
             tracing::warn!(target: "anchor_shadow", error = %e, "shadow report not serializable")
         }
     }
-    Some(report)
+}
+
+/// [`run_shadow`] through the session cache: the caller has claimed the run
+/// ([`AnchorCache::claim_shadow`]: nothing runs, no read, no line, while the last
+/// run is younger than [`SHADOW_RECHECK`]); the anchors are probed and a line is
+/// journalled only when something changed.
+pub async fn run_shadow_cached(
+    cache: &AnchorCache,
+    store: &dyn GraphStore,
+    session_id: Uuid,
+    inputs: &ProjectInputs<'_>,
+    legacy_project: Option<&str>,
+    infer: &dyn CwdInference,
+) -> Option<ShadowReport> {
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(
+        SHADOW_TIMEOUT,
+        cache.resolve(store, session_id, inputs, infer),
+    )
+    .await
+    {
+        Ok(Ok((res, false))) => {
+            let report = shadow_report(&res, session_id, legacy_project, started);
+            journal_shadow(&report);
+            Some(report)
+        }
+        Ok(Ok((_, true))) => None,
+        Ok(Err(e)) => {
+            tracing::warn!(target: "anchor_shadow", session_id = %session_id, error = %e, "shadow resolver failed (ignored)");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(target: "anchor_shadow", session_id = %session_id, "shadow resolver timed out (ignored)");
+            None
+        }
+    }
+}
+
+/// How long a shadow run is not repeated for a session (it only observes).
+pub const SHADOW_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
+/// Longest a cached resolution is trusted without being recomputed, whatever the
+/// epochs say: the titles and states of the nodes it shows live in the graph.
+pub const RESOLUTION_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+const CACHE_CAPACITY: usize = 256;
+
+struct CacheEntry {
+    fingerprint: String,
+    at: std::time::Instant,
+    resolution: std::sync::Arc<Resolution>,
+}
+
+/// What a session's turns share: the last resolution (valid while the epochs and
+/// the inputs are unchanged), when the shadow last ran, the warnings already given.
+#[derive(Default)]
+pub struct AnchorCache {
+    entries: std::sync::Mutex<HashMap<Uuid, CacheEntry>>,
+    shadow_at: std::sync::Mutex<HashMap<Uuid, std::time::Instant>>,
+    warned: std::sync::Mutex<HashSet<(Uuid, &'static str)>>,
+    /// Full resolutions computed / served from the cache (test counters).
+    pub computed: std::sync::atomic::AtomicUsize,
+    pub served: std::sync::atomic::AtomicUsize,
+}
+
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl AnchorCache {
+    fn fingerprint(inputs: &ProjectInputs<'_>) -> String {
+        format!(
+            "{}|{:?}|{}",
+            inputs.explicit_slug.unwrap_or(""),
+            inputs.place,
+            inputs.cwd
+        )
+    }
+
+    /// The resolution of a session, and whether the cache served it. One read of the
+    /// anchors, plus the sharing policies of the projects they name (the epochs);
+    /// the project lookups and the walks of the full resolution only when an epoch,
+    /// the inputs or the age say the last one is stale.
+    pub async fn resolve(
+        &self,
+        store: &dyn GraphStore,
+        session_id: Uuid,
+        inputs: &ProjectInputs<'_>,
+        infer: &dyn CwdInference,
+    ) -> Result<(std::sync::Arc<Resolution>, bool)> {
+        use std::sync::atomic::Ordering;
+        let anchors = store.list_session_anchors(session_id).await?;
+        let fingerprint = Self::fingerprint(inputs);
+        let last = lock(&self.entries)
+            .get(&session_id)
+            .filter(|e| e.fingerprint == fingerprint && e.at.elapsed() < RESOLUTION_MAX_AGE)
+            .map(|e| e.resolution.clone());
+        if let Some(last) = last {
+            if last.epochs.anchor == anchor_epoch(&anchors) {
+                let project = last.decision.project.as_ref().map(|p| p.id);
+                if last.epochs.consent == consent_epoch(store, project, &anchors).await? {
+                    self.served.fetch_add(1, Ordering::Relaxed);
+                    return Ok((last, true));
+                }
+            }
+        }
+        let res = std::sync::Arc::new(
+            resolve_from_anchors(store, session_id, inputs, infer, anchors).await?,
+        );
+        self.computed.fetch_add(1, Ordering::Relaxed);
+        let mut entries = lock(&self.entries);
+        if entries.len() >= CACHE_CAPACITY && !entries.contains_key(&session_id) {
+            if let Some(oldest) = entries.iter().min_by_key(|(_, e)| e.at).map(|(k, _)| *k) {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(
+            session_id,
+            CacheEntry {
+                fingerprint,
+                at: std::time::Instant::now(),
+                resolution: res.clone(),
+            },
+        );
+        Ok((res, false))
+    }
+
+    /// The anchor epoch of the last resolution of a session (no read).
+    pub fn anchor_epoch_of(&self, session_id: Uuid) -> Option<u64> {
+        lock(&self.entries)
+            .get(&session_id)
+            .map(|e| e.resolution.epochs.anchor)
+    }
+
+    /// Whether a shadow run is due for the session; true at most once per
+    /// [`SHADOW_RECHECK`].
+    pub fn claim_shadow(&self, session_id: Uuid) -> bool {
+        let mut at = lock(&self.shadow_at);
+        let due = at
+            .get(&session_id)
+            .is_none_or(|t| t.elapsed() >= SHADOW_RECHECK);
+        if due {
+            at.insert(session_id, std::time::Instant::now());
+        }
+        due
+    }
+
+    /// True the first time `what` is asked for `session_id`: warn once per session.
+    pub fn first_time(&self, session_id: Uuid, what: &'static str) -> bool {
+        lock(&self.warned).insert((session_id, what))
+    }
+
+    /// Forget a closed session.
+    pub fn forget(&self, session_id: Uuid) {
+        lock(&self.entries).remove(&session_id);
+        lock(&self.shadow_at).remove(&session_id);
+        lock(&self.warned).retain(|(s, _)| *s != session_id);
+    }
+}
+
+/// The anchor state of a session as its turns see it: the mode, resolved ONCE when
+/// the session is opened or resumed (never re-read from the environment), and the
+/// cache shared with the manager.
+#[derive(Clone)]
+pub struct AnchorSession {
+    pub mode: AnchorContextMode,
+    pub cache: std::sync::Arc<AnchorCache>,
+}
+
+impl AnchorSession {
+    pub fn new(mode: AnchorContextMode, cache: std::sync::Arc<AnchorCache>) -> Self {
+        Self { mode, cache }
+    }
+}
+
+impl Default for AnchorSession {
+    /// Mode `off` with a private cache.
+    fn default() -> Self {
+        Self::new(AnchorContextMode::Off, Default::default())
+    }
 }
 
 /// How long a hook trusts the project it resolved for its session.
@@ -1172,11 +1466,23 @@ pub const SESSION_PROJECT_TTL: std::time::Duration = std::time::Duration::from_s
 
 /// The resolved project of one session, for the per-tool hooks: they consume it
 /// instead of re-deducing a project from the cwd of each tool. Kept for
-/// [`SESSION_PROJECT_TTL`], so an anchor put mid-session is picked up.
+/// [`SESSION_PROJECT_TTL`], and dropped as soon as the anchors of the session are
+/// seen to have changed (the turn's resolution publishes their epoch in the
+/// shared [`AnchorCache`]), so an anchor put mid-session is picked up at the next
+/// turn instead of 30 s later.
 pub struct SessionProject {
     graph: std::sync::Arc<dyn GraphStore>,
     session_id: Uuid,
-    cache: std::sync::Mutex<Option<(std::time::Instant, Option<Uuid>)>>,
+    shared: Option<std::sync::Arc<AnchorCache>>,
+    cache: std::sync::Mutex<Option<ProjectMemo>>,
+}
+
+#[derive(Clone, Copy)]
+struct ProjectMemo {
+    at: std::time::Instant,
+    project: Option<Uuid>,
+    /// Anchor epoch known to the shared cache when the project was computed.
+    epoch: Option<u64>,
 }
 
 impl SessionProject {
@@ -1184,22 +1490,39 @@ impl SessionProject {
         Self {
             graph,
             session_id,
+            shared: None,
             cache: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Invalidate the memo when the anchor epoch published in `shared` changes.
+    pub fn with_anchor_cache(mut self, shared: std::sync::Arc<AnchorCache>) -> Self {
+        self.shared = Some(shared);
+        self
+    }
+
+    fn known_epoch(&self) -> Option<u64> {
+        self.shared
+            .as_ref()
+            .and_then(|c| c.anchor_epoch_of(self.session_id))
     }
 
     /// The project of the session by the precedence; `None` when it has none
     /// (or cannot be read: a hook never fails on it).
     pub async fn project_id(&self) -> Option<Uuid> {
-        if let Some((at, id)) = *self.cache.lock().unwrap_or_else(|e| e.into_inner()) {
-            if at.elapsed() < SESSION_PROJECT_TTL {
-                return id;
+        if let Some(memo) = *lock(&self.cache) {
+            if memo.at.elapsed() < SESSION_PROJECT_TTL && memo.epoch == self.known_epoch() {
+                return memo.project;
             }
         }
-        let id = self.compute().await;
-        *self.cache.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some((std::time::Instant::now(), id));
-        id
+        let epoch = self.known_epoch();
+        let project = self.compute().await;
+        *lock(&self.cache) = Some(ProjectMemo {
+            at: std::time::Instant::now(),
+            project,
+            epoch,
+        });
+        project
     }
 
     async fn compute(&self) -> Option<Uuid> {
@@ -2185,5 +2508,251 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, Some(p.id));
+    }
+
+    // ── Epochs, per-session cache, shadow cost ─────────────────────────────
+
+    fn reads(store: &MockGraphStore) -> usize {
+        store.store_reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A session of project alpha with a human project anchor and a plan anchor.
+    async fn anchored_fx() -> Fx {
+        let f = fx().await;
+        f.seed(node("p1", "plan", "Plan one", 1.0), f.a).await;
+        f.seed(node("t1", "task", "Task one", 0.9), f.a).await;
+        f.edge("p1", "t1", 0.9).await;
+        f.anchor(AnchorTargetType::Plan, "p1", &[AnchorRole::Focus])
+            .await;
+        f.anchor(
+            AnchorTargetType::Project,
+            &f.a.to_string(),
+            &[AnchorRole::Origin],
+        )
+        .await;
+        f
+    }
+
+    #[tokio::test]
+    async fn epochs_are_real_and_move_only_with_what_they_cover() {
+        let f = anchored_fx().await;
+        let inp = inputs(Some("alpha"), ExecutionPlace::Project, "/w");
+        let infer = Infer::new(None);
+        let r1 = resolve_with_precedence(&f.store, f.session, &inp, &infer)
+            .await
+            .unwrap();
+        let r2 = resolve_with_precedence(&f.store, f.session, &inp, &infer)
+            .await
+            .unwrap();
+        assert_ne!(r1.epochs.anchor, 0);
+        assert_eq!(r1.epochs, r2.epochs, "nothing changed: same epochs");
+        assert_eq!(r1.cache_key(), r2.cache_key(), "nothing changed: same key");
+
+        // another anchor: the anchor epoch, hence the key, move
+        f.seed(node("p2", "plan", "Plan two", 1.0), f.a).await;
+        f.seed(node("t2", "task", "Task two", 0.9), f.a).await;
+        f.edge("p2", "t2", 0.9).await;
+        f.anchor(AnchorTargetType::Plan, "p2", &[AnchorRole::Focus])
+            .await;
+        let r3 = resolve_with_precedence(&f.store, f.session, &inp, &infer)
+            .await
+            .unwrap();
+        assert_ne!(r3.epochs.anchor, r1.epochs.anchor);
+        assert_ne!(r3.cache_key(), r1.cache_key());
+        assert_eq!(r3.epochs.consent, r1.epochs.consent);
+
+        // a role promoted: the version of the anchor moves the epoch
+        let before = anchor_epoch(&f.store.list_session_anchors(f.session).await.unwrap());
+        let a = f.store.list_session_anchors(f.session).await.unwrap()[0].clone();
+        f.store
+            .promote_anchor_role(
+                f.session,
+                a.id,
+                AnchorRole::Mention,
+                a.version,
+                AnchorActor::User,
+                "t",
+            )
+            .await
+            .unwrap();
+        let after = anchor_epoch(&f.store.list_session_anchors(f.session).await.unwrap());
+        assert_ne!(before, after);
+
+        // the sharing policy of the anchored project: the consent epoch, hence the key
+        let before = r3.cache_key();
+        let policy = SharingPolicy {
+            enabled: true,
+            ..Default::default()
+        };
+        f.store.update_sharing_policy(f.a, &policy).await.unwrap();
+        let r4 = resolve_with_precedence(&f.store, f.session, &inp, &infer)
+            .await
+            .unwrap();
+        assert_ne!(r4.epochs.consent, r3.epochs.consent);
+        assert_ne!(r4.cache_key(), before);
+        // the same policy read twice: the same fingerprint
+        assert_eq!(
+            consent_epoch(&f.store, Some(f.a), &[]).await.unwrap(),
+            consent_epoch(&f.store, Some(f.a), &[]).await.unwrap()
+        );
+    }
+
+    /// The measure of the cost of a turn: reads of the store per turn, with the
+    /// cache and without it.
+    #[tokio::test]
+    async fn the_cache_serves_a_turn_without_the_walks_and_recomputes_on_change() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let f = anchored_fx().await;
+        let inp = inputs(Some("alpha"), ExecutionPlace::Project, "/w");
+        let infer = Infer::new(None);
+
+        let b = reads(&f.store);
+        resolve_with_precedence(&f.store, f.session, &inp, &infer)
+            .await
+            .unwrap();
+        let uncached = reads(&f.store) - b;
+
+        let cache = AnchorCache::default();
+        let b = reads(&f.store);
+        let (first, hit) = cache
+            .resolve(&f.store, f.session, &inp, &infer)
+            .await
+            .unwrap();
+        let miss = reads(&f.store) - b;
+        assert!(!hit);
+        let b = reads(&f.store);
+        let (second, hit) = cache
+            .resolve(&f.store, f.session, &inp, &infer)
+            .await
+            .unwrap();
+        let cached = reads(&f.store) - b;
+        assert!(hit);
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        eprintln!("store reads per turn: uncached={uncached} miss={miss} cached={cached}");
+        assert!(
+            cached < uncached,
+            "cached turn {cached} reads, uncached {uncached}"
+        );
+        assert_eq!(cache.computed.load(Relaxed), 1);
+        assert_eq!(cache.served.load(Relaxed), 1);
+
+        // an anchor added: the next call recomputes, and serves the new anchor
+        f.seed(node("p2", "plan", "Plan two", 1.0), f.a).await;
+        f.seed(node("t2", "task", "Task two", 0.9), f.a).await;
+        f.edge("p2", "t2", 0.9).await;
+        f.anchor(AnchorTargetType::Plan, "p2", &[AnchorRole::Focus])
+            .await;
+        let (third, hit) = cache
+            .resolve(&f.store, f.session, &inp, &infer)
+            .await
+            .unwrap();
+        assert!(!hit);
+        assert!(
+            third.live_block().contains("Task two"),
+            "{}",
+            third.live_block()
+        );
+        // a consent change: recomputed too
+        f.store
+            .update_sharing_policy(
+                f.a,
+                &SharingPolicy {
+                    enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (_, hit) = cache
+            .resolve(&f.store, f.session, &inp, &infer)
+            .await
+            .unwrap();
+        assert!(!hit);
+        // other inputs (another cwd): recomputed
+        let other = inputs(Some("alpha"), ExecutionPlace::Project, "/elsewhere");
+        let (_, hit) = cache
+            .resolve(&f.store, f.session, &other, &infer)
+            .await
+            .unwrap();
+        assert!(!hit);
+        assert_eq!(cache.computed.load(Relaxed), 4);
+    }
+
+    #[tokio::test]
+    async fn the_shadow_costs_nothing_between_two_turns_and_journals_only_a_change() {
+        let f = anchored_fx().await;
+        let inp = inputs(Some("alpha"), ExecutionPlace::Project, "/w");
+        let infer = Infer::new(None);
+        let cache = AnchorCache::default();
+        // turn 1: due, runs and journals
+        assert!(cache.claim_shadow(f.session));
+        let report =
+            run_shadow_cached(&cache, &f.store, f.session, &inp, Some("alpha"), &infer).await;
+        assert!(report.is_some());
+        // turn 2 and 3: not due, not a single read
+        let b = reads(&f.store);
+        assert!(!cache.claim_shadow(f.session));
+        assert!(!cache.claim_shadow(f.session));
+        assert_eq!(reads(&f.store), b, "no read between two shadow runs");
+        // a probe after the recheck delay, nothing changed: no line
+        let again =
+            run_shadow_cached(&cache, &f.store, f.session, &inp, Some("alpha"), &infer).await;
+        assert!(
+            again.is_none(),
+            "unchanged anchors are not journalled again"
+        );
+        // an anchor put: journalled
+        f.seed(node("p2", "plan", "Plan two", 1.0), f.a).await;
+        f.seed(node("t2", "task", "Task two", 0.9), f.a).await;
+        f.edge("p2", "t2", 0.9).await;
+        f.anchor(AnchorTargetType::Plan, "p2", &[AnchorRole::Focus])
+            .await;
+        let changed = run_shadow_cached(&cache, &f.store, f.session, &inp, Some("alpha"), &infer)
+            .await
+            .expect("a change is journalled");
+        assert!(changed.cache_key != report.unwrap().cache_key);
+    }
+
+    #[tokio::test]
+    async fn a_hook_project_follows_the_anchor_epoch_of_the_turn_not_the_ttl() {
+        let store = std::sync::Arc::new(MockGraphStore::new());
+        let p = test_project_named("hooked-live");
+        store.create_project(&p).await.unwrap();
+        let mut s = test_chat_session(None);
+        s.execution_place = ExecutionPlace::Neutral;
+        s.cwd = neutral_cwd();
+        store.create_chat_session(&s).await.unwrap();
+        let graph: std::sync::Arc<dyn GraphStore> = store.clone();
+        let shared = std::sync::Arc::new(AnchorCache::default());
+        let sp = SessionProject::new(graph.clone(), s.id).with_anchor_cache(shared.clone());
+        let inp = ProjectInputs::of_session(&s);
+        let infer = GraphCwdInference(graph.as_ref());
+        // turn 1 (publishes the epoch of the empty anchors), the hook has no project
+        shared
+            .resolve(graph.as_ref(), s.id, &inp, &infer)
+            .await
+            .unwrap();
+        assert_eq!(sp.project_id().await, None);
+        store
+            .apply_anchor_op(
+                s.id,
+                AnchorOp::Add(NewAnchor::new(
+                    AnchorTargetType::Project,
+                    p.id.to_string(),
+                    [AnchorRole::Focus],
+                    AnchorActor::User,
+                    "u",
+                )),
+            )
+            .await
+            .unwrap();
+        // within the TTL and before the next turn: still the memo
+        assert_eq!(sp.project_id().await, None);
+        // the next turn sees the anchor: the memo is dropped, no 30 s wait
+        shared
+            .resolve(graph.as_ref(), s.id, &inp, &infer)
+            .await
+            .unwrap();
+        assert_eq!(sp.project_id().await, Some(p.id));
     }
 }

@@ -580,6 +580,40 @@ pub fn test_milestone(project_id: Uuid, title: &str) -> MilestoneNode {
     }
 }
 
+/// A plan "Plan mid" with a task "Task mid" next to it in the neighborhood graph,
+/// both owned by `project`; returns the id of the plan.
+pub async fn seed_plan_with_task(
+    mock: &crate::neo4j::mock::MockGraphStore,
+    project: Uuid,
+) -> String {
+    use crate::graph::neighborhood::RawNode;
+    let node = |id: String, ty: &str, label: &str| RawNode {
+        id,
+        node_type: ty.into(),
+        label: label.into(),
+        subtitle: None,
+        weight: 1.0,
+    };
+    let plan = Uuid::new_v4().to_string();
+    let task = Uuid::new_v4().to_string();
+    for n in [
+        node(plan.clone(), "plan", "Plan mid"),
+        node(task.clone(), "task", "Task mid"),
+    ] {
+        mock.neighborhood_ownership
+            .write()
+            .await
+            .project_of
+            .insert(n.id.clone(), project.to_string());
+        mock.neighborhood_graph.write().await.add_node(n);
+    }
+    mock.neighborhood_graph
+        .write()
+        .await
+        .add_edge(&plan, &task, "RELATES_TO", 0.9);
+    plan
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
