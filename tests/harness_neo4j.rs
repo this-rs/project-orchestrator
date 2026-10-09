@@ -639,3 +639,304 @@ mod anchors {
         store.delete_chat_session(parent).await.unwrap();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Synaptic writes and note propagation: the Cypher of `reinforce_synapses`,
+// `weaken_node_synapses` and `get_propagated_notes`, scoped per project.
+// ---------------------------------------------------------------------------
+
+mod synapse_scope {
+    use super::*;
+    use project_orchestrator::episodes::distill_models::SharingConsent;
+    use project_orchestrator::notes::{EntityType, Note, NoteImportance, NoteType};
+
+    fn note(project: Uuid, importance: NoteImportance, consent: SharingConsent) -> Note {
+        let mut n = Note::new(
+            Some(project),
+            NoteType::Guideline,
+            format!("t0ab {}", Uuid::new_v4()),
+            "t0ab".into(),
+        );
+        n.importance = importance;
+        n.energy = 0.5;
+        n.sharing_consent = consent;
+        n
+    }
+
+    async fn make(
+        e: &Env,
+        project: Uuid,
+        importance: NoteImportance,
+        consent: SharingConsent,
+    ) -> Note {
+        let n = note(project, importance, consent);
+        e.client.create_note(&n).await.unwrap();
+        // create_note does not persist `sharing_consent`: set it explicitly.
+        e.client
+            .update_sharing_consent(n.id, &consent)
+            .await
+            .unwrap();
+        n
+    }
+
+    async fn count(e: &Env, cypher: &str, ids: &[Uuid]) -> i64 {
+        let ids: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        let mut r = e
+            .raw
+            .execute(query(cypher).param("ids", ids))
+            .await
+            .unwrap();
+        r.next().await.unwrap().unwrap().get("n").unwrap()
+    }
+
+    async fn cleanup(e: &Env, ids: &[Uuid], file: Option<&str>) {
+        let ids: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        e.raw
+            .run(query("MATCH (n:Note) WHERE n.id IN $ids DETACH DELETE n").param("ids", ids))
+            .await
+            .unwrap();
+        if let Some(p) = file {
+            e.raw
+                .run(query("MATCH (f:File {path: $p}) DETACH DELETE f").param("p", p.to_string()))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn reinforce_synapses_counts_only_pairs_really_reinforced() {
+        let Some(e) = env().await else { return };
+        let (p, q) = (Uuid::new_v4(), Uuid::new_v4());
+        let a1 = make(&e, p, NoteImportance::Medium, SharingConsent::NotSet).await;
+        let a2 = make(&e, p, NoteImportance::Medium, SharingConsent::NotSet).await;
+        let b1 = make(&e, q, NoteImportance::Medium, SharingConsent::NotSet).await;
+        let ids = [a1.id, a2.id, b1.id];
+
+        // 3 pairs, only (a1, a2) shares a project: 1 pair = 2 directed synapses.
+        let n = e
+            .client
+            .reinforce_synapses(&[a1.id, a2.id, b1.id, Uuid::new_v4()], 0.1)
+            .await
+            .unwrap();
+        let total = count(
+            &e,
+            "MATCH (a:Note)-[s:SYNAPSE]->(b:Note) WHERE a.id IN $ids AND b.id IN $ids \
+             RETURN count(s) AS n",
+            &ids,
+        )
+        .await;
+        assert_eq!(total, 2, "only the same-project pair is wired");
+        assert_eq!(
+            n as i64, total,
+            "the count is what was written, not an upper bound"
+        );
+
+        // Nothing reinforceable at all: 0, not pairs * 2.
+        let none = e
+            .client
+            .reinforce_synapses(&[a1.id, b1.id], 0.1)
+            .await
+            .unwrap();
+        assert_eq!(none, 0);
+        cleanup(&e, &ids, None).await;
+    }
+
+    #[tokio::test]
+    async fn weaken_node_synapses_leaves_cross_project_synapses_alone() {
+        let Some(e) = env().await else { return };
+        let (p, q) = (Uuid::new_v4(), Uuid::new_v4());
+        let a1 = make(&e, p, NoteImportance::Medium, SharingConsent::NotSet).await;
+        let a2 = make(&e, p, NoteImportance::Medium, SharingConsent::NotSet).await;
+        let b1 = make(&e, q, NoteImportance::Medium, SharingConsent::NotSet).await;
+        let ids = [a1.id, a2.id, b1.id];
+        e.client
+            .create_synapses(a1.id, &[(a2.id, 0.5)])
+            .await
+            .unwrap();
+        e.client
+            .create_synapses(a1.id, &[(b1.id, 0.5)])
+            .await
+            .unwrap();
+
+        let weakened = e
+            .client
+            .weaken_node_synapses(a1.id, 0.1, 0.05)
+            .await
+            .unwrap();
+        let mut r = e
+            .raw
+            .execute(
+                query(
+                    "MATCH (:Note {id: $a})-[s:SYNAPSE]-(:Note {id: $b}) RETURN collect(s.weight) AS w",
+                )
+                .param("a", a1.id.to_string())
+                .param("b", b1.id.to_string()),
+            )
+            .await
+            .unwrap();
+        let w: Vec<f64> = r.next().await.unwrap().unwrap().get("w").unwrap();
+        assert!(
+            !w.is_empty() && w.iter().all(|x| (x - 0.5).abs() < 1e-9),
+            "cross-project untouched: {w:?}"
+        );
+        assert_eq!(weakened, 2, "the same-project synapse, both directions");
+        cleanup(&e, &ids, None).await;
+    }
+
+    /// 25 foreign notes outrank 5 local ones; a LIMIT before the project filter
+    /// would return no local note at all.
+    #[tokio::test]
+    async fn get_propagated_notes_filters_project_before_the_limit() {
+        let Some(e) = env().await else { return };
+        let (me, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let file = format!("/t0ab/{}/f.rs", Uuid::new_v4());
+        e.raw
+            .run(query("CREATE (:File {path: $p})").param("p", file.clone()))
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        let mut local = Vec::new();
+        for _ in 0..25 {
+            let n = make(
+                &e,
+                other,
+                NoteImportance::Critical,
+                SharingConsent::ExplicitAllow,
+            )
+            .await;
+            e.client
+                .link_note_to_entity(n.id, &EntityType::File, &file, None, None)
+                .await
+                .unwrap();
+            ids.push(n.id);
+        }
+        for _ in 0..5 {
+            let n = make(&e, me, NoteImportance::Low, SharingConsent::NotSet).await;
+            e.client
+                .link_note_to_entity(n.id, &EntityType::File, &file, None, None)
+                .await
+                .unwrap();
+            ids.push(n.id);
+            local.push(n.id);
+        }
+
+        let got = e
+            .client
+            .get_propagated_notes(&EntityType::File, &file, 2, 0.0, None, Some(me), false)
+            .await
+            .unwrap();
+        let mut got_ids: Vec<Uuid> = got.iter().map(|p| p.note.id).collect();
+        got_ids.sort();
+        local.sort();
+        assert_eq!(got_ids, local, "Project scope: exactly the 5 local notes");
+        cleanup(&e, &ids, Some(&file)).await;
+    }
+
+    /// ExplicitDeny foreign notes (more relevant than the local ones) must not
+    /// eat the LIMIT in CrossProject.
+    #[tokio::test]
+    async fn get_propagated_notes_explicit_deny_is_filtered_before_the_limit() {
+        let Some(e) = env().await else { return };
+        let (me, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let file = format!("/t0ab/{}/g.rs", Uuid::new_v4());
+        e.raw
+            .run(query("CREATE (:File {path: $p})").param("p", file.clone()))
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        let mut local = Vec::new();
+        for _ in 0..25 {
+            let n = make(
+                &e,
+                other,
+                NoteImportance::Critical,
+                SharingConsent::ExplicitDeny,
+            )
+            .await;
+            e.client
+                .link_note_to_entity(n.id, &EntityType::File, &file, None, None)
+                .await
+                .unwrap();
+            ids.push(n.id);
+        }
+        for _ in 0..5 {
+            let n = make(&e, me, NoteImportance::Low, SharingConsent::NotSet).await;
+            e.client
+                .link_note_to_entity(n.id, &EntityType::File, &file, None, None)
+                .await
+                .unwrap();
+            ids.push(n.id);
+            local.push(n.id);
+        }
+        let got = e
+            .client
+            .get_propagated_notes(&EntityType::File, &file, 2, 0.0, None, Some(me), true)
+            .await
+            .unwrap();
+        let mut got_ids: Vec<Uuid> = got.iter().map(|p| p.note.id).collect();
+        got_ids.sort();
+        local.sort();
+        assert_eq!(
+            got_ids, local,
+            "CrossProject: denied notes never reach the LIMIT"
+        );
+        cleanup(&e, &ids, Some(&file)).await;
+    }
+
+    /// CrossProject: coupling weights the score BEFORE the cut. Uncoupled foreign
+    /// notes (weight 0) that outrank the local ones raw must not push them out.
+    #[tokio::test]
+    async fn get_propagated_notes_cross_project_weights_before_the_limit() {
+        let Some(e) = env().await else { return };
+        let (me, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let file = format!("/t0ab/{}/h.rs", Uuid::new_v4());
+        e.raw
+            .run(query("CREATE (:File {path: $p})").param("p", file.clone()))
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        let mut local = Vec::new();
+        for _ in 0..25 {
+            let n = make(
+                &e,
+                other,
+                NoteImportance::Critical,
+                SharingConsent::ExplicitAllow,
+            )
+            .await;
+            e.client
+                .link_note_to_entity(n.id, &EntityType::File, &file, None, None)
+                .await
+                .unwrap();
+            ids.push(n.id);
+        }
+        for _ in 0..5 {
+            let n = make(&e, me, NoteImportance::Low, SharingConsent::NotSet).await;
+            e.client
+                .link_note_to_entity(n.id, &EntityType::File, &file, None, None)
+                .await
+                .unwrap();
+            ids.push(n.id);
+            local.push(n.id);
+        }
+        let got = e
+            .client
+            .get_propagated_notes(&EntityType::File, &file, 2, 0.0, None, Some(me), true)
+            .await
+            .unwrap();
+        assert!(got.len() <= 20);
+        for l in &local {
+            assert!(
+                got.iter().any(|p| p.note.id == *l),
+                "local note {l} was cut before the coupling weighting"
+            );
+        }
+        // Weighted order: local notes (coupling 1) come before the uncoupled foreign ones.
+        let first_five: Vec<Uuid> = got.iter().take(5).map(|p| p.note.id).collect();
+        assert!(
+            first_five.iter().all(|i| local.contains(i)),
+            "{first_five:?}"
+        );
+        cleanup(&e, &ids, Some(&file)).await;
+    }
+}

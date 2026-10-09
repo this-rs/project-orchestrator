@@ -4019,6 +4019,12 @@ pub async fn reinforce_isomorphic_synapses(
         for file_path in &group.members {
             if let Ok(notes) = neo4j.get_notes_for_entity(&entity_type, file_path).await {
                 for note in notes {
+                    // get_notes_for_entity is not project-scoped: a file path can
+                    // anchor notes of other projects, which this project-wide pass
+                    // must neither boost nor wire.
+                    if note.project_id != Some(project_id) {
+                        continue;
+                    }
                     if !note_ids.contains(&note.id) {
                         note_ids.push(note.id);
                     }

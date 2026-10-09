@@ -430,6 +430,14 @@ impl GraphStore for Neo4jClient {
         self.get_file(path).await
     }
 
+    async fn find_files_by_path_suffix(
+        &self,
+        suffix: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, Option<Uuid>)>> {
+        self.find_files_by_path_suffix(suffix, limit).await
+    }
+
     async fn list_project_files(&self, project_id: Uuid) -> anyhow::Result<Vec<FileNode>> {
         self.list_project_files(project_id).await
     }

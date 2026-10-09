@@ -6,6 +6,7 @@
 //! Notes can be linked to code entities and automatically surfaced to agents
 //! based on relevance and graph propagation.
 
+pub mod coactivation;
 pub mod hashing;
 pub mod lifecycle;
 pub mod manager;

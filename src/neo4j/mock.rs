@@ -1650,6 +1650,24 @@ impl GraphStore for MockGraphStore {
         Ok(self.files.read().await.get(path).cloned())
     }
 
+    async fn find_files_by_path_suffix(
+        &self,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, Option<Uuid>)>> {
+        let mut out: Vec<(String, Option<Uuid>)> = self
+            .files
+            .read()
+            .await
+            .values()
+            .filter(|f| f.path.ends_with(suffix))
+            .map(|f| (f.path.clone(), f.project_id))
+            .collect();
+        out.sort();
+        out.truncate(limit);
+        Ok(out)
+    }
+
     async fn list_project_files(&self, project_id: Uuid) -> Result<Vec<FileNode>> {
         let pf = self.project_files.read().await;
         let files = self.files.read().await;
@@ -6976,6 +6994,9 @@ impl GraphStore for MockGraphStore {
             for j in (i + 1)..note_ids.len() {
                 let a = note_ids[i];
                 let b = note_ids[j];
+                if a == b {
+                    continue;
+                }
                 match (project_of[&a], project_of[&b]) {
                     (Some(pa), Some(pb)) if pa == pb => {}
                     _ => continue,
@@ -7006,6 +7027,42 @@ impl GraphStore for MockGraphStore {
         }
 
         Ok(count)
+    }
+
+    async fn weaken_node_synapses(
+        &self,
+        node_id: Uuid,
+        amount: f64,
+        prune_threshold: f64,
+    ) -> Result<usize> {
+        // Same rule as the Cypher: a synapse whose two ends have two different
+        // known projects is left alone (an end without project is not a signal).
+        let project_of =
+            |notes: &HashMap<Uuid, Note>, id: Uuid| notes.get(&id).and_then(|n| n.project_id);
+        let notes = self.notes.read().await;
+        let mine = project_of(&notes, node_id);
+        let allowed = |other: Uuid| match (mine, project_of(&notes, other)) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
+        let mut synapses = self.note_synapses.write().await;
+        let mut weakened = 0usize;
+        for (owner, neighbors) in synapses.iter_mut() {
+            for (other, w) in neighbors.iter_mut() {
+                let touches = *owner == node_id || *other == node_id;
+                let far = if *owner == node_id { *other } else { *owner };
+                if touches && allowed(far) {
+                    *w -= amount;
+                    weakened += 1;
+                }
+            }
+            neighbors.retain(|(other, w)| {
+                let touches = *owner == node_id || *other == node_id;
+                let far = if *owner == node_id { *other } else { *owner };
+                !(touches && allowed(far) && *w < prune_threshold)
+            });
+        }
+        Ok(weakened)
     }
 
     async fn decay_synapses(

@@ -39,6 +39,7 @@ diagrams:
     file: docs/diagrams/po-chat-manager.mmd
     covers:
       - "backend:src/chat/{mod,manager,cost,anchor,anchor_resolver,agent_e2e_tests,tree,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments,pending_queue,relay,refs_wiring_tests,untrusted,neutral_place}.rs"
+      - "backend:src/notes/coactivation.rs"
   - name: po-spawn-envelope
     owner: theotime
     status: verified
@@ -187,7 +188,9 @@ diagrams:
     owner: theotime
     status: planned
     covers:
-      - "backend:src/notes/**"
+      # Arbitrage : notes/coactivation.rs (regroupement des notes par projet avant renforcement
+      # synaptique, utilise par les gestionnaires du chat) appartient a po-chat-manager.
+      - "backend:src/notes/{hashing,lifecycle,manager,mod,models,witness}.rs"
       - "backend:src/neo4j/note.rs"
   - name: po-mcp
     owner: theotime

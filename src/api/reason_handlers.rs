@@ -13,6 +13,25 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Project guard of `followed_nodes`: `found` holds `(note_id, project_id)` for the
+/// ids that resolve to a Note. With a scoped tree every note must belong to its
+/// project; otherwise they must all share one known project.
+fn check_followed_project(
+    found: &[(Uuid, Option<Uuid>)],
+    tree_project: Option<Uuid>,
+) -> Result<(), AppError> {
+    if found.is_empty() {
+        return Ok(());
+    }
+    let project = crate::api::note_handlers::ensure_single_project(found)?;
+    match tree_project {
+        Some(p) if p != project => Err(AppError::BadRequest(
+            "followed_nodes belong to a project other than the one of the reasoning tree".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 // ============================================================================
 // Request / Response types
 // ============================================================================
@@ -206,6 +225,28 @@ pub async fn reason_feedback(
     };
 
     let neo4j = state.orchestrator.neo4j();
+
+    // `followed_nodes` is client-supplied: every id that is a Note must belong to
+    // the project of the tree (or, when the tree is gone or unscoped, to one and
+    // the same known project). Other ids (Decisions) cannot be checked and only
+    // receive scars, never energy nor synapses.
+    let tree_project = match state.orchestrator.reasoning_engine() {
+        Some(engine) => engine
+            .cache()
+            .get_by_id(tree_id)
+            .await
+            .and_then(|t| t.project_id),
+        None => None,
+    };
+    let mut note_entries: Vec<(Uuid, Option<Uuid>)> = Vec::new();
+    for node_id in &body.followed_nodes {
+        if let Some(note) = neo4j.get_note(*node_id).await.map_err(AppError::Internal)? {
+            note_entries.push((*node_id, note.project_id));
+        }
+    }
+    check_followed_project(&note_entries, tree_project)?;
+    let followed_notes: Vec<Uuid> = note_entries.iter().map(|(id, _)| *id).collect();
+
     let mut neurons_boosted = 0u64;
     let mut synapses_reinforced = 0usize;
     let mut scars_applied = 0usize;
@@ -214,7 +255,7 @@ pub async fn reason_feedback(
         // Boost energy for each followed node
         // The followed_nodes are ReasoningNode IDs which map to note/decision UUIDs
         // We need to boost the underlying notes' energy
-        for node_id in &body.followed_nodes {
+        for node_id in &followed_notes {
             // Try to boost as a note (most common entity in reasoning trees)
             if neo4j.boost_energy(*node_id, energy_boost).await.is_ok() {
                 neurons_boosted += 1;
@@ -222,9 +263,9 @@ pub async fn reason_feedback(
         }
 
         // Reinforce synapses between the followed nodes (Hebbian: co-activated = stronger)
-        if body.followed_nodes.len() >= 2 {
+        if followed_notes.len() >= 2 {
             match neo4j
-                .reinforce_synapses(&body.followed_nodes, synapse_boost)
+                .reinforce_synapses(&followed_notes, synapse_boost)
                 .await
             {
                 Ok(count) => {
@@ -511,18 +552,18 @@ mod tests {
         assert!(!is_zero_usize(&100));
     }
 
-    /// Success feedback with a `run_id` must link the persisted tree to the
-    /// ProtocolRun, so `get_run_reasoning_tree_id` finds it.
-    #[tokio::test]
-    async fn test_feedback_success_links_tree_to_run() {
+    /// Server state over a mock graph, with a reasoning engine.
+    async fn feedback_fixture(
+        graph: std::sync::Arc<crate::neo4j::mock::MockGraphStore>,
+    ) -> (
+        std::sync::Arc<crate::api::handlers::ServerState>,
+        std::sync::Arc<crate::orchestrator::Orchestrator>,
+    ) {
         use crate::events::{EventBus, HybridEmitter};
-        use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
         use crate::orchestrator::watcher::FileWatcher;
         use crate::orchestrator::Orchestrator;
         use std::sync::Arc;
 
-        let graph = Arc::new(MockGraphStore::new());
         let mut state = crate::test_helpers::mock_app_state_with_graph(graph.clone());
         let mut cfg = (*state.config).clone();
         cfg.embedding_provider = Some("http".to_string());
@@ -563,6 +604,19 @@ mod tests {
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
             vault: crate::vault::VaultService::ephemeral(),
         });
+        (server, orchestrator)
+    }
+
+    /// Success feedback with a `run_id` must link the persisted tree to the
+    /// ProtocolRun, so `get_run_reasoning_tree_id` finds it.
+    #[tokio::test]
+    async fn test_feedback_success_links_tree_to_run() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::GraphStore;
+        use std::sync::Arc;
+
+        let graph = Arc::new(MockGraphStore::new());
+        let (server, orchestrator) = feedback_fixture(graph.clone()).await;
 
         let tree = crate::reasoning::ReasoningTree::new("how to link runs", None);
         let tree_id = tree.id;
@@ -589,5 +643,105 @@ mod tests {
             graph.get_run_reasoning_tree_id(run_id).await.unwrap(),
             Some(tree_id)
         );
+    }
+
+    fn mk_note(project: Option<Uuid>) -> crate::notes::Note {
+        let mut n = crate::notes::Note::new(
+            project,
+            crate::notes::NoteType::Guideline,
+            "n".into(),
+            "t".into(),
+        );
+        n.energy = 0.5;
+        n
+    }
+
+    #[test]
+    fn test_check_followed_project_rules() {
+        let (p, q) = (Uuid::new_v4(), Uuid::new_v4());
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert!(check_followed_project(&[], Some(p)).is_ok());
+        assert!(check_followed_project(&[(a, Some(p)), (b, Some(p))], Some(p)).is_ok());
+        assert!(check_followed_project(&[(a, Some(p)), (b, Some(p))], None).is_ok());
+        assert!(check_followed_project(&[(a, Some(p)), (b, Some(q))], None).is_err());
+        assert!(check_followed_project(&[(a, Some(q))], Some(p)).is_err());
+        assert!(check_followed_project(&[(a, None)], Some(p)).is_err());
+    }
+
+    /// A followed note of another project than the tree is refused (400) and
+    /// nothing is written: no energy, no synapse, no scar.
+    #[tokio::test]
+    async fn test_feedback_refuses_nodes_of_another_project() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::GraphStore;
+        use std::sync::Arc;
+
+        let graph = Arc::new(MockGraphStore::new());
+        let (server, orchestrator) = feedback_fixture(graph.clone()).await;
+        let (mine, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let a = mk_note(Some(mine));
+        let b = mk_note(Some(other));
+        graph.create_note(&a).await.unwrap();
+        graph.create_note(&b).await.unwrap();
+
+        let tree = crate::reasoning::ReasoningTree::new("scoped", Some(mine));
+        let tree_id = tree.id;
+        orchestrator
+            .reasoning_engine()
+            .expect("reasoning engine")
+            .cache()
+            .insert(tree)
+            .await;
+
+        for outcome in ["success", "failure"] {
+            let body: ReasonFeedbackRequest = serde_json::from_value(json!({
+                "followed_nodes": [a.id, b.id],
+                "outcome": outcome,
+            }))
+            .unwrap();
+            let err = reason_feedback(State(server.clone()), Path(tree_id), Json(body))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AppError::BadRequest(_)), "{outcome}");
+        }
+        assert!(graph.get_synapses(a.id).await.unwrap().is_empty());
+        let after = graph.get_note(b.id).await.unwrap().unwrap();
+        assert_eq!(after.scar_intensity, 0.0);
+        assert_eq!(after.energy, 0.5);
+    }
+
+    /// Same-project nodes pass, and the response counts real synapses.
+    #[tokio::test]
+    async fn test_feedback_same_project_nodes_are_reinforced() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::GraphStore;
+        use std::sync::Arc;
+
+        let graph = Arc::new(MockGraphStore::new());
+        let (server, orchestrator) = feedback_fixture(graph.clone()).await;
+        let mine = Uuid::new_v4();
+        let a = mk_note(Some(mine));
+        let b = mk_note(Some(mine));
+        graph.create_note(&a).await.unwrap();
+        graph.create_note(&b).await.unwrap();
+        let tree = crate::reasoning::ReasoningTree::new("scoped", Some(mine));
+        let tree_id = tree.id;
+        orchestrator
+            .reasoning_engine()
+            .expect("reasoning engine")
+            .cache()
+            .insert(tree)
+            .await;
+
+        let body: ReasonFeedbackRequest = serde_json::from_value(json!({
+            "followed_nodes": [a.id, b.id],
+            "outcome": "success",
+        }))
+        .unwrap();
+        let resp = reason_feedback(State(server), Path(tree_id), Json(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.0.synapses_reinforced, 2);
+        assert_eq!(resp.0.neurons_boosted, 2);
     }
 }
