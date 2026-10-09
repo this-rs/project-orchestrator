@@ -30,11 +30,27 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Run cargo-deny (advisories, bans, licenses, sources)
-        uses: EmbarkStudios/cargo-deny-action@v2
+      # EmbarkStudios/cargo-deny-action rebuilt a Docker image from
+      # rust:1.85.0-alpine3.20 on every run, which hit Docker Hub's anonymous
+      # rate limit. Same cargo-deny version as that action used (0.20.2), as a
+      # prebuilt binary from GitHub releases.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
-          command: check advisories bans licenses sources
-          # Optional fast-fail short-circuit; leave default behaviour.
+          tool: cargo-deny@0.20.2
+
+      # The action ran `rustup show` in the manifest directory first, so
+      # cargo metadata uses the repo's rust-toolchain.toml.
+      - name: Install the repository toolchain
+        run: rustup show
+
+      # Same arguments as the action had (log-level warn, --all-features,
+      # manifest ./Cargo.toml); deny.toml is read from the repo root.
+      - name: Run cargo-deny (advisories, bans, licenses, sources)
+        run: >-
+          cargo-deny --log-level warn --all-features
+          --manifest-path ./Cargo.toml
+          check advisories bans licenses sources
 
   cargo-audit:
     name: cargo-audit
