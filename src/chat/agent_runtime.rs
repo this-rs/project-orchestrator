@@ -117,14 +117,15 @@ fn retry_delay_ms(error: &ProviderError, attempt: u32) -> u64 {
 ///
 /// Two sources, kept apart on purpose:
 /// - what THIS ENGINE (the backend) has not ported, whatever the provider can do:
-///   auto-continue, NATS fan-out;
+///   NATS fan-out;
 /// - what THE SESSION's capabilities say it cannot do: `images`, and `compaction`
 ///   when the provider emits no compaction signal.
 pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
     // `retry` is NOT listed: the engine retries a retryable `done.error` (B15).
     // `enrichment` is NOT listed: every turn gets the graph context (`TurnServices::prepare`).
     // `message_queue` is NOT listed: a message sent during a turn is queued (`pending`).
-    let mut missing = vec!["auto_continue", "nats"];
+    // `auto_continue` is NOT listed: a turn stopped on its limit is continued (`auto_continue_after`).
+    let mut missing = vec!["nats"];
     // The knowledge-graph hooks are served to a provider that runs hooks in its own loop
     // (`GraphSessionHooks`). A session that cannot carry an MCP server is the remote Claude
     // Code, which is given none: it keeps the entry.
@@ -153,6 +154,9 @@ pub trait TurnServices: Send + Sync {
     /// What the model receives for a turn: `sent` (the user's message `shown`,
     /// possibly behind a relayed history) with the knowledge graph's context.
     async fn prepare(&self, session_id: &str, shown: &str, sent: &str) -> String;
+    /// The system hint a turn continued automatically starts with
+    /// (`post_stream::continuation_message`).
+    async fn continuation(&self, session_id: &str) -> String;
 }
 
 /// Where the runtime finds a provider instance by identifier. The nexus
@@ -197,6 +201,11 @@ pub struct AgentSessionHandle {
     /// The running turn was stopped (by the user, or for a message sent now):
     /// the automated entries of the queue are dropped when it ends.
     interrupted: AtomicBool,
+    /// Continue a turn that stopped on its turn limit (`set_auto_continue`).
+    pub auto_continue: AtomicBool,
+    auto_continue_count: std::sync::atomic::AtomicU32,
+    /// Continuations allowed before auto-continue switches itself off (0: no limit).
+    max_auto_continues: std::sync::atomic::AtomicU32,
 }
 
 impl AgentSessionHandle {
@@ -415,7 +424,8 @@ impl AgentSessionHandle {
         let mut turn = first;
         loop {
             if let Some((stream, input)) = turn.take() {
-                self.play(stream, input).await;
+                let hit_turn_limit = self.play(stream, input).await;
+                self.auto_continue_after(hit_turn_limit).await;
             }
             let Some(next) = self.next_queued().await else {
                 return;
@@ -470,8 +480,10 @@ impl AgentSessionHandle {
     }
 
     /// Plays one turn to its terminal event, retrying a failure that showed nothing.
-    async fn play(&self, mut stream: nexus_claude::agent::EventStream, input: TurnInput) {
+    /// Answers whether the turn stopped on its turn limit (`max_turns`).
+    async fn play(&self, mut stream: nexus_claude::agent::EventStream, input: TurnInput) -> bool {
         let mut attempt = 0u32;
+        let mut hit_turn_limit = false;
         loop {
             // Did the turn already show the user anything? A turn that did is
             // never replayed: it would repeat text or tool calls.
@@ -488,6 +500,13 @@ impl AgentSessionHandle {
                     }
                 }
                 shown |= shows_content(&event);
+                hit_turn_limit |= matches!(
+                    event,
+                    AgentEvent::Done {
+                        stop_reason: nexus_claude::agent::StopReason::MaxTurns,
+                        ..
+                    }
+                );
                 let event = mask_agent_event(event);
                 let chat_events = self.mapper.lock().await.map(&event);
                 for chat_event in chat_events {
@@ -522,6 +541,49 @@ impl AgentSessionHandle {
                 }
             }
         }
+        hit_turn_limit
+    }
+
+    /// Sets how this session continues a turn that stopped on its turn limit.
+    pub fn configure_auto_continue(&self, enabled: bool, max: u32) {
+        self.auto_continue.store(enabled, Ordering::Relaxed);
+        self.max_auto_continues.store(max, Ordering::Relaxed);
+    }
+
+    /// After a turn: when it stopped on its turn limit and auto-continue allows it,
+    /// announce the continuation, wait (a Stop cancels it), and queue the
+    /// "continue" hint the queue then plays — the Claude Code engine's
+    /// `PostStreamHandler::handle_auto_continue`, with the same decision and message.
+    async fn auto_continue_after(&self, hit_turn_limit: bool) {
+        use super::post_stream::{auto_continue_allowed, AUTO_CONTINUE_DELAY_MS};
+        let Some(services) = &self.services else {
+            return;
+        };
+        if !auto_continue_allowed(
+            &self.session_id,
+            hit_turn_limit,
+            &self.auto_continue,
+            self.interrupted.load(Ordering::SeqCst),
+            &self.auto_continue_count,
+            self.max_auto_continues.load(Ordering::Relaxed),
+        ) {
+            return;
+        }
+        self.emit(ChatEvent::AutoContinue {
+            session_id: self.session_id.clone(),
+            delay_ms: AUTO_CONTINUE_DELAY_MS,
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(AUTO_CONTINUE_DELAY_MS)).await;
+        if self.interrupted.load(Ordering::SeqCst) {
+            tracing::info!(session_id = %self.session_id, "Auto-continue cancelled by interrupt");
+            return;
+        }
+        let hint = services.continuation(&self.session_id).await;
+        self.pending
+            .lock()
+            .await
+            .push_back(PendingMessage::system_hint(hint));
     }
 
     /// Answers a permission request.
@@ -651,6 +713,9 @@ impl AgentRuntime {
             services,
             pending: Mutex::new(std::collections::VecDeque::new()),
             interrupted: AtomicBool::new(false),
+            auto_continue: AtomicBool::new(false),
+            auto_continue_count: std::sync::atomic::AtomicU32::new(0),
+            max_auto_continues: std::sync::atomic::AtomicU32::new(0),
         });
         if let Some(oob) = session.out_of_band() {
             let pump = Arc::clone(&handle);
@@ -1076,7 +1141,7 @@ mod mask_tests {
     fn the_ported_features_are_not_announced_as_missing() {
         let caps = Capabilities::none();
         let degraded = degraded_features(&caps);
-        let ported = ["enrichment", "message_queue"];
+        let ported = ["enrichment", "message_queue", "auto_continue"];
         assert!(
             !degraded.iter().any(|f| ported.contains(&f.as_str())),
             "{degraded:?}"
@@ -1137,6 +1202,10 @@ mod turn_race_tests {
                 self.release.notified().await;
             }
             sent.to_string()
+        }
+
+        async fn continuation(&self, _session_id: &str) -> String {
+            String::new()
         }
     }
 
