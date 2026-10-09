@@ -752,10 +752,25 @@ impl AgentRuntime {
             let pump = Arc::clone(&handle);
             tokio::spawn(async move { pump_out_of_band(pump, oob).await });
         }
-        self.sessions
+        let replaced = self
+            .sessions
             .write()
             .await
             .insert(session_id.to_string(), Arc::clone(&handle));
+        // Two resumes raced for one session: the handle replaced is ended, or its
+        // listeners keep answering the session's NATS subjects next to the new ones
+        // (a message from another instance played twice) and its provider session
+        // stays open.
+        if let Some(old) = replaced {
+            tracing::warn!(
+                session_id,
+                "a live agent session was adopted again: the previous handle is closed"
+            );
+            old.closed.cancel();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(5), old.session.close()).await;
+            });
+        }
         handle
     }
 
@@ -1320,5 +1335,51 @@ mod turn_race_tests {
             !handle.is_streaming.load(Ordering::SeqCst),
             "the session stops streaming"
         );
+    }
+}
+
+/// What happens to a live session when the same id is adopted again (two resumes
+/// racing for one session).
+#[cfg(test)]
+mod adopt_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+
+    /// The handle replaced is ended: its listeners (NATS) stop, its provider
+    /// session is closed. Otherwise both handles answer the same NATS subjects and
+    /// a message from another instance is played twice.
+    #[tokio::test]
+    async fn adopting_a_live_session_again_ends_the_handle_it_replaces() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let adopt = || {
+            runtime.adopt(
+                "s",
+                "claude-code",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+        };
+        let first = adopt().await;
+        let second = adopt().await;
+        assert!(
+            first.closed.is_cancelled(),
+            "the replaced handle's listeners stop"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !provider.state.closed.load(Ordering::SeqCst) && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            provider.state.closed.load(Ordering::SeqCst),
+            "the replaced provider session is closed"
+        );
+        assert!(!second.closed.is_cancelled());
+        assert!(Arc::ptr_eq(&runtime.get("s").await.unwrap(), &second));
     }
 }
