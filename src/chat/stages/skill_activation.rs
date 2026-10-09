@@ -176,27 +176,34 @@ impl SkillActivationStage {
         match crate::skills::activation::current_skill_members(self.graph.as_ref(), skill.id).await
         {
             Ok((notes, decisions)) if !notes.is_empty() || !decisions.is_empty() => {
-                crate::skills::activation::assemble_context_with_confidence(
+                let (context, _) = crate::skills::activation::assemble_context_with_confidence(
                     &skill.name,
                     &notes,
                     &decisions,
                     SKILL_CONTEXT_BUDGET,
                     Some(confidence),
                     false,
+                );
+                // Skill name, notes and decisions are graph content: data.
+                crate::chat::untrusted::wrap_random(
+                    &context,
+                    crate::chat::untrusted::Origin::new("skill", None),
                 )
-                .0
             }
             _ => {
-                let mut section = format!(
-                    "### {} (confidence: {:.0}%)\n",
+                let mut body = format!(
+                    "### {} (confidence: {:.0}%)",
                     skill.name,
                     confidence * 100.0
                 );
                 if !skill.description.is_empty() {
-                    section.push_str(&skill.description);
-                    section.push('\n');
+                    body.push('\n');
+                    body.push_str(&skill.description);
                 }
-                section
+                crate::chat::untrusted::wrap_random(
+                    &body,
+                    crate::chat::untrusted::Origin::new("skill", None),
+                )
             }
         }
     }
