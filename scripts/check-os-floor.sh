@@ -6,7 +6,7 @@
 # found under the given paths, and fails the build when a file asks for more than the promise.
 #
 # Usage: scripts/check-os-floor.sh <id> <file-or-dir>...
-#   id: macos-arm64 | macos-x86_64 | macos-x86_64-legacy | linux-x86_64 | linux-arm64
+#   id: macos-arm64 | macos-x86_64 | macos-x86_64-legacy | linux-x86_64 | linux-arm64 | linux-desktop-x86_64 | linux-desktop-arm64
 #
 # The promises live in PROMISE below, nowhere else. Changing one is a product decision (it changes who can install the
 # app): update the README and the site (content/downloads.ts) in the same change.
@@ -20,11 +20,16 @@ case "$id" in
   macos-arm64)         kind=macos;  promise=11.0  ;;
   macos-x86_64)        kind=macos;  promise=13.4  ;; # ONNX Runtime (libonnxruntime) is built for 13.4
   macos-x86_64-legacy) kind=macos;  promise=10.15 ;; # no ONNX Runtime at all
-  # Linux: the release builds on Ubuntu 22.04 runners (glibc 2.35), so the files run on Ubuntu 22.04+, Debian 12+ (2.36),
-  # Fedora 36+. A runner upgrade cannot raise this silently: the check fails. RHEL 9 (2.34) is just below; going lower needs
-  # a build in an older image (manylinux_2_28), a separate decision.
-  linux-x86_64)        kind=linux;  promise=2.35  ;;
-  linux-arm64)         kind=linux;  promise=2.35  ;;
+  # Linux, measured with objdump -T on the real files and confirmed by a dry run of the release workflow:
+  #  - x86_64 and the desktop apps embed a STATIC ONNX Runtime (pyke) built against glibc 2.38+: they need 2.39 and cannot even link
+  #    on an Ubuntu 22.04 runner. Ubuntu 24.04+, Debian 13+, Fedora 40+.
+  #  - the arm64 CLI archive uses the dynamic Microsoft ONNX Runtime (glibc 2.27) and is built natively on Ubuntu 22.04: 2.35
+  #    (Ubuntu 22.04+, Debian 12+, Fedora 36+).
+  # Lowering the 2.39 ones = dynamic ONNX Runtime + shipping it in the .deb/.rpm + packaging dependencies: a separate piece of work.
+  linux-x86_64)         kind=linux;  promise=2.39  ;;
+  linux-arm64)          kind=linux;  promise=2.35  ;;
+  linux-desktop-x86_64) kind=linux;  promise=2.39  ;;
+  linux-desktop-arm64)  kind=linux;  promise=2.39  ;;
   *) echo "::error::unknown id '$id'" >&2; exit 2 ;;
 esac
 
