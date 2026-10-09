@@ -9,6 +9,11 @@ on:
         description: "Release tag (e.g. v0.0.1) — must already exist"
         required: true
         type: string
+      dry_run:
+        description: "Dry run: build, sign and check everything, publish NOTHING (no release, no Docker image, no Homebrew formula). The release files are attached to the run as an artifact."
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -1578,12 +1583,23 @@ jobs:
       # Delete any existing release for this tag before creating a fresh one.
       # softprops/action-gh-release with generate_release_notes APPENDS notes
       # when updating an existing release — causing duplicate changelogs on re-runs.
+      # Dry run: keep the files (latest.json, latest-legacy.json, installers) for inspection instead of publishing them.
+      - name: Upload release files (dry run only)
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: dry-run-release-files
+          path: release-files/
+          retention-days: 3
+
       - name: Delete existing release (if any)
+        if: ${{ !inputs.dry_run }}
         run: gh release delete "${{ env.RELEASE_TAG }}" --yes --cleanup-tag=false 2>/dev/null || true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create GitHub Release
+        if: ${{ !inputs.dry_run }}
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
@@ -1600,6 +1616,7 @@ jobs:
     name: Docker (${{ matrix.variant }})
     runs-on: ubuntu-latest
     needs: [build-frontend]
+    if: ${{ !inputs.dry_run }}
     strategy:
       fail-fast: false
       matrix:
@@ -1689,7 +1706,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [release]
     # Skip pre-releases (e.g. v0.0.1-beta). Works for both tag push and workflow_dispatch.
-    if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
+    if: ${{ !inputs.dry_run && !contains(inputs.tag || github.ref_name, '-') }}
     steps:
       - uses: actions/checkout@v7
 
