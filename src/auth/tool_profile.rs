@@ -47,7 +47,8 @@ pub enum ToolProfile {
     /// A session that may only look: the restricted tool set, and of each tool only
     /// the actions listed as reads in [`ACTION_CLASSES`]. An action nobody
     /// classified is refused, so a tool added tomorrow is closed until someone
-    /// decides. Every REST route rule of `Restricted` applies as well.
+    /// decides. Every REST route rule of `Restricted` applies as well, and on the REST
+    /// side only GET/HEAD/OPTIONS and the POST routes of `READ_ONLY_POST_ROUTES` pass.
     ReadOnly,
 }
 
@@ -113,7 +114,13 @@ const RESTRICTED_ACTIONS: &[(&str, &str)] = &[
 /// that only computes (`reason`, `predict_run`, the structural stress tests) is a
 /// read even when it is a POST. `skill.activate` and `persona.activate` return the
 /// context of the entity and are reads here, though the server may count the
-/// activation.
+/// activation. They only bump a counter
+/// (`activation_count`, `last_activated`), which is bookkeeping, not content: a
+/// read-only session has to be able to load a skill or a persona. `episode.export_artifact`
+/// builds a JSON artifact from the graph and returns it to the caller, writing nothing.
+/// `code.detect_processes` (purges and rewrites the project's processes),
+/// `code.refresh_context_cards` (starts the analytics recompute), `chat.add_discussed` and
+/// `chat.associate_with` (create links) do write.
 pub(crate) const ACTION_CLASSES: &[(&str, &[&str], &[&str])] = &[
     (
         "project",
@@ -421,8 +428,8 @@ pub(crate) const ACTION_CLASSES: &[(&str, &[&str], &[&str])] = &[
     ),
     (
         "episode",
-        &["list"],
-        &["collect", "anonymize", "export_artifact"],
+        &["list", "export_artifact"],
+        &["collect", "anonymize"],
     ),
     ("reasoning", &["reason"], &["reason_feedback"]),
     ("analysis_profile", &["list", "get"], &["create", "delete"]),
@@ -622,6 +629,89 @@ pub fn classify_route(path: &str) -> Option<RouteClass> {
     }
 }
 
+/// The POST routes that only READ, for the read-only profile: `(path, tool, action)`.
+/// `*` matches exactly one segment. They are POST because their input is a body
+/// (a query, a list of ids), not because they change anything. Each is the REST side
+/// of a `reads` action of [`ACTION_CLASSES`] (`tool.action`), and a test checks that
+/// pairing, so the two tables cannot disagree.
+///
+/// Every other non-GET route is refused to a read-only token: PUT, PATCH, DELETE
+/// never read, and a POST route nobody listed here (a new one included) is a write
+/// until someone reads its handler and adds it.
+const READ_ONLY_POST_ROUTES: &[(&str, &str, &str)] = &[
+    ("/api/plans/*/runs/compare", "plan", "compare_runs"),
+    ("/api/plans/*/runs/predict", "plan", "predict_run"),
+    ("/api/plans/*/tasks/*/build_prompt", "task", "build_prompt"),
+    ("/api/code/similar", "code", "find_similar"),
+    (
+        "/api/code/plan-implementation",
+        "code",
+        "plan_implementation",
+    ),
+    (
+        "/api/code/topology/check-file",
+        "code",
+        "check_file_topology",
+    ),
+    (
+        "/api/code/structural-profile",
+        "code",
+        "get_structural_profile",
+    ),
+    (
+        "/api/code/structural-twins",
+        "code",
+        "find_structural_twins",
+    ),
+    ("/api/code/structural-clusters", "code", "cluster_dna"),
+    (
+        "/api/code/structural-twins/cross-project",
+        "code",
+        "find_cross_project_twins",
+    ),
+    ("/api/code/predict-links", "code", "predict_missing_links"),
+    (
+        "/api/code/link-plausibility",
+        "code",
+        "check_link_plausibility",
+    ),
+    ("/api/code/stress-test-node", "code", "stress_test_node"),
+    ("/api/code/stress-test-edge", "code", "stress_test_edge"),
+    (
+        "/api/code/stress-test-cascade",
+        "code",
+        "stress_test_cascade",
+    ),
+    ("/api/code/find-bridges", "code", "find_bridges"),
+    ("/api/reason", "reasoning", "reason"),
+    ("/api/skills/*/activate", "skill", "activate"),
+    ("/api/personas/*/activate", "persona", "activate"),
+    (
+        "/api/episodes/export-artifact",
+        "episode",
+        "export_artifact",
+    ),
+];
+
+/// Whether `pattern` (with `*` segments) matches `path` segment for segment.
+fn route_matches_exactly(pattern: &str, path: &str) -> bool {
+    let pat = pattern.trim_start_matches('/').split('/');
+    let segs = path
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .split('/');
+    pat.clone().count() == segs.clone().count() && pat.zip(segs).all(|(p, s)| p == "*" || p == s)
+}
+
+/// Whether a read-only token may send this non-GET request: only a POST listed in
+/// [`READ_ONLY_POST_ROUTES`] whose action is still classified as a read.
+fn is_read_only_post(method: &Method, path: &str) -> bool {
+    *method == Method::POST
+        && READ_ONLY_POST_ROUTES.iter().any(|(pattern, tool, action)| {
+            route_matches_exactly(pattern, path) && is_read_action(tool, action)
+        })
+}
+
 impl ToolProfile {
     /// Profile named in a token. Absent → full; unknown → restricted.
     pub fn from_name(name: Option<&str>) -> Self {
@@ -730,6 +820,14 @@ impl ToolProfile {
         }
         if read {
             return false;
+        }
+        // The read-only profile goes no further than the reads: a write method is
+        // refused unless it is a listed POST that only reads (default deny, so a new
+        // route is closed). Without this, a read-only token driving the REST API
+        // directly (an external MCP, an extension) could write wherever the
+        // restricted profile can.
+        if self == Self::ReadOnly && path.starts_with("/api/") {
+            return !is_read_only_post(method, path);
         }
         // chat send_message: opening or feeding a session.
         if path == "/api/chat/sessions" {
@@ -1054,6 +1152,115 @@ mod tests {
             "routes with no explicit class for the restricted profile — add each to \
              ALLOWED_ROUTE_PREFIXES or CLOSED_ROUTE_PREFIXES in auth/tool_profile.rs: {unclassified:?}"
         );
+    }
+
+    /// Every `(METHOD, /api path)` of the router: the text after each `.route(` up to
+    /// the next one names the path and, with `get(`/`post(`/... , its methods.
+    fn router_routes() -> Vec<(Method, String)> {
+        let src = include_str!("../api/routes.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let path_re = regex::Regex::new(r#"^\s*"(/api/[^"\s]*)""#).unwrap();
+        let method_re = regex::Regex::new(r"\b(get|post|put|patch|delete)\(").unwrap();
+        let mut routes = Vec::new();
+        for chunk in production.split(".route(").skip(1) {
+            let Some(path) = path_re.captures(chunk).map(|c| c[1].to_string()) else {
+                continue;
+            };
+            for m in method_re.captures_iter(chunk) {
+                let method = Method::from_bytes(m[1].to_uppercase().as_bytes()).unwrap();
+                if !routes.contains(&(method.clone(), path.clone())) {
+                    routes.push((method, path.clone()));
+                }
+            }
+        }
+        routes
+    }
+
+    #[test]
+    fn the_scan_reads_the_methods_of_the_router() {
+        let routes = router_routes();
+        let has = |m: Method, p: &str| routes.contains(&(m, p.to_string()));
+        assert!(routes.len() > 400, "{}", routes.len());
+        assert!(has(Method::POST, "/api/notes"));
+        assert!(has(Method::POST, "/api/reason"));
+        assert!(has(Method::DELETE, "/api/decisions/{decision_id}/affects"));
+    }
+
+    #[test]
+    fn a_read_only_token_gets_no_write_route_of_the_rest_api() {
+        let ro = ToolProfile::ReadOnly;
+        for (method, path) in router_routes() {
+            let listed_read = method == Method::POST
+                && READ_ONLY_POST_ROUTES
+                    .iter()
+                    .any(|(p, _, _)| route_matches_exactly(p, &path));
+            let allowed = !ro.route_forbidden(&method, &path);
+            if method == Method::GET {
+                // Reads follow the route class, as for the restricted profile.
+                assert_eq!(
+                    allowed,
+                    classify_route(&path) == Some(RouteClass::Allowed),
+                    "GET {path}"
+                );
+            } else {
+                assert_eq!(
+                    allowed,
+                    listed_read && classify_route(&path) == Some(RouteClass::Allowed),
+                    "{method} {path}: a read-only token passes a write method only on a listed read POST"
+                );
+            }
+        }
+        // The restricted profile still passes these writes (the difference is the point).
+        assert!(!ToolProfile::Restricted.route_forbidden(&Method::POST, "/api/notes"));
+        assert!(ro.route_forbidden(&Method::POST, "/api/notes"));
+        assert!(ro.route_forbidden(&Method::PUT, "/api/notes/n"));
+        assert!(ro.route_forbidden(&Method::DELETE, "/api/notes/n"));
+        assert!(ro.route_forbidden(&Method::PATCH, "/api/projects/p"));
+        // A POST route added tomorrow, under an allowed parent, is a write until listed.
+        assert!(ro.route_forbidden(&Method::POST, "/api/notes/a-route-added-tomorrow"));
+        assert!(ro.route_forbidden(&Method::POST, "/api/plans/p/runs/compare/extra"));
+        // The reads that are POST stay open; the profile's closed routes stay closed.
+        assert!(!ro.route_forbidden(&Method::POST, "/api/reason"));
+        assert!(!ro.route_forbidden(&Method::POST, "/api/plans/p/runs/predict"));
+        assert!(!ro.route_forbidden(&Method::GET, "/api/notes"));
+        assert!(ro.route_forbidden(&Method::GET, "/api/admin/x"));
+        // Outside /api the profile has no say.
+        assert!(!ro.route_forbidden(&Method::POST, "/auth/ws-ticket"));
+    }
+
+    #[test]
+    fn every_read_only_post_route_is_a_real_route_backed_by_a_read_action() {
+        let routes = router_routes();
+        for (pattern, tool, action) in READ_ONLY_POST_ROUTES {
+            assert!(
+                routes
+                    .iter()
+                    .any(|(m, p)| *m == Method::POST && route_matches_exactly(pattern, p)),
+                "`POST {pattern}` matches no POST route of routes.rs: a dead entry"
+            );
+            assert!(
+                is_read_action(tool, action),
+                "`POST {pattern}` is listed as a read but {tool}.{action} is not a read in ACTION_CLASSES"
+            );
+            assert!(ToolProfile::ReadOnly.allows_action(tool, action));
+        }
+    }
+
+    #[test]
+    fn the_writes_the_audit_found_are_closed_to_a_read_only_token() {
+        let ro = ToolProfile::ReadOnly;
+        for (method, path) in [
+            (Method::POST, "/api/code/processes/detect"),
+            (Method::POST, "/api/code/context-cards/refresh"),
+            (Method::POST, "/api/code/communities/enrich"),
+            (Method::POST, "/api/chat/sessions/s/discussed"),
+            (Method::POST, "/api/chat/sessions/s/associate"),
+            (Method::POST, "/api/reason/t/feedback"),
+            (Method::POST, "/api/episodes/collect"),
+            (Method::POST, "/api/personas/detect"),
+        ] {
+            assert!(ro.route_forbidden(&method, path), "{method} {path}");
+        }
     }
 
     #[test]

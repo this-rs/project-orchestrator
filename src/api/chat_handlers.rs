@@ -145,11 +145,16 @@ pub async fn create_session(
             ),
         );
 
+        // A resume never changes the session's access or place: say what is stored
+        // (a client that resumes must learn that the session is read-only without a
+        // second call). An unreadable record answers the defaults, as before.
+        let (execution_place, access) =
+            stored_place_and_access(state.orchestrator.neo4j(), &sid).await;
         return Ok(Json(CreateSessionResponse {
             session_id: sid.clone(),
             stream_url: format!("/ws/chat/{}", sid),
-            execution_place: Default::default(),
-            access: Default::default(),
+            execution_place,
+            access,
             notices: Vec::new(),
         }));
     }
@@ -283,6 +288,24 @@ pub struct SessionsListQuery {
     pub include_detached: bool,
     #[serde(flatten)]
     pub pagination: PaginationParams,
+}
+
+/// Where and with what access a stored session runs, for the answer of a resume.
+/// A record that cannot be read answers the defaults (project, normal).
+async fn stored_place_and_access(
+    graph: &dyn crate::neo4j::traits::GraphStore,
+    session_id: &str,
+) -> (
+    crate::neo4j::models::ExecutionPlace,
+    crate::chat::provider::policy::SessionAccess,
+) {
+    let Ok(id) = Uuid::parse_str(session_id) else {
+        return Default::default();
+    };
+    match graph.get_chat_session(id).await {
+        Ok(Some(s)) => (s.execution_place, s.access),
+        _ => Default::default(),
+    }
 }
 
 /// Convert a ChatSessionNode to a ChatSession API response (without links).
@@ -4522,6 +4545,32 @@ mod tests {
             crate::api::handlers::INTERNAL_ERROR_MESSAGE,
             "an internal failure must reach the client generic: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_resume_answers_with_the_access_stored_on_the_session() {
+        use crate::chat::provider::policy::SessionAccess;
+        let h = action_harness(None).await;
+        let mut s = test_chat_session(None);
+        s.access = SessionAccess::ReadOnly;
+        h.graph.create_chat_session(&s).await.unwrap();
+        let (_, access) = super::stored_place_and_access(h.graph.as_ref(), &s.id.to_string()).await;
+        assert_eq!(access, SessionAccess::ReadOnly);
+        // The answer carries it on the wire; a normal session leaves it off.
+        let resp = crate::chat::types::CreateSessionResponse {
+            access,
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_value(&resp).unwrap()["access"], "read_only");
+        let normal =
+            serde_json::to_value(crate::chat::types::CreateSessionResponse::default()).unwrap();
+        assert!(normal.get("access").is_none());
+        // Unknown or malformed ids fall back to the defaults.
+        let (_, a) = super::stored_place_and_access(h.graph.as_ref(), "nope").await;
+        assert_eq!(a, SessionAccess::Normal);
+        let (_, a) =
+            super::stored_place_and_access(h.graph.as_ref(), &Uuid::new_v4().to_string()).await;
+        assert_eq!(a, SessionAccess::Normal);
     }
 
     #[tokio::test]
