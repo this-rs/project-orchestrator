@@ -87,6 +87,23 @@ detect_arch() {
   esac
 }
 
+# --- macOS older than 13.4? ---
+# The standard Intel build links libonnxruntime, which is built for macOS 13.4: on 10.15 to 13.3 it dies at launch
+# ("Symbol not found ... basic_stringbuf"). Those Macs get the "legacy" build instead (no ONNX Runtime, so no local
+# embeddings: use an HTTP embedding provider such as Ollama). PO_MACOS_VERSION overrides sw_vers, for tests.
+macos_older_than_13_4() {
+  local v major minor rest
+  v="${PO_MACOS_VERSION:-$(sw_vers -productVersion 2>/dev/null)}"
+  [ -n "$v" ] || return 1
+  major="${v%%.*}"
+  case "$v" in
+    *.*) rest="${v#*.}"; minor="${rest%%.*}" ;;
+    *)   minor=0 ;;
+  esac
+  case "${major}${minor}" in *[!0-9]* | "") return 1 ;; esac
+  [ "$major" -lt 13 ] || { [ "$major" -eq 13 ] && [ "$minor" -lt 4 ]; }
+}
+
 # --- Check for required tools ---
 check_deps() {
   for cmd in curl tar; do
@@ -123,6 +140,11 @@ main() {
   OS=$(detect_os)
   ARCH=$(detect_arch)
 
+  if [ "$OS" = "macos" ] && [ "$ARCH" = "x86_64" ] && macos_older_than_13_4; then
+    ARCH="x86_64-legacy"
+    info "macOS older than 13.4: using the legacy Intel build (no local embeddings; use an HTTP provider such as Ollama for semantic search)"
+  fi
+
   info "Detected platform: ${OS}-${ARCH}"
 
   # Resolve version
@@ -154,7 +176,7 @@ main() {
   # Download archive
   info "Downloading ${ARCHIVE_URL}..."
   if ! curl -fSL --progress-bar -o "${TMP_DIR}/${ARCHIVE_FILE}" "$ARCHIVE_URL"; then
-    error "Failed to download archive. Check that version v${VERSION} exists and has a ${OS}-${ARCH} build."
+    error "Failed to download archive. Check that version v${VERSION} exists and has a ${OS}-${ARCH} build (the macOS legacy build exists from the release after 0.0.17)."
   fi
 
   # Verify checksum
@@ -187,6 +209,15 @@ main() {
       cp "${TMP_DIR}/${ARCHIVE_NAME}/${bin}" "${INSTALL_DIR}/${bin}"
       chmod +x "${INSTALL_DIR}/${bin}"
       info "Installed ${BOLD}${bin}${RESET} to ${INSTALL_DIR}/${bin}"
+    fi
+  done
+
+  # ONNX Runtime ships next to the binaries in the archives that use it (macOS Intel, Linux arm64); the binaries look for it
+  # beside themselves (rpath @executable_path / $ORIGIN). Without it they fail at launch ("Library not loaded").
+  for lib in "${TMP_DIR}/${ARCHIVE_NAME}"/libonnxruntime*; do
+    if [ -e "$lib" ]; then
+      cp -a "$lib" "${INSTALL_DIR}/"
+      info "Installed $(basename "$lib") to ${INSTALL_DIR}/"
     fi
   done
 
