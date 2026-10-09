@@ -540,6 +540,8 @@ struct AgentOpen<'a> {
     project_slug: Option<&'a str>,
     /// History relayed from another provider, sent in front of the first message.
     relay: Option<&'a str>,
+    /// What the session may do (decided by the caller, persisted on the node).
+    access: super::provider::policy::SessionAccess,
 }
 
 /// What the per-turn router of a session needs to know about its opening.
@@ -3181,11 +3183,22 @@ impl ChatManager {
         } = self.session_origin(user_claims, session_id).await;
         // A third party gets `full` (trust) only when a person or a Claude Code
         // session is behind it.
-        let tool_profile = if opened_by_third_party || (third_party && !origin_known) {
-            Some(crate::auth::tool_profile::RESTRICTED)
-        } else {
-            tool_profile
-        };
+        // A read-only session stays read-only: that profile is narrower than the
+        // restricted one a third-party lineage would put in its place.
+        let read_only = tool_profile == Some(crate::auth::tool_profile::READ_ONLY);
+        let tool_profile =
+            if !read_only && (opened_by_third_party || (third_party && !origin_known)) {
+                Some(crate::auth::tool_profile::RESTRICTED)
+            } else {
+                tool_profile
+            };
+
+        if read_only {
+            env.insert(
+                crate::auth::tool_profile::TOOL_PROFILE_ENV.into(),
+                crate::auth::tool_profile::READ_ONLY.into(),
+            );
+        }
 
         // PO_SERVER_URL is always injected — mcp_server runs as an HTTP proxy
         // regardless of whether auth is enabled.
@@ -3341,7 +3354,7 @@ impl ChatManager {
                 permission_mode_override,
                 user_claims,
                 session_id,
-                None,
+                access.tool_profile(),
                 false,
             )
             .await;
@@ -3890,6 +3903,11 @@ impl ChatManager {
             )
             .await;
 
+        // What the session may do: fixed here, persisted on the node, kept by every resume.
+        let access = super::provider::policy::SessionAccess::for_open(
+            request.access,
+            super::neutral_place::is_neutral_path(&request.cwd),
+        );
         let session_node = ChatSessionNode {
             id: session_id,
             cli_session_id: None,
@@ -3921,6 +3939,7 @@ impl ChatManager {
             } else {
                 super::neutral_place::ExecutionPlace::Project
             },
+            access,
         };
         self.graph
             .create_chat_session(&session_node)
@@ -4023,6 +4042,7 @@ impl ChatManager {
                     add_dirs: &resolved_add_dirs,
                     project_slug: project_slug.as_deref(),
                     relay,
+                    access,
                 })
                 .await;
         }
@@ -4080,7 +4100,7 @@ impl ChatManager {
         // Build options and create InteractiveClient
         let sid_str = session_id.to_string();
         let options = self
-            .build_options(
+            .build_options_with_access(
                 &request.cwd,
                 &model,
                 &system_prompt,
@@ -4090,6 +4110,7 @@ impl ChatManager {
                 &resolved_add_dirs,
                 request.user_claims.as_ref(),
                 Some(&sid_str),
+                access,
             )
             .await;
         let mut client = InteractiveClient::new(options).map_err(|e| {
@@ -4464,6 +4485,7 @@ impl ChatManager {
             session_id: session_id.to_string(),
             stream_url: format!("/ws/chat/{}", session_id),
             execution_place: Default::default(),
+            access,
             notices: Vec::new(),
         })
     }
@@ -7004,6 +7026,8 @@ impl ChatManager {
             spawned_by: None,
             task_context: None,
             scaffolding_override: None,
+            // A switch never widens: the new session keeps the access of the old one.
+            access: Some(node.access),
             runner_context: None,
             routing_decision_id: None,
         };
@@ -7520,6 +7544,8 @@ impl ChatManager {
             hooks
         };
 
+        // A resume keeps the access the session was opened with and can only narrow it.
+        let access = super::provider::policy::SessionAccess::for_resume(session_node.access, None);
         let resume_add_dirs = session_node.add_dirs.clone().unwrap_or_default();
 
         // `--resume <cli_session_id>` can name a conversation the CLI no longer
@@ -7531,7 +7557,7 @@ impl ChatManager {
         let mut resume_with = cli_session_id;
         let client = loop {
             let options = self
-                .build_options(
+                .build_options_with_access(
                     &session_node.cwd,
                     &session_node.model,
                     &system_prompt,
@@ -7541,6 +7567,7 @@ impl ChatManager {
                     &resume_add_dirs,
                     user_claims,
                     Some(session_id),
+                    access,
                 )
                 .await;
 
@@ -9836,6 +9863,7 @@ impl ChatManager {
     /// model, system prompt, the neutral tool policy of the permission mode,
     /// the project-orchestrator MCP server (same environment as the Claude
     /// path, session-bound token included) and the clean child environment.
+    #[cfg(test)]
     pub(crate) async fn build_agent_spec(
         &self,
         i: AgentSpecInput<'_>,
@@ -9899,7 +9927,9 @@ impl ChatManager {
                 Some(&mode),
                 user_claims,
                 Some(session_id),
-                third_party_tool_profile(third_party, policy.mode),
+                access
+                    .tool_profile()
+                    .or_else(|| third_party_tool_profile(third_party, policy.mode)),
                 third_party,
             )
             .await;
@@ -10079,6 +10109,7 @@ impl ChatManager {
             add_dirs,
             project_slug,
             relay,
+            access,
         } = o;
         let provider = self.provider_for(provider_id).await?;
         let remote_cwd = self.remote_cwd_of(provider_id).await?;
@@ -10118,28 +10149,31 @@ impl ChatManager {
         )
         .await;
         let spec = self
-            .build_agent_spec(AgentSpecInput {
-                cwd: &request.cwd,
-                model,
-                system_prompt,
-                permission_mode,
-                add_dirs,
-                user_claims: request.user_claims.as_ref(),
-                session_id: &sid,
-                third_party: provider_id != super::provider::resolver::CLAUDE_CODE,
-                max_tokens: request.max_tokens,
-                kind: provider.kind(),
-                remote_cwd: remote_cwd.as_deref(),
-                hooks: Some(AgentHookScope {
-                    project_slug: project_slug.map(str::to_string),
-                    task_id: request
-                        .spawned_by
-                        .as_deref()
-                        .and_then(parse_spawned_by)
-                        .and_then(|ctx| ctx.task_id),
-                    runner: request.runner_context.is_some(),
-                }),
-            })
+            .build_agent_spec_with_access(
+                AgentSpecInput {
+                    cwd: &request.cwd,
+                    model,
+                    system_prompt,
+                    permission_mode,
+                    add_dirs,
+                    user_claims: request.user_claims.as_ref(),
+                    session_id: &sid,
+                    third_party: provider_id != super::provider::resolver::CLAUDE_CODE,
+                    max_tokens: request.max_tokens,
+                    kind: provider.kind(),
+                    remote_cwd: remote_cwd.as_deref(),
+                    hooks: Some(AgentHookScope {
+                        project_slug: project_slug.map(str::to_string),
+                        task_id: request
+                            .spawned_by
+                            .as_deref()
+                            .and_then(parse_spawned_by)
+                            .and_then(|ctx| ctx.task_id),
+                        runner: request.runner_context.is_some(),
+                    }),
+                },
+                access,
+            )
             .await?;
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
         if let Err(e) = self
@@ -10210,6 +10244,7 @@ impl ChatManager {
             session_id: sid.clone(),
             stream_url: format!("/ws/chat/{sid}"),
             execution_place: Default::default(),
+            access,
             notices: Vec::new(),
         })
     }
@@ -10395,29 +10430,34 @@ impl ChatManager {
             },
         )
         .await;
+        // A resume keeps the access the session was opened with and can only narrow it.
+        let access = super::provider::policy::SessionAccess::for_resume(node.access, None);
         let spec = self
-            .build_agent_spec(AgentSpecInput {
-                cwd: &node.cwd,
-                model: &node.model,
-                system_prompt: &system_prompt,
-                permission_mode: node.permission_mode.as_deref(),
-                add_dirs: node.add_dirs.as_deref().unwrap_or(&[]),
-                user_claims,
-                session_id: &sid,
-                third_party: provider_id != super::provider::resolver::CLAUDE_CODE,
-                max_tokens: None,
-                kind: provider.kind(),
-                remote_cwd: remote_cwd.as_deref(),
-                hooks: Some(AgentHookScope {
-                    project_slug: node.project_slug.clone(),
-                    task_id: node
-                        .spawned_by
-                        .as_deref()
-                        .and_then(parse_spawned_by)
-                        .and_then(|ctx| ctx.task_id),
-                    runner: false,
-                }),
-            })
+            .build_agent_spec_with_access(
+                AgentSpecInput {
+                    cwd: &node.cwd,
+                    model: &node.model,
+                    system_prompt: &system_prompt,
+                    permission_mode: node.permission_mode.as_deref(),
+                    add_dirs: node.add_dirs.as_deref().unwrap_or(&[]),
+                    user_claims,
+                    session_id: &sid,
+                    third_party: provider_id != super::provider::resolver::CLAUDE_CODE,
+                    max_tokens: None,
+                    kind: provider.kind(),
+                    remote_cwd: remote_cwd.as_deref(),
+                    hooks: Some(AgentHookScope {
+                        project_slug: node.project_slug.clone(),
+                        task_id: node
+                            .spawned_by
+                            .as_deref()
+                            .and_then(parse_spawned_by)
+                            .and_then(|ctx| ctx.task_id),
+                        runner: false,
+                    }),
+                },
+                access,
+            )
             .await?;
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
         // A resume is a new sending of the project's content: consent, guard
@@ -13410,6 +13450,7 @@ mod tests {
 
     fn runner_request(run_id: Uuid, plan_id: Uuid, task_id: Uuid) -> ChatRequest {
         ChatRequest {
+            access: None,
             routing_mode: None,
             attachments: Vec::new(),
             refs: Vec::new(),
@@ -14056,6 +14097,318 @@ mod tests {
             crate::chat::neutral_place::ExecutionPlace::Project
         );
         manager.close_session(&created.session_id).await.unwrap();
+    }
+
+    /// What the opened session's tool policy says about a write tool.
+    fn spec_refuses_writes(spec: &nexus_claude::agent::SessionSpec) -> bool {
+        spec.policy.decide(
+            "Write",
+            Some("/tmp/x"),
+            nexus_claude::agent::ToolCategory::Edit,
+        ) == nexus_claude::agent::PolicyDecision::Deny
+    }
+
+    /// The MCP server environment of an opened spec.
+    fn spec_po_env(
+        spec: &nexus_claude::agent::SessionSpec,
+    ) -> std::collections::BTreeMap<String, String> {
+        match spec.mcp_servers.get("project-orchestrator") {
+            Some(nexus_claude::agent::McpServerSpec::Stdio { env, .. }) => env.clone(),
+            _ => panic!("stdio MCP server expected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_neutral_session_opens_read_only_persists_it_and_every_resume_keeps_it() {
+        use crate::chat::provider::policy::SessionAccess;
+        let (manager, graph, fake) = agent_manager();
+        let mut req = agent_request("hello");
+        req.cwd = String::new();
+        let created = manager.create_session(&req).await.unwrap();
+        let sid = created.session_id.clone();
+        let id = Uuid::parse_str(&sid).unwrap();
+
+        // Said on the response, stored on the node, enforced on the open.
+        assert_eq!(created.access, SessionAccess::ReadOnly);
+        let node = graph.get_chat_session(id).await.unwrap().unwrap();
+        assert_eq!(node.access, SessionAccess::ReadOnly);
+        let spec = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+        assert!(spec_refuses_writes(&spec), "the open denies writes");
+        assert_eq!(
+            spec_po_env(&spec).get(crate::auth::tool_profile::TOOL_PROFILE_ENV),
+            Some(&crate::auth::tool_profile::READ_ONLY.to_string())
+        );
+
+        // A resume reads the access from the node and applies it again.
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+        manager.resume_session(&sid, "again", None).await.unwrap();
+        let spec = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+        assert!(spec_refuses_writes(&spec), "the resume denies writes too");
+        assert_eq!(
+            graph.get_chat_session(id).await.unwrap().unwrap().access,
+            SessionAccess::ReadOnly,
+            "a resume does not rewrite the access"
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_project_session_is_normal_unless_the_client_asks_for_read_only_and_a_resume_cannot_widen_it(
+    ) {
+        use crate::chat::provider::policy::SessionAccess;
+        let (manager, graph, fake) = agent_manager();
+
+        // Project session, nothing asked: normal, left off the wire, writes allowed.
+        let normal = manager
+            .create_session(&agent_request("hello"))
+            .await
+            .unwrap();
+        assert_eq!(normal.access, SessionAccess::Normal);
+        let json = serde_json::to_value(&normal).unwrap();
+        assert!(json.get("access").is_none(), "normal is left off the wire");
+        let spec = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+        assert!(!spec_refuses_writes(&spec));
+        assert!(!spec_po_env(&spec).contains_key(crate::auth::tool_profile::TOOL_PROFILE_ENV));
+        fake.state.end_turn();
+        manager.close_session(&normal.session_id).await.unwrap();
+
+        // Project session, read_only asked explicitly.
+        let mut req = agent_request("hello");
+        req.access = Some(SessionAccess::ReadOnly);
+        let created = manager.create_session(&req).await.unwrap();
+        let sid = created.session_id.clone();
+        let id = Uuid::parse_str(&sid).unwrap();
+        assert_eq!(created.access, SessionAccess::ReadOnly);
+        assert_eq!(
+            graph
+                .get_chat_session(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .execution_place,
+            crate::chat::neutral_place::ExecutionPlace::Project
+        );
+        let spec = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+        assert!(spec_refuses_writes(&spec));
+
+        // Resume: nothing in the stored node or the call can bring `normal` back.
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+        manager.resume_session(&sid, "again", None).await.unwrap();
+        let spec = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+        assert!(spec_refuses_writes(&spec), "read_only -> normal is refused");
+        assert_eq!(
+            graph.get_chat_session(id).await.unwrap().unwrap().access,
+            SessionAccess::ReadOnly
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_neutral_session_can_be_opened_normal_on_explicit_request_and_a_legacy_node_reads_as_normal(
+    ) {
+        use crate::chat::provider::policy::SessionAccess;
+        let (manager, graph, fake) = agent_manager();
+        let mut req = agent_request("hello");
+        req.cwd = String::new();
+        req.access = Some(SessionAccess::Normal);
+        let created = manager.create_session(&req).await.unwrap();
+        assert_eq!(created.access, SessionAccess::Normal);
+        let id = Uuid::parse_str(&created.session_id).unwrap();
+        let node = graph.get_chat_session(id).await.unwrap().unwrap();
+        assert_eq!(node.access, SessionAccess::Normal);
+        assert!(!spec_refuses_writes(
+            &fake.state.opened_specs.lock().unwrap().pop().unwrap()
+        ));
+        fake.state.end_turn();
+        manager.close_session(&created.session_id).await.unwrap();
+
+        // A node written before the field existed has no `access`: it reads as normal
+        // (compatibility), on the wire and on a resume.
+        let mut json = serde_json::to_value(&node).unwrap();
+        assert!(json.get("access").is_none());
+        json.as_object_mut().unwrap().remove("access");
+        let legacy: ChatSessionNode = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.access, SessionAccess::Normal);
+        let request: ChatRequest =
+            serde_json::from_value(serde_json::json!({"message": "m"})).unwrap();
+        assert_eq!(request.access, None);
+    }
+
+    #[tokio::test]
+    async fn a_provider_switch_keeps_a_read_only_session_read_only() {
+        use crate::chat::provider::policy::SessionAccess;
+        let (manager, graph, fake) = agent_manager();
+        let mut req = agent_request("hello");
+        req.access = Some(SessionAccess::ReadOnly);
+        let created = manager.create_session(&req).await.unwrap();
+        fake.state.end_turn();
+        manager.close_session(&created.session_id).await.unwrap();
+        // The request a switch builds carries the access of the node it leaves.
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&created.session_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.access, SessionAccess::ReadOnly);
+    }
+
+    /// The token minted for a read-only session carries the read-only profile, a
+    /// third-party lineage included: the restricted profile it would otherwise get is
+    /// WIDER (it runs the writes of the tools it keeps).
+    #[tokio::test]
+    async fn the_token_of_a_read_only_session_carries_the_read_only_profile() {
+        use crate::auth::tool_profile::ToolProfile;
+        use crate::chat::provider::policy::SessionAccess;
+        use nexus_claude::agent::ProviderKind;
+        let manager = signed_manager(mock_app_state());
+        let claims = person_claims();
+        for (third_party, mode) in [
+            (false, "default"),
+            (false, "bypassPermissions"),
+            (true, "default"),
+            (true, "bypassPermissions"),
+        ] {
+            let spec = manager
+                .build_agent_spec_with_access(
+                    AgentSpecInput {
+                        cwd: "/tmp",
+                        model: "m",
+                        system_prompt: "p",
+                        permission_mode: Some(mode),
+                        add_dirs: &[],
+                        user_claims: Some(&claims),
+                        session_id: "ro-token",
+                        third_party,
+                        max_tokens: None,
+                        kind: ProviderKind::Native,
+                        remote_cwd: None,
+                        hooks: None,
+                    },
+                    SessionAccess::ReadOnly,
+                )
+                .await
+                .unwrap();
+            let token = spec_po_env(&spec)
+                .get("PO_AUTH_TOKEN")
+                .cloned()
+                .expect("a session token");
+            let profile = ToolProfile::from_unverified_token(&token);
+            assert_eq!(
+                profile,
+                ToolProfile::ReadOnly,
+                "third_party={third_party} {mode}"
+            );
+            let call = |action: &str| -> crate::mcp::protocol::ToolCallParams {
+                serde_json::from_value(serde_json::json!({
+                    "name": "task", "arguments": {"action": action}
+                }))
+                .unwrap()
+            };
+            assert!(crate::mcp::server::profile_refusal(profile, &call("create")).is_some());
+            assert_eq!(
+                crate::mcp::server::profile_refusal(profile, &call("list")),
+                None
+            );
+        }
+    }
+
+    /// VERIFIER (4): the Claude CLI really receives the deny list when the mode is the
+    /// most permissive one. The CLI is the `fake_claude` of nexus, which records its
+    /// argv; a real `claude` is not available here and nothing below runs one.
+    #[tokio::test]
+    async fn the_cli_gets_the_read_only_deny_list_under_bypass_permissions() {
+        use crate::chat::provider::policy::SessionAccess;
+        let fake = std::env::var_os("NEXUS_FAKES_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../.target-nexus-fakes/debug")
+            })
+            .join("fake_claude");
+        assert!(
+            fake.exists(),
+            "{} is missing: build the nexus fakes (.github/actions/nexus-fakes builds fake_claude with the others)",
+            fake.display()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let argv_out = dir.path().join("argv.json");
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(&transcript, "{\"op\":\"exit\",\"code\":0}\n").unwrap();
+
+        let state = mock_app_state();
+        let mut config = test_config();
+        config.permission.disallowed_tools = vec!["Bash(rm -rf *)".into()];
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        for (access, expect_denied) in [
+            (SessionAccess::ReadOnly, true),
+            (SessionAccess::Normal, false),
+        ] {
+            let mut options = manager
+                .build_options_with_access(
+                    "/tmp",
+                    "m",
+                    "p",
+                    None,
+                    Some("bypassPermissions"),
+                    None,
+                    &[],
+                    None,
+                    Some("ro-cli"),
+                    access,
+                )
+                .await;
+            options.cli_path = Some(fake.clone());
+            options.env.insert(
+                "FAKE_CLAUDE_TRANSCRIPT".into(),
+                transcript.display().to_string(),
+            );
+            options.env.insert(
+                "FAKE_CLAUDE_ARGS_OUT".into(),
+                argv_out.display().to_string(),
+            );
+            let _ = std::fs::remove_file(&argv_out);
+            let mut client = nexus_claude::InteractiveClient::new(options).unwrap();
+            // The fake exits at once; the connection may or may not survive that, the
+            // recorded argv is what matters.
+            let _ = client.connect().await;
+            for _ in 0..100 {
+                if argv_out.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let recorded: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&argv_out).expect("argv recorded"))
+                    .unwrap();
+            let argv = recorded.to_string();
+            assert!(
+                argv.contains("bypassPermissions"),
+                "the mode is the permissive one: {argv}"
+            );
+            assert!(
+                argv.contains("Bash(rm -rf *)"),
+                "configured entries stay: {argv}"
+            );
+            for tool in [
+                "Write",
+                "Edit",
+                "Bash",
+                "Task",
+                "mcp__project-orchestrator__admin",
+            ] {
+                assert_eq!(
+                    argv.contains(&format!("\"{tool}\""))
+                        || argv.contains(&format!("{tool},"))
+                        || argv.contains(&format!(",{tool}"))
+                        || argv.contains(&format!("{tool}\"")),
+                    expect_denied,
+                    "{tool} in the CLI's disallowed tools ({access:?}): {argv}"
+                );
+            }
+            let _ = client.disconnect().await;
+        }
     }
 
     #[tokio::test]
@@ -14809,6 +15162,7 @@ mod tests {
             capabilities: None,
             resume_token: None,
             execution_place: Default::default(),
+            access: Default::default(),
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -15176,6 +15530,7 @@ mod tests {
             capabilities: None,
             resume_token: None,
             execution_place: Default::default(),
+            access: Default::default(),
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -15213,6 +15568,7 @@ mod tests {
             capabilities: None,
             resume_token: None,
             execution_place: Default::default(),
+            access: Default::default(),
         };
 
         let json = serde_json::to_string(&session).unwrap();

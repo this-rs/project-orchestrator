@@ -50,9 +50,16 @@ impl McpHttpClient {
     /// the session token (signed by the server; see [`crate::auth::tool_profile`]).
     /// No token = the full profile (no-auth mode, standalone use).
     pub fn tool_profile(&self) -> crate::auth::tool_profile::ToolProfile {
+        use crate::auth::tool_profile::{ToolProfile, READ_ONLY, TOOL_PROFILE_ENV};
+        // The harness also repeats a read-only session in the environment, for a
+        // session that has no token (auth off). Read-only is narrower than any other
+        // profile, so it wins whatever the token says.
+        if std::env::var(TOOL_PROFILE_ENV).is_ok_and(|v| v == READ_ONLY) {
+            return ToolProfile::ReadOnly;
+        }
         match self.auth_token.as_deref() {
-            Some(token) => crate::auth::tool_profile::ToolProfile::from_unverified_token(token),
-            None => crate::auth::tool_profile::ToolProfile::Full,
+            Some(token) => ToolProfile::from_unverified_token(token),
+            None => ToolProfile::Full,
         }
     }
 

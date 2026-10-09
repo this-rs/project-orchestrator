@@ -1,5 +1,6 @@
 //! Chat types — request/response/event types for the chat system
 
+use crate::chat::provider::policy::SessionAccess;
 use crate::neo4j::models::ExecutionPlace;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -211,6 +212,11 @@ pub struct ChatRequest {
     /// Project slug to associate with the session
     #[serde(default)]
     pub project_slug: Option<String>,
+    /// What the session may do: `normal` or `read_only`. Absent: `read_only` for a
+    /// session that runs in a neutral directory (no `cwd`), `normal` for a project
+    /// session. A resume never widens it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<SessionAccess>,
     /// Model override (default: from ChatConfig)
     #[serde(default)]
     pub model: Option<String>,
@@ -1067,6 +1073,9 @@ pub struct ChatSession {
     /// which is also what every session written before the field reads as.
     #[serde(default, skip_serializing_if = "ExecutionPlace::is_project")]
     pub execution_place: ExecutionPlace,
+    /// `read_only` when the session may only look. Left off for `normal`.
+    #[serde(default, skip_serializing_if = "SessionAccess::is_normal")]
+    pub access: SessionAccess,
     /// Session title (auto-generated or user-provided)
     #[serde(default)]
     pub title: Option<String>,
@@ -1200,6 +1209,9 @@ pub struct CreateSessionResponse {
     /// `neutral` when the host made the working directory (no `cwd` was given).
     #[serde(default, skip_serializing_if = "ExecutionPlace::is_project")]
     pub execution_place: ExecutionPlace,
+    /// `read_only` when the session was opened (or defaulted) read-only. Left off for `normal`.
+    #[serde(default, skip_serializing_if = "SessionAccess::is_normal")]
+    pub access: SessionAccess,
     /// Things the caller should know about how the session was opened (for example
     /// that it has no project, hence no graph context). Left off when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2442,6 +2454,7 @@ mod tests {
             capabilities: None,
             routed_by: None,
             execution_place: Default::default(),
+            access: Default::default(),
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -2665,6 +2678,7 @@ mod tests {
             capabilities: None,
             routed_by: None,
             execution_place: Default::default(),
+            access: Default::default(),
         };
 
         let json = serde_json::to_string(&session).unwrap();
