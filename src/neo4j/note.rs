@@ -13,6 +13,12 @@ use uuid::Uuid;
 /// Note properties a client may sort on. Anything else falls back to
 /// `created_at` (the field name is spliced into the Cypher, so it must come
 /// from this whitelist, never straight from the request).
+/// Candidates read by `get_propagated_notes` in `CrossProject`, where the pairwise
+/// coupling weights the score after the query: the final cut to 20 happens only
+/// once weighted.
+const CROSS_PROJECT_DIRECT_CANDIDATES: i64 = 200;
+const CROSS_PROJECT_TRANSITIVE_CANDIDATES: i64 = 100;
+
 const NOTE_SORT_FIELDS: &[&str] = &[
     "created_at",
     "updated_at",
@@ -1548,7 +1554,7 @@ impl Neo4jClient {
                    path_names, distance, avg_path_pagerank,
                    tail(rel_types) AS relation_path, path_rel_weight, hop_weights
             ORDER BY score DESC
-            LIMIT 20
+            LIMIT $limit
             "#,
             target_match, rel_pattern, max_depth
         );
@@ -1556,6 +1562,18 @@ impl Neo4jClient {
         let scope =
             crate::notes::PropagationScope::from_params(source_project_id, force_cross_project);
         let scope_project = scope.cypher_project().map(|p| p.to_string());
+        // In CrossProject the coupling weights the score AFTER the query: cutting at
+        // the final size first would drop notes the weighting would have promoted.
+        // Read a wider candidate set, weight, then cut (see the end of the function).
+        let cross_project = matches!(scope, crate::notes::PropagationScope::CrossProject(_));
+        let (direct_limit, transitive_limit): (i64, i64) = if cross_project {
+            (
+                CROSS_PROJECT_DIRECT_CANDIDATES,
+                CROSS_PROJECT_TRANSITIVE_CANDIDATES,
+            )
+        } else {
+            (20, 10)
+        };
         let q = query(&cypher)
             .param("entity_id", match_value.clone())
             .param("min_score", min_score)
@@ -1568,6 +1586,7 @@ impl Neo4jClient {
                 "consent_reader",
                 source_project_id.map(|p| p.to_string()).unwrap_or_default(),
             )
+            .param("limit", direct_limit)
             .param("scope_project", scope_project.clone().unwrap_or_default());
 
         let mut result = self.graph.execute(q).await?;
@@ -1654,7 +1673,7 @@ impl Neo4jClient {
                    tw AS path_rel_weight,
                    [] AS hop_weights
             ORDER BY score DESC
-            LIMIT 10
+            LIMIT $limit
             "#,
             target_match
         );
@@ -1671,36 +1690,59 @@ impl Neo4jClient {
                 "consent_reader",
                 source_project_id.map(|p| p.to_string()).unwrap_or_default(),
             )
+            .param("limit", transitive_limit)
             .param("scope_project", scope_project.unwrap_or_default());
 
-        if let Ok(mut tresult) = self.graph.execute(tq).await {
-            while let Ok(Some(row)) = tresult.next().await {
-                if let Ok(node) = row.get::<neo4rs::Node>("n") {
-                    if let Ok(note) = self.node_to_note(&node) {
-                        // Deduplicate: skip if already found via direct path
-                        if seen_note_ids.contains(&note.id) {
-                            continue;
-                        }
-                        let score: f64 = row.get("score").unwrap_or(0.0);
-                        let distance: i64 = row.get("distance").unwrap_or(1);
-                        let path_rel_weight: Option<f64> = row.get::<f64>("path_rel_weight").ok();
-                        let scar_intensity = note.scar_intensity;
-                        propagated_notes.push(PropagatedNote {
-                            note,
-                            relevance_score: score,
-                            source_entity: "transitive".to_string(),
-                            propagation_path: vec![],
-                            distance: distance as u32,
-                            path_pagerank: None,
-                            relation_path: vec![crate::notes::RelationHop::structural(
-                                "LINKED_TO_TRANSITIVE".to_string(),
-                            )],
-                            path_rel_weight,
-                            scar_intensity,
-                        });
-                    }
-                }
+        // A failure here is not swallowed: it is logged and returned, so the caller
+        // knows the transitive notes are missing instead of silently getting fewer.
+        let transitive_failed = |stage: &str, e: anyhow::Error| {
+            tracing::warn!(
+                entity = %entity_id,
+                stage,
+                error = %e,
+                "get_propagated_notes: LINKED_TO_TRANSITIVE query failed"
+            );
+            e.context(format!(
+                "get_propagated_notes: LINKED_TO_TRANSITIVE query failed ({stage})"
+            ))
+        };
+        let mut tresult = self
+            .graph
+            .execute(tq)
+            .await
+            .map_err(|e| transitive_failed("execute", e.into()))?;
+        while let Some(row) = tresult
+            .next()
+            .await
+            .map_err(|e| transitive_failed("fetch", e.into()))?
+        {
+            let node = row
+                .get::<neo4rs::Node>("n")
+                .map_err(|e| transitive_failed("decode node", e.into()))?;
+            let note = self
+                .node_to_note(&node)
+                .map_err(|e| transitive_failed("decode note", e))?;
+            // Deduplicate: skip if already found via direct path
+            if seen_note_ids.contains(&note.id) {
+                continue;
             }
+            let score: f64 = row.get("score").unwrap_or(0.0);
+            let distance: i64 = row.get("distance").unwrap_or(1);
+            let path_rel_weight: Option<f64> = row.get::<f64>("path_rel_weight").ok();
+            let scar_intensity = note.scar_intensity;
+            propagated_notes.push(PropagatedNote {
+                note,
+                relevance_score: score,
+                source_entity: "transitive".to_string(),
+                propagation_path: vec![],
+                distance: distance as u32,
+                path_pagerank: None,
+                relation_path: vec![crate::notes::RelationHop::structural(
+                    "LINKED_TO_TRANSITIVE".to_string(),
+                )],
+                path_rel_weight,
+                scar_intensity,
+            });
         }
 
         // Re-sort after merging transitive results
@@ -1709,7 +1751,9 @@ impl Neo4jClient {
                 .partial_cmp(&a.relevance_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        propagated_notes.truncate(20);
+        if !cross_project {
+            propagated_notes.truncate(20);
+        }
 
         // Defence in depth: the Cypher already applied the scope before LIMIT; this
         // re-check can only drop notes, never widen the result.
@@ -1798,6 +1842,8 @@ impl Neo4jClient {
                     .partial_cmp(&a.relevance_score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
+            // The cut comes last: weighted scores decide who stays in the top 20.
+            filtered_notes.truncate(20);
 
             return Ok(filtered_notes);
         }
@@ -2891,7 +2937,8 @@ impl Neo4jClient {
     /// Only `:Note` nodes are linked (Decision ids match nothing: explicitly not
     /// supported), and only pairs whose notes share the same non-null
     /// `project_id` — cross-project pairs and unknown projects are skipped by
-    /// the query. The returned count is an upper bound (2 per candidate pair).
+    /// the query. The returned count is exact: 2 directed synapses per pair that was
+    /// really reinforced (skipped pairs are not counted).
     /// Uses a single UNWIND query to batch all pairs instead of N*(N-1)/2
     /// individual queries, reducing 45 queries (10 notes) to 1.
     ///
@@ -2899,7 +2946,7 @@ impl Neo4jClient {
     /// - Before: 10 notes → 45 individual Cypher queries (~500ms)
     /// - After:  10 notes → 1 UNWIND query (~20ms)
     pub async fn reinforce_synapses(&self, note_ids: &[Uuid], boost: f64) -> Result<usize> {
-        use super::batch::{bolt_map, run_unwind_in_chunks_with, BoltMap};
+        use super::batch::{bolt_map, BoltMap};
 
         if note_ids.len() < 2 {
             anyhow::bail!(
@@ -2919,15 +2966,10 @@ impl Neo4jClient {
             }
         }
 
-        let pair_count = pairs.len();
-
-        run_unwind_in_chunks_with(
-            &self.graph,
-            pairs,
-            r#"
+        let cypher = r#"
             UNWIND $items AS pair
             MATCH (a:Note {id: pair.a}), (b:Note {id: pair.b})
-            WHERE a.project_id IS NOT NULL AND a.project_id = b.project_id
+            WHERE a.project_id IS NOT NULL AND a.project_id = b.project_id AND a.id <> b.id
             MERGE (a)-[s1:SYNAPSE]->(b)
               ON CREATE SET s1.weight = 0.5, s1.created_at = datetime(),
                 s1.last_reinforced_at = datetime(), s1.reinforcement_count = 1,
@@ -2950,17 +2992,33 @@ impl Neo4jClient {
                 s2.last_reinforced_at = datetime(),
                 s2.reinforcement_count = coalesce(s2.reinforcement_count, 0) + 1,
                 s2.source = CASE WHEN s2.source IS NULL OR s2.source = 'cosine' THEN 'coactivation' ELSE s2.source END
-            "#,
-            |q| q.param("boost", boost),
-        )
-        .await?;
+            RETURN count(*) AS reinforced
+            "#;
 
-        // Each pair creates/updates 2 synapses (bidirectional)
-        Ok(pair_count * 2)
+        // Count what the query really wrote: pairs skipped by the project guard
+        // (cross-project, unknown project, unknown id) match no row.
+        let mut reinforced_pairs = 0usize;
+        for chunk in pairs.chunks(super::batch::BATCH_SIZE) {
+            let mut result = self
+                .graph
+                .execute(
+                    query(cypher)
+                        .param("items", chunk.to_vec())
+                        .param("boost", boost),
+                )
+                .await?;
+            if let Some(row) = result.next().await? {
+                reinforced_pairs += row.get::<i64>("reinforced").unwrap_or(0) as usize;
+            }
+        }
+
+        // Each reinforced pair creates/updates 2 synapses (bidirectional)
+        Ok(reinforced_pairs * 2)
     }
 
     /// Weaken the synapses of ONE node (note or decision) by `amount` and
-    /// delete those that fall below `prune_threshold`. Returns how many were
+    /// delete those that fall below `prune_threshold`. Synapses that
+    /// cross two known projects are left alone. Returns how many were
     /// weakened. The counterpart of reinforcing a node's synapses: negative
     /// feedback on one piece of knowledge must not decay the whole graph.
     pub async fn weaken_node_synapses(
@@ -2974,7 +3032,11 @@ impl Neo4jClient {
             .execute(
                 query(
                     r#"
-                    MATCH (n {id: $id})-[s:SYNAPSE]-()
+                    MATCH (n {id: $id})-[s:SYNAPSE]-(m)
+                    // Never touch a synapse that crosses projects: both ends must
+                    // share the project (a Decision has no project_id: it is not a
+                    // cross-project signal by itself).
+                    WHERE n.project_id IS NULL OR m.project_id IS NULL OR n.project_id = m.project_id
                     SET s.weight = s.weight - $amount
                     WITH collect(s) AS all_syn
                     WITH all_syn, [x IN all_syn WHERE x.weight < $threshold] AS weak

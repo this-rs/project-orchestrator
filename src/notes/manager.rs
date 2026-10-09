@@ -14,6 +14,54 @@ use anyhow::Result;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Most files read when resolving a relative path by suffix (enough to tell
+/// "one project" from "several" without scanning a large monorepo).
+const RELATIVE_PATH_MATCH_LIMIT: usize = 50;
+
+/// Who owns an entity, as far as the server can tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntityOwner {
+    /// Exactly one project.
+    Project(Uuid),
+    /// Not resolvable (not a file/project, unknown path, file without project).
+    Unknown,
+    /// A relative file path that matches files of several projects (or a file
+    /// without project besides a project's): the listed candidate projects.
+    Ambiguous(Vec<Uuid>),
+}
+
+/// Normalize a client-supplied relative path: `\` becomes `/`, empty and `.`
+/// components are dropped. A path with a `..` component (or nothing left) is
+/// refused: it identifies no stored file.
+fn normalize_relative_path(path: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            p => parts.push(p),
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+/// Owner of a relative path from the `(path, project_id)` of the files it matches.
+fn owner_of_matches(matches: &[(String, Option<Uuid>)]) -> EntityOwner {
+    let mut projects: Vec<Uuid> = matches.iter().filter_map(|(_, p)| *p).collect();
+    projects.sort();
+    projects.dedup();
+    let has_unowned = matches.iter().any(|(_, p)| p.is_none());
+    match (projects.as_slice(), has_unowned) {
+        ([], _) => EntityOwner::Unknown,
+        ([only], false) => EntityOwner::Project(*only),
+        _ => EntityOwner::Ambiguous(projects),
+    }
+}
+
 /// Configuration for automatic synapse creation between similar notes.
 #[derive(Debug, Clone)]
 pub struct SynapseConfig {
@@ -1119,20 +1167,34 @@ impl NoteManager {
             .await?;
 
         // Scoped to the owning project when it can be resolved (project + global notes).
-        // Get propagated notes from graph traversal (default relations)
-        let owner_project = self.resolve_entity_project(entity_type, entity_id).await;
-        let mut propagated_notes = self
-            .neo4j
-            .get_propagated_notes(
-                entity_type,
-                entity_id,
-                max_depth,
-                min_score,
-                None,
-                owner_project,
-                false,
-            )
-            .await?;
+        // An ambiguous relative path yields no propagated notes rather than the
+        // notes of every project.
+        let mut propagated_notes = match self.resolve_entity_owner(entity_type, entity_id).await {
+            EntityOwner::Ambiguous(_) => {
+                tracing::warn!(
+                    entity_id,
+                    "ambiguous relative path: no propagated notes (would span projects)"
+                );
+                Vec::new()
+            }
+            owner => {
+                let owner_project = match owner {
+                    EntityOwner::Project(p) => Some(p),
+                    _ => None,
+                };
+                self.neo4j
+                    .get_propagated_notes(
+                        entity_type,
+                        entity_id,
+                        max_depth,
+                        min_score,
+                        None,
+                        owner_project,
+                        false,
+                    )
+                    .await?
+            }
+        };
 
         // If entity is a Project, also get workspace-level notes
         // These propagate from the parent workspace with a decay factor
@@ -1226,23 +1288,56 @@ impl NoteManager {
     }
 
     /// Project that owns an entity, when it can be determined server-side
-    /// (a `Project` is itself; a `File` belongs to the project that CONTAINS it).
-    /// Other entity kinds, and relative file paths, return `None`.
+    /// (a `Project` is itself; a `File` belongs to the project that CONTAINS it,
+    /// including when given as a relative path that identifies ONE file).
+    /// Other entity kinds, unknown files and ambiguous relative paths return `None`.
     pub async fn resolve_entity_project(
         &self,
         entity_type: &EntityType,
         entity_id: &str,
     ) -> Option<Uuid> {
+        match self.resolve_entity_owner(entity_type, entity_id).await {
+            EntityOwner::Project(p) => Some(p),
+            EntityOwner::Unknown | EntityOwner::Ambiguous(_) => None,
+        }
+    }
+
+    /// Like [`Self::resolve_entity_project`], but tells an unknown entity from a
+    /// relative file path that matches files of several projects (or a file
+    /// without project): the latter must never be treated as "no project".
+    pub async fn resolve_entity_owner(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> EntityOwner {
         match entity_type {
-            EntityType::Project => entity_id.parse::<Uuid>().ok(),
-            EntityType::File => self
-                .neo4j
-                .get_file(entity_id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|f| f.project_id),
-            _ => None,
+            EntityType::Project => entity_id
+                .parse::<Uuid>()
+                .map(EntityOwner::Project)
+                .unwrap_or(EntityOwner::Unknown),
+            EntityType::File => {
+                if let Some(file) = self.neo4j.get_file(entity_id).await.ok().flatten() {
+                    return file
+                        .project_id
+                        .map(EntityOwner::Project)
+                        .unwrap_or(EntityOwner::Unknown);
+                }
+                if entity_id.starts_with('/') {
+                    return EntityOwner::Unknown;
+                }
+                // Relative path: the stored paths are absolute, so resolve by
+                // normalized suffix, the same match `get_propagated_notes` uses.
+                let Some(rel) = normalize_relative_path(entity_id) else {
+                    return EntityOwner::Unknown;
+                };
+                let matches = self
+                    .neo4j
+                    .find_files_by_path_suffix(&format!("/{rel}"), RELATIVE_PATH_MATCH_LIMIT)
+                    .await
+                    .unwrap_or_default();
+                owner_of_matches(&matches)
+            }
+            _ => EntityOwner::Unknown,
         }
     }
 
@@ -1264,13 +1359,24 @@ impl NoteManager {
         entity_id: &str,
         requested: Option<Uuid>,
     ) -> std::result::Result<Option<Uuid>, String> {
-        let owner = self.resolve_entity_project(entity_type, entity_id).await;
-        match (owner, requested) {
-            (Some(o), Some(r)) if o != r => Err(format!(
-                "source_project_id {r} does not match the project {o} that owns the entity"
-            )),
-            (Some(o), _) => Ok(Some(o)),
-            (None, r) => Ok(r),
+        match self.resolve_entity_owner(entity_type, entity_id).await {
+            EntityOwner::Project(o) => match requested {
+                Some(r) if o != r => Err(format!(
+                    "source_project_id {r} does not match the project {o} that owns the entity"
+                )),
+                _ => Ok(Some(o)),
+            },
+            // A relative path shared by several projects: never widen. The client
+            // may only narrow to one of the candidates; otherwise it is refused.
+            EntityOwner::Ambiguous(candidates) => match requested {
+                Some(r) if candidates.contains(&r) => Ok(Some(r)),
+                _ => Err(format!(
+                    "path `{entity_id}` is ambiguous: it matches files of {} projects; \
+                     use the absolute path or a source_project_id of one of them",
+                    candidates.len().max(1)
+                )),
+            },
+            EntityOwner::Unknown => Ok(requested),
         }
     }
 
@@ -3521,6 +3627,154 @@ mod tests {
             mgr.resolve_propagation_scope(&EntityType::Function, "f", None)
                 .await,
             Ok(None)
+        );
+    }
+
+    fn file_in(path: &str, project: Option<Uuid>) -> crate::neo4j::models::FileNode {
+        crate::neo4j::models::FileNode {
+            path: path.into(),
+            language: "rust".into(),
+            hash: "h".into(),
+            last_parsed: chrono::Utc::now(),
+            project_id: project,
+        }
+    }
+
+    #[test]
+    fn test_normalize_relative_path() {
+        assert_eq!(
+            normalize_relative_path("src/a.rs").as_deref(),
+            Some("src/a.rs")
+        );
+        assert_eq!(
+            normalize_relative_path("./src//a.rs").as_deref(),
+            Some("src/a.rs")
+        );
+        assert_eq!(
+            normalize_relative_path("src\\a.rs").as_deref(),
+            Some("src/a.rs")
+        );
+        assert_eq!(normalize_relative_path("../src/a.rs"), None);
+        assert_eq!(normalize_relative_path("src/../a.rs"), None);
+        assert_eq!(normalize_relative_path("./"), None);
+    }
+
+    #[tokio::test]
+    async fn test_relative_path_resolves_to_its_single_project() {
+        use crate::neo4j::traits::GraphStore;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (p, q) = (Uuid::new_v4(), Uuid::new_v4());
+        graph
+            .upsert_file(&file_in("/ws/p/src/a.rs", Some(p)))
+            .await
+            .unwrap();
+        graph
+            .upsert_file(&file_in("/ws/q/src/b.rs", Some(q)))
+            .await
+            .unwrap();
+        // Not a path-component suffix of /ws/p/src/a.rs.
+        graph
+            .upsert_file(&file_in("/ws/q/xsrc/a.rs", Some(q)))
+            .await
+            .unwrap();
+        let state = crate::test_helpers::mock_app_state_with_graph(graph);
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+
+        for path in ["src/a.rs", "./src/a.rs", "src//a.rs"] {
+            assert_eq!(
+                mgr.resolve_entity_project(&EntityType::File, path).await,
+                Some(p),
+                "{path}"
+            );
+            assert_eq!(
+                mgr.resolve_propagation_scope(&EntityType::File, path, None)
+                    .await,
+                Ok(Some(p)),
+                "{path}"
+            );
+        }
+        // A client value for another project cannot override the resolved owner.
+        assert!(mgr
+            .resolve_propagation_scope(&EntityType::File, "src/a.rs", Some(q))
+            .await
+            .is_err());
+        // Unknown or non-normalizable paths stay unresolved (legacy rule).
+        assert_eq!(
+            mgr.resolve_propagation_scope(&EntityType::File, "nope/c.rs", None)
+                .await,
+            Ok(None)
+        );
+        assert_eq!(
+            mgr.resolve_propagation_scope(&EntityType::File, "../src/a.rs", None)
+                .await,
+            Ok(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ambiguous_relative_path_never_widens_the_scope() {
+        use crate::neo4j::traits::GraphStore;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (p, q, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        graph
+            .upsert_file(&file_in("/ws/p/src/lib.rs", Some(p)))
+            .await
+            .unwrap();
+        graph
+            .upsert_file(&file_in("/ws/q/src/lib.rs", Some(q)))
+            .await
+            .unwrap();
+        let state = crate::test_helpers::mock_app_state_with_graph(graph);
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+
+        assert_eq!(
+            mgr.resolve_entity_project(&EntityType::File, "src/lib.rs")
+                .await,
+            None
+        );
+        // No client value: refused, NOT unscoped.
+        assert!(mgr
+            .resolve_propagation_scope(&EntityType::File, "src/lib.rs", None)
+            .await
+            .is_err());
+        // A client value outside the candidates: refused.
+        assert!(mgr
+            .resolve_propagation_scope(&EntityType::File, "src/lib.rs", Some(other))
+            .await
+            .is_err());
+        // A candidate can only narrow.
+        assert_eq!(
+            mgr.resolve_propagation_scope(&EntityType::File, "src/lib.rs", Some(q))
+                .await,
+            Ok(Some(q))
+        );
+        // The absolute path stays unambiguous.
+        assert_eq!(
+            mgr.resolve_propagation_scope(&EntityType::File, "/ws/p/src/lib.rs", None)
+                .await,
+            Ok(Some(p))
+        );
+    }
+
+    #[test]
+    fn test_owner_of_matches() {
+        let (p, q) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(owner_of_matches(&[]), EntityOwner::Unknown);
+        assert_eq!(
+            owner_of_matches(&[("/a".into(), Some(p)), ("/b".into(), Some(p))]),
+            EntityOwner::Project(p)
+        );
+        assert!(matches!(
+            owner_of_matches(&[("/a".into(), Some(p)), ("/b".into(), Some(q))]),
+            EntityOwner::Ambiguous(c) if c.len() == 2
+        ));
+        assert!(matches!(
+            owner_of_matches(&[("/a".into(), Some(p)), ("/b".into(), None)]),
+            EntityOwner::Ambiguous(_)
+        ));
+        assert_eq!(
+            owner_of_matches(&[("/a".into(), None)]),
+            EntityOwner::Unknown
         );
     }
 }

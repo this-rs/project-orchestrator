@@ -2931,6 +2931,7 @@ pub async fn get_bridge(
     let bridge_node_paths: Vec<String> = node_paths;
     let neo4j_bg = state.orchestrator.neo4j_arc();
     tokio::spawn(async move {
+        let mut all_notes: Vec<crate::notes::Note> = Vec::new();
         let mut all_note_ids: Vec<uuid::Uuid> = Vec::new();
         for path in &bridge_node_paths {
             if let Ok(notes) = neo4j_bg
@@ -2939,13 +2940,21 @@ pub async fn get_bridge(
             {
                 for note in &notes {
                     all_note_ids.push(note.id);
+                    all_notes.push(note.clone());
                 }
             }
         }
         all_note_ids.sort();
         all_note_ids.dedup();
         if all_note_ids.len() >= 2 {
-            match neo4j_bg.reinforce_synapses(&all_note_ids, 0.05).await {
+            // Synapses never cross projects: reinforce each project on its own.
+            match crate::notes::coactivation::reinforce_per_project(
+                neo4j_bg.as_ref(),
+                &all_notes,
+                0.05,
+            )
+            .await
+            {
                 Ok(count) => {
                     tracing::debug!(
                         reinforced = count,

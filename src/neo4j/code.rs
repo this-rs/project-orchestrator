@@ -322,6 +322,36 @@ impl Neo4jClient {
         }
     }
 
+    /// Files whose path ends with `suffix`, as `(path, project_id)`.
+    pub async fn find_files_by_path_suffix(
+        &self,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, Option<Uuid>)>> {
+        let q = query(
+            r#"
+            MATCH (f:File)
+            WHERE f.path ENDS WITH $suffix
+            RETURN f.path AS path, f.project_id AS project_id
+            LIMIT $limit
+            "#,
+        )
+        .param("suffix", suffix.to_string())
+        .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut out = Vec::new();
+        while let Some(row) = result.next().await? {
+            let path: String = row.get("path")?;
+            let project = row
+                .get::<String>("project_id")
+                .ok()
+                .and_then(|s| s.parse().ok());
+            out.push((path, project));
+        }
+        Ok(out)
+    }
+
     /// List files for a project
     pub async fn list_project_files(&self, project_id: Uuid) -> Result<Vec<FileNode>> {
         let q = query(

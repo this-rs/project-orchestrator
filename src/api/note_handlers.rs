@@ -1413,7 +1413,7 @@ pub struct ReinforceNeuronsBody {
 /// All notes must exist and belong to one and the same known project: no
 /// synapse (nor energy boost) across projects or with an unknown `project_id`.
 /// `entries` holds `(note_id, project_id)` for notes that were found.
-fn ensure_single_project(entries: &[(Uuid, Option<Uuid>)]) -> Result<Uuid, AppError> {
+pub(crate) fn ensure_single_project(entries: &[(Uuid, Option<Uuid>)]) -> Result<Uuid, AppError> {
     let mut project: Option<Uuid> = None;
     for (id, pid) in entries {
         let pid = pid.ok_or_else(|| {

@@ -1271,6 +1271,7 @@ pub fn spawn_entity_extraction(state: &OrchestratorState, session_id: &str, mess
             return;
         }
 
+        let mut all_notes: Vec<crate::notes::Note> = Vec::new();
         let mut all_note_ids: Vec<uuid::Uuid> = Vec::new();
         let mut boost_count = 0u64;
 
@@ -1302,6 +1303,7 @@ pub fn spawn_entity_extraction(state: &OrchestratorState, session_id: &str, mess
                             boost_count += 1;
                         }
                         all_note_ids.push(note.id);
+                        all_notes.push(note.clone());
                     }
                 }
                 Err(e) => {
@@ -1320,9 +1322,14 @@ pub fn spawn_entity_extraction(state: &OrchestratorState, session_id: &str, mess
             all_note_ids.sort();
             all_note_ids.dedup();
             if all_note_ids.len() >= 2 {
-                match neo4j
-                    .reinforce_synapses(&all_note_ids, ar_config.chat_synapse_boost)
-                    .await
+                // Notes linked to an entity may belong to several projects: synapses
+                // never cross projects, so reinforce each project on its own.
+                match crate::notes::coactivation::reinforce_per_project(
+                    neo4j.as_ref(),
+                    &all_notes,
+                    ar_config.chat_synapse_boost,
+                )
+                .await
                 {
                     Ok(synapse_count) => {
                         debug!(

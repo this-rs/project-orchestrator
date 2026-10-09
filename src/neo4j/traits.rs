@@ -347,6 +347,17 @@ pub trait GraphStore: Send + Sync {
     /// Get a file by path
     async fn get_file(&self, path: &str) -> Result<Option<FileNode>>;
 
+    /// `(path, project_id)` of the files whose path ends with `suffix` (at most
+    /// `limit`). Used to resolve a relative file path to its owning project(s).
+    /// Defaults to no match for stores without file storage.
+    async fn find_files_by_path_suffix(
+        &self,
+        _suffix: &str,
+        _limit: usize,
+    ) -> Result<Vec<(String, Option<Uuid>)>> {
+        Ok(Vec::new())
+    }
+
     /// List files for a project
     async fn list_project_files(&self, project_id: Uuid) -> Result<Vec<FileNode>>;
 
