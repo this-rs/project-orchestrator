@@ -9,6 +9,11 @@ on:
         description: "Release tag (e.g. v0.0.1) — must already exist"
         required: true
         type: string
+      dry_run:
+        description: "Dry run: build, sign and check everything, publish NOTHING (no release, no Docker image, no Homebrew formula). The release files are attached to the run as an artifact."
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -101,20 +106,36 @@ jobs:
             arch: x86_64
             use_cross: false
 
+          # macOS Intel "legacy" (macOS 10.15 to 13.3): the standard Intel build links libonnxruntime, which is
+          # built for macOS 13.4 and needs a libc++ symbol Catalina..Ventura- do not have (0.0.17 crashed at launch
+          # on 10.15.7: "Symbol not found: basic_stringbuf::str() const"). This one is built WITHOUT the
+          # `local-embeddings` feature: no ONNX Runtime at all, deployment target 10.15. Semantic search then needs an
+          # HTTP embedding provider (Ollama, OpenAI...). Archive: orchestrator-<v>-macos-x86_64-legacy.tar.gz.
+          - target: x86_64-apple-darwin
+            runner: macos-14
+            os: macos
+            arch: x86_64-legacy
+            use_cross: false
+            legacy: true
+
+          # Linux runners are PINNED to Ubuntu 22.04 (glibc 2.35), not ubuntu-latest: a binary needs the glibc of the machine that
+          # built it, so building on 24.04 (what ubuntu-latest became) produced files that need glibc 2.39 and refuse to start on
+          # Ubuntu 22.04 / Debian 12. The promise is in scripts/check-os-floor.sh; the release fails if a build exceeds it.
           # Linux x86_64 (native build — no need for cross since host == target)
           # ort-sys downloads prebuilt ONNX Runtime from pyke.io and statically links.
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             os: linux
             arch: x86_64
             use_cross: false
 
-          # Linux ARM64
+          # Linux ARM64: built NATIVELY on an ARM runner (as the desktop job already does). The cross-rs container produced
+          # glibc 2.39 binaries (measured on 0.0.17); a native 22.04 build gives 2.35.
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-22.04-arm
             os: linux
             arch: arm64
-            use_cross: true
+            use_cross: false
 
           # Windows x86_64
           - target: x86_64-pc-windows-msvc
@@ -159,7 +180,7 @@ jobs:
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "release-${{ matrix.target }}"
+          shared-key: "release-${{ matrix.target }}${{ matrix.legacy && '-legacy' || '' }}"
 
       - name: Install cross-rs
         if: matrix.use_cross
@@ -184,8 +205,13 @@ jobs:
       # The .so/.dylib files are bundled alongside binaries in packaging steps.
       # -----------------------------------------------------------------------
 
+      # macOS legacy: lower the floor BEFORE anything compiles (rustc and every C dependency read it).
+      - name: macOS legacy settings (deployment target 10.15, no ONNX Runtime)
+        if: matrix.legacy
+        run: echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
+
       - name: Download ONNX Runtime for macOS x86_64
-        if: matrix.target == 'x86_64-apple-darwin'
+        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
         run: |
           ORT_VERSION="1.23.2"
           echo "Downloading ONNX Runtime ${ORT_VERSION} for macOS x86_64..."
@@ -223,7 +249,7 @@ jobs:
 
       - name: Build light variant (native)
         if: "!matrix.use_cross"
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.legacy && '--no-default-features' || '' }}
 
       - name: Build light variant (cross)
         if: matrix.use_cross
@@ -293,7 +319,7 @@ jobs:
 
       - name: Build full variant (native)
         if: "!matrix.use_cross"
-        run: cargo build --release --features embedded-frontend --target ${{ matrix.target }}
+        run: cargo build --release --features embedded-frontend --target ${{ matrix.target }} ${{ matrix.legacy && '--no-default-features' || '' }}
 
       - name: Build full variant (cross)
         if: matrix.use_cross
@@ -326,6 +352,14 @@ jobs:
           cd staging
           tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
           echo "ARCHIVE_FULL=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_ENV"
+
+      # Compare what the archives REQUIRE (macOS minimum version, glibc) with what we promise (scripts/check-os-floor.sh).
+      # Runs on every non-Windows target, light and full: a runner upgrade or a new native dependency that raises the floor
+      # fails here instead of at a user's launch. Windows is not measured (no equivalent check yet).
+      - name: Check OS floor (archives)
+        if: matrix.os != 'windows'
+        shell: bash
+        run: scripts/check-os-floor.sh "${{ matrix.os }}-${{ matrix.arch }}" staging
 
       - name: Package full (Windows)
         if: matrix.os == 'windows'
@@ -562,8 +596,17 @@ jobs:
             artifact_os: macos
             artifact_arch: x86_64
 
+          # macOS Intel "legacy" (10.15 to 13.3): see build-backend. Own updater feed (latest-legacy.json) so a Catalina
+          # install is never offered the standard build; its .dmg and .app.tar.gz carry a "-legacy" suffix.
+          - target: x86_64-apple-darwin
+            runner: macos-14
+            tauri_target: x86_64-apple-darwin
+            artifact_os: macos
+            artifact_arch: x86_64-legacy
+            legacy: true
+
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             tauri_target: x86_64-unknown-linux-gnu
             artifact_os: linux
             artifact_arch: x86_64
@@ -574,7 +617,7 @@ jobs:
           # they can't execute (GNOME falls back to "mount as disk image" →
           # nothing happens).
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
             tauri_target: aarch64-unknown-linux-gnu
             artifact_os: linux
             artifact_arch: arm64
@@ -693,7 +736,7 @@ jobs:
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "tauri-${{ matrix.target }}"
+          shared-key: "tauri-${{ matrix.target }}${{ matrix.legacy && '-legacy' || '' }}"
           workspaces: ". -> target"
 
       - name: Install Linux dependencies
@@ -710,8 +753,21 @@ jobs:
 
       # x86_64-apple-darwin: provide ONNX Runtime for dynamic linking
       # (same rationale as build-backend — ort-sys has no prebuilt for macOS Intel)
+      - name: macOS legacy settings (deployment target 10.15, own updater feed)
+        if: matrix.legacy
+        run: |
+          echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
+          # Merged over tauri.conf.json by the Tauri CLI (arrays are replaced): the legacy app reads latest-legacy.json.
+          echo 'TAURI_CONFIG={"plugins":{"updater":{"endpoints":["https://github.com/this-rs/project-orchestrator/releases/latest/download/latest-legacy.json"]}}}' >> "$GITHUB_ENV"
+
+      # The standard Intel app links libonnxruntime (macOS 13.4+). Declare it, so an older Mac gets macOS's own
+      # "requires macOS 13.4" message instead of a crash at launch.
+      - name: macOS Intel standard settings (declare the real minimum, 13.4)
+        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
+        run: echo 'TAURI_CONFIG={"bundle":{"macOS":{"minimumSystemVersion":"13.4"}}}' >> "$GITHUB_ENV"
+
       - name: Download ONNX Runtime for macOS x86_64
-        if: matrix.target == 'x86_64-apple-darwin'
+        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
         run: |
           ORT_VERSION="1.23.2"
           echo "Downloading ONNX Runtime ${ORT_VERSION} for macOS x86_64..."
@@ -886,7 +942,8 @@ jobs:
           # Windows signing
           TAURI_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           TAURI_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-        run: cargo tauri build --target ${{ matrix.tauri_target }} ${{ matrix.bundles && format('--bundles {0}', matrix.bundles) || '' }}
+        # Legacy: arguments after `--` go to cargo. `custom-protocol` is what makes the app load its embedded frontend.
+        run: cargo tauri build --target ${{ matrix.tauri_target }} ${{ matrix.bundles && format('--bundles {0}', matrix.bundles) || '' }} ${{ matrix.legacy && '-- --no-default-features --features custom-protocol' || '' }}
 
       # Free disk space after Tauri build completes.
       # The cargo build output (deps/, build/, .fingerprint/, incremental/) can
@@ -917,7 +974,7 @@ jobs:
       # We place it in Contents/Frameworks/ (standard macOS location) and add
       # the matching rpath. The re-sign step below will codesign the dylib.
       - name: Bundle ONNX Runtime in Tauri app (macOS x86_64)
-        if: matrix.target == 'x86_64-apple-darwin'
+        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
         run: |
           BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
           APP_PATH=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
@@ -957,6 +1014,20 @@ jobs:
           for binary in "$APP_PATH/Contents/MacOS/"*; do
             [ -f "$binary" ] && otool -l "$binary" | grep -A2 LC_RPATH || true
           done
+
+      # What the app REQUIRES vs what we PROMISE (scripts/check-os-floor.sh), after ONNX Runtime is bundled and before signing.
+      # macOS: every Mach-O's minimum, and the .app's LSMinimumSystemVersion must not be lower than that (the 0.0.17 lie).
+      - name: Check OS floor (macOS app)
+        if: runner.os == 'macOS'
+        run: scripts/check-os-floor.sh "macos-${{ matrix.artifact_arch }}" "target/${{ matrix.target }}/release/bundle/macos"
+
+      # Linux: the binaries inside the .deb (the AppImage and .rpm are built from the same ones).
+      - name: Check OS floor (Linux app)
+        if: runner.os == 'Linux'
+        run: |
+          rm -rf "$RUNNER_TEMP/debx" && mkdir -p "$RUNNER_TEMP/debx"
+          dpkg-deb -x target/${{ matrix.target }}/release/bundle/deb/*.deb "$RUNNER_TEMP/debx"
+          scripts/check-os-floor.sh "linux-${{ matrix.artifact_arch }}" "$RUNNER_TEMP/debx"
 
       # Verify the built bundle contains the correct frontend.
       # This catches any issue where Tauri silently bundles stale frontend files.
@@ -1258,11 +1329,23 @@ jobs:
           echo "Updater bundles after rename:"
           ls -la "$BUNDLE_DIR"/*.app.tar.gz* 2>/dev/null || echo "  (none)"
 
+      # The legacy .dmg is named like the standard Intel one (both are "..._x64.dmg"): without a suffix the release job
+      # would flatten one over the other. The site finds it by "_x64-legacy.dmg".
+      - name: Rename the legacy .dmg
+        if: matrix.legacy
+        shell: bash
+        run: |
+          for f in target/${{ matrix.target }}/release/bundle/dmg/*_x64.dmg; do
+            [ -f "$f" ] || { echo "::error::no _x64.dmg to rename"; exit 1; }
+            mv "$f" "${f%_x64.dmg}_x64-legacy.dmg"
+            echo "Renamed: $(basename "$f") → $(basename "${f%_x64.dmg}_x64-legacy.dmg")"
+          done
+
       - name: Upload Tauri artifacts (macOS)
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v7
         with:
-          name: tauri-${{ matrix.target }}
+          name: tauri-${{ matrix.target }}${{ matrix.legacy && '-legacy' || '' }}
           path: |
             target/${{ matrix.target }}/release/bundle/dmg/*.dmg
             target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
@@ -1474,15 +1557,49 @@ jobs:
           echo "=== Tauri updater latest.json ==="
           cat release-files/latest.json
 
+          # --- macOS Intel legacy: its own feed. The legacy app polls latest-legacy.json (see build-tauri), so a Mac on
+          # 10.15 to 13.3 is only ever offered the build that runs there. Not written when the legacy build is missing:
+          # the endpoint then 404s and that app simply sees no update, instead of being offered a file that cannot run.
+          LEGACY_URL=""
+          LEGACY_SIG=""
+          for f in release-files/*_x86_64-legacy.app.tar.gz; do
+            [ -f "$f" ] && LEGACY_URL="${BASE_URL}/$(gh_asset_name "$f")" && break
+          done
+          for f in release-files/*_x86_64-legacy.app.tar.gz.sig; do
+            [ -f "$f" ] && LEGACY_SIG=$(cat "$f") && break
+          done
+          if [ -n "$LEGACY_URL" ] && [ -n "$LEGACY_SIG" ]; then
+            jq -n \
+              --arg version "$VERSION" --arg notes "$NOTES" --arg pub_date "$PUB_DATE" \
+              --arg url "$LEGACY_URL" --arg sig "$LEGACY_SIG" \
+              '{ version: $version, notes: $notes, pub_date: $pub_date, platforms: { "darwin-x86_64": { url: $url, signature: $sig } } }' \
+              > release-files/latest-legacy.json
+            echo "=== macOS legacy updater latest-legacy.json ==="
+            cat release-files/latest-legacy.json
+          else
+            echo "::warning::macOS legacy updater bundle missing — latest-legacy.json not generated"
+          fi
+
       # Delete any existing release for this tag before creating a fresh one.
       # softprops/action-gh-release with generate_release_notes APPENDS notes
       # when updating an existing release — causing duplicate changelogs on re-runs.
+      # Dry run: keep the files (latest.json, latest-legacy.json, installers) for inspection instead of publishing them.
+      - name: Upload release files (dry run only)
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: dry-run-release-files
+          path: release-files/
+          retention-days: 3
+
       - name: Delete existing release (if any)
+        if: ${{ !inputs.dry_run }}
         run: gh release delete "${{ env.RELEASE_TAG }}" --yes --cleanup-tag=false 2>/dev/null || true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create GitHub Release
+        if: ${{ !inputs.dry_run }}
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
@@ -1499,6 +1616,7 @@ jobs:
     name: Docker (${{ matrix.variant }})
     runs-on: ubuntu-latest
     needs: [build-frontend]
+    if: ${{ !inputs.dry_run }}
     strategy:
       fail-fast: false
       matrix:
@@ -1588,7 +1706,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [release]
     # Skip pre-releases (e.g. v0.0.1-beta). Works for both tag push and workflow_dispatch.
-    if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
+    if: ${{ !inputs.dry_run && !contains(inputs.tag || github.ref_name, '-') }}
     steps:
       - uses: actions/checkout@v7
 
