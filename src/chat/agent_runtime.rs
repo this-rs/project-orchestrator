@@ -11,20 +11,21 @@
 //! The legacy path stays as it was; the manager decides which one serves a
 //! session and a session never changes engine.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use nexus_claude::agent::{
-    AgentEvent, AgentProvider, AgentSession, Capabilities, InterruptScope, PermissionDecision,
-    PolicyMode, ProviderError, TurnInput,
+    AgentEvent, AgentProvider, AgentSession, CancelScope, Capabilities, InterruptScope,
+    PermissionDecision, PolicyMode, ProviderError, TurnInput,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use uuid::Uuid;
 
+use super::manager::{CancelToolsResult, ChatManager, CANCEL_TOOLS_CAP, CANCEL_TOOLS_WINDOW_SECS};
 use super::provider::event_map::{out_of_band_to_chat_events, EventMapper};
 use super::types::{ChatEvent, PendingMessage, PendingMessageKind};
 use crate::neo4j::models::ChatEventRecord;
@@ -225,6 +226,15 @@ pub struct AgentSessionHandle {
     /// handle knows: what the opener persisted, then each change [`Self::sync_resume_token`]
     /// wrote. Held across the write, so two writers never store an older token last.
     persisted_token: Mutex<Option<String>>,
+    /// When `cancel_tools` was asked of this session: the sliding window of the
+    /// per-session cap the Claude Code engine applies
+    /// (`ActiveSession::cancel_tools_history`), so a Stop clicked in a loop
+    /// cannot flood the provider here either.
+    cancel_tools_history: Arc<Mutex<VecDeque<Instant>>>,
+    /// Calls allowed within `cancel_tools_window` (`CANCEL_TOOLS_CAP`).
+    cancel_tools_cap: u32,
+    /// The window of the cap (`CANCEL_TOOLS_WINDOW_SECS`).
+    cancel_tools_window: Duration,
 }
 
 impl AgentSessionHandle {
@@ -705,6 +715,60 @@ impl AgentSessionHandle {
             .map_err(anyhow::Error::new)
     }
 
+    /// Stops the tools the running turn executes and keeps the turn: the provider
+    /// answers each cut call with a cancelled `tool_result` and the model goes on
+    /// from there — the `cancel_tools` of the Claude Code engine
+    /// (`ChatManager::cancel_running_tools`), whose per-session cap applies here
+    /// too: past `cancel_tools_cap` calls within `cancel_tools_window` nothing
+    /// reaches the provider and the result says `capped`.
+    ///
+    /// Announces `tools_cancelled` to every client of the session (stored,
+    /// published to the other instances like any event of the session);
+    /// `killed_count` is the number of tools the provider stopped.
+    pub async fn cancel_tools(&self) -> Result<CancelToolsResult> {
+        let allowed = ChatManager::check_and_record_cancel_cap(
+            &self.cancel_tools_history,
+            self.cancel_tools_cap,
+            self.cancel_tools_window,
+        )
+        .await;
+        if !allowed {
+            tracing::warn!(
+                session_id = %self.session_id,
+                cap = self.cancel_tools_cap,
+                window_secs = self.cancel_tools_window.as_secs(),
+                "cancel_tools: rate cap hit, refusing"
+            );
+            return Ok(CancelToolsResult {
+                cli_pid: None,
+                killed_pids: Vec::new(),
+                capped: true,
+            });
+        }
+        let outcome = self
+            .session
+            .cancel_tools(CancelScope::All)
+            .await
+            .map_err(anyhow::Error::new)?;
+        let diagnostic = outcome.diagnostic.unwrap_or_default();
+        tracing::info!(
+            session_id = %self.session_id,
+            tools_cancelled = outcome.tools_cancelled,
+            "cancel_tools: the running tools were stopped (turn preserved)"
+        );
+        self.emit(ChatEvent::ToolsCancelled {
+            cli_pid: diagnostic.pid,
+            killed_count: outcome.tools_cancelled as usize,
+            requested_by: "user".to_string(),
+        })
+        .await;
+        Ok(CancelToolsResult {
+            cli_pid: diagnostic.pid,
+            killed_pids: diagnostic.killed_pids,
+            capped: false,
+        })
+    }
+
     /// Changes the model live.
     pub async fn set_model(&self, model: &str) -> Result<()> {
         self.session
@@ -809,6 +873,9 @@ impl AgentRuntime {
             max_auto_continues: std::sync::atomic::AtomicU32::new(0),
             // What the opener persisted with the snapshot (`ChatManager::finish_agent_open`).
             persisted_token: Mutex::new(session.resume_token().map(|t| t.to_wire())),
+            cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
+            cancel_tools_cap: CANCEL_TOOLS_CAP,
+            cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
         });
         if let Some(oob) = session.out_of_band() {
             let pump = Arc::clone(&handle);

@@ -3044,6 +3044,7 @@ mod parity {
         caps.hooks = HookSupport::InProtocol;
         caps.per_session_mcp = true;
         caps.tools = true;
+        caps.tool_cancel = true;
         caps
     }
 
@@ -3291,7 +3292,7 @@ mod parity {
             }
         }
 
-        fn interrupts(&self) -> usize {
+        pub(super) fn interrupts(&self) -> usize {
             self.provider
                 .inner
                 .calls()
@@ -4035,6 +4036,372 @@ mod claude_code_resume_token {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert_eq!(results, 2, "the resumed session answered its turn");
+        manager.close_session(&sid).await.unwrap();
+    }
+}
+
+/// P5 (parity): `cancel_tools` on the agent engine stops the running tools and
+/// keeps the turn — from this instance (the WS handler calls
+/// `cancel_running_tools`), from another instance over NATS, and under the cap
+/// of the Claude Code engine.
+mod cancel_tools {
+    use nexus_claude::agent::{CancelScope, ProviderKind};
+    use nexus_claude::testkit::scripted::steps;
+    use nexus_claude::testkit::{RecordedCall, Step};
+
+    use super::parity::{caps, rig, rig_with, Rig};
+    use super::*;
+
+    /// A turn calling one tool that runs until it is cancelled, then goes on.
+    fn slow_tool_turn() -> Vec<Step> {
+        vec![
+            steps::tool_call("s1", "slow", json!({})),
+            Step::AwaitCancel,
+            steps::text("I carry on"),
+            steps::done(&caps()),
+        ]
+    }
+
+    impl Rig {
+        /// How many times the provider was asked to cancel all its tools.
+        fn cancels(&self) -> usize {
+            self.provider
+                .inner
+                .calls()
+                .iter()
+                .filter(|c| matches!(c, RecordedCall::CancelTools(CancelScope::All)))
+                .count()
+        }
+    }
+
+    /// The events received up to and including the first one matching `pred`,
+    /// and whether it came within `within`.
+    async fn collect_until(
+        rx: &mut broadcast::Receiver<ChatEvent>,
+        within: Duration,
+        pred: impl Fn(&ChatEvent) -> bool,
+    ) -> (Vec<ChatEvent>, bool) {
+        let mut events = Vec::new();
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let Ok(Ok(event)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
+                return (events, false);
+            };
+            let found = pred(&event);
+            events.push(event);
+            if found {
+                return (events, true);
+            }
+        }
+    }
+
+    fn turn_ended(e: &ChatEvent) -> bool {
+        matches!(
+            e,
+            ChatEvent::StreamingStatus {
+                is_streaming: false
+            }
+        )
+    }
+
+    /// The turn went on after the cancel: the cut tool ended in a cancelled
+    /// `tool_result`, the model spoke again, and the turn completed.
+    fn assert_the_turn_went_on(events: &[ChatEvent], tool_id: &str) {
+        let types: Vec<&str> = events.iter().map(|e| e.event_type()).collect();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ChatEvent::ToolResult { id, is_error: true, result, .. }
+                    if id == tool_id && result.to_string().contains("cancelled")
+            )),
+            "a cancelled tool_result: {types:?}"
+        );
+        assert!(
+            events.iter().any(
+                |e| matches!(e, ChatEvent::AssistantText { content, .. } if content.contains("I carry on"))
+            ),
+            "the model went on: {types:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ChatEvent::Result { stop_reason, .. } if stop_reason.as_deref() == Some("completed")
+            )),
+            "the turn completed: {types:?}"
+        );
+    }
+
+    /// (a) From this instance: the tool is stopped, `tools_cancelled` is on the
+    /// wire (and stored for replay), the turn goes on — nothing interrupted it.
+    #[tokio::test]
+    async fn a_cancel_tools_from_this_instance_stops_the_tool_and_the_turn_goes_on() {
+        let mut r = rig(ProviderKind::Native, vec![slow_tool_turn()]).await;
+        r.manager.send_message(&r.sid, "slow").await.unwrap();
+        next_event(
+            &mut r.rx,
+            |e| matches!(e, ChatEvent::ToolUse { id, .. } if id == "s1"),
+        )
+        .await;
+
+        let result = r.manager.cancel_running_tools(&r.sid).await.unwrap();
+        assert!(!result.capped);
+
+        let (events, ended) = collect_until(&mut r.rx, Duration::from_secs(20), turn_ended).await;
+        assert!(ended, "the turn ended");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ChatEvent::ToolsCancelled { killed_count: 1, requested_by, .. } if requested_by == "user"
+            )),
+            "{:?}",
+            events.iter().map(|e| e.event_type()).collect::<Vec<_>>()
+        );
+        assert_the_turn_went_on(&events, "s1");
+        assert_eq!(r.cancels(), 1);
+        assert_eq!(r.interrupts(), 0, "the turn was not interrupted");
+
+        let stored = r
+            .graph
+            .get_chat_events(Uuid::parse_str(&r.sid).unwrap(), 0, 500)
+            .await
+            .unwrap();
+        assert!(
+            stored.iter().any(|e| e.event_type == "tools_cancelled"),
+            "stored for replay: {:?}",
+            stored.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+        );
+    }
+
+    /// (b) From another instance: its `cancel_running_tools` holds no session and
+    /// publishes over NATS; the owner stops the tool, keeps the turn, and the
+    /// other instance sees `tools_cancelled` in the session's feed.
+    #[tokio::test]
+    async fn a_cancel_tools_from_another_instance_stops_the_tool_here_and_keeps_the_turn() {
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+        use futures::StreamExt;
+
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let mut r = rig_with(ProviderKind::Native, vec![slow_tool_turn()], Some(owner)).await;
+
+        let other = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let mut seen = other.subscribe_chat_events(&r.sid).await.unwrap();
+        other.client().flush().await.unwrap();
+        // The other instance: no session of its own, the WS cancel goes through
+        // its manager and out over NATS.
+        let far = {
+            let state = mock_app_state();
+            let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Agent,
+                mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+                max_sessions: 10,
+                ..Default::default()
+            };
+            ChatManager::new_without_memory(graph, state.meili, config)
+                .with_nats(Arc::clone(&other))
+        };
+
+        r.manager.send_message(&r.sid, "slow").await.unwrap();
+        next_event(
+            &mut r.rx,
+            |e| matches!(e, ChatEvent::ToolUse { id, .. } if id == "s1"),
+        )
+        .await;
+
+        // The owner's listener may still be subscribing: ask again until it answers.
+        let mut events = Vec::new();
+        let mut cancelled = false;
+        for _ in 0..5 {
+            let routed = far.cancel_running_tools(&r.sid).await.unwrap();
+            assert!(
+                !routed.capped && routed.killed_pids.is_empty(),
+                "{routed:?}"
+            );
+            let (got, found) = collect_until(&mut r.rx, Duration::from_secs(1), |e| {
+                matches!(e, ChatEvent::ToolsCancelled { .. })
+            })
+            .await;
+            events.extend(got);
+            if found {
+                cancelled = true;
+                break;
+            }
+        }
+        assert!(cancelled, "the owner announced the cancel");
+        let (rest, ended) = collect_until(&mut r.rx, Duration::from_secs(20), turn_ended).await;
+        assert!(ended, "the turn ended");
+        events.extend(rest);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ChatEvent::ToolsCancelled {
+                    killed_count: 1,
+                    ..
+                }
+            )),
+            "{:?}",
+            events.iter().map(|e| e.event_type()).collect::<Vec<_>>()
+        );
+        assert_the_turn_went_on(&events, "s1");
+        assert!(r.cancels() >= 1);
+        assert_eq!(r.interrupts(), 0, "the turn was not interrupted");
+
+        // The other instance sees the cancel in the session's feed.
+        let shown = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(msg) = seen.next().await {
+                let event: ChatEvent = serde_json::from_slice(&msg.payload).unwrap();
+                if matches!(event, ChatEvent::ToolsCancelled { .. }) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(shown, Ok(true), "tools_cancelled is published");
+    }
+
+    /// (c) The cap of the Claude Code engine (`CANCEL_TOOLS_CAP` per window)
+    /// applies: the call past it says `capped` and never reaches the provider.
+    #[tokio::test]
+    async fn the_cancel_tools_cap_applies_on_the_agent_engine_as_on_claude_code() {
+        use super::super::manager::CANCEL_TOOLS_CAP;
+
+        let r = rig(ProviderKind::Native, vec![]).await;
+        for i in 0..CANCEL_TOOLS_CAP {
+            let result = r.manager.cancel_running_tools(&r.sid).await.unwrap();
+            assert!(!result.capped, "call {i} is within the cap");
+        }
+        let past = r.manager.cancel_running_tools(&r.sid).await.unwrap();
+        assert!(past.capped, "the call past the cap is refused");
+        assert_eq!(
+            r.cancels(),
+            CANCEL_TOOLS_CAP as usize,
+            "the refused call never reaches the provider"
+        );
+    }
+
+    /// (a) over the real chat WebSocket, on a real native session (the nexus
+    /// harness against `fake_openai` and `fake_mcp`): the model calls the `slow`
+    /// tool of the project-orchestrator server, which runs until it is told to
+    /// stop; the client's `cancel_tools` frame stops it, `tools_cancelled` and
+    /// the cancelled `tool_result` come back on the socket, the model is told
+    /// and answers, and the turn completes.
+    #[tokio::test]
+    async fn a_ws_cancel_tools_on_a_native_session_stops_the_running_mcp_tool_and_the_turn_goes_on()
+    {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let script = json!([
+            // The probe: the model must be able to call a tool.
+            sse_route("Call the ping tool now", vec![
+                delta(json!({"tool_calls": [{"index": 0, "id": "p1", "function": {"name": "ping", "arguments": "{}"}}]})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                json!("[DONE]"),
+            ]),
+            {"method": "GET", "path": "/v1/models", "status": 200,
+             "body": {"object": "list", "data": [{"id": "m", "context_length": 32000}]}},
+            // The turn: one call of the slow tool.
+            sse_route("slow please", vec![
+                delta(json!({"tool_calls": [{"index": 0, "id": "s1", "type": "function",
+                    "function": {"name": "mcp__project-orchestrator__slow", "arguments": "{}"}}]})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                json!("[DONE]"),
+            ]),
+            // Once the model hears of the cancelled tool, it answers (the first
+            // unused matching route answers: the slow call above is used by then).
+            sse_route("\"role\":\"tool\"", vec![
+                delta(json!({"content": "I carry on"})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!("[DONE]"),
+            ]),
+        ]);
+        let fake = FakeOpenAi::start(script);
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let manager = Arc::new(manager(graph.clone(), true));
+
+        let mut req = request(Some("local"), Some("proj"), "default");
+        req.message = "slow please".into();
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        next_event(&mut rx, |e| {
+            matches!(e, ChatEvent::ToolUse { id, tool, .. } if id == "s1" && tool.ends_with("slow"))
+        })
+        .await;
+
+        // The client: the real handler, nothing replayed (the tool already runs).
+        let addr = crate::test_helpers::serve_chat(Arc::clone(&manager), graph.clone()).await;
+        let url = format!("ws://{addr}/ws/chat/{sid}?last_event=999999999999999");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        ws.send(WsMessage::text("ready")).await.unwrap();
+        ws.send(WsMessage::text(json!({"type": "cancel_tools"}).to_string()))
+            .await
+            .unwrap();
+
+        // The frames up to the end of the turn.
+        let mut frames: Vec<Value> = Vec::new();
+        let ended = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(Ok(msg)) = ws.next().await {
+                let WsMessage::Text(t) = msg else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(t.as_str()) else {
+                    continue;
+                };
+                let done = v["type"] == "streaming_status" && v["is_streaming"] == false;
+                frames.push(v);
+                if done {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        let types: Vec<String> = frames
+            .iter()
+            .map(|f| f["type"].as_str().unwrap_or("?").to_string())
+            .collect();
+        assert!(ended, "the turn ended on the socket: {types:?}");
+        let cancelled = frames
+            .iter()
+            .find(|f| f["type"] == "tools_cancelled")
+            .unwrap_or_else(|| panic!("tools_cancelled on the socket: {types:?}"));
+        assert_eq!(cancelled["killed_count"], 1, "{cancelled}");
+        assert_eq!(cancelled["requested_by"], "user", "{cancelled}");
+        assert!(
+            cancelled.get("cli_pid").is_none(),
+            "no PID on the agent engine: {cancelled}"
+        );
+        assert!(
+            frames.iter().any(|f| f["type"] == "tool_result"
+                && f["id"] == "s1"
+                && f["is_error"] == true
+                && f["result"].to_string().contains("cancelled")),
+            "a cancelled tool_result on the socket: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|f| f["type"] == "assistant_text"
+                && f["content"].as_str().unwrap_or("").contains("I carry on")),
+            "the model went on: {types:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["type"] == "result" && f["stop_reason"] == "completed"),
+            "the turn completed: {frames:?}"
+        );
+
+        // The model was told: the request that followed carries the cancelled result.
+        let chats = fake.chat_requests();
+        let last = chats.last().expect("a request after the cancel")["body"].to_string();
+        assert!(last.contains("cancelled"), "{last}");
         manager.close_session(&sid).await.unwrap();
     }
 }
