@@ -44,6 +44,10 @@ use crate::expand_tilde;
 /// Broadcast channel buffer size for WebSocket subscribers
 const BROADCAST_BUFFER: usize = 256;
 
+/// How long a resumed CLI must stay up after its handshake before the resume is
+/// trusted (an unknown `--resume` target makes it exit within a second).
+const RESUME_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// OOB-triggered `stream_response` rate cap for interactive sessions.
 /// A misbehaving Monitor or background Bash that emits constantly could
 /// otherwise loop the session and inflate the LLM bill — this caps the
@@ -5861,9 +5865,27 @@ impl ChatManager {
                                 } else {
                                     // Not retryable — propagate error
                                     error!("Stream error for session {}: {}", session_id, e);
+                                    let cli_gone = err_str.contains("ended before a Result");
+                                    if cli_gone {
+                                        warn!(
+                                            "CLI left before answering for session {}, removing from \
+                                             active_sessions so the next message resumes it",
+                                            session_id
+                                        );
+                                        active_sessions.write().await.remove(&session_id);
+                                        notify_attention(
+                                            &event_emitter,
+                                            AttentionSubject::Session(session_id.to_string()),
+                                            AttentionReason::SessionInactive,
+                                        );
+                                    }
                                     emit_chat(
                                         ChatEvent::Error {
-                                            message: format!("Error: {}", e),
+                                            message: if cli_gone {
+                                                "The Claude Code process stopped before answering. Your message was not processed: send it again, the session will resume (or use Restart session).".to_string()
+                                            } else {
+                                                format!("Error: {}", e)
+                                            },
                                             parent_tool_use_id: None,
                                             code: None,
                                             reason: None,
@@ -6702,6 +6724,42 @@ impl ChatManager {
         }
     }
 
+    /// Whether a freshly spawned CLI is still there after `grace`. A CLI given a
+    /// `--resume` target it does not know prints an error and exits, but not
+    /// instantly: the probe must outlast that.
+    async fn stays_alive(client: &InteractiveClient, grace: std::time::Duration) -> bool {
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if !client.is_alive().await {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        client.is_alive().await
+    }
+
+    /// Removes a legacy session from `active_sessions` when its CLI process is
+    /// gone (stdout at EOF). A session being streamed holds the client lock and
+    /// is left alone: its own stream reports a death.
+    pub(crate) async fn evict_if_cli_dead(&self, session_id: &str) -> bool {
+        let client = match self.active_sessions.read().await.get(session_id) {
+            Some(s) => s.client.clone(),
+            None => return false,
+        };
+        let dead = match client.try_lock() {
+            Ok(c) => !c.is_alive().await,
+            Err(_) => false,
+        };
+        if dead {
+            warn!(
+                session_id = %session_id,
+                "CLI process is gone, dropping the session from active_sessions so the message resumes it"
+            );
+            self.active_sessions.write().await.remove(session_id);
+        }
+        dead
+    }
+
     /// Deliver a user message: local CLI -> owning instance (NATS) ->
     /// `resume_session` (respawns the CLI, keeping the session's identity and
     /// links). A failed local send falls back to `resume_session` too (dead
@@ -6713,6 +6771,10 @@ impl ChatManager {
         content: &str,
         claims: Option<&crate::auth::jwt::Claims>,
     ) -> std::result::Result<DeliveryRoute, MessageDeliveryError> {
+        // A registered session whose CLI has left would swallow the message (the
+        // write goes to a closed stdin and the turn ends empty): drop it so the
+        // message takes the resume path below.
+        self.evict_if_cli_dead(session_id).await;
         if self.is_session_active(session_id).await {
             match self.send_message(session_id, content).await {
                 Ok(()) => return Ok(DeliveryRoute::Local),
@@ -7459,45 +7521,76 @@ impl ChatManager {
         };
 
         let resume_add_dirs = session_node.add_dirs.clone().unwrap_or_default();
-        let options = self
-            .build_options(
-                &session_node.cwd,
-                &session_node.model,
-                &system_prompt,
-                cli_session_id,
-                session_node.permission_mode.as_deref(),
-                Some(session_hooks),
-                &resume_add_dirs,
-                user_claims,
-                Some(session_id),
-            )
-            .await;
 
-        // Create new InteractiveClient with --resume
-        let mut client = InteractiveClient::new(options).map_err(|e| {
-            super::provider::errors::sdk_open_error(
-                "Failed to create InteractiveClient for resume",
-                e,
-            )
-        })?;
+        // `--resume <cli_session_id>` can name a conversation the CLI no longer
+        // has (expired, purged, stale): the CLI then exits at once and the turn
+        // used to end empty (task 1ff0e2e4). The PO session — identity, links,
+        // context — lives in the graph, not in the CLI: when the resumed CLI is
+        // not alive after its handshake, fall back to a fresh CLI for the SAME
+        // PO session instead of handing back a dead one.
+        let mut resume_with = cli_session_id;
+        let client = loop {
+            let options = self
+                .build_options(
+                    &session_node.cwd,
+                    &session_node.model,
+                    &system_prompt,
+                    resume_with,
+                    session_node.permission_mode.as_deref(),
+                    Some(session_hooks.clone()),
+                    &resume_add_dirs,
+                    user_claims,
+                    Some(session_id),
+                )
+                .await;
 
-        client.connect().await.map_err(|e| {
-            super::provider::errors::sdk_open_error(
-                "Failed to connect resumed InteractiveClient",
-                e,
-            )
-        })?;
+            let mut candidate = InteractiveClient::new(options).map_err(|e| {
+                super::provider::errors::sdk_open_error(
+                    "Failed to create InteractiveClient for resume",
+                    e,
+                )
+            })?;
 
-        // Initialize hooks with the CLI (sends PreCompact, etc. registrations).
-        // Must be called AFTER connect() and BEFORE take_sdk_control_receiver().
-        // Graceful: warn on failure but don't abort the session.
-        if let Err(e) = client.initialize_hooks().await {
-            warn!(
-                session_id = %session_id,
-                "Failed to initialize hooks on resume (non-fatal): {}",
-                e
-            );
-        }
+            let connected = candidate.connect().await;
+            if let Err(e) = connected {
+                if resume_with.is_some() {
+                    warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "Resumed CLI failed to start, falling back to a fresh CLI (same PO session)"
+                    );
+                    resume_with = None;
+                    continue;
+                }
+                return Err(super::provider::errors::sdk_open_error(
+                    "Failed to connect resumed InteractiveClient",
+                    e,
+                ));
+            }
+
+            // Initialize hooks with the CLI (sends PreCompact, etc. registrations).
+            // Must be called AFTER connect() and BEFORE take_sdk_control_receiver().
+            // Graceful: warn on failure but don't abort the session.
+            if let Err(e) = candidate.initialize_hooks().await {
+                warn!(
+                    session_id = %session_id,
+                    "Failed to initialize hooks on resume (non-fatal): {}",
+                    e
+                );
+            }
+
+            if resume_with.is_some() && !Self::stays_alive(&candidate, RESUME_GRACE).await {
+                warn!(
+                    session_id = %session_id,
+                    "Resumed CLI exited right after its handshake, falling back to a fresh CLI \
+                     (same PO session)"
+                );
+                let _ = candidate.disconnect().await;
+                resume_with = None;
+                continue;
+            }
+            break candidate;
+        };
 
         // Clone stdin sender for lock-free permission responses (see create_session).
         let stdin_tx = client.clone_stdin_sender().await;
@@ -13475,6 +13568,120 @@ mod tests {
             .unwrap_err();
         let failure = crate::chat::provider::errors::classify_open_error(&err, None).unwrap();
         assert_eq!((failure.status, failure.code), (409, "provider_conflict"));
+    }
+
+    /// Task 1ff0e2e4: a `--resume` target the CLI no longer has makes it exit at
+    /// once. The message must still be taken: a fresh CLI for the SAME PO
+    /// session, never a dead one handed back (silent 2 s turns).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_falls_back_to_a_fresh_cli_when_the_resumed_one_dies_at_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("args.log");
+        let cli = dir.path().join("fake-claude");
+        std::fs::write(
+            &cli,
+            format!(
+                "#!/bin/sh\necho \"ARGS $*\" >> {log}\ncase \"$1\" in\n  --version) echo '2.1.287 (Claude Code)'; exit 0;;\nesac\nfor a in \"$@\"; do [ \"$a\" = \"--resume\" ] && exit 1; done\nexec cat > /dev/null\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (manager, graph) = manager_with_mock();
+        manager
+            .update_claude_cli_path(Some(cli.display().to_string()))
+            .await;
+        let mut s = test_chat_session(None);
+        s.provider_id = Some("claude-code".into());
+        s.cwd = dir.path().display().to_string();
+        s.cli_session_id = Some("512a5305-16d1-4ad8-a02f-d2b6e845dbdf".into());
+        graph.create_chat_session(&s).await.unwrap();
+        let id = s.id.to_string();
+
+        manager
+            .resume_session(&id, "hello", None)
+            .await
+            .expect("the message is taken by a fresh CLI");
+
+        assert!(manager.is_session_active(&id).await, "the session is live");
+        let mut calls = String::new();
+        for _ in 0..80 {
+            calls = std::fs::read_to_string(&log).unwrap_or_default();
+            if calls.matches("ARGS --output-format").count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let spawns: Vec<&str> = calls
+            .split("ARGS ")
+            .filter(|c| c.starts_with("--output-format"))
+            .collect();
+        let resumes = |c: &str| c.contains(" --resume ");
+        assert!(
+            spawns.len() >= 2,
+            "resume then fresh: {:?}",
+            calls
+                .split("ARGS ")
+                .map(|c| (
+                    c.len(),
+                    c.contains(" --resume "),
+                    c.chars().take(60).collect::<String>()
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(resumes(spawns[0]), "first try resumes");
+        assert!(!resumes(spawns[1]), "the fallback does not resume");
+        manager.evict_if_cli_dead(&id).await;
+    }
+
+    /// Task 1ff0e2e4: a registered session whose CLI has left is dropped, so the
+    /// next message resumes instead of being written to a closed stdin.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_session_whose_cli_has_left_is_evicted_before_delivery() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("fake-claude");
+        std::fs::write(
+            &cli,
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo '2.1.287 (Claude Code)'; exit 0;;\nesac\nexec cat > /dev/null\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (manager, graph) = manager_with_mock();
+        manager
+            .update_claude_cli_path(Some(cli.display().to_string()))
+            .await;
+        let mut s = test_chat_session(None);
+        s.provider_id = Some("claude-code".into());
+        s.cwd = dir.path().display().to_string();
+        graph.create_chat_session(&s).await.unwrap();
+        let id = s.id.to_string();
+        manager.resume_session(&id, "hello", None).await.unwrap();
+        assert!(manager.is_session_active(&id).await);
+        assert!(!manager.evict_if_cli_dead(&id).await, "alive: kept");
+
+        // The CLI leaves: kill its process.
+        let client = manager
+            .active_sessions
+            .read()
+            .await
+            .get(&id)
+            .unwrap()
+            .client
+            .clone();
+        let pid = client.lock().await.child_pid().await.expect("pid");
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        for _ in 0..50 {
+            if manager.evict_if_cli_dead(&id).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!manager.is_session_active(&id).await, "evicted");
     }
 
     #[tokio::test]
