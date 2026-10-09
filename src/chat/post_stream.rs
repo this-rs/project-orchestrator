@@ -257,48 +257,31 @@ impl PostStreamHandler {
     /// Check auto-continue eligibility and enqueue enriched "Continue" if triggered.
     /// Returns `true` if auto-continue was allowed (needed by objective tracker).
     pub async fn handle_auto_continue(&self, hit_error_max_turns: bool) -> bool {
-        let auto_continue_allowed = if hit_error_max_turns
-            && self.auto_continue.load(Ordering::Relaxed)
-            && !self.interrupt_flag.load(Ordering::SeqCst)
-        {
+        let auto_continue_allowed = {
             let sessions = self.active_sessions.read().await;
-            if let Some(session) = sessions.get(&self.session_id) {
-                let count = session.auto_continue_count.fetch_add(1, Ordering::Relaxed) + 1;
-                let max = session.max_auto_continues;
-                if max > 0 && count > max {
-                    warn!(
-                        "Auto-continue limit reached for session {} ({}/{}), disabling",
-                        self.session_id, count, max
-                    );
-                    self.auto_continue.store(false, Ordering::Relaxed);
-                    false
-                } else {
-                    if max > 0 {
-                        info!(
-                            "Auto-continue {}/{} for session {}",
-                            count, max, self.session_id
-                        );
-                    }
-                    true
-                }
-            } else {
-                false
+            match sessions.get(&self.session_id) {
+                Some(session) => auto_continue_allowed(
+                    &self.session_id,
+                    hit_error_max_turns,
+                    &self.auto_continue,
+                    self.interrupt_flag.load(Ordering::SeqCst),
+                    &session.auto_continue_count,
+                    session.max_auto_continues,
+                ),
+                None => false,
             }
-        } else {
-            false
         };
 
         if auto_continue_allowed {
-            let delay_ms = 500u64;
             info!(
                 "Auto-continue triggered for session {} (delay={}ms)",
-                self.session_id, delay_ms
+                self.session_id, AUTO_CONTINUE_DELAY_MS
             );
 
             // Emit AutoContinue event
             let ac_event = ChatEvent::AutoContinue {
                 session_id: self.session_id.clone(),
-                delay_ms,
+                delay_ms: AUTO_CONTINUE_DELAY_MS,
             };
             self.emit_chat(ac_event.clone());
 
@@ -318,44 +301,18 @@ impl PostStreamHandler {
 
             // Interruptible delay
             let sleep_cancelled = tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => false,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(AUTO_CONTINUE_DELAY_MS)) => false,
                 _ = self.interrupt_token.cancelled() => true,
             };
 
             if !sleep_cancelled && !self.interrupt_flag.load(Ordering::SeqCst) {
-                let continue_msg = 'build_msg: {
-                    let mut parts = Vec::new();
-                    parts.push(
-                        "Continue where you left off. Do NOT restart work already done."
-                            .to_string(),
-                    );
-
-                    // Append CompactionContext markdown (task/step context)
-                    if let Some(ref slug) = self.ctx.project_slug {
-                        let builder = super::compaction_context::CompactionContextBuilder::new(
-                            self.graph.clone(),
-                        );
-                        if let Ok(Ok(ctx)) = tokio::time::timeout(
-                            std::time::Duration::from_secs(2),
-                            builder.build_for_session(Some(slug.as_str())),
-                        )
-                        .await
-                        {
-                            let md = ctx.to_markdown();
-                            if !md.is_empty() {
-                                parts.push(md);
-                            }
-                        }
-                    }
-
-                    // Append SessionWorkLog summary (files modified, steps done)
-                    let work_summary = self.work_log.lock().await.to_summary_markdown();
-                    if !work_summary.is_empty() {
-                        parts.push(work_summary);
-                    }
-
-                    break 'build_msg parts.join("\n\n");
-                };
+                let work_summary = self.work_log.lock().await.to_summary_markdown();
+                let continue_msg = continuation_message(
+                    &self.graph,
+                    self.ctx.project_slug.as_deref(),
+                    &work_summary,
+                )
+                .await;
 
                 self.pending_messages
                     .lock()
@@ -745,6 +702,76 @@ pub(crate) fn check_objective_reminder(input: &ObjectiveCheckInput) -> Option<St
     ));
 
     Some(parts.join("\n"))
+}
+
+// ── Auto-continue (shared by both engines) ───────────────────────────────
+
+/// Pause between a turn that stopped on its turn limit and its continuation.
+pub(crate) const AUTO_CONTINUE_DELAY_MS: u64 = 500;
+
+/// Whether a turn that just ended is continued automatically: it stopped on its
+/// turn limit, the session's auto-continue is on and nobody stopped it. Counts
+/// the continuation; past `max` (0: no limit) auto-continue is switched off.
+/// The Claude Code engine (`PostStreamHandler::handle_auto_continue`) and the
+/// agent engine (`AgentSessionHandle`) decide with this one function.
+pub(crate) fn auto_continue_allowed(
+    session_id: &str,
+    hit_turn_limit: bool,
+    enabled: &AtomicBool,
+    interrupted: bool,
+    count: &std::sync::atomic::AtomicU32,
+    max: u32,
+) -> bool {
+    if !hit_turn_limit || !enabled.load(Ordering::Relaxed) || interrupted {
+        return false;
+    }
+    let count = count.fetch_add(1, Ordering::Relaxed) + 1;
+    if max > 0 && count > max {
+        warn!(
+            "Auto-continue limit reached for session {} ({}/{}), disabling",
+            session_id, count, max
+        );
+        enabled.store(false, Ordering::Relaxed);
+        return false;
+    }
+    if max > 0 {
+        info!("Auto-continue {}/{} for session {}", count, max, session_id);
+    }
+    true
+}
+
+/// The system hint a continued turn starts with: "continue", the task/step
+/// context of the session's project, and the work done so far.
+pub(crate) async fn continuation_message(
+    graph: &Arc<dyn GraphStore>,
+    project_slug: Option<&str>,
+    work_summary: &str,
+) -> String {
+    let mut parts =
+        vec!["Continue where you left off. Do NOT restart work already done.".to_string()];
+
+    // Append CompactionContext markdown (task/step context)
+    if let Some(slug) = project_slug {
+        let builder = super::compaction_context::CompactionContextBuilder::new(graph.clone());
+        if let Ok(Ok(ctx)) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            builder.build_for_session(Some(slug)),
+        )
+        .await
+        {
+            let md = ctx.to_markdown();
+            if !md.is_empty() {
+                parts.push(md);
+            }
+        }
+    }
+
+    // Append SessionWorkLog summary (files modified, steps done)
+    if !work_summary.is_empty() {
+        parts.push(work_summary.to_string());
+    }
+
+    parts.join("\n\n")
 }
 
 #[cfg(test)]

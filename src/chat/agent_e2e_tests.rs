@@ -2717,4 +2717,75 @@ mod parity {
         assert!(sent.len() == 2 && sent[1].ends_with("later"), "{sent:?}");
         assert_eq!(r.interrupts(), 1);
     }
+
+    fn stopped_on_its_turn_limit() -> Vec<Step> {
+        vec![
+            steps::text("partial"),
+            Step::Emit(nexus_claude::testkit::done_event(
+                &caps(),
+                nexus_claude::agent::StopReason::MaxTurns,
+                None,
+            )),
+        ]
+    }
+
+    /// Every event of the run, up to the end of streaming.
+    async fn run_events(r: &mut Rig) -> Vec<ChatEvent> {
+        let mut seen = Vec::new();
+        loop {
+            let e = next_event(&mut r.rx, |_| true).await;
+            let end = matches!(
+                e,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            );
+            seen.push(e);
+            if end {
+                return seen;
+            }
+        }
+    }
+
+    /// H3 auto-continue: a turn that stops on its turn limit is announced
+    /// (`auto_continue`) and continued with the "continue" hint of the Claude Code
+    /// engine when the session's toggle is on.
+    #[tokio::test]
+    async fn a_turn_stopped_on_its_limit_is_continued_when_auto_continue_is_on() {
+        let mut r = rig(ProviderKind::Native, vec![stopped_on_its_turn_limit()]).await;
+        assert!(!r.manager.get_auto_continue_state(&r.sid).await.unwrap());
+        r.manager.set_auto_continue(&r.sid, true).await.unwrap();
+        assert!(r.manager.get_auto_continue_state(&r.sid).await.unwrap());
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        let events = run_events(&mut r).await;
+        assert!(
+            events.iter().any(
+                |e| matches!(e, ChatEvent::AutoContinue { session_id, .. } if *session_id == r.sid)
+            ),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, ChatEvent::SystemHint { content } if content.starts_with("Continue where you left off"))),
+            "{events:?}"
+        );
+        let sent = r.sent();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent[1].contains("Continue where you left off"), "{sent:?}");
+    }
+
+    /// H3 auto-continue: toggle off (the default of an interactive session), the
+    /// turn stays stopped.
+    #[tokio::test]
+    async fn a_turn_stopped_on_its_limit_stays_stopped_when_auto_continue_is_off() {
+        let mut r = rig(ProviderKind::Native, vec![stopped_on_its_turn_limit()]).await;
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        let events = run_events(&mut r).await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ChatEvent::AutoContinue { .. })),
+            "{events:?}"
+        );
+        assert_eq!(r.sent().len(), 1);
+    }
 }

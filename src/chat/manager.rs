@@ -1001,6 +1001,16 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         }
         prepared
     }
+
+    async fn continuation(&self, session_id: &str) -> String {
+        let ctx = super::post_stream::PostStreamContext::build(
+            &self.graph,
+            Uuid::parse_str(session_id).ok(),
+        )
+        .await;
+        // No work log on this engine: the hint carries the task/step context alone.
+        super::post_stream::continuation_message(&self.graph, ctx.project_slug.as_deref(), "").await
+    }
 }
 
 /// `prompt` with the turn's enrichment in front of it.
@@ -6869,14 +6879,19 @@ impl ChatManager {
     pub async fn set_auto_continue(&self, session_id: &str, enabled: bool) -> Result<()> {
         // Try to update in-memory state if session is active
         let maybe_events_tx = {
-            let sessions = self.active_sessions.read().await;
-            if let Some(session) = sessions.get(session_id) {
-                session
-                    .auto_continue
-                    .store(enabled, std::sync::atomic::Ordering::Relaxed);
-                Some(session.events_tx.clone())
+            if let Some(handle) = self.agent_runtime.get(session_id).await {
+                handle.auto_continue.store(enabled, Ordering::Relaxed);
+                Some(handle.events_tx.clone())
             } else {
-                None
+                let sessions = self.active_sessions.read().await;
+                if let Some(session) = sessions.get(session_id) {
+                    session
+                        .auto_continue
+                        .store(enabled, std::sync::atomic::Ordering::Relaxed);
+                    Some(session.events_tx.clone())
+                } else {
+                    None
+                }
             }
         };
 
@@ -6922,6 +6937,9 @@ impl ChatManager {
     ///
     /// Reads from the in-memory ActiveSession if local, otherwise falls back to Neo4j.
     pub async fn get_auto_continue_state(&self, session_id: &str) -> Result<bool> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return Ok(handle.auto_continue.load(Ordering::Relaxed));
+        }
         // Try local active session first
         let sessions = self.active_sessions.read().await;
         if let Some(session) = sessions.get(session_id) {
@@ -9754,6 +9772,15 @@ impl ChatManager {
         }
         self.finish_agent_open(&sid, provider_id, provider.kind(), session, 1, tool_policy)
             .await;
+        if let Some(handle) = self.agent_runtime.get(&sid).await {
+            // As on Claude Code: a runner always continues, at most five times; an
+            // interactive session follows the configuration, with no limit.
+            let runner = request.runner_context.is_some();
+            handle.configure_auto_continue(
+                runner || self.config.auto_continue,
+                if runner { 5 } else { 0 },
+            );
+        }
         if !request.message.is_empty() {
             if let Some(handle) = self.agent_runtime.get(&sid).await {
                 handle
@@ -9936,6 +9963,13 @@ impl ChatManager {
             .get(&sid)
             .await
             .ok_or_else(|| anyhow!("Session {sid} vanished while resuming"))?;
+        // A resumed session is interactive: its persisted toggle, no limit (as on Claude Code).
+        let auto_continue = self
+            .graph
+            .get_session_auto_continue(node.id)
+            .await
+            .unwrap_or(self.config.auto_continue);
+        handle.configure_auto_continue(auto_continue, 0);
         handle.send_message(message).await
     }
 
@@ -13177,7 +13211,7 @@ mod tests {
         assert_eq!(wire["engine"], "agent", "{wire}");
         let degraded: Vec<String> = serde_json::from_value(wire["degraded_features"].clone())
             .unwrap_or_else(|_| panic!("degraded_features missing: {wire}"));
-        for lost in ["hooks", "auto_continue", "compaction", "nats", "images"] {
+        for lost in ["hooks", "compaction", "nats", "images"] {
             assert!(
                 degraded.iter().any(|d| d == lost),
                 "{lost} must be listed: {degraded:?}"
@@ -13224,11 +13258,11 @@ mod tests {
         let degraded: Vec<String> =
             serde_json::from_value(wire["degraded_features"].clone()).expect("a list");
         // What the backend does not do on this engine, whatever the provider says...
-        for lost in ["hooks", "auto_continue", "nats"] {
+        for lost in ["hooks", "nats"] {
             assert!(degraded.iter().any(|d| d == lost), "{lost}: {degraded:?}");
         }
         // ...what the engine ported is not claimed missing...
-        let ported = ["enrichment", "message_queue"];
+        let ported = ["enrichment", "message_queue", "auto_continue"];
         assert!(
             !degraded.iter().any(|d| ported.contains(&d.as_str())),
             "{degraded:?}"
