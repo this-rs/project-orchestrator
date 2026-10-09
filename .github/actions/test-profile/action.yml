@@ -1,0 +1,29 @@
+name: Test profile for CI
+description: >
+  Compiles the DEPENDENCIES (not this workspace's own crates) with optimisations in the dev/test
+  profile, and keeps the build lean. The suite is ~7,400 tests that mostly run axum, tokio and
+  serde code from the dependencies: unoptimised, that code is the bulk of the run time.
+  Measured on the same 349 tests (api::chat_handlers, orchestrator::runner, api::auth_handlers):
+  286 s of execution without it, 88 s with it. The dependencies compile once per cache key (the
+  cache is written by main), so a pull request pays only for its own crates.
+
+  Applied by every job that restores a `ci-test` or `ci-cov` cache: the setting is part of the
+  compiled artefacts, so a job without it would find nothing it can reuse.
+runs:
+  using: composite
+  steps:
+    - name: Optimise dependencies, keep line tables only, no incremental state
+      shell: bash
+      run: |
+        mkdir -p "$HOME/.cargo"
+        cat >> "$HOME/.cargo/config.toml" <<'TOML'
+        [profile.dev.package."*"]
+        opt-level = 2
+        TOML
+        {
+          # A clean checkout never reads incremental state; it only bloats the cache.
+          echo "CARGO_INCREMENTAL=0"
+          # File and line of a panic are all a CI log needs; full debug info is what makes the
+          # link of each large test binary slow.
+          echo "CARGO_PROFILE_DEV_DEBUG=line-tables-only"
+        } >> "$GITHUB_ENV"
