@@ -475,7 +475,9 @@ impl ParallelEnrichmentStage for StatusInjectionStage {
                         if let Some(ref fragment) = run.prompt_fragment {
                             context_content.push_str(&format!(
                                 "<protocol_context state=\"{}\" protocol=\"{}\">\n{}\n</protocol_context>\n",
-                                run.current_state, run.protocol_name, fragment,
+                                crate::chat::untrusted::escape_attr(&run.current_state),
+                                crate::chat::untrusted::escape_attr(&run.protocol_name),
+                                fragment,
                             ));
                         }
                         // Render forbidden_actions as warnings
@@ -483,7 +485,7 @@ impl ParallelEnrichmentStage for StatusInjectionStage {
                             if !actions.is_empty() {
                                 context_content.push_str(&format!(
                                     "\n⚠️ **Forbidden in state '{}'**: {}\n",
-                                    run.current_state,
+                                    crate::chat::untrusted::escape_attr(&run.current_state),
                                     actions.join(", "),
                                 ));
                             }
