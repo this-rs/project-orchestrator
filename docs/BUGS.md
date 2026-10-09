@@ -62,6 +62,7 @@ merge + CI verte (status: completed)
 | `TaskStatus` et `ConstraintType` sérialisés en `{:?}` dans le payload WS et le prompt de compaction | api | medium | ✅ ci-verte | PR #501 (`d42312a2`) |
 | `create_release`, `create_decision`, `create_constraint` renvoient `Ok(())` quand le parent est absent | neo4j | high | ✅ ci-verte | PR #500 (`64e508e6`) |
 | `protocolApi.triggerEvent` envoyait `{event}` au lieu de `{trigger}` | frontend | high | ✅ ci-verte | PR #466 |
+| Après la mort du CLI, l'envoi d'un message donnait des tours muets de 2 s (fin de flux sans `Result` absorbée, coût inchangé) puis « Failed to send message through channel » (message perdu, session restée « active ») ; une reprise `--resume` sur une cible inconnue rendait un CLI mort | chat | high | 🟠 PR | nexus #80 + backend `fix/resume-dead-cli` (tâche `1ff0e2e4`) |
 | Routes frontend appelant le backend absent (`retry`, `/api/progress`, `neighborhood`, `runs/{id}/history`) | api | high | ✅ ci-verte | PR #466 + routes ajoutées |
 | Tombstone signé par 128 zéros (signature non vérifiée) | auth | critical | ✅ ci-verte | PR #490 |
 | Injection Cypher dans `WhereBuilder` (paramètres de type non échappés) | neo4j | critical | ✅ ci-verte | PR #489 |
