@@ -1652,6 +1652,7 @@ fn fastembed_cache_dir() -> PathBuf {
 ///
 /// Looks for the model directory in the fastembed cache and checks if the
 /// ONNX model file exists. Returns availability status and estimated size.
+#[cfg(feature = "local-embeddings")]
 #[tauri::command]
 pub fn check_embedding_model(model_name: String) -> Result<EmbeddingModelStatus, String> {
     use fastembed::{EmbeddingModel, TextEmbedding};
@@ -1737,6 +1738,7 @@ pub struct EmbeddingDownloadResult {
 }
 
 /// Progress event payload emitted during embedding model download.
+#[cfg_attr(not(feature = "local-embeddings"), allow(dead_code))]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EmbeddingDownloadProgress {
@@ -1748,6 +1750,7 @@ pub struct EmbeddingDownloadProgress {
 }
 
 /// Recursively compute the total size of a directory in bytes.
+#[cfg_attr(not(feature = "local-embeddings"), allow(dead_code))]
 fn get_dir_size(path: &std::path::Path) -> u64 {
     if !path.exists() {
         return 0;
@@ -1774,6 +1777,7 @@ fn get_dir_size(path: &std::path::Path) -> u64 {
 /// - onnx/: model.onnx + model.onnx_data only (NOT _O4, _qint8 variants)
 ///
 /// Falls back to `estimated_model_size()` if the API is unreachable.
+#[cfg_attr(not(feature = "local-embeddings"), allow(dead_code))]
 async fn fetch_model_total_size(model_code: &str, fallback_name: &str) -> u64 {
     /// Fetch file entries from one HF tree path (non-recursive).
     /// Returns (type, size, lfs_size, path) tuples. Uses lfs.size when available
@@ -1881,6 +1885,7 @@ async fn fetch_model_total_size(model_code: &str, fallback_name: &str) -> u64 {
 /// This triggers the fastembed model download (HuggingFace Hub → ONNX files).
 /// Emits `embedding-download-progress` events to the frontend with real-time
 /// progress based on filesystem monitoring.
+#[cfg(feature = "local-embeddings")]
 #[tauri::command]
 pub async fn download_embedding_model(
     app_handle: tauri::AppHandle,
@@ -2238,4 +2243,38 @@ meilisearch:
         assert!(validate_remote_mcp_exposure(true, "http://po.example.com").is_err());
         assert!(validate_remote_mcp_exposure(true, "po.example.com").is_err());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Build without ONNX Runtime (macOS legacy): the model is never local, so the wizard must see
+// "not available" and an explicit reason, not a missing command.
+// ---------------------------------------------------------------------------
+
+/// Without `local-embeddings` there is no local model: report it as absent.
+#[cfg(not(feature = "local-embeddings"))]
+#[tauri::command]
+pub fn check_embedding_model(model_name: String) -> Result<EmbeddingModelStatus, String> {
+    Ok(EmbeddingModelStatus {
+        available: false,
+        cache_path: None,
+        estimated_size_mb: estimated_model_size(&model_name),
+    })
+}
+
+/// Without `local-embeddings` nothing can be downloaded: answer with a failure the wizard can display.
+#[cfg(not(feature = "local-embeddings"))]
+#[tauri::command]
+pub async fn download_embedding_model(
+    _app_handle: tauri::AppHandle,
+    _model_name: String,
+) -> Result<EmbeddingDownloadResult, String> {
+    Ok(EmbeddingDownloadResult {
+        success: false,
+        model_path: String::new(),
+        error: Some(
+            "Local embeddings are not available in this build (macOS 10.15-13.3). \
+             Use an HTTP embedding provider (Ollama, OpenAI, ...) instead."
+                .to_string(),
+        ),
+    })
 }

@@ -16,7 +16,7 @@ tauri-plugin-shell = "2"
 tauri-plugin-updater = "2"
 
 # Backend (as library)
-project-orchestrator = { path = "../.." }
+project-orchestrator = { path = "../..", default-features = false }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -52,7 +52,7 @@ url = "2"
 anyhow = "1"
 
 # Embedding model management (setup wizard)
-fastembed = "5.17"
+fastembed = { version = "5.17", optional = true }
 tauri-plugin-opener = "2.5.4"
 tauri-plugin-dialog = "2"
 tauri-plugin-websocket = "2"
@@ -63,5 +63,8 @@ cocoa = "0.26"
 objc = "0.2"
 
 [features]
-default = ["custom-protocol"]
+default = ["custom-protocol", "local-embeddings"]
+# ONNX Runtime embeddings (setup wizard model download + backend provider). The macOS legacy build
+# turns this off: libonnxruntime needs macOS 13.4+.
+local-embeddings = ["dep:fastembed", "project-orchestrator/local-embeddings"]
 custom-protocol = ["tauri/custom-protocol"]

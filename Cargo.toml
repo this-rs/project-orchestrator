@@ -195,7 +195,7 @@ dashmap = "6"
 neural-routing-runtime = { path = "crates/neural-routing-runtime" }
 
 # Local embeddings via ONNX Runtime (default provider — zero external dependency)
-fastembed = "5.17"
+fastembed = { version = "5.17", optional = true }
 
 # Dimensionality reduction (UMAP projection for embedding visualization)
 rag-umap = "0.0"
@@ -234,7 +234,10 @@ office_oxide = { version = ">=0.1.9, <0.1.12", default-features = false, optiona
 libc = "0.2"
 
 [features]
-default = []
+default = ["local-embeddings"]
+# Local embeddings via ONNX Runtime (fastembed). Disable (--no-default-features) for the macOS legacy
+# build: libonnxruntime is built for macOS 13.4+, so it cannot load on Catalina..Ventura-.
+local-embeddings = ["dep:fastembed"]
 docx = ["dep:quick-xml"]
 pptx = ["dep:quick-xml"]
 xlsx = ["dep:calamine"]

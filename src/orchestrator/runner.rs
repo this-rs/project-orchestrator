@@ -1,6 +1,8 @@
 //! Main orchestrator runner
 
-use crate::embeddings::{EmbeddingProvider, FastEmbedProvider, HttpEmbeddingProvider};
+#[cfg(feature = "local-embeddings")]
+use crate::embeddings::FastEmbedProvider;
+use crate::embeddings::{EmbeddingProvider, HttpEmbeddingProvider};
 use crate::events::{
     CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter, HybridEmitter,
 };
@@ -193,7 +195,20 @@ fn init_embedding_provider(config: &crate::Config) -> Option<Arc<dyn EmbeddingPr
     }
 }
 
+/// Without the `local-embeddings` feature (macOS legacy build) there is no ONNX Runtime to load: say so
+/// plainly instead of silently running without semantic search.
+#[cfg(not(feature = "local-embeddings"))]
+fn init_local_embedding_provider(_config: &crate::Config) -> Option<Arc<dyn EmbeddingProvider>> {
+    tracing::warn!(
+        "Local embeddings are not available in this build (compiled without the `local-embeddings` \
+         feature, e.g. the macOS legacy build). Semantic search is off. Set embeddings.provider to \
+         `http` (Ollama, OpenAI, ...) to enable it."
+    );
+    None
+}
+
 /// Initialize the local fastembed ONNX embedding provider (default).
+#[cfg(feature = "local-embeddings")]
 fn init_local_embedding_provider(config: &crate::Config) -> Option<Arc<dyn EmbeddingProvider>> {
     // Build from Config fields (already merged env var > YAML > None)
     use fastembed::EmbeddingModel;

@@ -11,11 +11,13 @@
 //!   `/v1/embeddings` API (Ollama, OpenAI, LiteLLM, vLLM, etc.)
 //! - `MockEmbeddingProvider`: deterministic mock for tests
 
+#[cfg(feature = "local-embeddings")]
 pub mod fastembed;
 pub mod mock;
 pub mod provider;
 pub mod traits;
 
+#[cfg(feature = "local-embeddings")]
 pub use fastembed::FastEmbedProvider;
 pub use mock::MockEmbeddingProvider;
 pub use provider::HttpEmbeddingProvider;
