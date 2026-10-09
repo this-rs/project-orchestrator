@@ -377,6 +377,7 @@ impl ProtocolEvolver {
                         embedding: None,
                         embedding_model: None,
                         scar_intensity: 0.0,
+                        sharing_consent: Default::default(),
                     };
                     self.graph.create_decision(tid, &decision).await?;
                     Some(decision.id)
@@ -521,6 +522,7 @@ impl ProtocolEvolver {
                 embedding: None,
                 embedding_model: None,
                 scar_intensity: 0.0,
+                sharing_consent: Default::default(),
             };
             self.graph.create_decision(tid, &decision).await?;
             Some(decision.id)

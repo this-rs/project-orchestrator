@@ -467,6 +467,7 @@ impl DecisionNode {
             embedding: None,
             embedding_model: None,
             scar_intensity: 0.0,
+            sharing_consent: Default::default(),
         }
     }
 }

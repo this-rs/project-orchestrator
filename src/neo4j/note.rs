@@ -1504,6 +1504,8 @@ impl Neo4jClient {
             MATCH path = (n:Note)-[:LINKED_TO]->(source)-[:{}*0..{}]->(target)
             WHERE n.status = 'active'
               AND (NOT $scoped OR coalesce(n.project_id, '') IN ['', $scope_project])
+              AND (NOT $consent_cross OR coalesce(n.project_id, '') IN ['', $consent_reader]
+                   OR coalesce(n.sharing_consent, 'not_set') <> 'explicit_deny')
             WITH n, source, path, length(path) - 1 AS distance,
                  [node IN nodes(path) | coalesce(node.name, node.path, node.id)] AS path_names,
                  [r IN relationships(path) | type(r)] AS rel_types,
@@ -1558,6 +1560,14 @@ impl Neo4jClient {
             .param("entity_id", match_value.clone())
             .param("min_score", min_score)
             .param("scoped", scope_project.is_some())
+            .param(
+                "consent_cross",
+                matches!(scope, crate::notes::PropagationScope::CrossProject(_)),
+            )
+            .param(
+                "consent_reader",
+                source_project_id.map(|p| p.to_string()).unwrap_or_default(),
+            )
             .param("scope_project", scope_project.clone().unwrap_or_default());
 
         let mut result = self.graph.execute(q).await?;
@@ -1623,6 +1633,8 @@ impl Neo4jClient {
             MATCH (n:Note)-[t:LINKED_TO_TRANSITIVE]->(target)
             WHERE n.status = 'active'
               AND (NOT $scoped OR coalesce(n.project_id, '') IN ['', $scope_project])
+              AND (NOT $consent_cross OR coalesce(n.project_id, '') IN ['', $consent_reader]
+                   OR coalesce(n.sharing_consent, 'not_set') <> 'explicit_deny')
             WITH n, t,
                  CASE n.importance
                      WHEN 'critical' THEN 1.0
@@ -1651,6 +1663,14 @@ impl Neo4jClient {
             .param("entity_id", match_value)
             .param("min_score", min_score)
             .param("scoped", scope_project.is_some())
+            .param(
+                "consent_cross",
+                matches!(scope, crate::notes::PropagationScope::CrossProject(_)),
+            )
+            .param(
+                "consent_reader",
+                source_project_id.map(|p| p.to_string()).unwrap_or_default(),
+            )
             .param("scope_project", scope_project.unwrap_or_default());
 
         if let Ok(mut tresult) = self.graph.execute(tq).await {
@@ -1704,11 +1724,25 @@ impl Neo4jClient {
             let mut coupling_cache: std::collections::HashMap<Uuid, Option<f64>> =
                 std::collections::HashMap::new();
             let mut filtered_notes = Vec::with_capacity(propagated_notes.len());
+            // One consent rule for every cross-project read (sharing::consent_gate).
+            let mut consent = crate::sharing::consent_gate::ConsentReader::new(self, Some(src_pid));
 
             for mut pn in propagated_notes {
                 let note_pid = pn.note.project_id;
                 match note_pid {
                     Some(pid) if pid != src_pid => {
+                        // Consent: ExplicitDeny was already dropped by the Cypher; this
+                        // is the same predicate applied in full (owner policy for NotSet).
+                        let verdict = consent.note(&pn.note).await;
+                        if !verdict.is_allow() {
+                            tracing::debug!(
+                                note_id = %pn.note.id,
+                                note_project = %pid,
+                                ?verdict,
+                                "Dropped cross-project note (consent)"
+                            );
+                            continue;
+                        }
                         // Cross-project note — look up coupling (cached per foreign project)
                         let coupling = match coupling_cache.get(&pid) {
                             Some(&c) => c,

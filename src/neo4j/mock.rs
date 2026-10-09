@@ -57,6 +57,8 @@ pub struct MockGraphStore {
     pub tasks: RwLock<HashMap<Uuid, TaskNode>>,
     pub steps: RwLock<HashMap<Uuid, StepNode>>,
     pub decisions: RwLock<HashMap<Uuid, DecisionNode>>,
+    /// Sharing policy per project (what `Project.sharing_policy` holds in Neo4j).
+    pub sharing_policies: RwLock<HashMap<Uuid, crate::episodes::distill_models::SharingPolicy>>,
     pub constraints: RwLock<HashMap<Uuid, ConstraintNode>>,
     pub commits: RwLock<HashMap<String, CommitNode>>,
     pub releases: RwLock<HashMap<Uuid, ReleaseNode>>,
@@ -281,6 +283,7 @@ impl MockGraphStore {
             tasks: RwLock::new(HashMap::new()),
             steps: RwLock::new(HashMap::new()),
             decisions: RwLock::new(HashMap::new()),
+            sharing_policies: RwLock::new(HashMap::new()),
             constraints: RwLock::new(HashMap::new()),
             commits: RwLock::new(HashMap::new()),
             releases: RwLock::new(HashMap::new()),
@@ -6429,11 +6432,25 @@ impl GraphStore for MockGraphStore {
         // top-20 cut, exactly like the Cypher of the real client.
         let scope =
             crate::notes::PropagationScope::from_params(source_project_id, force_cross_project);
-        let mut out: Vec<PropagatedNote> = self
+        let mut candidates: Vec<Note> = self
             .get_notes_for_entity(entity_type, entity_id)
             .await?
             .into_iter()
             .filter(|n| n.status == NoteStatus::Active && scope.admits(n.project_id))
+            .collect();
+        // Same consent predicate as the real client, applied before the cut.
+        if let crate::notes::PropagationScope::CrossProject(src) = scope {
+            let mut consent = crate::sharing::consent_gate::ConsentReader::new(self, Some(src));
+            let mut kept = Vec::with_capacity(candidates.len());
+            for n in candidates {
+                if consent.note(&n).await.is_allow() {
+                    kept.push(n);
+                }
+            }
+            candidates = kept;
+        }
+        let mut out: Vec<PropagatedNote> = candidates
+            .into_iter()
             .map(|n| PropagatedNote {
                 relevance_score: n.importance.weight() * (0.4 + n.energy * 0.6),
                 source_entity: entity_id.to_string(),
@@ -11855,16 +11872,20 @@ impl GraphStore for MockGraphStore {
 
     async fn get_sharing_policy(
         &self,
-        _project_id: Uuid,
+        project_id: Uuid,
     ) -> anyhow::Result<Option<crate::episodes::distill_models::SharingPolicy>> {
-        Ok(None)
+        Ok(self.sharing_policies.read().await.get(&project_id).cloned())
     }
 
     async fn update_sharing_policy(
         &self,
-        _project_id: Uuid,
-        _policy: &crate::episodes::distill_models::SharingPolicy,
+        project_id: Uuid,
+        policy: &crate::episodes::distill_models::SharingPolicy,
     ) -> anyhow::Result<()> {
+        self.sharing_policies
+            .write()
+            .await
+            .insert(project_id, policy.clone());
         Ok(())
     }
 
@@ -11881,6 +11902,30 @@ impl GraphStore for MockGraphStore {
         _consent: &crate::episodes::distill_models::SharingConsent,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    async fn update_decision_sharing_consent(
+        &self,
+        decision_id: Uuid,
+        consent: &crate::episodes::distill_models::SharingConsent,
+    ) -> anyhow::Result<()> {
+        if let Some(d) = self.decisions.write().await.get_mut(&decision_id) {
+            d.sharing_consent = *consent;
+        }
+        Ok(())
+    }
+
+    async fn count_notes_by_consent(
+        &self,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<crate::episodes::distill_models::ConsentCounts> {
+        let mut counts = crate::episodes::distill_models::ConsentCounts::default();
+        for n in self.notes.read().await.values() {
+            if project_id.is_none() || n.project_id == project_id {
+                counts.add(n.sharing_consent, 1);
+            }
+        }
+        Ok(counts)
     }
 
     async fn create_sharing_event(
