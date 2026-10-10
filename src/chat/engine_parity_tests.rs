@@ -226,17 +226,6 @@ const FUNCTIONS: &[(&str, &str)] = &[
 const EXPECTED: &[(Engine, &str, Expect)] = &[
     (
         Engine::ClaudeCode,
-        "nats.permission_response",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "P13",
-            why: "l'écouteur RPC NATS du moteur historique écrit au CLI une control_response \
-                  sans request_id ni behavior (et sous le verrou du client) : l'outil reste \
-                  bloqué alors que la RPC répond success",
-        },
-    ),
-    (
-        Engine::ClaudeCode,
         "nexus_tools",
         Expect::NotMeasured {
             why: "Read / Edit / Bash sont les outils internes du CLI Claude : fake_claude rejoue \
