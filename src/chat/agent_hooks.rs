@@ -842,6 +842,18 @@ impl TurnRouting {
     pub(crate) fn remove(&self, session_id: &str) {
         locked(&self.routers).remove(session_id);
     }
+
+    /// Removes the session's router only if it is still `router` (`Arc::ptr_eq`): an
+    /// opening that failed never takes away the router of one that replaced it.
+    pub(crate) fn remove_if(&self, session_id: &str, router: &Arc<TurnRouter>) {
+        let mut routers = locked(&self.routers);
+        if routers
+            .get(session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, router))
+        {
+            routers.remove(session_id);
+        }
+    }
 }
 
 #[cfg(test)]
