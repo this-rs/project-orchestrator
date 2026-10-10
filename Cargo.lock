@@ -6624,7 +6624,6 @@ dependencies = [
  "mime_guess",
  "multibase",
  "neo4rs",
- "neural-routing-gnn",
  "neural-routing-runtime",
  "nexus-claude",
  "nexus-tools",

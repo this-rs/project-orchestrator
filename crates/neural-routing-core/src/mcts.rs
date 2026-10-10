@@ -363,7 +363,6 @@ impl<P: ProxyModel> MctsEngine<P> {
                     cumulative_reward: path[..=i].iter().map(|(_, _, r)| r).sum(),
                     delta_ms: source_node.map(|n| n.delta_ms).unwrap_or(0),
                     order: i,
-                    outcome: None,
                 }
             })
             .collect();
@@ -407,7 +406,6 @@ mod tests {
                 cumulative_reward: 0.2 * (i + 1) as f64,
                 delta_ms: 100,
                 order: i,
-                outcome: None,
             })
             .collect();
 

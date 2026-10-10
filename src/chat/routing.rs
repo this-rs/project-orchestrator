@@ -405,7 +405,6 @@ impl RoutingDecision {
             node_features: vec![],
             protocol_run_id: None,
             protocol_state: None,
-            outcome: None,
         });
     }
 }

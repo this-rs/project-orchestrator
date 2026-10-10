@@ -385,7 +385,6 @@ fn build_migrated_trajectory(session_id: &Uuid, parsed: &[ParsedToolUse]) -> Tra
                 cumulative_reward: 0.0,
                 delta_ms,
                 order: i,
-                outcome: None,
             }
         })
         .collect();

@@ -262,7 +262,6 @@ fn make_trajectory(rng: &mut SimpleRng, dim: usize) -> Trajectory {
                 cumulative_reward: reward * (i + 1) as f64 / num_steps as f64,
                 delta_ms: 50 + rng.next_u64() % 200,
                 order: i,
-                outcome: None,
             }
         })
         .collect();

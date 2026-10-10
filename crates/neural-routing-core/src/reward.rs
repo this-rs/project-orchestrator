@@ -225,7 +225,6 @@ mod tests {
                 cumulative_reward: 0.0,
                 delta_ms: 100 * (i as u64 + 1),
                 order: i,
-                outcome: None,
             })
             .collect()
     }
@@ -395,7 +394,6 @@ mod tests {
                 cumulative_reward: 0.0,
                 delta_ms: 100,
                 order: i,
-                outcome: None,
             })
             .collect();
 
@@ -432,7 +430,6 @@ mod tests {
             cumulative_reward: 0.0,
             delta_ms: 200,
             order: 0,
-            outcome: None,
         }];
 
         let total = 1.0;

@@ -2672,7 +2672,6 @@ impl ChatManager {
         let enrichment_pipeline = self.enrichment_pipeline.clone();
         let search = self.search.clone();
         let documents = self.document_store.clone();
-        let rpc_turn_collector = self.trajectory_collector.read().unwrap().clone();
 
         tokio::spawn(async move {
             let mut subscriber = match nats.subscribe_rpc_send(&session_id).await {
@@ -3047,7 +3046,6 @@ impl ChatManager {
 
                             let active_sessions_for_turn = active_sessions.clone();
                             let session_id_for_turn = session_id.clone();
-                            let turn_collector = rpc_turn_collector.clone();
                             let turn_task = tokio::spawn(async move {
                                 Self::stream_response(
                                     client,
@@ -3072,7 +3070,6 @@ impl ChatManager {
                                     enrichment_pipeline_clone,
                                     search_clone,
                                     documents_clone,
-                                    turn_collector,
                                 )
                                 .await;
                             });
@@ -3470,7 +3467,6 @@ impl ChatManager {
                     node_features: vec![],
                     protocol_run_id: None,
                     protocol_state: None,
-                    outcome: None,
                 });
                 debug!(
                     "[routing] Emitted routing decision to trajectory: {} sections, {} tool groups",
@@ -5077,7 +5073,6 @@ impl ChatManager {
         let documents = self.document_store.clone();
 
         let session_id_for_turn = session_id_str.clone();
-        let turn_collector = self.trajectory_collector.read().unwrap().clone();
         let turn_task = tokio::spawn(async move {
             Self::stream_response(
                 client,
@@ -5102,7 +5097,6 @@ impl ChatManager {
                 enrichment_pipeline,
                 search,
                 documents,
-                turn_collector,
             )
             .await;
         });
@@ -5679,13 +5673,7 @@ impl ChatManager {
         enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
         search: Arc<dyn crate::meilisearch::SearchStore>,
         documents: crate::documents::store::DocumentStore,
-        turn_collector: Option<Arc<neural_routing_runtime::TrajectoryCollector>>,
     ) {
-        // The turn opens here: its tool calls join the session's routing decision, and
-        // its `Result` closes the turn with its outcome.
-        if let Some(collector) = &turn_collector {
-            collector.open_turn(session_id.clone());
-        }
         // Helper closure: emit a ChatEvent to local broadcast + NATS (if configured)
         let emit_chat = |event: ChatEvent,
                          tx: &broadcast::Sender<ChatEvent>,
@@ -6551,25 +6539,6 @@ impl ChatManager {
                                         work_log.lock().await.record_tool_use(tool, input);
                                     }
 
-                                    // The turn closes with its result: outcome of the routing decision.
-                                    if let (
-                                        Some(collector),
-                                        ChatEvent::Result {
-                                            is_error,
-                                            cost_usd,
-                                            duration_ms,
-                                            ..
-                                        },
-                                    ) = (&turn_collector, &event)
-                                    {
-                                        collector.close_turn(
-                                            session_id.clone(),
-                                            !*is_error,
-                                            *cost_usd,
-                                            *duration_ms,
-                                        );
-                                    }
-
                                     // Detect error_max_turns for auto-continue
                                     if let ChatEvent::Result { ref subtype, .. } = event {
                                         if subtype == "error_max_turns" {
@@ -6890,7 +6859,6 @@ impl ChatManager {
             enrichment_pipeline,
             search,
             documents,
-            turn_collector.clone(),
         )
         .await;
     }
@@ -7096,7 +7064,6 @@ impl ChatManager {
         let documents = self.document_store.clone();
 
         let session_id_for_turn = session_id_str.clone();
-        let turn_collector = self.trajectory_collector.read().unwrap().clone();
         let turn_task = tokio::spawn(async move {
             Self::stream_response(
                 client,
@@ -7121,7 +7088,6 @@ impl ChatManager {
                 enrichment_pipeline,
                 search,
                 documents,
-                turn_collector,
             )
             .await;
         });
@@ -8394,10 +8360,7 @@ impl ChatManager {
             Self::register_skill_hook(&mut hooks, self.graph.clone(), session_project.clone());
 
             // PostToolUse → PostToolUseRedirectHook suggests MCP alternatives after noisy Grep
-            // The tool trace is wired at both registrations (creation here, resume in
-            // `resume_session`): a resumed session's tool calls join its routing decision too.
-            let post_hook = Self::redirect_hook(self.graph.clone(), session_project)
-                .with_tool_trace(self.tool_trace_for(&session_id));
+            let post_hook = Self::redirect_hook(self.graph.clone(), session_project);
             hooks.insert(
                 "PostToolUse".to_string(),
                 vec![nexus_claude::HookMatcher {
@@ -8424,19 +8387,6 @@ impl ChatManager {
         Some(Arc::new(
             super::anchor_resolver::SessionProject::new(self.graph.clone(), id)
                 .with_anchor_cache(self.anchor_cache.clone()),
-        ))
-    }
-
-    /// The tool trace of a chat session: its tool calls are recorded under the session.
-    fn tool_trace_for(&self, session_id: &str) -> Option<post_tool_hook::ToolTrace> {
-        let collector = self
-            .trajectory_collector
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()?;
-        Some(post_tool_hook::ToolTrace::new(
-            collector,
-            session_id.to_string(),
         ))
     }
 
@@ -8639,10 +8589,7 @@ impl ChatManager {
             }
 
             // PostToolUse → PostToolUseRedirectHook suggests MCP alternatives after noisy Grep
-            // The tool trace is wired at both registrations (creation here, resume in
-            // `resume_session`): a resumed session's tool calls join its routing decision too.
-            let post_hook = Self::redirect_hook(self.graph.clone(), session_project)
-                .with_tool_trace(self.tool_trace_for(session_id));
+            let post_hook = Self::redirect_hook(self.graph.clone(), session_project);
             hooks.insert(
                 "PostToolUse".to_string(),
                 vec![nexus_claude::HookMatcher {
@@ -8987,7 +8934,6 @@ impl ChatManager {
         let documents = self.document_store.clone();
 
         let session_id_for_turn = session_id_str.clone();
-        let turn_collector = self.trajectory_collector.read().unwrap().clone();
         let turn_task = tokio::spawn(async move {
             Self::stream_response(
                 client,
@@ -9012,7 +8958,6 @@ impl ChatManager {
                 enrichment_pipeline,
                 search,
                 documents,
-                turn_collector,
             )
             .await;
         });
