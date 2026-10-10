@@ -90,58 +90,55 @@ pub(crate) struct OobListenerDeps {
     pub nats: Option<Arc<crate::events::NatsEmitter>>,
 }
 
-/// Where the turn and the OOB listener are in the CLI's output, counted in `result`s.
+/// Where the turns and the OOB listener are in the CLI's output, counted in `result`s.
 ///
 /// Both read the same output on subscriptions of their own, in the same order. The
-/// listener tells a turn's message from background output by `is_streaming` when it
-/// gets to the message: lagging behind the turn, it would get to the turn's last
-/// messages after the turn ended and take them for background output (a turn's own
-/// `tool_result` then started a turn of its own). So the turn does not end before the
-/// listener has reached the turn's `result`: every message before it was then seen
-/// while the turn was still streaming.
+/// listener used to tell a turn's message from background output by `is_streaming`
+/// alone, read when it gets to the message: lagging behind the turn (a loaded
+/// machine), it got to the turn's last messages after the turn had ended and took them
+/// for background output (a turn's own `tool_result` then started a turn of its own,
+/// and every later turn was one `result` behind).
+///
+/// The rule is now on the listener's side, whatever its lag: a message it gets to while
+/// it has not yet reached a `result` that a turn already read comes BEFORE that
+/// `result` in the output, so it belongs to a finished turn — never background output.
+///
+/// The listener counts only the `result`s a turn reads: one met while a turn streams,
+/// or while it is behind the turns. A `result` no turn reads (out of any turn) is not
+/// counted, so the two counts stay comparable.
 #[derive(Debug, Default)]
 pub struct ResultCursor {
     /// `result`s read by the turns of the session.
     turn: AtomicU64,
-    /// `result`s the listener got to.
+    /// `result`s of turns the listener got to.
     listener: AtomicU64,
-    /// Whether a listener reads the session (none on a mock transport).
-    listening: AtomicBool,
 }
 
 impl ResultCursor {
-    /// A turn read a `result` of the CLI.
+    /// A turn read a `result` of the CLI. Called before the turn stops streaming.
     pub(crate) fn turn_read_result(&self) {
         self.turn.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// The listener got to a `result`. Never behind the turns afterwards: a `result`
-    /// the listener missed (published before it subscribed) does not hold every later
-    /// turn.
-    fn listener_saw_result(&self) {
-        let next = self.listener.load(Ordering::SeqCst) + 1;
+    /// The listener starts: the `result`s turns read before it subscribed are behind
+    /// it (it subscribes under the client lock a turn holds while it reads).
+    fn listener_starts(&self) {
         self.listener
-            .store(next.max(self.turn.load(Ordering::SeqCst)), Ordering::SeqCst);
+            .store(self.turn.load(Ordering::SeqCst), Ordering::SeqCst);
     }
 
-    /// Wait, up to `bound`, for the listener to reach the last `result` a turn read.
-    pub(crate) async fn wait_for_listener(&self, bound: Duration) {
-        let deadline = tokio::time::Instant::now() + bound;
-        while self.listening.load(Ordering::SeqCst)
-            && self.listener.load(Ordering::SeqCst) < self.turn.load(Ordering::SeqCst)
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+    /// Whether the listener is behind the turns: what it gets to now precedes a
+    /// `result` a turn already read.
+    fn listener_behind(&self) -> bool {
+        self.listener.load(Ordering::SeqCst) < self.turn.load(Ordering::SeqCst)
+    }
+
+    /// The listener got to a `result`: counted when it is a turn's (`streaming`, or
+    /// already read by a turn).
+    fn listener_saw_result(&self, streaming: bool) {
+        if streaming || self.listener_behind() {
+            self.listener.fetch_add(1, Ordering::SeqCst);
         }
-    }
-}
-
-/// Clears `ResultCursor::listening` when the listener stops, however it stops.
-struct Listening(Arc<ResultCursor>);
-
-impl Drop for Listening {
-    fn drop(&mut self) {
-        self.0.listening.store(false, Ordering::SeqCst);
     }
 }
 
@@ -184,8 +181,18 @@ pub(crate) fn spawn_oob_listener(
     tokio::spawn(async move {
         // Briefly take the client lock to call subscribe_messages(). The
         // returned stream is `'static` and independent of the lock.
+        // Where this listener is, for the turns of the session (see `ResultCursor`).
+        let cursor = deps
+            .active_sessions
+            .read()
+            .await
+            .get(&session_id)
+            .map(|s| s.result_cursor.clone());
         let stream = {
             let client = client.lock().await;
+            if let Some(ref cursor) = cursor {
+                cursor.listener_starts();
+            }
             client.subscribe_messages().await
         };
 
@@ -203,18 +210,6 @@ pub(crate) fn spawn_oob_listener(
         };
 
         info!(session_id = %session_id, "OOB listener started");
-
-        // Where this listener is, for the turns of the session (see `ResultCursor`).
-        let cursor = deps
-            .active_sessions
-            .read()
-            .await
-            .get(&session_id)
-            .map(|s| s.result_cursor.clone());
-        let _listening = cursor.clone().map(|cursor| {
-            cursor.listening.store(true, Ordering::SeqCst);
-            Listening(cursor)
-        });
 
         // Tool-use ids of sub-agent launches (`Agent` / `Task`). Everything a
         // sub-agent does is streamed with `parent_tool_use_id` = that id, and
@@ -244,11 +239,20 @@ pub(crate) fn spawn_oob_listener(
                                 tokio::time::sleep(lag).await;
                             }
                             let message = ChatManager::mask_cli_message(message);
-                            // Everything before a turn's `result` has been handled: the turn
-                            // may end (it waits for this, `ResultCursor`).
-                            if let (Message::Result { .. }, Some(cursor)) = (&message, &cursor) {
-                                cursor.listener_saw_result();
-                            }
+                            // A message before a `result` that a turn already read belongs
+                            // to a finished turn, whatever `is_streaming` says now
+                            // (`ResultCursor`): never background output.
+                            let of_a_finished_turn = match &cursor {
+                                Some(cursor) if matches!(message, Message::Result { .. }) => {
+                                    cursor.listener_saw_result(
+                                        is_streaming.load(Ordering::SeqCst),
+                                    );
+                                    // Handled as before (a `result` is never background output).
+                                    false
+                                }
+                                Some(cursor) => cursor.listener_behind(),
+                                None => false,
+                            };
                             remember_subagent_launches(&message, &mut subagent_parents);
                             // The CLI's own count of running background tasks.
                             // Read from every message, in-stream ones included:
@@ -269,9 +273,10 @@ pub(crate) fn spawn_oob_listener(
                                     active.last_activity = Instant::now();
                                 }
                             }
-                            // If a stream_response is currently running, that path
-                            // already consumes the same broadcast. Skip silently.
-                            if is_streaming.load(Ordering::Relaxed) {
+                            // If a stream_response is currently running (or ran: the message
+                            // precedes a `result` it read), that path consumes the same
+                            // broadcast. Skip silently.
+                            if of_a_finished_turn || is_streaming.load(Ordering::Relaxed) {
                                 debug!(
                                     session_id = %session_id,
                                     "OOB listener: in-stream message — skipping (stream_response handles it)"
@@ -765,16 +770,16 @@ const ACTIVITY_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
 /// Tests only: a delay the OOB listener of a session takes before handling each
 /// message, to play a listener that lags behind the turn (a loaded machine).
 #[cfg(test)]
-pub(crate) static TEST_LAG: std::sync::Mutex<Option<(String, Duration)>> =
-    std::sync::Mutex::new(None);
+pub(crate) static TEST_LAG: std::sync::Mutex<Vec<(String, Duration)>> =
+    std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
 fn test_lag(session_id: &str) -> Option<Duration> {
     TEST_LAG
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .filter(|(sid, _)| sid == session_id)
+        .iter()
+        .find(|(sid, _)| sid == session_id)
         .map(|(_, lag)| *lag)
 }
 
