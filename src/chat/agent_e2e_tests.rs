@@ -7961,7 +7961,12 @@ mod background_tasks {
         let far = far_manager(Arc::new(NatsEmitter::new(broker.client().await, "events")));
         let started = std::time::Instant::now();
         let error = far.cancel_task(&sid, "b1").await.unwrap_err();
-        assert_eq!(relay_error(&error), Some(CancelRelayError::SessionGone));
+        assert_eq!(
+            relay_error(&error),
+            Some(CancelRelayError::SessionGone {
+                kind: super::super::cancel_relay::CancelKind::Task
+            })
+        );
         assert!(started.elapsed() >= super::super::cancel_relay::GONE_GRACE);
         let failure = relay_error(&error).unwrap().failure();
         assert_eq!((failure.status, failure.retryable), (410, true));
@@ -8064,6 +8069,7 @@ mod background_tasks {
         );
         let error = error.expect("a typed error frame for the failed cancel");
         assert_eq!(error["reason"], "owner_timeout", "{error}");
+        assert_eq!(error["seq"], 0, "a live frame like the others: {error}");
     }
 
     /// N4 (rolling upgrade): an older instance asks without `v` and reads only

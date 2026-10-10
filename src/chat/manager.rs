@@ -7606,7 +7606,8 @@ impl ChatManager {
     /// instance answering for a session it no longer holds — after a resume on
     /// another instance, its `gone` could reach a canceller before the real
     /// owner's answer (review N1 of #663). Every removal goes through here (or
-    /// cancels `nats_cancel` itself: `close_session`, a replaced session).
+    /// cancels `nats_cancel` itself: `close_session`, a replaced session,
+    /// [`Self::forget_if_client`]).
     pub(crate) async fn forget_active_session(
         active_sessions: &RwLock<HashMap<String, ActiveSession>>,
         session_id: &str,
@@ -7621,6 +7622,10 @@ impl ChatManager {
     /// Removes a legacy session from `active_sessions` when its CLI process is
     /// gone (stdout at EOF). A session being streamed holds the client lock and
     /// is left alone: its own stream reports a death.
+    ///
+    /// Only the entry whose CLI was found dead is removed: if a resume replaced it
+    /// meanwhile (between the read and the write lock), the new session and its
+    /// NATS listeners are left alone (review of #673, finding 4).
     pub(crate) async fn evict_if_cli_dead(&self, session_id: &str) -> bool {
         let client = match self.active_sessions.read().await.get(session_id) {
             Some(s) => s.client.clone(),
@@ -7630,14 +7635,37 @@ impl ChatManager {
             Ok(c) => !c.is_alive().await,
             Err(_) => false,
         };
-        if dead {
-            warn!(
-                session_id = %session_id,
-                "CLI process is gone, dropping the session from active_sessions so the message resumes it"
-            );
-            Self::forget_active_session(&self.active_sessions, session_id).await;
+        if !dead || !Self::forget_if_client(&self.active_sessions, session_id, &client).await {
+            return false;
         }
-        dead
+        warn!(
+            session_id = %session_id,
+            "CLI process is gone, dropped the session from active_sessions so the message resumes it"
+        );
+        true
+    }
+
+    /// [`Self::forget_active_session`], only while the entry is still the one of
+    /// `client` (`Arc::ptr_eq`, under the write lock). Whether it was removed.
+    async fn forget_if_client(
+        active_sessions: &RwLock<HashMap<String, ActiveSession>>,
+        session_id: &str,
+        client: &Arc<Mutex<InteractiveClient>>,
+    ) -> bool {
+        let removed = {
+            let mut sessions = active_sessions.write().await;
+            match sessions.get(session_id) {
+                Some(s) if Arc::ptr_eq(&s.client, client) => sessions.remove(session_id),
+                _ => None,
+            }
+        };
+        match removed {
+            Some(session) => {
+                session.nats_cancel.cancel();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Deliver a user message: local CLI -> owning instance (NATS) ->
@@ -10175,7 +10203,11 @@ impl ChatManager {
             };
 
             loop {
+                // `biased`: a listener whose session was removed (its token
+                // cancelled) stops before reading a request it would answer
+                // `gone` (review of #673, finding 1).
                 tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => {
                         debug!(
                             "NATS cancel_tools listener cancelled for session {} (session replaced)",
@@ -10291,7 +10323,9 @@ impl ChatManager {
             };
             let nats_opt = Some(Arc::clone(&nats));
             loop {
+                // `biased`: see `spawn_nats_cancel_tools_listener`.
                 tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => break,
                     msg = subscriber.next() => {
                         let Some(msg) = msg else { break };
@@ -10330,7 +10364,9 @@ impl ChatManager {
                                         .await
                                         .ok_or_else(|| {
                                             anyhow::Error::new(
-                                                super::cancel_relay::CancelRelayError::SessionGone,
+                                                super::cancel_relay::CancelRelayError::SessionGone {
+                                                    kind: super::cancel_relay::CancelKind::Task,
+                                                },
                                             )
                                         })
                                 },
@@ -21768,7 +21804,7 @@ mod tests {
     /// single instance as across instances (NATS, nobody answering):
     /// `owner_unreachable` (409, not retryable), for both cancels — not a 200 here and
     /// a 409 there.
-    async fn test_cancel_task_unknown_session_idempotent() {
+    async fn test_cancel_on_unknown_session_is_owner_unreachable() {
         use super::super::cancel_relay::CancelRelayError;
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
@@ -21789,6 +21825,33 @@ mod tests {
                 Some(&CancelRelayError::OwnerUnreachable)
             );
         }
+    }
+
+    /// Review of #673, finding 4: the eviction of a dead CLI removes only the entry
+    /// it found dead. A resume that replaced the entry meanwhile keeps its session
+    /// and its NATS listeners (before: the new session was removed and its
+    /// listeners cancelled).
+    #[tokio::test]
+    async fn evicting_a_dead_cli_leaves_a_session_that_replaced_it() {
+        let (old, _) = create_dummy_session(false, "", vec![]);
+        let (new, _) = create_dummy_session(false, "", vec![]);
+        let (old_client, old_token) = (old.client.clone(), old.nats_cancel.clone());
+        let new_token = new.nats_cancel.clone();
+        let sessions = RwLock::new(HashMap::new());
+        // A resume replaced the entry whose CLI was found dead.
+        sessions.write().await.insert("s".to_string(), new);
+        assert!(!ChatManager::forget_if_client(&sessions, "s", &old_client).await);
+        assert!(
+            sessions.read().await.contains_key("s"),
+            "the new session stays"
+        );
+        assert!(!new_token.is_cancelled(), "its listeners keep running");
+
+        // The entry is still the dead one: removed, its listeners ended.
+        sessions.write().await.insert("s".to_string(), old);
+        assert!(ChatManager::forget_if_client(&sessions, "s", &old_client).await);
+        assert!(!sessions.read().await.contains_key("s"));
+        assert!(old_token.is_cancelled());
     }
 
     #[tokio::test]
@@ -22007,8 +22070,12 @@ mod tests {
         );
 
         let state = mock_app_state();
+        // A short deadline: a `gone` alone for cancel_tools is kept until it.
         let far = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
-            .with_nats(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+            .with_nats(Arc::new(
+                NatsEmitter::new(broker.client().await, "events")
+                    .with_cancel_rpc_timeout(Duration::from_secs(3)),
+            ));
         // The owner's listeners may still be subscribing.
         let mut stopped = None;
         for _ in 0..20 {
@@ -22055,22 +22122,35 @@ mod tests {
         let _ = cli.kill();
         let _ = cli.wait();
 
-        // The session leaves the owner: both answer `gone`, typed, at once.
+        // The session leaves the owner: both answer `gone`, typed. cancel_task
+        // reports it after GONE_GRACE (retryable); cancel_tools keeps listening for
+        // a real owner until its deadline, then reports it, not retryable (review
+        // of #673, finding 1).
         owner.active_sessions.write().await.remove("s-far");
         let started = std::time::Instant::now();
         let gone = far.cancel_task("s-far", "tool_Far").await.unwrap_err();
         assert_eq!(
             gone.downcast_ref::<CancelRelayError>(),
-            Some(&CancelRelayError::SessionGone)
-        );
-        let gone = far.cancel_running_tools("s-far").await.unwrap_err();
-        assert_eq!(
-            gone.downcast_ref::<CancelRelayError>(),
-            Some(&CancelRelayError::SessionGone)
+            Some(&CancelRelayError::SessionGone {
+                kind: super::super::cancel_relay::CancelKind::Task
+            })
         );
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(3),
             "answered, not timed out"
+        );
+        let gone = far.cancel_running_tools("s-far").await.unwrap_err();
+        let gone = gone.downcast_ref::<CancelRelayError>().cloned();
+        assert_eq!(
+            gone,
+            Some(CancelRelayError::SessionGone {
+                kind: super::super::cancel_relay::CancelKind::Tools
+            })
+        );
+        assert!(!gone.unwrap().failure().retryable);
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "answered at the deadline, not after"
         );
         token.cancel();
     }
