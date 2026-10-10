@@ -936,7 +936,15 @@ impl AgentSessionHandle {
                 capped: true,
             });
         }
-        let outcome = match self.session.cancel_tools(CancelScope::All).await {
+        // Bounded like a cancel relayed from another instance (review N6): a
+        // provider that hangs is `owner_timeout` (not retryable for cancel_tools).
+        let call = tokio::time::timeout(
+            super::cancel_relay::OWNER_CANCEL_BOUND,
+            self.session.cancel_tools(CancelScope::All),
+        )
+        .await
+        .map_err(|_| cancel_timeout(super::cancel_relay::CancelKind::Tools))?;
+        let outcome = match call {
             Ok(outcome) => outcome,
             Err(error) => return Err(self.cancel_refused(error).await),
         };
@@ -999,13 +1007,15 @@ impl AgentSessionHandle {
             // No snapshot named it (yet): the provider decides.
             None => task_id.to_string(),
         };
-        match self
-            .session
-            .cancel_tools(CancelScope::Task {
+        let call = tokio::time::timeout(
+            super::cancel_relay::OWNER_CANCEL_BOUND,
+            self.session.cancel_tools(CancelScope::Task {
                 id: provider_id.clone(),
-            })
-            .await
-        {
+            }),
+        )
+        .await
+        .map_err(|_| cancel_timeout(super::cancel_relay::CancelKind::Task))?;
+        match call {
             Ok(outcome) => {
                 let diagnostic = outcome.diagnostic.unwrap_or_default();
                 tracing::info!(
@@ -1080,6 +1090,11 @@ impl AgentSessionHandle {
         .await;
         Ok(())
     }
+}
+
+/// A cancel the provider did not answer within `OWNER_CANCEL_BOUND`.
+fn cancel_timeout(kind: super::cancel_relay::CancelKind) -> anyhow::Error {
+    anyhow::Error::new(super::cancel_relay::CancelRelayError::OwnerTimeout { kind })
 }
 
 /// The wire form of a cancel (`cancel_tools`, `cancel_task`) the provider refused

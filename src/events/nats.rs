@@ -380,31 +380,66 @@ impl NatsEmitter {
         format!("{}.chat.{}.cancel_task", self.subject_prefix, session_id)
     }
 
-    /// Asks the instance that owns a session to cancel (request/reply on
-    /// `subject`, `payload` as JSON) and returns its raw answer, or why there is
-    /// none: nobody subscribes ([`RelayFailure::NoResponders`], what NATS answers at
-    /// once), no answer within the emitter's cancel timeout
+    /// Asks the instance that owns a session to cancel (request on `subject`,
+    /// `payload` as JSON, answers on a private inbox) and returns its raw answer, or
+    /// why there is none: nobody subscribes ([`RelayFailure::NoResponders`], what NATS
+    /// answers at once), no answer within the emitter's cancel timeout
     /// ([`RelayFailure::TimedOut`]), or the transport failed.
+    ///
+    /// Several instances may answer (one that just lost the session, the one that
+    /// holds it now): an answer `is_provisional` says is only kept if no other
+    /// answer comes within `grace` after it — a real answer always wins over it.
     pub async fn request_cancel(
         &self,
         subject: String,
         payload: serde_json::Value,
+        is_provisional: &(dyn Fn(&[u8]) -> bool + Sync),
+        grace: std::time::Duration,
     ) -> Result<Vec<u8>, RelayFailure> {
+        use futures::StreamExt;
+        let transport = |e: &dyn std::fmt::Display| RelayFailure::Transport(e.to_string());
+        let inbox = self.client.new_inbox();
+        let mut answers = self
+            .client
+            .subscribe(inbox.clone())
+            .await
+            .map_err(|e| transport(&e))?;
         let body = serde_json::to_vec(&payload).unwrap_or_default();
-        let request = async_nats::Request::new()
-            .payload(body.into())
-            .timeout(Some(self.cancel_rpc_timeout));
-        match self.client.send_request(subject.clone(), request).await {
-            Ok(reply) => Ok(reply.payload.to_vec()),
-            Err(e) => {
-                use async_nats::RequestErrorKind;
-                let failure = match e.kind() {
-                    RequestErrorKind::NoResponders => RelayFailure::NoResponders,
-                    RequestErrorKind::TimedOut => RelayFailure::TimedOut,
-                    _ => RelayFailure::Transport(e.to_string()),
-                };
-                debug!(subject = %subject, ?failure, "cancel request without an answer");
-                Err(failure)
+        self.client
+            .publish_with_reply(subject.clone(), inbox, body.into())
+            .await
+            .map_err(|e| transport(&e))?;
+        self.client.flush().await.map_err(|e| transport(&e))?;
+        let deadline = tokio::time::Instant::now() + self.cancel_rpc_timeout;
+        let mut until = deadline;
+        let mut provisional: Option<Vec<u8>> = None;
+        loop {
+            match tokio::time::timeout_at(until, answers.next()).await {
+                Ok(Some(msg)) => {
+                    if msg.status == Some(async_nats::StatusCode::NO_RESPONDERS) {
+                        if provisional.is_none() {
+                            debug!(subject = %subject, "cancel request: no responders");
+                            return Err(RelayFailure::NoResponders);
+                        }
+                        continue;
+                    }
+                    let bytes = msg.payload.to_vec();
+                    if is_provisional(&bytes) {
+                        if provisional.is_none() {
+                            provisional = Some(bytes);
+                            until = deadline.min(tokio::time::Instant::now() + grace);
+                        }
+                        continue;
+                    }
+                    return Ok(bytes);
+                }
+                Ok(None) => return Err(RelayFailure::Transport("inbox closed".to_string())),
+                Err(_) => {
+                    return provisional.ok_or_else(|| {
+                        debug!(subject = %subject, "cancel request timed out");
+                        RelayFailure::TimedOut
+                    })
+                }
             }
         }
     }

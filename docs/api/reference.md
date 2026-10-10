@@ -324,14 +324,20 @@ typed error body `{error, code, retryable}`, never a `200`:
 | Status | `code` | Meaning |
 |---|---|---|
 | 422 | `unsupported` | the provider cannot (`tool_cancel`: Claude Code over SSH or off Unix; `background_tasks`) |
-| 409 | `owner_unreachable` | no instance holds the session live: nothing was cancelled |
-| 504 | `owner_timeout` | the instance holding it did not answer in time (`retryable: true`) |
-| 410 | `session_gone` | the session left the instance that was asked |
-| 502 | `owner_protocol` / `owner_failed` | unreadable answer / the owner failed |
+| 409 | `owner_unreachable` | no instance holds the session live (same answer with or without NATS): nothing runs, nothing was cancelled — a client shows it as "already stopped"; not retryable |
+| 504 | `owner_timeout` | no answer in time (8 s on the owner, 10 s for the asker); the cancel may still happen. `retryable: false` for cancel-tools (a retry would stop tools started since), `true` for cancel-task |
+| 410 | `session_gone` | only the instance that just lost the session answered (after a 1.5 s grace for the real owner): `retryable: true`, asking again reaches the new owner |
+| 502 | `owner_protocol` / `owner_failed` / `relay_failed` | unreadable answer / the owner failed / the request could not be sent |
 
 A provider refusal is also announced on the session's stream as
-`error { code: "cancel_refused", reason: <capability> }`. Without NATS (one instance),
-an unknown session is a no-op `200`.
+`error { code: "cancel_refused", reason: <capability> }`. Over the WebSocket, a
+`cancel_tools` frame is answered asynchronously; a failure the client was not
+already told of comes back as `error { code: "cancel_failed", reason: <code above> }`.
+
+Rolling upgrades: the request/reply payload is versioned (`"v": 2`); an older
+instance asking gets the format it reads, and nothing it would take for a failure.
+A newer instance asking an older one may see `owner_timeout` (the older one does not
+answer cancel-tools); deploy all instances together to avoid it.
 
 ### GET /api/chat/sessions/{id}/messages -- Protected
 
