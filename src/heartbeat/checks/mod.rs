@@ -5,6 +5,7 @@
 //! Any check exceeding 5s is automatically skipped by the engine.
 
 pub mod architecture_drift;
+pub mod classifier_bench;
 pub mod consolidation;
 pub mod convention_guard;
 pub mod git_drift;
