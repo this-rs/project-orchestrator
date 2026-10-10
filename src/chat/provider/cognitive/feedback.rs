@@ -226,6 +226,7 @@ pub fn trajectory_record(
         node_features: vec![],
         protocol_run_id: decision.run_id,
         protocol_state: None,
+        outcome: None,
     }
 }
 

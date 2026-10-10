@@ -494,6 +494,7 @@ mod tests {
                 cumulative_reward: per_step_reward * (i + 1) as f64,
                 delta_ms: 100,
                 order: i,
+                outcome: None,
             });
         }
 

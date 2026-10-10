@@ -364,6 +364,7 @@ mod tests {
                     cumulative_reward: reward * (i + 1) as f64 / action_types.len() as f64,
                     delta_ms: 100,
                     order: i,
+                    outcome: None,
                 })
                 .collect(),
             created_at: Utc::now(),
