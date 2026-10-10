@@ -53,6 +53,11 @@ const RESUME_GRACE: std::time::Duration = std::time::Duration::from_millis(1500)
 /// once, a dead one does not hold the session longer than this.
 const INTERRUPTED_TURN_RESULT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a turn of the Claude CLI waits, at its end, for the OOB listener to
+/// reach the turn's `result` (see `oob_listener::ResultCursor`). A listener keeps
+/// up within milliseconds; a loaded machine may lag it by more.
+const OOB_CATCH_UP_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// OOB-triggered `stream_response` rate cap for interactive sessions.
 /// A misbehaving Monitor or background Bash that emits constantly could
 /// otherwise loop the session and inflate the LLM bill — this caps the
@@ -243,6 +248,9 @@ pub struct ActiveSession {
     /// `interrupt_token`. The interrupt watchdog compares it to know whether the
     /// turn it cancelled is still the one running (`abandon_turn_if_stuck`).
     pub turn_generation: Arc<AtomicU64>,
+    /// Where the turns and the OOB listener are in the CLI's output: a turn ends
+    /// only once the listener reached its `result` (`oob_listener::ResultCursor`).
+    pub result_cursor: Arc<super::oob_listener::ResultCursor>,
     /// The task running the current turn (`stream_response`, then whatever it
     /// drains next). Registered by `track_stream_task` at every spawn; aborted by
     /// the interrupt watchdog when the turn ignores its cancellation.
@@ -4852,6 +4860,7 @@ impl ChatManager {
                     nats_cancel: nats_cancel.clone(),
                     interrupt_token: interrupt_token.clone(),
                     turn_generation: Arc::new(AtomicU64::new(0)),
+                    result_cursor: Default::default(),
                     stream_task: Arc::new(std::sync::Mutex::new(None)),
                     post_stream_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
                     pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
@@ -5683,7 +5692,7 @@ impl ChatManager {
         // Create a NEW CancellationToken and store it in ActiveSession BEFORE
         // setting is_streaming=true. This ensures the token always matches
         // what interrupt() will cancel (fixes Gaps 1, 2, 4, 7, 10).
-        let interrupt_token = {
+        let (interrupt_token, result_cursor) = {
             let mut sessions = active_sessions.write().await;
             if let Some(session) = sessions.get_mut(&session_id) {
                 let token = CancellationToken::new();
@@ -5691,7 +5700,7 @@ impl ChatManager {
                 session.interrupt_flag.store(false, Ordering::SeqCst);
                 // A new turn: a watchdog armed for the previous one stands down.
                 session.turn_generation.fetch_add(1, Ordering::SeqCst);
-                token
+                (token, session.result_cursor.clone())
             } else {
                 warn!(
                     "Session {} no longer in active_sessions at stream start",
@@ -6271,6 +6280,7 @@ impl ChatManager {
                                     ..
                                 } = msg
                                 {
+                                    result_cursor.turn_read_result();
                                     // Update Neo4j with cli_session_id and cost. Never the
                                     // message count: each user message bumps it (send_message,
                                     // drain, the NATS listener), a `result` is not a message.
@@ -6615,7 +6625,10 @@ impl ChatManager {
                         let drained = tokio::time::timeout(INTERRUPTED_TURN_RESULT_GRACE, async {
                             while let Some(item) = stream.next().await {
                                 match item {
-                                    Ok(Message::Result { .. }) => return true,
+                                    Ok(Message::Result { .. }) => {
+                                        result_cursor.turn_read_result();
+                                        return true;
+                                    }
                                     Ok(_) => continue,
                                     Err(_) => return false,
                                 }
@@ -6699,6 +6712,11 @@ impl ChatManager {
         if sdk_control_rx.is_some() {
             *shared_sdk_control_rx.lock().await = sdk_control_rx;
         }
+
+        // The OOB listener reads the same output on its own subscription: the turn
+        // ends only once it reached the turn's `result`, so none of the turn's
+        // messages is taken for background output (`oob_listener::ResultCursor`).
+        result_cursor.wait_for_listener(OOB_CATCH_UP_BOUND).await;
 
         // ===== POST-STREAM PROCESSING =====
         // All post-stream logic delegated to PostStreamHandler (see post_stream.rs).
@@ -8776,6 +8794,7 @@ impl ChatManager {
                     nats_cancel: nats_cancel.clone(),
                     interrupt_token: interrupt_token.clone(),
                     turn_generation: Arc::new(AtomicU64::new(0)),
+                    result_cursor: Default::default(),
                     stream_task: Arc::new(std::sync::Mutex::new(None)),
                     post_stream_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
                     pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
@@ -17541,6 +17560,7 @@ mod tests {
             nats_cancel: CancellationToken::new(),
             interrupt_token: CancellationToken::new(),
             turn_generation: Arc::new(AtomicU64::new(0)),
+            result_cursor: Default::default(),
             stream_task: Arc::new(std::sync::Mutex::new(None)),
             post_stream_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
@@ -18995,6 +19015,7 @@ mod tests {
             nats_cancel: CancellationToken::new(),
             interrupt_token: CancellationToken::new(),
             turn_generation: Arc::new(AtomicU64::new(0)),
+            result_cursor: Default::default(),
             stream_task: Arc::new(std::sync::Mutex::new(None)),
             post_stream_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
@@ -22448,6 +22469,7 @@ pub(crate) mod test_support {
             nats_cancel: CancellationToken::new(),
             interrupt_token: CancellationToken::new(),
             turn_generation: Arc::new(AtomicU64::new(0)),
+            result_cursor: Default::default(),
             stream_task: Arc::new(std::sync::Mutex::new(None)),
             post_stream_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(pending)),
