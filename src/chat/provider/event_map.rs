@@ -71,6 +71,7 @@ fn task_info(task: &BackgroundTask) -> BackgroundTaskInfo {
         parent_tool_use_id: task.parent.clone().or_else(|| task.tool_call_id.clone()),
         last_seen_at: started_at,
         pending_removal_at: None,
+        signalled: false,
     }
 }
 

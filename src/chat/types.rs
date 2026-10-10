@@ -509,6 +509,13 @@ pub struct BackgroundTaskInfo {
     /// has elapsed. Skipped on the wire — the frontend doesn't need it.
     #[serde(skip)]
     pub pending_removal_at: Option<std::time::Instant>,
+    /// Whether a stop actually sent SIGINT to the task's subtree: by
+    /// `cancel_task` when the pid was known, or by the PID claim when the pid
+    /// came after the stop (`pending_removal_at` already set). A `cancel_task`
+    /// asked again is a no-op only once this is set; before, it still has
+    /// something to do. Skipped on the wire.
+    #[serde(skip)]
+    pub signalled: bool,
 }
 
 /// Events emitted by the chat system (sent via WebSocket / broadcast)
@@ -3446,6 +3453,7 @@ mod tests {
             pid: Some(42_424),
             parent_tool_use_id: Some("toolu_01ABC".to_string()),
             pending_removal_at: None,
+            signalled: false,
         };
         let json = serde_json::to_string(&info).expect("serialise");
         let back: BackgroundTaskInfo = serde_json::from_str(&json).expect("deserialise");
@@ -3471,6 +3479,7 @@ mod tests {
             pid: Some(12345),
             parent_tool_use_id: Some("toolu_01XYZ".into()),
             pending_removal_at: Some(std::time::Instant::now()),
+            signalled: false,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(
@@ -3497,6 +3506,7 @@ mod tests {
                     pid: Some(42_424),
                     parent_tool_use_id: Some("toolu_01ABC".into()),
                     pending_removal_at: None,
+                    signalled: false,
                 },
                 BackgroundTaskInfo {
                     id: "toolu_02XYZ".into(),
@@ -3507,6 +3517,7 @@ mod tests {
                     pid: Some(42_425),
                     parent_tool_use_id: Some("toolu_02XYZ".into()),
                     pending_removal_at: None,
+                    signalled: false,
                 },
             ],
         };
@@ -3567,6 +3578,7 @@ mod tests {
             pid: Some(42_424),
             parent_tool_use_id: None,
             pending_removal_at: None,
+            signalled: false,
         };
         let json = serde_json::to_string(&info).unwrap();
         let back: BackgroundTaskInfo = serde_json::from_str(&json).unwrap();

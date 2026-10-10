@@ -598,6 +598,7 @@ fn server_examples() -> Vec<ServerExample> {
                         parent_tool_use_id: Some(s(TOOL_USE_ID)),
                         last_seen_at: ts("2026-01-15T10:31:12Z"),
                         pending_removal_at: None,
+                        signalled: false,
                     },
                     BackgroundTaskInfo {
                         id: s("recovered-48301"),
@@ -608,6 +609,7 @@ fn server_examples() -> Vec<ServerExample> {
                         parent_tool_use_id: None,
                         last_seen_at: ts("2026-01-15T10:30:30Z"),
                         pending_removal_at: None,
+                        signalled: false,
                     },
                 ],
             },

@@ -5241,6 +5241,7 @@ impl ChatManager {
                     pid: None,
                     parent_tool_use_id: parent_tool_use_id.map(String::from),
                     pending_removal_at: None,
+                    signalled: false,
                 }
             });
 
@@ -5253,6 +5254,7 @@ impl ChatManager {
             // surprises us with a fresh ToolUse on the same id, cancel
             // the pending removal — the task is alive after all.
             entry.pending_removal_at = None;
+            entry.signalled = false;
 
             let snap = tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>();
             (snap, was_vacant)
@@ -5363,7 +5365,12 @@ impl ChatManager {
             return;
         };
 
-        // Update the task's pid and capture a fresh snapshot.
+        // Update the task's pid and capture a fresh snapshot. A task stopped
+        // before its pid was known (`cancel_task` within the claim's first
+        // second: marked `pending_removal_at`, nothing signalled) is signalled
+        // here, once: nothing else would, and a `cancel_task` asked again finds
+        // it signalled (review of #691, finding 1).
+        let mut stop_now = false;
         let snapshot = {
             let sessions = active_sessions.read().await;
             let Some(active) = sessions.get(&session_id) else {
@@ -5380,8 +5387,23 @@ impl ChatManager {
                 return;
             };
             task.pid = Some(claimed);
+            if task.pending_removal_at.is_some() && !task.signalled {
+                task.signalled = true;
+                stop_now = true;
+            }
             tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>()
         };
+
+        if stop_now {
+            let killed = Self::kill_subtree(claimed);
+            info!(
+                session_id = %session_id,
+                tool_use_id = %tool_use_id,
+                root_pid = claimed,
+                killed_count = killed.len(),
+                "async_pid_claim: the task was stopped before its pid was known: SIGINT'd subtree"
+            );
+        }
 
         info!(
             session_id = %session_id,
@@ -5491,6 +5513,7 @@ impl ChatManager {
                     pid: None,
                     parent_tool_use_id: Some(correlation_id.to_string()),
                     pending_removal_at: None,
+                    signalled: false,
                 },
             );
             info!(
@@ -9915,9 +9938,9 @@ impl ChatManager {
     /// 3. If `pid.is_none()` (claim race — `track_background_task_start`
     ///    spawned the async claim but it hasn't fired yet, OR the
     ///    subprocess crashed before pgrep saw it): logs a warning and
-    ///    falls back to V1 map-side-only cancel. `killed_pids` is empty
-    ///    in this edge case — the user can fall back to the global
-    ///    `cancel_running_tools` if needed.
+    ///    marks it only. `killed_pids` is empty in this edge case; the
+    ///    claim, when it finds the pid of a task marked stopping, sends the
+    ///    SIGINT itself (review of #691, finding 1).
     /// 4. Broadcasts a fresh `ChatEvent::ActiveTasksUpdate` so the
     ///    frontend immediately reflects the cancelled state.
     ///
@@ -10022,59 +10045,53 @@ impl ChatManager {
 
         let (history, cap, window, events_tx, tasks_arc) = session_state?;
 
-        // A task already being stopped (its grace period runs, pid kept) is not
-        // signalled again, nor counted in the cap: a retry after a `session_gone`
-        // or an `owner_timeout` from a real owner that did stop it, or a second
-        // click, would otherwise SIGINT the same pid twice (review of #685,
-        // finding 3). Checked again under the lock below (two concurrent cancels).
-        if Self::task_already_stopping(&tasks_arc, task_id).await {
-            debug!(
-                session_id = %session_id,
-                task_id = %task_id,
-                "cancel_task: already being stopped; idempotent no-op"
-            );
-            return Some(CancelTaskResult {
-                task_id: task_id.to_string(),
-                killed_pids: Vec::new(),
-                capped: false,
-            });
-        }
+        let no_op = |capped: bool| CancelTaskResult {
+            task_id: task_id.to_string(),
+            killed_pids: Vec::new(),
+            capped,
+        };
 
-        // Rate cap.
-        let capped = !Self::check_and_record_cancel_cap(&history, cap, window).await;
-        if capped {
-            warn!(
-                session_id = %session_id,
-                task_id = %task_id,
-                cap = cap,
-                window_secs = window.as_secs(),
-                "cancel_task: rate cap hit, refusing"
-            );
-            return Some(CancelTaskResult {
-                task_id: task_id.to_string(),
-                killed_pids: Vec::new(),
-                capped: true,
-            });
-        }
-
-        // V2 (plan fc35b25e, T4): atomically extract the task's pid AND
-        // mark for removal under a single tasks-lock op, then capture the
-        // snapshot for broadcast. Doing both in the same critical section
-        // ensures a concurrent claim-update from `async_pid_claim` cannot
-        // populate the pid AFTER we read it.
+        // One critical section on the task map for the whole decision: whether
+        // the task was already signalled, the rate cap, the mark and the pid.
+        //
+        // - A task already SIGNALLED (by a stop that knew its pid, or by the PID
+        //   claim for a stop that came first) is a no-op, not counted in the cap:
+        //   a retry after a `session_gone` / `owner_timeout` from a real owner
+        //   that did stop it, a second click, or a concurrent cancel waiting on
+        //   this lock, never SIGINTs the same pid twice (reviews of #685,
+        //   finding 3, and of #691, findings 1 and 2).
+        // - A task marked stopping but NOT signalled (stopped before its pid was
+        //   known, or marked by the death poller) is not a no-op: it is signalled
+        //   now if its pid is known; otherwise the PID claim will do it.
+        // - Marking and reading the pid together means a concurrent claim cannot
+        //   populate the pid AFTER we read it (plan fc35b25e, T4).
+        // Lock order: tasks, then the cap history (taken nowhere else first).
         let (snapshot, task_pid) = {
             let mut tasks = tasks_arc.lock().await;
+            if tasks.get(task_id).is_some_and(|t| t.signalled) {
+                debug!(
+                    session_id = %session_id,
+                    task_id = %task_id,
+                    "cancel_task: already signalled; idempotent no-op"
+                );
+                return Some(no_op(false));
+            }
+            if !Self::check_and_record_cancel_cap(&history, cap, window).await {
+                warn!(
+                    session_id = %session_id,
+                    task_id = %task_id,
+                    cap = cap,
+                    window_secs = window.as_secs(),
+                    "cancel_task: rate cap hit, refusing"
+                );
+                return Some(no_op(true));
+            }
             let pid = if let Some(entry) = tasks.get_mut(task_id) {
-                if entry.pending_removal_at.is_some() {
-                    // A concurrent cancel marked it first and signals it.
-                    return Some(CancelTaskResult {
-                        task_id: task_id.to_string(),
-                        killed_pids: Vec::new(),
-                        capped: false,
-                    });
-                }
-                entry.pending_removal_at = Some(std::time::Instant::now());
+                entry
+                    .pending_removal_at
+                    .get_or_insert_with(std::time::Instant::now);
                 let captured = entry.pid;
+                entry.signalled = captured.is_some();
                 info!(
                     session_id = %session_id,
                     task_id = %task_id,
@@ -10098,7 +10115,8 @@ impl ChatManager {
         };
 
         // V2: SIGINT the subtree if the async claim populated a pid;
-        // otherwise log a warning and fall back to map-side-only cancel.
+        // otherwise the claim signals it when it finds the pid (the task is
+        // marked stopping), and this answer has no pid.
         let killed_pids = match task_pid {
             Some(root_pid) => {
                 let killed = Self::kill_subtree(root_pid);
@@ -10115,7 +10133,7 @@ impl ChatManager {
                 warn!(
                     session_id = %session_id,
                     task_id = %task_id,
-                    "cancel_task: no PID stored (claim race or subprocess crashed before discovery), map-side only"
+                    "cancel_task: no PID stored yet (claim pending: it signals the task when it finds the pid; or the subprocess crashed before discovery)"
                 );
                 Vec::new()
             }
@@ -10132,18 +10150,6 @@ impl ChatManager {
             killed_pids,
             capped: false,
         })
-    }
-
-    /// Whether `task_id` is tracked and already being stopped (`pending_removal_at`).
-    async fn task_already_stopping(
-        tasks: &Mutex<HashMap<String, BackgroundTaskInfo>>,
-        task_id: &str,
-    ) -> bool {
-        tasks
-            .lock()
-            .await
-            .get(task_id)
-            .is_some_and(|t| t.pending_removal_at.is_some())
     }
 
     /// Snapshot the current background task tracking map for a session.
@@ -11930,22 +11936,38 @@ impl ChatManager {
     }
 
     /// `work` (a cancel asked of an agent-engine session from another instance),
-    /// unless the session closed meanwhile: then `session_gone`, which a v2 asker
-    /// reads as provisional (the real owner, if any, still answers), instead of what a
-    /// provider session being closed would say (`failed`, `refused`: final answers
-    /// that would beat the real owner's). A request read just before the close lands
-    /// here (review of #685, finding 1).
+    /// unless the session closes before it answers: then `session_gone`, which a
+    /// v2 asker reads as provisional (the real owner, if any, still answers),
+    /// instead of what a provider session being closed would say (`failed`,
+    /// `refused`: final answers that would beat the real owner's). A request read
+    /// just before the close lands here (review of #685, finding 1).
+    ///
+    /// The close is watched for the whole cancel, not only at its start (review
+    /// of #691, finding 3): a close during `work` drops it and answers `gone`, and
+    /// an outcome that comes back once the session is closed is replaced by
+    /// `gone` too. The cancel may then have reached the provider already (the
+    /// signal may have left): `gone` says nothing about that, which is what the
+    /// 410 tells the user ("may or may not have been stopped"; cancel-task is
+    /// retryable, a task signalled twice is still one stopped task).
     async fn unless_agent_closed<T>(
         closed: &CancellationToken,
         kind: super::cancel_relay::CancelKind,
         work: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
+        let gone =
+            || anyhow::Error::new(super::cancel_relay::CancelRelayError::SessionGone { kind });
         if closed.is_cancelled() {
-            return Err(anyhow::Error::new(
-                super::cancel_relay::CancelRelayError::SessionGone { kind },
-            ));
+            return Err(gone());
         }
-        work.await
+        let outcome = tokio::select! {
+            biased;
+            _ = closed.cancelled() => return Err(gone()),
+            outcome = work => outcome,
+        };
+        if closed.is_cancelled() {
+            return Err(gone());
+        }
+        outcome
     }
 
     /// What the other instances can ask of a session of the agent engine this
@@ -17243,6 +17265,7 @@ mod tests {
                 pid: Some(1234),
                 parent_tool_use_id: None,
                 pending_removal_at: dying.then(std::time::Instant::now),
+                signalled: false,
             }
         }
 
@@ -21810,6 +21833,7 @@ mod tests {
                 pid: None,
                 parent_tool_use_id: Some("tool_T1".into()),
                 pending_removal_at: None,
+                signalled: false,
             },
         );
 
@@ -21955,6 +21979,7 @@ mod tests {
                 pid: Some(task_pid),
                 parent_tool_use_id: Some("tool_Twice".into()),
                 pending_removal_at: None,
+                signalled: false,
             },
         );
         let state = mock_app_state();
@@ -21972,6 +21997,170 @@ mod tests {
         let again = manager.cancel_task("s-twice", "tool_Twice").await.unwrap();
         assert!(!again.capped && again.killed_pids.is_empty(), "{again:?}");
         assert_eq!(history.lock().await.len(), 1, "counted once");
+    }
+
+    fn tracked_task(id: &str, pid: Option<u32>) -> BackgroundTaskInfo {
+        BackgroundTaskInfo {
+            id: id.into(),
+            kind: BackgroundTaskKind::BashBackground,
+            description: "sleep".into(),
+            started_at: chrono::Utc::now(),
+            last_seen_at: chrono::Utc::now(),
+            pid,
+            parent_tool_use_id: Some(id.into()),
+            pending_removal_at: None,
+            signalled: false,
+        }
+    }
+
+    /// Review of #691, finding 1: a Stop in the first second of a background task
+    /// comes before its pid is known. It signals nothing, and marks the task
+    /// stopping. The PID claim that follows signals it (before: it only filled the
+    /// pid, and the no-op of a retry left the process running, untracked). Once
+    /// signalled, asking again is the no-op.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_task_stopped_before_its_pid_is_known_is_signalled_when_it_is_found() {
+        // A fake CLI whose child is the background task.
+        let mut cli = std::process::Command::new("sh")
+            .args(["-c", "sleep 30; true"])
+            .spawn()
+            .unwrap();
+        let (mut session, _) = create_dummy_session(false, "", vec![]);
+        session.child_pid = Some(cli.id());
+        let (history, events_tx, tasks) = (
+            session.cancel_task_history.clone(),
+            session.events_tx.clone(),
+            session.active_background_tasks.clone(),
+        );
+        tasks
+            .lock()
+            .await
+            .insert("tool_Early".into(), tracked_task("tool_Early", None));
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-early".into(), session);
+
+        let early = manager.cancel_task("s-early", "tool_Early").await.unwrap();
+        assert!(!early.capped && early.killed_pids.is_empty(), "{early:?}");
+
+        ChatManager::async_pid_claim(
+            "s-early".into(),
+            manager.active_sessions.clone(),
+            events_tx,
+            None,
+            "tool_Early".into(),
+            vec![],
+        )
+        .await;
+        let pid = tasks.lock().await["tool_Early"].pid;
+        assert!(pid.is_some(), "the claim found the task's process");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_alive(pid) == Some(true) {
+            assert!(
+                Instant::now() < deadline,
+                "the task's process was signalled once its pid was found"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = cli.wait();
+
+        let again = manager.cancel_task("s-early", "tool_Early").await.unwrap();
+        assert!(!again.capped && again.killed_pids.is_empty(), "{again:?}");
+        assert_eq!(history.lock().await.len(), 1, "the no-op is not counted");
+    }
+
+    /// Review of #691, finding 2: two concurrent stops of one task signal it once
+    /// and count once in the cap (before: both passed the check and both counted).
+    /// The cap history is held so that both are in flight together.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn two_concurrent_stops_signal_a_task_once_and_count_once() {
+        let mut task = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let task_pid = task.id();
+        let (session, _) = create_dummy_session(false, "", vec![]);
+        let history = session.cancel_task_history.clone();
+        session.active_background_tasks.lock().await.insert(
+            "tool_Both".into(),
+            tracked_task("tool_Both", Some(task_pid)),
+        );
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        sessions.write().await.insert("s-both".to_string(), session);
+
+        let held = history.lock().await;
+        let stop = || {
+            let sessions = Arc::clone(&sessions);
+            tokio::spawn(async move {
+                ChatManager::cancel_legacy_task(&sessions, &None, "s-both", "tool_Both")
+                    .await
+                    .expect("a session of this instance")
+            })
+        };
+        let (a, b) = (stop(), stop());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(held);
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+
+        assert!(!a.capped && !b.capped, "{a:?} {b:?}");
+        let signalled = [&a, &b]
+            .iter()
+            .filter(|r| r.killed_pids.contains(&task_pid))
+            .count();
+        assert_eq!(signalled, 1, "signalled once: {a:?} {b:?}");
+        assert_eq!(history.lock().await.len(), 1, "counted once");
+        assert!(!task.wait().unwrap().success());
+    }
+
+    /// Review of #691, finding 3: the close of an agent-engine session is watched
+    /// for the whole cancel, not only at its start. A close during the cancel, or
+    /// one that comes with its outcome, answers `gone` (provisional), never the
+    /// provider's final answer.
+    #[tokio::test]
+    async fn a_close_during_an_agent_cancel_answers_gone() {
+        use super::super::cancel_relay::{CancelKind, CancelRelayError};
+        let gone = |outcome: Result<u32>| {
+            outcome
+                .unwrap_err()
+                .downcast_ref::<CancelRelayError>()
+                .cloned()
+                == Some(CancelRelayError::SessionGone {
+                    kind: CancelKind::Tools,
+                })
+        };
+
+        // Closed while the cancel runs.
+        let closed = CancellationToken::new();
+        let closing = closed.clone();
+        let outcome = ChatManager::unless_agent_closed(&closed, CancelKind::Tools, async move {
+            closing.cancel();
+            tokio::task::yield_now().await;
+            Ok(7)
+        })
+        .await;
+        assert!(gone(outcome));
+
+        // Closed as the cancel answers.
+        let closed = CancellationToken::new();
+        let closing = closed.clone();
+        let outcome = ChatManager::unless_agent_closed(&closed, CancelKind::Tools, async move {
+            closing.cancel();
+            Ok(7)
+        })
+        .await;
+        assert!(gone(outcome));
+
+        // Open throughout: the cancel's own answer.
+        let closed = CancellationToken::new();
+        let outcome =
+            ChatManager::unless_agent_closed(&closed, CancelKind::Tools, async { Ok(7) }).await;
+        assert_eq!(outcome.unwrap(), 7);
     }
 
     /// A connected CLI whose turn ends before any `Result` (it died mid-turn).
@@ -22229,6 +22418,7 @@ mod tests {
                 pid: None,
                 parent_tool_use_id: Some("tool_NoPid".into()),
                 pending_removal_at: None,
+                signalled: false,
             },
         );
 
@@ -22301,6 +22491,7 @@ mod tests {
                 pid: Some(real_pid),
                 parent_tool_use_id: Some("tool_Real".into()),
                 pending_removal_at: None,
+                signalled: false,
             },
         );
 
@@ -22372,6 +22563,7 @@ mod tests {
                 pid: Some(task_pid),
                 parent_tool_use_id: Some("tool_Far".into()),
                 pending_removal_at: None,
+                signalled: false,
             },
         );
         owner
@@ -22745,6 +22937,7 @@ mod tests {
                 pid: None,
                 parent_tool_use_id: Some("toolu_existing".into()),
                 pending_removal_at: None,
+                signalled: false,
             },
         );
 
@@ -22835,6 +23028,7 @@ mod tests {
                 pid: None,
                 parent_tool_use_id: Some("tool_known".into()),
                 pending_removal_at: None,
+                signalled: false,
             },
         );
 
@@ -22923,6 +23117,7 @@ mod tests {
                 pid,
                 parent_tool_use_id: None,
                 pending_removal_at: None,
+                signalled: false,
             },
         );
         session
@@ -23069,6 +23264,7 @@ mod tests {
                     pid: None,
                     parent_tool_use_id: None,
                     pending_removal_at: Some(stale_at),
+                    signalled: false,
                 },
             );
             tasks.insert(
@@ -23082,6 +23278,7 @@ mod tests {
                     pid: None,
                     parent_tool_use_id: None,
                     pending_removal_at: None,
+                    signalled: false,
                 },
             );
         }
@@ -23150,6 +23347,7 @@ mod tests {
                     pid: None,
                     parent_tool_use_id: None,
                     pending_removal_at: None,
+                    signalled: false,
                 },
             );
             tasks.insert(
@@ -23163,6 +23361,7 @@ mod tests {
                     pid: None,
                     parent_tool_use_id: None,
                     pending_removal_at: None,
+                    signalled: false,
                 },
             );
         }
@@ -23231,6 +23430,7 @@ mod tests {
                 pid: None,
                 parent_tool_use_id: None,
                 pending_removal_at: Some(now),
+                signalled: false,
             },
         );
 
