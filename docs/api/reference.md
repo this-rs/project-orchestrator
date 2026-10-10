@@ -335,7 +335,10 @@ stopping) is a no-op: `200` with empty `killed_pids`, the signal is not sent twi
 and the cap counts it once. A task stopped in its first second, before its process
 is known, answers `200` with empty `killed_pids` too; its process is signalled as
 soon as it is found (about a second later), and until then asking again is not a
-no-op.
+no-op. When several processes started in that same second (two tools at once), none
+is signalled automatically, since the first one found may belong to the other tool:
+asking again signals the one recorded. A task whose process was found dead is never
+signalled (its pid may belong to another process by then): asking is the no-op.
 
 A provider refusal is also announced on the session's stream as
 `error { code: "cancel_refused", reason: <capability> }`. Over the WebSocket, a

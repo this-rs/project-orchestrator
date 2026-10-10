@@ -509,9 +509,10 @@ pub struct BackgroundTaskInfo {
     /// has elapsed. Skipped on the wire — the frontend doesn't need it.
     #[serde(skip)]
     pub pending_removal_at: Option<std::time::Instant>,
-    /// Whether a stop actually sent SIGINT to the task's subtree: by
-    /// `cancel_task` when the pid was known, or by the PID claim when the pid
-    /// came after the stop (`pending_removal_at` already set). A `cancel_task`
+    /// Whether no signal may go to the task's pid any more: a stop actually sent
+    /// SIGINT to its subtree (by `cancel_task` when the pid was known, or by the
+    /// PID claim when the pid came after the stop), or the death poller found its
+    /// process gone (the pid may name another process by now). A `cancel_task`
     /// asked again is a no-op only once this is set; before, it still has
     /// something to do. Skipped on the wire.
     #[serde(skip)]
@@ -3479,7 +3480,7 @@ mod tests {
             pid: Some(12345),
             parent_tool_use_id: Some("toolu_01XYZ".into()),
             pending_removal_at: Some(std::time::Instant::now()),
-            signalled: false,
+            signalled: true,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(
@@ -3487,10 +3488,17 @@ mod tests {
             "pending_removal_at must be skipped from the wire format, got: {}",
             json
         );
+        // `signalled` is server-side bookkeeping too (review of #694, point 3).
+        assert!(
+            !json.contains("signalled"),
+            "signalled must be skipped from the wire format, got: {}",
+            json
+        );
 
-        // Round-trip drops the field (becomes None on deserialise).
+        // Round-trip drops both fields (None / false on deserialise).
         let back: BackgroundTaskInfo = serde_json::from_str(&json).unwrap();
         assert!(back.pending_removal_at.is_none());
+        assert!(!back.signalled);
     }
 
     #[test]

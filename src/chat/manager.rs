@@ -5370,6 +5370,22 @@ impl ChatManager {
         // second: marked `pending_removal_at`, nothing signalled) is signalled
         // here, once: nothing else would, and a `cancel_task` asked again finds
         // it signalled (review of #691, finding 1).
+        //
+        // Only when the claim is unambiguous (review of #694, point 2): several new
+        // processes in the same second (two tools started together) means the
+        // first candidate may be the neighbour's. The pid is still recorded, as
+        // before, but nothing is sent automatically: the task stays marked
+        // stopping and NOT signalled, so an explicit Stop asked again signals it
+        // (it is not the no-op), as before #691.
+        let unambiguous = candidates.len() == 1;
+        if !unambiguous {
+            debug!(
+                session_id = %session_id,
+                tool_use_id = %tool_use_id,
+                candidates = candidates.len(),
+                "async_pid_claim: several new processes; a stop before the claim is left to an explicit Stop"
+            );
+        }
         let mut stop_now = false;
         let snapshot = {
             let sessions = active_sessions.read().await;
@@ -5387,7 +5403,7 @@ impl ChatManager {
                 return;
             };
             task.pid = Some(claimed);
-            if task.pending_removal_at.is_some() && !task.signalled {
+            if unambiguous && task.pending_removal_at.is_some() && !task.signalled {
                 task.signalled = true;
                 stop_now = true;
             }
@@ -5641,6 +5657,10 @@ impl ChatManager {
                     cli_reports_live_tasks,
                 ) {
                     info.pending_removal_at = Some(now_inst);
+                    // Found dead: no signal may go to its pid any more (it may
+                    // name another process by now). A `cancel_task` before the
+                    // purge is the no-op (review of #694, point 1).
+                    info.signalled = true;
                     newly_marked += 1;
                 }
             }
@@ -22072,6 +22092,121 @@ mod tests {
         let again = manager.cancel_task("s-early", "tool_Early").await.unwrap();
         assert!(!again.capped && again.killed_pids.is_empty(), "{again:?}");
         assert_eq!(history.lock().await.len(), 1, "the no-op is not counted");
+    }
+
+    /// Review of #694, point 1: a task the death poller found dead is never
+    /// signalled: by the time a Stop comes (before the purge), its pid may name
+    /// another process. The reuse is played by pointing the entry at a live
+    /// process after the poller marked it: it must survive the Stop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_task_found_dead_is_never_signalled_even_if_its_pid_was_reused() {
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = gone.id();
+        gone.wait().unwrap();
+        let (map, events_tx) =
+            session_with_silent_background_task("s-reused", Some(dead_pid), 0).await;
+        ChatManager::tick_purge_background_tasks(
+            "s-reused",
+            &map,
+            &events_tx,
+            &None,
+            Duration::from_secs(BACKGROUND_TASK_PURGE_GRACE_SECS),
+        )
+        .await;
+        assert!(silent_task_is_marked(&map, "s-reused").await);
+
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let other_pid = other.id();
+        map.read().await["s-reused"]
+            .active_background_tasks
+            .lock()
+            .await
+            .get_mut("tool_silent")
+            .unwrap()
+            .pid = Some(other_pid);
+
+        let stop = ChatManager::cancel_legacy_task(&map, &None, "s-reused", "tool_silent")
+            .await
+            .unwrap();
+        assert!(stop.killed_pids.is_empty(), "{stop:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            process_alive(Some(other_pid)),
+            Some(true),
+            "the process now holding the pid was left alone"
+        );
+        let _ = other.kill();
+        let _ = other.wait();
+    }
+
+    /// Review of #694, point 2: a claim that finds several new processes in the
+    /// same second (two tools started together) records the first, as before, but
+    /// does not signal a task stopped before it: the first candidate may be the
+    /// neighbour's. The task stays stopping and not signalled, so an explicit Stop
+    /// asked again signals it.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn an_ambiguous_claim_signals_nothing_and_leaves_it_to_an_explicit_stop() {
+        let mut cli = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & sleep 30; true"])
+            .spawn()
+            .unwrap();
+        let cli_pid = cli.id();
+        let (mut session, _) = create_dummy_session(false, "", vec![]);
+        session.child_pid = Some(cli_pid);
+        let (events_tx, tasks) = (
+            session.events_tx.clone(),
+            session.active_background_tasks.clone(),
+        );
+        tasks
+            .lock()
+            .await
+            .insert("tool_Two".into(), tracked_task("tool_Two", None));
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-two".into(), session);
+
+        let early = manager.cancel_task("s-two", "tool_Two").await.unwrap();
+        assert!(early.killed_pids.is_empty(), "{early:?}");
+        ChatManager::async_pid_claim(
+            "s-two".into(),
+            manager.active_sessions.clone(),
+            events_tx,
+            None,
+            "tool_Two".into(),
+            vec![],
+        )
+        .await;
+        let both = ChatManager::get_descendant_pids(cli_pid);
+        assert_eq!(both.len(), 2, "two new processes: {both:?}");
+        let claimed = {
+            let tasks = tasks.lock().await;
+            assert!(!tasks["tool_Two"].signalled);
+            tasks["tool_Two"]
+                .pid
+                .expect("the first candidate is recorded")
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for pid in &both {
+            assert_eq!(process_alive(Some(*pid)), Some(true), "{pid} signalled");
+        }
+
+        let explicit = manager.cancel_task("s-two", "tool_Two").await.unwrap();
+        assert!(explicit.killed_pids.contains(&claimed), "{explicit:?}");
+
+        for pid in both {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+        let _ = cli.kill();
+        let _ = cli.wait();
     }
 
     /// Review of #691, finding 2: two concurrent stops of one task signal it once
