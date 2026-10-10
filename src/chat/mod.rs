@@ -21,6 +21,8 @@ pub mod agent_runtime;
 pub mod anchor;
 pub mod anchor_resolver;
 pub mod cost;
+#[cfg(test)]
+mod engine_parity_tests;
 pub mod enrichment;
 pub mod entity_extractor;
 pub mod envelope;
