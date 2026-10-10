@@ -7490,6 +7490,12 @@ mod openclaw_delegation {
     /// refusal first, the other one (built while the provider still said yes) is
     /// opened too — by nexus' retry, or by the backend's when nexus answers
     /// `Unsupported { per_session_mcp }` — and both say what they lack.
+    ///
+    /// What it proves is the OUTCOME only: it cannot tell which of the two retries
+    /// (nexus', the backend's) opened the late session, and nexus' alone would make it
+    /// pass. The backend's retry is proven by the unit test
+    /// `a_refusal_learned_meanwhile_reopens_the_session_without_its_mcp_servers`
+    /// (manager.rs), where the provider answers `Unsupported { per_session_mcp }`.
     #[tokio::test]
     async fn two_first_sessions_opened_at_once_on_a_refusing_agent_both_open() {
         let agent = Agent::new("bridge", "acp-bridge", None);
@@ -7534,5 +7540,46 @@ mod openclaw_delegation {
         assert_eq!(bridge.refusals(), 1, "not refused again after the restart");
         assert!(lacks_po_tools(&graph, &sid).await);
         bridge.assert_home_here("p19-br-resume");
+    }
+
+    /// The frozen snapshot survives the resumes: a refusing agent's session resumed
+    /// after a restart, then after ANOTHER one, is loaded without servers both times.
+    /// The first resume must not rewrite the snapshot with what a fresh provider (which
+    /// has learned nothing yet) says, or the second restart sends the servers again, to
+    /// be refused again (a refused round-trip and a second `mcp_servers_refused`).
+    #[tokio::test]
+    async fn a_refused_session_stays_without_servers_across_two_restarts() {
+        let bridge = Agent::new("bridge", "acp-bridge", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let first = bridge.manager(&graph, "p19-br-twice").await;
+        let sid = open(&first, "p19-br-twice").await;
+        assert_eq!(bridge.refusals(), 1, "learned at the first session");
+        first.close_session(&sid).await.unwrap();
+        drop(first);
+        bridge.mode("load");
+        for restart in 1..=2 {
+            let manager = bridge.manager(&graph, "p19-br-twice").await;
+            resume(&manager, &sid).await;
+            manager.close_session(&sid).await.unwrap();
+            drop(manager);
+            assert_eq!(
+                bridge.servers_sent("session/load"),
+                vec![json!([]); restart],
+                "restart {restart}: loaded without servers"
+            );
+            assert_eq!(bridge.refusals(), 1, "restart {restart}: not refused again");
+        }
+        let notices = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 500)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|r| serde_json::from_str::<ChatEvent>(&r.data).ok())
+            .filter(|e| {
+                matches!(e, ChatEvent::BackgroundOutput { source, .. }
+                    if source == "system:mcp_servers_refused")
+            })
+            .count();
+        assert_eq!(notices, 1, "the refusal is told once, at the first opening");
     }
 }

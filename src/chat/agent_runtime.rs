@@ -1380,6 +1380,8 @@ pub(crate) mod fake {
         pub fail_open: Arc<StdMutex<Option<ProviderError>>>,
         /// Capabilities the sessions of this provider declare.
         pub caps: Arc<StdMutex<Capabilities>>,
+        /// The kind it says it is (Claude Code unless a test plays another).
+        pub kind: Arc<StdMutex<ProviderKind>>,
     }
 
     impl FakeProvider {
@@ -1388,6 +1390,7 @@ pub(crate) mod fake {
                 state: Arc::new(FakeState::default()),
                 fail_open: Arc::new(StdMutex::new(None)),
                 caps: Arc::new(StdMutex::new(Capabilities::none())),
+                kind: Arc::new(StdMutex::new(ProviderKind::ClaudeCode)),
             }
         }
         pub(crate) fn session(&self) -> Arc<FakeSession> {
@@ -1407,7 +1410,7 @@ pub(crate) mod fake {
             "claude-code"
         }
         fn kind(&self) -> ProviderKind {
-            ProviderKind::ClaudeCode
+            *self.kind.lock().unwrap()
         }
         async fn health(&self) -> ProviderHealth {
             ProviderHealth::ok(None)
