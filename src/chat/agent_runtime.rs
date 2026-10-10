@@ -417,9 +417,12 @@ pub trait TurnServices: Send + Sync {
     /// Sees each event of the session as it is emitted (the work log of the turn).
     /// Default: nothing.
     fn observe(&self, _session_id: &str, _event: &ChatEvent) {}
-    /// A turn was sent to the provider (`send_turn` accepted it): what `prepare`
-    /// put in front of it only for one turn may be dropped now. Default: nothing.
-    async fn turn_sent(&self, _session_id: &str) {}
+    /// A turn ended on a `done` that is neither an error nor a Stop: the model
+    /// answered it, so what `prepare` put in front of it only for one turn may be
+    /// dropped now. Not on `send_turn` accepting it: a provider may accept a turn
+    /// before any request (the native harness spawns its run), then fail it (a 429
+    /// once the retries are spent). Default: nothing.
+    async fn turn_completed(&self, _session_id: &str) {}
     /// After each turn played (not one refused before it was sent): the
     /// Claude Code engine's post-stream steps — post-compaction re-injection,
     /// objective tracking, memory, feedback, observations. The host bounds each of
@@ -868,9 +871,6 @@ impl AgentSessionHandle {
             },
             Err(error) => return Err(error),
         };
-        if let Some(services) = &self.services {
-            services.turn_sent(&self.session_id).await;
-        }
         self.streaming_text.lock().await.clear();
         self.streaming_events.lock().await.clear();
         self.emit(ChatEvent::StreamingStatus { is_streaming: true })
@@ -959,6 +959,8 @@ impl AgentSessionHandle {
             ..TurnOutcome::default()
         };
         let mut pending_tools: Vec<(String, Option<String>)> = Vec::new();
+        // The turn ended on a `done` the model answered (no error, no Stop).
+        let mut answered = false;
         let mut tool_ids: Vec<String> = Vec::new();
         // What the turn cost, read on its `done` (`None`: no price, or no `done`).
         let mut turn_cost: Option<f64> = None;
@@ -993,8 +995,16 @@ impl AgentSessionHandle {
                         ..
                     }
                 );
-                if let AgentEvent::Done { cost, .. } = &event {
+                if let AgentEvent::Done {
+                    cost,
+                    is_error,
+                    stop_reason,
+                    ..
+                } = &event
+                {
                     turn_cost = cost.usd;
+                    answered =
+                        !is_error && *stop_reason != nexus_claude::agent::StopReason::Interrupted;
                 }
                 let event = mask_agent_event(event);
                 let chat_events = self.mapper.lock().await.map(&event);
@@ -1044,6 +1054,11 @@ impl AgentSessionHandle {
         }
         // The record carries the turn's cost before the session is seen idle.
         self.add_turn_cost(turn_cost).await;
+        if answered {
+            if let Some(services) = &self.services {
+                services.turn_completed(&self.session_id).await;
+            }
+        }
         (outcome, pending_tools)
     }
 
@@ -2860,5 +2875,113 @@ mod retry_stop_tests {
             );
         }
         assert!(ended, "a result with stop_reason interrupted");
+    }
+}
+
+/// What waits for the next turn after a compaction is dropped only when a turn
+/// carrying it was ANSWERED: the native harness accepts a turn before any request
+/// (its run is spawned) and may then fail it (a 429 once its retries are spent).
+#[cfg(test)]
+mod turn_completed_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Default)]
+    struct Host {
+        completed: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TurnServices for Host {
+        async fn prepare(
+            &self,
+            _session_id: &str,
+            _shown: &str,
+            sent: &str,
+            _turn: &crate::refs::turn::TurnExpansion,
+        ) -> String {
+            sent.to_string()
+        }
+        async fn continuation(&self, _session_id: &str) -> String {
+            String::new()
+        }
+        async fn turn_completed(&self, _session_id: &str) {
+            self.completed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn done(is_error: bool, error: Option<ProviderError>) -> AgentEvent {
+        AgentEvent::Done {
+            stop_reason: if is_error {
+                nexus_claude::agent::StopReason::Error
+            } else {
+                nexus_claude::agent::StopReason::Completed
+            },
+            subtype: None,
+            is_error,
+            result_text: None,
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error,
+        }
+    }
+
+    async fn play(provider: &FakeProvider, handle: &Arc<AgentSessionHandle>, end: AgentEvent) {
+        let before = provider.state.turns_started.lock().unwrap().len();
+        handle.send_message("go").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while provider.state.turns_started.lock().unwrap().len() == before {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        provider.state.push(end);
+        while handle.is_streaming.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_accepted_then_failed_does_not_count_as_completed() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let host = Arc::new(Host::default());
+        let handle = runtime
+            .adopt(
+                "not-a-uuid",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                Some(host.clone() as Arc<dyn TurnServices>),
+            )
+            .await;
+        // `send_turn` accepted it, then the endpoint refused it for good.
+        play(
+            &provider,
+            &handle,
+            done(true, Some(ProviderError::Unauthorized)),
+        )
+        .await;
+        assert_eq!(
+            host.completed.load(Ordering::SeqCst),
+            0,
+            "a failed turn keeps it"
+        );
+        play(&provider, &handle, done(false, None)).await;
+        assert_eq!(
+            host.completed.load(Ordering::SeqCst),
+            1,
+            "an answered turn drops it"
+        );
     }
 }
