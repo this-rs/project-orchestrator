@@ -202,7 +202,8 @@ fn default_messages_limit() -> usize {
 ///
 /// Returns persisted chat events as `messages`. Each event includes its full
 /// payload (type, content, tool info, etc.) plus injected `seq` and `created_at`
-/// metadata. The frontend reconstructs the ChatMessage UI model from these events.
+/// metadata (`created_at`: seconds since the epoch, milliseconds as the fraction).
+/// The frontend reconstructs the ChatMessage UI model from these events.
 pub async fn list_messages(
     State(state): State<OrchestratorState>,
     Path(session_id): Path<Uuid>,
@@ -251,7 +252,7 @@ pub async fn list_messages(
                 map.insert("seq".to_string(), serde_json::json!(e.seq));
                 map.insert(
                     "created_at".to_string(),
-                    serde_json::json!(e.created_at.timestamp()),
+                    serde_json::json!(super::ws_chat_handler::wire_seconds(e.created_at)),
                 );
             }
             obj
