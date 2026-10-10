@@ -326,8 +326,13 @@ typed error body `{error, code, retryable}`, never a `200`:
 | 422 | `unsupported` | the provider cannot (`tool_cancel`: Claude Code over SSH or off Unix; `background_tasks`) |
 | 409 | `owner_unreachable` | no instance holds the session live (same answer with or without NATS): nothing runs, nothing was cancelled — a client shows it as "already stopped"; not retryable |
 | 504 | `owner_timeout` | no answer in time (8 s on the owner, 10 s for the asker); the cancel may still happen. `retryable: false` for cancel-tools (a retry would stop tools started since), `true` for cancel-task |
-| 410 | `session_gone` | only the instance that just lost the session answered. cancel-task: after a 1.5 s grace for the real owner, `retryable: true` (asking again reaches the new owner). cancel-tools: only once the asker's 10 s are over (a real owner slower than 1.5 s still answers), `retryable: false` (the tools may have been stopped; a retry would stop tools started since) |
+| 410 | `session_gone` | only the instance that just lost the session answered. cancel-task: after a 1.5 s grace for the real owner, `retryable: true` (asking again reaches the new owner). cancel-tools: only once the asker's 10 s are over (a real owner slower than 1.5 s still answers), `retryable: false` (the tools may or may not have been stopped; a retry would stop tools started since) |
 | 502 | `owner_protocol` / `owner_failed` / `relay_failed` | unreadable answer / the owner failed / the request could not be sent |
+
+Asking cancel-task again for a task already being stopped (a retry after a
+`410`/`504`, a second click, within the 5 s it stays listed as stopping) is a no-op:
+`200` with empty `killed_pids`, the signal is not sent twice and the cap does not
+count it.
 
 A provider refusal is also announced on the session's stream as
 `error { code: "cancel_refused", reason: <capability> }`. Over the WebSocket, a
