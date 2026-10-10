@@ -24,6 +24,9 @@ static BACKEND_PORT: std::sync::atomic::AtomicU16 =
 /// The backend thread polls this flag before calling `show_main_window()`.
 static SPLASH_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// How long the desktop thread waits for the backend's HTTP listener before moving on.
+const BACKEND_LISTEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Tauri command: get the server port for the frontend to connect to.
 /// Returns the real port from config.yaml (not necessarily 6600).
 #[tauri::command]
@@ -401,7 +404,16 @@ fn main() {
                 let start = std::time::Instant::now();
 
                 loop {
-                    if start.elapsed() > std::time::Duration::from_secs(30) {
+                    if SPLASH_READY.load(std::sync::atomic::Ordering::SeqCst) {
+                        // "Continue anyway" was pressed: the splash already faded out, so do
+                        // not keep the user on an empty window for the rest of the wait.
+                        tracing::warn!(
+                            "Splash asked to proceed after {:?} — not waiting for the backend any longer",
+                            start.elapsed()
+                        );
+                        break;
+                    }
+                    if start.elapsed() > BACKEND_LISTEN_TIMEOUT {
                         tracing::error!("Backend HTTP listener did not start within 30 seconds");
                         break;
                     }
@@ -674,5 +686,27 @@ fn show_main_window(handle: &tauri::AppHandle) {
         if let Err(e) = main_window.set_focus() {
             tracing::warn!("Failed to focus main window: {}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// The splash's "Continue anyway" button sets `SPLASH_READY` through `proceed_to_main`.
+    /// The wait for the backend reads that flag, otherwise the faded-out splash stays on an
+    /// empty window until the whole backend timeout has run out.
+    #[test]
+    fn proceed_to_main_sets_the_flag_the_backend_wait_reads() {
+        SPLASH_READY.store(false, Ordering::SeqCst);
+        proceed_to_main();
+        assert!(SPLASH_READY.load(Ordering::SeqCst));
+        SPLASH_READY.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn the_backend_wait_is_bounded() {
+        assert_eq!(BACKEND_LISTEN_TIMEOUT.as_secs(), 30);
     }
 }
