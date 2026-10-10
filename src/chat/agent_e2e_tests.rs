@@ -6222,3 +6222,132 @@ mod legacy_session_record {
         manager.close_session(&sid).await.unwrap();
     }
 }
+
+/// P14: a native session's conversation lives in a transcript the resume token only
+/// names. Kept on disk (owner-only), the session resumes after a restart with its
+/// whole history; a deletion of the session removes it.
+mod native_transcripts {
+    use super::*;
+
+    fn answer(key: &str) -> Value {
+        sse_route(
+            key,
+            vec![
+                delta(json!({"content": format!("answer to {key}")})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}),
+                json!("[DONE]"),
+            ],
+        )
+    }
+
+    /// The most specific routes first: the fake answers with the first unused match,
+    /// and a later turn's body holds the earlier turns' text.
+    fn script_with_turns() -> Value {
+        let mut routes = vec![answer("AFTER-RESTART"), answer("SECOND-TURN")];
+        routes.extend(script().as_array().cloned().unwrap());
+        Value::Array(routes)
+    }
+
+    async fn wait_results(graph: &MockGraphStore, sid: &str, count: usize) {
+        let uuid = Uuid::parse_str(sid).unwrap();
+        for _ in 0..400 {
+            let n = graph
+                .get_chat_events(uuid, 0, 500)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| e.event_type == "result")
+                .count();
+            if n >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{count} result event(s) never persisted");
+    }
+
+    #[tokio::test]
+    async fn a_native_session_resumes_its_history_after_a_restart_and_its_deletion_removes_the_transcript(
+    ) {
+        let fake = FakeOpenAi::start(script_with_turns());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("native-transcripts");
+
+        // Before the restart: two turns.
+        let before = manager(graph.clone(), true).with_native_transcripts(&root);
+        let created = before
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap();
+        let sid = created.session_id;
+        assert!(before.agent_runtime.owns(&sid).await, "the agent engine");
+        wait_results(&graph, &sid, 1).await;
+        before.send_message(&sid, "SECOND-TURN").await.unwrap();
+        wait_results(&graph, &sid, 2).await;
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+
+        // The transcript the token names is on disk, owner-only.
+        let uuid = Uuid::parse_str(&sid).unwrap();
+        let token = graph
+            .get_chat_session(uuid)
+            .await
+            .unwrap()
+            .unwrap()
+            .resume_token
+            .expect("a native session persists its resume token");
+        let id = super::super::provider::transcripts::transcript_id_of(&token)
+            .expect("a native token names a transcript");
+        let file = root.join("local").join(format!("{id}.json"));
+        assert!(
+            file.exists(),
+            "the transcript is on disk: {}",
+            file.display()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode =
+                |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&file), 0o600, "the transcript file");
+            assert_eq!(mode(&root.join("local")), 0o700, "the instance directory");
+            assert_eq!(mode(&root), 0o700, "the root");
+        }
+
+        // A restart: a new manager on the same graph and the same data directory.
+        let after = manager(graph.clone(), true).with_native_transcripts(&root);
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        after
+            .resume_session(&sid, "AFTER-RESTART", Some(&claims))
+            .await
+            .unwrap_or_else(|e| panic!("resume after a restart failed: {e:#}"));
+        wait_results(&graph, &sid, 3).await;
+        let body = fake
+            .chat_requests()
+            .iter()
+            .map(|r| r["body"].to_string())
+            .find(|b| b.contains("AFTER-RESTART"))
+            .expect("the resumed turn reached the model");
+        for earlier in [
+            "hi there",
+            "hello from the fake model",
+            "SECOND-TURN",
+            "answer to SECOND-TURN",
+        ] {
+            assert!(
+                body.contains(earlier),
+                "the resumed turn carries the history ({earlier}): {body}"
+            );
+        }
+
+        // Deleting the session removes its transcript, then the node.
+        assert!(after.delete_session(uuid).await.unwrap());
+        assert!(!file.exists(), "the transcript goes with the session");
+        assert!(graph.get_chat_session(uuid).await.unwrap().is_none());
+        assert!(!after.delete_session(uuid).await.unwrap(), "already gone");
+    }
+}

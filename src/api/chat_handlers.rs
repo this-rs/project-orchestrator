@@ -629,18 +629,19 @@ pub async fn delete_session(
     State(state): State<OrchestratorState>,
     Path(session_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // Close active session if running
-    if let Some(chat_manager) = &state.chat_manager {
-        let _ = chat_manager.close_session(&session_id.to_string()).await;
+    // The chat manager closes the session if it runs and removes what it keeps on
+    // disk (a native session's transcript) before the node.
+    let deleted = match &state.chat_manager {
+        Some(chat_manager) => chat_manager.delete_session(session_id).await,
+        None => {
+            state
+                .orchestrator
+                .neo4j()
+                .delete_chat_session(session_id)
+                .await
+        }
     }
-
-    // Delete from Neo4j
-    let deleted = state
-        .orchestrator
-        .neo4j()
-        .delete_chat_session(session_id)
-        .await
-        .map_err(AppError::Internal)?;
+    .map_err(AppError::Internal)?;
 
     if deleted {
         // Emit CRUD event for live refresh
