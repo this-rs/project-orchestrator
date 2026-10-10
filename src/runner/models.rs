@@ -496,6 +496,12 @@ pub enum TriggerSource {
     Event {
         trigger_id: Uuid,
         source_event: String,
+        /// How many event-triggered runs lead to this one: 1 when the event
+        /// did not come from an event-triggered run. Refused beyond
+        /// `runner::dispatch::MAX_EVENT_CHAIN_DEPTH` (plans that trigger each
+        /// other never loop forever).
+        #[serde(default)]
+        chain_depth: u32,
     },
 }
 
@@ -676,6 +682,99 @@ pub struct Trigger {
     /// Total number of times this trigger has fired.
     pub fire_count: u64,
     pub created_at: DateTime<Utc>,
+    /// Who created (or last enabled) the trigger: the identity a `schedule` or
+    /// `event` run is started as, since no caller is behind those signals.
+    /// `None` for a trigger written before authors were recorded: such a
+    /// schedule or event trigger never starts a run (see
+    /// `runner::dispatch::TriggerDispatcher::dispatch`).
+    #[serde(default)]
+    pub author: Option<TriggerAuthor>,
+}
+
+/// The caller that created or enabled a [`Trigger`], recorded so a run the
+/// trigger starts with no caller behind it (schedule, event) gets exactly the
+/// identity, the third-party lineage and the permission ceiling that
+/// `plan(action: "run")` would give that caller.
+///
+/// `token_type` and `scope` are the caller's, verbatim: the scope of an
+/// `agent_session` token is what signs its session, ceiling, tool profile and
+/// lineage, and what [`TriggerAuthor::claims`] hands back to the run. The
+/// other fields are read from it, for whoever lists the trigger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TriggerAuthor {
+    pub sub: String,
+    pub email: String,
+    pub name: String,
+    /// `None`: a person's JWT; `agent_session`, `mcp`...: an agent's token.
+    #[serde(default)]
+    pub token_type: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// The chat session of an `agent_session` author.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// The author's session runs on a third-party provider, or descends from
+    /// one: the run's agents get the restricted profile.
+    #[serde(default)]
+    pub third_party: bool,
+    /// Permission mode signed into the author's token (its policy ceiling).
+    #[serde(default)]
+    pub ceiling: Option<String>,
+    /// MCP tool profile signed into the author's token (`None`: full).
+    #[serde(default)]
+    pub tool_profile: Option<String>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+impl TriggerAuthor {
+    /// The author of a trigger created or enabled with `claims`.
+    pub fn from_claims(claims: &crate::auth::jwt::Claims) -> Self {
+        let binding = crate::auth::jwt::agent_session_binding(claims);
+        Self {
+            sub: claims.sub.clone(),
+            email: claims.email.clone(),
+            name: claims.name.clone(),
+            token_type: claims.token_type.clone(),
+            scope: claims.scope.clone(),
+            session_id: binding.as_ref().map(|b| b.session_id.clone()),
+            third_party: binding.as_ref().is_some_and(|b| b.third_party),
+            ceiling: binding.as_ref().and_then(|b| b.ceiling.clone()),
+            tool_profile: binding.and_then(|b| b.tool_profile),
+            recorded_at: Utc::now(),
+        }
+    }
+
+    /// The claims a run started by this trigger is given: the author's
+    /// identity, token type and scope (so lineage and ceiling), freshly dated.
+    /// Never presented over HTTP: the runner mints each agent's own session
+    /// token from them, as it does from a `plan(run)` caller's claims.
+    pub fn claims(&self) -> crate::auth::jwt::Claims {
+        let now = Utc::now().timestamp();
+        crate::auth::jwt::Claims {
+            sub: self.sub.clone(),
+            email: self.email.clone(),
+            name: self.name.clone(),
+            iat: now,
+            exp: now + 86400,
+            token_type: self.token_type.clone(),
+            scope: self.scope.clone(),
+            jti: None,
+        }
+    }
+}
+
+/// What the reservation of a trigger signal decided (see
+/// `GraphStore::reserve_trigger_signal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalReservation {
+    /// This caller holds the signal: it may start the run. The trigger's
+    /// `last_fired` was moved to now in the same write.
+    Reserved,
+    /// The signal was already reserved (here, on another instance, or
+    /// earlier: a redelivery), or the trigger does not exist.
+    Duplicate,
+    /// The trigger fired less than its cooldown ago: nothing reserved.
+    Cooldown,
 }
 
 /// A firing record — one entry per trigger activation.

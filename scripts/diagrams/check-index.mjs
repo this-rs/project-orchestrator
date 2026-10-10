@@ -7,6 +7,7 @@
 //      status planned => pas de fichier ; tout .mmd du dossier est dans l'index ;
 //      ou bien le diagramme est EXTERNE (service Mermaid de l'equipe, regle par defaut) : l'entree
 //      porte `mermaid_id` et/ou `external` (emplacement sans hote), plus `verified_at` et `verified_sha`, et aucun .mmd local ;
+//      `verified_sha` doit designer un commit qui existe dans ce depot (`git cat-file -e`, hors reseau) ;
 //      une entree externe verified possede ses `covers` comme une entree locale (hors reseau) ;
 //   4. l'index porte la carte d'index `po-carte` (role: index) et toute carte provisoire
 //      reprise est declaree par `supersedes:` sur l'entree qui la remplace ;
@@ -37,7 +38,7 @@
 //   DIAGRAM_ROOT_FRONTEND (defaut : ../frontend)   DIAGRAM_ROOT_NEXUS (../nexus)   DIAGRAM_ROOT_WEBSITE (../website)
 // Un depot absent est ignore avec un avertissement, sauf avec --strict (exit 1).
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { dirname, join, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -110,6 +111,31 @@ export function checkDiagramFile(entry, text) {
 // Le controle reste HORS RESEAU : on verifie la forme de l'entree, jamais le service.
 // `verified_sha` est le sha du backend contre lequel le diagramme a ete relu : c'est ce qui
 // remplace l'en-tete `%% verified` d'un .mmd local.
+// Un segment d'emplacement qui est un nom d'hote : la forme <workspace>/<session>/... admet
+// `localhost/doc/po-x@2` (le workspace n'a pas de point), et une session peut porter des
+// points. On refuse donc les noms d'hote locaux SANS point (localhost et ses alias), une
+// adresse IPv4, et un segment qui finit comme un domaine (`.xx` et plus, lettres seules).
+// Ce que ce controle ne peut pas voir : un nom d'hote d'intranet sans point qui ne serait pas
+// dans cette liste ressemble a un workspace ; le gate des jetons interdits reste la defense.
+const LOCAL_HOSTNAMES = new Set(['localhost', 'ip6-localhost', 'ip6-loopback', 'broadcasthost']);
+export function looksLikeHost(segment) {
+  const s = segment.toLowerCase();
+  return LOCAL_HOSTNAMES.has(s) || /^\d{1,3}(\.\d{1,3}){3}$/.test(s) || /\.[a-z]{2,}$/.test(s);
+}
+
+// `verified_sha` doit DESIGNER un commit de ce depot : un sha bien forme mais absent (une
+// branche ecrasee par un squash, une faute de frappe) passerait le controle de forme et ne
+// prouverait rien. Verifie HORS RESEAU (`git cat-file -e <sha>^{commit}`) :
+//   'present' : le commit existe ; 'absent' : il n'existe pas ;
+//   'unknown' : pas un depot git, ou un clone superficiel (le commit peut exister en amont).
+export function commitStatus(root, sha) {
+  const git = (args) => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' });
+  const inside = git(['rev-parse', '--is-inside-work-tree']);
+  if (inside.status !== 0 || inside.stdout.trim() !== 'true') return 'unknown';
+  if (git(['cat-file', '-e', `${sha}^{commit}`]).status === 0) return 'present';
+  return git(['rev-parse', '--is-shallow-repository']).stdout.trim() === 'true' ? 'unknown' : 'absent';
+}
+
 export function isExternal(entry) {
   return Object.hasOwn(entry, 'mermaid_id') || Object.hasOwn(entry, 'external');
 }
@@ -124,6 +150,7 @@ export function checkExternalEntry(entry) {
   if (Object.hasOwn(entry, 'external')) {
     const m = /^([a-z0-9-]+)\/([A-Za-z0-9._-]+)\/([a-z0-9-]+)@(\d+)$/.exec(loc);
     if (!m) errs.push(`${entry.name} : 'external' doit etre <workspace>/<session>/<name>@<version>, sans hote (trouve : ${loc || 'vide'})`);
+    else if (looksLikeHost(m[1]) || looksLikeHost(m[2])) errs.push(`${entry.name} : 'external' commence par un nom d'hote (${looksLikeHost(m[1]) ? m[1] : m[2]}) ; l'emplacement s'ecrit sans hote`);
     else if (m[3] !== entry.name) errs.push(`${entry.name} : 'external' designe le diagramme ${m[3]}, pas ${entry.name}`);
   }
   if (!id && !loc) errs.push(`${entry.name} : diagramme externe sans identifiant ('mermaid_id' ou 'external')`);
@@ -359,6 +386,11 @@ function main() {
     if (isExternal(e)) {
       // Le diagramme vit dans le service Mermaid : une copie locale serait une deuxieme source.
       problems.push(...checkExternalEntry(e));
+      if (e.status === 'verified' && /^[0-9a-f]{7,40}$/.test(e.verified_sha ?? '')) {
+        const status = commitStatus(backendRoot, e.verified_sha);
+        if (status === 'absent') problems.push(`${e.name} : 'verified_sha: ${e.verified_sha}' ne designe aucun commit de ce depot (squash ? relever contre le sha fusionne)`);
+        else if (status === 'unknown') console.warn(`AVERTISSEMENT ${e.name} : 'verified_sha: ${e.verified_sha}' non verifiable ici (pas un depot git, ou clone superficiel)`);
+      }
       if (existsSync(file)) problems.push(`${e.name} : diagramme externe ET docs/diagrams/${e.name}.mmd present ; une seule source`);
     } else if (e.status === 'verified') {
       if (!existsSync(file)) problems.push(`${e.name} : status verified mais docs/diagrams/${e.name}.mmd est absent`);

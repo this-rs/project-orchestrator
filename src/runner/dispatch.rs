@@ -17,9 +17,11 @@ use crate::chat::manager::ChatManager;
 use crate::events::EventEmitter;
 use crate::neo4j::traits::GraphStore;
 use crate::orchestrator::context::ContextBuilder;
-use crate::runner::models::{RunnerConfig, Trigger, TriggerFiring, TriggerSource};
+use crate::runner::models::{
+    RunnerConfig, SignalReservation, Trigger, TriggerFiring, TriggerSource,
+};
 use crate::runner::runner::{PlanRunner, StartResult};
-use crate::runner::trigger::TriggerEngine;
+use crate::runner::trigger::{effective_cooldown_secs, TriggerEngine};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -109,8 +111,9 @@ impl PlanRunnerFactory {
 /// Starts a plan run. Implemented by [`PlanRunnerFactory`]; a seam for tests.
 #[async_trait]
 pub trait PlanRunStarter: Send + Sync {
-    /// `claims`: the caller behind the signal, whose identity (and lineage) the
-    /// run's agents inherit; `None` for the system (schedule, event).
+    /// `claims`: whom the run's agents act for, identity and lineage — the
+    /// caller behind the signal (webhook) or the trigger's author (schedule,
+    /// event), see [`TriggerDispatcher::run_claims`].
     async fn start_run(
         &self,
         plan_id: Uuid,
@@ -131,10 +134,9 @@ impl PlanRunStarter for PlanRunnerFactory {
         project_slug: Option<String>,
         claims: Option<Claims>,
     ) -> Result<StartResult> {
-        // The caller's claims when there is one (a webhook): a third-party
-        // lineage stays restricted in the run, as with `plan(action: "run")`.
-        // Without (schedule, event), each agent uses a service account. Budget
-        // and routing are the defaults.
+        // The caller's claims (webhook) or the trigger author's (schedule,
+        // event): a third-party lineage stays restricted in the run, as with
+        // `plan(action: "run")`. Budget and routing are the defaults.
         self.build(RunOptions {
             claims,
             ..RunOptions::default()
@@ -188,9 +190,20 @@ pub async fn resolve_run_location(
 
     let project = match plan.project_id {
         Some(project_id) => graph.get_project(project_id).await?,
-        None => match graph.list_plan_project_slugs(plan_id).await?.first() {
-            Some(slug) => graph.get_project_by_slug(slug).await?,
-            None => None,
+        None => match graph.list_plan_project_slugs(plan_id).await?.as_slice() {
+            [] => None,
+            [slug] => graph.get_project_by_slug(slug).await?,
+            // Several projects and no main one: picking one would run the plan
+            // in a directory nobody chose.
+            slugs => {
+                return Err(anyhow!(
+                    "Plan {} belongs to {} projects ({}) and has no main project: a triggered \
+                     run cannot choose where to execute",
+                    plan_id,
+                    slugs.len(),
+                    slugs.join(", ")
+                ))
+            }
         },
     }
     .ok_or_else(|| {
@@ -242,9 +255,19 @@ pub struct FireRequest {
     pub dedupe_key: String,
     /// What the source sent, recorded in the firing (never passed to the run).
     pub payload: Option<serde_json::Value>,
-    /// The caller behind the signal (a webhook); `None` for the system.
+    /// The caller behind the signal (a webhook). A schedule or event signal
+    /// has none: its run starts as the trigger's recorded author.
     pub claims: Option<Claims>,
+    /// For an event signal: the depth of the event chain this run would
+    /// extend (1 when the event did not come from an event-triggered run).
+    /// Beyond [`MAX_EVENT_CHAIN_DEPTH`] the run is refused.
+    pub chain_depth: Option<u32>,
 }
+
+/// Longest chain of event-triggered runs: plans whose event triggers answer
+/// each other (A done → B, B done → A) stop after this many hops, whatever
+/// their cooldown.
+pub const MAX_EVENT_CHAIN_DEPTH: u32 = 5;
 
 /// What became of a trigger signal.
 #[derive(Debug, Clone)]
@@ -298,8 +321,10 @@ impl TriggerDispatcher {
     ///
     /// In order: the guards (enabled, cooldown, no run of this plan) → the
     /// reservation of the signal (one dispatch per `dedupe_key`, across
-    /// instances) → no other run active (the runner has a single global run
-    /// state) → where the run executes → the start → the firing.
+    /// instances, and the cooldown read and `last_fired` written in the same
+    /// graph write) → who the run starts as ([`Self::run_claims`]) and how
+    /// deep its event chain is → no other run active (the runner has a single
+    /// global run state) → where the run executes → the start → the firing.
     ///
     /// `Err` only when the guards or the reservation cannot be read/written;
     /// a run that does not start is an `Ok(StartFailed)` with its firing.
@@ -308,28 +333,50 @@ impl TriggerDispatcher {
         trigger: &Trigger,
         request: FireRequest,
     ) -> Result<DispatchOutcome> {
-        let Some(source) = self.engine.evaluate_and_prepare(trigger).await? else {
+        let Some(mut source) = self.engine.evaluate_and_prepare(trigger).await? else {
             return Ok(DispatchOutcome::Skipped);
         };
 
-        if !self
+        match self
             .graph
-            .reserve_trigger_signal(trigger.id, &request.dedupe_key)
+            .reserve_trigger_signal(
+                trigger.id,
+                &request.dedupe_key,
+                effective_cooldown_secs(trigger),
+            )
             .await?
         {
-            info!(
-                "Trigger {}: signal '{}' already dispatched, skipping",
-                trigger.id, request.dedupe_key
-            );
-            return Ok(DispatchOutcome::Duplicate);
+            SignalReservation::Reserved => {}
+            SignalReservation::Duplicate => {
+                info!(
+                    "Trigger {}: signal '{}' already dispatched, skipping",
+                    trigger.id, request.dedupe_key
+                );
+                return Ok(DispatchOutcome::Duplicate);
+            }
+            SignalReservation::Cooldown => {
+                info!(
+                    "Trigger {}: in cooldown (fired elsewhere since it was read), skipping '{}'",
+                    trigger.id, request.dedupe_key
+                );
+                return Ok(DispatchOutcome::Skipped);
+            }
         }
 
-        let started = match self.another_run_active(trigger.plan_id).await {
+        if let TriggerSource::Event { chain_depth, .. } = &mut source {
+            *chain_depth = request.chain_depth.unwrap_or(1);
+        }
+
+        let started = match self
+            .refusal(trigger, &source, request.claims.is_some())
+            .await
+        {
             Some(error) => Err(anyhow!(error)),
             None => match resolve_run_location(self.graph.as_ref(), trigger.plan_id).await {
                 Ok((cwd, project_slug)) => {
+                    let claims = Self::run_claims(trigger, request.claims);
                     self.starter
-                        .start_run(trigger.plan_id, source, cwd, project_slug, request.claims)
+                        .start_run(trigger.plan_id, source, cwd, project_slug, claims)
                         .await
                 }
                 Err(e) => Err(e),
@@ -373,6 +420,44 @@ impl TriggerDispatcher {
         }
     }
 
+    /// Who the run of `trigger` starts as: the caller behind the signal when
+    /// there is one (a webhook), otherwise the trigger's recorded author — the
+    /// identity, third-party lineage and ceiling of whoever created or enabled
+    /// it, so the run's agents get what `plan(action: "run")` would give that
+    /// caller. Never the server's own service account for a trigger someone
+    /// wrote: [`Self::refusal`] stops an authorless schedule or event trigger.
+    pub fn run_claims(trigger: &Trigger, caller: Option<Claims>) -> Option<Claims> {
+        caller.or_else(|| trigger.author.as_ref().map(|a| a.claims()))
+    }
+
+    /// Why this firing starts no run, decided before anything is resolved:
+    /// a schedule or event trigger without a recorded author (written before
+    /// authors were recorded: enabling it again records one), an event chain
+    /// too deep, or a run of another plan active.
+    async fn refusal(
+        &self,
+        trigger: &Trigger,
+        source: &TriggerSource,
+        has_caller: bool,
+    ) -> Option<String> {
+        if !has_caller && trigger.author.is_none() {
+            return Some(format!(
+                "trigger {} has no recorded author: a {} trigger starts its run as whoever \
+                 created or enabled it; enable it again to record one",
+                trigger.id, trigger.trigger_type
+            ));
+        }
+        if let TriggerSource::Event { chain_depth, .. } = source {
+            if *chain_depth > MAX_EVENT_CHAIN_DEPTH {
+                return Some(format!(
+                    "event chain too deep: this run would be the {chain_depth}th event-triggered \
+                     run in a row (at most {MAX_EVENT_CHAIN_DEPTH})"
+                ));
+            }
+        }
+        self.another_run_active(trigger.plan_id).await
+    }
+
     /// Why no run can start now: a run of another plan is active (the runner
     /// keeps a single global run state; starting would overwrite it).
     async fn another_run_active(&self, plan_id: Uuid) -> Option<String> {
@@ -396,7 +481,7 @@ impl TriggerDispatcher {
 pub(crate) mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-    use crate::runner::models::TriggerType;
+    use crate::runner::models::{TriggerAuthor, TriggerType};
     use crate::runner::RunnerState;
     use crate::test_helpers::{test_plan, test_project, test_task};
     use chrono::Utc;
@@ -410,15 +495,57 @@ pub(crate) mod tests {
     pub(crate) struct RecordingStarter {
         pub graph: Option<Arc<dyn GraphStore>>,
         pub calls: Mutex<Vec<StartCall>>,
+        /// The claims of each start, in full.
+        pub claims: Mutex<Vec<Option<Claims>>>,
     }
 
     impl RecordingStarter {
         pub(crate) fn on(graph: Arc<dyn GraphStore>) -> Self {
             Self {
                 graph: Some(graph),
-                calls: Mutex::new(Vec::new()),
+                ..Self::default()
             }
         }
+    }
+
+    /// A person's claims (a regular JWT).
+    pub(crate) fn person_claims() -> Claims {
+        Claims {
+            sub: Uuid::new_v4().to_string(),
+            email: "alice@example.com".into(),
+            name: "Alice".into(),
+            iat: 0,
+            exp: 0,
+            token_type: None,
+            scope: None,
+            jti: None,
+        }
+    }
+
+    /// The claims of an `agent_session` token bound to session `sid`, with
+    /// the given lineage and tool profile, signed and decoded as the auth
+    /// middleware would hand them to a handler.
+    pub(crate) fn agent_session_claims(
+        sid: &str,
+        third_party: bool,
+        tool_profile: Option<&str>,
+        ceiling: &str,
+    ) -> Claims {
+        let secret = "test-secret-key-minimum-32-chars!!";
+        let binding = crate::auth::jwt::AgentSessionBinding {
+            session_id: sid.to_string(),
+            ceiling: Some(ceiling.to_string()),
+            tool_profile: tool_profile.map(str::to_string),
+            third_party,
+        };
+        let (token, _) = crate::auth::jwt::generate_session_token(
+            &person_claims(),
+            Some(&binding),
+            secret,
+            3600,
+        )
+        .unwrap();
+        crate::auth::jwt::decode_jwt(&token, secret).unwrap()
     }
 
     #[async_trait]
@@ -436,8 +563,9 @@ pub(crate) mod tests {
                 source.clone(),
                 cwd,
                 project_slug,
-                claims.map(|c| c.sub),
+                claims.as_ref().map(|c| c.sub.clone()),
             ));
+            self.claims.lock().await.push(claims);
             let run_id = Uuid::new_v4();
             if let Some(graph) = &self.graph {
                 graph
@@ -464,8 +592,14 @@ pub(crate) mod tests {
             last_fired: None,
             fire_count: 0,
             created_at: Utc::now(),
+            author: Some(TriggerAuthor::from_claims(&Claims::service_account(
+                TEST_AUTHOR,
+            ))),
         }
     }
+
+    /// The `sub` of the author of every [`trigger_of`] trigger.
+    pub(crate) const TEST_AUTHOR: &str = "trigger-author";
 
     /// A plan with one task in a project whose root_path is `root`.
     pub(crate) async fn runnable_plan(mock: &MockGraphStore, root: &std::path::Path) -> Uuid {
@@ -560,7 +694,7 @@ pub(crate) mod tests {
         assert!(firing.start_error.is_none());
 
         // Started in the project's root_path, absolute (no `.` left for the
-        // runner to resolve), as the system (no caller).
+        // runner to resolve), as the trigger's author (no caller).
         let calls = starter.calls.lock().await;
         assert_eq!(calls.len(), 1);
         let project_slug = test_project().slug;
@@ -573,7 +707,7 @@ pub(crate) mod tests {
                 },
                 dir.path().to_string_lossy().into_owned(),
                 Some(project_slug),
-                None
+                Some(TEST_AUTHOR.to_string())
             )
         );
 
@@ -600,8 +734,8 @@ pub(crate) mod tests {
 
         let request = FireRequest {
             dedupe_key: "delivery-1".to_string(),
-            payload: None,
             claims: Some(Claims::service_account("agent-session:third-party")),
+            ..FireRequest::default()
         };
         let outcome = dispatcher.dispatch(&trigger, request).await.unwrap();
         assert!(matches!(outcome, DispatchOutcome::Started { .. }));
@@ -908,5 +1042,212 @@ pub(crate) mod tests {
         {
             *crate::runner::RUNNER_STATE.write().await = None;
         }
+    }
+
+    fn dispatcher_with(
+        mock: &Arc<MockGraphStore>,
+    ) -> (Arc<TriggerDispatcher>, Arc<RecordingStarter>) {
+        let starter = Arc::new(RecordingStarter::on(mock.clone()));
+        let dispatcher = Arc::new(TriggerDispatcher::new(
+            mock.clone(),
+            Arc::new(TriggerEngine::new(mock.clone())),
+            starter.clone(),
+        ));
+        (dispatcher, starter)
+    }
+
+    /// (A) A schedule or event trigger written before authors were recorded
+    /// starts no run: there is nobody to start it as, and the server's own
+    /// account (full profile, bypass) is not an option. The firing says why.
+    #[tokio::test]
+    async fn an_authorless_schedule_or_event_trigger_never_starts_a_run() {
+        for trigger_type in [TriggerType::Schedule, TriggerType::Event] {
+            let mock = Arc::new(MockGraphStore::new());
+            let dir = tempfile::tempdir().unwrap();
+            let plan_id = runnable_plan(&mock, dir.path()).await;
+            let mut trigger = trigger_of(plan_id, trigger_type.clone());
+            trigger.author = None;
+            mock.create_trigger(&trigger).await.unwrap();
+            let (dispatcher, starter) = dispatcher_with(&mock);
+
+            let outcome = dispatcher.dispatch(&trigger, signal("s1")).await.unwrap();
+            let DispatchOutcome::StartFailed { firing, error } = outcome else {
+                panic!("{trigger_type:?}: expected a start failure, got {outcome:?}");
+            };
+            assert!(error.contains("no recorded author"), "{error}");
+            assert_eq!(firing.start_error.as_deref(), Some(error.as_str()));
+            assert!(starter.calls.lock().await.is_empty(), "{trigger_type:?}");
+        }
+    }
+
+    /// (A) The run of a schedule or event trigger starts as its author: an
+    /// `agent_session` author of a third-party lineage hands the run its
+    /// signed lineage, never a service account.
+    #[tokio::test]
+    async fn a_triggered_run_starts_as_the_triggers_author() {
+        use crate::auth::jwt::agent_session_binding;
+        for trigger_type in [TriggerType::Schedule, TriggerType::Event] {
+            let mock = Arc::new(MockGraphStore::new());
+            let dir = tempfile::tempdir().unwrap();
+            let plan_id = runnable_plan(&mock, dir.path()).await;
+            let author = agent_session_claims("third-s1", true, None, "bypassPermissions");
+            let mut trigger = trigger_of(plan_id, trigger_type.clone());
+            trigger.author = Some(TriggerAuthor::from_claims(&author));
+            mock.create_trigger(&trigger).await.unwrap();
+            let (dispatcher, starter) = dispatcher_with(&mock);
+
+            let outcome = dispatcher.dispatch(&trigger, signal("s1")).await.unwrap();
+            assert!(
+                matches!(outcome, DispatchOutcome::Started { .. }),
+                "{outcome:?}"
+            );
+            let claims = starter.claims.lock().await[0].clone().expect("claims");
+            assert_eq!(claims.sub, author.sub);
+            assert!(!claims.is_service_account());
+            let binding = agent_session_binding(&claims).expect("an agent_session binding");
+            assert!(
+                binding.third_party,
+                "{trigger_type:?}: the lineage reaches the run"
+            );
+            assert_eq!(binding.session_id, "third-s1");
+            assert_eq!(binding.ceiling.as_deref(), Some("bypassPermissions"));
+        }
+    }
+
+    /// (B) One key per signal, not only the last one: A, B, then A again (a
+    /// redelivery behind another signal) starts two runs, not three.
+    #[tokio::test]
+    async fn a_signal_seen_before_another_one_is_still_a_duplicate() {
+        let mock = Arc::new(MockGraphStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = runnable_plan(&mock, dir.path()).await;
+        let trigger = trigger_of(plan_id, TriggerType::Schedule);
+        mock.create_trigger(&trigger).await.unwrap();
+        let (dispatcher, starter) = dispatcher_with(&mock);
+
+        let mut outcomes = Vec::new();
+        for key in ["A", "B", "A"] {
+            outcomes.push(dispatcher.dispatch(&trigger, signal(key)).await.unwrap());
+            finish_all_runs(&mock).await;
+        }
+        assert!(matches!(outcomes[0], DispatchOutcome::Started { .. }));
+        assert!(matches!(outcomes[1], DispatchOutcome::Started { .. }));
+        assert!(
+            matches!(outcomes[2], DispatchOutcome::Duplicate),
+            "{:?}",
+            outcomes[2]
+        );
+        assert_eq!(starter.calls.lock().await.len(), 2);
+    }
+
+    /// (C) Different signals racing on a trigger with a cooldown (two
+    /// instances, two events): the cooldown is decided in the reservation,
+    /// against the `last_fired` the winner wrote, so one run starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_signals_within_the_cooldown_start_one_run() {
+        let mock = Arc::new(MockGraphStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = runnable_plan(&mock, dir.path()).await;
+        // An event trigger: at least MIN_AUTOMATIC_COOLDOWN_SECS between runs.
+        let trigger = trigger_of(plan_id, TriggerType::Event);
+        mock.create_trigger(&trigger).await.unwrap();
+        let (dispatcher, starter) = dispatcher_with(&mock);
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let dispatcher = dispatcher.clone();
+                // Every dispatch read the trigger before any fired.
+                let trigger = trigger.clone();
+                tokio::spawn(async move {
+                    dispatcher
+                        .dispatch(&trigger, signal(&format!("event-{i}")))
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect();
+        let mut skipped = 0;
+        for handle in handles {
+            if matches!(handle.await.unwrap(), DispatchOutcome::Skipped) {
+                skipped += 1;
+            }
+        }
+        assert_eq!(starter.calls.lock().await.len(), 1);
+        assert_eq!(skipped, 7);
+    }
+
+    /// (D) An event chain longer than MAX_EVENT_CHAIN_DEPTH is refused (and
+    /// recorded); within it, the run carries its depth on.
+    #[tokio::test]
+    async fn an_event_chain_beyond_the_limit_is_refused() {
+        let mock = Arc::new(MockGraphStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = runnable_plan(&mock, dir.path()).await;
+        let (dispatcher, starter) = dispatcher_with(&mock);
+
+        let deep = trigger_of(plan_id, TriggerType::Event);
+        mock.create_trigger(&deep).await.unwrap();
+        let request = FireRequest {
+            dedupe_key: "e1".into(),
+            chain_depth: Some(MAX_EVENT_CHAIN_DEPTH + 1),
+            ..FireRequest::default()
+        };
+        let outcome = dispatcher.dispatch(&deep, request).await.unwrap();
+        let DispatchOutcome::StartFailed { firing, error } = outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert!(error.contains("event chain too deep"), "{error}");
+        assert!(firing.start_error.is_some());
+        assert!(starter.calls.lock().await.is_empty());
+
+        let last = trigger_of(plan_id, TriggerType::Event);
+        mock.create_trigger(&last).await.unwrap();
+        let request = FireRequest {
+            dedupe_key: "e2".into(),
+            chain_depth: Some(MAX_EVENT_CHAIN_DEPTH),
+            ..FireRequest::default()
+        };
+        let outcome = dispatcher.dispatch(&last, request).await.unwrap();
+        assert!(
+            matches!(outcome, DispatchOutcome::Started { .. }),
+            "{outcome:?}"
+        );
+        assert!(matches!(
+            starter.calls.lock().await[0].1,
+            TriggerSource::Event { chain_depth, .. } if chain_depth == MAX_EVENT_CHAIN_DEPTH
+        ));
+    }
+
+    /// (E) A plan linked to several projects, none of them its main one: the
+    /// run is not started in whichever came first, the firing says why.
+    #[tokio::test]
+    async fn a_plan_of_several_projects_without_a_main_one_is_a_start_error() {
+        let mock = Arc::new(MockGraphStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plan = test_plan();
+        mock.create_plan(&plan).await.unwrap();
+        mock.create_task(plan.id, &test_task()).await.unwrap();
+        for slug in ["first-project", "second-project"] {
+            let mut project = crate::test_helpers::test_project_named(slug);
+            project.root_path = dir.path().to_string_lossy().into_owned();
+            mock.create_project(&project).await.unwrap();
+            mock.project_plans
+                .write()
+                .await
+                .entry(project.id)
+                .or_default()
+                .push(plan.id);
+        }
+        let trigger = trigger_of(plan.id, TriggerType::Schedule);
+        mock.create_trigger(&trigger).await.unwrap();
+        let (dispatcher, starter) = dispatcher_with(&mock);
+
+        let outcome = dispatcher.dispatch(&trigger, signal("s1")).await.unwrap();
+        let DispatchOutcome::StartFailed { firing, error } = outcome else {
+            panic!("expected a start failure, got {outcome:?}");
+        };
+        assert!(error.contains("belongs to 2 projects"), "{error}");
+        assert_eq!(firing.start_error.as_deref(), Some(error.as_str()));
+        assert!(starter.calls.lock().await.is_empty());
     }
 }

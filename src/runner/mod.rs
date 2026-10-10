@@ -56,8 +56,8 @@ pub use guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict, Hi
 pub use lifecycle::{route_lifecycle_protocol, LifecycleRouteResult};
 pub use models::{
     ActiveAgent, ActiveAgentSnapshot, CwdValidation, PlanRunStatus, RunSnapshot, RunnerConfig,
-    RunnerEvent, TaskExecutionReport, TaskResult, TaskRunStatus, TaskStateMachine, Trigger,
-    TriggerFiring, TriggerSource, TriggerType,
+    RunnerEvent, SignalReservation, TaskExecutionReport, TaskResult, TaskRunStatus,
+    TaskStateMachine, Trigger, TriggerAuthor, TriggerFiring, TriggerSource, TriggerType,
 };
 pub use persona::{
     activate_skills_for_task, complexity_directive, load_persona_stack, profile_task,

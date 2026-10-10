@@ -3703,11 +3703,26 @@ pub trait GraphStore: Send + Sync {
     /// Record a trigger firing event.
     async fn record_trigger_firing(&self, firing: &crate::runner::TriggerFiring) -> Result<()>;
 
-    /// Reserve the signal `key` of trigger `trigger_id`, atomically: `true` for
-    /// the one caller whose key differs from the trigger's last reserved key
-    /// (which becomes `key`), `false` for every other (same key already taken,
-    /// or no such trigger). Several instances seeing the same signal start one run.
-    async fn reserve_trigger_signal(&self, trigger_id: Uuid, key: &str) -> Result<bool>;
+    /// Enable a trigger and record `author` as the identity its runs start as,
+    /// in one write. `None` when there is no such trigger.
+    async fn enable_trigger_as(
+        &self,
+        trigger_id: Uuid,
+        author: &crate::runner::TriggerAuthor,
+    ) -> Result<Option<crate::runner::Trigger>>;
+
+    /// Reserve the signal `key` of trigger `trigger_id`, atomically, across
+    /// instances: `Reserved` for the one caller that sees `key` for the first
+    /// time (one `TriggerSignal` per key, kept 24 h) AND finds the trigger out
+    /// of its `cooldown_secs` — `last_fired` then moves to now in the same
+    /// write; `Duplicate` when `key` was already reserved (or no such trigger);
+    /// `Cooldown` when the trigger fired less than `cooldown_secs` ago.
+    async fn reserve_trigger_signal(
+        &self,
+        trigger_id: Uuid,
+        key: &str,
+        cooldown_secs: u64,
+    ) -> Result<crate::runner::SignalReservation>;
 
     /// List all triggers across all plans, optionally filtered by type.
     async fn list_all_triggers(

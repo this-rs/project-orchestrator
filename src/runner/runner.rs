@@ -201,6 +201,19 @@ pub static RUNNER_CANCEL: LazyLock<Arc<AtomicBool>> =
 static RUNNER_START_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+/// The claims a task agent of run `run_id` opens its session with: the run's
+/// caller (a `plan(run)` caller, a webhook caller, a trigger's author), whose
+/// lineage `ChatManager::po_mcp_env` signs into the agent's token; a service
+/// account only when the run has none.
+pub(crate) fn agent_claims(
+    user_claims: Option<&crate::auth::jwt::Claims>,
+    run_id: Uuid,
+) -> crate::auth::jwt::Claims {
+    user_claims.cloned().unwrap_or_else(|| {
+        crate::auth::jwt::Claims::service_account(&format!("runner-agent:{}", run_id))
+    })
+}
+
 /// Why a new run cannot start while `state` holds the process's run: the
 /// runner has a single global run state (state, cancel flag, budget, vector
 /// collector), so a second run would take over the first one's. `None` when
@@ -1041,16 +1054,28 @@ impl PlanRunner {
             return Ok(false);
         }
 
+        // Restore global state, under the start lock as `start` writes it: a
+        // run started meanwhile (a trigger firing during the boot) keeps the
+        // globals, and this one is interrupted rather than taking them over.
+        let start_guard = RUNNER_START_LOCK.lock().await;
+        if let Some(refusal) = active_run_refusal(RUNNER_STATE.read().await.as_ref(), plan_id) {
+            drop(start_guard);
+            self.interrupt_run(
+                saved_state,
+                &format!("another run holds the runner: {refusal}"),
+            )
+            .await?;
+            return Ok(false);
+        }
         // Proof of life BEFORE the run is spawned, so the reconciliation sweep that
         // follows the recovery sees this run as driven by this process.
         let live = LiveRunGuard::register(run_id);
-
-        // Restore global state
         {
             let mut global = RUNNER_STATE.write().await;
             *global = Some(saved_state.clone());
         }
         RUNNER_CANCEL.store(false, Ordering::SeqCst);
+        drop(start_guard);
 
         // Emit recovery event
         self.emit_event(RunnerEvent::PlanStarted {
@@ -3204,9 +3229,7 @@ impl PlanRunner {
             permission_mode: Some("bypassPermissions".to_string()),
             add_dirs: None,
             workspace_slug: None,
-            user_claims: Some(self.user_claims.clone().unwrap_or_else(|| {
-                crate::auth::jwt::Claims::service_account(&format!("runner-agent:{}", run_id))
-            })),
+            user_claims: Some(agent_claims(self.user_claims.as_ref(), run_id)),
             spawned_by: Some(
                 serde_json::json!({
                     "type": "runner",
@@ -9868,6 +9891,39 @@ mod tests {
         assert_eq!(second_after.status, PlanRunStatus::Interrupted);
         let first_after = g.get_plan_run(first.run_id).await.unwrap().unwrap();
         assert_ne!(first_after.status, PlanRunStatus::Interrupted);
+        reset_globals().await;
+    }
+
+    /// (F) A run started while the recovery was examining the saved runs (a
+    /// trigger firing during the boot) keeps the globals: the recovered run is
+    /// interrupted, never written over it.
+    #[tokio::test]
+    async fn recovery_does_not_take_over_a_run_started_meanwhile() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (runner, g) = test_plan_runner_with_graph();
+        let here = std::env::temp_dir().to_string_lossy().into_owned();
+        let saved = resumable_candidate(&g, Some(here), 1).await;
+        let (run_b, plan_b) = (Uuid::new_v4(), Uuid::new_v4());
+        {
+            *RUNNER_STATE.write().await =
+                Some(RunnerState::new(run_b, plan_b, 1, TriggerSource::Manual));
+        }
+        RUNNER_CANCEL.store(true, Ordering::SeqCst);
+
+        let resumed = Arc::new(runner)
+            .recover_one(saved.clone(), false)
+            .await
+            .unwrap();
+
+        assert!(!resumed);
+        let global = RUNNER_STATE.read().await;
+        let state = global.as_ref().expect("B's state is still there");
+        assert_eq!((state.run_id, state.plan_id), (run_b, plan_b));
+        drop(global);
+        assert!(RUNNER_CANCEL.load(Ordering::SeqCst), "B's cancel flag kept");
+        let after = g.get_plan_run(saved.run_id).await.unwrap().unwrap();
+        assert_eq!(after.status, PlanRunStatus::Interrupted);
         reset_globals().await;
     }
 

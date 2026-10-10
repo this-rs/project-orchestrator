@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { globToRegExp, parseIndex, parseHeader, checkDiagramFile, sharedOwnership, renderOrphans, localIndexOwners, orphanCeiling, orphanCeilingsByRepo, orphansByRepo, isExternal, checkExternalEntry } from './check-index.mjs';
+import { globToRegExp, parseIndex, parseHeader, checkDiagramFile, sharedOwnership, renderOrphans, localIndexOwners, orphanCeiling, orphanCeilingsByRepo, orphansByRepo, isExternal, checkExternalEntry, looksLikeHost, commitStatus } from './check-index.mjs';
 
 test('glob: **, *, braces', () => {
   assert.ok(globToRegExp('src/heartbeat/**').test('src/heartbeat/checks/git_drift.rs'));
@@ -122,7 +122,7 @@ test('renderOrphans: les index locaux sont expliques dans le registre publie', (
 // --- controle negatif de bout en bout : le gate doit REFUSER une collision entre index.
 // Un gate qui ne refuse rien est pire que pas de gate, parce qu'il se cite comme preuve.
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -541,6 +541,56 @@ test('externe: identifiant absent, adresse hors site, releve incomplet ou planne
   assert.match(checkExternalEntry(ext(EXT_OK.replace('6c79054e', 'HEAD'))).join('\n'), /verified_sha/);
   assert.match(checkExternalEntry(ext(EXT_OK.replace(/ {4}verified_at:.*\n/, ''))).join('\n'), /verified_at/);
   assert.match(checkExternalEntry(ext(EXT_OK.replace('status: verified', 'status: planned'))).join('\n'), /status devrait etre verified/);
+});
+
+test('externe: un nom d\'hote dans l\'emplacement est refuse, meme sans point', () => {
+  for (const loc of ['localhost/doc/po-x@2', 'po/127.0.0.1/po-x@2', 'po/diagrams.example.com/po-x@2']) {
+    assert.match(checkExternalEntry(ext(EXT_OK.replace('po/doc/po-x@2', loc))).join('\n'), /nom d'hote/, loc);
+  }
+  assert.ok(looksLikeHost('LocalHost'));
+  for (const segment of ['po', 'architecture-po', 'doc.v2', 'project-orchestrator']) assert.ok(!looksLikeHost(segment), segment);
+});
+
+// Un depot git jetable avec un commit : `verified_sha` est verifie contre lui.
+function gitRepoWithCommit(dir) {
+  const git = (...args) => execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...args], { encoding: 'utf8' }).trim();
+  git('init', '-q');
+  git('add', '-A');
+  git('commit', '-q', '-m', 'fixture');
+  return git('rev-parse', 'HEAD');
+}
+
+test('verified_sha: present, absent, ou non verifiable hors depot', () => {
+  const root = mkdtempSync(join(tmpdir(), 'diagram-sha-'));
+  try {
+    const repo = join(root, 'repo');
+    mkdirSync(repo);
+    writeFileSync(join(repo, 'f'), 'x\n');
+    const head = gitRepoWithCommit(repo);
+    assert.equal(commitStatus(repo, head.slice(0, 8)), 'present');
+    assert.equal(commitStatus(repo, 'deadbeef'), 'absent');
+    const plain = join(root, 'plain');
+    mkdirSync(plain);
+    assert.equal(commitStatus(plain, head.slice(0, 8)), 'unknown');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('gate: un verified_sha qui ne designe aucun commit du depot echoue', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    writeIndex(be, EXT_OK);
+    const head = gitRepoWithCommit(be);
+    const absent = run(be, nx);
+    assert.equal(absent.code, 1, absent.out);
+    assert.match(absent.out, /po-x : 'verified_sha: 6c79054e' ne designe aucun commit de ce depot/);
+    writeIndex(be, EXT_OK.replace('6c79054e', head.slice(0, 8)));
+    const present = run(be, nx);
+    assert.doesNotMatch(present.out, /ne designe aucun commit/, present.out);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 function writeIndex(be, poX) {

@@ -129,6 +129,8 @@ async fn handle_event(
     }
     // The plan the event belongs to (resolved once, only when a trigger may use it).
     let mut event_plan: Option<Option<uuid::Uuid>> = None;
+    // The chain depth of the run behind the event (resolved once, likewise).
+    let mut origin_depth: Option<u32> = None;
     // Same signal on every instance (NATS bridge): one dispatch wins it.
     let dedupe_key = format!(
         "event:{:?}:{:?}:{}:{}",
@@ -172,11 +174,21 @@ async fn handle_event(
             continue;
         }
 
-        // Evaluate the guards, start the run, record the firing
+        // How deep the chain of event-triggered runs this one would extend is
+        // (A done → B, B done → A...): the dispatcher refuses it beyond
+        // MAX_EVENT_CHAIN_DEPTH.
+        if origin_depth.is_none() {
+            origin_depth =
+                Some(chain_depth_of_event(graph.as_ref(), event, event_plan.flatten()).await);
+        }
+
+        // Evaluate the guards, start the run (as the trigger's author: no
+        // caller is behind an event), record the firing.
         let request = FireRequest {
             dedupe_key: dedupe_key.clone(),
             payload: serde_json::to_value(event).ok(),
             claims: None,
+            chain_depth: Some(origin_depth.unwrap_or(0) + 1),
         };
         match dispatcher.dispatch(trigger, request).await {
             Ok(DispatchOutcome::Started { start, .. }) => {
@@ -209,6 +221,50 @@ async fn handle_event(
     }
 
     Ok(())
+}
+
+/// How long after its end a run still counts as the origin of its plan's
+/// events (the completion of its tasks and of the plan arrive right after).
+const CHAIN_ORIGIN_WINDOW_SECS: i64 = 600;
+
+/// The chain depth of the event-triggered run `event` comes from: that run's
+/// own `chain_depth`, 0 when the event comes from no run, or from one that no
+/// event started (a person, a schedule, a webhook).
+///
+/// The run is the one the event names (a runner event), else its plan's
+/// latest run if it is still running or ended within
+/// [`CHAIN_ORIGIN_WINDOW_SECS`]. A graph error counts as no run: the chain is
+/// then bounded by the cooldown alone for that hop.
+async fn chain_depth_of_event(
+    graph: &dyn GraphStore,
+    event: &CrudEvent,
+    event_plan: Option<uuid::Uuid>,
+) -> u32 {
+    let named = match event.entity_type {
+        EntityType::Runner => match event.entity_id.parse::<uuid::Uuid>() {
+            Ok(run_id) => graph.get_plan_run(run_id).await.ok().flatten(),
+            Err(_) => None,
+        },
+        _ => None,
+    };
+    let run = match (named, event_plan) {
+        (Some(run), _) => Some(run),
+        (None, Some(plan_id)) => graph
+            .list_plan_runs(plan_id, 1)
+            .await
+            .ok()
+            .and_then(|runs| runs.into_iter().next())
+            .filter(|run| {
+                run.completed_at.is_none_or(|end| {
+                    (chrono::Utc::now() - end).num_seconds() <= CHAIN_ORIGIN_WINDOW_SECS
+                })
+            }),
+        (None, None) => None,
+    };
+    match run.map(|r| r.triggered_by) {
+        Some(crate::runner::TriggerSource::Event { chain_depth, .. }) => chain_depth,
+        _ => 0,
+    }
 }
 
 /// The plan `event` belongs to: the plan itself, a task's plan, a run's plan.
@@ -327,6 +383,7 @@ mod tests {
             crate::runner::TriggerSource::Event {
                 trigger_id: trigger.id,
                 source_event: "plan_completed".to_string(),
+                chain_depth: 1,
             }
         );
         let firings = mock.list_trigger_firings(trigger.id, 10).await.unwrap();
@@ -437,5 +494,82 @@ mod tests {
         assert!(starter.calls.lock().await.is_empty());
         let firings = mock.list_trigger_firings(trigger.id, 10).await.unwrap();
         assert_eq!(firings.len(), 0);
+    }
+
+    /// (D) Plans whose event triggers answer each other (A done → B, B done
+    /// → A) stop: the run started by an event carries the depth of the run the
+    /// event came from, plus one, and the dispatcher refuses it beyond the limit.
+    #[tokio::test]
+    async fn a_ping_pong_of_event_triggers_stops_at_the_chain_limit() {
+        use crate::runner::dispatch::MAX_EVENT_CHAIN_DEPTH;
+        use crate::runner::{PlanRunStatus, RunnerState, TriggerSource};
+        let mock = Arc::new(MockGraphStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plan_b = runnable_plan(&mock, dir.path()).await;
+        let (dispatcher, starter) = dispatcher_on(&mock);
+
+        // Plan A's last run was itself started by an event, at depth `depth`;
+        // it has just completed.
+        let a_completes_at = |depth: u32| {
+            let mock = mock.clone();
+            async move {
+                let plan_a = crate::test_helpers::test_plan();
+                mock.create_plan(&plan_a).await.unwrap();
+                let mut run = RunnerState::new(
+                    Uuid::new_v4(),
+                    plan_a.id,
+                    1,
+                    TriggerSource::Event {
+                        trigger_id: Uuid::new_v4(),
+                        source_event: "plan_completed".into(),
+                        chain_depth: depth,
+                    },
+                );
+                run.finalize(PlanRunStatus::Completed);
+                mock.create_plan_run(&run).await.unwrap();
+                plan_a.id
+            }
+        };
+
+        // Within the limit: B starts, one hop deeper.
+        let plan_a = a_completes_at(2).await;
+        let trigger = event_trigger(
+            plan_b,
+            serde_json::json!({"event_type": "plan_completed", "entity_id": plan_a.to_string()}),
+        );
+        mock.create_trigger(&trigger).await.unwrap();
+        handle_event(
+            &(mock.clone() as Arc<dyn GraphStore>),
+            &dispatcher,
+            &plan_completed(plan_a),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            starter.calls.lock().await[0].1,
+            TriggerSource::Event { chain_depth: 3, .. }
+        ));
+        crate::runner::dispatch::tests::finish_all_runs(&mock).await;
+
+        // At the limit: B is refused, the firing says why.
+        let plan_a = a_completes_at(MAX_EVENT_CHAIN_DEPTH).await;
+        let trigger = event_trigger(
+            plan_b,
+            serde_json::json!({"event_type": "plan_completed", "entity_id": plan_a.to_string()}),
+        );
+        mock.create_trigger(&trigger).await.unwrap();
+        handle_event(
+            &(mock.clone() as Arc<dyn GraphStore>),
+            &dispatcher,
+            &plan_completed(plan_a),
+        )
+        .await
+        .unwrap();
+        assert_eq!(starter.calls.lock().await.len(), 1, "no second run");
+        let firings = mock.list_trigger_firings(trigger.id, 10).await.unwrap();
+        assert!(firings[0]
+            .start_error
+            .as_deref()
+            .is_some_and(|e| e.contains("event chain too deep")));
     }
 }

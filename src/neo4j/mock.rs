@@ -148,8 +148,8 @@ pub struct MockGraphStore {
     pub triggers: RwLock<HashMap<Uuid, crate::runner::Trigger>>,
     /// Trigger firings
     pub trigger_firings: RwLock<HashMap<Uuid, Vec<crate::runner::TriggerFiring>>>,
-    /// Last reserved signal key per trigger (`reserve_trigger_signal`).
-    pub trigger_reservations: RwLock<HashMap<Uuid, String>>,
+    /// Reserved signal keys per trigger, with when (`reserve_trigger_signal`).
+    pub trigger_reservations: RwLock<HashMap<(Uuid, String), chrono::DateTime<chrono::Utc>>>,
 
     // Relationships (adjacency lists)
     pub plan_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
@@ -12106,22 +12106,56 @@ impl GraphStore for MockGraphStore {
         let mut triggers = self.triggers.write().await;
         if let Some(t) = triggers.get_mut(&firing.trigger_id) {
             t.fire_count += 1;
-            t.last_fired = Some(firing.fired_at);
+            t.last_fired = t.last_fired.max(Some(firing.fired_at));
         }
         Ok(())
     }
 
-    async fn reserve_trigger_signal(&self, trigger_id: Uuid, key: &str) -> anyhow::Result<bool> {
-        if !self.triggers.read().await.contains_key(&trigger_id) {
-            return Ok(false);
-        }
-        // One write lock for the read and the write: compare-and-set.
+    async fn enable_trigger_as(
+        &self,
+        trigger_id: Uuid,
+        author: &crate::runner::TriggerAuthor,
+    ) -> anyhow::Result<Option<crate::runner::Trigger>> {
+        let mut triggers = self.triggers.write().await;
+        Ok(triggers.get_mut(&trigger_id).map(|t| {
+            t.enabled = true;
+            t.author = Some(author.clone());
+            t.clone()
+        }))
+    }
+
+    async fn reserve_trigger_signal(
+        &self,
+        trigger_id: Uuid,
+        key: &str,
+        cooldown_secs: u64,
+    ) -> anyhow::Result<crate::runner::SignalReservation> {
+        use crate::runner::SignalReservation;
+        // The trigger's write lock held across the reads and the writes, as
+        // the Cypher statement holds the Trigger node's.
+        let mut triggers = self.triggers.write().await;
+        let Some(trigger) = triggers.get_mut(&trigger_id) else {
+            return Ok(SignalReservation::Duplicate);
+        };
+        let now = chrono::Utc::now();
         let mut reservations = self.trigger_reservations.write().await;
-        if reservations.get(&trigger_id).map(String::as_str) == Some(key) {
-            return Ok(false);
+        reservations.retain(|_, at| {
+            now - *at
+                < chrono::Duration::hours(crate::neo4j::trigger::TRIGGER_SIGNAL_RETENTION_HOURS)
+        });
+        if reservations.contains_key(&(trigger_id, key.to_string())) {
+            return Ok(SignalReservation::Duplicate);
         }
-        reservations.insert(trigger_id, key.to_string());
-        Ok(true)
+        if cooldown_secs > 0
+            && trigger
+                .last_fired
+                .is_some_and(|at| now - at < chrono::Duration::seconds(cooldown_secs as i64))
+        {
+            return Ok(SignalReservation::Cooldown);
+        }
+        reservations.insert((trigger_id, key.to_string()), now);
+        trigger.last_fired = Some(now);
+        Ok(SignalReservation::Reserved)
     }
 
     async fn list_trigger_firings(
