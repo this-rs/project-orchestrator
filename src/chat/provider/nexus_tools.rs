@@ -1396,7 +1396,12 @@ mod tests {
             none,
         )
         .unwrap();
-        assert_eq!(profile_for(&named, None), ["Read", "Grep", "Bash"]);
+        // `TaskStop` rides with `Bash` (nexus #83): the harness stops a background task
+        // with it (`cancel_tools(task)`); the model is offered it only if the policy says so.
+        assert_eq!(
+            profile_for(&named, None),
+            ["Read", "Grep", "Bash", "TaskStop"]
+        );
         // A deny without argument removes the tool, a deny with one does not.
         let denied = ToolPolicy::from_patterns(
             PolicyMode::Ask,

@@ -7923,3 +7923,409 @@ mod compaction_loop {
         manager.close_session(&sid).await.unwrap();
     }
 }
+
+/// OpenClaw delegated through its ACP bridge (`openclaw acp`), played by nexus'
+/// `fake_acp` (its `refuse_mcp_servers` mode answers as the bridge does). The bridge
+/// refuses MCP servers per session (`session/new`, `session/load` answered with an
+/// error, 2026.9.x; older versions ignored them): the session is opened WITHOUT the
+/// project-orchestrator server, and says so (`project_orchestrator_tools` among its
+/// `degraded_features`), as a remote Claude Code.
+///
+/// Each test has its own directory: the agent's script, its transcripts, what it
+/// recorded, and the agent's `HOME` (`with_acp_homes`). Nothing is declared in the
+/// process environment (`with_acp_commands`), nothing is written in the user's real
+/// data directory.
+mod openclaw_delegation {
+    use super::super::provider::settings::{process_origin, AcpCommand};
+    use super::*;
+
+    const INIT: &str = r#"{"op": "expect", "method": "initialize", "reply": {"protocolVersion": 1, "agentCapabilities": {"loadSession": true, "promptCapabilities": {"image": true, "audio": false, "embeddedContext": true}, "mcpCapabilities": {"http": false, "sse": false}}, "agentInfo": {"name": "openclaw-acp", "version": "2026.9.9"}, "authMethods": []}}"#;
+
+    fn turn() -> [Value; 3] {
+        [
+            json!({"op": "expect", "method": "session/prompt", "defer": "p"}),
+            json!({"op": "notify", "method": "session/update", "params": {"sessionId": "oc-1",
+                   "update": {"sessionUpdate": "agent_message_chunk",
+                              "content": {"type": "text", "text": "hello from openclaw"}}}}),
+            json!({"op": "reply", "to": "p", "result": {"stopReason": "end_turn"}}),
+        ]
+    }
+
+    /// One declared ACP agent played by `fake_acp`. The transcript it plays is the
+    /// one `mode` names (written by the test before a session starts): `new` (a
+    /// 2026.9.x bridge: `session/new` refused when it carries servers), `load` (same on
+    /// `session/load`), `ignoring` (an older bridge: servers ignored without a word).
+    struct Agent {
+        dir: tempfile::TempDir,
+        preset: &'static str,
+        command: AcpCommand,
+    }
+
+    impl Agent {
+        fn new(preset: &'static str, program: &str, per_session_mcp: Option<bool>) -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            let d = dir.path();
+            let write = |name: &str, lines: Vec<Value>| {
+                let text: Vec<String> = lines.iter().map(Value::to_string).collect();
+                std::fs::write(d.join(format!("{name}.jsonl")), text.join("\n")).unwrap();
+            };
+            let init: Value = serde_json::from_str(INIT).unwrap();
+            let mut new = vec![
+                init.clone(),
+                json!({"op": "expect", "method": "session/new", "refuse_mcp_servers": true,
+                       "reply": {"sessionId": "oc-1"}}),
+            ];
+            new.extend(turn());
+            write("new", new);
+            let mut load = vec![
+                init.clone(),
+                json!({"op": "expect", "method": "session/load", "refuse_mcp_servers": true,
+                       "reply": null}),
+            ];
+            load.extend(turn());
+            write("load", load);
+            let mut ignoring = vec![
+                init,
+                json!({"op": "expect", "method": "session/new", "reply": {"sessionId": "oc-1"}}),
+            ];
+            ignoring.extend(turn());
+            write("ignoring", ignoring);
+            let script = d.join(program);
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nD='{dir}'\nFAKE_ACP_TRANSCRIPT=\"$D/$(cat \"$D/mode\").jsonl\" \
+                     FAKE_ACP_RECORD=\"$D/record.jsonl\" FAKE_ACP_MAX_RUNTIME_MS=120000 \
+                     exec '{fake}' \"$@\"\n",
+                    dir = d.display(),
+                    fake = fake_bin("fake_acp").display()
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let agent = Self {
+                command: AcpCommand {
+                    argv: vec![
+                        script.display().to_string(),
+                        "acp".into(),
+                        "--token-file".into(),
+                        "/dev/null".into(),
+                    ],
+                    per_session_mcp,
+                },
+                dir,
+                preset,
+            };
+            agent.mode("new");
+            agent
+        }
+
+        fn mode(&self, mode: &str) {
+            std::fs::write(self.dir.path().join("mode"), mode).unwrap();
+        }
+
+        fn recorded(&self) -> Vec<Value> {
+            std::fs::read_to_string(self.dir.path().join("record.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .collect()
+        }
+
+        /// The `mcpServers` of every `method` request the agent received (the health
+        /// probe sends none).
+        fn servers_sent(&self, method: &str) -> Vec<Value> {
+            self.recorded()
+                .into_iter()
+                .filter(|e| e["kind"] == "in" && e["method"] == method)
+                .map(|e| e["params"]["mcpServers"].clone())
+                .collect()
+        }
+
+        fn refusals(&self) -> usize {
+            self.recorded()
+                .iter()
+                .filter(|e| e["kind"] == "refused_mcp")
+                .count()
+        }
+
+        /// A manager that knows this agent only, keeps its `HOME` here, and a stored,
+        /// consented instance `id` of it.
+        async fn manager(&self, graph: &Arc<MockGraphStore>, id: &str) -> ChatManager {
+            let origin = process_origin("acp", Some(self.preset));
+            store_instance(
+                graph,
+                &InstanceRecord {
+                    id: id.into(),
+                    kind: "acp".into(),
+                    preset: Some(self.preset.into()),
+                    label: id.into(),
+                    base_url: String::new(),
+                    origin: origin.clone(),
+                    default_model: Some("openclaw".into()),
+                    cost_source: "unknown".into(),
+                    credential_ref: "none".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            consent(graph, "proj", id, &origin).await;
+            manager(graph.clone(), true)
+                .with_acp_commands(
+                    [(self.preset.to_string(), self.command.clone())]
+                        .into_iter()
+                        .collect(),
+                )
+                .with_acp_homes(self.dir.path().join("acp-homes"))
+        }
+
+        /// The instance's `HOME` is in this directory, and NOT in nexus' default under
+        /// the user's real data directory.
+        fn assert_home_here(&self, id: &str) {
+            let home = self.dir.path().join("acp-homes").join(id).join("home");
+            assert!(
+                home.is_dir(),
+                "the agent ran with its HOME at {}",
+                home.display()
+            );
+            let real = nexus_claude::providers::acp::default_acp_home(id);
+            assert!(
+                !real.exists(),
+                "nothing is written in the real data directory: {}",
+                real.display()
+            );
+        }
+    }
+
+    /// The persisted events of `sid` until one matches `found` (the out-of-turn pump
+    /// may persist after the Result).
+    async fn persisted<T>(
+        graph: &MockGraphStore,
+        sid: &str,
+        found: impl Fn(&ChatEvent) -> Option<T>,
+    ) -> Option<T> {
+        let uuid = Uuid::parse_str(sid).unwrap();
+        for _ in 0..100 {
+            let hit = graph
+                .get_chat_events(uuid, 0, 200)
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|r| serde_json::from_str::<ChatEvent>(&r.data).ok())
+                .find_map(|e| found(&e));
+            if hit.is_some() {
+                return hit;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        None
+    }
+
+    async fn lacks_po_tools(graph: &MockGraphStore, sid: &str) -> bool {
+        let degraded = persisted(graph, sid, |e| match e {
+            ChatEvent::SystemInit {
+                degraded_features, ..
+            } => degraded_features.clone(),
+            _ => None,
+        })
+        .await
+        .expect("a system_init with degraded_features");
+        degraded
+            .iter()
+            .any(|f| f == super::super::agent_runtime::PO_TOOLS_FEATURE)
+    }
+
+    async fn answered(manager: &ChatManager, sid: &str) {
+        let mut rx = manager.subscribe(sid).await.unwrap();
+        next_event(
+            &mut rx,
+            |e| matches!(e, ChatEvent::AssistantText { content, .. } if content.contains("hello from openclaw")),
+        )
+        .await;
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+    }
+
+    /// Opens a session on `id` and plays its turn; returns its id.
+    async fn open(manager: &ChatManager, id: &str) -> String {
+        let created = manager
+            .create_session(&request(Some(id), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("the session on {id} must open: {e:#}"));
+        answered(manager, &created.session_id).await;
+        created.session_id
+    }
+
+    async fn resume(manager: &ChatManager, sid: &str) {
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        manager
+            .resume_session(sid, "again", Some(&claims))
+            .await
+            .unwrap_or_else(|e| panic!("the session must resume: {e:#}"));
+        answered(manager, sid).await;
+    }
+
+    #[tokio::test]
+    async fn an_openclaw_session_opens_without_the_po_server_and_says_so() {
+        let agent = Agent::new("openclaw", "openclaw", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = agent.manager(&graph, "p19-openclaw").await;
+        let sid = open(&manager, "p19-openclaw").await;
+        // Never given a server: no refusal, no second request.
+        assert_eq!(agent.servers_sent("session/new"), vec![json!([])]);
+        assert_eq!(agent.refusals(), 0);
+        assert!(lacks_po_tools(&graph, &sid).await);
+        agent.assert_home_here("p19-openclaw");
+    }
+
+    /// An older OpenClaw IGNORES the servers without a word (nothing to learn), and a
+    /// wrapper hides its name: the declaration `per_session_mcp: false` says it.
+    #[tokio::test]
+    async fn a_declared_agent_without_per_session_mcp_is_never_given_a_server() {
+        let agent = Agent::new("wrapped", "my-bridge", Some(false));
+        agent.mode("ignoring");
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = agent.manager(&graph, "p19-wrapped").await;
+        let sid = open(&manager, "p19-wrapped").await;
+        assert_eq!(agent.servers_sent("session/new"), vec![json!([])]);
+        assert!(lacks_po_tools(&graph, &sid).await);
+        agent.assert_home_here("p19-wrapped");
+    }
+
+    /// An agent of another name that refuses the servers: the first session is opened
+    /// again without them by nexus (and says so, on the thread too); the provider has
+    /// learned it, so the SECOND session is built without the PO server and opens at
+    /// once, with no refusal and no retry.
+    #[tokio::test]
+    async fn a_learned_refusal_opens_the_next_session_without_the_po_server_and_without_retry() {
+        let agent = Agent::new("bridge", "acp-bridge", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = agent.manager(&graph, "p19-bridge").await;
+
+        let first = open(&manager, "p19-bridge").await;
+        let asked = agent.servers_sent("session/new");
+        assert_eq!(asked.len(), 2, "refused, then asked again: {asked:?}");
+        assert_eq!(asked[0][0]["name"], "project-orchestrator");
+        assert_eq!(asked[1], json!([]));
+        assert!(lacks_po_tools(&graph, &first).await);
+        // The user sees the refusal on the thread, not only in a log.
+        let notice = persisted(&graph, &first, |e| match e {
+            ChatEvent::BackgroundOutput { source, .. }
+                if source == "system:mcp_servers_refused" =>
+            {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+        assert!(notice.is_some(), "mcp_servers_refused reaches the thread");
+
+        let second = open(&manager, "p19-bridge").await;
+        let asked = agent.servers_sent("session/new");
+        assert_eq!(asked.len(), 3, "one more session/new, no retry: {asked:?}");
+        assert_eq!(asked[2], json!([]));
+        assert_eq!(agent.refusals(), 1);
+        assert!(lacks_po_tools(&graph, &second).await);
+        agent.assert_home_here("p19-bridge");
+    }
+
+    /// Two FIRST sessions opened at once on a refusing agent: whichever learns the
+    /// refusal first, the other one (built while the provider still said yes) is
+    /// opened too — by nexus' retry, or by the backend's when nexus answers
+    /// `Unsupported { per_session_mcp }` — and both say what they lack.
+    ///
+    /// What it proves is the OUTCOME only: it cannot tell which of the two retries
+    /// (nexus', the backend's) opened the late session, and nexus' alone would make it
+    /// pass. The backend's retry is proven by the unit test
+    /// `a_refusal_learned_meanwhile_reopens_the_session_without_its_mcp_servers`
+    /// (manager.rs), where the provider answers `Unsupported { per_session_mcp }`.
+    #[tokio::test]
+    async fn two_first_sessions_opened_at_once_on_a_refusing_agent_both_open() {
+        let agent = Agent::new("bridge", "acp-bridge", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = agent.manager(&graph, "p19-race").await;
+        let (a, b) = tokio::join!(open(&manager, "p19-race"), open(&manager, "p19-race"));
+        assert!(lacks_po_tools(&graph, &a).await);
+        assert!(lacks_po_tools(&graph, &b).await);
+        assert_ne!(a, b);
+        // The two agent processes write one record file at once: its lines are not
+        // counted here. A session given the server was refused, never served with it.
+        let asked = agent.servers_sent("session/new");
+        assert!(asked.contains(&json!([])), "{asked:?}");
+    }
+
+    /// Resuming: an OpenClaw session is loaded without servers; a refusing agent's
+    /// session resumed after a RESTART (a new manager, the learned refusal forgotten
+    /// in memory) is loaded without servers too, from its frozen snapshot.
+    #[tokio::test]
+    async fn a_resumed_session_is_loaded_without_servers_even_after_a_restart() {
+        let openclaw = Agent::new("openclaw", "openclaw", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = openclaw.manager(&graph, "p19-oc-resume").await;
+        let sid = open(&manager, "p19-oc-resume").await;
+        manager.close_session(&sid).await.unwrap();
+        openclaw.mode("load");
+        resume(&manager, &sid).await;
+        assert_eq!(openclaw.servers_sent("session/load"), vec![json!([])]);
+        assert_eq!(openclaw.refusals(), 0);
+
+        let bridge = Agent::new("bridge", "acp-bridge", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let before = bridge.manager(&graph, "p19-br-resume").await;
+        let sid = open(&before, "p19-br-resume").await;
+        assert_eq!(bridge.refusals(), 1, "learned at the first session");
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+        let after = bridge.manager(&graph, "p19-br-resume").await;
+        bridge.mode("load");
+        resume(&after, &sid).await;
+        assert_eq!(bridge.servers_sent("session/load"), vec![json!([])]);
+        assert_eq!(bridge.refusals(), 1, "not refused again after the restart");
+        assert!(lacks_po_tools(&graph, &sid).await);
+        bridge.assert_home_here("p19-br-resume");
+    }
+
+    /// The frozen snapshot survives the resumes: a refusing agent's session resumed
+    /// after a restart, then after ANOTHER one, is loaded without servers both times.
+    /// The first resume must not rewrite the snapshot with what a fresh provider (which
+    /// has learned nothing yet) says, or the second restart sends the servers again, to
+    /// be refused again (a refused round-trip and a second `mcp_servers_refused`).
+    #[tokio::test]
+    async fn a_refused_session_stays_without_servers_across_two_restarts() {
+        let bridge = Agent::new("bridge", "acp-bridge", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let first = bridge.manager(&graph, "p19-br-twice").await;
+        let sid = open(&first, "p19-br-twice").await;
+        assert_eq!(bridge.refusals(), 1, "learned at the first session");
+        first.close_session(&sid).await.unwrap();
+        drop(first);
+        bridge.mode("load");
+        for restart in 1..=2 {
+            let manager = bridge.manager(&graph, "p19-br-twice").await;
+            resume(&manager, &sid).await;
+            manager.close_session(&sid).await.unwrap();
+            drop(manager);
+            assert_eq!(
+                bridge.servers_sent("session/load"),
+                vec![json!([]); restart],
+                "restart {restart}: loaded without servers"
+            );
+            assert_eq!(bridge.refusals(), 1, "restart {restart}: not refused again");
+        }
+        let notices = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 500)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|r| serde_json::from_str::<ChatEvent>(&r.data).ok())
+            .filter(|e| {
+                matches!(e, ChatEvent::BackgroundOutput { source, .. }
+                    if source == "system:mcp_servers_refused")
+            })
+            .count();
+        assert_eq!(notices, 1, "the refusal is told once, at the first opening");
+    }
+}

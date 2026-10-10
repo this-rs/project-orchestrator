@@ -404,30 +404,40 @@ impl PostStreamHandler {
                 pending_tool_calls.len(),
                 self.session_id
             );
+            // Each ToolCancelled, then the timing of the call it ends (`tool_clock`).
+            let tool_clock = super::tool_clock::ToolClock::for_session(&self.session_id);
             let mut cancel_events = Vec::new();
             for (tool_id, parent) in pending_tool_calls {
                 let event = ChatEvent::ToolCancelled {
                     id: tool_id.clone(),
                     parent_tool_use_id: parent.clone(),
                 };
-                cancel_events.push(event.clone());
-                self.emit_chat(event);
+                let timing = tool_clock.observe(&event, chrono::Utc::now());
+                cancel_events.push(event);
+                cancel_events.extend(timing);
             }
 
-            // Persist ToolCancelled events in Neo4j
-            if let Some(uuid) = self.session_uuid {
-                let mut cancel_records = Vec::new();
-                for event in &cancel_events {
-                    let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-                    cancel_records.push(ChatEventRecord {
+            // Their seqs are taken BEFORE they are sent, in the order they are sent.
+            let cancel_records: Vec<ChatEventRecord> = match self.session_uuid {
+                Some(uuid) => cancel_events
+                    .iter()
+                    .map(|event| ChatEventRecord {
                         id: Uuid::new_v4(),
                         session_id: uuid,
-                        seq,
+                        seq: self.next_seq.fetch_add(1, Ordering::SeqCst),
                         event_type: event.event_type().to_string(),
                         data: serde_json::to_string(event).unwrap_or_default(),
                         created_at: chrono::Utc::now(),
-                    });
-                }
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            for event in &cancel_events {
+                self.emit_chat(event.clone());
+            }
+
+            // Persist ToolCancelled events (and their timings) in Neo4j
+            if let Some(uuid) = self.session_uuid {
                 if let Err(e) = self.graph.store_chat_events(uuid, cancel_records).await {
                     warn!(
                         "Failed to persist ToolCancelled events for session {}: {}",

@@ -182,6 +182,10 @@ const FUNCTIONS: &[(&str, &str)] = &[
         "une permission accordée pour toujours est retenue au-delà de la session",
     ),
     (
+        "tool_timing",
+        "un outil qui a attendu une permission porte tool_timing persisté : prise en charge, attente, exécution, fin",
+    ),
+    (
         "po_tools",
         "les outils project-orchestrator (MCP) sont donnés et appelables",
     ),
@@ -755,6 +759,47 @@ impl Stage {
     }
 }
 
+/// The persisted `tool_timing` of the call `id`, which waited for a permission that
+/// was allowed: taken up, then asked, then answered (where it starts to run), then
+/// ended, in that order; stored once, after the call's result.
+fn timing_verdict(persisted: &[ChatEvent], id: &str) -> (bool, String) {
+    let is_timing = |e: &ChatEvent| matches!(e, ChatEvent::ToolTiming { id: t, .. } if t == id);
+    let Some(at) = persisted.iter().position(&is_timing) else {
+        return (false, format!("aucun tool_timing persisté pour {id}"));
+    };
+    let ChatEvent::ToolTiming {
+        started_at,
+        permission_requested_at,
+        permission_resolved_at,
+        permission_outcome,
+        run_started_at,
+        ended_at,
+        ..
+    } = &persisted[at]
+    else {
+        unreachable!("found as a tool_timing")
+    };
+    let after_result = persisted[..at]
+        .iter()
+        .any(|e| matches!(e, ChatEvent::ToolResult { id: r, .. } if r == id));
+    let once = persisted.iter().filter(|e| is_timing(e)).count() == 1;
+    let seen = format!(
+        "pris={started_at:?} demandé={permission_requested_at:?} répondu={permission_resolved_at:?} \
+         issue={permission_outcome:?} exécuté={run_started_at:?} fin={ended_at} \
+         après le résultat={after_result} une fois={once}"
+    );
+    let ordered = match (started_at, permission_requested_at, permission_resolved_at) {
+        (Some(s), Some(q), Some(r)) => s <= q && q <= r && r <= ended_at,
+        _ => false,
+    };
+    let ok = ordered
+        && run_started_at == permission_resolved_at
+        && permission_outcome.as_deref() == Some("allowed")
+        && after_result
+        && once;
+    (ok, seen)
+}
+
 /// `ok` when the record of a session carries what its conversation produced:
 /// the record of a session after `sent` user messages: each counted, a cost (the
 /// total the provider reported: 0 for a free endpoint, a real figure; an unknown
@@ -1231,6 +1276,16 @@ fn transcript_main(k: Keys, cwd: &str) -> Vec<Value> {
     t.extend(vec![
         await_in(&k.k("TURN-FIVE")),
         cc_tool_use("t5", "Bash", json!({"command": "ls"})),
+        hook(
+            "PreToolUse",
+            "hook-t5",
+            hook_input(
+                "PreToolUse",
+                cwd,
+                json!({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
+            ),
+            Some("t5"),
+        ),
         permission_request("req-perm", "Bash", json!({"command": "ls"}), "t5"),
         await_in("req-perm"),
         cc_tool_result("t5", "a.rs", false),
@@ -1938,6 +1993,8 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
         "portée persistante dans la réponse : aucune".to_string(),
     );
     w.settle(ends, &manager).await;
+    let (timed, seen) = timing_verdict(&w.persisted().await, "t5");
+    cc.check("tool_timing", timed, Cause::Harness, seen);
 
     // cancel_tools: the running tool's process is signalled, the turn goes on.
     let ends = w.turn_ends();
@@ -2375,6 +2432,8 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
         ),
     );
     wn.settle(ends, &manager).await;
+    let (timed, seen) = timing_verdict(&wn.persisted().await, "c5");
+    na.check("tool_timing", timed, Cause::Harness, seen);
     // The same tool again: a grant for the session would not ask twice.
     let ends = wn.turn_ends();
     manager

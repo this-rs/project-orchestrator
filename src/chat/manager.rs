@@ -559,6 +559,11 @@ pub(crate) struct AgentSpecInput<'a> {
     /// directories (the provider refuses both, and the local paths mean nothing
     /// there).
     pub remote_cwd: Option<&'a str>,
+    /// The provider can be given MCP servers for this session
+    /// ([`ChatManager::carries_per_session_mcp`]). `false` (OpenClaw's ACP bridge,
+    /// whatever its capabilities say): no project-orchestrator MCP server, and the
+    /// session reports `project_orchestrator_tools` among what it does not do.
+    pub per_session_mcp: bool,
     /// The knowledge-graph hooks to give the session (`None`: none).
     pub hooks: Option<AgentHookScope>,
 }
@@ -705,6 +710,10 @@ pub struct ChatManager {
     /// Root of the native sessions' transcripts (`<root>/<instance id>/<id>.json`, P14);
     /// `None`: kept in memory, lost with the process (nexus' default, the tests' too).
     pub(crate) native_transcripts: Option<std::path::PathBuf>,
+    /// The declared ACP agents and the root of their `HOME`s (`with_acp_homes`,
+    /// `with_acp_commands`); the default reads `CHAT_PROVIDER_ACP_COMMANDS` and keeps
+    /// nexus' default `HOME` under the user's data directory.
+    pub(crate) acp: super::provider::native_factory::AcpSetup,
     /// How far the anchor resolver drives the context (`PO_ANCHOR_CONTEXT`, default `shadow`).
     pub(crate) anchor_mode: super::anchor_resolver::AnchorContextMode,
     /// What the turns of every session share in anchor mode (resolutions, shadow runs).
@@ -2213,6 +2222,124 @@ pub(crate) fn lacks_nexus_tools(
             .is_none()
 }
 
+/// Name of the project-orchestrator MCP server in a session's spec.
+pub(crate) const PO_MCP_SERVER: &str = "project-orchestrator";
+
+/// What a session about to open lacks that the HOST knows and its provider's
+/// capabilities may not say, as `degraded_features` entries: `nexus_tools`
+/// ([`lacks_nexus_tools`]) and `project_orchestrator_tools` when the spec carries no
+/// project-orchestrator MCP server (a remote Claude Code, OpenClaw's ACP bridge).
+pub(crate) fn host_degraded(
+    kind: nexus_claude::agent::ProviderKind,
+    spec: &nexus_claude::agent::SessionSpec,
+    configured: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    if lacks_nexus_tools(kind, spec, configured) {
+        missing.push(super::agent_runtime::NEXUS_TOOLS_FEATURE.to_string());
+    }
+    if !spec.mcp_servers.contains_key(PO_MCP_SERVER) {
+        missing.push(super::agent_runtime::PO_TOOLS_FEATURE.to_string());
+    }
+    missing
+}
+
+/// Opens (or resumes) a session with `spec` through `open`. A provider that learned,
+/// between the reading of its capabilities and this opening, that it takes no MCP
+/// server per session (two first sessions opened at once on an ACP agent that refuses
+/// them: the other one taught it) answers `Unsupported { per_session_mcp }`: the
+/// session is asked ONCE more without its MCP servers. `true` beside the session: it
+/// was opened without them (it lacks the PO tools, [`PO_TOOLS_FEATURE`]).
+///
+/// Only an ACP agent (`kind`) is asked again: its spec holds no server but the PO one
+/// (nothing else is dropped without being said). Any other kind's refusal is returned
+/// as it is.
+///
+/// [`PO_TOOLS_FEATURE`]: super::agent_runtime::PO_TOOLS_FEATURE
+pub(crate) async fn open_dropping_refused_mcp<F, Fut>(
+    kind: nexus_claude::agent::ProviderKind,
+    spec: nexus_claude::agent::SessionSpec,
+    open: F,
+) -> std::result::Result<
+    (Arc<dyn nexus_claude::agent::AgentSession>, bool),
+    nexus_claude::agent::ProviderError,
+>
+where
+    F: Fn(nexus_claude::agent::SessionSpec) -> Fut,
+    Fut: std::future::Future<
+        Output = std::result::Result<
+            Arc<dyn nexus_claude::agent::AgentSession>,
+            nexus_claude::agent::ProviderError,
+        >,
+    >,
+{
+    let acp = kind == nexus_claude::agent::ProviderKind::Acp;
+    let without = (acp && !spec.mcp_servers.is_empty()).then(|| {
+        let mut without = spec.clone();
+        without.mcp_servers.clear();
+        without
+    });
+    match (open(spec).await, without) {
+        (Err(nexus_claude::agent::ProviderError::Unsupported { capability }), Some(without))
+            if capability == "per_session_mcp" =>
+        {
+            open(without).await.map(|session| (session, true))
+        }
+        (outcome, _) => outcome.map(|session| (session, false)),
+    }
+}
+
+/// Whether a session whose spec carried MCP servers (`requested`: the PO server,
+/// with the token minted for it) came out WITHOUT them: the host opened it again
+/// without them (`dropped`, [`open_dropping_refused_mcp`]), or the provider did on its
+/// own — an ACP agent that refuses `mcpServers` at `session/new` is asked again
+/// without them by nexus, which only says so in the session's capabilities
+/// (`per_session_mcp: false`). Either way the token went to the agent in the refused
+/// request and nothing will ever present it legitimately: it is revoked.
+pub(crate) fn opened_without_mcp(
+    requested: bool,
+    dropped: bool,
+    session: &nexus_claude::agent::Capabilities,
+) -> bool {
+    requested && (dropped || !session.per_session_mcp)
+}
+
+/// What an opening (or a resume) of the agent engine has set up before its session
+/// is live — the PO token minted for its spec, its per-turn router — undone when the
+/// opening stops short of [`ChatManager::finish_agent_open`]: an authorization
+/// refused, a spec that cannot be built, a provider unavailable or that refuses the
+/// session, a window too small, or the opening future dropped. [`Self::disarm`]
+/// once the session is handed over.
+struct OpeningCleanup {
+    session_id: String,
+    turn_routing: Arc<super::agent_hooks::TurnRouting>,
+    armed: bool,
+}
+
+impl OpeningCleanup {
+    fn new(session_id: &str, turn_routing: &Arc<super::agent_hooks::TurnRouting>) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            turn_routing: Arc::clone(turn_routing),
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OpeningCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            // Nothing will ever use this session's token.
+            crate::auth::agent_tokens::revoke_session(&self.session_id);
+            self.turn_routing.remove(&self.session_id);
+        }
+    }
+}
+
 /// Refuses a model whose context window cannot hold the tool schemas of the
 /// session's `profile` with room to work: the schemas must take at most half of
 /// it. A window that is not known is not a refusal (nothing is invented).
@@ -2376,6 +2503,7 @@ impl ChatManager {
                 crate::documents::store::default_storage_dir(),
             ),
             native_transcripts: None,
+            acp: Default::default(),
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
             held_slots: Default::default(),
@@ -2458,6 +2586,7 @@ impl ChatManager {
                 crate::documents::store::default_storage_dir(),
             ),
             native_transcripts: None,
+            acp: Default::default(),
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
             held_slots: Default::default(),
@@ -2490,6 +2619,24 @@ impl ChatManager {
     /// restart (`provider::transcripts`). Applies to the providers built afterwards.
     pub fn with_native_transcripts(mut self, root: impl Into<std::path::PathBuf>) -> Self {
         self.native_transcripts = Some(root.into());
+        self
+    }
+
+    /// Put the dedicated `HOME` of each ACP instance under `root` (`<root>/<instance>/home`)
+    /// instead of nexus' default in the user's data directory. Applies to the providers
+    /// built afterwards; the tests use it so that nothing is written in the real one.
+    pub fn with_acp_homes(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.acp.homes = Some(root.into());
+        self
+    }
+
+    /// Declare the ACP agents here instead of `CHAT_PROVIDER_ACP_COMMANDS` (the tests:
+    /// the process environment is shared by every test running at the same time).
+    pub fn with_acp_commands(
+        mut self,
+        commands: std::collections::BTreeMap<String, super::provider::settings::AcpCommand>,
+    ) -> Self {
+        self.acp.commands = Some(commands);
         self
     }
 
@@ -6527,6 +6674,9 @@ impl ChatManager {
         let session_uuid = Uuid::parse_str(&session_id).ok();
         let mut assistant_text_parts: Vec<String> = Vec::new();
         let mut events_to_persist: Vec<ChatEventRecord> = Vec::new();
+        // When each tool call of the turn really ran (`tool_clock`): a `tool_timing`
+        // is stored and sent right after the result or the cancellation it times.
+        let tool_clock = super::tool_clock::ToolClock::for_session(&session_id);
 
         // What the CLI is given: the prompt as one string, or — with images — the
         // text and image blocks, checked by nexus (`agent_runtime::CliInput`). An
@@ -6719,6 +6869,7 @@ impl ChatManager {
                                               current_parent: Option<String>|
                      -> Option<ChatEvent> {
                         let event = parse_permission_control_msg(&control_msg, current_parent)?;
+                        tool_clock.observe(&event, chrono::Utc::now());
 
                         match &event {
                             ChatEvent::PermissionRequest { id, tool, .. } => {
@@ -7162,6 +7313,8 @@ impl ChatManager {
                                         pending_tool_calls.remove(id);
                                     }
 
+                                    let timing = tool_clock.observe(&event, chrono::Utc::now());
+
                                     // Persist structured events (skip transient: stream_delta, streaming_status)
                                     if !matches!(
                                         event,
@@ -7256,6 +7409,23 @@ impl ChatManager {
                                     }
 
                                     emit_chat(event, &events_tx, &nats, &session_id);
+                                    // The timing of the call this event ended: stored in the
+                                    // turn's batch right after it, sent right after it.
+                                    if let Some(timing) = timing {
+                                        if let Some(uuid) = session_uuid {
+                                            events_to_persist.push(ChatEventRecord {
+                                                id: Uuid::new_v4(),
+                                                session_id: uuid,
+                                                seq: next_seq.fetch_add(1, Ordering::SeqCst),
+                                                event_type: timing.event_type().to_string(),
+                                                data: serde_json::to_string(&timing)
+                                                    .unwrap_or_default(),
+                                                created_at: chrono::Utc::now(),
+                                            });
+                                        }
+                                        streaming_events.lock().await.push(timing.clone());
+                                        emit_chat(timing, &events_tx, &nats, &session_id);
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -8175,7 +8345,11 @@ impl ChatManager {
             "Sending permission control response to CLI (via stdin_tx, lock-free)"
         );
 
+        // On the tool clock BEFORE the CLI has it: a fast tool's result cannot overtake it.
+        let tool_clock = super::tool_clock::ToolClock::for_session(session_id);
+        let mark = tool_clock.decided(request_id, allow, chrono::Utc::now());
         if let Err(e) = stdin_tx.send(json).await {
+            tool_clock.undecided(request_id, mark);
             restore_claim(original_input).await;
             return Err(PermissionDeliveryError::Failed(anyhow!(
                 "Failed to send permission control response: {}",
@@ -9069,6 +9243,12 @@ impl ChatManager {
                 }],
             );
         }
+        // PreToolUse → the session's tool clock notes when the engine takes a call up
+        // (every session, runner or not: it adds nothing to the context).
+        super::tool_clock::clock_the_table(
+            &mut hooks,
+            super::tool_clock::ToolClock::for_session(&session_id),
+        );
         hooks
     }
 
@@ -11829,6 +12009,7 @@ impl ChatManager {
             &record,
             self.vault.clone(),
             self.native_transcripts.as_deref(),
+            &self.acp,
         )
         .map_err(anyhow::Error::new)?;
         {
@@ -11867,6 +12048,29 @@ impl ChatManager {
                 "this remote instance has no working directory",
             ))
         })
+    }
+
+    /// Whether a session can be given MCP servers (the project-orchestrator server
+    /// among them): what its provider says NOW (`capabilities(model).per_session_mcp`:
+    /// declared for an ACP agent that takes none — `build_acp` —, or learned by nexus
+    /// at a refusal). A resumed session whose frozen snapshot says it carried none
+    /// (`snapshot`) is not given one either: a refusal learned before a restart is not
+    /// asked again. The snapshot also wins over a declaration changed since to
+    /// `per_session_mcp: true`: a declaration applies to the sessions opened after it
+    /// (docs/guides/providers.md, OpenClaw).
+    pub(crate) fn carries_per_session_mcp(
+        provider: &dyn nexus_claude::agent::AgentProvider,
+        model: &str,
+        snapshot: Option<&str>,
+    ) -> bool {
+        let refused_before = snapshot
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|caps| {
+                caps.get("per_session_mcp")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            == Some(false);
+        provider.capabilities(Some(model)).per_session_mcp && !refused_before
     }
 
     /// Everything that must hold before a session's content is sent to a
@@ -12024,6 +12228,7 @@ impl ChatManager {
             max_tokens,
             kind,
             remote_cwd,
+            per_session_mcp,
             hooks,
         } = i;
         // A neutral directory of the host is made on demand (new session or resume).
@@ -12055,17 +12260,24 @@ impl ChatManager {
         // The project is read before the hooks scope is consumed: it is what the consent of
         // the network tools is tied to (A28).
         let project_slug = hooks.as_ref().and_then(|scope| scope.project_slug.clone());
-        let env = self
-            .po_mcp_env(
-                Some(&mode),
-                user_claims,
-                Some(session_id),
-                access
-                    .tool_profile()
-                    .or_else(|| third_party_tool_profile(third_party, policy.mode)),
-                third_party,
+        // The PO server's environment holds a token bound to the session: minted only
+        // for a session that is given the server.
+        let po_env = if remote_cwd.is_none() && per_session_mcp {
+            Some(
+                self.po_mcp_env(
+                    Some(&mode),
+                    user_claims,
+                    Some(session_id),
+                    access
+                        .tool_profile()
+                        .or_else(|| third_party_tool_profile(third_party, policy.mode)),
+                    third_party,
+                )
+                .await,
             )
-            .await;
+        } else {
+            None
+        };
         // A remote session runs where `remote_cwd` says; the local path of the
         // project (and a local `~`) means nothing on that machine.
         let mut spec = SessionSpec::new(match remote_cwd {
@@ -12095,12 +12307,14 @@ impl ChatManager {
         }
         spec.policy = policy;
         // A remote Claude Code cannot carry an MCP server (its configuration holds
-        // the session token, which must not reach another machine's command line):
-        // the PO tools are NOT given to it, and `system_init.degraded_features`
-        // says so (`project_orchestrator_tools`).
-        if remote_cwd.is_none() {
+        // the session token, which must not reach another machine's command line),
+        // nor can an agent that refuses per-session MCP servers (OpenClaw's ACP
+        // bridge, `per_session_mcp`): the PO tools are NOT given to it, and
+        // `system_init.degraded_features` says so (`project_orchestrator_tools`,
+        // [`host_degraded`]).
+        if let Some(env) = po_env {
             spec.mcp_servers.insert(
-                "project-orchestrator".to_string(),
+                PO_MCP_SERVER.to_string(),
                 McpServerSpec::Stdio {
                     command: self.config.mcp_server_path.to_string_lossy().to_string(),
                     args: Vec::new(),
@@ -12247,6 +12461,7 @@ impl ChatManager {
         } = o;
         let provider = self.provider_for(provider_id).await?;
         let remote_cwd = self.remote_cwd_of(provider_id).await?;
+        let per_session_mcp = Self::carries_per_session_mcp(provider.as_ref(), model, None);
         let sid = session_id.to_string();
         // A run (an executor) on a remote machine that does not allow `Trust` runs under `ask`
         // instead (a pilot asking for it is refused in authorize_provider_use). Every other
@@ -12268,6 +12483,8 @@ impl ChatManager {
             }
             other => other,
         };
+        // From here, a failure undoes the router and the token (finding 5 of #682).
+        let cleanup = OpeningCleanup::new(&sid, &self.turn_routing);
         self.register_turn_router(
             &sid,
             provider_id,
@@ -12299,6 +12516,7 @@ impl ChatManager {
                     max_tokens: request.max_tokens,
                     kind: provider.kind(),
                     remote_cwd: remote_cwd.as_deref(),
+                    per_session_mcp,
                     hooks: Some(AgentHookScope {
                         project_slug: project_slug.map(str::to_string),
                         task_id: request
@@ -12313,26 +12531,20 @@ impl ChatManager {
             )
             .await?;
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
-        if let Err(e) = self
-            .authorize_provider_use(ProviderUse {
-                provider_id,
-                model: spec.model.as_deref().unwrap_or(model),
-                mode: spec.policy.mode,
-                project_slug,
-                claims: request.user_claims.as_ref(),
-                session_id: &sid,
-            })
-            .await
-        {
-            crate::auth::agent_tokens::revoke_session(&sid);
-            return Err(e);
-        }
+        self.authorize_provider_use(ProviderUse {
+            provider_id,
+            model: spec.model.as_deref().unwrap_or(model),
+            mode: spec.policy.mode,
+            project_slug,
+            claims: request.user_claims.as_ref(),
+            session_id: &sid,
+        })
+        .await?;
         // Preflight at EVERY opening (A30), not only when the instance was saved:
         // is the provider reachable and logged in now?
         if provider_id != super::provider::resolver::CLAUDE_CODE {
             let health = provider.health().await;
             if health.status == nexus_claude::agent::HealthStatus::Unavailable {
-                crate::auth::agent_tokens::revoke_session(&sid);
                 return Err(anyhow::Error::new(health.error.unwrap_or(
                     nexus_claude::agent::ProviderError::EndpointUnreachable {
                         detail: "the provider reports itself unavailable".to_string(),
@@ -12341,26 +12553,30 @@ impl ChatManager {
             }
         }
         let tool_profile = spec_tool_profile(&spec);
-        let nexus_missing = lacks_nexus_tools(
+        let mut host_missing = host_degraded(
             provider.kind(),
             &spec,
             self.config.nexus_tools_path.as_deref(),
         );
-        let session = provider.open(spec).await.map_err(|e| {
-            // Nothing will ever use this session's token.
+        let (session, dropped) =
+            open_dropping_refused_mcp(provider.kind(), spec, |spec| provider.open(spec))
+                .await
+                .map_err(anyhow::Error::new)?;
+        let without_mcp = opened_without_mcp(per_session_mcp, dropped, session.capabilities());
+        if without_mcp {
+            // The token minted for the refused spec's PO server: nothing holds it.
             crate::auth::agent_tokens::revoke_session(&sid);
-            self.turn_routing.remove(&sid);
-            anyhow::Error::new(e)
-        })?;
+            host_missing.push(super::agent_runtime::PO_TOOLS_FEATURE.to_string());
+        }
         // ... and does the model's window hold the tool schemas the session was
         // given, with room left to work? (known only once the provider has probed)
         if provider_id != super::provider::resolver::CLAUDE_CODE {
             if let Err(e) = window_holds_the_tools(session.capabilities(), tool_profile) {
                 let _ = session.close().await;
-                crate::auth::agent_tokens::revoke_session(&sid);
                 return Err(anyhow::Error::new(e));
             }
         }
+        cleanup.disarm();
         self.finish_agent_open(
             &sid,
             provider_id,
@@ -12368,7 +12584,8 @@ impl ChatManager {
             session,
             1,
             tool_policy,
-            nexus_missing,
+            host_missing,
+            !per_session_mcp || without_mcp,
         )
         .await;
         if let Some(handle) = self.agent_runtime.get(&sid).await {
@@ -12497,9 +12714,10 @@ impl ChatManager {
     }
 
     /// Records what the provider reported (frozen capabilities, resume token)
-    /// and registers the live session. `nexus_missing`: the session was opened without
-    /// its `nexus-tools` server ([`lacks_nexus_tools`]), which it reports as a feature it
-    /// does not have rather than leaving only a line in the server's log.
+    /// and registers the live session. `host_missing`: what the host knows the session
+    /// lacks ([`host_degraded`]: its `nexus-tools` server, the project-orchestrator
+    /// server), which it reports as features it does not have rather than leaving only
+    /// a line in the server's log.
     #[allow(clippy::too_many_arguments)]
     async fn finish_agent_open(
         &self,
@@ -12509,13 +12727,24 @@ impl ChatManager {
         session: Arc<dyn nexus_claude::agent::AgentSession>,
         first_seq: i64,
         tool_policy: serde_json::Value,
-        nexus_missing: bool,
+        host_missing: Vec<String>,
+        without_mcp: bool,
     ) {
         self.warn_if_forced(provider_id, session.as_ref());
         if let Some(router) = self.turn_routing.get(session_id) {
             router.set_model_live(session.capabilities().set_model_live);
         }
-        let capabilities = serde_json::to_string(session.capabilities()).unwrap_or_default();
+        // The frozen snapshot keeps what the opening FOUND: a session opened without
+        // its MCP servers (`without_mcp`: its provider takes none, it refused them, or
+        // its snapshot already said so) says `per_session_mcp: false`, whatever a
+        // provider that has learned nothing yet (a fresh one after a restart) answers.
+        // Otherwise the next resume after another restart would send them again, to be
+        // refused again ([`Self::carries_per_session_mcp`]).
+        let mut snapshot = session.capabilities().clone();
+        if without_mcp {
+            snapshot.per_session_mcp = false;
+        }
+        let capabilities = serde_json::to_string(&snapshot).unwrap_or_default();
         let token = session.resume_token().map(|t| t.to_wire());
         if let Ok(uuid) = Uuid::parse_str(session_id) {
             if let Err(e) = self
@@ -12530,11 +12759,6 @@ impl ChatManager {
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_else(|| "claude_code".to_string());
-        let extra_degraded = if nexus_missing {
-            vec![super::agent_runtime::NEXUS_TOOLS_FEATURE.to_string()]
-        } else {
-            Vec::new()
-        };
         let handle = self
             .agent_runtime
             .adopt_with(
@@ -12545,7 +12769,7 @@ impl ChatManager {
                 &kind_name,
                 tool_policy,
                 Some(self.turn_services_with(self.agent_turn_state(session_id).await)),
-                extra_degraded,
+                host_missing,
             )
             .await;
         // A failed turn is retried as the chat's configuration says, on both engines.
@@ -12674,6 +12898,11 @@ impl ChatManager {
             .unwrap_or_else(|| super::provider::resolver::CLAUDE_CODE.to_string());
         let provider = self.provider_for(&provider_id).await?;
         let remote_cwd = self.remote_cwd_of(&provider_id).await?;
+        let per_session_mcp = Self::carries_per_session_mcp(
+            provider.as_ref(),
+            &node.model,
+            node.capabilities.as_deref(),
+        );
         let sid = node.id.to_string();
         let (system_prompt, _) = self
             .build_system_prompt_anchored(
@@ -12686,6 +12915,8 @@ impl ChatManager {
                 None,
             )
             .await;
+        // From here, a failure undoes the router and the token (finding 5 of #682).
+        let cleanup = OpeningCleanup::new(&sid, &self.turn_routing);
         // A resumed session starts counting its turns again; the harness is the authority
         // on the index, and nothing says whether its model was named by the request.
         self.register_turn_router(
@@ -12730,6 +12961,7 @@ impl ChatManager {
                     max_tokens: None,
                     kind: provider.kind(),
                     remote_cwd: remote_cwd.as_deref(),
+                    per_session_mcp,
                     hooks: Some(AgentHookScope {
                         project_slug: node.project_slug.clone(),
                         task_id: node
@@ -12746,39 +12978,48 @@ impl ChatManager {
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
         // A resume is a new sending of the project's content: consent, guard
         // and journal apply again (a consent may have been revoked meanwhile).
-        if let Err(e) = self
-            .authorize_provider_use(ProviderUse {
-                provider_id: &provider_id,
-                model: &node.model,
-                mode: spec.policy.mode,
-                project_slug: node.project_slug.as_deref(),
-                claims: user_claims,
-                session_id: &sid,
-            })
-            .await
-        {
-            crate::auth::agent_tokens::revoke_session(&sid);
-            return Err(e);
-        }
+        self.authorize_provider_use(ProviderUse {
+            provider_id: &provider_id,
+            model: &node.model,
+            mode: spec.policy.mode,
+            project_slug: node.project_slug.as_deref(),
+            claims: user_claims,
+            session_id: &sid,
+        })
+        .await?;
         let token = node
             .resume_token
             .as_deref()
             .and_then(|raw| nexus_claude::agent::ResumeToken::from_wire(raw).ok());
-        let nexus_missing = lacks_nexus_tools(
+        let mut host_missing = host_degraded(
             provider.kind(),
             &spec,
             self.config.nexus_tools_path.as_deref(),
         );
-        let session = match token {
-            Some(token) => provider.resume(spec, token).await,
-            None => provider.open(spec).await,
-        }
+        let (session, dropped) = open_dropping_refused_mcp(provider.kind(), spec, |spec| {
+            let provider = Arc::clone(&provider);
+            let token = token.clone();
+            async move {
+                match token {
+                    Some(token) => provider.resume(spec, token).await,
+                    None => provider.open(spec).await,
+                }
+            }
+        })
+        .await
         .map_err(anyhow::Error::new)?;
+        let without_mcp = opened_without_mcp(per_session_mcp, dropped, session.capabilities());
+        if without_mcp {
+            // As at an opening: the token went out in the refused request.
+            crate::auth::agent_tokens::revoke_session(&sid);
+            host_missing.push(super::agent_runtime::PO_TOOLS_FEATURE.to_string());
+        }
         let latest = self
             .graph
             .get_latest_chat_event_seq(node.id)
             .await
             .unwrap_or(0);
+        cleanup.disarm();
         self.finish_agent_open(
             &sid,
             &provider_id,
@@ -12786,7 +13027,8 @@ impl ChatManager {
             session,
             latest + 1,
             tool_policy,
-            nexus_missing,
+            host_missing,
+            !per_session_mcp || without_mcp,
         )
         .await;
         let handle = self
@@ -13365,6 +13607,12 @@ fn parse_permission_control_msg(
         parent_tool_use_id: current_parent,
         category: None,
         canonical: None,
+        tool_use_id: request_data
+            .get("toolUseId")
+            .or_else(|| request_data.get("tool_use_id"))
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -13610,6 +13858,7 @@ mod tests {
                             max_tokens: None,
                             kind: ProviderKind::ClaudeCode,
                             remote_cwd: None,
+                            per_session_mcp: true,
                             hooks: None,
                         },
                         access,
@@ -14387,6 +14636,7 @@ mod tests {
                         max_tokens: None,
                         kind,
                         remote_cwd: remote,
+                        per_session_mcp: true,
                         hooks,
                     })
                     .await
@@ -14426,8 +14676,9 @@ mod tests {
             keys
         };
         assert_eq!(table(true), ["PostToolUse", "PreCompact", "PreToolUse"]);
-        // A runner has its task context in the prompt: compaction guidance only.
-        assert_eq!(table(false), ["PreCompact"]);
+        // A runner has its task context in the prompt: compaction guidance, and the
+        // tool clock (PreToolUse, which adds nothing to the context).
+        assert_eq!(table(false), ["PreCompact", "PreToolUse"]);
     }
 
     #[tokio::test]
@@ -14510,6 +14761,7 @@ mod tests {
                         max_tokens: None,
                         kind: ProviderKind::ClaudeCode,
                         remote_cwd,
+                        per_session_mcp: true,
                         hooks: None,
                     })
                     .await
@@ -14528,6 +14780,51 @@ mod tests {
         let local = spec_for(None).await;
         assert!(local.mcp_servers.contains_key("project-orchestrator"));
         assert_eq!(local.extra_dirs.len(), 1);
+    }
+
+    /// An agent that takes no MCP server per session (OpenClaw's ACP bridge) is not
+    /// given the PO server, and the host reports what the session lacks.
+    #[tokio::test]
+    async fn a_provider_without_per_session_mcp_gets_no_po_server_and_it_is_reported() {
+        use nexus_claude::agent::ProviderKind;
+        let state = mock_app_state();
+        let mut config = test_config();
+        config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let claims = crate::auth::jwt::Claims::service_account("acp");
+        let spec_for = |per_session_mcp: bool| {
+            let manager = &manager;
+            let claims = &claims;
+            async move {
+                manager
+                    .build_agent_spec(AgentSpecInput {
+                        cwd: "/tmp",
+                        model: "openclaw",
+                        system_prompt: "p",
+                        permission_mode: None,
+                        add_dirs: &[],
+                        user_claims: Some(claims),
+                        session_id: "acp-s1",
+                        third_party: true,
+                        max_tokens: None,
+                        kind: ProviderKind::Acp,
+                        remote_cwd: None,
+                        per_session_mcp,
+                        hooks: None,
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        let without = spec_for(false).await;
+        assert!(without.mcp_servers.is_empty(), "{:?}", without.mcp_servers);
+        assert_eq!(
+            host_degraded(ProviderKind::Acp, &without, None),
+            vec![super::super::agent_runtime::PO_TOOLS_FEATURE.to_string()]
+        );
+        let with = spec_for(true).await;
+        assert!(with.mcp_servers.contains_key(PO_MCP_SERVER));
+        assert!(host_degraded(ProviderKind::Acp, &with, None).is_empty());
     }
 
     // ── nexus-tools on a native session (B40) ───────────────────────────────
@@ -14565,6 +14862,7 @@ mod tests {
                         max_tokens: None,
                         kind,
                         remote_cwd: None,
+                        per_session_mcp: true,
                         hooks: None,
                     })
                     .await
@@ -14645,6 +14943,7 @@ mod tests {
                 max_tokens: None,
                 kind: ProviderKind::Native,
                 remote_cwd: None,
+                per_session_mcp: true,
                 hooks: None,
             })
             .await
@@ -14681,6 +14980,7 @@ mod tests {
                 max_tokens: None,
                 kind: ProviderKind::Native,
                 remote_cwd: None,
+                per_session_mcp: true,
                 hooks: None,
             })
             .await
@@ -14724,6 +15024,7 @@ mod tests {
                 max_tokens: None,
                 kind: ProviderKind::Native,
                 remote_cwd: None,
+                per_session_mcp: true,
                 hooks: None,
             })
             .await
@@ -15060,6 +15361,7 @@ mod tests {
                 max_tokens: None,
                 kind,
                 remote_cwd,
+                per_session_mcp: true,
                 hooks: Some(AgentHookScope {
                     project_slug: Some("proj".into()),
                     task_id: None,
@@ -16592,6 +16894,303 @@ mod tests {
         }
     }
 
+    /// Two first sessions opened at once on an agent that refuses MCP servers per
+    /// session: the other one taught the provider, which now answers
+    /// `Unsupported { per_session_mcp }` to a spec built while it still said yes. The
+    /// session is opened once more WITHOUT its servers, and says what it lacks.
+    #[tokio::test]
+    async fn a_refusal_learned_meanwhile_reopens_the_session_without_its_mcp_servers() {
+        use nexus_claude::agent::AgentEvent;
+        let (manager, graph, fake) = agent_manager();
+        *fake.kind.lock().unwrap() = nexus_claude::agent::ProviderKind::Acp;
+        // The session's own capabilities say it carries MCP servers: only the HOST can
+        // say it lacks the PO tools (it opened it without them).
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        *fake.fail_open.lock().unwrap() = Some(nexus_claude::agent::ProviderError::unsupported(
+            "per_session_mcp",
+        ));
+        let sid = manager
+            .create_session(&agent_request("hello"))
+            .await
+            .expect("opened again without the servers")
+            .session_id;
+        let opened = fake.state.opened_specs.lock().unwrap().clone();
+        assert_eq!(opened.len(), 1, "the refused spec never opened");
+        assert!(
+            opened[0].mcp_servers.is_empty(),
+            "{:?}",
+            opened[0].mcp_servers.keys()
+        );
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        fake.state.push(AgentEvent::SessionStarted {
+            provider_session_id: Some("p1".into()),
+            model: Some("m".into()),
+            policy_mode: None,
+            native_mode: None,
+            tools: vec![],
+            mcp_servers: vec![],
+            cwd: None,
+        });
+        let init = next_matching(&mut rx, |e| matches!(e, ChatEvent::SystemInit { .. })).await;
+        let wire = serde_json::to_value(&init).unwrap();
+        let degraded: Vec<String> =
+            serde_json::from_value(wire["degraded_features"].clone()).expect("a list");
+        assert!(
+            degraded
+                .iter()
+                .any(|f| f == super::super::agent_runtime::PO_TOOLS_FEATURE),
+            "{degraded:?}"
+        );
+        // The frozen snapshot says what the opening found, not what the session's
+        // capabilities claim: a resume after a restart does not send them again.
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!ChatManager::carries_per_session_mcp(
+            &fake,
+            "m",
+            node.capabilities.as_deref()
+        ));
+        // Only an ACP agent is asked again (its spec holds no server but the PO one):
+        // another kind's refusal is returned as it is, nothing dropped in silence.
+        let (manager, _graph, fake) = agent_manager();
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        *fake.fail_open.lock().unwrap() = Some(nexus_claude::agent::ProviderError::unsupported(
+            "per_session_mcp",
+        ));
+        assert!(manager
+            .create_session(&agent_request("hello"))
+            .await
+            .is_err());
+        assert!(fake.state.opened_specs.lock().unwrap().is_empty());
+        // Another refusal is not taken for this one: no second opening.
+        let (manager, _graph, fake) = agent_manager();
+        *fake.kind.lock().unwrap() = nexus_claude::agent::ProviderKind::Acp;
+        *fake.fail_open.lock().unwrap() =
+            Some(nexus_claude::agent::ProviderError::unsupported("images"));
+        assert!(manager
+            .create_session(&agent_request("hello"))
+            .await
+            .is_err());
+        assert!(fake.state.opened_specs.lock().unwrap().is_empty());
+    }
+
+    /// A resumed session whose frozen snapshot says it carried no MCP server is not
+    /// given one, whatever its provider says now (a refusal learned before a restart).
+    #[test]
+    fn a_snapshot_without_per_session_mcp_keeps_the_resumed_session_without_servers() {
+        let fake = super::super::agent_runtime::fake::FakeProvider::new();
+        assert!(ChatManager::carries_per_session_mcp(&fake, "m", None));
+        assert!(ChatManager::carries_per_session_mcp(
+            &fake,
+            "m",
+            Some(r#"{"per_session_mcp": true}"#)
+        ));
+        assert!(!ChatManager::carries_per_session_mcp(
+            &fake,
+            "m",
+            Some(r#"{"per_session_mcp": false}"#)
+        ));
+        assert!(ChatManager::carries_per_session_mcp(
+            &fake,
+            "m",
+            Some("not json")
+        ));
+    }
+
+    /// The agent-path manager of [`agent_manager`], with a signing key (PO tokens are
+    /// minted), a per-turn router configured, and every provider id answered by the fake.
+    fn signed_routed_agent_manager() -> (
+        ChatManager,
+        Arc<crate::neo4j::mock::MockGraphStore>,
+        super::super::agent_runtime::fake::FakeProvider,
+    ) {
+        struct AnyId(super::super::agent_runtime::fake::FakeProvider);
+        impl super::super::agent_runtime::ProviderSource for AnyId {
+            fn get(&self, _id: &str) -> Option<Arc<dyn nexus_claude::agent::AgentProvider>> {
+                Some(Arc::new(self.0.clone()))
+            }
+        }
+        struct NoDecider;
+        #[async_trait::async_trait]
+        impl crate::chat::provider::cognitive::decision::Decider for NoDecider {
+            async fn decide(
+                &self,
+                _request: &crate::chat::provider::cognitive::decision::DecideRequest,
+            ) -> anyhow::Result<crate::chat::provider::cognitive::decision::CognitiveDecision>
+            {
+                anyhow::bail!("not asked in this test")
+            }
+        }
+        struct NoPool;
+        #[async_trait::async_trait]
+        impl crate::chat::agent_hooks::PoolSource for NoPool {
+            async fn pool(
+                &self,
+                _provider_id: &str,
+            ) -> Vec<crate::chat::provider::cognitive::candidates::ModelFacts> {
+                Vec::new()
+            }
+        }
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let state = mock_app_state();
+        let mut config = test_config();
+        config.provider_path = crate::chat::config::ProviderPath::Agent;
+        config.jwt_secret = Some(SIGNING_SECRET.into());
+        let fake = super::super::agent_runtime::fake::FakeProvider::new();
+        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
+            .with_provider_source(Arc::new(AnyId(fake.clone())))
+            .with_turn_decider(Arc::new(NoDecider), Arc::new(NoPool));
+        (manager, graph, fake)
+    }
+
+    const SIGNING_SECRET: &str = "test-secret-key-minimum-32-chars!!";
+
+    /// The `jti` of the PO token a spec carries.
+    fn spec_token_jti(spec: &nexus_claude::agent::SessionSpec) -> String {
+        let token = spec_po_env(spec)
+            .get("PO_AUTH_TOKEN")
+            .cloned()
+            .expect("a PO token in the spec");
+        crate::auth::jwt::decode_jwt(&token, SIGNING_SECRET)
+            .expect("a token signed by the server")
+            .jti
+            .expect("a bound token has a jti")
+    }
+
+    /// Review of #682, findings 1 and 4: an ACP agent that refuses `mcpServers` is
+    /// asked again WITHOUT them by nexus itself (OpenClaw 2026.9.x, a command the name
+    /// does not give away): the host sees no refusal, only the session's capabilities
+    /// (`per_session_mcp: false`). The PO token went to the agent in the refused
+    /// `session/new`: it is revoked, at an opening and at a resume. A session that kept
+    /// its servers keeps its token.
+    #[tokio::test]
+    async fn the_po_token_is_revoked_when_the_provider_itself_opens_the_session_without_servers() {
+        let (manager, _graph, fake) = signed_routed_agent_manager();
+        *fake.kind.lock().unwrap() = nexus_claude::agent::ProviderKind::Acp;
+        let mut req = agent_request("hello");
+        req.user_claims = Some(person_claims());
+
+        // Kept: the session carries its servers, its token stays live.
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        let kept = spec_token_jti(&fake.state.opened_specs.lock().unwrap().pop().unwrap());
+        assert!(
+            crate::auth::agent_tokens::is_live(&kept),
+            "servers kept: token live"
+        );
+
+        // Resumed after a restart of the agent that now refuses them: nexus asked
+        // `session/load` again without them. The snapshot said "takes servers", so the
+        // resume's spec carried a fresh token: revoked.
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+        fake.caps.lock().unwrap().per_session_mcp = false;
+        manager
+            .resume_session(&sid, "again", req.user_claims.as_ref())
+            .await
+            .unwrap();
+        let resumed = spec_token_jti(&fake.state.opened_specs.lock().unwrap().pop().unwrap());
+        assert!(
+            !crate::auth::agent_tokens::is_live(&resumed),
+            "the token of a resume nexus opened without servers is revoked"
+        );
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+
+        // Opened: same at a first opening.
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        let opened = spec_token_jti(&fake.state.opened_specs.lock().unwrap().pop().unwrap());
+        assert!(
+            !crate::auth::agent_tokens::is_live(&opened),
+            "the token of an opening nexus made without servers is revoked"
+        );
+        // ... and the session still runs, reporting what it lacks.
+        assert!(manager.agent_runtime.get(&sid).await.is_some());
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+
+        // The rule itself: requested and lost, by the host or by the provider.
+        let mut caps = nexus_claude::agent::Capabilities::none();
+        caps.per_session_mcp = true;
+        assert!(!opened_without_mcp(true, false, &caps));
+        assert!(opened_without_mcp(true, true, &caps));
+        assert!(!opened_without_mcp(false, false, &caps));
+        caps.per_session_mcp = false;
+        assert!(opened_without_mcp(true, false, &caps));
+        assert!(!opened_without_mcp(false, false, &caps), "nothing was sent");
+    }
+
+    /// Review of #682, finding 5: an opening or a resume that stops short — here its
+    /// authorization refused (a third-party instance the store does not know), after
+    /// its router was registered and its token minted — leaves neither behind.
+    #[tokio::test]
+    async fn a_refused_opening_or_resume_leaves_no_turn_router_nor_token() {
+        let (manager, graph, _fake) = signed_routed_agent_manager();
+        // A first opening on Claude Code (no gate): the router IS registered, so the
+        // assertions below are not vacuous.
+        let ok = manager
+            .create_session(&agent_request("hello"))
+            .await
+            .unwrap()
+            .session_id;
+        assert!(
+            manager.turn_routing.get(&ok).is_some(),
+            "routing is configured"
+        );
+
+        // Refused: a third-party instance the store does not know.
+        let req = {
+            let mut req = agent_request("");
+            req.user_claims = Some(person_claims());
+            req
+        };
+        let sid = Uuid::new_v4();
+        let refused = manager
+            .open_agent_session(AgentOpen {
+                request: &req,
+                session_id: sid,
+                provider_id: "elsewhere",
+                model: "m",
+                system_prompt: "p",
+                add_dirs: &[],
+                project_slug: None,
+                relay: None,
+                access: Default::default(),
+            })
+            .await;
+        assert!(refused.is_err());
+        let sid = sid.to_string();
+        assert!(
+            manager.turn_routing.get(&sid).is_none(),
+            "a refused opening leaves no router"
+        );
+        assert_eq!(
+            crate::auth::agent_tokens::revoke_session(&sid),
+            0,
+            "nor a live token"
+        );
+
+        // The same at a resume.
+        let mut node = test_chat_session(None);
+        node.provider_id = Some("elsewhere".into());
+        graph.create_chat_session(&node).await.unwrap();
+        let refused = manager
+            .resume_agent_session(&node, "again", req.user_claims.as_ref())
+            .await;
+        assert!(refused.is_err());
+        let sid = node.id.to_string();
+        assert!(
+            manager.turn_routing.get(&sid).is_none(),
+            "a refused resume leaves no router"
+        );
+        assert_eq!(crate::auth::agent_tokens::revoke_session(&sid), 0);
+        manager.close_session(&ok).await.unwrap();
+    }
+
     #[tokio::test]
     async fn agent_path_opens_a_session_persists_the_snapshot_and_streams_a_turn() {
         use nexus_claude::agent::{AgentEvent, StopReason};
@@ -17113,6 +17712,7 @@ mod tests {
                         max_tokens: None,
                         kind: ProviderKind::Native,
                         remote_cwd: None,
+                        per_session_mcp: true,
                         hooks: None,
                     },
                     SessionAccess::ReadOnly,
@@ -19124,6 +19724,7 @@ mod tests {
                 parent_tool_use_id: None,
                 category: None,
                 canonical: None,
+                tool_use_id: None,
             },
             ChatEvent::Error {
                 message: "Something went wrong".into(),

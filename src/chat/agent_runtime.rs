@@ -339,6 +339,12 @@ fn image_refusal(error: &ProviderError) -> Option<ChatEvent> {
 /// knows it, not the provider's capabilities, so it is added at adoption.
 pub const NEXUS_TOOLS_FEATURE: &str = "nexus_tools";
 
+/// The identifier of a session that has none of the project-orchestrator tools: it
+/// cannot carry an MCP server (`per_session_mcp` false: a remote Claude Code), or the
+/// host did not give it one because its agent refuses them (OpenClaw's ACP bridge,
+/// `ChatManager::carries_per_session_mcp`).
+pub const PO_TOOLS_FEATURE: &str = "project_orchestrator_tools";
+
 /// What a session on the agent engine does NOT do, as the identifiers the
 /// frontend knows (`hooks`, `message_queue`, `auto_continue`, `compaction`,
 /// `nats`, `enrichment`, `images`, and [`NEXUS_TOOLS_FEATURE`] added by the host).
@@ -371,7 +377,7 @@ pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
     // A session that cannot carry an MCP server (a remote Claude Code) has none
     // of the project-orchestrator tools.
     if !caps.per_session_mcp {
-        missing.push("project_orchestrator_tools");
+        missing.push(PO_TOOLS_FEATURE);
     }
     missing.into_iter().map(str::to_string).collect()
 }
@@ -538,11 +544,22 @@ pub struct AgentSessionHandle {
     /// When the session last did something (an event, a message): what the idle
     /// cleanup reads (`ChatManager::start_cleanup_task`).
     last_activity: std::sync::Mutex<Instant>,
+    /// When its tool calls really ran (`tool_clock`): a `tool_timing` follows each result.
+    tool_clock: Arc<super::tool_clock::ToolClock>,
 }
 
 impl AgentSessionHandle {
-    /// Persists (except transient events) and broadcasts one event.
-    pub async fn emit(&self, mut event: ChatEvent) {
+    /// Persists (except transient events) and broadcasts one event, then the timing
+    /// of the tool call it ends, if it ends one.
+    pub async fn emit(&self, event: ChatEvent) {
+        let timing = self.tool_clock.observe(&event, chrono::Utc::now());
+        self.emit_one(event).await;
+        if let Some(timing) = timing {
+            self.emit_one(timing).await;
+        }
+    }
+
+    async fn emit_one(&self, mut event: ChatEvent) {
         self.touch();
         // What only the session owner knows rides on `system_init`.
         if let ChatEvent::SystemInit {
@@ -1210,10 +1227,17 @@ impl AgentSessionHandle {
         } else {
             PermissionDecision::deny()
         };
-        self.session
-            .answer_permission(request_id, decision)
-            .await
-            .map_err(anyhow::Error::new)?;
+        // On the tool clock BEFORE the provider has it: a fast tool's result cannot
+        // overtake it.
+        // A second answer (double click, two tabs) the provider refuses takes back
+        // only its own mark, never the first answer's.
+        let mark = self
+            .tool_clock
+            .decided(request_id, allow, chrono::Utc::now());
+        if let Err(e) = self.session.answer_permission(request_id, decision).await {
+            self.tool_clock.undecided(request_id, mark);
+            return Err(anyhow::Error::new(e));
+        }
         self.emit(ChatEvent::PermissionDecision {
             id: request_id.to_string(),
             allow,
@@ -1443,6 +1467,7 @@ impl AgentRuntime {
             persisted_token: Mutex::new(session.resume_token().map(|t| t.to_wire())),
             cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_tools_cap: CANCEL_TOOLS_CAP,
+            tool_clock: super::tool_clock::ToolClock::for_session(session_id),
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
             cost_figure: super::session_record::CostFigure::of_kind(provider_kind),
             keeps_interrupted_turns: keeps_interrupted_turns(provider_kind),
@@ -1604,6 +1629,9 @@ pub(crate) mod fake {
         /// none at open, the one of the first `session_started` / `done` that carries
         /// one, the token's at resume.
         pub provider_session_id: StdMutex<Option<String>>,
+        /// When set, `answer_permission` waits for this signal before it returns: the
+        /// provider is slow to take the answer.
+        pub hold_answers: StdMutex<Option<Arc<tokio::sync::Notify>>>,
     }
 
     impl FakeState {
@@ -1683,11 +1711,18 @@ pub(crate) mod fake {
             request_id: &str,
             decision: PermissionDecision,
         ) -> Result<(), ProviderError> {
-            self.state
-                .permission_answers
-                .lock()
-                .unwrap()
-                .push((request_id.to_string(), decision));
+            let hold = self.state.hold_answers.lock().unwrap().clone();
+            if let Some(hold) = hold {
+                hold.notified().await;
+            }
+            let mut answers = self.state.permission_answers.lock().unwrap();
+            // As nexus does: a request is answered once.
+            if answers.iter().any(|(id, _)| id == request_id) {
+                return Err(ProviderError::invalid(format!(
+                    "no pending permission request {request_id}"
+                )));
+            }
+            answers.push((request_id.to_string(), decision));
             Ok(())
         }
         async fn answer_question(
@@ -1735,6 +1770,8 @@ pub(crate) mod fake {
         pub fail_open: Arc<StdMutex<Option<ProviderError>>>,
         /// Capabilities the sessions of this provider declare.
         pub caps: Arc<StdMutex<Capabilities>>,
+        /// The kind it says it is (Claude Code unless a test plays another).
+        pub kind: Arc<StdMutex<ProviderKind>>,
     }
 
     impl FakeProvider {
@@ -1743,6 +1780,7 @@ pub(crate) mod fake {
                 state: Arc::new(FakeState::default()),
                 fail_open: Arc::new(StdMutex::new(None)),
                 caps: Arc::new(StdMutex::new(Capabilities::none())),
+                kind: Arc::new(StdMutex::new(ProviderKind::ClaudeCode)),
             }
         }
         pub(crate) fn session(&self) -> Arc<FakeSession> {
@@ -1762,7 +1800,7 @@ pub(crate) mod fake {
             "claude-code"
         }
         fn kind(&self) -> ProviderKind {
-            ProviderKind::ClaudeCode
+            *self.kind.lock().unwrap()
         }
         async fn health(&self) -> ProviderHealth {
             ProviderHealth::ok(None)
@@ -1771,7 +1809,11 @@ pub(crate) mod fake {
             Ok(Vec::new())
         }
         fn capabilities(&self, _model: Option<&str>) -> Capabilities {
-            Capabilities::none()
+            // A local Claude Code takes MCP servers per session: the host gives it the
+            // PO server (`ChatManager::carries_per_session_mcp`).
+            let mut caps = Capabilities::none();
+            caps.per_session_mcp = true;
+            caps
         }
         async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
             if let Some(e) = self.fail_open.lock().unwrap().take() {
@@ -3134,5 +3176,164 @@ mod answered_tests {
         }
         assert_eq!(provider.state.turns_started.lock().unwrap().len(), 1);
         assert_eq!(host.seen(), [false]);
+    }
+}
+
+#[cfg(test)]
+mod tool_timing_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+    use crate::neo4j::traits::GraphStore as _;
+    use serde_json::json;
+
+    /// The provider is slow to take the answer and the tool is fast: its result is
+    /// emitted before the decision event. The answer was put on the clock before it
+    /// was handed over, so the timing still has it, and the run starts there.
+    #[tokio::test]
+    async fn a_permission_answer_is_timed_even_when_the_result_overtakes_its_event() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph.clone());
+        let provider = FakeProvider::new();
+        let sid = Uuid::new_v4().to_string();
+        let handle = runtime
+            .adopt(
+                &sid,
+                "claude-code",
+                provider.session(),
+                1,
+                "native",
+                json!({}),
+                None,
+            )
+            .await;
+        handle
+            .emit(ChatEvent::ToolUse {
+                id: "t1".into(),
+                tool: "Bash".into(),
+                input: json!({"command": "ls"}),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+            })
+            .await;
+        handle
+            .emit(ChatEvent::PermissionRequest {
+                id: "req-1".into(),
+                tool: "Bash".into(),
+                input: json!({"command": "ls"}),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+                tool_use_id: Some("t1".into()),
+            })
+            .await;
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *provider.state.hold_answers.lock().unwrap() = Some(Arc::clone(&hold));
+        let answering = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move { handle.answer_permission("req-1", true).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle
+            .emit(ChatEvent::ToolResult {
+                id: "t1".into(),
+                result: json!("a.rs"),
+                is_error: false,
+                parent_tool_use_id: None,
+            })
+            .await;
+        hold.notify_one();
+        answering.await.unwrap().unwrap();
+
+        let stored = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 50)
+            .await
+            .unwrap();
+        let types: Vec<&str> = stored.iter().map(|r| r.event_type.as_str()).collect();
+        let result_at = types.iter().position(|t| *t == "tool_result").unwrap();
+        assert_eq!(types[result_at + 1], "tool_timing", "{types:?}");
+        let timing: serde_json::Value = serde_json::from_str(&stored[result_at + 1].data).unwrap();
+        assert_eq!(timing["permission_outcome"], "allowed", "{timing}");
+        assert_eq!(
+            timing["run_started_at"], timing["permission_resolved_at"],
+            "{timing}"
+        );
+        assert!(timing["run_started_at"].is_f64(), "{timing}");
+        assert_eq!(
+            types.iter().filter(|t| **t == "tool_timing").count(),
+            1,
+            "one timing per call: {types:?}"
+        );
+    }
+
+    /// A double click (or two tabs): the provider refuses the second answer to the
+    /// same request. Its failure must not erase the first answer from the clock.
+    #[tokio::test]
+    async fn a_second_answer_refused_by_the_provider_keeps_the_first_on_the_clock() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph.clone());
+        let provider = FakeProvider::new();
+        let sid = Uuid::new_v4().to_string();
+        let handle = runtime
+            .adopt(
+                &sid,
+                "claude-code",
+                provider.session(),
+                1,
+                "native",
+                json!({}),
+                None,
+            )
+            .await;
+        handle
+            .emit(ChatEvent::ToolUse {
+                id: "t1".into(),
+                tool: "Bash".into(),
+                input: json!({"command": "ls"}),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+            })
+            .await;
+        handle
+            .emit(ChatEvent::PermissionRequest {
+                id: "req-1".into(),
+                tool: "Bash".into(),
+                input: json!({"command": "ls"}),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+                tool_use_id: Some("t1".into()),
+            })
+            .await;
+        handle.answer_permission("req-1", true).await.unwrap();
+        assert!(
+            handle.answer_permission("req-1", false).await.is_err(),
+            "the provider refuses a second answer"
+        );
+        handle
+            .emit(ChatEvent::ToolResult {
+                id: "t1".into(),
+                result: json!("a.rs"),
+                is_error: false,
+                parent_tool_use_id: None,
+            })
+            .await;
+
+        let stored = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 50)
+            .await
+            .unwrap();
+        let timing = stored
+            .iter()
+            .find(|r| r.event_type == "tool_timing")
+            .expect("a timing");
+        let timing: serde_json::Value = serde_json::from_str(&timing.data).unwrap();
+        assert_eq!(timing["permission_outcome"], "allowed", "{timing}");
+        assert!(timing["permission_resolved_at"].is_f64(), "{timing}");
+        assert_eq!(
+            timing["run_started_at"], timing["permission_resolved_at"],
+            "{timing}"
+        );
     }
 }
