@@ -26,6 +26,7 @@
 //!  intent rules)      learned preferences)
 //! ```
 
+use neural_routing_core::confidence::{normalized_entropy_confidence, top_margin};
 use serde::Serialize;
 
 use super::prompt_sections::{
@@ -246,64 +247,19 @@ pub struct RoutingDecisionRecord {
     pub used_embeddings: bool,
     /// Detected intent (if any).
     pub detected_intent: Option<String>,
+    /// Entropy confidence of `section_weights`: decisiveness of the distribution,
+    /// see [`RoutingDecision::trajectory_confidence`]. The heuristic sentinel when
+    /// there are no weights. Derived from the weights, never a copy of another field.
+    pub entropy_confidence: f64,
+    /// Top-1 minus top-2 of the normalized `section_weights` (`0.0` when there are none).
+    pub margin: f64,
 }
 
-/// Confidence of a routing decision, from the normalized Shannon entropy of
-/// its section-weight distribution: `1 - H(p) / ln(k)`.
-///
-/// Ported from Laya's `confidence_from_probs` (`laya/common.py`, Apache-2.0).
-///
-/// The weights are first normalized into a probability distribution, so callers
-/// may pass raw, unnormalized scores. The result is clamped to `[0, 1]`.
-///
-/// ## What this measures
-///
-/// **Decisiveness, not correctness.** A peaked distribution (one section clearly
-/// dominant) yields a confidence near `1.0`; a flat distribution (every section
-/// equally weighted, i.e. the router expressed no preference at all) yields the
-/// *minimum* confidence `0.0`. This is the whole point of the metric compared to
-/// the mean of the weights it replaces: the mean is a re-description of the
-/// decision, whereas entropy says how concentrated that decision is, on a scale
-/// that is comparable across queries even when `k` differs.
-///
-/// ## Edge cases
-///
-/// - `k < 2` → `1.0`. `ln(1) = 0` and `ln(0)` is undefined, so the normalization
-///   is not defined below two outcomes; with zero or one candidate there is no
-///   ambiguity to measure, hence maximal confidence.
-/// - All weights zero (or all negative, which is not a meaningful weight) → `0.0`.
-///   There is no distribution to speak of, and this is the limit of the uniform
-///   case, which is also the minimum.
-/// - `p = 0` terms contribute `0` to `H` (`lim p→0 of p·ln p = 0`), which also
-///   avoids evaluating `ln(0)`. Laya clips at `1e-12` for the same reason.
-fn confidence_from_weights(weights: &[f32]) -> f64 {
-    let k = weights.len();
-    if k < 2 {
-        return 1.0;
-    }
-
-    // Negative weights are not meaningful here (0.0 = exclude is the floor);
-    // clamp them so the normalization cannot produce a negative "probability".
-    let clamped = || weights.iter().map(|w| f64::from(*w).max(0.0));
-
-    let total: f64 = clamped().sum();
-    if !total.is_finite() || total <= 0.0 {
-        return 0.0;
-    }
-
-    let entropy: f64 = clamped()
-        .map(|w| {
-            let p = w / total;
-            if p > 0.0 {
-                -p * p.ln()
-            } else {
-                0.0
-            }
-        })
-        .sum();
-
-    (1.0 - entropy / (k as f64).ln()).clamp(0.0, 1.0)
-}
+// The confidence of a routing decision is the normalized Shannon entropy of its
+// section-weight distribution, `1 - H(p) / ln(k)`, computed by the one shared
+// implementation in `neural_routing_core::confidence` (edge cases documented there:
+// `k < 2` is `1.0`, a flat distribution is `0.0`). It measures decisiveness, not
+// correctness: a peaked distribution is near `1.0`, a flat one is `0.0`.
 
 /// Sentinel emitted as `confidence` when the router produced no weight
 /// distribution at all — i.e. the pure-heuristic path, [`HeuristicRouter`].
@@ -311,7 +267,7 @@ fn confidence_from_weights(weights: &[f32]) -> f64 {
 /// **This is a sentinel meaning "not measurable", not a measurement.** The
 /// heuristic router is a deterministic rule set: it emits no `SectionHint`s, so
 /// there is no distribution over sections and the normalized entropy of
-/// [`confidence_from_weights`] is simply undefined here. No value in `[0, 1]`
+/// [`normalized_entropy_confidence`] is simply undefined here. No value in `[0, 1]`
 /// would be a *measurement* of this decision.
 ///
 /// `0.5` is retained for two concrete reasons:
@@ -322,7 +278,7 @@ fn confidence_from_weights(weights: &[f32]) -> f64 {
 ///   record sitting next to it says `alternatives_count = 39`, which would make
 ///   "39 alternatives, confidence 1.0" a self-contradictory row. Telling a caller
 ///   that a coin flip is a certainty is precisely the failure mode the bound in
-///   [`confidence_from_weights`] exists to prevent.
+///   [`normalized_entropy_confidence`] exists to prevent.
 /// - It keeps the field comparable with the trajectories already collected under
 ///   the previous implementation, which emitted the same value on this path.
 ///
@@ -336,14 +292,14 @@ impl RoutingDecision {
     /// collector.
     ///
     /// With section weights, this is the normalized Shannon entropy of their
-    /// distribution — see [`confidence_from_weights`], including the caveat that
+    /// distribution — see [`normalized_entropy_confidence`], including the caveat that
     /// it measures decisiveness, not correctness.
     ///
     /// With no section weights at all (the [`HeuristicRouter`] path) there is no
     /// distribution to measure, so this returns
     /// [`HEURISTIC_CONFIDENCE_SENTINEL`] rather than routing an empty slice
     /// through the entropy formula. The two cases are deliberately kept apart:
-    /// `k < 2` inside [`confidence_from_weights`] means "a real distribution with
+    /// `k < 2` inside [`normalized_entropy_confidence`] means "a real distribution with
     /// a single outcome", which genuinely has zero entropy; an empty
     /// `section_hints` means "no distribution was ever produced", which is not
     /// the same claim.
@@ -351,8 +307,20 @@ impl RoutingDecision {
         if self.section_hints.is_empty() {
             return HEURISTIC_CONFIDENCE_SENTINEL;
         }
-        let weights: Vec<f32> = self.section_hints.iter().map(|h| h.weight).collect();
-        confidence_from_weights(&weights)
+        normalized_entropy_confidence(&self.hint_weights())
+    }
+
+    /// Top-1 minus top-2 of the normalized section weights: how clearly the router
+    /// preferred its first section over the second. `0.0` when there are no weights.
+    pub fn margin(&self) -> f64 {
+        top_margin(&self.hint_weights())
+    }
+
+    fn hint_weights(&self) -> Vec<f64> {
+        self.section_hints
+            .iter()
+            .map(|h| f64::from(h.weight))
+            .collect()
     }
 
     /// Convert this routing decision into a trajectory-compatible record.
@@ -375,6 +343,8 @@ impl RoutingDecision {
             scaffolding_level: ctx.scaffolding_level,
             used_embeddings: ctx.message_embedding.is_some(),
             detected_intent: ctx.detected_intent.clone(),
+            entropy_confidence: self.trajectory_confidence(),
+            margin: self.margin(),
         }
     }
 
@@ -388,25 +358,43 @@ impl RoutingDecision {
         collector: &neural_routing_runtime::TrajectoryCollector,
     ) {
         let record = self.to_trajectory_record(ctx);
-        let params = serde_json::to_value(&record).unwrap_or_default();
+        collector.record_decision(select_sections_decision_record(
+            &record,
+            session_id,
+            ctx.message_embedding.clone().unwrap_or_default(),
+        ));
+    }
+}
 
-        collector.record_decision(neural_routing_runtime::DecisionRecord {
-            session_id: session_id.to_string(),
-            context_embedding: vec![], // Will be computed by VectorBuilder
-            action_type: "routing.select_sections".to_string(),
-            action_params: params,
-            alternatives_count: PromptSectionId::ALL.len(),
-            chosen_index: 0,
-            confidence: self.trajectory_confidence(),
-            tool_usages: vec![],
-            touched_entities: vec![],
-            timestamp_ms: 0, // Collector fills this
-            query_embedding: ctx.message_embedding.clone().unwrap_or_default(),
-            node_features: vec![],
-            protocol_run_id: None,
-            protocol_state: None,
-            outcome: None,
-        });
+/// The `routing.select_sections` decision of a routing record, as the trajectory
+/// collector stores it. The single emission path: the chat manager and
+/// [`RoutingDecision::emit_to_trajectory`] both build their record here.
+///
+/// - `confidence` is the record's entropy confidence (never the mean of its weights).
+/// - `alternatives_count` is the number of prompt sections the router chooses among
+///   (`PromptSectionId::ALL`), not the number it selected.
+/// - `action_params` is the whole record, so the entropy and the margin travel with it.
+pub fn select_sections_decision_record(
+    record: &RoutingDecisionRecord,
+    session_id: &str,
+    query_embedding: Vec<f32>,
+) -> neural_routing_runtime::DecisionRecord {
+    neural_routing_runtime::DecisionRecord {
+        session_id: session_id.to_string(),
+        context_embedding: vec![], // Will be computed by VectorBuilder
+        action_type: "routing.select_sections".to_string(),
+        action_params: serde_json::to_value(record).unwrap_or_default(),
+        alternatives_count: PromptSectionId::ALL.len(),
+        chosen_index: 0,
+        confidence: record.entropy_confidence,
+        tool_usages: vec![],
+        touched_entities: vec![],
+        timestamp_ms: 0, // Collector fills this
+        query_embedding,
+        node_features: vec![],
+        protocol_run_id: None,
+        protocol_state: None,
+        outcome: None,
     }
 }
 
@@ -948,8 +936,12 @@ mod tests {
             scaffolding_level: 3,
             used_embeddings: true,
             detected_intent: Some("code".into()),
+            entropy_confidence: 1.0,
+            margin: 1.0,
         };
         let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["entropy_confidence"], 1.0);
+        assert_eq!(json["margin"], 1.0);
         assert_eq!(json["scaffolding_level"], 3);
         assert_eq!(json["used_embeddings"], true);
         assert_eq!(json["selected_sections"].as_array().unwrap().len(), 2);
@@ -1048,7 +1040,13 @@ mod tests {
         );
     }
 
-    // ── confidence_from_weights — normalized Shannon entropy ────────────
+    // ── entropy confidence over the section weights ────────────────────
+
+    /// The shared entropy confidence, over the router's `f32` weights.
+    fn confidence_of(weights: &[f32]) -> f64 {
+        let weights: Vec<f64> = weights.iter().map(|w| f64::from(*w)).collect();
+        normalized_entropy_confidence(&weights)
+    }
 
     fn hints(weights: &[f32]) -> Vec<SectionHint> {
         PromptSectionId::ALL
@@ -1067,15 +1065,15 @@ mod tests {
     fn test_confidence_k_below_two_is_one() {
         // ln(1) = 0 → the normalization is undefined; with 0 or 1 candidate
         // there is nothing to hesitate about.
-        assert_eq!(confidence_from_weights(&[]), 1.0);
-        assert_eq!(confidence_from_weights(&[0.7]), 1.0);
-        assert_eq!(confidence_from_weights(&[0.0]), 1.0);
+        assert_eq!(confidence_of(&[]), 1.0);
+        assert_eq!(confidence_of(&[0.7]), 1.0);
+        assert_eq!(confidence_of(&[0.0]), 1.0);
     }
 
     #[test]
     fn test_confidence_all_zero_weights_is_zero() {
         // No distribution at all — treated as the uniform limit, i.e. minimal.
-        assert_eq!(confidence_from_weights(&[0.0, 0.0, 0.0]), 0.0);
+        assert_eq!(confidence_of(&[0.0, 0.0, 0.0]), 0.0);
     }
 
     #[test]
@@ -1088,7 +1086,7 @@ mod tests {
             vec![0.3, 0.3, 0.3, 0.3],
             vec![7.5, 7.5, 7.5, 7.5, 7.5],
         ] {
-            let c = confidence_from_weights(&weights);
+            let c = confidence_of(&weights);
             assert!(
                 c < 1e-9,
                 "uniform weights {:?} must give minimal confidence, got {c}",
@@ -1099,19 +1097,19 @@ mod tests {
 
     #[test]
     fn test_confidence_uniform_is_lower_than_any_skew() {
-        let uniform = confidence_from_weights(&[1.0, 1.0, 1.0, 1.0]);
-        let slight = confidence_from_weights(&[1.0, 1.0, 1.0, 1.2]);
-        let strong = confidence_from_weights(&[1.0, 0.05, 0.05, 0.05]);
+        let uniform = confidence_of(&[1.0, 1.0, 1.0, 1.0]);
+        let slight = confidence_of(&[1.0, 1.0, 1.0, 1.2]);
+        let strong = confidence_of(&[1.0, 0.05, 0.05, 0.05]);
         assert!(uniform < slight, "{uniform} !< {slight}");
         assert!(slight < strong, "{slight} !< {strong}");
     }
 
     #[test]
     fn test_confidence_single_dominant_weight_is_near_one() {
-        let c = confidence_from_weights(&[1.0, 0.0, 0.0, 0.0, 0.0]);
+        let c = confidence_of(&[1.0, 0.0, 0.0, 0.0, 0.0]);
         assert!((c - 1.0).abs() < 1e-12, "one-hot must be 1.0, got {c}");
 
-        let c = confidence_from_weights(&[1.0, 0.001, 0.001, 0.001]);
+        let c = confidence_of(&[1.0, 0.001, 0.001, 0.001]);
         assert!(c > 0.95, "near-one-hot should be close to 1, got {c}");
     }
 
@@ -1122,10 +1120,10 @@ mod tests {
             let h = -(0.75_f64 * 0.75_f64.ln() + 0.25_f64 * 0.25_f64.ln());
             1.0 - h / 2.0_f64.ln()
         };
-        let c = confidence_from_weights(&[0.75, 0.25]);
+        let c = confidence_of(&[0.75, 0.25]);
         assert!((c - expected).abs() < 1e-12, "{c} != {expected}");
         // Scale invariance: only the distribution matters, not the magnitude.
-        let scaled = confidence_from_weights(&[300.0, 100.0]);
+        let scaled = confidence_of(&[300.0, 100.0]);
         assert!((scaled - expected).abs() < 1e-9, "{scaled} != {expected}");
     }
 
@@ -1141,7 +1139,7 @@ mod tests {
             vec![1e-30, 1e-30, 1e-30],
         ];
         for weights in cases {
-            let c = confidence_from_weights(&weights);
+            let c = confidence_of(&weights);
             assert!(
                 (0.0..=1.0).contains(&c),
                 "confidence {c} out of [0,1] for {weights:?}"
@@ -1154,7 +1152,7 @@ mod tests {
         // Pure-heuristic path: no distribution at all, so the entropy formula is
         // not applicable — an explicit, named sentinel is emitted instead. It
         // must stay below any plausible confidence gate, unlike the `k < 2`
-        // branch of `confidence_from_weights`, which is about a real one-outcome
+        // branch of `normalized_entropy_confidence`, which is about a real one-outcome
         // distribution.
         let router = HeuristicRouter;
         let decision = router.route(&RoutingContext::default());
@@ -1169,10 +1167,7 @@ mod tests {
             "the heuristic sentinel must not pass a confidence gate"
         );
         // Explicitly NOT the value the empty slice would get from the formula.
-        assert_ne!(
-            decision.trajectory_confidence(),
-            confidence_from_weights(&[])
-        );
+        assert_ne!(decision.trajectory_confidence(), confidence_of(&[]));
     }
 
     #[test]
@@ -1190,5 +1185,57 @@ mod tests {
             section_hints: hints(&[1.0, 0.0, 0.0]),
         };
         assert!((decision.trajectory_confidence() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_select_sections_record_carries_entropy_not_mean_weight() {
+        // Uniform weights: the emitted confidence is the entropy confidence, 0.
+        // The mean of these weights (0.5) is what the manager used to emit.
+        let decision = RoutingDecision {
+            sections: vec![],
+            tool_groups: vec![],
+            section_hints: hints(&[0.5, 0.5, 0.5]),
+        };
+        let record = decision.to_trajectory_record(&RoutingContext::default());
+        let emitted = select_sections_decision_record(&record, "session-1", vec![]);
+        assert!(
+            emitted.confidence < 1e-9,
+            "uniform weights must give entropy confidence 0, not their mean; got {}",
+            emitted.confidence
+        );
+        assert!(
+            emitted.action_params["entropy_confidence"]
+                .as_f64()
+                .unwrap()
+                < 1e-9
+        );
+        assert_eq!(emitted.action_params["margin"].as_f64(), Some(0.0));
+        // The alternatives are every section the router chooses among, not the selected ones.
+        assert_eq!(emitted.alternatives_count, PromptSectionId::ALL.len());
+        assert_eq!(emitted.action_type, "routing.select_sections");
+    }
+
+    #[test]
+    fn test_select_sections_record_margin_is_one_for_a_dominant_section() {
+        let decision = RoutingDecision {
+            sections: vec![],
+            tool_groups: vec![],
+            section_hints: hints(&[1.0, 0.0, 0.0]),
+        };
+        let record = decision.to_trajectory_record(&RoutingContext::default());
+        assert!((record.margin - 1.0).abs() < 1e-12);
+        assert!((record.entropy_confidence - 1.0).abs() < 1e-12);
+        let emitted = select_sections_decision_record(&record, "session-1", vec![]);
+        assert_eq!(emitted.action_params["margin"].as_f64(), Some(1.0));
+    }
+
+    #[test]
+    fn test_margin_is_zero_without_weights() {
+        let decision = RoutingDecision {
+            sections: vec![],
+            tool_groups: vec![],
+            section_hints: vec![],
+        };
+        assert_eq!(decision.margin(), 0.0);
     }
 }

@@ -7,6 +7,7 @@
 //! - `Neo4jTrajectoryStore` — concrete storage implementation
 
 pub mod augmentation;
+pub mod confidence;
 pub mod error;
 pub mod mcts;
 pub mod migration;

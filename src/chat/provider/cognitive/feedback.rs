@@ -33,6 +33,7 @@
 //! [`TrajectorySink`]; [`CollectorSink`] feeds the neural-routing collector
 //! with a `routing.select_model` decision record.
 
+use neural_routing_core::confidence::{normalized_entropy_confidence, top_margin};
 use uuid::Uuid;
 
 use super::decision::{CognitiveDecision, DecisionOutcome};
@@ -143,32 +144,27 @@ pub trait TrajectorySink: Send + Sync {
     fn record(&self, decision: &CognitiveDecision, reward: f64);
 }
 
-/// Confidence of a decision: `1 - H(p) / ln(k)` over the normalised scores of
-/// its scored alternatives. 1 when one option dominates, 0 when they are
-/// indistinguishable, and 0 when fewer than two were scored.
-pub fn decision_confidence(decision: &CognitiveDecision) -> f64 {
-    let scores: Vec<f64> = decision
+/// The finite scores of a decision's scored alternatives.
+fn scored_alternatives(decision: &CognitiveDecision) -> Vec<f64> {
+    decision
         .alternatives
         .iter()
         .filter_map(|a| a.score)
         .filter(|s| s.is_finite())
-        .map(|s| s.max(0.0))
-        .collect();
-    let k = scores.len();
-    if k < 2 {
+        .collect()
+}
+
+/// Confidence of a decision: the shared normalised-entropy confidence
+/// (`neural_routing_core::confidence`) over its scored alternatives. 1 when one
+/// option dominates, 0 when they are indistinguishable. Fewer than two scored
+/// alternatives means nothing was compared, which is 0 here (the routing side
+/// reads a single outcome as 1, see `RoutingDecision::trajectory_confidence`).
+pub fn decision_confidence(decision: &CognitiveDecision) -> f64 {
+    let scores = scored_alternatives(decision);
+    if scores.len() < 2 {
         return 0.0;
     }
-    let sum: f64 = scores.iter().sum();
-    if sum <= 0.0 {
-        return 0.0;
-    }
-    let entropy: f64 = scores
-        .iter()
-        .map(|s| s / sum)
-        .filter(|p| *p > 0.0)
-        .map(|p| -p * p.ln())
-        .sum();
-    (1.0 - entropy / (k as f64).ln()).clamp(0.0, 1.0)
+    normalized_entropy_confidence(&scores)
 }
 
 /// Sends closed decisions to the neural-routing `TrajectoryCollector`.
@@ -215,6 +211,8 @@ pub fn trajectory_record(
             "explored": decision.explored,
             "applied": decision.applied,
             "reward": reward,
+            "entropy_confidence": decision_confidence(decision),
+            "margin": top_margin(&scored_alternatives(decision)),
         }),
         alternatives_count: decision.alternatives.len(),
         chosen_index: 0,
@@ -746,6 +744,13 @@ mod tests {
         );
         assert_eq!(record.action_params["explored"], true);
         assert_eq!(record.action_params["applied"], true);
+        // Entropy and margin travel with the record, next to the confidence.
+        assert!(close(
+            record.action_params["entropy_confidence"].as_f64().unwrap(),
+            record.confidence
+        ));
+        // Scores 0.8 / 0.2 normalise to a gap of 0.6.
+        assert!(close(record.action_params["margin"].as_f64().unwrap(), 0.6));
         let session = Uuid::new_v4();
         d.session_id = Some(session);
         assert_eq!(trajectory_record(&d, 0.7).session_id, session.to_string());

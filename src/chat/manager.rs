@@ -4400,30 +4400,13 @@ impl ChatManager {
         {
             let tc_guard = self.trajectory_collector.read().unwrap();
             if let (Some(ref collector), Some(sid)) = (&*tc_guard, session_id) {
-                // Emit routing decision directly to trajectory collector
-                let params = serde_json::to_value(&routing_record).unwrap_or_default();
-                collector.record_decision(neural_routing_runtime::DecisionRecord {
-                    session_id: sid.to_string(),
-                    context_embedding: vec![],
-                    action_type: "routing.select_sections".to_string(),
-                    action_params: params,
-                    alternatives_count: routing_record.selected_sections.len(),
-                    chosen_index: 0,
-                    confidence: if routing_record.section_weights.is_empty() {
-                        0.5
-                    } else {
-                        let sum: f32 = routing_record.section_weights.iter().map(|(_, w)| w).sum();
-                        (sum / routing_record.section_weights.len() as f32) as f64
-                    },
-                    tool_usages: vec![],
-                    touched_entities: vec![],
-                    timestamp_ms: 0,
-                    query_embedding: vec![],
-                    node_features: vec![],
-                    protocol_run_id: None,
-                    protocol_state: None,
-                    outcome: None,
-                });
+                // Emit routing decision to trajectory collector: the shared emission path
+                // (entropy confidence over all section alternatives, margin in action_params).
+                collector.record_decision(crate::chat::routing::select_sections_decision_record(
+                    &routing_record,
+                    sid,
+                    Vec::new(),
+                ));
                 debug!(
                     "[routing] Emitted routing decision to trajectory: {} sections, {} tool groups",
                     routing_record.selected_sections.len(),
