@@ -3466,3 +3466,206 @@ mod parity {
         assert!(!seen[1].0.contains("anchor_context"), "{}", seen[1].0);
     }
 }
+
+// ============================================================================
+// The resume token of a Claude Code session on the agent engine
+// ============================================================================
+
+/// Claude Code on the agent engine, the REAL nexus façade against `fake_claude`: the CLI
+/// names its session only with its first `system/init` (and each `result`), never at
+/// open. The token must still reach the graph, and a session resumed after a restart
+/// must give the CLI `--resume <that id>` — not open a blank conversation.
+mod claude_code_resume_token {
+    use async_trait::async_trait;
+    use nexus_claude::agent::{
+        AgentProvider, AgentSession, Capabilities, ModelInfo, ProviderError, ProviderHealth,
+        ProviderKind, ResumeToken, SessionSpec,
+    };
+    use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
+
+    use super::*;
+
+    const CLI_SESSION: &str = "cli-session-7f3a";
+
+    /// The Claude Code provider of nexus, its CLI the fake, which gets its transcript and
+    /// its recording file through the session's environment.
+    #[derive(Clone)]
+    struct FakeCli {
+        inner: Arc<ClaudeCodeProvider>,
+        env: Vec<(String, String)>,
+    }
+
+    impl FakeCli {
+        fn tap(&self, mut spec: SessionSpec) -> SessionSpec {
+            spec.env.set.extend(self.env.iter().cloned());
+            spec
+        }
+    }
+
+    #[async_trait]
+    impl AgentProvider for FakeCli {
+        fn id(&self) -> &str {
+            "claude-code"
+        }
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::ClaudeCode
+        }
+        async fn health(&self) -> ProviderHealth {
+            ProviderHealth::ok(None)
+        }
+        async fn catalog(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            self.inner.catalog().await
+        }
+        fn capabilities(&self, model: Option<&str>) -> Capabilities {
+            self.inner.capabilities(model)
+        }
+        async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            self.inner.open(self.tap(spec)).await
+        }
+        async fn resume(
+            &self,
+            spec: SessionSpec,
+            token: ResumeToken,
+        ) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            self.inner.resume(self.tap(spec), token).await
+        }
+    }
+
+    impl super::super::agent_runtime::ProviderSource for FakeCli {
+        fn get(&self, provider_id: &str) -> Option<Arc<dyn AgentProvider>> {
+            (provider_id == "claude-code").then(|| Arc::new(self.clone()) as Arc<dyn AgentProvider>)
+        }
+    }
+
+    /// One turn as the CLI plays it: it reads the user's message, opens with
+    /// `system/init` (its session id, the first time anyone hears of it), answers, ends
+    /// with a `result`, and stays up until stdin closes. Both processes (open, resume)
+    /// replay it.
+    fn cli_turn() -> String {
+        let lines = [
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 15000}),
+            json!({"op": "emit_json", "json": {
+                "type": "system", "subtype": "init", "session_id": CLI_SESSION,
+                "model": "fake-claude", "cwd": ".", "tools": ["Read"],
+                "permissionMode": "default", "apiKeySource": "none"}}),
+            json!({"op": "emit_json", "json": {
+                "type": "assistant", "message": {"id": "msg_fake", "type": "message",
+                "role": "assistant", "model": "fake-claude",
+                "content": [{"type": "text", "text": "hello"}], "stop_reason": "end_turn"}}}),
+            json!({"op": "emit_json", "json": {
+                "type": "result", "subtype": "success", "duration_ms": 12,
+                "duration_api_ms": 7, "is_error": false, "num_turns": 1,
+                "session_id": CLI_SESSION, "total_cost_usd": 0.0001,
+                "usage": {"input_tokens": 3, "output_tokens": 5}, "result": "hello"}}),
+            json!({"op": "wait_eof", "timeout_ms": 15000, "optional": true}),
+        ];
+        lines.iter().map(|l| format!("{l}\n")).collect()
+    }
+
+    async fn stored_token(graph: &MockGraphStore, sid: &str) -> Option<String> {
+        graph
+            .get_chat_session(Uuid::parse_str(sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .resume_token
+    }
+
+    #[tokio::test]
+    async fn a_claude_code_session_resumes_the_cli_session_it_learned_after_open() {
+        let cli = fake_bin("fake_claude");
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let argv_out = dir.path().join("argv.json");
+        std::fs::write(&transcript, cli_turn()).unwrap();
+        let mut config = ClaudeCodeConfig::default();
+        config.cli_path = Some(cli);
+        let provider = FakeCli {
+            inner: Arc::new(ClaudeCodeProvider::new(config)),
+            env: vec![
+                (
+                    "FAKE_CLAUDE_TRANSCRIPT".into(),
+                    transcript.display().to_string(),
+                ),
+                (
+                    "FAKE_CLAUDE_ARGS_OUT".into(),
+                    argv_out.display().to_string(),
+                ),
+            ],
+        };
+        let graph = Arc::new(MockGraphStore::new());
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
+            .with_provider_source(Arc::new(provider));
+
+        let mut req = request(None, None, "default");
+        req.message = "first".into();
+        req.cwd = dir.path().display().to_string();
+        let created = manager.create_session(&req).await.unwrap();
+        let sid = created.session_id;
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+
+        // The CLI named its session during the turn: the graph knows it now.
+        let token = stored_token(&graph, &sid)
+            .await
+            .expect("the resume token is persisted once the CLI named its session");
+        let token = ResumeToken::from_wire(&token).unwrap();
+        assert_eq!(token.data()["session_id"], CLI_SESSION);
+
+        // A restart: the live session is gone, the next message resumes it.
+        manager.close_session(&sid).await.unwrap();
+        assert!(!manager.agent_runtime.owns(&sid).await);
+        std::fs::remove_file(&argv_out).unwrap();
+        manager.resume_session(&sid, "second", None).await.unwrap();
+        for _ in 0..200 {
+            if argv_out.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let recorded: Value =
+            serde_json::from_str(&std::fs::read_to_string(&argv_out).expect("argv recorded"))
+                .unwrap();
+        let argv: Vec<String> = recorded["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.as_str().map(str::to_string))
+            .collect();
+        let resume_at = argv
+            .iter()
+            .position(|a| a == "--resume")
+            .unwrap_or_else(|| panic!("the resumed CLI gets --resume: {argv:?}"));
+        assert_eq!(
+            argv.get(resume_at + 1).map(String::as_str),
+            Some(CLI_SESSION)
+        );
+        // The resumed CLI plays the second turn (it may end before anyone subscribes).
+        let uuid = Uuid::parse_str(&sid).unwrap();
+        let mut results = 0;
+        for _ in 0..400 {
+            results = graph
+                .get_chat_events(uuid, 0, 500)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| e.event_type == "result")
+                .count();
+            if results >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(results, 2, "the resumed session answered its turn");
+        manager.close_session(&sid).await.unwrap();
+    }
+}
