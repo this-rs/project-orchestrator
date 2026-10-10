@@ -144,6 +144,17 @@ pub struct MockGraphStore {
     /// store that never answers, for the post-stream tests.
     pub stall_chat_events_of: std::sync::Mutex<std::collections::HashSet<String>>,
     chat_events_released: tokio::sync::Notify,
+    /// Failure injection: writes (put / delete) of these setting keys error.
+    pub fail_llm_setting_writes_of: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Failure injection: reads of these setting keys error.
+    pub fail_llm_setting_reads_of: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Stall injection: deletes of these setting keys do not return until
+    /// [`Self::release_llm_setting_deletes`] — a slow store.
+    pub stall_llm_setting_deletes_of: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Stall injection: reads of these setting keys do not return until
+    /// [`Self::release_llm_setting_reads`] — a store read that never answers.
+    pub stall_llm_setting_reads_of: std::sync::Mutex<std::collections::HashSet<String>>,
+    llm_setting_writes_released: tokio::sync::Notify,
     /// Triggers
     pub triggers: RwLock<HashMap<Uuid, crate::runner::Trigger>>,
     /// Trigger firings
@@ -359,6 +370,11 @@ impl MockGraphStore {
             fail_get_plan: std::sync::Mutex::new(std::collections::HashSet::new()),
             stall_chat_events_of: std::sync::Mutex::new(std::collections::HashSet::new()),
             chat_events_released: tokio::sync::Notify::new(),
+            fail_llm_setting_writes_of: std::sync::Mutex::new(std::collections::HashSet::new()),
+            fail_llm_setting_reads_of: std::sync::Mutex::new(std::collections::HashSet::new()),
+            stall_llm_setting_deletes_of: std::sync::Mutex::new(std::collections::HashSet::new()),
+            stall_llm_setting_reads_of: std::sync::Mutex::new(std::collections::HashSet::new()),
+            llm_setting_writes_released: tokio::sync::Notify::new(),
             triggers: RwLock::new(HashMap::new()),
             trigger_firings: RwLock::new(HashMap::new()),
             plan_tasks: RwLock::new(HashMap::new()),
@@ -661,6 +677,84 @@ impl MockGraphStore {
             s.remove(event_type);
         }
         self.chat_events_released.notify_waiters();
+    }
+
+    /// Make every write (put / delete) of the setting `key` fail (`on`) or not.
+    pub fn fail_llm_setting_writes(&self, key: &str, on: bool) {
+        if let Ok(mut s) = self.fail_llm_setting_writes_of.lock() {
+            if on {
+                s.insert(key.to_string());
+            } else {
+                s.remove(key);
+            }
+        }
+    }
+
+    /// Make every read of the setting `key` fail (`on`) or not.
+    pub fn fail_llm_setting_reads(&self, key: &str, on: bool) {
+        if let Ok(mut s) = self.fail_llm_setting_reads_of.lock() {
+            if on {
+                s.insert(key.to_string());
+            } else {
+                s.remove(key);
+            }
+        }
+    }
+
+    /// Make every delete of the setting `key` hang until
+    /// [`Self::release_llm_setting_deletes`].
+    pub fn stall_llm_setting_deletes(&self, key: &str) {
+        if let Ok(mut s) = self.stall_llm_setting_deletes_of.lock() {
+            s.insert(key.to_string());
+        }
+    }
+
+    /// Lift [`Self::stall_llm_setting_deletes`]: the deletes it held go through.
+    pub fn release_llm_setting_deletes(&self, key: &str) {
+        if let Ok(mut s) = self.stall_llm_setting_deletes_of.lock() {
+            s.remove(key);
+        }
+        self.llm_setting_writes_released.notify_waiters();
+    }
+
+    /// Make every read of the setting `key` hang until
+    /// [`Self::release_llm_setting_reads`].
+    pub fn stall_llm_setting_reads(&self, key: &str) {
+        if let Ok(mut s) = self.stall_llm_setting_reads_of.lock() {
+            s.insert(key.to_string());
+        }
+    }
+
+    /// Lift [`Self::stall_llm_setting_reads`]: the reads it held go through.
+    pub fn release_llm_setting_reads(&self, key: &str) {
+        if let Ok(mut s) = self.stall_llm_setting_reads_of.lock() {
+            s.remove(key);
+        }
+        self.llm_setting_writes_released.notify_waiters();
+    }
+
+    /// The stall (deletes only) / failure injected on writes of the setting `key`.
+    async fn llm_setting_write_gate(&self, key: &str, delete: bool) -> Result<()> {
+        loop {
+            let released = self.llm_setting_writes_released.notified();
+            let stalled = delete
+                && self
+                    .stall_llm_setting_deletes_of
+                    .lock()
+                    .is_ok_and(|s| s.contains(key));
+            if !stalled {
+                break;
+            }
+            released.await;
+        }
+        if self
+            .fail_llm_setting_writes_of
+            .lock()
+            .is_ok_and(|s| s.contains(key))
+        {
+            anyhow::bail!("mock: injected failure of the write of setting {key}");
+        }
+        Ok(())
     }
 
     /// Names of the store reads performed so far (see `read_log`).
@@ -7919,6 +8013,24 @@ impl GraphStore for MockGraphStore {
     }
 
     async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>> {
+        loop {
+            let released = self.llm_setting_writes_released.notified();
+            let stalled = self
+                .stall_llm_setting_reads_of
+                .lock()
+                .is_ok_and(|s| s.contains(key));
+            if !stalled {
+                break;
+            }
+            released.await;
+        }
+        if self
+            .fail_llm_setting_reads_of
+            .lock()
+            .is_ok_and(|s| s.contains(key))
+        {
+            anyhow::bail!("mock: injected failure of the read of setting {key}");
+        }
         Ok(self
             .llm_settings
             .read()
@@ -7934,6 +8046,7 @@ impl GraphStore for MockGraphStore {
         {
             anyhow::bail!("mock: the send journal cannot be written");
         }
+        self.llm_setting_write_gate(key, false).await?;
         self.llm_settings
             .write()
             .await
@@ -7941,6 +8054,7 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
     async fn delete_llm_setting(&self, scope: &str, key: &str) -> Result<bool> {
+        self.llm_setting_write_gate(key, true).await?;
         Ok(self
             .llm_settings
             .write()

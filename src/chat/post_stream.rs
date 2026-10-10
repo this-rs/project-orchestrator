@@ -123,6 +123,49 @@ where
     })
 }
 
+/// Wait for a write started by [`spawn_write`], up to `budget`. Past it the
+/// caller goes on and gets the `error` event (`persistence_delayed`, `reason` =
+/// the step) its clients must see; the write itself keeps running and lands when
+/// the store answers ([`spawn_write`] logs it, late or failed).
+pub(crate) async fn await_write(
+    session_id: &str,
+    step: &'static str,
+    budget: Duration,
+    write: JoinHandle<()>,
+) -> Option<ChatEvent> {
+    match tokio::time::timeout(budget, write).await {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => {
+            warn!(
+                session_id = %session_id,
+                step,
+                "store write task ended abnormally: {e}"
+            );
+            None
+        }
+        Err(_) => {
+            warn!(
+                session_id = %session_id,
+                step,
+                budget_ms = budget.as_millis() as u64,
+                "store write still running past its budget: the turn goes on, the write too"
+            );
+            Some(ChatEvent::Error {
+                message: format!(
+                    "Saving this conversation ({step}) is taking longer than {}s. \
+                     It will be saved when the database answers; until then a reload \
+                     may not show the latest messages.",
+                    budget.as_secs()
+                ),
+                parent_tool_use_id: None,
+                code: Some(PERSISTENCE_DELAYED_CODE.to_string()),
+                reason: Some(step.to_string()),
+                index: None,
+            })
+        }
+    }
+}
+
 /// The budget of the post-stream steps of one turn, and where an overrun is
 /// reported: the server log (always, with the step) and the clients (an
 /// `error` event whose `code` says what happened and whose `reason` names
@@ -165,31 +208,10 @@ impl StepBudget {
     /// the turn goes on and the clients learn that the write is late; the
     /// write itself keeps running.
     pub async fn wait_for_write(&self, step: &'static str, write: JoinHandle<()>) {
-        match tokio::time::timeout(self.budget, write).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!(
-                session_id = %self.session_id,
-                step,
-                "store write task ended abnormally: {e}"
-            ),
-            Err(_) => {
-                warn!(
-                    session_id = %self.session_id,
-                    step,
-                    budget_ms = self.budget.as_millis() as u64,
-                    "store write still running past its budget: the turn goes on, the write too"
-                );
-                self.report(
-                    step,
-                    PERSISTENCE_DELAYED_CODE,
-                    format!(
-                        "Saving this conversation ({step}) is taking longer than {}s. \
-                         It will be saved when the database answers; until then a reload \
-                         may not show the latest messages.",
-                        self.budget.as_secs()
-                    ),
-                );
-            }
+        if let Some(ChatEvent::Error { message, .. }) =
+            await_write(&self.session_id, step, self.budget, write).await
+        {
+            self.report(step, PERSISTENCE_DELAYED_CODE, message);
         }
     }
 
@@ -327,71 +349,20 @@ impl PostStreamHandler {
     /// Re-inject project context after compaction so the LLM regains awareness.
     pub async fn handle_post_compaction(&self, needs_injection: bool) {
         if needs_injection && !self.interrupt_flag.load(Ordering::SeqCst) {
-            info!(
-                "Post-compaction injection triggered for session {}",
-                self.session_id
-            );
-
-            let build_start = std::time::Instant::now();
-            let builder =
-                super::compaction_context::CompactionContextBuilder::new(self.graph.clone());
-            let build_result = builder
-                .build_for_session(self.ctx.project_slug.as_deref())
-                .await;
-            let build_latency_ms = build_start.elapsed().as_millis() as u64;
-
-            let (hint_len, recovery_success) = match build_result {
-                Ok(mut ctx) => {
-                    // Inject SessionWorkLog snapshot so to_markdown() includes "Work Already Done"
-                    let snapshot = self.work_log.lock().await.snapshot();
-                    let has_work = !snapshot.files_modified.is_empty()
-                        || !snapshot.steps_completed.is_empty()
-                        || snapshot.tool_use_count > 0;
-                    if has_work {
-                        ctx.work_log = Some(snapshot);
-                    }
-                    let hint = ctx.to_markdown();
-                    let len = hint.len();
-                    if !hint.is_empty() {
-                        info!(
-                            "Injecting post-compaction context for session {} ({} chars)",
-                            self.session_id, len
-                        );
-                        self.pending_messages
-                            .lock()
-                            .await
-                            .push_back(PendingMessage::system_hint(hint));
-                    }
-                    (len, true)
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to build post-compaction context for session {}: {}. Injecting minimal reminder.",
-                        self.session_id, e
-                    );
-                    let minimal = if self.ctx.project_slug.is_some() {
-                        format!(
-                            "<system-reminder>\n# Post-Compaction Context\nYou are working on project \"{}\". Context rebuild failed — continue based on conversation history.\n</system-reminder>",
-                            self.ctx.project_slug.as_deref().unwrap_or("unknown")
-                        )
-                    } else {
-                        "<system-reminder>\n# Post-Compaction Context\nYou are in an interactive session. No project context available.\n</system-reminder>".to_string()
-                    };
-                    let len = minimal.len();
-                    self.pending_messages
-                        .lock()
-                        .await
-                        .push_back(PendingMessage::system_hint(minimal));
-                    (len, false)
-                }
-            };
-
-            let hint_tokens = (hint_len as u32) / 3;
-            let recovery_event = ChatEvent::CompactionRecovery {
-                hint_tokens,
-                build_latency_ms,
-                recovery_success,
-            };
+            let snapshot = self.work_log.lock().await.snapshot();
+            let (hint, recovery_event) = post_compaction_recovery(
+                &self.graph,
+                &self.session_id,
+                self.ctx.project_slug.as_deref(),
+                Some(snapshot),
+            )
+            .await;
+            if let Some(hint) = hint {
+                self.pending_messages
+                    .lock()
+                    .await
+                    .push_back(PendingMessage::system_hint(hint));
+            }
             self.emit_chat(recovery_event);
         } else if needs_injection {
             debug!(
@@ -572,98 +543,34 @@ impl PostStreamHandler {
         auto_continue_allowed: bool,
         hit_error_max_turns: bool,
     ) {
-        // Gather session-level state for the pure decision function
-        let (tracking_enabled, cooldown_turns, reminders_in_a_row) = {
+        let counters = {
             let sessions = self.active_sessions.read().await;
-            if let Some(session) = sessions.get(&self.session_id) {
-                if had_productive_tool_use && !had_conclusive_tool_use {
-                    // Agent used ONLY productive tools (no commit/push) = actively working, reset cooldown
-                    session
-                        .objective_reminder_turns_since
-                        .store(0, Ordering::Relaxed);
-                    // The agent is working again: the next stall may be reminded afresh.
-                    session
-                        .objective_reminders_in_a_row
-                        .store(0, Ordering::Relaxed);
-                }
-                // When both productive AND conclusive → agent did work AND committed.
-                // Don't reset cooldown — let the reminder check fire.
-                let enabled = session.objective_tracking;
-                let turns = session
-                    .objective_reminder_turns_since
-                    .fetch_add(1, Ordering::Relaxed);
-                let in_a_row = session.objective_reminders_in_a_row.load(Ordering::Relaxed);
-                (enabled, turns, in_a_row)
-            } else {
-                return;
+            match sessions.get(&self.session_id) {
+                Some(session) => ObjectiveCounters {
+                    enabled: session.objective_tracking,
+                    turns_since: session.objective_reminder_turns_since.clone(),
+                    in_a_row: session.objective_reminders_in_a_row.clone(),
+                },
+                None => return,
             }
         };
-
-        // Should we check for pending objectives?
-        // Yes when: (a) no productive tools, OR (b) productive + conclusive (agent wrapping up)
-        let should_check = !had_productive_tool_use || had_conclusive_tool_use;
-
-        // Fetch pending objectives from graph (only if we might need them)
-        let (pending_tasks, work_log_summary) = if should_check
-            && !auto_continue_allowed
-            && !hit_error_max_turns
-            && !self.interrupt_flag.load(Ordering::SeqCst)
-            && tracking_enabled
-            && reminders_in_a_row < OBJECTIVE_REMINDER_MAX_IN_A_ROW
-            && (cooldown_turns == 0 || cooldown_turns >= OBJECTIVE_REMINDER_COOLDOWN)
-        {
-            let tasks = if let Some(ref slug) = self.ctx.project_slug {
-                let builder =
-                    super::compaction_context::CompactionContextBuilder::new(self.graph.clone());
-                if let Ok(Ok(ctx)) = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    builder.build_for_session(Some(slug.as_str())),
-                )
-                .await
-                {
-                    ctx.pending_tasks
-                        .iter()
-                        .filter(|t| t.status == "inprogress" || t.status == "pending")
-                        .take(4)
-                        .map(|t| PendingTaskInfo {
-                            title: t.title.clone(),
-                            status: t.status.clone(),
-                            pending_steps: t
-                                .steps
-                                .iter()
-                                .filter(|s| s.status != "completed" && s.status != "skipped")
-                                .map(|s| s.description.clone())
-                                .collect(),
-                            affected_files: t.affected_files.clone(),
-                        })
-                        .collect()
-                } else {
-                    vec![]
-                }
-            } else {
-                vec![]
-            };
-            let wl = self.work_log.lock().await.to_summary_markdown();
-            (tasks, wl)
-        } else {
-            (vec![], String::new())
-        };
-
-        // Pure decision
-        let input = ObjectiveCheckInput {
+        let work_log_summary = self.work_log.lock().await.to_summary_markdown();
+        let turn = ObjectiveTurn {
             had_productive_tool_use,
             had_conclusive_tool_use,
             auto_continue_allowed,
             hit_error_max_turns,
             interrupted: self.interrupt_flag.load(Ordering::SeqCst),
-            tracking_enabled,
-            cooldown_turns,
-            reminders_in_a_row,
-            pending_tasks,
-            work_log_summary,
         };
-
-        if let Some(reminder) = check_objective_reminder(&input) {
+        if let Some(reminder) = objective_reminder(
+            &self.graph,
+            self.ctx.project_slug.as_deref(),
+            &counters,
+            turn,
+            work_log_summary,
+        )
+        .await
+        {
             info!(
                 "Objective tracker: injecting reminder for session {}",
                 self.session_id
@@ -672,17 +579,6 @@ impl PostStreamHandler {
                 .lock()
                 .await
                 .push_back(PendingMessage::system_hint(reminder));
-
-            // Reset cooldown counter
-            let sessions = self.active_sessions.read().await;
-            if let Some(session) = sessions.get(&self.session_id) {
-                session
-                    .objective_reminder_turns_since
-                    .store(1, Ordering::Relaxed);
-                session
-                    .objective_reminders_in_a_row
-                    .fetch_add(1, Ordering::Relaxed);
-            }
         }
     }
 
@@ -740,67 +636,285 @@ impl PostStreamHandler {
         memory_manager: &Option<Arc<Mutex<ConversationMemoryManager>>>,
         context_injector: &Option<Arc<ContextInjector>>,
     ) {
-        let Some(ref mm) = memory_manager else {
-            return;
+        let rfc_accumulator = {
+            let sessions = self.active_sessions.read().await;
+            sessions
+                .get(&self.session_id)
+                .map(|s| s.rfc_accumulator.clone())
         };
-        let assistant_text = assistant_text_parts.join("");
-        if assistant_text.is_empty() {
-            return;
-        }
-        let pending = {
-            let mut mm = mm.lock().await;
-            mm.record_assistant_message(&assistant_text);
-            context_injector
-                .as_ref()
-                .map(|injector| (injector.clone(), mm.take_pending_messages()))
-        };
+        record_turn_feedback(
+            TurnFeedback {
+                graph: &self.graph,
+                search: &self.search,
+                event_emitter: &self.event_emitter,
+                session_id: &self.session_id,
+                session_uuid: self.session_uuid,
+                project_id: self.ctx.project_id,
+                rfc_accumulator,
+            },
+            &assistant_text_parts.join(""),
+            memory_manager,
+            context_injector,
+        )
+        .await;
+    }
+}
 
-        if let Some(uuid) = self.session_uuid {
-            let project_id = self.ctx.project_id;
-            super::feedback::spawn_feedback(
-                self.graph.clone(),
-                uuid,
-                project_id,
-                assistant_text.clone(),
-                super::feedback::SessionDiscussedCache::new(),
+/// Where the feedback of a turn goes ([`record_turn_feedback`]).
+pub(crate) struct TurnFeedback<'a> {
+    pub graph: &'a Arc<dyn GraphStore>,
+    pub search: &'a Arc<dyn SearchStore>,
+    pub event_emitter: &'a Option<Arc<dyn crate::events::EventEmitter>>,
+    pub session_id: &'a str,
+    pub session_uuid: Option<Uuid>,
+    pub project_id: Option<Uuid>,
+    /// The session's RFC accumulator (`None`: no observation processing).
+    pub rfc_accumulator: Option<Arc<Mutex<super::observation_detector::RfcAccumulator>>>,
+}
+
+/// Records the assistant's answer in memory, spawns feedback extraction and the
+/// observation (RFC…) detection — both engines (the Claude Code engine's
+/// [`PostStreamHandler::handle_feedback`], the agent engine's end of turn).
+///
+/// Nothing here waits on a store: the memory write (`store_messages`, an HTTP call
+/// without a timeout of its own) runs in a task of its own ([`spawn_write`]), after
+/// the memory lock is released.
+pub(crate) async fn record_turn_feedback(
+    f: TurnFeedback<'_>,
+    assistant_text: &str,
+    memory_manager: &Option<Arc<Mutex<ConversationMemoryManager>>>,
+    context_injector: &Option<Arc<ContextInjector>>,
+) {
+    let Some(ref mm) = memory_manager else {
+        return;
+    };
+    if assistant_text.is_empty() {
+        return;
+    }
+    let pending = {
+        let mut mm = mm.lock().await;
+        mm.record_assistant_message(assistant_text);
+        context_injector
+            .as_ref()
+            .map(|injector| (injector.clone(), mm.take_pending_messages()))
+    };
+
+    if let Some(uuid) = f.session_uuid {
+        super::feedback::spawn_feedback(
+            f.graph.clone(),
+            uuid,
+            f.project_id,
+            assistant_text.to_string(),
+            super::feedback::SessionDiscussedCache::new(),
+        );
+
+        // Observation auto-detection (RFC + all categories)
+        if let Some(rfc_acc) = f.rfc_accumulator {
+            super::feedback::spawn_observation_processing(
+                f.graph.clone(),
+                f.search.clone(),
+                f.project_id,
+                assistant_text.to_string(),
+                rfc_acc,
+                Some(uuid),
+                f.event_emitter.clone(),
             );
-
-            // Observation auto-detection (RFC + all categories)
-            let rfc_acc = {
-                let sessions = self.active_sessions.read().await;
-                sessions
-                    .get(&self.session_id)
-                    .map(|s| s.rfc_accumulator.clone())
-            };
-            if let Some(rfc_acc) = rfc_acc {
-                super::feedback::spawn_observation_processing(
-                    self.graph.clone(),
-                    self.search.clone(),
-                    project_id,
-                    assistant_text.clone(),
-                    rfc_acc,
-                    Some(uuid),
-                    self.event_emitter.clone(),
-                );
-            }
-        }
-
-        // Store pending messages via ContextInjector
-        if let Some((injector, pending)) = pending {
-            if !pending.is_empty() {
-                let count = pending.len();
-                let session_id = self.session_id.clone();
-                spawn_write(self.session_id.clone(), "memory_store", async move {
-                    injector
-                        .store_messages(&pending)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    debug!("Stored {} messages for session {}", count, session_id);
-                    Ok(())
-                });
-            }
         }
     }
+
+    // Store pending messages via ContextInjector
+    if let Some((injector, pending)) = pending {
+        if !pending.is_empty() {
+            let count = pending.len();
+            let session_id = f.session_id.to_string();
+            spawn_write(f.session_id.to_string(), "memory_store", async move {
+                injector
+                    .store_messages(&pending)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                debug!("Stored {} messages for session {}", count, session_id);
+                Ok(())
+            });
+        }
+    }
+}
+
+// ── Shared by both engines ─────────────────────────────────────────────
+
+/// The context re-injected after a compaction (`None`: nothing to say) and the
+/// `compaction_recovery` event that reports it. The Claude Code engine queues the
+/// hint from [`PostStreamHandler::handle_post_compaction`], the agent engine from
+/// its end of turn (`ManagerTurnServices::after_turn`): one logic.
+pub(crate) async fn post_compaction_recovery(
+    graph: &Arc<dyn GraphStore>,
+    session_id: &str,
+    project_slug: Option<&str>,
+    work_log: Option<super::types::SessionWorkLogSnapshot>,
+) -> (Option<String>, ChatEvent) {
+    info!(
+        "Post-compaction injection triggered for session {}",
+        session_id
+    );
+    let build_start = std::time::Instant::now();
+    let builder = super::compaction_context::CompactionContextBuilder::new(graph.clone());
+    let build_result = builder.build_for_session(project_slug).await;
+    let build_latency_ms = build_start.elapsed().as_millis() as u64;
+    let (hint, recovery_success) = match build_result {
+        Ok(mut ctx) => {
+            // Inject SessionWorkLog snapshot so to_markdown() includes "Work Already Done"
+            if let Some(snapshot) = work_log {
+                let has_work = !snapshot.files_modified.is_empty()
+                    || !snapshot.steps_completed.is_empty()
+                    || snapshot.tool_use_count > 0;
+                if has_work {
+                    ctx.work_log = Some(snapshot);
+                }
+            }
+            let hint = ctx.to_markdown();
+            if !hint.is_empty() {
+                info!(
+                    "Injecting post-compaction context for session {} ({} chars)",
+                    session_id,
+                    hint.len()
+                );
+            }
+            (hint, true)
+        }
+        Err(e) => {
+            warn!(
+                "Failed to build post-compaction context for session {}: {}. Injecting minimal reminder.",
+                session_id, e
+            );
+            let minimal = match project_slug {
+                Some(slug) => format!(
+                    "<system-reminder>\n# Post-Compaction Context\nYou are working on project \"{}\". Context rebuild failed — continue based on conversation history.\n</system-reminder>",
+                    slug
+                ),
+                None => "<system-reminder>\n# Post-Compaction Context\nYou are in an interactive session. No project context available.\n</system-reminder>".to_string(),
+            };
+            (minimal, false)
+        }
+    };
+    let event = ChatEvent::CompactionRecovery {
+        hint_tokens: (hint.len() as u32) / 3,
+        build_latency_ms,
+        recovery_success,
+    };
+    ((!hint.is_empty()).then_some(hint), event)
+}
+
+/// The objective-reminder state of a session (both engines keep one).
+#[derive(Clone, Default)]
+pub(crate) struct ObjectiveCounters {
+    /// Objective tracking is on for the session.
+    pub enabled: bool,
+    /// Turns since the last reminder (the cooldown).
+    pub turns_since: Arc<std::sync::atomic::AtomicU32>,
+    /// Reminders injected back to back without productive work in between.
+    pub in_a_row: Arc<std::sync::atomic::AtomicU32>,
+}
+
+/// What a turn did, for the objective tracker.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ObjectiveTurn {
+    pub had_productive_tool_use: bool,
+    pub had_conclusive_tool_use: bool,
+    pub auto_continue_allowed: bool,
+    pub hit_error_max_turns: bool,
+    pub interrupted: bool,
+}
+
+/// If the agent concluded without using *productive* tools and auto-continue
+/// didn't fire, the reminder of the project's pending objectives to queue, and the
+/// counters updated — both engines ([`PostStreamHandler::handle_objective_tracking`],
+/// the agent engine's end of turn).
+///
+/// "Productive" excludes conclusive tools (git commit/push/status) — the agent
+/// may be wrapping up prematurely after a commit without finishing remaining tasks.
+pub(crate) async fn objective_reminder(
+    graph: &Arc<dyn GraphStore>,
+    project_slug: Option<&str>,
+    counters: &ObjectiveCounters,
+    turn: ObjectiveTurn,
+    work_log_summary: String,
+) -> Option<String> {
+    if turn.had_productive_tool_use && !turn.had_conclusive_tool_use {
+        // Agent used ONLY productive tools (no commit/push) = actively working, reset cooldown
+        counters.turns_since.store(0, Ordering::Relaxed);
+        // The agent is working again: the next stall may be reminded afresh.
+        counters.in_a_row.store(0, Ordering::Relaxed);
+    }
+    // When both productive AND conclusive → agent did work AND committed.
+    // Don't reset cooldown — let the reminder check fire.
+    let cooldown_turns = counters.turns_since.fetch_add(1, Ordering::Relaxed);
+    let reminders_in_a_row = counters.in_a_row.load(Ordering::Relaxed);
+
+    // Should we check for pending objectives?
+    // Yes when: (a) no productive tools, OR (b) productive + conclusive (agent wrapping up)
+    let should_check = !turn.had_productive_tool_use || turn.had_conclusive_tool_use;
+
+    // Fetch pending objectives from graph (only if we might need them)
+    let (pending_tasks, work_log_summary) = if should_check
+        && !turn.auto_continue_allowed
+        && !turn.hit_error_max_turns
+        && !turn.interrupted
+        && counters.enabled
+        && reminders_in_a_row < OBJECTIVE_REMINDER_MAX_IN_A_ROW
+        && (cooldown_turns == 0 || cooldown_turns >= OBJECTIVE_REMINDER_COOLDOWN)
+    {
+        let tasks = if let Some(slug) = project_slug {
+            let builder = super::compaction_context::CompactionContextBuilder::new(graph.clone());
+            if let Ok(Ok(ctx)) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                builder.build_for_session(Some(slug)),
+            )
+            .await
+            {
+                ctx.pending_tasks
+                    .iter()
+                    .filter(|t| t.status == "inprogress" || t.status == "pending")
+                    .take(4)
+                    .map(|t| PendingTaskInfo {
+                        title: t.title.clone(),
+                        status: t.status.clone(),
+                        pending_steps: t
+                            .steps
+                            .iter()
+                            .filter(|s| s.status != "completed" && s.status != "skipped")
+                            .map(|s| s.description.clone())
+                            .collect(),
+                        affected_files: t.affected_files.clone(),
+                    })
+                    .collect()
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+        (tasks, work_log_summary)
+    } else {
+        (vec![], String::new())
+    };
+
+    // Pure decision
+    let input = ObjectiveCheckInput {
+        had_productive_tool_use: turn.had_productive_tool_use,
+        had_conclusive_tool_use: turn.had_conclusive_tool_use,
+        auto_continue_allowed: turn.auto_continue_allowed,
+        hit_error_max_turns: turn.hit_error_max_turns,
+        interrupted: turn.interrupted,
+        tracking_enabled: counters.enabled,
+        cooldown_turns,
+        reminders_in_a_row,
+        pending_tasks,
+        work_log_summary,
+    };
+    let reminder = check_objective_reminder(&input)?;
+    // Reset cooldown counter
+    counters.turns_since.store(1, Ordering::Relaxed);
+    counters.in_a_row.fetch_add(1, Ordering::Relaxed);
+    Some(reminder)
 }
 
 // ── Pure logic for objective tracking (testable without Graph) ─────────

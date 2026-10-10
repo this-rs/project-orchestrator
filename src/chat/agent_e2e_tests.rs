@@ -7195,6 +7195,735 @@ mod legacy_oob_lag {
     }
 }
 
+/// P8 — the record of a native session (the agent engine) is kept as the legacy
+/// engine keeps its own (`chat::session_record`): before, it stayed at what the
+/// creation wrote (`message_count: 1`, no cost, no title) whatever the conversation did.
+mod native_session_record {
+    use super::*;
+
+    fn answer(key: &str) -> Value {
+        sse_route(
+            key,
+            vec![
+                delta(json!({"content": format!("answer to {key}")})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}),
+                json!("[DONE]"),
+            ],
+        )
+    }
+
+    async fn record_until(
+        graph: &MockGraphStore,
+        sid: &str,
+        done: impl Fn(&crate::neo4j::models::ChatSessionNode) -> bool,
+    ) -> crate::neo4j::models::ChatSessionNode {
+        let id = Uuid::parse_str(sid).unwrap();
+        let mut last = None;
+        for _ in 0..400 {
+            if let Some(node) = graph.get_chat_session(id).await.unwrap() {
+                if done(&node) {
+                    return node;
+                }
+                last = Some(node);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the record of {sid} never got there: {last:?}");
+    }
+
+    async fn results(graph: &MockGraphStore, sid: &str) -> usize {
+        graph
+            .get_chat_events(Uuid::parse_str(sid).unwrap(), 0, 500)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| e.event_type == "result")
+            .count()
+    }
+
+    async fn wait_results(graph: &MockGraphStore, sid: &str, count: usize) {
+        for _ in 0..400 {
+            if results(graph, sid).await >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{count} result event(s) never persisted");
+    }
+
+    #[tokio::test]
+    async fn a_native_session_keeps_its_title_its_message_count_and_its_cost_across_a_resume() {
+        let mut routes = vec![answer("AFTER-RESTART"), answer("SECOND-TURN")];
+        routes.extend(script().as_array().cloned().unwrap());
+        let fake = FakeOpenAi::start(Value::Array(routes));
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("native-transcripts");
+
+        let before = manager(graph.clone(), true).with_native_transcripts(&root);
+        let sid = before
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        assert!(before.agent_runtime.owns(&sid).await, "the agent engine");
+        wait_results(&graph, &sid, 1).await;
+        // A free endpoint: its turns cost a real 0, recorded.
+        let node = record_until(&graph, &sid, |n| n.total_cost_usd.is_some()).await;
+        assert_eq!(node.message_count, 1, "the opening message, once: {node:?}");
+        assert_eq!(node.total_cost_usd, Some(0.0), "{node:?}");
+        assert_eq!(node.title.as_deref(), Some("hi there"), "{node:?}");
+        assert_eq!(node.preview.as_deref(), Some("hi there"), "{node:?}");
+
+        before.send_message(&sid, "SECOND-TURN").await.unwrap();
+        wait_results(&graph, &sid, 2).await;
+        let node = record_until(&graph, &sid, |n| n.message_count >= 2).await;
+        assert_eq!(node.message_count, 2, "{node:?}");
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+
+        // The message that resumes the session after a restart counts too.
+        let after = manager(graph.clone(), true).with_native_transcripts(&root);
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        after
+            .resume_session(&sid, "AFTER-RESTART", Some(&claims))
+            .await
+            .unwrap_or_else(|e| panic!("resume failed: {e:#}"));
+        wait_results(&graph, &sid, 3).await;
+        let node = record_until(&graph, &sid, |n| n.message_count >= 3).await;
+        assert_eq!(node.message_count, 3, "{node:?}");
+        assert_eq!(node.title.as_deref(), Some("hi there"), "the title stays");
+        assert_eq!(node.total_cost_usd, Some(0.0));
+        after.close_session(&sid).await.unwrap();
+    }
+}
+
+/// P8 — the lifecycle of the agent engine's sessions follows the chat's
+/// configuration as the legacy engine's do: the idle cleanup closes them, they
+/// count in `max_sessions` / `active_session_count`, and their retries follow
+/// `RetryConfig`. Before, they were invisible to all three.
+mod agent_lifecycle {
+    use super::*;
+
+    fn configured(
+        graph: Arc<MockGraphStore>,
+        edit: impl FnOnce(&mut super::super::config::ChatConfig),
+    ) -> Arc<ChatManager> {
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph;
+        let mut config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: None,
+            nexus_browser_path: None,
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        edit(&mut config);
+        Arc::new(ChatManager::new_without_memory(
+            dyn_graph,
+            state.meili,
+            config,
+        ))
+    }
+
+    async fn native_world() -> (FakeOpenAi, Arc<MockGraphStore>) {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        (fake, graph)
+    }
+
+    async fn idle(manager: &ChatManager, sid: &str) {
+        for _ in 0..400 {
+            if !manager.is_session_streaming(sid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the opening turn never ended");
+    }
+
+    #[tokio::test]
+    async fn an_idle_native_session_is_closed_by_the_cleanup() {
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |c| c.session_timeout = Duration::from_millis(300));
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        idle(&manager, &sid).await;
+        manager.start_cleanup_task();
+        for _ in 0..200 {
+            if !manager.agent_runtime.owns(&sid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("an idle native session outlived the session timeout");
+    }
+
+    #[tokio::test]
+    async fn native_sessions_count_toward_max_sessions_and_get_the_chat_retry_config() {
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |c| {
+            c.max_sessions = 1;
+            c.retry = super::super::config::RetryConfig {
+                max_attempts: 7,
+                initial_delay_ms: 5,
+                backoff_multiplier: 1.5,
+            };
+        });
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        assert_eq!(manager.active_session_count().await, 1);
+        let live = manager.live_session_snapshot().await;
+        assert!(
+            live.live.contains(&Uuid::parse_str(&sid).unwrap()),
+            "the cockpit sees the native session live"
+        );
+        let second = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await;
+        let err = second.expect_err("the limit refuses a second session");
+        assert!(
+            err.to_string()
+                .contains("Maximum number of active sessions"),
+            "{err:#}"
+        );
+        let retry = manager
+            .agent_runtime
+            .get(&sid)
+            .await
+            .unwrap()
+            .retry_config();
+        assert_eq!(
+            (retry.max_attempts, retry.initial_delay_ms),
+            (7, 5),
+            "the chat's RetryConfig, not a constant"
+        );
+        manager.close_session(&sid).await.unwrap();
+        assert_eq!(manager.active_session_count().await, 0);
+    }
+}
+
+/// P8 (c) — the post-stream steps of the Claude Code engine run at the end of each
+/// turn of the agent engine, with the same functions (`post_stream`): the context
+/// re-injected after a compaction, the objective reminder, and `cancel_task`
+/// refused, typed, instead of a silent success.
+mod post_turn {
+    use super::parity::{caps, rig};
+    use super::*;
+    use nexus_claude::agent::{AgentEvent, CompactionPhase, ProviderKind};
+    use nexus_claude::testkit::scripted::steps;
+    use nexus_claude::testkit::Step;
+
+    async fn seed_pending_tasks(graph: &MockGraphStore, project: Uuid) {
+        use crate::neo4j::models::{PlanNode, PlanStatus, TaskStatus};
+        let plan = PlanNode::new_for_project(
+            "Active Plan".into(),
+            "Plan with pending tasks".into(),
+            "test".into(),
+            50,
+            project,
+        );
+        graph.create_plan(&plan).await.unwrap();
+        graph
+            .update_plan_status(plan.id, PlanStatus::InProgress)
+            .await
+            .unwrap();
+        let mut task = crate::test_helpers::test_task_titled("Fix the parser bug");
+        task.status = TaskStatus::Pending;
+        graph.create_task(plan.id, &task).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn after_a_compaction_the_context_is_reinjected_and_the_objectives_recalled() {
+        let compacted = Step::Emit(AgentEvent::Compaction {
+            phase: CompactionPhase::Completed,
+            trigger: None,
+            pre_tokens: Some(1000),
+        });
+        let quiet = || vec![steps::done(&caps())];
+        let mut r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![compacted, steps::done(&caps())],
+                quiet(),
+                quiet(),
+                quiet(),
+                quiet(),
+            ],
+        )
+        .await;
+        seed_pending_tasks(&r.graph, r.project.id).await;
+        r.manager.send_message(&r.sid, "go on").await.unwrap();
+        let recovery = next_event(&mut r.rx, |e| {
+            matches!(e, ChatEvent::CompactionRecovery { .. })
+        })
+        .await;
+        assert!(
+            matches!(
+                recovery,
+                ChatEvent::CompactionRecovery {
+                    recovery_success: true,
+                    ..
+                }
+            ),
+            "{recovery:?}"
+        );
+        for _ in 0..400 {
+            if !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // No turn of its own for the context, nor any automated turn on the history
+        // just compacted: the run is the user's turn alone.
+        assert_eq!(r.sent().len(), 1, "{:#?}", r.sent());
+        // The next turn carries in front, once, the context and the reminder of the
+        // turn that compacted (it did no work: the objective is pending).
+        r.manager.send_message(&r.sid, "next").await.unwrap();
+        r.turn_end().await;
+        for _ in 0..400 {
+            if !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let sent = r.sent();
+        assert!(
+            sent[1].contains("Post-Compaction Context")
+                && sent[1].contains(&r.project.name)
+                && sent[1].contains("next"),
+            "the context of the project, in front of the next turn: {}",
+            sent[1]
+        );
+        assert!(
+            sent[2..]
+                .iter()
+                .all(|s| !s.contains("Post-Compaction Context")),
+            "re-injected once: {sent:#?}"
+        );
+        assert!(
+            sent[1].contains(super::super::post_stream::OBJECTIVE_REMINDER_MARKER)
+                && sent[1].contains("Fix the parser bug"),
+            "the pending objective recalled with the context: {}",
+            sent[1]
+        );
+        assert!(
+            sent.len() <= 4,
+            "the reminders stop at their cap: {sent:#?}"
+        );
+    }
+
+    /// After a compaction, the context comes back BEFORE the model continues: the
+    /// continuation turn carries it in front of "Continue…" (the legacy engine queues
+    /// the re-injection before the auto-continue hint).
+    #[tokio::test]
+    async fn after_a_compaction_the_continuation_carries_the_context_first() {
+        let compacted = Step::Emit(AgentEvent::Compaction {
+            phase: CompactionPhase::Completed,
+            trigger: None,
+            pre_tokens: Some(1000),
+        });
+        let r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![
+                    compacted,
+                    Step::Emit(nexus_claude::testkit::done_event(
+                        &caps(),
+                        nexus_claude::agent::StopReason::MaxTurns,
+                        None,
+                    )),
+                ],
+                vec![steps::done(&caps())],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        r.manager.set_auto_continue(&r.sid, true).await.unwrap();
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        for _ in 0..400 {
+            if r.sent().len() >= 2 && !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let sent = r.sent();
+        assert_eq!(sent.len(), 2, "the turn, then its continuation: {sent:#?}");
+        let context = sent[1].find("Post-Compaction Context");
+        let cont = sent[1].find("Continue where you left off");
+        assert!(
+            matches!((context, cont), (Some(a), Some(b)) if a < b),
+            "the context first, then the continuation: {}",
+            sent[1]
+        );
+    }
+
+    /// A tool call announced before its input was complete (Claude Code, ACP) is
+    /// judged on its RESOLVED input: a `git commit` is conclusive, so a turn that
+    /// only committed still gets the objective reminder.
+    #[tokio::test]
+    async fn a_tool_is_judged_on_its_resolved_input() {
+        let r = rig(
+            ProviderKind::ClaudeCode,
+            vec![
+                vec![
+                    steps::tool_call_start("c1", "Bash"),
+                    steps::tool_call("c1", "Bash", json!({ "command": "git commit -m done" })),
+                    steps::tool_result("c1", "committed"),
+                    steps::done(&caps()),
+                ],
+                vec![steps::done(&caps())],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        seed_pending_tasks(&r.graph, r.project.id).await;
+        r.manager.send_message(&r.sid, "commit it").await.unwrap();
+        for _ in 0..400 {
+            if r.sent().len() >= 2 && !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let sent = r.sent();
+        assert!(
+            sent.iter()
+                .skip(1)
+                .any(|s| s.contains(super::super::post_stream::OBJECTIVE_REMINDER_MARKER)),
+            "a commit alone is wrapping up, not working: the objectives are recalled: {sent:#?}"
+        );
+    }
+
+    async fn idle(r: &super::parity::Rig) {
+        for _ in 0..400 {
+            if !r.manager.is_session_streaming(&r.sid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the session never went idle");
+    }
+
+    async fn sent_count(r: &super::parity::Rig, n: usize) {
+        for _ in 0..400 {
+            if r.sent().len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{n} turns were never sent: {:#?}", r.sent());
+    }
+
+    fn compaction() -> Step {
+        Step::Emit(AgentEvent::Compaction {
+            phase: CompactionPhase::Completed,
+            trigger: None,
+            pre_tokens: Some(1000),
+        })
+    }
+
+    /// What the session keeps in the store for its next turn.
+    async fn stored(r: &super::parity::Rig) -> super::super::manager::HeldContext {
+        let graph: Arc<dyn GraphStore> = r.graph.clone();
+        super::super::manager::HeldContext::load(&graph, &r.sid)
+            .await
+            .unwrap()
+    }
+
+    /// Through the real `ManagerTurnServices`: a compaction, then the next turn hit
+    /// by a 429 (retried with the same text), the retry stopped by the user — the
+    /// provider ended it `done interrupted` and recorded it (nexus' native loop
+    /// keeps an interrupted turn in its history). The context rode that one turn:
+    /// the turn after it does not carry it again, and the store holds nothing.
+    #[tokio::test]
+    async fn the_held_context_rides_one_turn_across_a_429_and_a_stop() {
+        let limited = AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Error,
+            subtype: None,
+            is_error: true,
+            result_text: None,
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 0,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: Some(nexus_claude::agent::ProviderError::RateLimited {
+                retry_after_ms: Some(5),
+            }),
+        };
+        let r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![compaction(), steps::done(&caps())],
+                vec![Step::Emit(limited)],
+                vec![Step::AwaitInterrupt],
+                vec![steps::done(&caps())],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        idle(&r).await;
+        assert!(
+            stored(&r).await.context.is_some(),
+            "held after the compaction"
+        );
+        r.manager.send_message(&r.sid, "next").await.unwrap();
+        // The turn, then its retry after the 429: stopped while it runs.
+        sent_count(&r, 3).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        r.manager.interrupt(&r.sid).await.unwrap();
+        idle(&r).await;
+        r.manager.send_message(&r.sid, "then").await.unwrap();
+        sent_count(&r, 4).await;
+        idle(&r).await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 4, "{sent:#?}");
+        assert!(
+            sent[1].contains("Post-Compaction Context") && sent[1].contains("next"),
+            "{}",
+            sent[1]
+        );
+        assert_eq!(sent[1], sent[2], "the retry sends the same turn");
+        assert!(
+            !sent[3].contains("Post-Compaction Context"),
+            "injected once, not again after the Stop: {}",
+            sent[3]
+        );
+        assert!(stored(&r).await.is_empty(), "cleared from the store too");
+    }
+
+    /// A turn that carried the held context, was answered AND compacted again holds
+    /// the NEW context, in memory and in the store: the clear of the answered turn
+    /// and the store of its compaction are one ordered write, so a restart or an
+    /// idle close still finds it.
+    #[tokio::test]
+    async fn a_turn_that_compacts_again_keeps_its_new_context_stored() {
+        let r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![compaction(), steps::done(&caps())],
+                vec![compaction(), steps::done(&caps())],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        r.manager.send_message(&r.sid, "one").await.unwrap();
+        idle(&r).await;
+        r.manager.send_message(&r.sid, "two").await.unwrap();
+        idle(&r).await;
+        // The write is waited for in `after_turn`, before the session goes idle.
+        assert!(
+            stored(&r).await.context.is_some(),
+            "the context of the second compaction is stored"
+        );
+        r.manager.send_message(&r.sid, "three").await.unwrap();
+        sent_count(&r, 3).await;
+        idle(&r).await;
+        let sent = r.sent();
+        assert!(sent[1].contains("Post-Compaction Context"), "{}", sent[1]);
+        assert!(sent[2].contains("Post-Compaction Context"), "{}", sent[2]);
+    }
+
+    /// A turn carrying the held context compacts again, then the user stops it (the
+    /// provider ends it `done interrupted`: answered, the context delivered). The
+    /// compaction's own context is still built and held — the next turn carries a
+    /// context, and the store keeps one — instead of nothing at all.
+    #[tokio::test]
+    async fn a_stop_on_a_turn_that_compacts_again_keeps_a_context_for_the_next() {
+        let r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![compaction(), steps::done(&caps())],
+                vec![compaction(), Step::AwaitInterrupt],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        r.manager.send_message(&r.sid, "one").await.unwrap();
+        idle(&r).await;
+        r.manager.send_message(&r.sid, "two").await.unwrap();
+        sent_count(&r, 2).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        r.manager.interrupt(&r.sid).await.unwrap();
+        idle(&r).await;
+        assert!(
+            stored(&r).await.context.is_some(),
+            "the stopped turn's compaction holds its context in the store"
+        );
+        r.manager.send_message(&r.sid, "three").await.unwrap();
+        sent_count(&r, 3).await;
+        idle(&r).await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 3, "{sent:#?}");
+        assert!(sent[1].contains("Post-Compaction Context"), "{}", sent[1]);
+        assert!(
+            sent[2].contains("Post-Compaction Context") && sent[2].contains("three"),
+            "the turn after the Stop carries a context: {}",
+            sent[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_task_on_the_agent_engine_is_refused_typed() {
+        let r = rig(ProviderKind::Native, vec![vec![steps::done(&caps())]]).await;
+        let err = r
+            .manager
+            .cancel_task(&r.sid, "task-1")
+            .await
+            .expect_err("no silent success");
+        assert!(
+            err.downcast_ref::<super::super::manager::CancelTaskUnsupported>()
+                .is_some(),
+            "{err:#}"
+        );
+    }
+}
+
+/// P8c — the context re-injected after a compaction never starts a turn of its
+/// own: such a turn is measured against the window right after the compaction and
+/// compacted again (measured on integ/p8: a second summarisation call whose history
+/// held the re-injected context). The context rides in front of the session's next
+/// turn instead. What is guaranteed: the re-injection itself never starts a turn,
+/// hence never a compaction; in this scenario (one model call per message) a user
+/// turn compacts at most once. Nexus may still compact between the tool steps of
+/// one turn: that is its own policy, not bounded here.
+mod compaction_loop {
+    use super::*;
+
+    const SUMMARY_PROMPT: &str = "You are compacting the history";
+    const TURNS: [&str; 5] = [
+        "turn two",
+        "turn three",
+        "turn four",
+        "turn five",
+        "turn six",
+    ];
+
+    fn answer(text: &str, prompt_tokens: u64) -> Vec<Value> {
+        vec![
+            delta(json!({ "content": text })),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 4, "total_tokens": prompt_tokens + 4}}),
+            json!("[DONE]"),
+        ]
+    }
+
+    /// A 32k window; every long turn reports a prompt near it (31k), so each turn
+    /// after enough history calls for a compaction before it.
+    fn script() -> Value {
+        let mut routes = vec![
+            sse_route(
+                "Call the ping tool now",
+                vec![
+                    delta(
+                        json!({"tool_calls": [{"index": 0, "id": "p1", "function": {"name": "ping", "arguments": "{}"}}]}),
+                    ),
+                    json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                    json!("[DONE]"),
+                ],
+            ),
+            json!({"method": "GET", "path": "/v1/models", "status": 200,
+                   "body": {"object": "list", "data": [{"id": "m", "context_length": 32000}]}}),
+            sse_route(SUMMARY_PROMPT, answer("a dense summary", 50)),
+        ];
+        for text in TURNS.iter().rev() {
+            routes.push(sse_route(text, answer("noted", 31_000)));
+        }
+        routes.push(sse_route("hi there", answer("hello", 10)));
+        Value::Array(routes)
+    }
+
+    fn bodies(fake: &FakeOpenAi) -> Vec<String> {
+        fake.chat_requests()
+            .iter()
+            .map(|r| r["body"].to_string())
+            .filter(|b| !b.contains("Call the ping tool now"))
+            .collect()
+    }
+
+    async fn idle(manager: &ChatManager, sid: &str) {
+        for _ in 0..600 {
+            if !manager.is_session_streaming(sid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the session never went idle");
+    }
+
+    #[tokio::test]
+    async fn a_reinjected_context_never_triggers_a_compaction_and_a_user_turn_compacts_at_most_once(
+    ) {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let manager = manager(graph.clone(), true);
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        idle(&manager, &sid).await;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+
+        let mut recovered = 0;
+        for text in TURNS {
+            let before = bodies(&fake).len();
+            manager.send_message(&sid, text).await.unwrap();
+            // Its result, then the end of its run (hints included).
+            next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+            idle(&manager, &sid).await;
+            let run: Vec<String> = bodies(&fake)[before..].to_vec();
+            let compactions = run.iter().filter(|b| b.contains(SUMMARY_PROMPT)).count();
+            assert!(
+                compactions <= 1,
+                "{text}: {compactions} compactions in one user turn: {run:#?}"
+            );
+            for body in run.iter().filter(|b| b.contains(SUMMARY_PROMPT)) {
+                assert!(
+                    !body.contains("Post-Compaction Context"),
+                    "{text}: a compaction summarised the re-injected context: {body}"
+                );
+            }
+            let turns = run.iter().filter(|b| !b.contains(SUMMARY_PROMPT)).count();
+            assert_eq!(turns, 1, "{text}: one model turn per user turn: {run:#?}");
+            while let Ok(event) = rx.try_recv() {
+                recovered += usize::from(matches!(event, ChatEvent::CompactionRecovery { .. }));
+            }
+        }
+        assert!(recovered >= 1, "the scenario compacted at least once");
+        // The context of the last compaction reaches the model, in front of a turn.
+        let last = bodies(&fake)
+            .into_iter()
+            .filter(|b| !b.contains(SUMMARY_PROMPT))
+            .rfind(|b| b.contains("Post-Compaction Context"));
+        assert!(
+            last.is_some(),
+            "the re-injected context rode on a user turn"
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
+}
+
 /// OpenClaw delegated through its ACP bridge (`openclaw acp`), played by nexus'
 /// `fake_acp` (its `refuse_mcp_servers` mode answers as the bridge does). The bridge
 /// refuses MCP servers per session (`session/new`, `session/load` answered with an

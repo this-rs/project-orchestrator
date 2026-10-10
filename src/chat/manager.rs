@@ -494,6 +494,26 @@ pub struct CancelTaskResult {
     pub capped: bool,
 }
 
+/// `cancel_task` asked of a session of the agent engine: it tracks no background
+/// task of its own yet (P4) and has nothing to stop (P12). Refused, typed, instead
+/// of the silent success it used to answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelTaskUnsupported {
+    pub session_id: String,
+}
+
+impl std::fmt::Display for CancelTaskUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cancel_task is not available on the agent engine yet: session {} tracks no background task",
+            self.session_id
+        )
+    }
+}
+
+impl std::error::Error for CancelTaskUnsupported {}
+
 /// Runtime-mutable environment config for Claude CLI subprocess.
 ///
 /// These fields can be changed at runtime via the REST API and are
@@ -701,6 +721,12 @@ pub struct ChatManager {
     pub(crate) anchor_mode: super::anchor_resolver::AnchorContextMode,
     /// What the turns of every session share in anchor mode (resolutions, shadow runs).
     pub(crate) anchor_cache: Arc<super::anchor_resolver::AnchorCache>,
+    /// The held context of each agent session this process opened ([`HeldSlot`]):
+    /// one per session id, shared by every state built for it, so a reopen orders
+    /// against the writes still running and keeps memory when the store is behind.
+    /// One small entry per session opened since the start (its held context is
+    /// empty once delivered).
+    pub(crate) held_slots: std::sync::Mutex<HashMap<String, Arc<HeldSlot>>>,
 }
 
 // ============================================================================
@@ -1232,6 +1258,458 @@ pub(crate) struct ManagerTurnServices {
     nats: Option<Arc<crate::events::NatsEmitter>>,
     /// The anchor state of the manager when these services were built.
     anchor: super::anchor_resolver::AnchorSession,
+    /// The session's state for the end of its turns, as `ActiveSession` holds it on
+    /// the Claude Code engine.
+    session: AgentTurnState,
+    search: Arc<dyn SearchStore>,
+    event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
+    context_injector: Option<Arc<ContextInjector>>,
+    /// The budget of each end-of-turn step (`post_stream::POST_STREAM_STEP_BUDGET`).
+    step_budget: Duration,
+    /// A step made to never answer (tests only, `None` in production).
+    stall_step: Option<&'static str>,
+}
+
+/// What a session of the agent engine keeps for the end of its turns: the fields of
+/// `ActiveSession` the Claude Code engine's post-stream reads.
+#[derive(Clone, Default)]
+pub(crate) struct AgentTurnState {
+    /// Records the conversation in memory (`None`: no memory configured).
+    memory: Option<Arc<Mutex<ConversationMemoryManager>>>,
+    rfc_accumulator: Arc<Mutex<super::observation_detector::RfcAccumulator>>,
+    /// The protocol run the session was spawned in (`spawned_by`), for the enrichment.
+    protocol_run_id: Option<Uuid>,
+    protocol_state: Option<String>,
+    reasoning_path_tracker: super::feedback::ReasoningPathTracker,
+    objectives: super::post_stream::ObjectiveCounters,
+    /// The tools the session used (files, steps), live from its events.
+    work_log: Arc<std::sync::Mutex<SessionWorkLog>>,
+    /// What waits for the session's next turn after a compaction: the re-injected
+    /// context and the objective reminder of that turn ([`HeldContext`]). Never a
+    /// turn of its own (P8c): a turn started only to carry it was measured against
+    /// the window right after the compaction and compacted again (measured in
+    /// `routing_modes_e2e_tests` on integ/p8). Persisted with the session (it
+    /// survives an idle close, a restart, a resume) and cleared only once a turn
+    /// carrying it was answered ([`super::agent_runtime::TurnOutcome::answered`], in `after_turn`).
+    held: Arc<HeldSlot>,
+    /// Tool calls announced and not yet answered: id → (tool, input so far).
+    open_tools: Arc<std::sync::Mutex<HashMap<String, (String, serde_json::Value)>>>,
+}
+
+/// A session's [`HeldContext`] in this process: what waits in memory (the truth
+/// while the process lives) and the one ordered way it reaches the store.
+#[derive(Default)]
+pub(crate) struct HeldSlot {
+    memory: std::sync::Mutex<HeldMemory>,
+    /// Orders the store writes of the session: each write takes it INSIDE its task,
+    /// then stores what memory holds at that moment, so the last write to land is
+    /// the latest state (a clear can never land after a newer store, among the
+    /// writes that land within their bound — see [`Self::write_once`] for one that
+    /// was dropped). A reopen ([`Self::reopen`]) takes it too. Every holder bounds
+    /// its store call by [`HELD_WRITE_BUDGET_FACTOR`] × the step budget (a write and
+    /// the reopen's read alike: one that never answers is dropped, the slot kept
+    /// as it stands), so the lock is never held past that, and waiting for it is
+    /// bounded by the writes queued before.
+    write: tokio::sync::Mutex<()>,
+    /// A background retry of a failed write runs ([`Self::retry_in_background`]):
+    /// at most one per session.
+    retrying: std::sync::atomic::AtomicBool,
+}
+
+/// What memory holds for a session, and how it stands against the store.
+#[derive(Debug, Clone)]
+struct HeldMemory {
+    held: HeldContext,
+    /// Moves at each change of `held` (`HeldSlot::edit`): a write or a reload knows
+    /// whether memory changed since it read it.
+    generation: u64,
+    /// The generation the store is known to hold; `None`: unknown (a write failed
+    /// or ran out of time). Memory and store diverge — the slot is *unsynced* —
+    /// whenever this is not the current generation: from the first change of a
+    /// turn (`after_turn` empties memory long before its write) until a write of
+    /// that state landed.
+    stored: Option<u64>,
+}
+
+impl Default for HeldMemory {
+    /// A slot nobody wrote yet: in step with the store, which the first open of the
+    /// session in this process reads.
+    fn default() -> Self {
+        Self {
+            held: HeldContext::default(),
+            generation: 0,
+            stored: Some(0),
+        }
+    }
+}
+
+/// A held-context write gets this many step budgets before its store call is
+/// dropped (the lock released, the slot left unsynced): a store that never answers
+/// does not make every later turn of the session wait for the lock.
+pub(crate) const HELD_WRITE_BUDGET_FACTOR: u32 = 2;
+
+/// The background retries of a failed held-context write: the first after
+/// [`HELD_RETRY_FIRST_DELAY`], each next one twice later, at most
+/// [`HELD_RETRY_ATTEMPTS`]; past them the next turn writes again.
+pub(crate) const HELD_RETRY_FIRST_DELAY: Duration = Duration::from_secs(1);
+pub(crate) const HELD_RETRY_ATTEMPTS: u32 = 6;
+
+impl HeldSlot {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HeldMemory> {
+        self.memory.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What goes in front of the next turn ([`HeldContext::prefix`]).
+    fn prefix(&self) -> Option<String> {
+        self.lock().held.prefix()
+    }
+
+    /// What memory holds.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> HeldContext {
+        self.lock().held.clone()
+    }
+
+    /// Changes what memory holds; a change moves the generation (the store no
+    /// longer holds it, [`Self::unsynced`]).
+    fn edit<R>(&self, f: impl FnOnce(&mut HeldContext) -> R) -> R {
+        let mut m = self.lock();
+        let before = m.held.clone();
+        let out = f(&mut m.held);
+        if m.held != before {
+            m.generation += 1;
+        }
+        out
+    }
+
+    /// The store may not hold what memory holds: memory changed since the last
+    /// write that landed (a turn under way, a write still running), or a write
+    /// failed. The next turn writes again, and a reopen in this process keeps
+    /// memory instead of reloading the store.
+    fn unsynced(&self) -> bool {
+        let m = self.lock();
+        m.stored != Some(m.generation)
+    }
+
+    /// Replaces memory with what the store holds, read while memory was at
+    /// generation `seen` and in step with the store. Refused (memory kept) when
+    /// memory moved meanwhile: the store read is older than memory.
+    fn reload(&self, stored: HeldContext, seen: u64) -> bool {
+        let mut m = self.lock();
+        if m.generation != seen || m.stored != Some(seen) {
+            return false;
+        }
+        if m.held != stored {
+            m.held = stored;
+            m.generation += 1;
+            m.stored = Some(m.generation);
+        }
+        true
+    }
+
+    /// Replaces memory with what the store holds, as a new state of the session
+    /// starts from it: only a slot in step with the store reloads it, and only if
+    /// memory did not move during the read ([`Self::reload`]). Ordered after the
+    /// writes already started (their lock, waited for within `budget`; past it the
+    /// read goes on, the generation check alone keeping it safe). The read is
+    /// bounded like a write ([`HELD_WRITE_BUDGET_FACTOR`] × `budget`): a store that
+    /// does not answer, or cannot be read, keeps memory and releases the lock.
+    async fn reopen(&self, graph: &Arc<dyn GraphStore>, session_id: &str, budget: Duration) {
+        let _order = tokio::time::timeout(budget, self.write.lock()).await.ok();
+        let seen = {
+            let m = self.lock();
+            (m.stored == Some(m.generation)).then_some(m.generation)
+        };
+        let Some(seen) = seen else {
+            return;
+        };
+        let bound = budget * HELD_WRITE_BUDGET_FACTOR;
+        let read = match tokio::time::timeout(bound, HeldContext::load(graph, session_id)).await {
+            Ok(read) => read,
+            Err(_) => Err(anyhow!(
+                "the store did not answer within {} ms",
+                bound.as_millis()
+            )),
+        };
+        match read {
+            Ok(stored) => {
+                self.reload(stored, seen);
+            }
+            Err(e) => warn!(
+                session_id,
+                "held context: the store could not be read, memory kept: {e:#}"
+            ),
+        }
+    }
+
+    /// Writes what memory holds to the store, ordered after the writes already
+    /// started, the store call bounded ([`HELD_WRITE_BUDGET_FACTOR`] × `budget`).
+    /// The slot is in step only if memory did not move since the write read it.
+    ///
+    /// A store call dropped by the bound may still land on the server, later. If a
+    /// newer write lands first, the dropped one overwrites it there while the slot
+    /// believes itself in step: no retry, and the newer state is lost at a restart
+    /// (memory stays right while the process lives). It takes a store slower than
+    /// the bound (60 s in production). A write conditional on a version would close
+    /// it, but the generation lives in this process only (it restarts at 0, and
+    /// another instance has its own): it would need a durable version and a delete
+    /// turned into a versioned tombstone in the `GraphStore` setting API.
+    async fn write_once(
+        &self,
+        graph: &Arc<dyn GraphStore>,
+        session_id: &str,
+        budget: Duration,
+    ) -> Result<()> {
+        let _order = self.write.lock().await;
+        let (held, generation) = {
+            let m = self.lock();
+            (m.held.clone(), m.generation)
+        };
+        let bound = budget * HELD_WRITE_BUDGET_FACTOR;
+        let out = match tokio::time::timeout(bound, held.store(graph, session_id)).await {
+            Ok(out) => out,
+            Err(_) => Err(anyhow!(
+                "the store did not answer within {} ms: dropped, retried later",
+                bound.as_millis()
+            )),
+        };
+        self.lock().stored = match out {
+            Ok(()) => Some(generation),
+            Err(_) => None,
+        };
+        out
+    }
+
+    /// Writes what memory holds to the store, in a task of its own
+    /// ([`super::post_stream::spawn_write`]: never dropped, a failure logged),
+    /// ordered after the writes already started. A failed write leaves the slot
+    /// [`Self::unsynced`] and is retried in the background
+    /// ([`Self::retry_in_background`]), then by the next turn. Returns the step
+    /// (for the report) and the write to wait for.
+    fn spawn_write(
+        self: &Arc<Self>,
+        graph: &Arc<dyn GraphStore>,
+        session_id: &str,
+        budget: Duration,
+    ) -> (&'static str, tokio::task::JoinHandle<()>) {
+        let step = if self.lock().held.is_empty() {
+            "clear_held_context"
+        } else {
+            "hold_context"
+        };
+        let slot = Arc::clone(self);
+        let graph = graph.clone();
+        let sid = session_id.to_string();
+        let write = super::post_stream::spawn_write(session_id.to_string(), step, async move {
+            let out = slot.write_once(&graph, &sid, budget).await;
+            if out.is_err() {
+                slot.retry_in_background(graph, sid, budget);
+            }
+            out
+        });
+        (step, write)
+    }
+
+    /// Retries a failed write without waiting for a turn (a session closed, idle
+    /// closed or simply left keeps no stale context in the store for a restart to
+    /// reload): after [`HELD_RETRY_FIRST_DELAY`], then twice later each time, at
+    /// most [`HELD_RETRY_ATTEMPTS`] times, until the slot is in step. One retry
+    /// loop per session at a time.
+    fn retry_in_background(
+        self: &Arc<Self>,
+        graph: Arc<dyn GraphStore>,
+        sid: String,
+        budget: Duration,
+    ) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.retrying.swap(true, SeqCst) {
+            return;
+        }
+        let slot = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut delay = HELD_RETRY_FIRST_DELAY;
+            let mut in_step = false;
+            for attempt in 1..=HELD_RETRY_ATTEMPTS {
+                tokio::time::sleep(delay).await;
+                if !slot.unsynced() {
+                    in_step = true;
+                    break;
+                }
+                match slot.write_once(&graph, &sid, budget).await {
+                    Ok(()) => {
+                        info!(session_id = %sid, attempt, "held context write retried: landed")
+                    }
+                    Err(e) => {
+                        warn!(session_id = %sid, attempt, "held context write retry failed: {e:#}")
+                    }
+                }
+                if !slot.unsynced() {
+                    in_step = true;
+                    break;
+                }
+                delay *= 2;
+            }
+            slot.retrying.store(false, SeqCst);
+            // A write that failed after the last check found the slot in step saw
+            // this loop still running and left the retry to it: retry it now. Not
+            // after the attempts ran out (the next turn writes again).
+            if in_step && slot.lock().stored.is_none() {
+                slot.retry_in_background(graph, sid, budget);
+            }
+        });
+    }
+}
+
+/// What waits for a session's next turn after a compaction (`AgentTurnState::held`).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HeldContext {
+    /// The project context re-injected after the compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// The objective reminder of the turn that compacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reminder: Option<String>,
+}
+
+impl HeldContext {
+    /// Where it is stored: one setting document per session.
+    const KEY: &'static str = "held_context";
+
+    fn scope(session_id: &str) -> String {
+        format!("session:{session_id}")
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.context.is_none() && self.reminder.is_none()
+    }
+
+    /// What goes in front of the next turn: the context, then the reminder.
+    pub fn prefix(&self) -> Option<String> {
+        match (&self.context, &self.reminder) {
+            (None, None) => None,
+            (Some(c), None) => Some(c.clone()),
+            (None, Some(r)) => Some(r.clone()),
+            (Some(c), Some(r)) => Some(format!(
+                "{c}
+
+{r}"
+            )),
+        }
+    }
+
+    /// The re-injected context cut to fit the model's window: at most
+    /// [`HELD_CONTEXT_WINDOW_SHARE`] of a known window (four characters a token),
+    /// never more than the builder's own cap (`MAX_MARKDOWN_CHARS`, 6000). It cannot
+    /// by itself push a turn over nexus' compaction threshold (80 % of the window)
+    /// unless the history alone is already past 75 %.
+    pub fn cap(context: &str, window_tokens: Option<u64>) -> String {
+        const BUILDER_CAP: usize = 6000;
+        let limit = window_tokens
+            .map(|w| ((w as f64) * HELD_CONTEXT_WINDOW_SHARE * 4.0) as usize)
+            .unwrap_or(BUILDER_CAP)
+            .min(BUILDER_CAP);
+        if context.chars().count() <= limit {
+            return context.to_string();
+        }
+        const TAIL: &str = "
+[… cut to fit the context window]
+</system-reminder>";
+        let keep = limit.saturating_sub(TAIL.chars().count());
+        let mut out: String = context.chars().take(keep).collect();
+        out.push_str(TAIL);
+        out
+    }
+
+    /// The held context of `session_id`, as stored (none: empty; an unreadable
+    /// document: empty, said). A store that cannot be read is an error, not an
+    /// empty context: the caller keeps what it has.
+    pub async fn load(graph: &Arc<dyn GraphStore>, session_id: &str) -> Result<Self> {
+        let raw = graph
+            .get_llm_setting(&Self::scope(session_id), Self::KEY)
+            .await?;
+        Ok(match raw {
+            Some(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+                warn!(session_id, "held context unreadable, dropped: {e}");
+                Self::default()
+            }),
+            None => Self::default(),
+        })
+    }
+
+    /// Stores it (empty: clears it).
+    pub async fn store(&self, graph: &Arc<dyn GraphStore>, session_id: &str) -> Result<()> {
+        if self.is_empty() {
+            return Self::clear(graph, session_id).await;
+        }
+        graph
+            .put_llm_setting(
+                &Self::scope(session_id),
+                Self::KEY,
+                &serde_json::to_string(self)?,
+            )
+            .await
+    }
+
+    pub async fn clear(graph: &Arc<dyn GraphStore>, session_id: &str) -> Result<()> {
+        graph
+            .delete_llm_setting(&Self::scope(session_id), Self::KEY)
+            .await
+            .map(|_| ())
+    }
+}
+
+/// Largest share of the model's window the held context may take.
+pub(crate) const HELD_CONTEXT_WINDOW_SHARE: f64 = 0.05;
+
+impl ManagerTurnServices {
+    /// One end-of-turn step under its own budget ([`run_step`]); `stall_step` makes
+    /// the named one never answer (tests only: proves the budgets are per step).
+    async fn step<F: std::future::Future>(
+        &self,
+        after: &mut super::agent_runtime::AfterTurn,
+        session_id: &str,
+        name: &'static str,
+        fut: F,
+    ) -> Option<F::Output> {
+        let stalled = self.stall_step == Some(name);
+        run_step(after, session_id, name, self.step_budget, async move {
+            if stalled {
+                std::future::pending::<()>().await;
+            }
+            fut.await
+        })
+        .await
+    }
+
+    fn flush_open_tools(&self) {
+        let open: Vec<(String, serde_json::Value)> = self
+            .session
+            .open_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, call)| call)
+            .collect();
+        if open.is_empty() {
+            return;
+        }
+        let mut log = self
+            .session
+            .work_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (tool, input) in open {
+            log.record_tool_use(&tool, &input);
+        }
+    }
+
+    fn work_summary(&self) -> String {
+        self.session
+            .work_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .to_summary_markdown()
+    }
 }
 
 #[async_trait::async_trait]
@@ -1258,12 +1736,20 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         };
         // The enrichment reads what the user typed (the attachments' text, without
         // references), and does not inject again the notes the user pointed at.
+        // What the user typed goes to memory, as `stream_response` records it.
+        if let Some(mm) = &self.session.memory {
+            mm.lock().await.record_user_message(&turn.memory_text);
+        }
         let prepared = match enrichment_for_turn(
             &self.graph,
             &self.enrichment_pipeline,
             session_id,
             &turn.enrichment_text,
-            TurnProtocol::default(),
+            TurnProtocol {
+                run_id: self.session.protocol_run_id,
+                state: self.session.protocol_state.clone(),
+                reasoning_path_tracker: Some(self.session.reasoning_path_tracker.clone()),
+            },
             turn.excluded_note_ids.clone(),
             &self.anchor,
         )
@@ -1271,6 +1757,15 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         {
             Some(md) => prepend_enrichment(&md, &body),
             None => body,
+        };
+        // What waits since the last compaction goes in front of this turn, whatever
+        // started it. Only read here: `after_turn` clears it once a turn carrying it
+        // was answered (`TurnOutcome::answered`), so a turn refused before it was
+        // sent, failed, or stopped before any attempt was answered keeps it.
+        let held = self.session.held.prefix();
+        let prepared = match held {
+            Some(context) => prepend_enrichment(&context, &prepared),
+            None => prepared,
         };
         // The hook of the turn only sees the length of the text: hand it the text of
         // THIS turn, whatever started it (a message, the queue, a hint, another
@@ -1288,8 +1783,13 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             Uuid::parse_str(session_id).ok(),
         )
         .await;
-        // No work log on this engine: the hint carries the task/step context alone.
-        super::post_stream::continuation_message(&self.graph, ctx.project_slug.as_deref(), "").await
+        let work_summary = self.work_summary();
+        super::post_stream::continuation_message(
+            &self.graph,
+            ctx.project_slug.as_deref(),
+            &work_summary,
+        )
+        .await
     }
 
     async fn images(
@@ -1304,6 +1804,233 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             nats.publish_chat_event(session_id, event.clone());
         }
     }
+
+    /// The work log records a tool once its input is final: a call announced before
+    /// its input was complete (Claude Code, ACP: `tool_use` with `{}`, then
+    /// `tool_use_input_resolved`) is logged when its result (or its cancel) arrives,
+    /// with the resolved input.
+    fn observe(&self, _session_id: &str, event: &ChatEvent) {
+        let mut open = self
+            .session
+            .open_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match event {
+            ChatEvent::ToolUse {
+                id, tool, input, ..
+            } => {
+                open.insert(id.clone(), (tool.clone(), input.clone()));
+            }
+            ChatEvent::ToolUseInputResolved { id, input, .. } => {
+                if let Some(call) = open.get_mut(id) {
+                    call.1 = input.clone();
+                }
+            }
+            ChatEvent::ToolResult { id, .. } | ChatEvent::ToolCancelled { id, .. } => {
+                if let Some((tool, input)) = open.remove(id) {
+                    drop(open);
+                    self.session
+                        .work_log
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_tool_use(&tool, &input);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The post-stream steps of the Claude Code engine, with the same functions:
+    /// post-compaction re-injection, objective tracking, memory / feedback /
+    /// observations. Interrupt cleanup and auto-continue are the runtime's.
+    async fn after_turn(
+        &self,
+        session_id: &str,
+        outcome: &super::agent_runtime::TurnOutcome,
+    ) -> super::agent_runtime::AfterTurn {
+        let mut after = super::agent_runtime::AfterTurn::default();
+        let uuid = Uuid::parse_str(session_id).ok();
+        // The turn carried what waited since the last compaction and was answered:
+        // dropped in memory before anything else (before the first await, so the
+        // backstop cannot skip it), a compaction of this same turn holding its own
+        // context again below. The store follows in ONE ordered write at the end.
+        let previous = if outcome.answered {
+            self.session.held.edit(std::mem::take)
+        } else {
+            HeldContext::default()
+        };
+        let dropped = !previous.is_empty();
+        // Each step under its own budget, as `PostStreamHandler`'s (`StepBudget`): a
+        // step that never answers is dropped and said, the next ones still run.
+        let ctx = self
+            .step(
+                &mut after,
+                session_id,
+                "context",
+                super::post_stream::PostStreamContext::build(&self.graph, uuid),
+            )
+            .await
+            .unwrap_or_default();
+        // 1. Post-compaction context re-injection, a Stop included: unlike the Claude
+        // Code engine, nothing is queued as a turn (a Stop would drop it), the context
+        // waits in front of the next turn. Skipping it on a Stop lost the context the
+        // turn delivered AND the one of its own compaction.
+        if outcome.compacted {
+            let snapshot = self
+                .session
+                .work_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .snapshot();
+            if let Some((hint, event)) = self
+                .step(
+                    &mut after,
+                    session_id,
+                    "post_compaction",
+                    super::post_stream::post_compaction_recovery(
+                        &self.graph,
+                        session_id,
+                        ctx.project_slug.as_deref(),
+                        Some(snapshot),
+                    ),
+                )
+                .await
+            {
+                // Kept for the next turn, never queued as a turn of its own, and
+                // no bigger than the window allows (`HeldContext::cap`).
+                if let Some(hint) = hint {
+                    let hint = HeldContext::cap(&hint, outcome.context_window);
+                    self.session.held.edit(|h| h.context = Some(hint));
+                }
+                after.events.push(event);
+            }
+            // The compaction summarized what this turn carried: when no fresh context
+            // came (the step ran out of time), what it carried waits again — the
+            // context and its reminder (a newer reminder of this turn replaces it
+            // below) — rather than nothing.
+            self.session.held.edit(|held| {
+                if held.context.is_none() {
+                    held.context = previous.context.clone();
+                    if held.reminder.is_none() {
+                        held.reminder = previous.reminder.clone();
+                    }
+                }
+            });
+        }
+        // 2. Objective tracking, as on the Claude Code engine. After a turn that
+        // compacted, its reminder waits with the re-injected context, in front of
+        // the next turn, instead of starting a turn on a history just compacted.
+        {
+            let had_conclusive = outcome
+                .tools
+                .iter()
+                .any(|(tool, input)| is_conclusive_tool(tool, input));
+            let had_productive = outcome
+                .tools
+                .iter()
+                .any(|(tool, input)| !is_conclusive_tool(tool, input));
+            let turn = super::post_stream::ObjectiveTurn {
+                had_productive_tool_use: had_productive,
+                had_conclusive_tool_use: had_conclusive,
+                auto_continue_allowed: outcome.auto_continue_allowed,
+                hit_error_max_turns: outcome.hit_turn_limit,
+                interrupted: outcome.interrupted,
+            };
+            let reminder = self
+                .step(
+                    &mut after,
+                    session_id,
+                    "objective_tracking",
+                    super::post_stream::objective_reminder(
+                        &self.graph,
+                        ctx.project_slug.as_deref(),
+                        &self.session.objectives,
+                        turn,
+                        self.work_summary(),
+                    ),
+                )
+                .await
+                .flatten();
+            if let Some(reminder) = reminder {
+                info!(session_id, "Objective tracker: injecting reminder");
+                if outcome.compacted {
+                    self.session.held.edit(|h| h.reminder = Some(reminder));
+                } else {
+                    after.hints.push(reminder);
+                }
+            }
+        }
+        // What waits for the next turn is stored with the session: ONE write of what
+        // memory holds, ordered after the session's earlier writes (`HeldSlot`), so a
+        // clear can never land after the store of this turn's compaction. Also when
+        // an earlier write failed (`unsynced`): retried until the store follows, so a
+        // restart, an idle close or a relay never reloads a context already delivered.
+        // Waited for within the step budget; past it the clients learn it is late
+        // (`persistence_delayed`) and the write goes on.
+        if outcome.compacted || dropped || self.session.held.unsynced() {
+            let (step, write) =
+                self.session
+                    .held
+                    .spawn_write(&self.graph, session_id, self.step_budget);
+            if let Some(late) =
+                super::post_stream::await_write(session_id, step, self.step_budget, write).await
+            {
+                after.events.push(late);
+            }
+        }
+        // Tools still open when the turn ended (an error, the turn limit) are
+        // logged as they stand: the work log misses none.
+        self.flush_open_tools();
+        // 3. Memory / feedback / observations (the store write runs on its own).
+        self.step(
+            &mut after,
+            session_id,
+            "feedback",
+            super::post_stream::record_turn_feedback(
+                super::post_stream::TurnFeedback {
+                    graph: &self.graph,
+                    search: &self.search,
+                    event_emitter: &self.event_emitter,
+                    session_id,
+                    session_uuid: uuid,
+                    project_id: ctx.project_id,
+                    rfc_accumulator: Some(self.session.rfc_accumulator.clone()),
+                },
+                &outcome.assistant_text,
+                &self.session.memory,
+                &self.context_injector,
+            ),
+        )
+        .await;
+        after
+    }
+}
+
+/// One end-of-turn step of the agent engine under its own `budget`: past it the step
+/// is dropped (`post_stream::bounded`) and an `error` event says which one
+/// (`post_stream_step_abandoned`, `reason` = the step), as the Claude Code engine's
+/// `StepBudget::run` reports it.
+pub(crate) async fn run_step<F: std::future::Future>(
+    after: &mut super::agent_runtime::AfterTurn,
+    session_id: &str,
+    step: &'static str,
+    budget: Duration,
+    fut: F,
+) -> Option<F::Output> {
+    let out = super::post_stream::bounded(session_id, step, budget, fut).await;
+    if out.is_none() {
+        after.events.push(ChatEvent::Error {
+            message: format!(
+                "Error: the end-of-turn step '{step}' took longer than {} s: skipped",
+                budget.as_secs()
+            ),
+            parent_tool_use_id: None,
+            code: Some(super::post_stream::STEP_ABANDONED_CODE.to_string()),
+            reason: Some(step.to_string()),
+            index: None,
+        });
+    }
+    out
 }
 
 /// What another instance asks of a session of the agent engine this instance
@@ -1782,6 +2509,7 @@ impl ChatManager {
             acp: Default::default(),
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
+            held_slots: Default::default(),
         }
     }
 
@@ -1864,6 +2592,7 @@ impl ChatManager {
             acp: Default::default(),
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
+            held_slots: Default::default(),
         }
     }
 
@@ -3683,6 +4412,16 @@ impl ChatManager {
                 }
             }
         }
+        // The agent engine's sessions are live too (their permissions and background
+        // tasks are not tracked here: P11 / P4).
+        for handle in self.agent_runtime.handles().await {
+            if let Ok(id) = handle.session_id.parse::<Uuid>() {
+                snap.live.insert(id);
+                if handle.is_streaming.load(Ordering::SeqCst) {
+                    snap.streaming.insert(id);
+                }
+            }
+        }
         for (id, pending) in inputs {
             let ids: std::collections::HashSet<String> =
                 pending.lock().await.keys().cloned().collect();
@@ -4499,10 +5238,9 @@ impl ChatManager {
         relay: Option<&super::relay::RelayedFrom>,
         session_id: Uuid,
     ) -> Result<CreateSessionResponse> {
-        // Check max sessions
+        // Check max sessions: both engines' live sessions count.
         {
-            let sessions = self.active_sessions.read().await;
-            if sessions.len() >= self.config.max_sessions {
+            if self.active_session_count().await >= self.config.max_sessions {
                 return Err(anyhow!(
                     "Maximum number of active sessions reached ({})",
                     self.config.max_sessions
@@ -4630,13 +5368,24 @@ impl ChatManager {
             request.access,
             super::neutral_place::is_neutral_path(&request.cwd),
         );
+        // The record both engines keep (`session_record`): the title and preview come
+        // from the opening message as typed, and the memory conversation is named
+        // here (a relayed session keeps the one it continues).
+        let title_preview = super::session_record::title_and_preview(&request.message);
+        let conversation_id = relay.and_then(|r| r.conversation_id.clone()).or_else(|| {
+            self.memory_config.as_ref().map(|cfg| {
+                ConversationMemoryManager::new(cfg.clone())
+                    .conversation_id()
+                    .to_string()
+            })
+        });
         let session_node = ChatSessionNode {
             id: session_id,
             cli_session_id: None,
             project_slug: project_slug.clone(),
             workspace_slug: request.workspace_slug.clone(),
             cwd: request.cwd.clone(),
-            title: None,
+            title: title_preview.as_ref().map(|(t, _)| t.clone()),
             model: model.clone(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -4644,9 +5393,8 @@ impl ChatManager {
             // `user_message`); every later one bumps the count.
             message_count: 1,
             total_cost_usd: None,
-            // A relayed session keeps the memory conversation of the one it continues.
-            conversation_id: relay.and_then(|r| r.conversation_id.clone()),
-            preview: None,
+            conversation_id: conversation_id.clone(),
+            preview: title_preview.map(|(_, p)| p),
             permission_mode: request.permission_mode.clone(),
             add_dirs: if resolved_add_dirs.is_empty() {
                 None
@@ -4872,37 +5620,18 @@ impl ChatManager {
         }
 
         // Create ConversationMemoryManager for message recording
-        let memory_manager = if let Some(ref mem_config) = self.memory_config {
-            // A relayed session records into the conversation it continues.
-            let mm = match relay.and_then(|r| r.conversation_id.clone()) {
-                Some(kept) => {
-                    ConversationMemoryManager::new(mem_config.clone()).with_conversation_id(kept)
-                }
-                None => ConversationMemoryManager::new(mem_config.clone()),
-            };
-            let conversation_id = mm.conversation_id().to_string();
-            debug!(
-                "Created ConversationMemoryManager for session {} with conversation_id {}",
-                session_id, conversation_id
-            );
-
-            // Persist conversation_id in Neo4j
-            let _ = self
-                .graph
-                .update_chat_session(
-                    session_id,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(conversation_id),
-                    None,
-                )
-                .await;
-
-            Some(Arc::new(Mutex::new(mm)))
-        } else {
-            None
+        // It records into the conversation named on the node at creation.
+        let memory_manager = match (&self.memory_config, &conversation_id) {
+            (Some(mem_config), Some(conversation_id)) => {
+                let mm = ConversationMemoryManager::new(mem_config.clone())
+                    .with_conversation_id(conversation_id.clone());
+                debug!(
+                    "Created ConversationMemoryManager for session {} with conversation_id {}",
+                    session_id, conversation_id
+                );
+                Some(Arc::new(Mutex::new(mm)))
+            }
+            _ => None,
         };
 
         // Clone the stdin sender BEFORE wrapping client in Arc<Mutex<>>.
@@ -5177,36 +5906,7 @@ impl ChatManager {
             );
         }
 
-        // Auto-generate title and preview from the first user message — what the
-        // user typed, never the `<po-refs>`/`<po-attachments>` blocks around it.
-        {
-            let typed = crate::refs::turn::visible_text(&request.message);
-            let msg = &typed;
-            let title = if msg.chars().count() > 80 {
-                let truncated: String = msg.chars().take(77).collect();
-                format!("{}...", truncated.trim_end())
-            } else {
-                msg.to_string()
-            };
-            let preview = if msg.chars().count() > 200 {
-                let truncated: String = msg.chars().take(197).collect();
-                format!("{}...", truncated.trim_end())
-            } else {
-                msg.to_string()
-            };
-            let _ = self
-                .graph
-                .update_chat_session(
-                    session_id,
-                    None,
-                    Some(title),
-                    None,
-                    None,
-                    None,
-                    Some(preview),
-                )
-                .await;
-        }
+        // The title and preview were set on the node at creation (`session_record`).
 
         // Send the initial message and start streaming in a background task
         let session_id_str = session_id.to_string();
@@ -9092,6 +9792,11 @@ impl ChatManager {
             created_at: chrono::Utc::now(),
         };
         let _ = self.graph.store_chat_events(uuid, vec![user_event]).await;
+        // The message that resumes the session is a user message: it counts
+        // (`session_record`), as on the agent engine.
+        if let Err(e) = super::session_record::count_user_message(&self.graph, uuid).await {
+            warn!(session_id, error = %e, "Failed to count the resuming message (non-fatal)");
+        }
 
         // Emit user_message on local broadcast + NATS
         let user_msg_event = ChatEvent::UserMessage {
@@ -9319,18 +10024,11 @@ impl ChatManager {
                 .find(|m| m.role == "user")
                 .map(|m| m.content.clone());
 
-            if let Some(content) = first_user_msg {
-                let chars: Vec<char> = content.chars().collect();
-                let title = if chars.len() > 80 {
-                    format!("{}...", chars[..77].iter().collect::<String>().trim_end())
-                } else {
-                    content.clone()
-                };
-                let preview = if chars.len() > 200 {
-                    format!("{}...", chars[..197].iter().collect::<String>().trim_end())
-                } else {
-                    content
-                };
+            // The title rule of every session (`session_record`).
+            if let Some((title, preview)) = first_user_msg
+                .as_deref()
+                .and_then(super::session_record::title_and_preview)
+            {
                 let _ = self
                     .graph
                     .update_chat_session(
@@ -9348,6 +10046,130 @@ impl ChatManager {
         }
 
         Ok(count)
+    }
+
+    /// Brings the record of the sessions the agent engine served before it kept one
+    /// (P8) to what it would hold today (`session_record`), from their persisted
+    /// events: `message_count` = their `user_message` events (raised, never lowered),
+    /// `total_cost_usd` from their `result` events when the record has none, and the
+    /// title and preview of their first user message when they have none.
+    /// Idempotent: a second run changes nothing. A session of the legacy engine (no
+    /// provider snapshot) is left alone, that engine kept its record; a live one too.
+    /// Returns the number of sessions updated.
+    ///
+    /// Run it AT REST, or on the instance that holds the live sessions: it skips the
+    /// sessions live on THIS instance only. A session live on another instance
+    /// (NATS) can still be counted twice until the cluster-wide follow-up (plan
+    /// 5ad54c48-6317-4dc0-ad99-096242cc038d) lands.
+    pub async fn backfill_agent_session_records(&self) -> Result<usize> {
+        use super::session_record::{next_total_cost, title_and_preview, CostFigure};
+        const PAGE: usize = 200;
+        // Listed in full first: the list is ordered by `updated_at`, which each
+        // write below changes (paging while writing would skip sessions).
+        let mut sessions = Vec::new();
+        let mut offset = 0;
+        loop {
+            let (page, _) = self
+                .graph
+                .list_chat_sessions(None, None, PAGE, offset, true)
+                .await
+                .context("Failed to list sessions")?;
+            let fetched = page.len();
+            offset += fetched;
+            // The sessions the agent engine served: it alone stores their provider
+            // snapshot (`finish_agent_open`), Claude Code forced onto it included;
+            // and any other provider than Claude Code (only the agent engine serves
+            // one), in case that snapshot write failed.
+            sessions.extend(page.into_iter().filter(|s| {
+                s.capabilities.is_some()
+                    || s.provider_id
+                        .as_deref()
+                        .is_some_and(|p| p != super::provider::resolver::CLAUDE_CODE)
+            }));
+            if fetched < PAGE {
+                break;
+            }
+        }
+        let mut updated = 0;
+        for session in sessions {
+            // A live session keeps its own record: its handle may be between the
+            // event and the write (`user_message` stored, count not yet bumped; a
+            // `result` stored, cost not yet added), the backfill would count it twice.
+            if self.agent_runtime.owns(&session.id.to_string()).await {
+                continue;
+            }
+            let provider_id = session.provider_id.as_deref().unwrap_or_default();
+            let events = self.graph.get_chat_events(session.id, -1, 100_000).await?;
+            let parsed: Vec<ChatEvent> = events
+                .iter()
+                .filter(|e| e.event_type == "user_message" || e.event_type == "result")
+                .filter_map(|e| serde_json::from_str(&e.data).ok())
+                .collect();
+            let users: Vec<&str> = parsed
+                .iter()
+                .filter_map(|e| match e {
+                    ChatEvent::UserMessage { content } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let message_count = i64::try_from(users.len())
+                .ok()
+                .filter(|n| *n > session.message_count);
+            let total_cost_usd = if session.total_cost_usd.is_none() {
+                // A Claude Code on another machine reports the session's total.
+                let figure = match super::provider::store::instance(
+                    self.graph.as_ref(),
+                    provider_id,
+                )
+                .await
+                {
+                    Ok(Some(record))
+                        if record.kind == super::provider::settings::KIND_CLAUDE_CODE_REMOTE =>
+                    {
+                        CostFigure::SessionTotal
+                    }
+                    // Claude Code forced onto the agent engine: the CLI's total too.
+                    _ if provider_id == super::provider::resolver::CLAUDE_CODE => {
+                        CostFigure::SessionTotal
+                    }
+                    _ => CostFigure::Turn,
+                };
+                parsed
+                    .iter()
+                    .filter_map(|e| match e {
+                        ChatEvent::Result { cost_usd, .. } => Some(*cost_usd),
+                        _ => None,
+                    })
+                    .fold(None, |total, usd| {
+                        next_total_cost(total, usd, figure).or(total)
+                    })
+            } else {
+                None
+            };
+            let (title, preview) = match (&session.title, users.first()) {
+                (None, Some(first)) => match title_and_preview(first) {
+                    Some((t, p)) => (Some(t), Some(p)),
+                    None => (None, None),
+                },
+                _ => (None, None),
+            };
+            if message_count.is_none() && total_cost_usd.is_none() && title.is_none() {
+                continue;
+            }
+            self.graph
+                .update_chat_session(
+                    session.id,
+                    None,
+                    title,
+                    message_count,
+                    total_cost_usd,
+                    None,
+                    preview,
+                )
+                .await?;
+            updated += 1;
+        }
+        Ok(updated)
     }
 
     /// Search messages across all sessions via Meilisearch full-text search.
@@ -10066,6 +10888,11 @@ impl ChatManager {
     ///   task_id isn't in the map (idempotent — clicking Stop twice on
     ///   the same task is fine).
     pub async fn cancel_task(&self, session_id: &str, task_id: &str) -> Result<CancelTaskResult> {
+        if self.agent_runtime.owns(session_id).await {
+            return Err(anyhow::Error::new(CancelTaskUnsupported {
+                session_id: session_id.to_string(),
+            }));
+        }
         let session_state = {
             let sessions = self.active_sessions.read().await;
             sessions.get(session_id).map(|s| {
@@ -11779,12 +12606,20 @@ impl ChatManager {
                 handle.emit(relay.event(&sid, provider_id)).await;
             }
             if !request.message.is_empty() {
-                handle
+                // Counted on the node at creation (`message_count: 1`).
+                handle.opening_message_counted();
+                let sent = handle
                     .send_message_relayed(
                         &request.message,
                         &super::relay::prefixed(relay.and_then(|r| r.text()), &request.message),
                     )
-                    .await?;
+                    .await;
+                // A send that failed before its turn took the flag: the next message
+                // the user sends is counted.
+                if sent.is_err() {
+                    handle.forget_opening_count();
+                }
+                sent?;
             }
         }
         Ok(CreateSessionResponse {
@@ -11797,8 +12632,12 @@ impl ChatManager {
     }
 
     /// What a session of the agent engine gets around its turns, built from the
-    /// manager as it is configured NOW (the pipeline is replaced after construction).
-    pub(crate) fn turn_services(&self) -> Arc<dyn super::agent_runtime::TurnServices> {
+    /// manager as it is configured NOW (the pipeline is replaced after construction)
+    /// and the session's own end-of-turn state ([`Self::agent_turn_state`]).
+    fn turn_services_with(
+        &self,
+        session: AgentTurnState,
+    ) -> Arc<dyn super::agent_runtime::TurnServices> {
         Arc::new(ManagerTurnServices {
             graph: self.graph.clone(),
             enrichment_pipeline: self.enrichment_pipeline.clone(),
@@ -11806,7 +12645,75 @@ impl ChatManager {
             documents: self.document_store.clone(),
             nats: self.nats.clone(),
             anchor: self.anchor_session(),
+            session,
+            search: self.search.clone(),
+            event_emitter: self.event_emitter.clone(),
+            context_injector: self.context_injector.clone(),
+            step_budget: super::post_stream::POST_STREAM_STEP_BUDGET,
+            stall_step: None,
         })
+    }
+
+    /// The held context of `session_id` ([`HeldSlot`]), as a new state of the session
+    /// starts from it: the store's (a first open in this process, a restart, another
+    /// instance that played turns since), once the writes of an earlier state of the
+    /// session in this process landed (waited for within the step budget). When
+    /// memory and store may diverge (a write failed or still runs, a turn of an
+    /// earlier handle changed memory and has not written it yet) or the store
+    /// cannot be read in time ([`HeldSlot::reopen`]), memory.
+    async fn held_slot(&self, session_id: &str) -> Arc<HeldSlot> {
+        let slot = {
+            let mut slots = self.held_slots.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(slots.entry(session_id.to_string()).or_default())
+        };
+        // Only a slot in step with the store reloads it, and only if memory did not
+        // move during the read (an earlier handle's `after_turn` still runs: `close`
+        // does not stop it, `adopt` replaces a live handle).
+        slot.reopen(
+            &self.graph,
+            session_id,
+            super::post_stream::POST_STREAM_STEP_BUDGET,
+        )
+        .await;
+        slot
+    }
+
+    /// The end-of-turn state of the agent session `session_id`, from its node: its
+    /// memory conversation, the protocol run it was spawned in. Objective tracking
+    /// is on, as for every Claude Code session.
+    async fn agent_turn_state(&self, session_id: &str) -> AgentTurnState {
+        let node = match Uuid::parse_str(session_id) {
+            Ok(uuid) => self.graph.get_chat_session(uuid).await.ok().flatten(),
+            Err(_) => None,
+        };
+        let memory = match (
+            &self.memory_config,
+            node.as_ref().and_then(|n| n.conversation_id.clone()),
+        ) {
+            (Some(config), Some(conversation_id)) => Some(Arc::new(Mutex::new(
+                ConversationMemoryManager::new(config.clone())
+                    .with_conversation_id(conversation_id),
+            ))),
+            _ => None,
+        };
+        let spawned = node
+            .as_ref()
+            .and_then(|n| n.spawned_by.as_deref())
+            .and_then(parse_spawned_by);
+        // What waited for this session's next turn before it closed or the server
+        // restarted.
+        let held = self.held_slot(session_id).await;
+        AgentTurnState {
+            memory,
+            protocol_run_id: spawned.as_ref().and_then(|s| s.protocol_run_id),
+            held,
+            protocol_state: spawned.and_then(|s| s.protocol_state),
+            objectives: super::post_stream::ObjectiveCounters {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     /// Records what the provider reported (frozen capabilities, resume token)
@@ -11864,10 +12771,12 @@ impl ChatManager {
                 first_seq,
                 &kind_name,
                 tool_policy,
-                Some(self.turn_services()),
+                Some(self.turn_services_with(self.agent_turn_state(session_id).await)),
                 host_missing,
             )
             .await;
+        // A failed turn is retried as the chat's configuration says, on both engines.
+        handle.configure_retry(self.config.retry.clone());
         self.spawn_agent_nats_listeners(handle);
     }
 
@@ -12321,6 +13230,22 @@ impl ChatManager {
                         );
                     }
                 }
+                // The agent engine's sessions, by the same rule. It tracks no
+                // background task of its own (P4): a running turn keeps it.
+                for handle in manager.agent_runtime.handles().await {
+                    let idle = handle.idle_for();
+                    let is_streaming = handle.is_streaming.load(Ordering::SeqCst);
+                    if session_is_expired(idle, timeout, is_streaming, 0) {
+                        expired.push(handle.session_id.clone());
+                    } else if idle > timeout {
+                        debug!(
+                            session_id = %handle.session_id,
+                            idle_secs = idle.as_secs(),
+                            is_streaming,
+                            "Idle agent session kept alive: a turn is running"
+                        );
+                    }
+                }
 
                 for id in expired {
                     info!("Cleaning up timed-out session {}", id);
@@ -12332,9 +13257,10 @@ impl ChatManager {
         });
     }
 
-    /// Get the number of currently active sessions
+    /// Get the number of currently active sessions, on both engines.
     pub async fn active_session_count(&self) -> usize {
-        self.active_sessions.read().await.len()
+        let legacy = self.active_sessions.read().await.len();
+        legacy + self.agent_runtime.len().await
     }
 }
 
@@ -19126,6 +20052,193 @@ mod tests {
     }
 
     // ====================================================================
+    // backfill_agent_session_records — the record of the sessions the agent
+    // engine served before it kept one (P8)
+    // ====================================================================
+
+    fn record_event(session: Uuid, seq: i64, event: &ChatEvent) -> ChatEventRecord {
+        ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: session,
+            seq,
+            event_type: event.event_type().to_string(),
+            data: serde_json::to_string(event).unwrap(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn result_costing(usd: Option<f64>) -> ChatEvent {
+        ChatEvent::Result {
+            session_id: String::new(),
+            duration_ms: 1,
+            cost_usd: usd,
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: None,
+            result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_backfill_rebuilds_the_record_of_an_agent_session_once_and_leaves_claude_code_alone(
+    ) {
+        let state = mock_app_state();
+        let graph = state.neo4j.clone();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // A native session of before P8: three messages, three priced turns (one
+        // unknown), a record stuck at its creation.
+        let mut native = crate::test_helpers::test_chat_session(None);
+        native.provider_id = Some("local".into());
+        native.message_count = 1;
+        native.capabilities = Some("{}".into());
+        graph.create_chat_session(&native).await.unwrap();
+        let typed = crate::refs::block::encode(&"x".repeat(100), &[]);
+        let events = [
+            ChatEvent::UserMessage { content: typed },
+            result_costing(Some(0.01)),
+            ChatEvent::UserMessage {
+                content: "two".into(),
+            },
+            result_costing(None),
+            ChatEvent::UserMessage {
+                content: "three".into(),
+            },
+            result_costing(Some(0.02)),
+        ];
+        graph
+            .store_chat_events(
+                native.id,
+                events
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| record_event(native.id, i as i64 + 1, e))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        // A Claude Code session: the legacy engine kept its record.
+        let mut legacy = crate::test_helpers::test_chat_session(None);
+        legacy.provider_id = Some(crate::chat::provider::resolver::CLAUDE_CODE.into());
+        legacy.message_count = 1;
+        graph.create_chat_session(&legacy).await.unwrap();
+        graph
+            .store_chat_events(
+                legacy.id,
+                vec![
+                    record_event(
+                        legacy.id,
+                        1,
+                        &ChatEvent::UserMessage {
+                            content: "a".into(),
+                        },
+                    ),
+                    record_event(
+                        legacy.id,
+                        2,
+                        &ChatEvent::UserMessage {
+                            content: "b".into(),
+                        },
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(manager.backfill_agent_session_records().await.unwrap(), 1);
+        let node = graph.get_chat_session(native.id).await.unwrap().unwrap();
+        assert_eq!(node.message_count, 3, "{node:?}");
+        assert!(
+            (node.total_cost_usd.unwrap() - 0.03).abs() < 1e-9,
+            "{node:?}"
+        );
+        let title = node.title.clone().unwrap();
+        assert_eq!(title.chars().count(), 80, "the one title rule: {title}");
+        assert!(title.ends_with("..."));
+        assert_eq!(node.preview.as_deref(), Some("x".repeat(100).as_str()));
+
+        let untouched = graph.get_chat_session(legacy.id).await.unwrap().unwrap();
+        assert_eq!(untouched.message_count, 1);
+        assert_eq!(untouched.title, None);
+
+        // Idempotent.
+        assert_eq!(manager.backfill_agent_session_records().await.unwrap(), 0);
+        let again = graph.get_chat_session(native.id).await.unwrap().unwrap();
+        assert_eq!(again.message_count, 3);
+        assert_eq!(again.total_cost_usd, node.total_cost_usd);
+    }
+
+    /// Claude Code forced onto the agent engine has a provider snapshot: it is
+    /// backfilled, its cost being the CLI's session total (the last one). A session
+    /// live on this instance is left to its handle (it could be counted twice).
+    #[tokio::test]
+    async fn the_backfill_takes_claude_code_on_the_agent_engine_and_skips_a_live_session() {
+        let state = mock_app_state();
+        let graph = state.neo4j.clone();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let mut forced = crate::test_helpers::test_chat_session(None);
+        forced.provider_id = Some(crate::chat::provider::resolver::CLAUDE_CODE.into());
+        forced.capabilities = Some("{}".into());
+        forced.message_count = 1;
+        graph.create_chat_session(&forced).await.unwrap();
+        let mut live = crate::test_helpers::test_chat_session(None);
+        live.provider_id = Some("local".into());
+        live.capabilities = Some("{}".into());
+        live.message_count = 1;
+        graph.create_chat_session(&live).await.unwrap();
+        for id in [forced.id, live.id] {
+            let events = [
+                ChatEvent::UserMessage {
+                    content: "a".into(),
+                },
+                result_costing(Some(0.01)),
+                ChatEvent::UserMessage {
+                    content: "b".into(),
+                },
+                result_costing(Some(0.03)),
+            ];
+            graph
+                .store_chat_events(
+                    id,
+                    events
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| record_event(id, i as i64 + 1, e))
+                        .collect(),
+                )
+                .await
+                .unwrap();
+        }
+        let provider = crate::chat::agent_runtime::fake::FakeProvider::new();
+        manager
+            .agent_runtime
+            .adopt(
+                &live.id.to_string(),
+                "local",
+                provider.session(),
+                10,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+
+        assert_eq!(manager.backfill_agent_session_records().await.unwrap(), 1);
+        let node = graph.get_chat_session(forced.id).await.unwrap().unwrap();
+        assert_eq!(node.message_count, 2, "{node:?}");
+        assert_eq!(node.total_cost_usd, Some(0.03), "the CLI's total, not 0.04");
+        let untouched = graph.get_chat_session(live.id).await.unwrap().unwrap();
+        assert_eq!(untouched.message_count, 1, "a live session is its handle's");
+        assert_eq!(untouched.total_cost_usd, None);
+    }
+
+    // ====================================================================
     // update_chat_session via mock — title, preview, conversation_id
     // ====================================================================
 
@@ -23381,6 +24494,12 @@ mod refs_turn_services_tests {
             nats: None,
             documents: crate::documents::store::DocumentStore::new(std::env::temp_dir()),
             anchor: Default::default(),
+            session: Default::default(),
+            search: crate::test_helpers::mock_app_state().meili,
+            event_emitter: None,
+            context_injector: None,
+            step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
+            stall_step: None,
         };
 
         let note = Uuid::new_v4();
@@ -23404,5 +24523,508 @@ mod refs_turn_services_tests {
             "{out}"
         );
         assert!(!out.contains("<po-refs>"), "{out}");
+    }
+}
+
+/// The end-of-turn steps of the agent engine are bounded one by one, as the Claude
+/// Code engine's (`StepBudget::run`): a step that never answers is dropped and
+/// said, the next one still runs (before, one budget held the three together, so a
+/// slow re-injection lost the memory and the feedback too).
+#[cfg(test)]
+mod agent_step_budget_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_step_past_its_budget_is_said_and_the_next_one_still_runs() {
+        let mut after = super::super::agent_runtime::AfterTurn::default();
+        let budget = Duration::from_millis(20);
+        let stuck = run_step(
+            &mut after,
+            "s",
+            "post_compaction",
+            budget,
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(stuck.is_none());
+        let next = run_step(&mut after, "s", "feedback", budget, async { 7 }).await;
+        assert_eq!(next, Some(7), "the next step ran");
+        assert!(
+            matches!(
+                after.events.as_slice(),
+                [ChatEvent::Error { code: Some(code), reason: Some(step), .. }]
+                    if code == super::super::post_stream::STEP_ABANDONED_CODE
+                        && step == "post_compaction"
+            ),
+            "{:?}",
+            after.events
+        );
+    }
+}
+
+/// What waits for a session's next turn after a compaction (`HeldContext`): kept
+/// across a restart, dropped only once a turn carrying it was sent, cut to the
+/// window; and the end-of-turn steps each under their own budget.
+#[cfg(test)]
+mod held_context_tests {
+    use super::*;
+    use crate::chat::agent_runtime::{TurnOutcome, TurnServices};
+
+    fn test_config() -> ChatConfig {
+        ChatConfig {
+            max_sessions: 10,
+            ..Default::default()
+        }
+    }
+
+    fn services(manager: &ChatManager, state: AgentTurnState) -> ManagerTurnServices {
+        ManagerTurnServices {
+            graph: manager.graph.clone(),
+            enrichment_pipeline: manager.enrichment_pipeline.clone(),
+            turn_routing: Arc::default(),
+            documents: crate::documents::store::DocumentStore::new(std::env::temp_dir()),
+            nats: None,
+            anchor: Default::default(),
+            session: state,
+            search: crate::test_helpers::mock_app_state().meili,
+            event_emitter: None,
+            context_injector: None,
+            step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
+            stall_step: None,
+        }
+    }
+
+    async fn world() -> (ChatManager, String) {
+        world_on(Arc::new(crate::neo4j::mock::MockGraphStore::new())).await
+    }
+
+    /// [`world`] on a store the test drives (slow, failing writes).
+    async fn world_on(mock: Arc<crate::neo4j::mock::MockGraphStore>) -> (ChatManager, String) {
+        let graph: Arc<dyn GraphStore> = mock;
+        let manager = ChatManager::new_without_memory(
+            graph.clone(),
+            crate::test_helpers::mock_app_state().meili,
+            test_config(),
+        );
+        let mut project = crate::test_helpers::test_project();
+        project.slug = "held".into();
+        graph.create_project(&project).await.unwrap();
+        let session = crate::test_helpers::test_chat_session(Some("held"));
+        graph.create_chat_session(&session).await.unwrap();
+        (manager, session.id.to_string())
+    }
+
+    async fn prepared(s: &ManagerTurnServices, sid: &str, text: &str) -> String {
+        let turn = crate::refs::turn::expand_user_turn_if(&s.graph, text, false).await;
+        s.prepare(sid, text, text, &turn).await
+    }
+
+    fn compacted() -> TurnOutcome {
+        TurnOutcome {
+            compacted: true,
+            ..Default::default()
+        }
+    }
+
+    fn answered() -> TurnOutcome {
+        TurnOutcome {
+            answered: true,
+            ..Default::default()
+        }
+    }
+
+    const HELD: &str = "Post-Compaction Context";
+
+    /// The clear of a delivered context fails (the store errs): the failure is not
+    /// lost — the slot knows the store is behind, a reopen in this process does not
+    /// reload the delivered context, and the next turn, whatever it is, writes again
+    /// until the store follows (else a restart, an idle close or a relay would
+    /// re-inject it, maybe days later).
+    #[tokio::test]
+    async fn a_failed_clear_is_retried_on_the_next_turn() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_on(mock.clone()).await;
+        let s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.after_turn(&sid, &compacted()).await;
+        assert!(!HeldContext::load(&s.graph, &sid).await.unwrap().is_empty());
+        mock.fail_llm_setting_writes(HeldContext::KEY, true);
+        s.after_turn(&sid, &answered()).await;
+        assert!(!prepared(&s, &sid, "one").await.contains(HELD), "delivered");
+        assert!(
+            !HeldContext::load(&s.graph, &sid).await.unwrap().is_empty(),
+            "the store refused the clear"
+        );
+        assert!(s.session.held.unsynced(), "and the slot knows it");
+        let reopened = services(&manager, manager.agent_turn_state(&sid).await);
+        assert!(
+            !prepared(&reopened, &sid, "two").await.contains(HELD),
+            "a reopen keeps memory over a store known to be behind"
+        );
+        // Still failing: a plain turn tries again, and keeps knowing.
+        s.after_turn(&sid, &TurnOutcome::default()).await;
+        assert!(s.session.held.unsynced());
+        // The store answers again: the next turn's write lands.
+        mock.fail_llm_setting_writes(HeldContext::KEY, false);
+        s.after_turn(&sid, &TurnOutcome::default()).await;
+        assert!(
+            HeldContext::load(&s.graph, &sid).await.unwrap().is_empty(),
+            "retried"
+        );
+        assert!(!s.session.held.unsynced());
+    }
+
+    /// The clear of a delivered context is slow (the store does not answer): the
+    /// turn does not wait past the step budget and says the write is late
+    /// (`persistence_delayed`); the next turn compacts again meanwhile, and its
+    /// store is ORDERED after that clear — the newer context is what the store ends
+    /// with, not an empty one landed last, also once the stalled store answers.
+    /// The budget (1 s: the clear dropped after 2 s) leaves the stalled clear in
+    /// flight well after the newer store would land without the lock, so the test
+    /// is red without it however slow the machine.
+    #[tokio::test]
+    async fn a_slow_clear_is_said_late_and_a_newer_store_lands_after_it() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_on(mock.clone()).await;
+        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.step_budget = Duration::from_secs(1);
+        s.after_turn(&sid, &compacted()).await;
+        mock.stall_llm_setting_deletes(HeldContext::KEY);
+        let started = std::time::Instant::now();
+        let after = s.after_turn(&sid, &answered()).await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(late(&after, "clear_held_context"), "{:?}", after.events);
+        // The next turn (not carrying a context) compacts again while the clear waits.
+        s.after_turn(&sid, &compacted()).await;
+        let stored_context = || async {
+            HeldContext::load(&s.graph, &sid)
+                .await
+                .unwrap()
+                .context
+                .is_some()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !stored_context().await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the newer context was never stored"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        mock.release_llm_setting_deletes(HeldContext::KEY);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            stored_context().await,
+            "the newer context is stored, the late clear landed before it"
+        );
+    }
+
+    /// Whether `after` says the write `step` is late (`persistence_delayed`).
+    fn late(after: &crate::chat::agent_runtime::AfterTurn, step: &str) -> bool {
+        after.events.iter().any(|e| {
+            matches!(
+                e,
+                ChatEvent::Error { code: Some(code), reason: Some(reason), .. }
+                    if code == crate::chat::post_stream::PERSISTENCE_DELAYED_CODE
+                        && reason == step
+            )
+        })
+    }
+
+    /// Waits (5 s at most) until `cond` holds.
+    async fn until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "never: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The session is reopened (`close` does not stop the earlier handle's
+    /// `after_turn`, `adopt` replaces a live handle) while the earlier handle's turn
+    /// compacted and holds its new context in memory, not yet written (its steps
+    /// still run). The reopen keeps memory instead of reloading the store, which
+    /// does not have it yet: the new context is neither lost in memory nor
+    /// overwritten in the store by the reloaded one. Red without the generation:
+    /// the slot looked in step, the reopen reloaded nothing over it, and the turn's
+    /// write then stored that nothing.
+    #[tokio::test]
+    async fn a_reopen_during_an_earlier_turn_keeps_the_context_it_holds() {
+        let (manager, sid) = world().await;
+        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.step_budget = Duration::from_millis(500);
+        s.stall_step = Some("objective_tracking");
+        let s = Arc::new(s);
+        let turn = {
+            let (s, sid) = (Arc::clone(&s), sid.clone());
+            tokio::spawn(async move { s.after_turn(&sid, &compacted()).await })
+        };
+        until("the compaction's context is held", || {
+            s.session.held.held().context.is_some()
+        })
+        .await;
+        let reopened = services(&manager, manager.agent_turn_state(&sid).await);
+        turn.await.unwrap();
+        assert!(
+            prepared(&reopened, &sid, "next").await.contains(HELD),
+            "the reopened session carries the new context"
+        );
+        assert!(
+            HeldContext::load(&s.graph, &sid)
+                .await
+                .unwrap()
+                .context
+                .is_some(),
+            "and the store has it"
+        );
+    }
+
+    /// The other way round: the earlier handle's turn delivered the context and
+    /// emptied memory, its clear not written yet; a reopen meanwhile does not
+    /// reload the delivered context from the store (it would ride a second turn).
+    #[tokio::test]
+    async fn a_reopen_during_an_earlier_turn_does_not_reload_a_delivered_context() {
+        let (manager, sid) = world().await;
+        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.after_turn(&sid, &compacted()).await;
+        s.step_budget = Duration::from_millis(500);
+        s.stall_step = Some("context");
+        let s = Arc::new(s);
+        let turn = {
+            let (s, sid) = (Arc::clone(&s), sid.clone());
+            tokio::spawn(async move { s.after_turn(&sid, &answered()).await })
+        };
+        until("the delivered context is dropped in memory", || {
+            s.session.held.held().is_empty()
+        })
+        .await;
+        let reopened = services(&manager, manager.agent_turn_state(&sid).await);
+        assert!(
+            !prepared(&reopened, &sid, "next").await.contains(HELD),
+            "not reloaded from the store the clear has not reached yet"
+        );
+        turn.await.unwrap();
+        assert!(HeldContext::load(&s.graph, &sid).await.unwrap().is_empty());
+    }
+
+    /// The store cannot be read when the session is reopened: memory is kept, not
+    /// replaced by an empty context.
+    #[tokio::test]
+    async fn a_store_read_error_at_reopen_keeps_memory() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_on(mock.clone()).await;
+        let s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.after_turn(&sid, &compacted()).await;
+        assert!(!s.session.held.unsynced());
+        mock.fail_llm_setting_reads(HeldContext::KEY, true);
+        let reopened = services(&manager, manager.agent_turn_state(&sid).await);
+        assert!(
+            prepared(&reopened, &sid, "next").await.contains(HELD),
+            "a read error is not an empty context"
+        );
+        mock.fail_llm_setting_reads(HeldContext::KEY, false);
+    }
+
+    /// The store read of a reopen never answers: it is dropped after twice the step
+    /// budget, memory is kept, and the session's write lock is released — the next
+    /// writes are not stuck behind it. Red without the bound: the reopen never
+    /// returns, holding the lock.
+    #[tokio::test]
+    async fn a_store_read_that_never_answers_at_reopen_releases_the_lock() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_on(mock.clone()).await;
+        let s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.after_turn(&sid, &compacted()).await;
+        assert!(!s.session.held.unsynced());
+        mock.stall_llm_setting_reads(HeldContext::KEY);
+        let budget = Duration::from_millis(100);
+        let reopen = tokio::time::timeout(
+            Duration::from_secs(5),
+            s.session.held.reopen(&s.graph, &sid, budget),
+        )
+        .await;
+        assert!(reopen.is_ok(), "the reopen waited on the store for good");
+        assert!(
+            s.session.held.write.try_lock().is_ok(),
+            "the write lock is released"
+        );
+        assert!(
+            s.session.held.held().context.is_some(),
+            "a read that never answers is not an empty context"
+        );
+        // A write goes through meanwhile.
+        s.session.held.edit(|h| *h = HeldContext::default());
+        s.session
+            .held
+            .write_once(&s.graph, &sid, budget)
+            .await
+            .unwrap();
+        assert!(!s.session.held.unsynced());
+        mock.release_llm_setting_reads(HeldContext::KEY);
+        assert!(HeldContext::load(&s.graph, &sid).await.unwrap().is_empty());
+    }
+
+    /// A failed write is retried in the background, without waiting for a turn: a
+    /// session closed or left right after keeps no delivered context in the store
+    /// for a restart to reload.
+    #[tokio::test]
+    async fn a_failed_write_is_retried_without_a_turn() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_on(mock.clone()).await;
+        let s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.after_turn(&sid, &compacted()).await;
+        mock.fail_llm_setting_writes(HeldContext::KEY, true);
+        s.after_turn(&sid, &answered()).await;
+        assert!(s.session.held.unsynced());
+        mock.fail_llm_setting_writes(HeldContext::KEY, false);
+        // No turn from here on.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while s.session.held.unsynced() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the failed clear was never retried"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(HeldContext::load(&s.graph, &sid).await.unwrap().is_empty());
+    }
+
+    /// A store write that never answers is dropped after twice the step budget: the
+    /// session's write lock is released (later turns and reopens do not wait on
+    /// it) and the slot stays unsynced (written again later). Red without the
+    /// bound: the lock is held for as long as the store does not answer.
+    #[tokio::test]
+    async fn a_store_write_that_never_answers_releases_the_lock() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_on(mock.clone()).await;
+        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.step_budget = Duration::from_millis(100);
+        s.after_turn(&sid, &compacted()).await;
+        mock.stall_llm_setting_deletes(HeldContext::KEY);
+        let after = s.after_turn(&sid, &answered()).await;
+        assert!(late(&after, "clear_held_context"), "{:?}", after.events);
+        until("the write lock is released", || {
+            s.session.held.write.try_lock().is_ok()
+        })
+        .await;
+        assert!(s.session.held.unsynced(), "the clear did not land");
+        mock.release_llm_setting_deletes(HeldContext::KEY);
+    }
+
+    /// A turn carrying a context compacts and is answered, but its re-injection
+    /// gives nothing in time (the step stalls): what it carried — the context AND
+    /// its objective reminder — waits again, in memory and in the store.
+    #[tokio::test]
+    async fn a_compaction_without_a_fresh_context_holds_what_the_turn_carried() {
+        let (manager, sid) = world().await;
+        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.step_budget = Duration::from_millis(200);
+        s.stall_step = Some("post_compaction");
+        let carried = HeldContext {
+            context: Some("H1 carried context".into()),
+            reminder: Some("R1 carried reminder".into()),
+        };
+        s.session.held.edit(|h| *h = carried.clone());
+        s.after_turn(
+            &sid,
+            &TurnOutcome {
+                answered: true,
+                compacted: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(s.session.held.held(), carried);
+        assert_eq!(HeldContext::load(&s.graph, &sid).await.unwrap(), carried);
+    }
+
+    /// The server goes down between the compaction and the next turn: the session
+    /// resumed on a new state still gets the context in front of that turn.
+    #[tokio::test]
+    async fn the_held_context_survives_a_restart() {
+        let (manager, sid) = world().await;
+        let before = services(&manager, manager.agent_turn_state(&sid).await);
+        before.after_turn(&sid, &compacted()).await;
+        drop(before);
+        let after = services(&manager, manager.agent_turn_state(&sid).await);
+        let sent = prepared(&after, &sid, "next").await;
+        assert!(sent.contains("Post-Compaction Context"), "{sent}");
+    }
+
+    /// A turn that was prepared but not answered (a Stop during the enrichment, a
+    /// refused image, a provider error, a failure after `send_turn` accepted it)
+    /// leaves the context for the next one; a turn answered drops it, in memory and
+    /// in the store.
+    #[tokio::test]
+    async fn the_held_context_is_dropped_only_once_a_turn_is_answered() {
+        let (manager, sid) = world().await;
+        let s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.after_turn(&sid, &compacted()).await;
+        let first = prepared(&s, &sid, "one").await;
+        assert!(first.contains("Post-Compaction Context"));
+        // The turn failed: not answered.
+        s.after_turn(&sid, &TurnOutcome::default()).await;
+        let again = prepared(&s, &sid, "two").await;
+        assert!(again.contains("Post-Compaction Context"), "kept: {again}");
+        assert!(!HeldContext::load(&s.graph, &sid).await.unwrap().is_empty());
+        s.after_turn(
+            &sid,
+            &TurnOutcome {
+                answered: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let then = prepared(&s, &sid, "three").await;
+        assert!(!then.contains("Post-Compaction Context"), "dropped: {then}");
+        // And from the store too: written before `after_turn` returned.
+        assert!(HeldContext::load(&s.graph, &sid).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_held_context_is_cut_to_a_share_of_the_window() {
+        let long = format!(
+            "<system-reminder>\n{}\n</system-reminder>",
+            "x".repeat(20_000)
+        );
+        let small = HeldContext::cap(&long, Some(8_000));
+        assert!(small.chars().count() <= 1_600, "{}", small.chars().count());
+        assert!(small.ends_with("</system-reminder>"));
+        let unknown = HeldContext::cap(&long, None);
+        assert!(unknown.chars().count() <= 6_000);
+        let big = HeldContext::cap(&long, Some(1_000_000));
+        assert!(
+            big.chars().count() <= 6_000,
+            "never above the builder's cap"
+        );
+        assert_eq!(HeldContext::cap("short", Some(8_000)), "short");
+    }
+
+    /// One step that never answers costs that step only: the next steps run, each in
+    /// its own budget (a shared budget would drop them with it).
+    #[tokio::test]
+    async fn a_stuck_step_does_not_take_the_next_ones_with_it() {
+        let (manager, sid) = world().await;
+        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.step_budget = Duration::from_millis(100);
+        s.stall_step = Some("context");
+        let started = std::time::Instant::now();
+        let after = s.after_turn(&sid, &TurnOutcome::default()).await;
+        assert!(
+            after.events.iter().any(|e| matches!(
+                e,
+                ChatEvent::Error { reason: Some(step), .. } if step == "context"
+            )),
+            "{:?}",
+            after.events
+        );
+        assert_eq!(
+            s.session
+                .objectives
+                .turns_since
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the objective step still ran after the stuck one"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
