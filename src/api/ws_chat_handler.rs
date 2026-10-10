@@ -961,10 +961,10 @@ async fn handle_ws_chat_loop(
                                                 }
                                                 Err(e) => {
                                                     warn!(session_id = %sid, error = %e, "WS: cancel_tools failed");
-                                                    if let Some(event) = crate::chat::cancel_relay::ws_error_event(&e) {
-                                                        if let Ok(frame) = serde_json::to_string(&event) {
-                                                            let _ = tx.send(frame);
-                                                        }
+                                                    if let Some(frame) = crate::chat::cancel_relay::ws_error_event(&e)
+                                                        .and_then(|event| control_frame(&event))
+                                                    {
+                                                        let _ = tx.send(frame);
                                                     }
                                                 }
                                             }
@@ -1410,12 +1410,38 @@ pub(crate) async fn neural_reinforcement(
 // Tests
 // ============================================================================
 
+/// A frame a task spawned by the connection sends to its client: the event with
+/// `seq` 0, like every live event of the loop (`send_chat_event!`), so a client
+/// that orders or dedups by `seq` reads it the same way.
+fn control_frame(event: &crate::chat::types::ChatEvent) -> Option<String> {
+    let mut value = serde_json::to_value(event).ok()?;
+    value
+        .as_object_mut()?
+        .insert("seq".to_string(), serde_json::json!(0));
+    Some(value.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::chat::types::ChatEvent;
     use std::collections::HashSet;
     use tokio::sync::broadcast;
+
+    /// Review of #673, nit 6: the `cancel_failed` frame a spawned cancel_tools
+    /// sends carries `seq` like every live frame of the loop.
+    #[test]
+    fn a_control_frame_carries_seq_like_live_events() {
+        let error =
+            anyhow::Error::new(crate::chat::cancel_relay::CancelRelayError::OwnerUnreachable);
+        let event = crate::chat::cancel_relay::ws_error_event(&error).unwrap();
+        let frame: serde_json::Value =
+            serde_json::from_str(&control_frame(&event).unwrap()).unwrap();
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["code"], "cancel_failed");
+        assert_eq!(frame["reason"], "owner_unreachable");
+        assert_eq!(frame["seq"], 0);
+    }
 
     /// Verify that dropping the broadcast sender causes RecvError::Closed.
     /// This is the mechanism that triggers the dormant transition.

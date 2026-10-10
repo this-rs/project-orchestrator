@@ -8,14 +8,25 @@
 //! | the owner's provider refused (`Unsupported`, …) | `Err(ProviderError)` | 422 `unsupported` … | no |
 //! | no instance holds the session live (NATS "no responders"; one instance without NATS: the same) | [`CancelRelayError::OwnerUnreachable`] | 409 `owner_unreachable` | no |
 //! | no answer in time (asker's timeout, or the owner's [`OWNER_CANCEL_BOUND`]) | [`CancelRelayError::OwnerTimeout`] | 504 `owner_timeout` | cancel_task only: a late `cancel_tools` may have happened, a retry would stop tools started since |
-//! | only `gone` came back: the session left the instance that was asked | [`CancelRelayError::SessionGone`] | 410 `session_gone` | yes (asking again reaches the new owner) |
+//! | only `gone` came back: the session left the instance that was asked | [`CancelRelayError::SessionGone`] | 410 `session_gone` | cancel_task only (asking again reaches the new owner; see below for cancel_tools) |
 //! | an answer that is not a [`CancelReply`] | [`CancelRelayError::OwnerProtocol`] | 502 `owner_protocol` | no |
 //! | the owner failed otherwise | [`CancelRelayError::OwnerFailed`] | 502 `owner_failed` | no |
 //! | the request could not be sent | [`CancelRelayError::RelayFailed`] | 502 `relay_failed` | no |
 //!
-//! A `gone` is never taken over a real answer: the asker keeps listening
-//! [`GONE_GRACE`] after one (an instance that just lost the session may answer
-//! before the one that now holds it), and only then reports `session_gone`.
+//! A `gone` is never taken over a real answer: after one, the asker keeps
+//! listening (an instance that just lost the session may answer before the one
+//! that now holds it), and only then reports `session_gone`. How long depends on
+//! the kind ([`gone_grace`]):
+//!
+//! - `cancel_task`: [`GONE_GRACE`]. A task stopped twice is still one stopped
+//!   task, so a 410 the real owner beat by more than the grace is safe to retry.
+//! - `cancel_tools`: until the asker's own deadline. A real owner slower than
+//!   [`GONE_GRACE`] may still stop the tools after a 410; a retry would then stop
+//!   the tools started since (review of #673, finding 1). Waiting to the deadline
+//!   (longer than [`OWNER_CANCEL_BOUND`], so a v2 owner always answers within it)
+//!   takes the owner's real answer; a `gone` alone at the deadline is still not
+//!   proof that nothing happened (an older owner sends nothing when it times
+//!   out), so this 410 is not retryable.
 //!
 //! Wire (versioned, for rolling upgrades): the request carries `"v": 2`; a v2
 //! owner answers `{"v":2, "result"|"refused"|"failed"|"timeout"|"gone": …}`. A
@@ -41,8 +52,19 @@ use crate::events::{NatsEmitter, RelayFailure};
 /// reported as such instead of a silence).
 pub const OWNER_CANCEL_BOUND: Duration = Duration::from_secs(8);
 
-/// How long the asker keeps listening for a real answer after a `gone`.
+/// How long the asker of a `cancel_task` keeps listening for a real answer after
+/// a `gone`.
 pub const GONE_GRACE: Duration = Duration::from_millis(1500);
+
+/// How long the asker keeps listening for a real answer after a `gone`, for this
+/// kind of cancel (see the module doc). `Duration::MAX`: until the asker's own
+/// deadline.
+pub fn gone_grace(kind: CancelKind) -> Duration {
+    match kind {
+        CancelKind::Task => GONE_GRACE,
+        CancelKind::Tools => Duration::MAX,
+    }
+}
 
 /// Version of the request/reply payload.
 pub const WIRE_VERSION: u64 = 2;
@@ -79,7 +101,7 @@ impl<T> CancelReply<T> {
             Err(error) => {
                 if let Some(relay) = error.downcast_ref::<CancelRelayError>() {
                     return match relay {
-                        CancelRelayError::SessionGone => Self::Gone,
+                        CancelRelayError::SessionGone { .. } => Self::Gone,
                         CancelRelayError::OwnerTimeout { .. } => Self::Timeout,
                         other => Self::Failed(other.to_string()),
                     };
@@ -103,7 +125,7 @@ impl<T> CancelReply<T> {
             Self::Refused(refusal) => Err(anyhow::Error::new(refusal)),
             Self::Failed(text) => Err(anyhow::Error::new(CancelRelayError::OwnerFailed(text))),
             Self::Timeout => Err(anyhow::Error::new(CancelRelayError::OwnerTimeout { kind })),
-            Self::Gone => Err(anyhow::Error::new(CancelRelayError::SessionGone)),
+            Self::Gone => Err(anyhow::Error::new(CancelRelayError::SessionGone { kind })),
         }
     }
 
@@ -177,8 +199,8 @@ pub enum CancelRelayError {
         "the instance holding this session did not answer in time: the cancel may still happen"
     )]
     OwnerTimeout { kind: CancelKind },
-    #[error("the session is no longer held by the instance that was asked: nothing was cancelled")]
-    SessionGone,
+    #[error("the session is no longer held by the instance that was asked")]
+    SessionGone { kind: CancelKind },
     #[error("the instance holding this session sent an unreadable answer: {0}")]
     OwnerProtocol(String),
     #[error("the instance holding this session failed to cancel: {0}")]
@@ -195,8 +217,10 @@ impl CancelRelayError {
             // A late cancel_tools may have happened: a retry would stop the tools
             // started since. A task stopped twice is still one stopped task.
             Self::OwnerTimeout { kind } => (504, "owner_timeout", *kind == CancelKind::Task),
-            // The session moved: asking again reaches the instance that holds it now.
-            Self::SessionGone => (410, "session_gone", true),
+            // The session moved: asking again reaches the instance that holds it
+            // now. Not for cancel_tools: only a `gone` came back by the deadline,
+            // which does not prove that no owner stopped the tools (module doc).
+            Self::SessionGone { kind } => (410, "session_gone", *kind == CancelKind::Task),
             Self::OwnerProtocol(_) => (502, "owner_protocol", false),
             Self::OwnerFailed(_) => (502, "owner_failed", false),
             Self::RelayFailed(_) => (502, "relay_failed", false),
@@ -209,8 +233,15 @@ impl CancelRelayError {
             Self::OwnerTimeout { .. } => {
                 "The instance holding this session did not answer in time: the cancel may still happen."
             }
-            Self::SessionGone => {
+            Self::SessionGone {
+                kind: CancelKind::Task,
+            } => {
                 "The session moved to another instance while it was asked: nothing was cancelled; ask again."
+            }
+            Self::SessionGone {
+                kind: CancelKind::Tools,
+            } => {
+                "The session left the instance that was asked and no other instance answered in time: the tools may not have been stopped."
             }
             Self::OwnerProtocol(_) => "The instance holding this session sent an unreadable answer.",
             Self::OwnerFailed(_) => "The instance holding this session failed to cancel.",
@@ -240,7 +271,7 @@ pub async fn relay<T: DeserializeOwned>(
     payload["v"] = json!(WIRE_VERSION);
     let is_gone = |bytes: &[u8]| CancelReply::<Value>::from_wire(bytes).is_ok_and(|r| r.is_gone());
     match nats
-        .request_cancel(subject, payload, &is_gone, GONE_GRACE)
+        .request_cancel(subject, payload, &is_gone, gone_grace(kind))
         .await
     {
         Ok(bytes) => CancelReply::<T>::from_wire(&bytes)
@@ -408,7 +439,12 @@ mod tests {
                     kind: CancelKind::Tools,
                 },
             ),
-            (CancelReply::Gone, CancelRelayError::SessionGone),
+            (
+                CancelReply::Gone,
+                CancelRelayError::SessionGone {
+                    kind: CancelKind::Tools,
+                },
+            ),
             (
                 CancelReply::Failed("disk".into()),
                 CancelRelayError::OwnerFailed("disk".into()),
@@ -456,6 +492,126 @@ mod tests {
         assert!(!asker_v2(br#"{"task_id":"x"}"#));
     }
 
+    /// Responders on `subject`: one stale instance answering `gone` at once, and,
+    /// when `owner_after` is given, the real owner answering `result` that late.
+    async fn responders(
+        broker: &crate::events::nats_broker_test::TestBroker,
+        subject: &str,
+        owner_after: Option<Duration>,
+    ) {
+        use futures::StreamExt;
+        let stale = broker.client().await;
+        let mut stale_sub = stale.subscribe(subject.to_string()).await.unwrap();
+        stale.flush().await.unwrap();
+        tokio::spawn(async move {
+            while let Some(msg) = stale_sub.next().await {
+                if let Some(reply) = msg.reply {
+                    let _ = stale.publish(reply, "{\"v\":2,\"gone\":true}".into()).await;
+                    let _ = stale.flush().await;
+                }
+            }
+        });
+        let Some(after) = owner_after else { return };
+        let owner = broker.client().await;
+        let mut owner_sub = owner.subscribe(subject.to_string()).await.unwrap();
+        owner.flush().await.unwrap();
+        tokio::spawn(async move {
+            while let Some(msg) = owner_sub.next().await {
+                let Some(reply) = msg.reply else { continue };
+                tokio::time::sleep(after).await;
+                let body = json!({"v": 2, "result": {"cli_pid": 42, "killed_pids": [43], "capped": false}});
+                let _ = owner.publish(reply, body.to_string().into()).await;
+                let _ = owner.flush().await;
+            }
+        });
+    }
+
+    /// Review of #673, finding 1: a stale `gone` at once, the real owner of a
+    /// cancel_tools answering later than GONE_GRACE (a slow provider, within its
+    /// own bound). The asker returns what the owner did, never a 410 the client
+    /// could retry while the tools were being stopped (a retry would stop the
+    /// tools started since).
+    #[tokio::test]
+    async fn a_gone_never_beats_a_cancel_tools_owner_slower_than_the_grace() {
+        use crate::chat::manager::CancelToolsResult;
+        let broker = crate::events::nats_broker_test::TestBroker::start().await;
+        let subject = "events.chat.s1.cancel_tools";
+        responders(
+            &broker,
+            subject,
+            Some(GONE_GRACE + Duration::from_millis(800)),
+        )
+        .await;
+        let nats = NatsEmitter::new(broker.client().await, "events")
+            .with_cancel_rpc_timeout(Duration::from_secs(5));
+        let done: CancelToolsResult =
+            relay(&nats, subject.to_string(), json!({}), CancelKind::Tools)
+                .await
+                .expect("the real owner's answer");
+        assert_eq!((done.cli_pid, done.killed_pids), (Some(42), vec![43]));
+    }
+
+    /// Finding 1, the other half: only `gone` comes back. A cancel_task reports
+    /// it after GONE_GRACE, retryable; a cancel_tools only at its deadline, not
+    /// retryable.
+    #[tokio::test]
+    async fn only_a_gone_is_retryable_for_cancel_task_and_not_for_cancel_tools() {
+        use crate::chat::manager::CancelToolsResult;
+        let broker = crate::events::nats_broker_test::TestBroker::start().await;
+        let subject = "events.chat.s2.cancel";
+        responders(&broker, subject, None).await;
+        let deadline = Duration::from_millis(2500);
+        let nats =
+            NatsEmitter::new(broker.client().await, "events").with_cancel_rpc_timeout(deadline);
+
+        let started = std::time::Instant::now();
+        let error =
+            relay::<CancelTaskResult>(&nats, subject.to_string(), json!({}), CancelKind::Task)
+                .await
+                .unwrap_err();
+        let elapsed = started.elapsed();
+        let relay_error = error.downcast_ref::<CancelRelayError>().unwrap();
+        assert_eq!(
+            relay_error,
+            &CancelRelayError::SessionGone {
+                kind: CancelKind::Task
+            }
+        );
+        assert!(elapsed >= GONE_GRACE && elapsed < deadline, "{elapsed:?}");
+        assert_eq!(
+            (
+                relay_error.failure().status,
+                relay_error.failure().retryable
+            ),
+            (410, true)
+        );
+
+        let started = std::time::Instant::now();
+        let error =
+            relay::<CancelToolsResult>(&nats, subject.to_string(), json!({}), CancelKind::Tools)
+                .await
+                .unwrap_err();
+        let elapsed = started.elapsed();
+        let relay_error = error.downcast_ref::<CancelRelayError>().unwrap();
+        assert_eq!(
+            relay_error,
+            &CancelRelayError::SessionGone {
+                kind: CancelKind::Tools
+            }
+        );
+        assert!(
+            elapsed >= deadline,
+            "kept listening until the deadline: {elapsed:?}"
+        );
+        assert_eq!(
+            (
+                relay_error.failure().status,
+                relay_error.failure().retryable
+            ),
+            (410, false)
+        );
+    }
+
     /// N2: retry only where it is safe.
     #[test]
     fn each_relay_failure_has_its_own_code_and_retry_rule() {
@@ -467,7 +623,12 @@ mod tests {
             CancelRelayError::OwnerTimeout {
                 kind: CancelKind::Task,
             },
-            CancelRelayError::SessionGone,
+            CancelRelayError::SessionGone {
+                kind: CancelKind::Tools,
+            },
+            CancelRelayError::SessionGone {
+                kind: CancelKind::Task,
+            },
             CancelRelayError::OwnerProtocol("x".into()),
             CancelRelayError::OwnerFailed("x".into()),
             CancelRelayError::RelayFailed("x".into()),
@@ -484,6 +645,7 @@ mod tests {
                 (409, "owner_unreachable", false),
                 (504, "owner_timeout", false),
                 (504, "owner_timeout", true),
+                (410, "session_gone", false),
                 (410, "session_gone", true),
                 (502, "owner_protocol", false),
                 (502, "owner_failed", false),

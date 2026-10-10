@@ -388,7 +388,8 @@ impl NatsEmitter {
     ///
     /// Several instances may answer (one that just lost the session, the one that
     /// holds it now): an answer `is_provisional` says is only kept if no other
-    /// answer comes within `grace` after it — a real answer always wins over it.
+    /// answer comes within `grace` after it (capped by the cancel timeout;
+    /// `Duration::MAX`: until it) — a real answer always wins over it.
     pub async fn request_cancel(
         &self,
         subject: String,
@@ -427,7 +428,10 @@ impl NatsEmitter {
                     if is_provisional(&bytes) {
                         if provisional.is_none() {
                             provisional = Some(bytes);
-                            until = deadline.min(tokio::time::Instant::now() + grace);
+                            // `grace` may be `Duration::MAX` (until the deadline).
+                            until = tokio::time::Instant::now()
+                                .checked_add(grace)
+                                .map_or(deadline, |end| deadline.min(end));
                         }
                         continue;
                     }
