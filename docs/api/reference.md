@@ -312,6 +312,27 @@ curl -X DELETE -H "Authorization: Bearer <JWT>" \
   http://localhost:8080/api/chat/sessions/{id}
 ```
 
+### POST /api/chat/sessions/{id}/cancel-tools and /cancel-task/{task_id} -- Protected
+
+Stop the running tools of a session (the turn goes on), or one background task
+(`task_id` = the `tool_use` that started it, as in `active_tasks_update`). Works on
+both engines and across instances (NATS request/reply to the instance holding the
+session). `200` with `{cli_pid?, killed_pids, capped}` / `{task_id, killed_pids,
+capped}` when the cancel was done (`capped: true`: per-session cap hit). Otherwise a
+typed error body `{error, code, retryable}`, never a `200`:
+
+| Status | `code` | Meaning |
+|---|---|---|
+| 422 | `unsupported` | the provider cannot (`tool_cancel`: Claude Code over SSH or off Unix; `background_tasks`) |
+| 409 | `owner_unreachable` | no instance holds the session live: nothing was cancelled |
+| 504 | `owner_timeout` | the instance holding it did not answer in time (`retryable: true`) |
+| 410 | `session_gone` | the session left the instance that was asked |
+| 502 | `owner_protocol` / `owner_failed` | unreadable answer / the owner failed |
+
+A provider refusal is also announced on the session's stream as
+`error { code: "cancel_refused", reason: <capability> }`. Without NATS (one instance),
+an unknown session is a no-op `200`.
+
 ### GET /api/chat/sessions/{id}/messages -- Protected
 
 List messages in a session.

@@ -88,7 +88,9 @@ mod types;
 pub use bus::EventBus;
 pub use graph::{ActivationTarget, GraphEvent, GraphEventType, GraphLayer};
 pub use hybrid::HybridEmitter;
-pub use nats::{connect_nats, ChatRpcRequest, ChatRpcResponse, NatsEmitter, StreamingSnapshot};
+pub use nats::{
+    connect_nats, ChatRpcRequest, ChatRpcResponse, NatsEmitter, RelayFailure, StreamingSnapshot,
+};
 #[allow(deprecated)]
 pub use notifier::EventNotifier;
 pub use reactions::register_builtin_reactions;

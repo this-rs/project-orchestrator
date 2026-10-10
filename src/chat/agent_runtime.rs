@@ -992,10 +992,10 @@ impl AgentSessionHandle {
             return Ok(result(Vec::new(), true));
         }
         let known = self.mapper.lock().await.provider_task(task_id);
-        let provider_id = match known {
+        let provider_id = match &known {
             // Over already: nothing to stop, nothing changes (as on Claude Code).
             Some((_, false)) => return Ok(result(Vec::new(), false)),
-            Some((id, true)) => id,
+            Some((id, true)) => id.clone(),
             // No snapshot named it (yet): the provider decides.
             None => task_id.to_string(),
         };
@@ -1021,7 +1021,13 @@ impl AgentSessionHandle {
             // An id the provider does not know (or no longer runs): the idempotent
             // no-op of the Claude Code engine.
             Err(ProviderError::InvalidRequest { detail }) => {
-                tracing::debug!(session_id = %self.session_id, task_id, %detail, "cancel_task: unknown task, no-op");
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    task_id,
+                    %detail,
+                    known_in_snapshot = known.is_some(),
+                    "cancel_task: the provider does not know this task (unknown id, already over, or a Stop that came before the first background_tasks snapshot named it): idempotent no-op"
+                );
                 Ok(result(Vec::new(), false))
             }
             Err(error) => Err(self.cancel_refused(error).await),
