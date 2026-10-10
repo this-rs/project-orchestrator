@@ -385,31 +385,23 @@ pub struct AgentSessionHandle {
     cancel_tools_cap: u32,
     /// The window of the cap (`CANCEL_TOOLS_WINDOW_SECS`).
     cancel_tools_window: Duration,
-    /// Where an approval `always` is kept when the provider has no lasting scope of
-    /// its own (the native harness): set once, right after adoption
-    /// ([`Self::grant_lasting_rules`]). Unset: the session offers the scopes its
-    /// provider declares, nothing more.
-    lasting: std::sync::OnceLock<LastingGrant>,
+    /// What the user granted "for the session" (`chat::session_grants`): the backend
+    /// answers itself the later requests of THIS session they cover ([`Self::emit`]);
+    /// never handed to the provider.
+    session_grants: std::sync::Mutex<super::session_grants::SessionGrants>,
     /// The call each permission request still waiting asks for (request id -> call):
-    /// what an approval `always` derives its rule from.
-    asked_calls: std::sync::Mutex<HashMap<String, super::lasting_rules::AskedCall>>,
-}
-
-/// The backend's lasting rules for one session: the store and the project the
-/// session runs in (`chat::lasting_rules`).
-pub struct LastingGrant {
-    pub rules: Arc<super::lasting_rules::LastingRules>,
-    pub project: String,
-    /// The session's directory, as nexus normalises paths against it.
-    pub cwd: std::path::PathBuf,
+    /// what a `session` grant is derived from.
+    asked_calls: std::sync::Mutex<HashMap<String, super::session_grants::AskedCall>>,
 }
 
 impl AgentSessionHandle {
     /// Persists (except transient events) and broadcasts one event. A permission
-    /// request the project's lasting rules cover (an earlier `always`) is answered here,
-    /// `once`, its decision emitted with the scope `always`: the user is not asked.
+    /// request a grant of this session covers (an earlier `session` answer) is answered
+    /// here, `once`, its decision emitted with the scope `session` and the grant: the user
+    /// is not asked. Only requests the provider ASKED reach this point: its policy
+    /// (read-only access, denies, trust) has already decided.
     pub async fn emit(&self, event: ChatEvent) {
-        let Some(covered) = self.emit_one(event).await else {
+        let Some((covered, rule)) = self.emit_one(event).await else {
             return;
         };
         let answered = self
@@ -426,7 +418,8 @@ impl AgentSessionHandle {
                     .emit_one(ChatEvent::PermissionDecision {
                         id: covered,
                         allow: true,
-                        scope: Some(PermissionAnswerScope::Always),
+                        scope: Some(PermissionAnswerScope::Session),
+                        rule: Some(rule),
                     })
                     .await;
             }
@@ -434,14 +427,14 @@ impl AgentSessionHandle {
             Err(e) => tracing::warn!(
                 session_id = %self.session_id,
                 error = %e,
-                "a call the lasting rules cover could not be allowed: the user is asked"
+                "a call a session grant covers could not be allowed: the user is asked"
             ),
         }
     }
 
-    /// [`Self::emit`] for one event; returns the id of a permission request the
-    /// lasting rules cover.
-    async fn emit_one(&self, mut event: ChatEvent) -> Option<String> {
+    /// [`Self::emit`] for one event; returns the id of a permission request a grant of
+    /// this session covers, and that grant as the user is shown it.
+    async fn emit_one(&self, mut event: ChatEvent) -> Option<(String, String)> {
         // What only the session owner knows rides on `system_init`.
         if let ChatEvent::SystemInit {
             provider,
@@ -471,17 +464,17 @@ impl AgentSessionHandle {
             ..
         } = &event
         {
-            let call = super::lasting_rules::AskedCall {
+            let call = super::session_grants::AskedCall {
                 tool: tool.clone(),
                 canonical: canonical.clone(),
                 input: input.clone(),
             };
-            if let Some(grant) = self.lasting.get() {
-                let rules = grant.rules.allowed_for(&grant.project);
-                if super::lasting_rules::matches_call(&rules, &call, &grant.cwd) {
-                    covered = Some(id.clone());
-                }
-            }
+            covered = self
+                .session_grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .covering(&call)
+                .map(|grant| (id.clone(), grant.describe()));
             self.asked_calls
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -942,95 +935,84 @@ impl AgentSessionHandle {
             })
     }
 
-    /// Sets where this session keeps an approval `always` its provider cannot keep:
-    /// the session then offers `always` ([`Self::offered_capabilities`]). Only for a
-    /// provider that asks interactively (it declares `session`) and does not keep
-    /// `always` itself. Called once, right after adoption.
-    pub fn grant_lasting_rules(&self, grant: LastingGrant) {
-        let scopes = &self.capabilities.permission_scopes;
-        if scopes.contains(&PermissionScope::Session) && !scopes.contains(&PermissionScope::Always)
-        {
-            let _ = self.lasting.set(grant);
-        }
+    /// Keeps a grant as if the user had answered `session` (tests).
+    #[cfg(test)]
+    pub(crate) fn seed_session_grant(&self, grant: super::session_grants::SessionGrant) {
+        self.session_grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .add(grant);
     }
 
-    /// The capabilities this session offers: its provider's, plus `always` when the
-    /// backend keeps it ([`Self::grant_lasting_rules`]). What `system_init` carries.
+    /// The capabilities this session offers: its provider's, without `always` — no
+    /// engine keeps a lasting approval in this lot (P11b), whatever the provider declares.
+    /// What `system_init` carries.
     pub fn offered_capabilities(&self) -> Capabilities {
         let mut caps = self.capabilities.clone();
-        if self.lasting.get().is_some()
-            && !caps.permission_scopes.contains(&PermissionScope::Always)
-        {
-            caps.permission_scopes.push(PermissionScope::Always);
-        }
+        caps.permission_scopes
+            .retain(|scope| *scope != PermissionScope::Always);
         caps
     }
 
-    /// Answers a permission request; an approval lasts as long as `scope` says. A
-    /// scope the session does not offer is refused ([`PermissionDeliveryError::ScopeUnsupported`]),
-    /// never answered as a narrower one; the request then stays waiting.
+    /// Answers a permission request; an approval lasts as long as `scope` says. The
+    /// provider is ALWAYS answered `once` (never a provider-side session or lasting
+    /// rule, whose matching is looser than what the user approved):
     ///
-    /// `always` on a provider without it (native): the rule scoped on this call
-    /// (`lasting_rules::rules_for_call`: a command prefix, a path, a domain) is recorded
-    /// for the project FIRST (a failed write answers nothing), then the provider is
-    /// answered `once`: the backend answers the next covered calls of this session itself
-    /// ([`Self::emit`]), and the sessions opened later get the rule in their policy. A
-    /// call no rule can name without widening it is refused (`ScopeUnsupported`).
+    /// - `session`: the grant of this call (`session_grants::grant_for`: the identical
+    ///   call, or any call of a read-only tool) is kept in this session AFTER the provider
+    ///   took the answer; the backend answers the later requests it covers ([`Self::emit`]).
+    ///   A call that cannot be granted (a command running another command) is refused.
+    /// - `always`: refused on every engine in this lot.
+    ///
+    /// A refusal ([`PermissionDeliveryError::ScopeUnsupported`]) answers nothing: the
+    /// request stays waiting.
     pub async fn answer_permission_scoped(
         &self,
         request_id: &str,
         allow: bool,
         scope: PermissionAnswerScope,
     ) -> std::result::Result<(), PermissionDeliveryError> {
-        let decision = if !allow {
-            PermissionDecision::deny()
-        } else {
-            let wanted = scope.to_nexus();
-            // `once` is what every provider answers (a provider listing no scope at all
-            // still takes it, as it always did).
-            let provider_scope = if scope == PermissionAnswerScope::Once
-                || self.capabilities.permission_scopes.contains(&wanted)
-            {
-                wanted
-            } else if let (PermissionAnswerScope::Always, Some(grant)) = (scope, self.lasting.get())
-            {
+        let grant = match (allow, scope) {
+            (false, _) | (true, PermissionAnswerScope::Once) => None,
+            (true, PermissionAnswerScope::Session) => {
+                if !self
+                    .offered_capabilities()
+                    .permission_scopes
+                    .contains(&PermissionScope::Session)
+                {
+                    return Err(PermissionDeliveryError::ScopeUnsupported(scope));
+                }
                 let call = self
                     .asked_calls
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .get(request_id)
                     .cloned();
-                let rules = call
-                    .and_then(|call| super::lasting_rules::rules_for_call(&call, &grant.cwd))
-                    .ok_or(PermissionDeliveryError::ScopeUnsupported(scope))?;
-                grant
-                    .rules
-                    .allow(&grant.project, &rules)
-                    .map_err(PermissionDeliveryError::Failed)?;
-                tracing::info!(
-                    session_id = %self.session_id,
-                    rules = ?rules,
-                    project = %grant.project,
-                    "permission granted always: lasting rule recorded"
-                );
-                PermissionScope::Once
-            } else {
-                return Err(PermissionDeliveryError::ScopeUnsupported(scope));
-            };
-            PermissionDecision::Allow {
-                scope: provider_scope,
-                updated_input: None,
+                Some(
+                    call.as_ref()
+                        .and_then(super::session_grants::grant_for)
+                        .ok_or(PermissionDeliveryError::ScopeUnsupported(scope))?,
+                )
             }
+            (true, PermissionAnswerScope::Always) => {
+                return Err(PermissionDeliveryError::ScopeUnsupported(scope));
+            }
+        };
+        let decision = if allow {
+            PermissionDecision::allow_once()
+        } else {
+            PermissionDecision::deny()
         };
         self.session
             .answer_permission(request_id, decision)
             .await
-            .map_err(|e| match e {
-                ProviderError::Unsupported { .. } => {
-                    PermissionDeliveryError::ScopeUnsupported(scope)
-                }
-                other => PermissionDeliveryError::Failed(anyhow::Error::new(other)),
-            })?;
+            .map_err(|e| PermissionDeliveryError::Failed(anyhow::Error::new(e)))?;
+        if let Some(grant) = &grant {
+            self.session_grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .add(grant.clone());
+        }
         self.asked_calls
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1039,6 +1021,9 @@ impl AgentSessionHandle {
             id: request_id.to_string(),
             allow,
             scope: scope.lasting(allow),
+            rule: grant
+                .as_ref()
+                .map(super::session_grants::SessionGrant::describe),
         })
         .await;
         Ok(())
@@ -1261,7 +1246,7 @@ impl AgentRuntime {
             cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
-            lasting: std::sync::OnceLock::new(),
+            session_grants: std::sync::Mutex::default(),
             asked_calls: std::sync::Mutex::new(HashMap::new()),
         });
         if let Some(oob) = session.out_of_band() {

@@ -233,6 +233,29 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
         },
     ),
     (
+        Engine::ClaudeCode,
+        "permissions.always",
+        Expect::Gap {
+            cause: Cause::Harness,
+            task: "P11b",
+            why: "volontaire (sécurité) : aucune approbation durable tant que les règles ne sont \
+                  pas tenues par un comparateur strict du backend (revue P11 : une suggestion du \
+                  CLI réécrite vers localSettings pouvait y porter setMode / addDirectories) ; \
+                  always est refusé, typé",
+        },
+    ),
+    (
+        Engine::Native,
+        "permissions.always",
+        Expect::Gap {
+            cause: Cause::Harness,
+            task: "P11b",
+            why: "volontaire (sécurité) : aucune règle durable tant qu'elle n'est pas tenue par \
+                  un comparateur strict du backend (revue P11 : un préfixe Bash(cat *) dans la \
+                  liste allow de nexus autorisait cat x >> ~/.zshrc) ; always est refusé, typé",
+        },
+    ),
+    (
         Engine::Native,
         "session_record",
         Expect::Gap {
@@ -691,9 +714,7 @@ impl Stage {
             .with_nats(owner)
             .with_refs_v1(true)
             .with_document_store(self.store.clone())
-            .with_native_transcripts(self.data.path().join("native-transcripts"))
-            // The approvals `always` of the native sessions survive the restart (P11).
-            .with_lasting_rules(self.data.path().join("permission-rules.json"));
+            .with_native_transcripts(self.data.path().join("native-transcripts"));
         manager.update_claude_cli_path(Some(cli.path())).await;
         let real = manager
             .provider_for("local")
@@ -1107,25 +1128,6 @@ fn permission_request(request_id: &str, tool: &str, input: Value, tool_use_id: &
     }))
 }
 
-/// A `can_use_tool` that carries the CLI's `permission_suggestions` (the rule a lasting
-/// approval adds, as the CLI proposes it: destination `localSettings`).
-fn permission_request_suggesting(
-    request_id: &str,
-    tool: &str,
-    input: Value,
-    tool_use_id: &str,
-    rule_content: &str,
-) -> Value {
-    emit(json!({
-        "type": "control_request", "request_id": request_id,
-        "request": {"subtype": "can_use_tool", "tool_name": tool, "input": input,
-                    "tool_use_id": tool_use_id,
-                    "permission_suggestions": [{
-                        "type": "addRules", "behavior": "allow", "destination": "localSettings",
-                        "rules": [{"toolName": tool, "ruleContent": rule_content}]}]},
-    }))
-}
-
 fn hook(event: &str, request_id: &str, input: Value, tool_use_id: Option<&str>) -> Value {
     json!({
         "op": "emit_hook", "event": event, "request_id": request_id, "input": input,
@@ -1226,30 +1228,33 @@ fn transcript_main(k: Keys, cwd: &str) -> Vec<Value> {
         text("answered five"),
         result_ok("answered five"),
     ]);
-    // TURN-PERM-S / TURN-PERM-A: approvals that outlive the call (session, always).
+    // TURN-PERM-S: `git status` granted for the session, then the identical call again
+    // (the backend answers it). TURN-PERM-A: an `always` (refused), then once.
     t.extend(vec![
         await_in(&k.k("TURN-PERM-S")),
         cc_tool_use("t5s", "Bash", json!({"command": "git status"})),
-        permission_request_suggesting(
+        permission_request(
             "req-perm-s",
             "Bash",
             json!({"command": "git status"}),
             "t5s",
-            "git status",
         ),
         await_in("req-perm-s"),
         cc_tool_result("t5s", "clean", false),
+        cc_tool_use("t5t", "Bash", json!({"command": "git status"})),
+        permission_request(
+            "req-perm-t",
+            "Bash",
+            json!({"command": "git status"}),
+            "t5t",
+        ),
+        await_in("req-perm-t"),
+        cc_tool_result("t5t", "clean", false),
         text("answered perm s"),
         result_ok("answered perm s"),
         await_in(&k.k("TURN-PERM-A")),
         cc_tool_use("t5a", "Bash", json!({"command": "cargo fmt"})),
-        permission_request_suggesting(
-            "req-perm-a",
-            "Bash",
-            json!({"command": "cargo fmt"}),
-            "t5a",
-            "cargo fmt",
-        ),
+        permission_request("req-perm-a", "Bash", json!({"command": "cargo fmt"}), "t5a"),
         await_in("req-perm-a"),
         cc_tool_result("t5a", "formatted", false),
         text("answered perm a"),
@@ -1559,15 +1564,15 @@ fn native_script(k: Keys, cwd: &str) -> Value {
             json!({"file_path": format!("{cwd}/session-1.txt"), "content": "AGAIN-SESSION"}),
         ),
         says(&k.k("TURN-PERM2"), "answered perm2"),
-        // TURN-PERM3: the same tool again: the session grant holds, not asked.
+        // TURN-PERM3: the identical call again: the session grant holds, not asked.
         calls(
             &k.k("TURN-PERM3"),
             "c5c",
             &nexus("Write"),
-            json!({"file_path": format!("{cwd}/session-2.txt"), "content": "THIRD-SESSION"}),
+            json!({"file_path": format!("{cwd}/session-1.txt"), "content": "AGAIN-SESSION"}),
         ),
         says(&k.k("TURN-PERM3"), "answered perm3"),
-        // TURN-ALWAYS: another tool, granted always (kept by the backend for the project).
+        // TURN-ALWAYS: another tool, `always` asked (refused), then once.
         calls(
             &k.k("TURN-ALWAYS"),
             "c5d",
@@ -1634,15 +1639,6 @@ fn native_script(k: Keys, cwd: &str) -> Value {
     r.push(says(&k.k("TURN-COMPACT"), "answered compact"));
     // After the restart.
     r.push(says(&k.k("RESUMED"), "answered resumed"));
-    // After the restart: the tool granted always runs without asking.
-    r.push(calls(
-        &k.k("TURN-ALWAYS2"),
-        "c5e",
-        &nexus("Edit"),
-        json!({"file_path": format!("{cwd}/always.txt"), "old_string": "ALWAYS-EDITED",
-               "new_string": "ALWAYS-TWO"}),
-    ));
-    r.push(says(&k.k("TURN-ALWAYS2"), "answered always2"));
     Value::Array(r)
 }
 
@@ -1692,7 +1688,7 @@ async fn wait_body(fake: &FakeOpenAi, key: &str) -> Option<String> {
 
 /// A Claude Code turn whose permission `req` is answered with `scope`: whether the
 /// answer was routed, and the line the CLI read.
-async fn cc_lasting(
+async fn cc_scoped(
     manager: &ChatManager,
     w: &Watch,
     cli: &FakeClaude,
@@ -1713,6 +1709,18 @@ async fn cc_lasting(
     let routed = manager
         .route_permission_response(&w.sid, req, true, scope, false)
         .await;
+    if routed.is_err() {
+        // Refused (the request still waits): unblock the turn.
+        let _ = manager
+            .route_permission_response(
+                &w.sid,
+                req,
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                false,
+            )
+            .await;
+    }
     let line = cli.wait_line(0, req, WAIT).await.unwrap_or_default();
     w.settle(ends, manager).await;
     (routed.is_ok(), line)
@@ -1739,6 +1747,18 @@ async fn native_grant(
             .is_ok(),
         None => false,
     };
+    if let (Some(id), false) = (&id, granted) {
+        // Refused (the request still waits): unblock the turn.
+        let _ = manager
+            .route_permission_response(
+                &w.sid,
+                id,
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                false,
+            )
+            .await;
+    }
     wait_body_nth(fake, &key, 1, WAIT).await;
     w.said(WAIT, said).await;
     w.settle(ends, manager).await;
@@ -2031,10 +2051,10 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
         format!("réponse écrite : {}", excerpt(&allowed)),
     );
     w.settle(ends, &manager).await;
-    // Approvals that outlive the call: the CLI's suggestion goes back as
-    // `updatedPermissions`, moved to the scope's destination (the CLI keeps the rule).
+    // `session`: a plain allow for the CLI (never a rule handed to it); the identical
+    // call again is answered by the backend. `always`: refused on every engine (P11b).
     // Boxed: the scenario's future is already large (a stack overflow otherwise).
-    let (routed_s, line_s) = Box::pin(cc_lasting(
+    let (routed_s, line_s) = Box::pin(cc_scoped(
         &manager,
         &w,
         &cli,
@@ -2044,7 +2064,7 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     ))
     .await;
     cc_sent += 1;
-    let (routed_a, line_a) = Box::pin(cc_lasting(
+    let (routed_a, line_a) = Box::pin(cc_scoped(
         &manager,
         &w,
         &cli,
@@ -2054,27 +2074,31 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     ))
     .await;
     cc_sent += 1;
-    let updates = |line: &str| -> Value {
-        serde_json::from_str::<Value>(line).unwrap_or(Value::Null)["response"]["response"]
-            ["updatedPermissions"]
-            .clone()
+    let second = cli
+        .wait_line(0, "req-perm-t", WAIT)
+        .await
+        .unwrap_or_default();
+    let plain = |line: &str| {
+        line.contains("\"behavior\":\"allow\"") && !line.contains("updatedPermissions")
     };
-    let (up_s, up_a) = (updates(&line_s), updates(&line_a));
     cc.check(
         "permissions.session",
-        routed_s
-            && up_s[0]["destination"] == "session"
-            && up_s[0]["rules"][0]["ruleContent"] == "git status",
+        routed_s && plain(&line_s) && plain(&second),
         Cause::Harness,
-        format!("updatedPermissions écrit : {}", excerpt(&up_s.to_string())),
+        format!(
+            "accordée={routed_s}, réponse : {}, appel identique répondu par le backend : {}",
+            excerpt(&line_s),
+            excerpt(&second)
+        ),
     );
     cc.check(
         "permissions.always",
-        routed_a
-            && up_a[0]["destination"] == "localSettings"
-            && up_a[0]["rules"][0]["ruleContent"] == "cargo fmt",
+        routed_a,
         Cause::Harness,
-        format!("updatedPermissions écrit : {}", excerpt(&up_a.to_string())),
+        format!(
+            "always accepté={routed_a}, réponse écrite : {}",
+            excerpt(&line_a)
+        ),
     );
 
     // cancel_tools: the running tool's process is signalled, the turn goes on.
@@ -2543,15 +2567,32 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
         .await
         .unwrap();
     na_sent += 1;
-    let asked_again = answer_if_asked(
-        &manager,
-        &wn,
-        &fake,
-        "THIRD-SESSION",
-        &kn.k("TURN-PERM3"),
-        1,
-    )
-    .await;
+    // The identical call: the backend answers it (the tool runs, nobody is asked).
+    let ran_again = wait_body_nth(&fake, &kn.k("TURN-PERM3"), 1, WAIT)
+        .await
+        .is_some();
+    // The backend answers the second request itself (its decision says `session`); a
+    // request it left to the user would have no such decision.
+    let asked = wn.permission_ids("AGAIN-SESSION").await;
+    let events = wn.all().await;
+    let answered_by_backend = |id: &String| {
+        events.iter().any(|e| {
+            matches!(e, ChatEvent::PermissionDecision { id: d, scope: Some(s), .. }
+                if d == id && *s == crate::chat::types::PermissionAnswerScope::Session)
+        })
+    };
+    let asked_again = !ran_again || asked.iter().skip(1).any(|id| !answered_by_backend(id));
+    for id in asked.iter().skip(1).filter(|id| !answered_by_backend(id)) {
+        let _ = manager
+            .route_permission_response(
+                &nid,
+                id,
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                false,
+            )
+            .await;
+    }
     na.check(
         "permissions.session",
         first.is_some() && granted_session && !asked_again,
@@ -2564,8 +2605,7 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     wn.said(WAIT, "answered perm3").await;
     wn.settle(ends, &manager).await;
 
-    // A tool granted always: the session offers the scope, the backend keeps the rule
-    // for the project (measured after the restart, below).
+    // `always`: not offered and refused on every engine in this lot (P11b).
     let offers_always = match &wn.system_init().await {
         Some(ChatEvent::SystemInit { capabilities, .. }) => capabilities
             .as_ref()
@@ -2585,6 +2625,12 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     ))
     .await;
     na_sent += 1;
+    na.check(
+        "permissions.always",
+        offers_always && granted_always,
+        Cause::Harness,
+        format!("portée offerte={offers_always}, accordée={granted_always}"),
+    );
 
     // cancel_tools.
     let ends = wn.turn_ends();
@@ -2885,7 +2931,6 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     drop(w);
     drop(manager);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let mut asked_after_restart = None;
     let manager = stage.backend(&cli, &answers).await;
     let reopened = manager
         .resume_session(&nid, &format!("{}: go on", kn.k("RESUMED")), Some(&claims))
@@ -2907,20 +2952,6 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
                 format!("historique connu après redémarrage={knows}"),
             );
             wn.settle(0, &manager).await;
-            // The tool granted always before the restart: not asked any more.
-            let ends = wn.turn_ends();
-            manager
-                .send_message(&nid, &kn.k("TURN-ALWAYS2"))
-                .await
-                .unwrap();
-            let asked =
-                answer_if_asked(&manager, &wn, &fake, "ALWAYS-TWO", &kn.k("TURN-ALWAYS2"), 1).await;
-            let ran = wait_body_nth(&fake, &kn.k("TURN-ALWAYS2"), 1, WAIT)
-                .await
-                .is_some();
-            asked_after_restart = Some(asked || !ran);
-            wn.said(WAIT, "answered always2").await;
-            wn.settle(ends, &manager).await;
         }
         Err(e) => na.check(
             "resume",
@@ -2929,15 +2960,6 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
             format!("reprise refusée : {e:#}"),
         ),
     }
-    na.check(
-        "permissions.always",
-        offers_always && granted_always && asked_after_restart == Some(false),
-        Cause::Harness,
-        format!(
-            "portée offerte={offers_always}, accordée={granted_always}, \
-             redemandée après redémarrage={asked_after_restart:?}"
-        ),
-    );
 
     // ===================================================================
     // native → Claude Code: the conversation relayed back (process #3)

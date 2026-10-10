@@ -510,6 +510,7 @@
         "full": {
           "allow": true,
           "id": "perm_0001",
+          "rule": "Bash: git status",
           "scope": "session",
           "type": "permission_decision"
         },
@@ -526,6 +527,10 @@
         },
         "id": {
           "required": true,
+          "type": "string"
+        },
+        "rule": {
+          "required": false,
           "type": "string"
         },
         "scope": {

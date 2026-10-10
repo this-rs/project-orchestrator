@@ -28,7 +28,6 @@ pub mod entity_extractor;
 pub mod envelope;
 pub mod feedback;
 pub(crate) mod hook_ledger;
-pub mod lasting_rules;
 pub mod manager;
 pub mod message_attachments;
 pub mod model_catalog;
@@ -48,6 +47,7 @@ pub mod relay;
 pub mod routing;
 #[cfg(test)]
 mod routing_modes_e2e_tests;
+pub mod session_grants;
 pub(crate) mod skill_hook;
 pub mod stages;
 pub mod tree;
