@@ -65,7 +65,6 @@
         "full": {
           "allow": true,
           "id": "perm_0001",
-          "scope": "session",
           "type": "permission_response"
         },
         "minimal": {
@@ -78,10 +77,6 @@
           "type": "boolean"
         },
         "id": {
-          "required": false,
-          "type": "string"
-        },
-        "scope": {
           "required": false,
           "type": "string"
         },
