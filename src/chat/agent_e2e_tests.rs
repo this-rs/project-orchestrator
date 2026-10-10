@@ -8128,3 +8128,1123 @@ mod background_tasks {
         assert!(started.elapsed() >= OWNER_CANCEL_BOUND);
     }
 }
+
+/// P8 — the record of a native session (the agent engine) is kept as the legacy
+/// engine keeps its own (`chat::session_record`): before, it stayed at what the
+/// creation wrote (`message_count: 1`, no cost, no title) whatever the conversation did.
+mod native_session_record {
+    use super::*;
+
+    fn answer(key: &str) -> Value {
+        sse_route(
+            key,
+            vec![
+                delta(json!({"content": format!("answer to {key}")})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}),
+                json!("[DONE]"),
+            ],
+        )
+    }
+
+    async fn record_until(
+        graph: &MockGraphStore,
+        sid: &str,
+        done: impl Fn(&crate::neo4j::models::ChatSessionNode) -> bool,
+    ) -> crate::neo4j::models::ChatSessionNode {
+        let id = Uuid::parse_str(sid).unwrap();
+        let mut last = None;
+        for _ in 0..400 {
+            if let Some(node) = graph.get_chat_session(id).await.unwrap() {
+                if done(&node) {
+                    return node;
+                }
+                last = Some(node);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the record of {sid} never got there: {last:?}");
+    }
+
+    async fn results(graph: &MockGraphStore, sid: &str) -> usize {
+        graph
+            .get_chat_events(Uuid::parse_str(sid).unwrap(), 0, 500)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| e.event_type == "result")
+            .count()
+    }
+
+    async fn wait_results(graph: &MockGraphStore, sid: &str, count: usize) {
+        for _ in 0..400 {
+            if results(graph, sid).await >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{count} result event(s) never persisted");
+    }
+
+    #[tokio::test]
+    async fn a_native_session_keeps_its_title_its_message_count_and_its_cost_across_a_resume() {
+        let mut routes = vec![answer("AFTER-RESTART"), answer("SECOND-TURN")];
+        routes.extend(script().as_array().cloned().unwrap());
+        let fake = FakeOpenAi::start(Value::Array(routes));
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("native-transcripts");
+
+        let before = manager(graph.clone(), true).with_native_transcripts(&root);
+        let sid = before
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        assert!(before.agent_runtime.owns(&sid).await, "the agent engine");
+        wait_results(&graph, &sid, 1).await;
+        // A free endpoint: its turns cost a real 0, recorded.
+        let node = record_until(&graph, &sid, |n| n.total_cost_usd.is_some()).await;
+        assert_eq!(node.message_count, 1, "the opening message, once: {node:?}");
+        assert_eq!(node.total_cost_usd, Some(0.0), "{node:?}");
+        assert_eq!(node.title.as_deref(), Some("hi there"), "{node:?}");
+        assert_eq!(node.preview.as_deref(), Some("hi there"), "{node:?}");
+
+        before.send_message(&sid, "SECOND-TURN").await.unwrap();
+        wait_results(&graph, &sid, 2).await;
+        let node = record_until(&graph, &sid, |n| n.message_count >= 2).await;
+        assert_eq!(node.message_count, 2, "{node:?}");
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+
+        // The message that resumes the session after a restart counts too.
+        let after = manager(graph.clone(), true).with_native_transcripts(&root);
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        after
+            .resume_session(&sid, "AFTER-RESTART", Some(&claims))
+            .await
+            .unwrap_or_else(|e| panic!("resume failed: {e:#}"));
+        wait_results(&graph, &sid, 3).await;
+        let node = record_until(&graph, &sid, |n| n.message_count >= 3).await;
+        assert_eq!(node.message_count, 3, "{node:?}");
+        assert_eq!(node.title.as_deref(), Some("hi there"), "the title stays");
+        assert_eq!(node.total_cost_usd, Some(0.0));
+        after.close_session(&sid).await.unwrap();
+    }
+}
+
+/// P8 — the lifecycle of the agent engine's sessions follows the chat's
+/// configuration as the legacy engine's do: the idle cleanup closes them, they
+/// count in `max_sessions` / `active_session_count`, and their retries follow
+/// `RetryConfig`. Before, they were invisible to all three.
+mod agent_lifecycle {
+    use super::*;
+
+    fn configured(
+        graph: Arc<MockGraphStore>,
+        edit: impl FnOnce(&mut super::super::config::ChatConfig),
+    ) -> Arc<ChatManager> {
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph;
+        let mut config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: None,
+            nexus_browser_path: None,
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        edit(&mut config);
+        Arc::new(ChatManager::new_without_memory(
+            dyn_graph,
+            state.meili,
+            config,
+        ))
+    }
+
+    async fn native_world() -> (FakeOpenAi, Arc<MockGraphStore>) {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        (fake, graph)
+    }
+
+    async fn idle(manager: &ChatManager, sid: &str) {
+        for _ in 0..400 {
+            if !manager.is_session_streaming(sid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the opening turn never ended");
+    }
+
+    #[tokio::test]
+    async fn an_idle_native_session_is_closed_by_the_cleanup() {
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |c| c.session_timeout = Duration::from_millis(300));
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        idle(&manager, &sid).await;
+        manager.start_cleanup_task();
+        for _ in 0..200 {
+            if !manager.agent_runtime.owns(&sid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("an idle native session outlived the session timeout");
+    }
+
+    #[tokio::test]
+    async fn native_sessions_count_toward_max_sessions_and_get_the_chat_retry_config() {
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |c| {
+            c.max_sessions = 1;
+            c.retry = super::super::config::RetryConfig {
+                max_attempts: 7,
+                initial_delay_ms: 5,
+                backoff_multiplier: 1.5,
+            };
+        });
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        assert_eq!(manager.active_session_count().await, 1);
+        let live = manager.live_session_snapshot().await;
+        assert!(
+            live.live.contains(&Uuid::parse_str(&sid).unwrap()),
+            "the cockpit sees the native session live"
+        );
+        let second = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await;
+        let err = second.expect_err("the limit refuses a second session");
+        assert!(
+            err.to_string()
+                .contains("Maximum number of active sessions"),
+            "{err:#}"
+        );
+        let retry = manager
+            .agent_runtime
+            .get(&sid)
+            .await
+            .unwrap()
+            .retry_config();
+        assert_eq!(
+            (retry.max_attempts, retry.initial_delay_ms),
+            (7, 5),
+            "the chat's RetryConfig, not a constant"
+        );
+        manager.close_session(&sid).await.unwrap();
+        assert_eq!(manager.active_session_count().await, 0);
+    }
+}
+
+/// P8 (c) — the post-stream steps of the Claude Code engine run at the end of each
+/// turn of the agent engine, with the same functions (`post_stream`): the context
+/// re-injected after a compaction, the objective reminder, and `cancel_task`
+/// refused, typed, instead of a silent success.
+mod post_turn {
+    use super::parity::{caps, rig};
+    use super::*;
+    use nexus_claude::agent::{AgentEvent, CompactionPhase, ProviderKind};
+    use nexus_claude::testkit::scripted::steps;
+    use nexus_claude::testkit::Step;
+
+    async fn seed_pending_tasks(graph: &MockGraphStore, project: Uuid) {
+        use crate::neo4j::models::{PlanNode, PlanStatus, TaskStatus};
+        let plan = PlanNode::new_for_project(
+            "Active Plan".into(),
+            "Plan with pending tasks".into(),
+            "test".into(),
+            50,
+            project,
+        );
+        graph.create_plan(&plan).await.unwrap();
+        graph
+            .update_plan_status(plan.id, PlanStatus::InProgress)
+            .await
+            .unwrap();
+        let mut task = crate::test_helpers::test_task_titled("Fix the parser bug");
+        task.status = TaskStatus::Pending;
+        graph.create_task(plan.id, &task).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn after_a_compaction_the_context_is_reinjected_and_the_objectives_recalled() {
+        let compacted = Step::Emit(AgentEvent::Compaction {
+            phase: CompactionPhase::Completed,
+            trigger: None,
+            pre_tokens: Some(1000),
+        });
+        let quiet = || vec![steps::done(&caps())];
+        let mut r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![compacted, steps::done(&caps())],
+                quiet(),
+                quiet(),
+                quiet(),
+                quiet(),
+            ],
+        )
+        .await;
+        seed_pending_tasks(&r.graph, r.project.id).await;
+        r.manager.send_message(&r.sid, "go on").await.unwrap();
+        let recovery = next_event(&mut r.rx, |e| {
+            matches!(e, ChatEvent::CompactionRecovery { .. })
+        })
+        .await;
+        assert!(
+            matches!(
+                recovery,
+                ChatEvent::CompactionRecovery {
+                    recovery_success: true,
+                    ..
+                }
+            ),
+            "{recovery:?}"
+        );
+        for _ in 0..400 {
+            if !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // No turn of its own for the context, nor any automated turn on the history
+        // just compacted: the run is the user's turn alone.
+        assert_eq!(r.sent().len(), 1, "{:#?}", r.sent());
+        // The next turn carries in front, once, the context and the reminder of the
+        // turn that compacted (it did no work: the objective is pending).
+        r.manager.send_message(&r.sid, "next").await.unwrap();
+        r.turn_end().await;
+        for _ in 0..400 {
+            if !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let sent = r.sent();
+        assert!(
+            sent[1].contains("Post-Compaction Context")
+                && sent[1].contains(&r.project.name)
+                && sent[1].contains("next"),
+            "the context of the project, in front of the next turn: {}",
+            sent[1]
+        );
+        assert!(
+            sent[2..]
+                .iter()
+                .all(|s| !s.contains("Post-Compaction Context")),
+            "re-injected once: {sent:#?}"
+        );
+        assert!(
+            sent[1].contains(super::super::post_stream::OBJECTIVE_REMINDER_MARKER)
+                && sent[1].contains("Fix the parser bug"),
+            "the pending objective recalled with the context: {}",
+            sent[1]
+        );
+        assert!(
+            sent.len() <= 4,
+            "the reminders stop at their cap: {sent:#?}"
+        );
+    }
+
+    /// After a compaction, the context comes back BEFORE the model continues: the
+    /// continuation turn carries it in front of "Continue…" (the legacy engine queues
+    /// the re-injection before the auto-continue hint).
+    #[tokio::test]
+    async fn after_a_compaction_the_continuation_carries_the_context_first() {
+        let compacted = Step::Emit(AgentEvent::Compaction {
+            phase: CompactionPhase::Completed,
+            trigger: None,
+            pre_tokens: Some(1000),
+        });
+        let r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![
+                    compacted,
+                    Step::Emit(nexus_claude::testkit::done_event(
+                        &caps(),
+                        nexus_claude::agent::StopReason::MaxTurns,
+                        None,
+                    )),
+                ],
+                vec![steps::done(&caps())],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        r.manager.set_auto_continue(&r.sid, true).await.unwrap();
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        for _ in 0..400 {
+            if r.sent().len() >= 2 && !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let sent = r.sent();
+        assert_eq!(sent.len(), 2, "the turn, then its continuation: {sent:#?}");
+        let context = sent[1].find("Post-Compaction Context");
+        let cont = sent[1].find("Continue where you left off");
+        assert!(
+            matches!((context, cont), (Some(a), Some(b)) if a < b),
+            "the context first, then the continuation: {}",
+            sent[1]
+        );
+    }
+
+    /// A tool call announced before its input was complete (Claude Code, ACP) is
+    /// judged on its RESOLVED input: a `git commit` is conclusive, so a turn that
+    /// only committed still gets the objective reminder.
+    #[tokio::test]
+    async fn a_tool_is_judged_on_its_resolved_input() {
+        let r = rig(
+            ProviderKind::ClaudeCode,
+            vec![
+                vec![
+                    steps::tool_call_start("c1", "Bash"),
+                    steps::tool_call("c1", "Bash", json!({ "command": "git commit -m done" })),
+                    steps::tool_result("c1", "committed"),
+                    steps::done(&caps()),
+                ],
+                vec![steps::done(&caps())],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        seed_pending_tasks(&r.graph, r.project.id).await;
+        r.manager.send_message(&r.sid, "commit it").await.unwrap();
+        for _ in 0..400 {
+            if r.sent().len() >= 2 && !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let sent = r.sent();
+        assert!(
+            sent.iter()
+                .skip(1)
+                .any(|s| s.contains(super::super::post_stream::OBJECTIVE_REMINDER_MARKER)),
+            "a commit alone is wrapping up, not working: the objectives are recalled: {sent:#?}"
+        );
+    }
+
+    async fn idle(r: &super::parity::Rig) {
+        for _ in 0..400 {
+            if !r.manager.is_session_streaming(&r.sid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the session never went idle");
+    }
+
+    async fn sent_count(r: &super::parity::Rig, n: usize) {
+        for _ in 0..400 {
+            if r.sent().len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{n} turns were never sent: {:#?}", r.sent());
+    }
+
+    fn compaction() -> Step {
+        Step::Emit(AgentEvent::Compaction {
+            phase: CompactionPhase::Completed,
+            trigger: None,
+            pre_tokens: Some(1000),
+        })
+    }
+
+    /// What the session keeps in the store for its next turn.
+    async fn stored(r: &super::parity::Rig) -> super::super::manager::HeldContext {
+        let graph: Arc<dyn GraphStore> = r.graph.clone();
+        super::super::manager::HeldContext::load(&graph, &r.sid)
+            .await
+            .unwrap()
+    }
+
+    /// Through the real `ManagerTurnServices`: a compaction, then the next turn hit
+    /// by a 429 (retried with the same text), the retry stopped by the user — the
+    /// provider ended it `done interrupted` and recorded it (nexus' native loop
+    /// keeps an interrupted turn in its history). The context rode that one turn:
+    /// the turn after it does not carry it again, and the store holds nothing.
+    #[tokio::test]
+    async fn the_held_context_rides_one_turn_across_a_429_and_a_stop() {
+        let limited = AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Error,
+            subtype: None,
+            is_error: true,
+            result_text: None,
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 0,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: Some(nexus_claude::agent::ProviderError::RateLimited {
+                retry_after_ms: Some(5),
+            }),
+        };
+        let r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![compaction(), steps::done(&caps())],
+                vec![Step::Emit(limited)],
+                vec![Step::AwaitInterrupt],
+                vec![steps::done(&caps())],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        idle(&r).await;
+        assert!(
+            stored(&r).await.context.is_some(),
+            "held after the compaction"
+        );
+        r.manager.send_message(&r.sid, "next").await.unwrap();
+        // The turn, then its retry after the 429: stopped while it runs.
+        sent_count(&r, 3).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        r.manager.interrupt(&r.sid).await.unwrap();
+        idle(&r).await;
+        r.manager.send_message(&r.sid, "then").await.unwrap();
+        sent_count(&r, 4).await;
+        idle(&r).await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 4, "{sent:#?}");
+        assert!(
+            sent[1].contains("Post-Compaction Context") && sent[1].contains("next"),
+            "{}",
+            sent[1]
+        );
+        assert_eq!(sent[1], sent[2], "the retry sends the same turn");
+        assert!(
+            !sent[3].contains("Post-Compaction Context"),
+            "injected once, not again after the Stop: {}",
+            sent[3]
+        );
+        assert!(stored(&r).await.is_empty(), "cleared from the store too");
+    }
+
+    /// A turn that carried the held context, was answered AND compacted again holds
+    /// the NEW context, in memory and in the store: the clear of the answered turn
+    /// and the store of its compaction are one ordered write, so a restart or an
+    /// idle close still finds it.
+    #[tokio::test]
+    async fn a_turn_that_compacts_again_keeps_its_new_context_stored() {
+        let r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![compaction(), steps::done(&caps())],
+                vec![compaction(), steps::done(&caps())],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        r.manager.send_message(&r.sid, "one").await.unwrap();
+        idle(&r).await;
+        r.manager.send_message(&r.sid, "two").await.unwrap();
+        idle(&r).await;
+        // The write is waited for in `after_turn`, before the session goes idle.
+        assert!(
+            stored(&r).await.context.is_some(),
+            "the context of the second compaction is stored"
+        );
+        r.manager.send_message(&r.sid, "three").await.unwrap();
+        sent_count(&r, 3).await;
+        idle(&r).await;
+        let sent = r.sent();
+        assert!(sent[1].contains("Post-Compaction Context"), "{}", sent[1]);
+        assert!(sent[2].contains("Post-Compaction Context"), "{}", sent[2]);
+    }
+
+    /// A turn carrying the held context compacts again, then the user stops it (the
+    /// provider ends it `done interrupted`: answered, the context delivered). The
+    /// compaction's own context is still built and held — the next turn carries a
+    /// context, and the store keeps one — instead of nothing at all.
+    #[tokio::test]
+    async fn a_stop_on_a_turn_that_compacts_again_keeps_a_context_for_the_next() {
+        let r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![compaction(), steps::done(&caps())],
+                vec![compaction(), Step::AwaitInterrupt],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        r.manager.send_message(&r.sid, "one").await.unwrap();
+        idle(&r).await;
+        r.manager.send_message(&r.sid, "two").await.unwrap();
+        sent_count(&r, 2).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        r.manager.interrupt(&r.sid).await.unwrap();
+        idle(&r).await;
+        assert!(
+            stored(&r).await.context.is_some(),
+            "the stopped turn's compaction holds its context in the store"
+        );
+        r.manager.send_message(&r.sid, "three").await.unwrap();
+        sent_count(&r, 3).await;
+        idle(&r).await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 3, "{sent:#?}");
+        assert!(sent[1].contains("Post-Compaction Context"), "{}", sent[1]);
+        assert!(
+            sent[2].contains("Post-Compaction Context") && sent[2].contains("three"),
+            "the turn after the Stop carries a context: {}",
+            sent[2]
+        );
+    }
+}
+
+/// P8c — the context re-injected after a compaction never starts a turn of its
+/// own: such a turn is measured against the window right after the compaction and
+/// compacted again (measured on integ/p8: a second summarisation call whose history
+/// held the re-injected context). The context rides in front of the session's next
+/// turn instead. What is guaranteed: the re-injection itself never starts a turn,
+/// hence never a compaction; in this scenario (one model call per message) a user
+/// turn compacts at most once. Nexus may still compact between the tool steps of
+/// one turn: that is its own policy, not bounded here.
+mod compaction_loop {
+    use super::*;
+
+    const SUMMARY_PROMPT: &str = "You are compacting the history";
+    const TURNS: [&str; 5] = [
+        "turn two",
+        "turn three",
+        "turn four",
+        "turn five",
+        "turn six",
+    ];
+
+    fn answer(text: &str, prompt_tokens: u64) -> Vec<Value> {
+        vec![
+            delta(json!({ "content": text })),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 4, "total_tokens": prompt_tokens + 4}}),
+            json!("[DONE]"),
+        ]
+    }
+
+    /// A 32k window; every long turn reports a prompt near it (31k), so each turn
+    /// after enough history calls for a compaction before it.
+    fn script() -> Value {
+        let mut routes = vec![
+            sse_route(
+                "Call the ping tool now",
+                vec![
+                    delta(
+                        json!({"tool_calls": [{"index": 0, "id": "p1", "function": {"name": "ping", "arguments": "{}"}}]}),
+                    ),
+                    json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                    json!("[DONE]"),
+                ],
+            ),
+            json!({"method": "GET", "path": "/v1/models", "status": 200,
+                   "body": {"object": "list", "data": [{"id": "m", "context_length": 32000}]}}),
+            sse_route(SUMMARY_PROMPT, answer("a dense summary", 50)),
+        ];
+        for text in TURNS.iter().rev() {
+            routes.push(sse_route(text, answer("noted", 31_000)));
+        }
+        routes.push(sse_route("hi there", answer("hello", 10)));
+        Value::Array(routes)
+    }
+
+    fn bodies(fake: &FakeOpenAi) -> Vec<String> {
+        fake.chat_requests()
+            .iter()
+            .map(|r| r["body"].to_string())
+            .filter(|b| !b.contains("Call the ping tool now"))
+            .collect()
+    }
+
+    async fn idle(manager: &ChatManager, sid: &str) {
+        for _ in 0..600 {
+            if !manager.is_session_streaming(sid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the session never went idle");
+    }
+
+    #[tokio::test]
+    async fn a_reinjected_context_never_triggers_a_compaction_and_a_user_turn_compacts_at_most_once(
+    ) {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let manager = manager(graph.clone(), true);
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        idle(&manager, &sid).await;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+
+        let mut recovered = 0;
+        for text in TURNS {
+            let before = bodies(&fake).len();
+            manager.send_message(&sid, text).await.unwrap();
+            // Its result, then the end of its run (hints included).
+            next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+            idle(&manager, &sid).await;
+            let run: Vec<String> = bodies(&fake)[before..].to_vec();
+            let compactions = run.iter().filter(|b| b.contains(SUMMARY_PROMPT)).count();
+            assert!(
+                compactions <= 1,
+                "{text}: {compactions} compactions in one user turn: {run:#?}"
+            );
+            for body in run.iter().filter(|b| b.contains(SUMMARY_PROMPT)) {
+                assert!(
+                    !body.contains("Post-Compaction Context"),
+                    "{text}: a compaction summarised the re-injected context: {body}"
+                );
+            }
+            let turns = run.iter().filter(|b| !b.contains(SUMMARY_PROMPT)).count();
+            assert_eq!(turns, 1, "{text}: one model turn per user turn: {run:#?}");
+            while let Ok(event) = rx.try_recv() {
+                recovered += usize::from(matches!(event, ChatEvent::CompactionRecovery { .. }));
+            }
+        }
+        assert!(recovered >= 1, "the scenario compacted at least once");
+        // The context of the last compaction reaches the model, in front of a turn.
+        let last = bodies(&fake)
+            .into_iter()
+            .filter(|b| !b.contains(SUMMARY_PROMPT))
+            .rfind(|b| b.contains("Post-Compaction Context"));
+        assert!(
+            last.is_some(),
+            "the re-injected context rode on a user turn"
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
+}
+
+/// OpenClaw delegated through its ACP bridge (`openclaw acp`), played by nexus'
+/// `fake_acp` (its `refuse_mcp_servers` mode answers as the bridge does). The bridge
+/// refuses MCP servers per session (`session/new`, `session/load` answered with an
+/// error, 2026.9.x; older versions ignored them): the session is opened WITHOUT the
+/// project-orchestrator server, and says so (`project_orchestrator_tools` among its
+/// `degraded_features`), as a remote Claude Code.
+///
+/// Each test has its own directory: the agent's script, its transcripts, what it
+/// recorded, and the agent's `HOME` (`with_acp_homes`). Nothing is declared in the
+/// process environment (`with_acp_commands`), nothing is written in the user's real
+/// data directory.
+mod openclaw_delegation {
+    use super::super::provider::settings::{process_origin, AcpCommand};
+    use super::*;
+
+    const INIT: &str = r#"{"op": "expect", "method": "initialize", "reply": {"protocolVersion": 1, "agentCapabilities": {"loadSession": true, "promptCapabilities": {"image": true, "audio": false, "embeddedContext": true}, "mcpCapabilities": {"http": false, "sse": false}}, "agentInfo": {"name": "openclaw-acp", "version": "2026.9.9"}, "authMethods": []}}"#;
+
+    fn turn() -> [Value; 3] {
+        [
+            json!({"op": "expect", "method": "session/prompt", "defer": "p"}),
+            json!({"op": "notify", "method": "session/update", "params": {"sessionId": "oc-1",
+                   "update": {"sessionUpdate": "agent_message_chunk",
+                              "content": {"type": "text", "text": "hello from openclaw"}}}}),
+            json!({"op": "reply", "to": "p", "result": {"stopReason": "end_turn"}}),
+        ]
+    }
+
+    /// One declared ACP agent played by `fake_acp`. The transcript it plays is the
+    /// one `mode` names (written by the test before a session starts): `new` (a
+    /// 2026.9.x bridge: `session/new` refused when it carries servers), `load` (same on
+    /// `session/load`), `ignoring` (an older bridge: servers ignored without a word).
+    struct Agent {
+        dir: tempfile::TempDir,
+        preset: &'static str,
+        command: AcpCommand,
+    }
+
+    impl Agent {
+        fn new(preset: &'static str, program: &str, per_session_mcp: Option<bool>) -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            let d = dir.path();
+            let write = |name: &str, lines: Vec<Value>| {
+                let text: Vec<String> = lines.iter().map(Value::to_string).collect();
+                std::fs::write(d.join(format!("{name}.jsonl")), text.join("\n")).unwrap();
+            };
+            let init: Value = serde_json::from_str(INIT).unwrap();
+            let mut new = vec![
+                init.clone(),
+                json!({"op": "expect", "method": "session/new", "refuse_mcp_servers": true,
+                       "reply": {"sessionId": "oc-1"}}),
+            ];
+            new.extend(turn());
+            write("new", new);
+            let mut load = vec![
+                init.clone(),
+                json!({"op": "expect", "method": "session/load", "refuse_mcp_servers": true,
+                       "reply": null}),
+            ];
+            load.extend(turn());
+            write("load", load);
+            let mut ignoring = vec![
+                init,
+                json!({"op": "expect", "method": "session/new", "reply": {"sessionId": "oc-1"}}),
+            ];
+            ignoring.extend(turn());
+            write("ignoring", ignoring);
+            let script = d.join(program);
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nD='{dir}'\nFAKE_ACP_TRANSCRIPT=\"$D/$(cat \"$D/mode\").jsonl\" \
+                     FAKE_ACP_RECORD=\"$D/record.jsonl\" FAKE_ACP_MAX_RUNTIME_MS=120000 \
+                     exec '{fake}' \"$@\"\n",
+                    dir = d.display(),
+                    fake = fake_bin("fake_acp").display()
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let agent = Self {
+                command: AcpCommand {
+                    argv: vec![
+                        script.display().to_string(),
+                        "acp".into(),
+                        "--token-file".into(),
+                        "/dev/null".into(),
+                    ],
+                    per_session_mcp,
+                },
+                dir,
+                preset,
+            };
+            agent.mode("new");
+            agent
+        }
+
+        fn mode(&self, mode: &str) {
+            std::fs::write(self.dir.path().join("mode"), mode).unwrap();
+        }
+
+        fn recorded(&self) -> Vec<Value> {
+            std::fs::read_to_string(self.dir.path().join("record.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .collect()
+        }
+
+        /// The `mcpServers` of every `method` request the agent received (the health
+        /// probe sends none).
+        fn servers_sent(&self, method: &str) -> Vec<Value> {
+            self.recorded()
+                .into_iter()
+                .filter(|e| e["kind"] == "in" && e["method"] == method)
+                .map(|e| e["params"]["mcpServers"].clone())
+                .collect()
+        }
+
+        fn refusals(&self) -> usize {
+            self.recorded()
+                .iter()
+                .filter(|e| e["kind"] == "refused_mcp")
+                .count()
+        }
+
+        /// A manager that knows this agent only, keeps its `HOME` here, and a stored,
+        /// consented instance `id` of it.
+        async fn manager(&self, graph: &Arc<MockGraphStore>, id: &str) -> ChatManager {
+            let origin = process_origin("acp", Some(self.preset));
+            store_instance(
+                graph,
+                &InstanceRecord {
+                    id: id.into(),
+                    kind: "acp".into(),
+                    preset: Some(self.preset.into()),
+                    label: id.into(),
+                    base_url: String::new(),
+                    origin: origin.clone(),
+                    default_model: Some("openclaw".into()),
+                    cost_source: "unknown".into(),
+                    credential_ref: "none".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            consent(graph, "proj", id, &origin).await;
+            manager(graph.clone(), true)
+                .with_acp_commands(
+                    [(self.preset.to_string(), self.command.clone())]
+                        .into_iter()
+                        .collect(),
+                )
+                .with_acp_homes(self.dir.path().join("acp-homes"))
+        }
+
+        /// The instance's `HOME` is in this directory, and NOT in nexus' default under
+        /// the user's real data directory.
+        fn assert_home_here(&self, id: &str) {
+            let home = self.dir.path().join("acp-homes").join(id).join("home");
+            assert!(
+                home.is_dir(),
+                "the agent ran with its HOME at {}",
+                home.display()
+            );
+            let real = nexus_claude::providers::acp::default_acp_home(id);
+            assert!(
+                !real.exists(),
+                "nothing is written in the real data directory: {}",
+                real.display()
+            );
+        }
+    }
+
+    /// The persisted events of `sid` until one matches `found` (the out-of-turn pump
+    /// may persist after the Result).
+    async fn persisted<T>(
+        graph: &MockGraphStore,
+        sid: &str,
+        found: impl Fn(&ChatEvent) -> Option<T>,
+    ) -> Option<T> {
+        let uuid = Uuid::parse_str(sid).unwrap();
+        for _ in 0..100 {
+            let hit = graph
+                .get_chat_events(uuid, 0, 200)
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|r| serde_json::from_str::<ChatEvent>(&r.data).ok())
+                .find_map(|e| found(&e));
+            if hit.is_some() {
+                return hit;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        None
+    }
+
+    async fn lacks_po_tools(graph: &MockGraphStore, sid: &str) -> bool {
+        let degraded = persisted(graph, sid, |e| match e {
+            ChatEvent::SystemInit {
+                degraded_features, ..
+            } => degraded_features.clone(),
+            _ => None,
+        })
+        .await
+        .expect("a system_init with degraded_features");
+        degraded
+            .iter()
+            .any(|f| f == super::super::agent_runtime::PO_TOOLS_FEATURE)
+    }
+
+    async fn answered(manager: &ChatManager, sid: &str) {
+        let mut rx = manager.subscribe(sid).await.unwrap();
+        next_event(
+            &mut rx,
+            |e| matches!(e, ChatEvent::AssistantText { content, .. } if content.contains("hello from openclaw")),
+        )
+        .await;
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+    }
+
+    /// Opens a session on `id` and plays its turn; returns its id.
+    async fn open(manager: &ChatManager, id: &str) -> String {
+        let created = manager
+            .create_session(&request(Some(id), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("the session on {id} must open: {e:#}"));
+        answered(manager, &created.session_id).await;
+        created.session_id
+    }
+
+    async fn resume(manager: &ChatManager, sid: &str) {
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        manager
+            .resume_session(sid, "again", Some(&claims))
+            .await
+            .unwrap_or_else(|e| panic!("the session must resume: {e:#}"));
+        answered(manager, sid).await;
+    }
+
+    #[tokio::test]
+    async fn an_openclaw_session_opens_without_the_po_server_and_says_so() {
+        let agent = Agent::new("openclaw", "openclaw", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = agent.manager(&graph, "p19-openclaw").await;
+        let sid = open(&manager, "p19-openclaw").await;
+        // Never given a server: no refusal, no second request.
+        assert_eq!(agent.servers_sent("session/new"), vec![json!([])]);
+        assert_eq!(agent.refusals(), 0);
+        assert!(lacks_po_tools(&graph, &sid).await);
+        agent.assert_home_here("p19-openclaw");
+    }
+
+    /// An older OpenClaw IGNORES the servers without a word (nothing to learn), and a
+    /// wrapper hides its name: the declaration `per_session_mcp: false` says it.
+    #[tokio::test]
+    async fn a_declared_agent_without_per_session_mcp_is_never_given_a_server() {
+        let agent = Agent::new("wrapped", "my-bridge", Some(false));
+        agent.mode("ignoring");
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = agent.manager(&graph, "p19-wrapped").await;
+        let sid = open(&manager, "p19-wrapped").await;
+        assert_eq!(agent.servers_sent("session/new"), vec![json!([])]);
+        assert!(lacks_po_tools(&graph, &sid).await);
+        agent.assert_home_here("p19-wrapped");
+    }
+
+    /// An agent of another name that refuses the servers: the first session is opened
+    /// again without them by nexus (and says so, on the thread too); the provider has
+    /// learned it, so the SECOND session is built without the PO server and opens at
+    /// once, with no refusal and no retry.
+    #[tokio::test]
+    async fn a_learned_refusal_opens_the_next_session_without_the_po_server_and_without_retry() {
+        let agent = Agent::new("bridge", "acp-bridge", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = agent.manager(&graph, "p19-bridge").await;
+
+        let first = open(&manager, "p19-bridge").await;
+        let asked = agent.servers_sent("session/new");
+        assert_eq!(asked.len(), 2, "refused, then asked again: {asked:?}");
+        assert_eq!(asked[0][0]["name"], "project-orchestrator");
+        assert_eq!(asked[1], json!([]));
+        assert!(lacks_po_tools(&graph, &first).await);
+        // The user sees the refusal on the thread, not only in a log.
+        let notice = persisted(&graph, &first, |e| match e {
+            ChatEvent::BackgroundOutput { source, .. }
+                if source == "system:mcp_servers_refused" =>
+            {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+        assert!(notice.is_some(), "mcp_servers_refused reaches the thread");
+
+        let second = open(&manager, "p19-bridge").await;
+        let asked = agent.servers_sent("session/new");
+        assert_eq!(asked.len(), 3, "one more session/new, no retry: {asked:?}");
+        assert_eq!(asked[2], json!([]));
+        assert_eq!(agent.refusals(), 1);
+        assert!(lacks_po_tools(&graph, &second).await);
+        agent.assert_home_here("p19-bridge");
+    }
+
+    /// Two FIRST sessions opened at once on a refusing agent: whichever learns the
+    /// refusal first, the other one (built while the provider still said yes) is
+    /// opened too — by nexus' retry, or by the backend's when nexus answers
+    /// `Unsupported { per_session_mcp }` — and both say what they lack.
+    ///
+    /// What it proves is the OUTCOME only: it cannot tell which of the two retries
+    /// (nexus', the backend's) opened the late session, and nexus' alone would make it
+    /// pass. The backend's retry is proven by the unit test
+    /// `a_refusal_learned_meanwhile_reopens_the_session_without_its_mcp_servers`
+    /// (manager.rs), where the provider answers `Unsupported { per_session_mcp }`.
+    #[tokio::test]
+    async fn two_first_sessions_opened_at_once_on_a_refusing_agent_both_open() {
+        let agent = Agent::new("bridge", "acp-bridge", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = agent.manager(&graph, "p19-race").await;
+        let (a, b) = tokio::join!(open(&manager, "p19-race"), open(&manager, "p19-race"));
+        assert!(lacks_po_tools(&graph, &a).await);
+        assert!(lacks_po_tools(&graph, &b).await);
+        assert_ne!(a, b);
+        // The two agent processes write one record file at once: its lines are not
+        // counted here. A session given the server was refused, never served with it.
+        let asked = agent.servers_sent("session/new");
+        assert!(asked.contains(&json!([])), "{asked:?}");
+    }
+
+    /// Resuming: an OpenClaw session is loaded without servers; a refusing agent's
+    /// session resumed after a RESTART (a new manager, the learned refusal forgotten
+    /// in memory) is loaded without servers too, from its frozen snapshot.
+    #[tokio::test]
+    async fn a_resumed_session_is_loaded_without_servers_even_after_a_restart() {
+        let openclaw = Agent::new("openclaw", "openclaw", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = openclaw.manager(&graph, "p19-oc-resume").await;
+        let sid = open(&manager, "p19-oc-resume").await;
+        manager.close_session(&sid).await.unwrap();
+        openclaw.mode("load");
+        resume(&manager, &sid).await;
+        assert_eq!(openclaw.servers_sent("session/load"), vec![json!([])]);
+        assert_eq!(openclaw.refusals(), 0);
+
+        let bridge = Agent::new("bridge", "acp-bridge", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let before = bridge.manager(&graph, "p19-br-resume").await;
+        let sid = open(&before, "p19-br-resume").await;
+        assert_eq!(bridge.refusals(), 1, "learned at the first session");
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+        let after = bridge.manager(&graph, "p19-br-resume").await;
+        bridge.mode("load");
+        resume(&after, &sid).await;
+        assert_eq!(bridge.servers_sent("session/load"), vec![json!([])]);
+        assert_eq!(bridge.refusals(), 1, "not refused again after the restart");
+        assert!(lacks_po_tools(&graph, &sid).await);
+        bridge.assert_home_here("p19-br-resume");
+    }
+
+    /// The frozen snapshot survives the resumes: a refusing agent's session resumed
+    /// after a restart, then after ANOTHER one, is loaded without servers both times.
+    /// The first resume must not rewrite the snapshot with what a fresh provider (which
+    /// has learned nothing yet) says, or the second restart sends the servers again, to
+    /// be refused again (a refused round-trip and a second `mcp_servers_refused`).
+    #[tokio::test]
+    async fn a_refused_session_stays_without_servers_across_two_restarts() {
+        let bridge = Agent::new("bridge", "acp-bridge", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let first = bridge.manager(&graph, "p19-br-twice").await;
+        let sid = open(&first, "p19-br-twice").await;
+        assert_eq!(bridge.refusals(), 1, "learned at the first session");
+        first.close_session(&sid).await.unwrap();
+        drop(first);
+        bridge.mode("load");
+        for restart in 1..=2 {
+            let manager = bridge.manager(&graph, "p19-br-twice").await;
+            resume(&manager, &sid).await;
+            manager.close_session(&sid).await.unwrap();
+            drop(manager);
+            assert_eq!(
+                bridge.servers_sent("session/load"),
+                vec![json!([]); restart],
+                "restart {restart}: loaded without servers"
+            );
+            assert_eq!(bridge.refusals(), 1, "restart {restart}: not refused again");
+        }
+        let notices = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 500)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|r| serde_json::from_str::<ChatEvent>(&r.data).ok())
+            .filter(|e| {
+                matches!(e, ChatEvent::BackgroundOutput { source, .. }
+                    if source == "system:mcp_servers_refused")
+            })
+            .count();
+        assert_eq!(notices, 1, "the refusal is told once, at the first opening");
+    }
+}

@@ -3,12 +3,17 @@
   "event_envelope": {
     "examples": {
       "full": {
+        "created_at": 1760099999.123,
         "replaying": true,
         "seq": 42
       },
       "minimal": {}
     },
     "fields": {
+      "created_at": {
+        "required": false,
+        "type": "number"
+      },
       "replaying": {
         "required": false,
         "type": "boolean"

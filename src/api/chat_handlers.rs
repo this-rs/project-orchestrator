@@ -202,7 +202,8 @@ fn default_messages_limit() -> usize {
 ///
 /// Returns persisted chat events as `messages`. Each event includes its full
 /// payload (type, content, tool info, etc.) plus injected `seq` and `created_at`
-/// metadata. The frontend reconstructs the ChatMessage UI model from these events.
+/// metadata (`created_at`: seconds since the epoch, milliseconds as the fraction).
+/// The frontend reconstructs the ChatMessage UI model from these events.
 pub async fn list_messages(
     State(state): State<OrchestratorState>,
     Path(session_id): Path<Uuid>,
@@ -251,7 +252,7 @@ pub async fn list_messages(
                 map.insert("seq".to_string(), serde_json::json!(e.seq));
                 map.insert(
                     "created_at".to_string(),
-                    serde_json::json!(e.created_at.timestamp()),
+                    serde_json::json!(super::ws_chat_handler::wire_seconds(e.created_at)),
                 );
             }
             obj
@@ -1312,7 +1313,8 @@ pub async fn search_messages(
 // Backfill
 // ============================================================================
 
-/// POST /api/chat/sessions/backfill-previews — Backfill title/preview for existing sessions
+/// POST /api/chat/sessions/backfill-previews — Backfill title/preview for existing
+/// sessions, and the record of the sessions of the agent engine (`agent_records`).
 pub async fn backfill_previews(
     State(state): State<OrchestratorState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1334,11 +1336,23 @@ pub async fn backfill_previews(
         0
     };
 
+    // Phase 3: the record (message count, cost, title) of the sessions the agent
+    // engine served before it kept one, from their persisted events.
+    let agent_count = if let Some(chat_manager) = &state.chat_manager {
+        chat_manager
+            .backfill_agent_session_records()
+            .await
+            .map_err(AppError::Internal)?
+    } else {
+        0
+    };
+
     let total = neo4j_count + meili_count;
     Ok(Json(serde_json::json!({
         "updated": total,
         "from_neo4j": neo4j_count,
         "from_meilisearch": meili_count,
+        "agent_records": agent_count,
         "message": format!("Backfilled title/preview for {} sessions", total)
     })))
 }
@@ -4166,6 +4180,7 @@ mod tests {
                 parent_tool_use_id: None,
                 category: None,
                 canonical: None,
+                tool_use_id: None,
             },
         )
         .await;

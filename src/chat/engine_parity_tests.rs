@@ -182,6 +182,10 @@ const FUNCTIONS: &[(&str, &str)] = &[
         "une permission accordée pour toujours est retenue au-delà de la session",
     ),
     (
+        "tool_timing",
+        "un outil qui a attendu une permission porte tool_timing persisté : prise en charge, attente, exécution, fin",
+    ),
+    (
         "po_tools",
         "les outils project-orchestrator (MCP) sont donnés et appelables",
     ),
@@ -270,16 +274,6 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
             task: "P11",
             why: "le harnais natif ne déclare pas la portée always (permission_scopes = once, \
                   session) et le backend ne la transmet pas",
-        },
-    ),
-    (
-        Engine::Native,
-        "session_record",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "P8",
-            why: "le moteur agent ne met pas à jour le dossier de session à la fin d'un tour \
-                  (message_count / total_cost_usd)",
         },
     ),
 ];
@@ -745,11 +739,54 @@ impl Stage {
     }
 }
 
-/// `ok` when the record of a session carries what its conversation produced.
+/// The persisted `tool_timing` of the call `id`, which waited for a permission that
+/// was allowed: taken up, then asked, then answered (where it starts to run), then
+/// ended, in that order; stored once, after the call's result.
+fn timing_verdict(persisted: &[ChatEvent], id: &str) -> (bool, String) {
+    let is_timing = |e: &ChatEvent| matches!(e, ChatEvent::ToolTiming { id: t, .. } if t == id);
+    let Some(at) = persisted.iter().position(&is_timing) else {
+        return (false, format!("aucun tool_timing persisté pour {id}"));
+    };
+    let ChatEvent::ToolTiming {
+        started_at,
+        permission_requested_at,
+        permission_resolved_at,
+        permission_outcome,
+        run_started_at,
+        ended_at,
+        ..
+    } = &persisted[at]
+    else {
+        unreachable!("found as a tool_timing")
+    };
+    let after_result = persisted[..at]
+        .iter()
+        .any(|e| matches!(e, ChatEvent::ToolResult { id: r, .. } if r == id));
+    let once = persisted.iter().filter(|e| is_timing(e)).count() == 1;
+    let seen = format!(
+        "pris={started_at:?} demandé={permission_requested_at:?} répondu={permission_resolved_at:?} \
+         issue={permission_outcome:?} exécuté={run_started_at:?} fin={ended_at} \
+         après le résultat={after_result} une fois={once}"
+    );
+    let ordered = match (started_at, permission_requested_at, permission_resolved_at) {
+        (Some(s), Some(q), Some(r)) => s <= q && q <= r && r <= ended_at,
+        _ => false,
+    };
+    let ok = ordered
+        && run_started_at == permission_resolved_at
+        && permission_outcome.as_deref() == Some("allowed")
+        && after_result
+        && once;
+    (ok, seen)
+}
+
+/// `ok` when the record of a session carries what its conversation produced:
+/// the record of a session after `sent` user messages: each counted, a cost (the
+/// total the provider reported: 0 for a free endpoint, a real figure; an unknown
+/// price leaves none, never an invented 0) and a title.
 fn record_verdict(node: &crate::neo4j::models::ChatSessionNode, sent: i64) -> (bool, String) {
-    let cost = node.total_cost_usd.unwrap_or(0.0);
     let ok = node.message_count >= sent
-        && cost > 0.0
+        && node.total_cost_usd.is_some_and(|c| c >= 0.0)
         && node.title.as_deref().is_some_and(|t| !t.is_empty());
     (
         ok,
@@ -1219,6 +1256,16 @@ fn transcript_main(k: Keys, cwd: &str) -> Vec<Value> {
     t.extend(vec![
         await_in(&k.k("TURN-FIVE")),
         cc_tool_use("t5", "Bash", json!({"command": "ls"})),
+        hook(
+            "PreToolUse",
+            "hook-t5",
+            hook_input(
+                "PreToolUse",
+                cwd,
+                json!({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
+            ),
+            Some("t5"),
+        ),
         permission_request("req-perm", "Bash", json!({"command": "ls"}), "t5"),
         await_in("req-perm"),
         cc_tool_result("t5", "a.rs", false),
@@ -1926,6 +1973,8 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
         "portée persistante dans la réponse : aucune".to_string(),
     );
     w.settle(ends, &manager).await;
+    let (timed, seen) = timing_verdict(&w.persisted().await, "t5");
+    cc.check("tool_timing", timed, Cause::Harness, seen);
 
     // cancel_tools: the running tool's process is signalled, the turn goes on.
     let ends = w.turn_ends();
@@ -2363,6 +2412,8 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
         ),
     );
     wn.settle(ends, &manager).await;
+    let (timed, seen) = timing_verdict(&wn.persisted().await, "c5");
+    na.check("tool_timing", timed, Cause::Harness, seen);
     // The same tool again: a grant for the session would not ask twice.
     let ends = wn.turn_ends();
     manager
@@ -2448,12 +2499,15 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
         Cause::Harness,
         format!("active_tasks_update={tracked}"),
     );
-    let stopped = manager.cancel_task(&nid, "c7").await.unwrap();
+    let stopped = manager.cancel_task(&nid, "c7").await;
     na.check(
         "cancel_task",
-        !stopped.killed_pids.is_empty(),
+        stopped.as_ref().is_ok_and(|s| !s.killed_pids.is_empty()),
         Cause::Harness,
-        format!("killed_pids={:?}", stopped.killed_pids),
+        match &stopped {
+            Ok(s) => format!("killed_pids={:?}", s.killed_pids),
+            Err(e) => format!("refusé : {e}"),
+        },
     );
     wn.said(WAIT, "answered bg").await;
     wn.settle(ends, &manager).await;
@@ -2820,7 +2874,7 @@ fn a_declared_gap_fixed_silently_turns_the_matrix_red() {
     let mut na = as_declared(Engine::Native);
     na.rows
         .iter_mut()
-        .find(|(f, _, _)| *f == "session_record")
+        .find(|(f, _, _)| *f == "permissions.always")
         .unwrap()
         .1 = Verdict::Ok;
     let problems = audit(&cc, &na, &expected);

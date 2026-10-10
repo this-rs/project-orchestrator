@@ -8,7 +8,8 @@ Ne modifiez aucun fichier de ce dossier à la main, sauf ce README.
 - `server-events.json` : chaque variante de `ChatEvent` (`src/chat/types.rs`), sous `events.<tag>`.
 - `client-messages.json` : chaque variante de `WsChatClientMessage` (`src/api/ws_chat_handler.rs`), sous `messages.<tag>`.
 - `control-frames.json` : les trames construites à la main par le handler WS (`frames.<tag>`), et
-  `event_envelope`, les champs `seq` / `replaying` que le handler ajoute aux événements.
+  `event_envelope`, les champs `seq` / `replaying` / `created_at` que le handler ajoute aux événements
+  (`created_at` : secondes depuis l'epoch, millisecondes en fraction, comme l'historique REST).
 - `SHA256SUMS` : une ligne `<sha256>  <fichier>` par fichier JSON (format `shasum -a 256`).
 
 Chaque entrée porte `fields` (`type` JSON, `required`, `nullable: true` si le champ peut valoir `null`) et

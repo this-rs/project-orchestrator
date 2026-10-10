@@ -210,6 +210,7 @@ impl EventMapper {
                 parent,
                 category,
                 canonical,
+                tool_call_id,
                 ..
             } => vec![ChatEvent::PermissionRequest {
                 id: request_id.clone(),
@@ -218,6 +219,7 @@ impl EventMapper {
                 parent_tool_use_id: parent.clone(),
                 category: Some(category_name(*category)),
                 canonical: canonical.clone(),
+                tool_use_id: tool_call_id.clone(),
             }],
             AgentEvent::Question {
                 question_id,

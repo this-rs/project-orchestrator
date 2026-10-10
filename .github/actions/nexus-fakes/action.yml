@@ -1,6 +1,6 @@
 name: Build the nexus fake servers
 description: >
-  Installs `fake_openai`, `fake_mcp` and `fake_claude` of the nexus repository, and
+  Installs `fake_openai`, `fake_mcp`, `fake_claude` and `fake_acp` of the nexus repository, and
   the real `nexus-tools`, at the revision Cargo.toml pins, and exports NEXUS_FAKES_DIR.
   `nexus-tools` is built exactly as the release ships it (scripts/build-nexus-tools.sh:
   same pinned revision, `--features tls`), so this is also the CI check that the pin
@@ -21,14 +21,14 @@ runs:
         # skips the cargo installs until the pin moves (a new pin = a new directory, so the check
         # that the pin builds the shipped tools still runs once per pin); a hosted runner starts
         # empty and installs every time.
-        ROOT="$RUNNER_TOOL_CACHE/nexus-fakes/$REV-tls"
+        ROOT="$RUNNER_TOOL_CACHE/nexus-fakes/$REV-tls-acp"
         if [ -x "$ROOT/bin/fake_openai" ] && [ -x "$ROOT/bin/fake_mcp" ] \
-          && [ -x "$ROOT/bin/fake_claude" ] && [ -x "$ROOT/bin/nexus-tools" ]; then
+          && [ -x "$ROOT/bin/fake_claude" ] && [ -x "$ROOT/bin/fake_acp" ] && [ -x "$ROOT/bin/nexus-tools" ]; then
           echo "nexus fakes for $REV already installed in $ROOT"
         else
           cargo install --git https://github.com/this-rs/nexus.git --rev "$REV" \
             --features "provider-native testkit" --root "$ROOT" \
-            --bin fake_openai --bin fake_mcp --bin fake_claude nexus-claude
+            --bin fake_openai --bin fake_mcp --bin fake_claude --bin fake_acp nexus-claude
           # The shipped nexus-tools (tls on), as release.yml builds it.
           scripts/build-nexus-tools.sh "$ROOT"
         fi
