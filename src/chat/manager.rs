@@ -916,6 +916,26 @@ pub struct SpawnedByContext {
     pub scaffolding_level: Option<u8>,
 }
 
+/// The title (80 characters at most) and the preview (200 at most) of a session named from
+/// its first message, or `None` when there is nothing visible to name it from. Runs of
+/// whitespace (newlines, indentation) become one space; a longer text is cut on a character
+/// boundary and ends with `...`.
+pub(crate) fn title_and_preview(msg: &str) -> Option<(String, String)> {
+    let flat = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return None;
+    }
+    let cut = |max: usize| {
+        if flat.chars().count() > max {
+            let truncated: String = flat.chars().take(max - 3).collect();
+            format!("{}...", truncated.trim_end())
+        } else {
+            flat.clone()
+        }
+    };
+    Some((cut(80), cut(200)))
+}
+
 /// Classify a tool use as "conclusive" (wrapping-up, not productive work).
 ///
 /// Conclusive tools are git finalization commands (commit, push, tag, status-after-commit).
@@ -923,20 +943,6 @@ pub struct SpawnedByContext {
 /// reminder should still fire — the agent may be concluding prematurely.
 ///
 /// Returns `true` if the tool use is a finalization/wrap-up action.
-/// The title (80 characters at most) and the preview (200 at most) of a session named from
-/// its first message; a longer text is cut on a character boundary and ends with `...`.
-pub(crate) fn title_and_preview(msg: &str) -> (String, String) {
-    let cut = |max: usize| {
-        if msg.chars().count() > max {
-            let truncated: String = msg.chars().take(max - 3).collect();
-            format!("{}...", truncated.trim_end())
-        } else {
-            msg.to_string()
-        }
-    };
-    (cut(80), cut(200))
-}
-
 fn is_conclusive_tool(tool_name: &str, input: &serde_json::Value) -> bool {
     if tool_name == "Bash" {
         if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
@@ -11604,15 +11610,15 @@ impl ChatManager {
         Ok(spec)
     }
 
-    /// Opens a session on the provider-neutral engine and sends the first
-    /// message. The `ChatSession` node is already persisted by `create_session`.
     /// Title and preview of a session, from its first user message: what the user typed,
     /// never the `<po-refs>`/`<po-attachments>` blocks around it. One writer for both
-    /// engines (Claude Code and agent).
+    /// engines (Claude Code and agent). Nothing is written when nothing visible was typed.
     async fn name_session_from_first_message(&self, session_id: Uuid, message: &str) {
         let typed = crate::refs::turn::visible_text(message);
-        let (title, preview) = title_and_preview(&typed);
-        let _ = self
+        let Some((title, preview)) = title_and_preview(&typed) else {
+            return;
+        };
+        if let Err(e) = self
             .graph
             .update_chat_session(
                 session_id,
@@ -11623,9 +11629,14 @@ impl ChatManager {
                 None,
                 Some(preview),
             )
-            .await;
+            .await
+        {
+            warn!("could not name session {session_id} from its first message: {e}");
+        }
     }
 
+    /// Opens a session on the provider-neutral engine and sends the first
+    /// message. The `ChatSession` node is already persisted by `create_session`.
     async fn open_agent_session(&self, o: AgentOpen<'_>) -> Result<CreateSessionResponse> {
         let AgentOpen {
             request,
@@ -19121,81 +19132,23 @@ mod tests {
 
     #[test]
     fn title_and_preview_cut_on_characters_and_keep_short_text_whole() {
-        let (t, p) = title_and_preview("Bonjour");
+        let (t, p) = title_and_preview("Bonjour").unwrap();
         assert_eq!((t.as_str(), p.as_str()), ("Bonjour", "Bonjour"));
-        let (t, p) = title_and_preview(&"é".repeat(100));
+        let (t, p) = title_and_preview(&"é".repeat(100)).unwrap();
         assert_eq!(t.chars().count(), 80);
         assert!(t.ends_with("..."));
         assert_eq!(p.chars().count(), 100, "under 200: whole");
-        let (_, p) = title_and_preview(&"a".repeat(300));
+        let (_, p) = title_and_preview(&"a".repeat(300)).unwrap();
         assert_eq!(p.chars().count(), 200);
         assert!(p.ends_with("..."));
     }
 
     #[test]
-    fn test_title_generation_short_message() {
-        let msg = "Hello, help me with my project";
-        // < 80 chars → title == message
-        let title = if msg.chars().count() > 80 {
-            let truncated: String = msg.chars().take(77).collect();
-            format!("{}...", truncated.trim_end())
-        } else {
-            msg.to_string()
-        };
-        assert_eq!(title, "Hello, help me with my project");
-    }
-
-    #[test]
-    fn test_title_generation_long_message() {
-        let msg = "a".repeat(100);
-        // > 80 chars → truncated to 77 + "..."
-        let title = if msg.chars().count() > 80 {
-            let truncated: String = msg.chars().take(77).collect();
-            format!("{}...", truncated.trim_end())
-        } else {
-            msg.to_string()
-        };
-        assert_eq!(title.chars().count(), 80);
-        assert!(title.ends_with("..."));
-    }
-
-    #[test]
-    fn test_preview_generation_short_message() {
-        let msg = "Short message";
-        let preview = if msg.chars().count() > 200 {
-            let truncated: String = msg.chars().take(197).collect();
-            format!("{}...", truncated.trim_end())
-        } else {
-            msg.to_string()
-        };
-        assert_eq!(preview, "Short message");
-    }
-
-    #[test]
-    fn test_preview_generation_long_message() {
-        let msg = "b".repeat(300);
-        let preview = if msg.chars().count() > 200 {
-            let truncated: String = msg.chars().take(197).collect();
-            format!("{}...", truncated.trim_end())
-        } else {
-            msg.to_string()
-        };
-        assert_eq!(preview.chars().count(), 200);
-        assert!(preview.ends_with("..."));
-    }
-
-    #[test]
-    fn test_title_generation_utf8_multibyte() {
-        // 90 chars with accented characters
-        let msg: String = "é".repeat(90);
-        let title = if msg.chars().count() > 80 {
-            let truncated: String = msg.chars().take(77).collect();
-            format!("{}...", truncated.trim_end())
-        } else {
-            msg.to_string()
-        };
-        assert_eq!(title.chars().count(), 80);
-        assert!(title.ends_with("..."));
+    fn title_and_preview_flatten_whitespace_and_skip_blank_text() {
+        let (t, _) = title_and_preview("\n\n   Fix  the\n  login\tbug  ").unwrap();
+        assert_eq!(t, "Fix the login bug");
+        assert_eq!(title_and_preview(""), None);
+        assert_eq!(title_and_preview(" \n\t "), None);
     }
 
     // ========================================================================
