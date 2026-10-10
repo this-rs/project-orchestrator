@@ -220,10 +220,7 @@ jobs:
   # ==========================================================================
   unit-tests:
     name: Unit Tests
-    # Self-hosted (more cores, persistent target directory) for pushes and for PRs whose
-    # branch lives in THIS repository; a PR from a fork never reaches the self-hosted runner
-    # (the repository also requires approval for every external contributor's run).
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","po-ci"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     # A hung test used to hold a job for 1-2 hours; nextest kills it after 5 min (see
     # .config/nextest.toml), this is the backstop.
     timeout-minutes: 40
@@ -235,10 +232,7 @@ jobs:
 
       - uses: ./.github/actions/test-profile
 
-      # The self-hosted runner keeps its target directory between runs: restoring and saving
-      # GitHub's cache there would only cost time.
       - name: Cache cargo registry
-        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "ci-test-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
@@ -280,7 +274,7 @@ jobs:
   # ==========================================================================
   integration-tests:
     name: Integration Tests
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","po-ci"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
@@ -329,7 +323,6 @@ jobs:
       - uses: ./.github/actions/test-profile
 
       - name: Cache cargo registry
-        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "ci-test-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
@@ -472,7 +465,7 @@ jobs:
     name: Code Coverage
     # FULL tier only: PRs into main, pushes to main, nightly and manual runs (all on main).
     if: github.base_ref == 'main' || github.ref == 'refs/heads/main'
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","po-ci"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     # Backstop: a hung test used to keep this job alive for 1-2 hours.
     timeout-minutes: 50
     permissions:
@@ -522,7 +515,6 @@ jobs:
       - uses: ./.github/actions/test-profile
 
       - name: Cache cargo registry
-        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "ci-cov-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
