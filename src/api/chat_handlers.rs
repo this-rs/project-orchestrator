@@ -202,7 +202,8 @@ fn default_messages_limit() -> usize {
 ///
 /// Returns persisted chat events as `messages`. Each event includes its full
 /// payload (type, content, tool info, etc.) plus injected `seq` and `created_at`
-/// metadata. The frontend reconstructs the ChatMessage UI model from these events.
+/// metadata (`created_at`: seconds since the epoch, milliseconds as the fraction).
+/// The frontend reconstructs the ChatMessage UI model from these events.
 pub async fn list_messages(
     State(state): State<OrchestratorState>,
     Path(session_id): Path<Uuid>,
@@ -251,7 +252,7 @@ pub async fn list_messages(
                 map.insert("seq".to_string(), serde_json::json!(e.seq));
                 map.insert(
                     "created_at".to_string(),
-                    serde_json::json!(e.created_at.timestamp()),
+                    serde_json::json!(super::ws_chat_handler::wire_seconds(e.created_at)),
                 );
             }
             obj
@@ -1109,6 +1110,9 @@ pub async fn get_live_activity(
 /// - `capped: true` → rate cap hit (30/5min/session); display a
 ///   "slow down" toast and disable the button briefly.
 ///
+/// **501** — the session runs on the agent engine, which tracks no background
+/// task yet (`CancelTaskUnsupported`, P12).
+///
 /// **404** — `chat_manager` not configured.
 pub async fn cancel_task(
     State(state): State<OrchestratorState>,
@@ -1121,9 +1125,18 @@ pub async fn cancel_task(
     let result = chat_manager
         .cancel_task(&session_id.to_string(), &task_id)
         .await
-        .map_err(AppError::Internal)?;
+        .map_err(cancel_task_error)?;
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
+}
+
+/// The error of `cancel_task` as the route answers it.
+fn cancel_task_error(e: anyhow::Error) -> AppError {
+    match e.downcast_ref::<crate::chat::manager::CancelTaskUnsupported>() {
+        // A session of the agent engine: refused, said so (501).
+        Some(unsupported) => AppError::NotImplemented(unsupported.to_string()),
+        None => AppError::Internal(e),
+    }
 }
 
 // ============================================================================
@@ -1297,7 +1310,8 @@ pub async fn search_messages(
 // Backfill
 // ============================================================================
 
-/// POST /api/chat/sessions/backfill-previews — Backfill title/preview for existing sessions
+/// POST /api/chat/sessions/backfill-previews — Backfill title/preview for existing
+/// sessions, and the record of the sessions of the agent engine (`agent_records`).
 pub async fn backfill_previews(
     State(state): State<OrchestratorState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1319,11 +1333,23 @@ pub async fn backfill_previews(
         0
     };
 
+    // Phase 3: the record (message count, cost, title) of the sessions the agent
+    // engine served before it kept one, from their persisted events.
+    let agent_count = if let Some(chat_manager) = &state.chat_manager {
+        chat_manager
+            .backfill_agent_session_records()
+            .await
+            .map_err(AppError::Internal)?
+    } else {
+        0
+    };
+
     let total = neo4j_count + meili_count;
     Ok(Json(serde_json::json!({
         "updated": total,
         "from_neo4j": neo4j_count,
         "from_meilisearch": meili_count,
+        "agent_records": agent_count,
         "message": format!("Backfilled title/preview for {} sessions", total)
     })))
 }
@@ -1839,6 +1865,21 @@ pub async fn associate_session(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cancel_task_refused_by_the_agent_engine_is_a_501_not_a_500() {
+        let refused = anyhow::Error::new(crate::chat::manager::CancelTaskUnsupported {
+            session_id: "s".into(),
+        });
+        assert!(matches!(
+            super::cancel_task_error(refused),
+            crate::api::handlers::AppError::NotImplemented(_)
+        ));
+        assert!(matches!(
+            super::cancel_task_error(anyhow::anyhow!("boom")),
+            crate::api::handlers::AppError::Internal(_)
+        ));
+    }
+
     use super::*;
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
@@ -4151,6 +4192,7 @@ mod tests {
                 parent_tool_use_id: None,
                 category: None,
                 canonical: None,
+                tool_use_id: None,
             },
         )
         .await;
