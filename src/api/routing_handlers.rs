@@ -703,6 +703,93 @@ mod tests {
         assert_eq!(page["limit"], 200, "the page size is bounded");
     }
 
+    /// The decision log carries the cause of a `window_unknown` rejection (B-R3), so
+    /// the frontend can say "catalog offline"; other alternatives have no `why` key.
+    #[tokio::test]
+    async fn the_decision_log_says_why_a_window_is_unknown() {
+        use crate::chat::provider::cognitive::candidates::{RejectReason, UnknownWindow};
+        use crate::chat::provider::cognitive::decision::{
+            CognitiveDecision, DecisionAlternative, Pick,
+        };
+        use crate::chat::provider::cognitive::mode::{LearningStage, ProviderRoutingMode};
+        use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
+        use crate::chat::provider::cognitive::store::{InMemoryRoutingStore, RoutingArmStore};
+
+        let alternative = |model: &str, score, rejected| DecisionAlternative {
+            pick: Pick::new("claude-code", model),
+            score,
+            rejected,
+        };
+        let store = InMemoryRoutingStore::new();
+        store
+            .put_decision(&CognitiveDecision {
+                id: Uuid::new_v4(),
+                at: chrono::Utc::now(),
+                signature: TaskSignature::utility(TaskClass::Simple, 9_000, Some("p")),
+                chosen: None,
+                score: None,
+                explored: false,
+                reason: "no_candidate".into(),
+                alternatives: vec![
+                    alternative("claude-opus-5-5", Some(0.4), None),
+                    alternative(
+                        "claude-sonnet-4-6",
+                        None,
+                        Some(RejectReason::WindowUnknown {
+                            need: 9_000,
+                            why: UnknownWindow::CatalogOffline,
+                        }),
+                    ),
+                    alternative(
+                        "claude-zeta-9-9",
+                        None,
+                        Some(RejectReason::WindowUnknown {
+                            need: 9_000,
+                            why: UnknownWindow::NotInCatalog,
+                        }),
+                    ),
+                    alternative(
+                        "claude-haiku-4-5",
+                        None,
+                        Some(RejectReason::ContextTooSmall {
+                            need: 9_000,
+                            have: Some(4_000),
+                        }),
+                    ),
+                ],
+                applied: false,
+                mode: ProviderRoutingMode::Full,
+                stage: LearningStage::Shadow,
+                session_id: None,
+                task_id: None,
+                run_id: None,
+                turn_index: None,
+                outcome: None,
+                used: None,
+            })
+            .await
+            .unwrap();
+        let query = super::DecisionsQuery {
+            project_slug: Some("p".into()),
+            limit: None,
+            offset: None,
+            since: None,
+        };
+        let page = super::decisions_page(Some(&store), &query).await.unwrap();
+        assert_eq!(
+            page["items"][0]["alternatives"],
+            json!([
+                {"provider_id": "claude-code", "model": "claude-opus-5-5", "score": 0.4, "rejected": null},
+                {"provider_id": "claude-code", "model": "claude-sonnet-4-6", "score": null,
+                 "rejected": "window_unknown", "why": "catalog_offline"},
+                {"provider_id": "claude-code", "model": "claude-zeta-9-9", "score": null,
+                 "rejected": "window_unknown", "why": "not_in_catalog"},
+                {"provider_id": "claude-code", "model": "claude-haiku-4-5", "score": null,
+                 "rejected": "context_too_small"},
+            ])
+        );
+    }
+
     /// A chat manager with no cognitive router wired: its pool is empty.
     fn bare_manager() -> Arc<crate::chat::ChatManager> {
         let state = mock_app_state();

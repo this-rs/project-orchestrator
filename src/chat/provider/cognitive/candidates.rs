@@ -142,6 +142,15 @@ impl RejectReason {
             Self::TrustWithoutSandbox => "trust_without_sandbox",
         }
     }
+
+    /// Stable code of the cause, when the reason carries one (`window_unknown`:
+    /// `catalog_offline` or `not_in_catalog`), for the decision log.
+    pub fn why(&self) -> Option<&'static str> {
+        match self {
+            Self::WindowUnknown { why, .. } => Some(why.code()),
+            _ => None,
+        }
+    }
 }
 
 /// Why a model's window is unknown.
@@ -154,6 +163,16 @@ pub enum UnknownWindow {
     /// The live catalog does not list this model, or lists it without
     /// `max_input_tokens`.
     NotInCatalog,
+}
+
+impl UnknownWindow {
+    /// Stable code, the same as its serialized form.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::CatalogOffline => "catalog_offline",
+            Self::NotInCatalog => "not_in_catalog",
+        }
+    }
 }
 
 impl std::fmt::Display for UnknownWindow {
