@@ -528,7 +528,16 @@ jobs:
       - name: Build the nexus fake servers used by the agent e2e tests
         uses: ./.github/actions/nexus-fakes
 
+      # NEO4J_URI here (this job has the Neo4j service) is what makes the one
+      # lib test that needs a real Neo4j, neo4j::mock::cross_project_parity,
+      # actually run; HARNESS_NEO4J_REQUIRED turns a missing Neo4j into a
+      # failure. The Unit Tests job has no Neo4j and no NEO4J_URI: it skips.
       - name: Collect coverage — unit tests (workspace)
+        env:
+          NEO4J_URI: bolt://localhost:7687
+          NEO4J_USER: neo4j
+          NEO4J_PASSWORD: testpassword
+          HARNESS_NEO4J_REQUIRED: "1"
         run: |
           cargo llvm-cov --no-report --no-fail-fast \
             --workspace --exclude project-orchestrator-desktop --lib \

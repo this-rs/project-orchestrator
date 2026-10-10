@@ -17586,14 +17586,27 @@ mod cross_project_parity {
 
     #[tokio::test]
     async fn mock_and_neo4j_cut_after_the_coupling_weighting() {
-        let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:17687".into());
+        // A unit test never guesses a Neo4j address: without NEO4J_URI it
+        // skips. The CI coverage job sets it (and HARNESS_NEO4J_REQUIRED).
+        // The connection is also bounded: with nothing listening, connecting
+        // and creating the schema never return, which hung the Unit Tests job.
+        let required = std::env::var("HARNESS_NEO4J_REQUIRED").is_ok();
+        let Ok(uri) = std::env::var("NEO4J_URI") else {
+            assert!(
+                !required,
+                "HARNESS_NEO4J_REQUIRED is set but NEO4J_URI is not"
+            );
+            eprintln!("Skipping parity test: NEO4J_URI is not set");
+            return;
+        };
         let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
         let pass = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
-        let real = match Neo4jClient::new(&uri, &user, &pass).await {
-            Ok(c) => c,
-            Err(_) => {
+        let connect = Neo4jClient::new(&uri, &user, &pass);
+        let real = match tokio::time::timeout(std::time::Duration::from_secs(30), connect).await {
+            Ok(Ok(c)) => c,
+            _ => {
                 assert!(
-                    std::env::var("HARNESS_NEO4J_REQUIRED").is_err(),
+                    !required,
                     "HARNESS_NEO4J_REQUIRED is set but no Neo4j answers at {uri}"
                 );
                 eprintln!("Skipping parity test: no Neo4j at {uri}");
