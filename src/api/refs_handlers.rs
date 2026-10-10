@@ -14,7 +14,7 @@ use super::handlers::{AppError, OrchestratorState};
 use crate::auth::jwt::Claims;
 use crate::refs::access::{AccessPolicy, Principal};
 use crate::refs::search::{search, RefSearchParams};
-use crate::refs::wire::{RefSearchResponse, RefsErrorBody};
+use crate::refs::wire::{KindsResponse, RefSearchResponse, RefsErrorBody};
 
 /// A refused search, in the shape `tests/fixtures/refs/errors.json` pins.
 pub enum RefsHttpError {
@@ -29,6 +29,11 @@ impl IntoResponse for RefsHttpError {
             RefsHttpError::App(e) => e.into_response(),
         }
     }
+}
+
+/// GET /api/refs/kinds: the kinds this server resolves (see [`KindsResponse`]).
+pub async fn ref_kinds() -> Json<KindsResponse> {
+    Json(KindsResponse::active())
 }
 
 /// GET /api/refs/search?q=&kinds=&project_id=&workspace_slug=&limit=
@@ -128,6 +133,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_kinds_route_is_not_public_and_tells_what_the_server_resolves() {
+        let w = world().await;
+        let (status, _) = get(app(w.graph.clone()).await, "/api/refs/kinds", false).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) = get(app(w.graph.clone()).await, "/api/refs/kinds", true).await;
+        assert_eq!(status, StatusCode::OK);
+        let raw = include_str!("../../tests/fixtures/refs/kinds_response.json");
+        let fixture: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(body, fixture["response"]);
+    }
+
+    #[tokio::test]
     async fn a_signed_in_caller_gets_the_items_body() {
         let w = world().await;
         let (status, body) = get(
@@ -139,12 +156,15 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let keys: Vec<_> = body.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["items"]);
-        let kinds: Vec<_> = body["items"]
+        // ranked by relevance, then recency: both match "refs" as a word, so
+        // the order between the two kinds is not what this test is about.
+        let mut kinds: Vec<_> = body["items"]
             .as_array()
             .unwrap()
             .iter()
             .map(|i| i["kind"].as_str().unwrap())
             .collect();
+        kinds.sort();
         assert_eq!(kinds, ["plan", "rfc"]);
     }
 
@@ -185,7 +205,6 @@ mod tests {
             (long.as_str(), "search text too long"),
             ("/api/refs/search?limit=51", "search limit out of range"),
             ("/api/refs/search?limit=zero", "search limit out of range"),
-            ("/api/refs/search?kinds=persona", "reserved kind"),
         ];
         for (uri, name) in cases {
             let (status, body) = get(app(w.graph.clone()).await, uri, true).await;
@@ -194,7 +213,7 @@ mod tests {
         }
         let (status, body) = get(
             app(w.graph.clone()).await,
-            "/api/refs/search?kinds=plan,task,workspace",
+            "/api/refs/search?kinds=plan,task,step",
             true,
         )
         .await;

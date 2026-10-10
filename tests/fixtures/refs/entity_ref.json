@@ -1,8 +1,9 @@
 {
   "_contract_version": 1,
-  "_description": "EntityRef: the only thing a client sends to designate an entity. Exactly two fields; no label (the server writes it), unknown fields are refused. Five active kinds. An RFC is a Note of type rfc, there is no EntityType::Rfc: its id is the note id.",
+  "_description": "EntityRef: the only thing a client sends to designate an entity. Exactly two fields; no label (the server writes it), unknown fields are refused. The five kinds of the first release (the `kinds` list below; a client falls back on exactly these when the server has no GET /api/refs/kinds). Since R2 the server resolves more kinds: see kinds_response.json and kind_ids.json; `all_kinds` lists them all. persona and skill, once reserved, are active, so reserved_kinds_refused_as_kind_disabled is now empty. An RFC is a Note of type rfc, there is no EntityType::Rfc: its id is the note id.",
   "kinds": ["plan", "task", "note", "decision", "rfc"],
-  "reserved_kinds_refused_as_kind_disabled": ["persona", "skill"],
+  "all_kinds": ["plan", "task", "note", "decision", "rfc", "conversation", "project", "milestone", "release", "workspace", "commit", "protocol", "persona", "skill", "file", "link"],
+  "reserved_kinds_refused_as_kind_disabled": [],
   "max_refs_per_message": 20,
   "cases": [
     { "name": "plan", "ref": { "kind": "plan", "id": "57cf05c9-25b6-495d-ab07-de4b11d64736" } },

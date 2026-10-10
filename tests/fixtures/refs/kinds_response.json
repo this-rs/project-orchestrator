@@ -1,0 +1,208 @@
+{
+  "_contract_version": 1,
+  "_description": "ADDITIVE fixture (R2). GET /api/refs/kinds (authenticated, like /api/refs/search): the kinds THIS server resolves, derived from ONE table on the server, so that a client offers only those and draws them without a list of its own. Response 200: {contract_version, kinds[]}, in display order. Each entry: kind (the name in #kind:id); class ('data': cited with '#', read or discussed; 'actor': invocable, cited with '@' — persona and skill; the server only fixes the class here, invoking one is another feature); sigil ('#' or '@', follows from class); id_format ('uuid' = hyphenated UUID, 'project_commit' = <project uuid>:<40 or 64 hex>, 'project_path' = <project uuid>:<path relative to the project root>, 'url' = a normalized http/https address, see kind_ids.json); sensitive (file and commit: GET /api/refs/search suggests them only when project_id or workspace_slug is given, and a chat session reads them only inside a project or workspace it is attached to); label_source (what the label is made of: title, title_or_first_line, first_line, name, title_or_version, path, host); searchable (false for link: nothing to list, it is pasted); open_route (where the app opens it, relative to /workspace/:slug/; {id} is the reference id, {slug} the slug of the result's `project`; null = no page of its own); opens_external (a link opens outside the app); icon (a key to map to an icon). A server that predates this route answers 404 (or the SPA fallback, which is not JSON with a kinds array): the client then offers fallback_kinds, the five kinds of the first release, and sends nothing else. A kind name or a field value the client does not know must be ignored, not offered. GET /api/refs/search without `kinds` still asks for the five fallback kinds; any other kind (for '@': kinds=persona,skill) must be requested by name. Results are ranked by relevance (see search_response.json).",
+  "fallback_kinds": [
+    "plan",
+    "task",
+    "note",
+    "decision",
+    "rfc"
+  ],
+  "response": {
+    "contract_version": 1,
+    "kinds": [
+      {
+        "kind": "plan",
+        "class": "data",
+        "sigil": "#",
+        "id_format": "uuid",
+        "sensitive": false,
+        "label_source": "title",
+        "searchable": true,
+        "open_route": "plans/{id}",
+        "opens_external": false,
+        "icon": "clipboard-list"
+      },
+      {
+        "kind": "task",
+        "class": "data",
+        "sigil": "#",
+        "id_format": "uuid",
+        "sensitive": false,
+        "label_source": "title_or_first_line",
+        "searchable": true,
+        "open_route": "tasks/{id}",
+        "opens_external": false,
+        "icon": "check-square"
+      },
+      {
+        "kind": "note",
+        "class": "data",
+        "sigil": "#",
+        "id_format": "uuid",
+        "sensitive": false,
+        "label_source": "first_line",
+        "searchable": true,
+        "open_route": "notes/{id}",
+        "opens_external": false,
+        "icon": "sticky-note"
+      },
+      {
+        "kind": "decision",
+        "class": "data",
+        "sigil": "#",
+        "id_format": "uuid",
+        "sensitive": false,
+        "label_source": "first_line",
+        "searchable": true,
+        "open_route": "decisions/{id}",
+        "opens_external": false,
+        "icon": "scale"
+      },
+      {
+        "kind": "rfc",
+        "class": "data",
+        "sigil": "#",
+        "id_format": "uuid",
+        "sensitive": false,
+        "label_source": "title",
+        "searchable": true,
+        "open_route": "rfcs/{id}",
+        "opens_external": false,
+        "icon": "file-text"
+      },
+      {
+        "kind": "conversation",
+        "class": "data",
+        "sigil": "#",
+        "id_format": "uuid",
+        "sensitive": false,
+        "label_source": "title",
+        "searchable": true,
+        "open_route": "chat/{id}",
+        "opens_external": false,
+        "icon": "message-square"
+      },
+      {
+        "kind": "project",
+        "class": "data",
+        "sigil": "#",
+        "id_format": "uuid",
+        "sensitive": false,
+        "label_source": "name",
+        "searchable": true,
+        "open_route": "projects/{slug}",
+        "opens_external": false,
+        "icon": "folder"
+      },
+      {
+        "kind": "milestone",
+        "class": "data",
+        "sigil": "#",
+        "id_format": "uuid",
+        "sensitive": false,
+        "label_source": "title",
+        "searchable": true,
+        "open_route": "milestones/{id}",
+        "opens_external": false,
+        "icon": "flag"
+      },
+      {
+        "kind": "release",
+        "class": "data",
+        "sigil": "#",
+        "id_format": "uuid",
+        "sensitive": false,
+        "label_source": "title_or_version",
+        "searchable": true,
+        "open_route": null,
+        "opens_external": false,
+        "icon": "tag"
+      },
+      {
+        "kind": "workspace",
+        "class": "data",
+        "sigil": "#",
+        "id_format": "uuid",
+        "sensitive": false,
+        "label_source": "name",
+        "searchable": true,
+        "open_route": "overview",
+        "opens_external": false,
+        "icon": "layers"
+      },
+      {
+        "kind": "commit",
+        "class": "data",
+        "sigil": "#",
+        "id_format": "project_commit",
+        "sensitive": true,
+        "label_source": "first_line",
+        "searchable": true,
+        "open_route": null,
+        "opens_external": false,
+        "icon": "git-commit"
+      },
+      {
+        "kind": "protocol",
+        "class": "data",
+        "sigil": "#",
+        "id_format": "uuid",
+        "sensitive": false,
+        "label_source": "name",
+        "searchable": true,
+        "open_route": "protocols/{id}",
+        "opens_external": false,
+        "icon": "workflow"
+      },
+      {
+        "kind": "persona",
+        "class": "actor",
+        "sigil": "@",
+        "id_format": "uuid",
+        "sensitive": false,
+        "label_source": "name",
+        "searchable": true,
+        "open_route": "personas/{id}",
+        "opens_external": false,
+        "icon": "user-round"
+      },
+      {
+        "kind": "skill",
+        "class": "actor",
+        "sigil": "@",
+        "id_format": "uuid",
+        "sensitive": false,
+        "label_source": "name",
+        "searchable": true,
+        "open_route": "skills/{id}",
+        "opens_external": false,
+        "icon": "sparkles"
+      },
+      {
+        "kind": "file",
+        "class": "data",
+        "sigil": "#",
+        "id_format": "project_path",
+        "sensitive": true,
+        "label_source": "path",
+        "searchable": true,
+        "open_route": null,
+        "opens_external": false,
+        "icon": "file-code"
+      },
+      {
+        "kind": "link",
+        "class": "data",
+        "sigil": "#",
+        "id_format": "url",
+        "sensitive": false,
+        "label_source": "host",
+        "searchable": false,
+        "open_route": null,
+        "opens_external": true,
+        "icon": "link"
+      }
+    ]
+  }
+}

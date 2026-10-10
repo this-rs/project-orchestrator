@@ -4,7 +4,9 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::types::{de_ref_id, MapOnly, RefKind};
+use super::kinds::{KindClass, LabelSource, KINDS};
+use super::registry;
+use super::types::{canonical_id, IdFormat, MapOnly, RefId, RefKind};
 use super::validate::{InvalidReason, RefsInvalid};
 
 /// The outcome of resolving one reference, as the user sees it.
@@ -33,8 +35,7 @@ pub struct ScopeLabel {
 #[serde(deny_unknown_fields)]
 pub struct RefSearchItem {
     pub kind: RefKind,
-    #[serde(deserialize_with = "de_ref_id")]
-    pub id: Uuid,
+    pub id: RefId,
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<String>,
@@ -50,7 +51,15 @@ pub struct RefSearchItem {
 /// The rows as objects only: a positional row is refused.
 fn de_items<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<RefSearchItem>, D::Error> {
     let rows = Vec::<MapOnly<RefSearchItem>>::deserialize(d)?;
-    Ok(rows.into_iter().map(|MapOnly(r)| r).collect())
+    let mut items = Vec::with_capacity(rows.len());
+    for MapOnly(r) in rows {
+        // the id must be valid, and spelled canonically, for its kind.
+        if canonical_id(r.kind, r.id.as_str()).as_ref() != Some(&r.id) {
+            return Err(serde::de::Error::custom("not a valid reference id"));
+        }
+        items.push(r);
+    }
+    Ok(items)
 }
 
 /// Body of `GET /api/refs/search`.
@@ -67,7 +76,7 @@ pub struct RefSearchResponse {
 #[serde(deny_unknown_fields)]
 pub struct RefResolution {
     pub kind: RefKind,
-    pub id: Uuid,
+    pub id: RefId,
     pub status: RefStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -86,6 +95,69 @@ pub struct RefResolution {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RefsEvent {
     RefsResolved { refs: Vec<RefResolution> },
+}
+
+/// One kind the server resolves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KindInfo {
+    pub kind: RefKind,
+    /// `data` (cited with `#`) or `actor` (invocable, cited with `@`).
+    pub class: KindClass,
+    /// The character that starts its token in the composer: `#` or `@`.
+    pub sigil: String,
+    /// How its `id` is spelled.
+    pub id_format: IdFormat,
+    /// Sensitive kinds (file, commit) are suggested only inside a project or
+    /// workspace (`project_id` / `workspace_slug` on the search) and are
+    /// readable by a session only inside a project it is attached to.
+    pub sensitive: bool,
+    /// What the label is made of.
+    pub label_source: LabelSource,
+    /// Offered by `GET /api/refs/search`.
+    pub searchable: bool,
+    /// Where the app opens it, relative to `/workspace/:slug/` (`{id}` is the
+    /// reference id, `{slug}` the slug of the result's `project`); `null`: no page.
+    pub open_route: Option<String>,
+    /// Opened outside the app.
+    pub opens_external: bool,
+    /// A key the frontend maps to an icon.
+    pub icon: String,
+}
+
+/// Body of `GET /api/refs/kinds`: the kinds this server resolves, so that a
+/// client offers only those. A server older than this route answers 404: the
+/// client then offers the five historical kinds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KindsResponse {
+    pub contract_version: u32,
+    pub kinds: Vec<KindInfo>,
+}
+
+impl KindsResponse {
+    /// The enabled kinds of the registry, in registry order.
+    pub fn active() -> Self {
+        Self {
+            contract_version: super::CONTRACT_VERSION,
+            kinds: KINDS
+                .iter()
+                .filter(|d| registry::spec(d.kind).enabled)
+                .map(|d| KindInfo {
+                    kind: d.kind,
+                    class: d.class,
+                    sigil: d.class.sigil().to_string(),
+                    id_format: d.id_format,
+                    sensitive: d.kind.is_sensitive(),
+                    label_source: d.label,
+                    searchable: d.searchable,
+                    open_route: d.open_route.map(str::to_string),
+                    opens_external: d.opens_external,
+                    icon: d.icon.to_string(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Error body for a refused request (HTTP 400, or a WS error frame).

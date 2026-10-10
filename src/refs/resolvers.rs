@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use super::access::{RefMeta, RefSource};
 use super::label;
-use super::types::{EntityRef, RefKind};
+use super::types::{EntityRef, RefId, RefKind};
 use super::wire::ScopeLabel;
 use crate::neo4j::models::{DecisionNode, DecisionStatus, PlanNode, TaskWithPlan};
 use crate::neo4j::GraphStore;
@@ -93,16 +93,69 @@ pub struct Memo {
     plans: HashMap<Uuid, Option<PlanNode>>,
 }
 
+/// A suggestion before it is ranked: what to draw, and the text the typed
+/// words are matched against (its title is `meta.label`).
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub meta: RefMeta,
+    /// The text of the entity beyond its title (description, content...).
+    pub body: String,
+    /// The text the ranking treats as the TITLE when it is not the label (a
+    /// conversation with no title is labelled by its preview, but must not rank
+    /// as if the preview were its title).
+    pub title: Option<String>,
+    /// When it was created or last decided: ties in relevance go to the latest.
+    pub at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl Candidate {
+    pub fn new(
+        meta: RefMeta,
+        body: impl Into<String>,
+        at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        Self {
+            meta,
+            body: body.into(),
+            title: None,
+            at,
+        }
+    }
+
+    pub fn titled(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+}
+
+impl std::ops::Deref for Candidate {
+    type Target = RefMeta;
+    fn deref(&self) -> &RefMeta {
+        &self.meta
+    }
+}
+
+impl Candidates {
+    /// Does an entity with this title and body match the typed text at all?
+    /// Resolvers use it to skip a row before paying for its scope; the ORDER
+    /// of the survivors is decided once, by [`super::rank`].
+    pub fn matches(&self, title: &str, body: &str) -> bool {
+        super::rank::score(&self.needle, title, body).is_some()
+    }
+}
+
 /// The resolver of one kind.
 #[async_trait]
 pub trait KindResolver: Send + Sync {
     fn kind(&self) -> RefKind;
 
     /// The entity `id`, or `None`. Unchecked.
-    async fn load(&self, id: Uuid, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>>;
+    async fn load(&self, id: &RefId, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>>;
 
-    /// Recent entities matching the needle, most recent first. Unchecked.
-    async fn candidates(&self, c: &Candidates, memo: &mut Memo) -> anyhow::Result<Vec<RefMeta>>;
+    /// Rows to rank for the typed text: a bounded window of the most recent
+    /// entities of the scope (at most [`SCAN_CAP`] per source), not yet ordered
+    /// nor filtered by the policy. Unchecked.
+    async fn candidates(&self, c: &Candidates, memo: &mut Memo) -> anyhow::Result<Vec<Candidate>>;
 
     /// The parts of a result too costly to compute for every candidate.
     async fn finish(&self, _meta: &mut RefMeta) -> anyhow::Result<()> {
@@ -111,17 +164,13 @@ pub trait KindResolver: Send + Sync {
 }
 
 /// The wire spelling of an enum (`in_progress`, `active`...).
-fn snake<T: Serialize>(v: &T) -> Option<String> {
+pub(super) fn snake<T: Serialize>(v: &T) -> Option<String> {
     serde_json::to_value(v)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
 }
 
-fn contains(haystack: &str, needle: &str) -> bool {
-    needle.is_empty() || haystack.to_lowercase().contains(needle)
-}
-
-async fn scope_of(
+pub(super) async fn scope_of(
     graph: &dyn GraphStore,
     memo: &mut Memo,
     project_id: Option<Uuid>,
@@ -172,12 +221,17 @@ pub struct PlanResolver {
     graph: Arc<dyn GraphStore>,
 }
 
+/// The resolver of `plan`, for the table of kinds.
+pub fn plan(graph: Arc<dyn GraphStore>) -> Box<dyn KindResolver> {
+    Box::new(PlanResolver { graph })
+}
+
 impl PlanResolver {
     async fn meta(&self, p: &PlanNode, memo: &mut Memo) -> anyhow::Result<RefMeta> {
         let (project, workspace) = scope_of(self.graph.as_ref(), memo, p.project_id).await?;
         Ok(RefMeta {
             kind: RefKind::Plan,
-            id: p.id,
+            id: p.id.into(),
             label: label::derive("plan", &p.id, &[&p.title]),
             subtitle: None,
             project,
@@ -193,39 +247,64 @@ impl KindResolver for PlanResolver {
         RefKind::Plan
     }
 
-    async fn load(&self, id: Uuid, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+    async fn load(&self, id: &RefId, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+        let Some(id) = id.uuid() else {
+            return Ok(None);
+        };
         match self.graph.get_plan(id).await? {
             Some(p) => Ok(Some(self.meta(&p, memo).await?)),
             None => Ok(None),
         }
     }
 
-    async fn candidates(&self, c: &Candidates, memo: &mut Memo) -> anyhow::Result<Vec<RefMeta>> {
-        let search = (!c.needle.is_empty()).then_some(c.needle.as_str());
-        let (plans, _) = self
-            .graph
-            .list_plans_filtered(
-                c.project_id,
-                c.workspace_slug.as_deref(),
-                None,
-                None,
-                None,
-                search,
-                c.fetch,
-                0,
-                Some("created_at"),
-                "desc",
-            )
-            .await?;
-        let mut out = Vec::with_capacity(plans.len());
-        for p in &plans {
-            out.push(self.meta(p, memo).await?);
+    async fn candidates(&self, c: &Candidates, memo: &mut Memo) -> anyhow::Result<Vec<Candidate>> {
+        // The store's own text search reaches plans older than the recent
+        // window; the window catches what its exact-case substring misses
+        // (accents). Both are bounded by SCAN_CAP.
+        let searches = if c.needle.is_empty() {
+            vec![None]
+        } else {
+            vec![Some(c.needle.clone()), None]
+        };
+        let mut plans: Vec<PlanNode> = Vec::new();
+        for search in searches {
+            let (found, _) = self
+                .graph
+                .list_plans_filtered(
+                    c.project_id,
+                    c.workspace_slug.as_deref(),
+                    None,
+                    None,
+                    None,
+                    search.as_deref(),
+                    SCAN_CAP,
+                    0,
+                    Some("created_at"),
+                    "desc",
+                )
+                .await?;
+            for p in found {
+                if !plans.iter().any(|q| q.id == p.id) {
+                    plans.push(p);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for p in plans.iter().filter(|p| c.matches(&p.title, &p.description)) {
+            out.push(Candidate::new(
+                self.meta(p, memo).await?,
+                p.description.clone(),
+                Some(p.created_at),
+            ));
         }
         Ok(out)
     }
 
     async fn finish(&self, meta: &mut RefMeta) -> anyhow::Result<()> {
-        let n = self.graph.get_plan_tasks(meta.id).await?.len();
+        let Some(plan_id) = meta.id.uuid() else {
+            return Ok(());
+        };
+        let n = self.graph.get_plan_tasks(plan_id).await?.len();
         meta.subtitle = Some(match n {
             1 => "1 tâche".to_string(),
             n => format!("{n} tâches"),
@@ -242,6 +321,10 @@ pub struct TaskResolver {
     graph: Arc<dyn GraphStore>,
 }
 
+pub fn task(graph: Arc<dyn GraphStore>) -> Box<dyn KindResolver> {
+    Box::new(TaskResolver { graph })
+}
+
 impl TaskResolver {
     async fn meta(
         &self,
@@ -254,7 +337,7 @@ impl TaskResolver {
         let title = t.title.as_deref().unwrap_or("");
         Ok(RefMeta {
             kind: RefKind::Task,
-            id: t.id,
+            id: t.id.into(),
             label: label::derive("task", &t.id, &[title, &t.description]),
             subtitle: plan.map(|p| format!("Plan : {}", p.title)),
             project,
@@ -263,9 +346,12 @@ impl TaskResolver {
         })
     }
 
-    fn matches(t: &TaskWithPlan, needle: &str) -> bool {
-        contains(t.task.title.as_deref().unwrap_or(""), needle)
-            || contains(&t.task.description, needle)
+    fn matches(t: &TaskWithPlan, c: &Candidates) -> bool {
+        let title = match t.task.title.as_deref() {
+            Some(title) if !title.is_empty() => title.to_string(),
+            _ => label::first_line(&t.task.description).unwrap_or_default(),
+        };
+        c.matches(&title, &t.task.description)
     }
 }
 
@@ -275,7 +361,10 @@ impl KindResolver for TaskResolver {
         RefKind::Task
     }
 
-    async fn load(&self, id: Uuid, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+    async fn load(&self, id: &RefId, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+        let Some(id) = id.uuid() else {
+            return Ok(None);
+        };
         let Some(t) = self.graph.get_task(id).await? else {
             return Ok(None);
         };
@@ -286,7 +375,7 @@ impl KindResolver for TaskResolver {
         Ok(Some(self.meta(&t, plan.as_ref(), memo).await?))
     }
 
-    async fn candidates(&self, c: &Candidates, memo: &mut Memo) -> anyhow::Result<Vec<RefMeta>> {
+    async fn candidates(&self, c: &Candidates, memo: &mut Memo) -> anyhow::Result<Vec<Candidate>> {
         // No text search on tasks in the store: scan the newest SCAN_CAP of the
         // scope and filter here (see the module comment).
         let (rows, _) = self
@@ -307,12 +396,13 @@ impl KindResolver for TaskResolver {
             )
             .await?;
         let mut out = Vec::new();
-        for row in rows.iter().filter(|r| Self::matches(r, &c.needle)) {
-            if out.len() >= c.fetch {
-                break;
-            }
+        for row in rows.iter().filter(|r| Self::matches(r, c)) {
             let plan = plan_of(self.graph.as_ref(), memo, row.plan_id).await?;
-            out.push(self.meta(&row.task, plan.as_ref(), memo).await?);
+            out.push(Candidate::new(
+                self.meta(&row.task, plan.as_ref(), memo).await?,
+                row.task.description.clone(),
+                Some(row.task.created_at),
+            ));
         }
         Ok(out)
     }
@@ -330,23 +420,46 @@ pub struct RfcResolver {
     graph: Arc<dyn GraphStore>,
 }
 
+pub fn note(graph: Arc<dyn GraphStore>) -> Box<dyn KindResolver> {
+    Box::new(NoteResolver { graph })
+}
+
+pub fn rfc(graph: Arc<dyn GraphStore>) -> Box<dyn KindResolver> {
+    Box::new(RfcResolver { graph })
+}
+
 async fn note_candidates(
     graph: &dyn GraphStore,
     c: &Candidates,
     types: &[NoteType],
 ) -> anyhow::Result<Vec<Note>> {
-    let filters = NoteFilters {
-        note_type: Some(types.to_vec()),
-        search: (!c.needle.is_empty()).then(|| c.needle.clone()),
-        limit: Some(c.fetch as i64),
-        offset: Some(0),
-        sort_by: Some("created_at".into()),
-        sort_order: Some("desc".into()),
-        ..Default::default()
+    // The store's text search reaches notes older than the recent window; the
+    // window catches what its exact-case substring misses (accents).
+    let searches = if c.needle.is_empty() {
+        vec![None]
+    } else {
+        vec![Some(c.needle.clone()), None]
     };
-    let (notes, _) = graph
-        .list_notes(c.project_id, c.workspace_slug.as_deref(), &filters)
-        .await?;
+    let mut notes: Vec<Note> = Vec::new();
+    for search in searches {
+        let filters = NoteFilters {
+            note_type: Some(types.to_vec()),
+            search,
+            limit: Some(SCAN_CAP as i64),
+            offset: Some(0),
+            sort_by: Some("created_at".into()),
+            sort_order: Some("desc".into()),
+            ..Default::default()
+        };
+        let (found, _) = graph
+            .list_notes(c.project_id, c.workspace_slug.as_deref(), &filters)
+            .await?;
+        for n in found {
+            if !notes.iter().any(|m| m.id == n.id) {
+                notes.push(n);
+            }
+        }
+    }
     Ok(notes)
 }
 
@@ -373,7 +486,7 @@ async fn note_meta(
     };
     Ok(RefMeta {
         kind,
-        id: n.id,
+        id: n.id.into(),
         label,
         subtitle,
         project,
@@ -397,7 +510,10 @@ impl KindResolver for NoteResolver {
         RefKind::Note
     }
 
-    async fn load(&self, id: Uuid, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+    async fn load(&self, id: &RefId, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+        let Some(id) = id.uuid() else {
+            return Ok(None);
+        };
         match self.graph.get_note(id).await? {
             Some(n) if n.note_type != NoteType::Rfc => Ok(Some(
                 note_meta(self.graph.as_ref(), RefKind::Note, &n, memo).await?,
@@ -406,11 +522,15 @@ impl KindResolver for NoteResolver {
         }
     }
 
-    async fn candidates(&self, c: &Candidates, memo: &mut Memo) -> anyhow::Result<Vec<RefMeta>> {
+    async fn candidates(&self, c: &Candidates, memo: &mut Memo) -> anyhow::Result<Vec<Candidate>> {
         let notes = note_candidates(self.graph.as_ref(), c, &NOTE_TYPES).await?;
-        let mut out = Vec::with_capacity(notes.len());
+        let mut out = Vec::new();
         for n in &notes {
-            out.push(note_meta(self.graph.as_ref(), RefKind::Note, n, memo).await?);
+            let title = label::first_line(&n.content).unwrap_or_default();
+            if c.matches(&title, &n.content) {
+                let meta = note_meta(self.graph.as_ref(), RefKind::Note, n, memo).await?;
+                out.push(Candidate::new(meta, n.content.clone(), Some(n.created_at)));
+            }
         }
         Ok(out)
     }
@@ -422,7 +542,10 @@ impl KindResolver for RfcResolver {
         RefKind::Rfc
     }
 
-    async fn load(&self, id: Uuid, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+    async fn load(&self, id: &RefId, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+        let Some(id) = id.uuid() else {
+            return Ok(None);
+        };
         match self.graph.get_note(id).await? {
             Some(n) if n.note_type == NoteType::Rfc => Ok(Some(
                 note_meta(self.graph.as_ref(), RefKind::Rfc, &n, memo).await?,
@@ -431,11 +554,14 @@ impl KindResolver for RfcResolver {
         }
     }
 
-    async fn candidates(&self, c: &Candidates, memo: &mut Memo) -> anyhow::Result<Vec<RefMeta>> {
+    async fn candidates(&self, c: &Candidates, memo: &mut Memo) -> anyhow::Result<Vec<Candidate>> {
         let notes = note_candidates(self.graph.as_ref(), c, &[NoteType::Rfc]).await?;
-        let mut out = Vec::with_capacity(notes.len());
+        let mut out = Vec::new();
         for n in &notes {
-            out.push(note_meta(self.graph.as_ref(), RefKind::Rfc, n, memo).await?);
+            let meta = note_meta(self.graph.as_ref(), RefKind::Rfc, n, memo).await?;
+            if c.matches(&meta.label, &n.content) {
+                out.push(Candidate::new(meta, n.content.clone(), Some(n.created_at)));
+            }
         }
         Ok(out)
     }
@@ -449,6 +575,10 @@ pub struct DecisionResolver {
     graph: Arc<dyn GraphStore>,
 }
 
+pub fn decision(graph: Arc<dyn GraphStore>) -> Box<dyn KindResolver> {
+    Box::new(DecisionResolver { graph })
+}
+
 impl DecisionResolver {
     async fn meta(
         &self,
@@ -459,7 +589,7 @@ impl DecisionResolver {
         let (project, workspace) = scope_of(self.graph.as_ref(), memo, project_id).await?;
         Ok(RefMeta {
             kind: RefKind::Decision,
-            id: d.id,
+            id: d.id.into(),
             label: label::derive("decision", &d.id, &[&d.description]),
             subtitle: d.chosen_option.as_deref().and_then(label::first_line),
             project,
@@ -475,7 +605,10 @@ impl KindResolver for DecisionResolver {
         RefKind::Decision
     }
 
-    async fn load(&self, id: Uuid, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+    async fn load(&self, id: &RefId, memo: &mut Memo) -> anyhow::Result<Option<RefMeta>> {
+        let Some(id) = id.uuid() else {
+            return Ok(None);
+        };
         let Some(d) = self.graph.get_decision(id).await? else {
             return Ok(None);
         };
@@ -487,7 +620,7 @@ impl KindResolver for DecisionResolver {
         Ok(Some(self.meta(&d, project_id, memo).await?))
     }
 
-    async fn candidates(&self, c: &Candidates, memo: &mut Memo) -> anyhow::Result<Vec<RefMeta>> {
+    async fn candidates(&self, c: &Candidates, memo: &mut Memo) -> anyhow::Result<Vec<Candidate>> {
         // Same bounded in-memory filter as tasks: the store lists decisions by
         // status, it does not search their text.
         let mut rows = Vec::new();
@@ -504,15 +637,22 @@ impl KindResolver for DecisionResolver {
                 .await?;
             rows.extend(items);
         }
+        let text = |i: &crate::neo4j::models::DecisionListItem| {
+            format!("{} {}", i.decision.description, i.decision.rationale)
+        };
         rows.retain(|i| {
-            contains(&i.decision.description, &c.needle)
-                || contains(&i.decision.rationale, &c.needle)
+            let title = label::first_line(&i.decision.description).unwrap_or_default();
+            c.matches(&title, &text(i))
         });
         rows.sort_by(|a, b| b.decision.decided_at.cmp(&a.decision.decided_at));
-        rows.truncate(c.fetch);
+        rows.truncate(SCAN_CAP);
         let mut out = Vec::with_capacity(rows.len());
         for i in &rows {
-            out.push(self.meta(&i.decision, i.project_id, memo).await?);
+            out.push(Candidate::new(
+                self.meta(&i.decision, i.project_id, memo).await?,
+                text(i),
+                Some(i.decision.decided_at),
+            ));
         }
         Ok(out)
     }
@@ -525,42 +665,27 @@ impl KindResolver for DecisionResolver {
 /// The five resolvers over one store. Implements the raw read the access
 /// policy wraps.
 pub struct GraphRefSource {
-    plan: PlanResolver,
-    task: TaskResolver,
-    note: NoteResolver,
-    decision: DecisionResolver,
-    rfc: RfcResolver,
+    resolvers: HashMap<RefKind, Box<dyn KindResolver>>,
 }
 
 impl GraphRefSource {
+    /// Every resolver of the table of kinds, built over `graph`.
     pub fn new(graph: Arc<dyn GraphStore>) -> Self {
         Self {
-            plan: PlanResolver {
-                graph: graph.clone(),
-            },
-            task: TaskResolver {
-                graph: graph.clone(),
-            },
-            note: NoteResolver {
-                graph: graph.clone(),
-            },
-            decision: DecisionResolver {
-                graph: graph.clone(),
-            },
-            rfc: RfcResolver { graph },
+            resolvers: super::kinds::KINDS
+                .iter()
+                .map(|d| (d.kind, (d.resolver)(graph.clone())))
+                .collect(),
         }
     }
 
-    /// The resolver of `kind`. Exhaustive: a new kind does not compile until it
-    /// has one.
+    /// The resolver of `kind`. The table has one for every kind (a test pins
+    /// it); a kind it somehow lacks reads as absent.
     pub fn resolver(&self, kind: RefKind) -> &dyn KindResolver {
-        match kind {
-            RefKind::Plan => &self.plan,
-            RefKind::Task => &self.task,
-            RefKind::Note => &self.note,
-            RefKind::Decision => &self.decision,
-            RefKind::Rfc => &self.rfc,
-        }
+        self.resolvers
+            .get(&kind)
+            .map(|r| r.as_ref())
+            .unwrap_or(&super::resolvers_ext::Missing)
     }
 }
 
@@ -568,7 +693,7 @@ impl GraphRefSource {
 impl RefSource for GraphRefSource {
     async fn load_unchecked(&self, r: &EntityRef) -> anyhow::Result<Option<RefMeta>> {
         let resolver = self.resolver(r.kind);
-        let Some(mut meta) = resolver.load(r.id, &mut Memo::default()).await? else {
+        let Some(mut meta) = resolver.load(&r.id, &mut Memo::default()).await? else {
             return Ok(None);
         };
         resolver.finish(&mut meta).await?;
@@ -788,22 +913,12 @@ mod tests {
         assert_eq!(hit[0].id, w.task_b.id);
         let by_title = t.candidates(&all("alpha"), &mut memo).await.unwrap();
         assert_eq!(by_title.len(), 1);
-        let cap = Candidates {
-            fetch: 2,
-            ..all("")
-        };
-        assert_eq!(t.candidates(&cap, &mut memo).await.unwrap().len(), 2);
 
         let d = s.resolver(RefKind::Decision);
         assert_eq!(d.candidates(&all(""), &mut memo).await.unwrap().len(), 2);
         let by_rationale = d.candidates(&all("simplicité"), &mut memo).await.unwrap();
         assert_eq!(by_rationale.len(), 1);
         assert_eq!(by_rationale[0].id, w.decision_b.id);
-        let one = Candidates {
-            fetch: 1,
-            ..all("")
-        };
-        assert_eq!(d.candidates(&one, &mut memo).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

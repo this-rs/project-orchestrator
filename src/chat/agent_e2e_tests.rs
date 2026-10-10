@@ -2404,7 +2404,7 @@ mod refs_native {
         let fake = FakeOpenAi::start(script_for(keys));
         let w = world().await;
         store_instance(&w.graph, &instance(&fake, "none")).await;
-        consent(&w.graph, "proj", "local", &fake.origin()).await;
+        consent(&w.graph, "alpha", "local", &fake.origin()).await;
         let manager = manager(w.graph.clone(), true);
         (fake, w, manager)
     }
@@ -2457,7 +2457,7 @@ mod refs_native {
     #[tokio::test]
     async fn a_native_session_opened_with_references_gives_the_model_the_pointers() {
         let (fake, w, manager) = setup(&["PINNED-ONE"]).await;
-        let mut req = request(Some("local"), Some("proj"), "default");
+        let mut req = request(Some("local"), Some("alpha"), "default");
         req.message = stored(&w, "PINNED-ONE #task:x", &[task_ref(&w)]).await;
         let created = manager.create_session(&req).await.unwrap();
         let sid = created.session_id;
@@ -2488,7 +2488,7 @@ mod refs_native {
     {
         let (fake, w, manager) = setup(&["hi there", "PINNED-TWO"]).await;
         let created = manager
-            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .create_session(&request(Some("local"), Some("alpha"), "default"))
             .await
             .unwrap();
         let sid = created.session_id;
@@ -2512,7 +2512,7 @@ mod refs_native {
     async fn a_native_message_without_references_is_sent_untouched() {
         let (fake, w, manager) = setup(&["hi there"]).await;
         let created = manager
-            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .create_session(&request(Some("local"), Some("alpha"), "default"))
             .await
             .unwrap();
         let sid = created.session_id;
@@ -2531,7 +2531,7 @@ mod refs_native {
     async fn a_resumed_native_session_expands_the_references_of_the_message_that_resumes_it() {
         let (fake, w, manager) = setup(&["hi there", "PINNED-THREE"]).await;
         let created = manager
-            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .create_session(&request(Some("local"), Some("alpha"), "default"))
             .await
             .unwrap();
         let sid = created.session_id;
@@ -3247,7 +3247,7 @@ mod parity {
         r.turns_sent(1).await;
         let typed = "after you, see #plan:wire";
         let pointed = EntityRef::new(RefKind::Plan, plan.id);
-        let stored = crate::refs::block::encode(typed, &[pointed]);
+        let stored = crate::refs::block::encode(typed, std::slice::from_ref(&pointed));
         assert!(r.manager.queue_user_message(&r.sid, &stored).await.unwrap());
 
         // Listed with its references, the block kept out of the text.

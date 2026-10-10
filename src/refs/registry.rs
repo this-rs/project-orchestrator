@@ -24,8 +24,10 @@ pub enum Tier {
 /// What stores an active kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Backing {
-    pub events_entity: EventsEntity,
-    pub notes_entity: NotesEntity,
+    /// `None` when no entity of that enum backs the kind (a `file` is a graph
+    /// node but no `events::EntityType`; a `link` is no entity at all).
+    pub events_entity: Option<EventsEntity>,
+    pub notes_entity: Option<NotesEntity>,
     /// `Some` when the kind is a sub-type of the entity (an RFC is a `Note`).
     pub note_type: Option<NoteType>,
 }
@@ -47,38 +49,18 @@ pub struct ReservedSpec {
     pub enabled: bool,
 }
 
-/// Tier-B kinds: the names are taken, the switch is off.
-pub const RESERVED: [ReservedSpec; 2] = [
-    ReservedSpec {
-        name: "persona",
-        tier: Tier::B,
-        enabled: false,
-    },
-    ReservedSpec {
-        name: "skill",
-        tier: Tier::B,
-        enabled: false,
-    },
-];
+/// Tier-B kinds: the names are taken, the switch is off. None today: `persona`
+/// and `skill`, the two that were reserved, are delivered. The mechanism stays
+/// so that a future kind can be announced before it is switched on.
+pub const RESERVED: [ReservedSpec; 0] = [];
 
 /// The registry entry of an active kind.
 pub fn spec(kind: RefKind) -> KindSpec {
-    let (events_entity, notes_entity, note_type) = match kind {
-        RefKind::Plan => (EventsEntity::Plan, NotesEntity::Plan, None),
-        RefKind::Task => (EventsEntity::Task, NotesEntity::Task, None),
-        RefKind::Note => (EventsEntity::Note, NotesEntity::Note, None),
-        RefKind::Decision => (EventsEntity::Decision, NotesEntity::Decision, None),
-        RefKind::Rfc => (EventsEntity::Note, NotesEntity::Note, Some(NoteType::Rfc)),
-    };
     KindSpec {
         kind,
         tier: Tier::A,
         enabled: true,
-        backing: Backing {
-            events_entity,
-            notes_entity,
-            note_type,
-        },
+        backing: kind.descriptor().backing.clone(),
     }
 }
 
@@ -92,14 +74,20 @@ pub enum Lookup {
 }
 
 pub fn lookup(name: &str) -> Lookup {
+    lookup_in(name, &RESERVED)
+}
+
+/// [`lookup`] against an explicit reserved table. `RESERVED` is empty today,
+/// so this is how the reserved arm stays exercised.
+pub fn lookup_in(name: &str, reserved: &[ReservedSpec]) -> Lookup {
     if let Some(kind) = RefKind::ALL
         .into_iter()
         .find(|k| k.as_str() == name && spec(*k).enabled)
     {
         return Lookup::Active(kind);
     }
-    match RESERVED.into_iter().find(|r| r.name == name) {
-        Some(r) => Lookup::Reserved(r),
+    match reserved.iter().find(|r| r.name == name) {
+        Some(r) => Lookup::Reserved(*r),
         None => Lookup::Unknown,
     }
 }
@@ -122,7 +110,7 @@ const LATER: &str = "work entity, not scheduled for references yet";
 
 /// Exhaustive on purpose: no `_` arm.
 pub fn classify_events(e: &EventsEntity) -> Classification {
-    use Classification::{Excluded, Kind, Reserved};
+    use Classification::{Excluded, Kind};
     match e {
         EventsEntity::Plan => Kind(RefKind::Plan),
         EventsEntity::Task => Kind(RefKind::Task),
@@ -130,23 +118,23 @@ pub fn classify_events(e: &EventsEntity) -> Classification {
         // An RFC is a Note of type `rfc`: the same entity backs two kinds, the
         // plain one is the default reading.
         EventsEntity::Note => Kind(RefKind::Note),
-        EventsEntity::Persona => Reserved("persona"),
-        EventsEntity::Skill => Reserved("skill"),
+        EventsEntity::Persona => Kind(RefKind::Persona),
+        EventsEntity::Skill => Kind(RefKind::Skill),
+        EventsEntity::Project => Kind(RefKind::Project),
+        EventsEntity::Milestone => Kind(RefKind::Milestone),
+        EventsEntity::Release => Kind(RefKind::Release),
+        EventsEntity::Workspace => Kind(RefKind::Workspace),
+        EventsEntity::Commit => Kind(RefKind::Commit),
+        EventsEntity::Protocol => Kind(RefKind::Protocol),
+        EventsEntity::ChatSession => Kind(RefKind::Conversation),
         EventsEntity::Step => Excluded(NOT_A_PAGE),
-        EventsEntity::Project
-        | EventsEntity::Constraint
-        | EventsEntity::Commit
-        | EventsEntity::Release
-        | EventsEntity::Milestone
+        EventsEntity::Constraint
         | EventsEntity::Environment
         | EventsEntity::Deployment
-        | EventsEntity::Workspace
         | EventsEntity::WorkspaceMilestone
         | EventsEntity::Resource
         | EventsEntity::Component
-        | EventsEntity::ChatSession
         | EventsEntity::ProtocolRun
-        | EventsEntity::Protocol
         | EventsEntity::Episode => Excluded(LATER),
         EventsEntity::FeatureGraph | EventsEntity::TopologyRule => Excluded(CODE_INTEL),
         EventsEntity::Runner
@@ -161,37 +149,37 @@ pub fn classify_events(e: &EventsEntity) -> Classification {
 
 /// Exhaustive on purpose: no `_` arm.
 pub fn classify_notes(e: &NotesEntity) -> Classification {
-    use Classification::{Excluded, Kind, Reserved};
+    use Classification::{Excluded, Kind};
     match e {
         NotesEntity::Plan => Kind(RefKind::Plan),
         NotesEntity::Task => Kind(RefKind::Task),
         NotesEntity::Decision => Kind(RefKind::Decision),
         NotesEntity::Note => Kind(RefKind::Note),
-        NotesEntity::Skill => Reserved("skill"),
+        NotesEntity::Skill => Kind(RefKind::Skill),
+        NotesEntity::Project => Kind(RefKind::Project),
+        NotesEntity::Milestone => Kind(RefKind::Milestone),
+        NotesEntity::Release => Kind(RefKind::Release),
+        NotesEntity::Workspace => Kind(RefKind::Workspace),
+        NotesEntity::Commit => Kind(RefKind::Commit),
+        NotesEntity::Protocol => Kind(RefKind::Protocol),
+        NotesEntity::ChatSession => Kind(RefKind::Conversation),
+        NotesEntity::File => Kind(RefKind::File),
         NotesEntity::Step => Excluded(NOT_A_PAGE),
-        NotesEntity::File
-        | NotesEntity::Module
+        NotesEntity::Module
         | NotesEntity::Function
         | NotesEntity::Struct
         | NotesEntity::Trait
         | NotesEntity::Enum
         | NotesEntity::Impl => Excluded(CODE_INTEL),
         NotesEntity::Process => Excluded(INFRA),
-        NotesEntity::Project
-        | NotesEntity::Commit
-        | NotesEntity::Constraint
-        | NotesEntity::Milestone
-        | NotesEntity::Release
-        | NotesEntity::Workspace
+        NotesEntity::Constraint
         | NotesEntity::WorkspaceMilestone
         | NotesEntity::Resource
         | NotesEntity::Component
         | NotesEntity::FeatureGraph
-        | NotesEntity::Protocol
         | NotesEntity::ProtocolState
         | NotesEntity::ProtocolRun
         | NotesEntity::PlanRun
-        | NotesEntity::ChatSession
         | NotesEntity::Document => Excluded(LATER),
     }
 }
@@ -326,12 +314,20 @@ mod tests {
     fn every_classified_kind_is_backed_by_the_registry() {
         for e in &EVENTS_ALL {
             if let Classification::Kind(k) = classify_events(e) {
-                assert_eq!(&spec(k).backing.events_entity, e, "events::{e:?}");
+                assert_eq!(
+                    spec(k).backing.events_entity.as_ref(),
+                    Some(e),
+                    "events::{e:?}"
+                );
             }
         }
         for e in &NOTES_ALL {
             if let Classification::Kind(k) = classify_notes(e) {
-                assert_eq!(&spec(k).backing.notes_entity, e, "notes::{e:?}");
+                assert_eq!(
+                    spec(k).backing.notes_entity.as_ref(),
+                    Some(e),
+                    "notes::{e:?}"
+                );
             }
         }
     }
@@ -342,28 +338,26 @@ mod tests {
             let s = spec(kind);
             // The plain reading of an entity must be classified to a kind
             // whose backing is that entity; an RFC shares its entity with Note.
-            assert!(
-                matches!(
-                    classify_events(&s.backing.events_entity),
-                    Classification::Kind(_)
-                ),
-                "{kind}: events side"
-            );
-            assert!(
-                matches!(
-                    classify_notes(&s.backing.notes_entity),
-                    Classification::Kind(_)
-                ),
-                "{kind}: notes side"
-            );
+            if let Some(e) = &s.backing.events_entity {
+                assert!(
+                    matches!(classify_events(e), Classification::Kind(_)),
+                    "{kind}: events side"
+                );
+            }
+            if let Some(e) = &s.backing.notes_entity {
+                assert!(
+                    matches!(classify_notes(e), Classification::Kind(_)),
+                    "{kind}: notes side"
+                );
+            }
         }
     }
 
     #[test]
     fn rfc_is_a_note_of_type_rfc_and_has_no_entity_type_of_its_own() {
         let s = spec(RefKind::Rfc);
-        assert_eq!(s.backing.events_entity, EventsEntity::Note);
-        assert_eq!(s.backing.notes_entity, NotesEntity::Note);
+        assert_eq!(s.backing.events_entity, Some(EventsEntity::Note));
+        assert_eq!(s.backing.notes_entity, Some(NotesEntity::Note));
         assert_eq!(s.backing.note_type, Some(NoteType::Rfc));
         assert!(
             !variants_in(include_str!("../events/types.rs"), "EntityType")
@@ -411,11 +405,28 @@ mod tests {
     fn lookup_tells_active_reserved_and_unknown_apart() {
         assert_eq!(lookup("plan"), Lookup::Active(RefKind::Plan));
         assert_eq!(lookup("rfc"), Lookup::Active(RefKind::Rfc));
-        assert_eq!(lookup("persona"), Lookup::Reserved(RESERVED[0]));
-        assert_eq!(lookup("skill"), Lookup::Reserved(RESERVED[1]));
-        assert_eq!(lookup("workspace"), Lookup::Unknown);
+        assert_eq!(lookup("persona"), Lookup::Active(RefKind::Persona));
+        assert_eq!(lookup("link"), Lookup::Active(RefKind::Link));
+        assert_eq!(lookup("step"), Lookup::Unknown);
         assert_eq!(lookup("Plan"), Lookup::Unknown);
         assert_eq!(lookup(""), Lookup::Unknown);
+    }
+
+    #[test]
+    fn a_reserved_name_is_told_apart_from_an_unknown_one() {
+        let ghost = ReservedSpec {
+            name: "ghost",
+            tier: Tier::B,
+            enabled: false,
+        };
+        assert_eq!(lookup_in("ghost", &[ghost]), Lookup::Reserved(ghost));
+        assert_eq!(lookup_in("ghost", &[]), Lookup::Unknown);
+        // An active kind wins over a reserved entry of the same name.
+        let shadow = ReservedSpec {
+            name: "plan",
+            ..ghost
+        };
+        assert_eq!(lookup_in("plan", &[shadow]), Lookup::Active(RefKind::Plan));
     }
 
     #[test]

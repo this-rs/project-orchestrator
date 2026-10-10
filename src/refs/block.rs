@@ -12,10 +12,10 @@ use super::validate::{validate_refs, MAX_REFS_PER_MESSAGE};
 const OPEN: &str = "\n\n<po-refs>";
 const CLOSE: &str = "</po-refs>";
 const MARKER: &str = "<po-refs>";
-/// Longest JSON array [`split`] will parse: room for [`MAX_REFS_PER_MESSAGE`] objects
+/// Longest JSON array [`split`] will parse: room for [`MAX_REFS_PER_MESSAGE`] objects (a link may be 1 KiB)
 /// with the longest kind and a UUID (about 70 bytes each), with a margin. A longer
 /// block is not one we wrote, and is not parsed at all.
-const MAX_BLOCK_JSON_BYTES: usize = MAX_REFS_PER_MESSAGE * 128;
+const MAX_BLOCK_JSON_BYTES: usize = MAX_REFS_PER_MESSAGE * 1400;
 /// What a typed `<po-refs>` becomes in user text, so a user cannot forge a block.
 const NEUTRAL_MARKER: &str = "&lt;po-refs>";
 

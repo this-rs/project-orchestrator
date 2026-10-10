@@ -465,7 +465,8 @@ impl AgentSessionHandle {
         // instance): a message with `#` references reaches the model as its visible
         // text plus the pointers, never as the raw block; one without is sent as it
         // always was (a relayed history, if any, stays in front).
-        let turn = crate::refs::turn::expand_user_turn(&self.graph, shown).await;
+        let turn =
+            crate::refs::turn::expand_user_turn_in(&self.graph, shown, &self.session_id).await;
         if let Some(event) = turn.event() {
             self.emit(event).await;
         }

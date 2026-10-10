@@ -5380,7 +5380,7 @@ impl ChatManager {
         // the agent runtime): the visible text, the `<po-context>` pointers of its
         // `#` references, the attached documents' text. A message without references
         // is expanded exactly as before.
-        let turn = crate::refs::turn::expand_user_turn(&graph, &prompt).await;
+        let turn = crate::refs::turn::expand_user_turn_in(&graph, &prompt, &session_id).await;
 
         // Tell the clients what the references resolved to (persisted for replay).
         if let Some(event) = turn.event() {

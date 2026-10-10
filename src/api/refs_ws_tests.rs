@@ -170,7 +170,7 @@ async fn malformed_refs_get_an_error_frame_with_code_reason_and_index_and_reach_
     send(
         &mut ws,
         json!({"type": "user_message", "content": "salut",
-               "refs": [{"kind": "task", "id": rig.task.id}, {"kind": "workspace", "id": rig.task.id}]}),
+               "refs": [{"kind": "task", "id": rig.task.id}, {"kind": "step", "id": rig.task.id}]}),
     )
     .await;
     let err = frame_where(&mut ws, of_type("error")).await;
@@ -287,7 +287,7 @@ async fn with_the_switch_off_refs_in_a_websocket_message_are_ignored() {
     // Would be refused with the switch on; ignored (not an error) with it off.
     send(
         &mut ws,
-        json!({"type": "user_message", "content": "texte", "refs": [{"kind": "workspace", "id": "x"}]}),
+        json!({"type": "user_message", "content": "texte", "refs": [{"kind": "step", "id": "x"}]}),
     )
     .await;
     let sent = tokio::time::timeout(WAIT, cli.sent_input_rx.recv())
@@ -305,7 +305,7 @@ async fn a_message_refused_over_the_websocket_leaves_no_trace_in_the_graph() {
     send(
         &mut ws,
         json!({"type": "user_message", "content": "regarde src/main.rs et Cargo.toml",
-               "refs": [{"kind": "workspace", "id": rig.task.id}]}),
+               "refs": [{"kind": "step", "id": rig.task.id}]}),
     )
     .await;
     frame_where(&mut ws, of_type("error")).await;

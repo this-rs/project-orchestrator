@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::registry::{lookup, Lookup};
-use super::types::{parse_ref_id, split_token, EntityRef, RawRef};
+use super::types::{canonical_id, split_token, EntityRef, RawRef, RefKind};
 
 /// Most references one message may carry.
 pub const MAX_REFS_PER_MESSAGE: usize = 20;
@@ -25,8 +25,12 @@ pub enum InvalidReason {
     UnknownKind,
     /// The kind is declared but switched off (tier B).
     KindDisabled,
-    /// The id is not a UUID, or is the nil UUID.
+    /// The id is not valid for its kind: not a UUID (or the nil one), not
+    /// `<project>:<hash>`, not `<project>:<path>`.
     BadId,
+    /// A `link` that is not allowed: not http/https, credentials in it, too
+    /// long, or aimed at a private address. See `refs::link`.
+    BadLink,
     /// The `#kind:id` token is malformed.
     BadToken,
     /// The search text is longer than [`MAX_QUERY_CHARS`].
@@ -42,6 +46,9 @@ impl InvalidReason {
             InvalidReason::UnknownKind => "unknown reference kind",
             InvalidReason::KindDisabled => "this reference kind is not available yet",
             InvalidReason::BadId => "reference id is not a valid UUID",
+            InvalidReason::BadLink => {
+                "this link is not allowed (http or https only, no credentials, no private address)"
+            }
             InvalidReason::BadToken => "malformed #kind:id token",
             InvalidReason::QueryTooLong => "search text is too long",
             InvalidReason::BadLimit => "search limit is out of range",
@@ -58,13 +65,23 @@ pub struct RefsInvalid {
 
 /// Validate one raw reference.
 pub fn validate_one(raw: &RawRef) -> Result<EntityRef, InvalidReason> {
+    validate_one_with(raw, lookup)
+}
+
+/// [`validate_one`] with the registry lookup injected: the reserved arm has
+/// no entry to hit while `registry::RESERVED` is empty, so it is proven here.
+fn validate_one_with(
+    raw: &RawRef,
+    lookup: impl Fn(&str) -> Lookup,
+) -> Result<EntityRef, InvalidReason> {
     let kind = match lookup(&raw.kind) {
         Lookup::Active(kind) => kind,
         Lookup::Reserved(_) => return Err(InvalidReason::KindDisabled),
         Lookup::Unknown => return Err(InvalidReason::UnknownKind),
     };
-    match parse_ref_id(&raw.id) {
+    match canonical_id(kind, &raw.id) {
         Some(id) => Ok(EntityRef::new(kind, id)),
+        None if kind == RefKind::Link => Err(InvalidReason::BadLink),
         None => Err(InvalidReason::BadId),
     }
 }
@@ -91,9 +108,16 @@ pub fn validate_refs(raw: &[RawRef]) -> Result<Vec<EntityRef>, RefsInvalid> {
     Ok(out)
 }
 
-/// Validate a `#kind:id` token.
+/// Validate a `#kind:id` or `@kind:id` token. The sigil is carried by the token
+/// and follows from the class of the kind: `#` for data, `@` for an actor, and
+/// only that: the other one is `bad_token`.
 pub fn validate_token(token: &str) -> Result<EntityRef, InvalidReason> {
-    let raw = split_token(token).ok_or(InvalidReason::BadToken)?;
+    let (sigil, raw) = split_token(token).ok_or(InvalidReason::BadToken)?;
+    if let Lookup::Active(kind) = lookup(&raw.kind) {
+        if !kind.class().sigil().starts_with(sigil) {
+            return Err(InvalidReason::BadToken);
+        }
+    }
     validate_one(&raw)
 }
 
@@ -111,7 +135,7 @@ pub fn validate_search(q: &str, limit: Option<usize>) -> Result<usize, InvalidRe
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::RefKind;
+    use super::super::types::{IdFormat, RefKind};
     use super::*;
 
     const ID_A: &str = "3adeffc9-c8b0-4e2f-a674-55bfcb293433";
@@ -124,26 +148,28 @@ mod tests {
         }
     }
 
+    fn a_valid_id_for(kind: RefKind) -> String {
+        match kind.id_format() {
+            IdFormat::Uuid => ID_A.to_string(),
+            IdFormat::ProjectCommit => format!("{ID_B}:{}", "ab12".repeat(10)),
+            IdFormat::ProjectPath => format!("{ID_B}:src/refs/mod.rs"),
+            IdFormat::Url => "https://example.com/a".to_string(),
+        }
+    }
+
     #[test]
-    fn every_active_kind_is_accepted() {
+    fn every_active_kind_is_accepted_with_an_id_of_its_format() {
         for kind in RefKind::ALL {
-            let r = validate_one(&raw(kind.as_str(), ID_A)).unwrap();
+            let id = a_valid_id_for(kind);
+            let r = validate_one(&raw(kind.as_str(), &id)).unwrap();
             assert_eq!(r.kind, kind);
-            assert_eq!(r.id.to_string(), ID_A);
+            assert_eq!(r.id.as_str(), id);
         }
     }
 
     #[test]
     fn excluded_kinds_are_refused_by_name() {
-        for kind in [
-            "workspace",
-            "project",
-            "step",
-            "file",
-            "milestone",
-            "Plan",
-            "",
-        ] {
+        for kind in ["step", "constraint", "document", "Plan", "Workspace", ""] {
             assert_eq!(
                 validate_one(&raw(kind, ID_A)),
                 Err(InvalidReason::UnknownKind),
@@ -153,14 +179,28 @@ mod tests {
     }
 
     #[test]
-    fn tier_b_kinds_are_known_but_disabled() {
-        for kind in ["persona", "skill"] {
-            assert_eq!(
-                validate_one(&raw(kind, ID_A)),
-                Err(InvalidReason::KindDisabled),
-                "{kind}"
-            );
-        }
+    fn a_reserved_kind_is_known_but_disabled() {
+        use super::super::registry::{ReservedSpec, Tier};
+        let reserved = |name: &str| {
+            if name == "ghost" {
+                Lookup::Reserved(ReservedSpec {
+                    name: "ghost",
+                    tier: Tier::B,
+                    enabled: false,
+                })
+            } else {
+                lookup(name)
+            }
+        };
+        assert_eq!(
+            validate_one_with(&raw("ghost", ID_A), reserved),
+            Err(InvalidReason::KindDisabled)
+        );
+        assert_eq!(
+            validate_one_with(&raw("step", ID_A), reserved),
+            Err(InvalidReason::UnknownKind)
+        );
+        assert!(validate_one_with(&raw("plan", ID_A), reserved).is_ok());
     }
 
     #[test]
@@ -225,12 +265,43 @@ mod tests {
 
     #[test]
     fn the_error_names_the_offending_index() {
-        let err = validate_refs(&[raw("plan", ID_A), raw("plan", ID_B), raw("workspace", ID_A)])
-            .unwrap_err();
+        let err =
+            validate_refs(&[raw("plan", ID_A), raw("plan", ID_B), raw("step", ID_A)]).unwrap_err();
         assert_eq!(err.reason, InvalidReason::UnknownKind);
         assert_eq!(err.index, Some(2));
     }
 
+    #[test]
+    fn the_sigil_follows_the_class_of_the_kind_in_both_directions() {
+        use super::super::kinds::KindClass;
+        for kind in RefKind::ALL {
+            let id = a_valid_id_for(kind);
+            let (right, wrong) = match kind.class() {
+                KindClass::Data => ('#', '@'),
+                KindClass::Actor => ('@', '#'),
+            };
+            let ok = validate_token(&format!("{right}{kind}:{id}")).unwrap();
+            assert_eq!(ok.kind, kind);
+            assert_eq!(ok.token(), format!("{right}{kind}:{}", ok.id));
+            assert_eq!(
+                validate_token(&format!("{wrong}{kind}:{id}")),
+                Err(InvalidReason::BadToken),
+                "{wrong}{kind}"
+            );
+        }
+        assert_eq!(
+            validate_token(&format!("#persona:{ID_A}")),
+            Err(InvalidReason::BadToken)
+        );
+        assert_eq!(
+            validate_token(&format!("@plan:{ID_A}")),
+            Err(InvalidReason::BadToken)
+        );
+        assert_eq!(
+            validate_token(&format!("@nope:{ID_A}")),
+            Err(InvalidReason::UnknownKind)
+        );
+    }
     #[test]
     fn tokens_are_validated_end_to_end() {
         assert_eq!(
@@ -240,8 +311,8 @@ mod tests {
         assert_eq!(validate_token("rfc:abc"), Err(InvalidReason::BadToken));
         assert_eq!(validate_token("#rfc"), Err(InvalidReason::BadToken));
         assert_eq!(
-            validate_token(&format!("#persona:{ID_A}")),
-            Err(InvalidReason::KindDisabled)
+            validate_token(&format!("#step:{ID_A}")),
+            Err(InvalidReason::UnknownKind)
         );
         assert_eq!(validate_token("#plan:zzz"), Err(InvalidReason::BadId));
     }
@@ -284,7 +355,7 @@ mod tests {
                 if let Ok(valid) = validate_refs(&raw) {
                     prop_assert!(valid.len() <= MAX_REFS_PER_MESSAGE);
                     for r in &valid {
-                        prop_assert!(!r.id.is_nil());
+                        prop_assert!(r.id.uuid().is_some_and(|u| !u.is_nil()));
                     }
                 }
             }
@@ -296,7 +367,7 @@ mod tests {
             }
 
             #[test]
-            fn a_valid_token_always_round_trips(kind in 0usize..5, bytes in any::<[u8; 16]>()) {
+            fn a_valid_token_always_round_trips(kind in 0usize..10, bytes in any::<[u8; 16]>()) {
                 let id = uuid::Uuid::from_bytes(bytes);
                 prop_assume!(!id.is_nil());
                 let r = EntityRef::new(RefKind::ALL[kind], id);
@@ -312,6 +383,7 @@ mod tests {
             InvalidReason::UnknownKind,
             InvalidReason::KindDisabled,
             InvalidReason::BadId,
+            InvalidReason::BadLink,
             InvalidReason::BadToken,
             InvalidReason::QueryTooLong,
             InvalidReason::BadLimit,
