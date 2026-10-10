@@ -492,6 +492,18 @@ mod tests {
     }
 
     #[test]
+    fn backing_is_built_from_its_three_parts() {
+        // `backing` is a const fn evaluated at compile time for the table:
+        // calling it here is what gives its lines a runtime hit.
+        let b = backing(Some(E::Note), Some(N::Note), Some(NoteType::Rfc));
+        assert_eq!(b, RefKind::Rfc.descriptor().backing);
+        assert_eq!(
+            backing(None, None, None),
+            RefKind::Link.descriptor().backing
+        );
+    }
+
+    #[test]
     fn the_first_five_are_the_historical_ones_in_order() {
         assert_eq!(
             historical(),

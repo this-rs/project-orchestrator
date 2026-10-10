@@ -33,7 +33,7 @@ pub mod registry;
 pub mod resolvers;
 pub mod resolvers_ext;
 #[cfg(test)]
-mod resolvers_ext_tests;
+mod resolvers_ext_contract;
 pub mod search;
 #[cfg(test)]
 mod search_contract;

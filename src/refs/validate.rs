@@ -65,6 +65,15 @@ pub struct RefsInvalid {
 
 /// Validate one raw reference.
 pub fn validate_one(raw: &RawRef) -> Result<EntityRef, InvalidReason> {
+    validate_one_with(raw, lookup)
+}
+
+/// [`validate_one`] with the registry lookup injected: the reserved arm has
+/// no entry to hit while `registry::RESERVED` is empty, so it is proven here.
+fn validate_one_with(
+    raw: &RawRef,
+    lookup: impl Fn(&str) -> Lookup,
+) -> Result<EntityRef, InvalidReason> {
     let kind = match lookup(&raw.kind) {
         Lookup::Active(kind) => kind,
         Lookup::Reserved(_) => return Err(InvalidReason::KindDisabled),
@@ -167,6 +176,31 @@ mod tests {
                 "{kind}"
             );
         }
+    }
+
+    #[test]
+    fn a_reserved_kind_is_known_but_disabled() {
+        use super::super::registry::{ReservedSpec, Tier};
+        let reserved = |name: &str| {
+            if name == "ghost" {
+                Lookup::Reserved(ReservedSpec {
+                    name: "ghost",
+                    tier: Tier::B,
+                    enabled: false,
+                })
+            } else {
+                lookup(name)
+            }
+        };
+        assert_eq!(
+            validate_one_with(&raw("ghost", ID_A), reserved),
+            Err(InvalidReason::KindDisabled)
+        );
+        assert_eq!(
+            validate_one_with(&raw("step", ID_A), reserved),
+            Err(InvalidReason::UnknownKind)
+        );
+        assert!(validate_one_with(&raw("plan", ID_A), reserved).is_ok());
     }
 
     #[test]

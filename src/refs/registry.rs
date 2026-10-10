@@ -74,14 +74,20 @@ pub enum Lookup {
 }
 
 pub fn lookup(name: &str) -> Lookup {
+    lookup_in(name, &RESERVED)
+}
+
+/// [`lookup`] against an explicit reserved table. `RESERVED` is empty today,
+/// so this is how the reserved arm stays exercised.
+pub fn lookup_in(name: &str, reserved: &[ReservedSpec]) -> Lookup {
     if let Some(kind) = RefKind::ALL
         .into_iter()
         .find(|k| k.as_str() == name && spec(*k).enabled)
     {
         return Lookup::Active(kind);
     }
-    match RESERVED.into_iter().find(|r| r.name == name) {
-        Some(r) => Lookup::Reserved(r),
+    match reserved.iter().find(|r| r.name == name) {
+        Some(r) => Lookup::Reserved(*r),
         None => Lookup::Unknown,
     }
 }
@@ -404,6 +410,23 @@ mod tests {
         assert_eq!(lookup("step"), Lookup::Unknown);
         assert_eq!(lookup("Plan"), Lookup::Unknown);
         assert_eq!(lookup(""), Lookup::Unknown);
+    }
+
+    #[test]
+    fn a_reserved_name_is_told_apart_from_an_unknown_one() {
+        let ghost = ReservedSpec {
+            name: "ghost",
+            tier: Tier::B,
+            enabled: false,
+        };
+        assert_eq!(lookup_in("ghost", &[ghost]), Lookup::Reserved(ghost));
+        assert_eq!(lookup_in("ghost", &[]), Lookup::Unknown);
+        // An active kind wins over a reserved entry of the same name.
+        let shadow = ReservedSpec {
+            name: "plan",
+            ..ghost
+        };
+        assert_eq!(lookup_in("plan", &[shadow]), Lookup::Active(RefKind::Plan));
     }
 
     #[test]
