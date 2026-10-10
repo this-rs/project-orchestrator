@@ -3237,6 +3237,24 @@ mod tests {
             .unwrap()
     }
 
+    /// Moving a conversation sends it to another origin: a person's call. An agent is
+    /// refused even on its own session; a signed-in user gets past the gate (and meets
+    /// the switch's own checks: here, the session is already on that provider).
+    #[tokio::test]
+    async fn only_a_signed_in_user_can_move_a_conversation_to_another_provider() {
+        let h = action_harness(None).await;
+        let own = seed_session(&h).await;
+        let uri = format!("/api/chat/sessions/{own}/switch-provider");
+        let body = r#"{"provider":"claude-code","message":"go on"}"#;
+
+        let (status, resp) = call(&h.app, agent_req(&agent_bearer(own), "POST", &uri, body)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{resp}");
+
+        let (status, resp) = call(&h.app, auth_post(&uri, body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert!(resp.to_string().contains("already on"), "{resp}");
+    }
+
     #[tokio::test]
     async fn an_agent_token_cannot_write_to_a_session_it_did_not_spawn() {
         let h = action_harness(None).await;

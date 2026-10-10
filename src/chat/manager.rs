@@ -541,8 +541,9 @@ struct AgentOpen<'a> {
     system_prompt: &'a str,
     add_dirs: &'a [String],
     project_slug: Option<&'a str>,
-    /// History relayed from another provider, sent in front of the first message.
-    relay: Option<&'a str>,
+    /// History relayed from another provider, sent in front of the first message
+    /// and stated on the thread.
+    relay: Option<&'a super::relay::RelayedFrom>,
     /// What the session may do (decided by the caller, persisted on the node).
     access: super::provider::policy::SessionAccess,
 }
@@ -4011,12 +4012,13 @@ impl ChatManager {
     }
 
     /// [`Self::create_session`] with a history relayed from another provider (B-SW):
-    /// `relay` is sent to the model in front of `request.message`, but the conversation
-    /// stores and shows `request.message` alone.
+    /// the relay is sent to the model in front of `request.message`, but the conversation
+    /// stores and shows `request.message` alone, behind a `conversation_relayed` event
+    /// that says how much was carried over.
     pub async fn create_session_relayed(
         &self,
         request: &ChatRequest,
-        relay: Option<&str>,
+        relay: Option<&super::relay::RelayedFrom>,
     ) -> Result<CreateSessionResponse> {
         // The menu's ticks, read once: one model ticked is strict, an empty pool is none.
         let settled = request.settled_routing();
@@ -4062,7 +4064,7 @@ impl ChatManager {
     async fn create_session_in_place(
         &self,
         request: &ChatRequest,
-        relay: Option<&str>,
+        relay: Option<&super::relay::RelayedFrom>,
         session_id: Uuid,
     ) -> Result<CreateSessionResponse> {
         // Check max sessions
@@ -4208,7 +4210,8 @@ impl ChatManager {
             updated_at: chrono::Utc::now(),
             message_count: 0,
             total_cost_usd: None,
-            conversation_id: None,
+            // A relayed session keeps the memory conversation of the one it continues.
+            conversation_id: relay.and_then(|r| r.conversation_id.clone()),
             preview: None,
             permission_mode: request.permission_mode.clone(),
             add_dirs: if resolved_add_dirs.is_empty() {
@@ -4427,7 +4430,13 @@ impl ChatManager {
 
         // Create ConversationMemoryManager for message recording
         let memory_manager = if let Some(ref mem_config) = self.memory_config {
-            let mm = ConversationMemoryManager::new(mem_config.clone());
+            // A relayed session records into the conversation it continues.
+            let mm = match relay.and_then(|r| r.conversation_id.clone()) {
+                Some(kept) => {
+                    ConversationMemoryManager::new(mem_config.clone()).with_conversation_id(kept)
+                }
+                None => ConversationMemoryManager::new(mem_config.clone()),
+            };
             let conversation_id = mm.conversation_id().to_string();
             debug!(
                 "Created ConversationMemoryManager for session {} with conversation_id {}",
@@ -4662,6 +4671,22 @@ impl ChatManager {
             },
         );
 
+        // A relayed conversation says so first: what the model is given in front
+        // of the message is stated on the thread, never slipped in silently.
+        if let Some(relay) = relay {
+            let relayed = relay.event(&session_id.to_string(), &provider_choice.provider_id);
+            let record = ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id,
+                seq: next_seq.fetch_add(1, Ordering::SeqCst),
+                event_type: relayed.event_type().to_string(),
+                data: serde_json::to_string(&relayed).unwrap_or_default(),
+                created_at: chrono::Utc::now(),
+            };
+            let _ = self.graph.store_chat_events(session_id, vec![record]).await;
+            let _ = events_tx.send(relayed);
+        }
+
         // Persist the initial user_message event
         let user_event = ChatEventRecord {
             id: Uuid::new_v4(),
@@ -4739,7 +4764,7 @@ impl ChatManager {
         let session_id_str = session_id.to_string();
         let graph = self.graph.clone();
         let active_sessions = self.active_sessions.clone();
-        let message = super::relay::prefixed(relay, &request.message);
+        let message = super::relay::prefixed(relay.and_then(|r| r.text()), &request.message);
         let events_tx_clone = events_tx.clone();
         let injector = self.context_injector.clone();
         let event_emitter = self.event_emitter.clone();
@@ -7293,12 +7318,20 @@ impl ChatManager {
                 .map(|w| w.value),
             Err(_) => None,
         };
-        let rendered = relay::render_relay(
-            &events,
-            &current,
-            provider,
-            relay::budget_for_window(window),
-        );
+        let relayed = relay::RelayedFrom {
+            relay: relay::render_relay(
+                &events,
+                &current,
+                provider,
+                relay::budget_for_window(window),
+            ),
+            from_session_id: session_id.to_string(),
+            from_provider: current.clone(),
+            moved_by: relay::MOVED_BY_USER.to_string(),
+            // The memory conversation goes on in the new session.
+            conversation_id: node.conversation_id.clone(),
+        };
+        let rendered = &relayed.relay;
 
         // A neutral session continues in a neutral place of its own (a new session, a new directory).
         let relay_cwd = if node.execution_place == super::neutral_place::ExecutionPlace::Neutral {
@@ -7338,11 +7371,12 @@ impl ChatManager {
         // Opening can be refused (consent, endpoint, gate, no model): the old
         // session is then left exactly as it was.
         let created = self
-            .create_session_relayed(
-                &request,
-                (!rendered.text.is_empty()).then_some(rendered.text.as_str()),
-            )
+            .create_session_relayed(&request, Some(&relayed))
             .await?;
+
+        // The thread it leaves learns where the conversation went, before it closes.
+        self.emit_on_session(session_id, relayed.event(&created.session_id, provider))
+            .await;
 
         let note = serde_json::json!({
             "from_session": session_id,
@@ -7371,7 +7405,55 @@ impl ChatManager {
             previous_session_id: session_id.to_string(),
             relayed_entries: rendered.included,
             omitted_entries: rendered.omitted,
+            conversation_id: relayed.conversation_id.clone(),
         })
+    }
+
+    /// Persists and broadcasts `event` on the thread of a session this instance may or
+    /// may not run live: through the agent handle when it owns it, through the legacy
+    /// session's channel when it is active, else on the stored thread alone (a dormant
+    /// session still has a thread, replayed when it is opened again).
+    pub(crate) async fn emit_on_session(&self, session_id: &str, event: ChatEvent) {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            handle.emit(event).await;
+            return;
+        }
+        let Ok(uuid) = Uuid::parse_str(session_id) else {
+            return;
+        };
+        let live = {
+            let sessions = self.active_sessions.read().await;
+            sessions
+                .get(session_id)
+                .map(|s| (Arc::clone(&s.next_seq), s.events_tx.clone()))
+        };
+        let seq = match &live {
+            Some((next_seq, _)) => next_seq.fetch_add(1, Ordering::SeqCst),
+            None => {
+                self.graph
+                    .get_latest_chat_event_seq(uuid)
+                    .await
+                    .unwrap_or(0)
+                    + 1
+            }
+        };
+        let record = ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: uuid,
+            seq,
+            event_type: event.event_type().to_string(),
+            data: serde_json::to_string(&event).unwrap_or_default(),
+            created_at: chrono::Utc::now(),
+        };
+        if let Err(error) = self.graph.store_chat_events(uuid, vec![record]).await {
+            warn!(%session_id, %error, event = event.event_type(), "event not stored on the thread");
+        }
+        if let Some((_, events_tx)) = live {
+            let _ = events_tx.send(event.clone());
+        }
+        if let Some(nats) = &self.nats {
+            nats.publish_chat_event(session_id, event);
+        }
     }
 
     /// Change the model of an active CLI session mid-conversation.
@@ -10710,12 +10792,16 @@ impl ChatManager {
                 if runner { 5 } else { 0 },
             );
         }
-        if !request.message.is_empty() {
-            if let Some(handle) = self.agent_runtime.get(&sid).await {
+        if let Some(handle) = self.agent_runtime.get(&sid).await {
+            // A relayed conversation says so first, on the thread.
+            if let Some(relay) = relay {
+                handle.emit(relay.event(&sid, provider_id)).await;
+            }
+            if !request.message.is_empty() {
                 handle
                     .send_message_relayed(
                         &request.message,
-                        &super::relay::prefixed(relay, &request.message),
+                        &super::relay::prefixed(relay.and_then(|r| r.text()), &request.message),
                     )
                     .await?;
             }

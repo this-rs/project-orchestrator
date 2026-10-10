@@ -924,6 +924,32 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// The conversation moved to another provider (B-SW): on the thread of the
+    /// session it left, where it went; on the thread of the session it reached,
+    /// what was relayed ("N entries replayed, M left out"). The old session is
+    /// closed right after this event; the client follows `to_session_id`.
+    ConversationRelayed {
+        /// The session the conversation left (closed).
+        from_session_id: String,
+        /// The session that continues it.
+        to_session_id: String,
+        /// Provider instance it left.
+        from_provider: String,
+        /// Provider instance it reached.
+        to_provider: String,
+        /// Earlier entries (messages, answers, one per tool call) carried over.
+        relayed_entries: usize,
+        /// Oldest entries left out to fit the target's context window; the
+        /// omission is stated to the model, never silent.
+        omitted_entries: usize,
+        /// Who moved it: `user` (the switch route; the only value emitted today) or
+        /// `auto` (reserved for the cognitive router).
+        moved_by: String,
+        /// The memory conversation both sessions share (kept across the move), when
+        /// the server records one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+    },
 }
 
 impl ChatEvent {
@@ -964,6 +990,7 @@ impl ChatEvent {
             ChatEvent::SecretRequest { .. } => "secret_request",
             ChatEvent::SecretRequestResolved { .. } => "secret_request_resolved",
             ChatEvent::SessionClosed { .. } => "session_closed",
+            ChatEvent::ConversationRelayed { .. } => "conversation_relayed",
         }
     }
 
@@ -1128,7 +1155,17 @@ impl ChatEvent {
                 ))
             }
 
+            // One relay per (from, to) pair: the same statement on both threads.
+            ChatEvent::ConversationRelayed {
+                from_session_id,
+                to_session_id,
+                ..
+            } => Some(format!(
+                "conversation_relayed:{from_session_id}:{to_session_id}"
+            )),
+
             // StreamDelta and StreamingStatus are never in the snapshot.
+
             // ActiveTasksUpdate is ephemeral — every emission is a fresh
             // full snapshot, dedup is meaningless (and would actively hide
             // useful state changes from the frontend). Plan 754a1379, T4.
@@ -1386,6 +1423,10 @@ pub struct SwitchProviderResponse {
     pub relayed_entries: usize,
     /// Older entries left out to fit the target's context window (stated to the model).
     pub omitted_entries: usize,
+    /// The memory conversation, the same before and after the move (absent when the
+    /// server records none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
 }
 
 // ============================================================================
