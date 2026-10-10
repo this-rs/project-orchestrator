@@ -356,7 +356,7 @@ fn slugify(label: &str) -> String {
 
 const COST_SOURCES: [&str; 5] = ["reported", "priced", "free", "subscription", "unknown"];
 
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 48
         && id
