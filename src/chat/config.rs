@@ -347,9 +347,11 @@ impl ChatConfig {
 
     /// Where `nexus-tools` is: `NEXUS_TOOLS_PATH` when set (an operator's choice,
     /// taken as is), else next to the server's executable, else on the `PATH`
-    /// (`DefaultTools::locate` of nexus). Nothing downloads it: it ships with the
-    /// server or is installed by the operator (`cargo install --git
-    /// https://github.com/this-rs/nexus nexus-tools`).
+    /// (`DefaultTools::locate` of nexus). Nothing downloads it: every release
+    /// channel ships it next to the server's executable (archives, Homebrew,
+    /// .deb/.rpm `/usr/bin`, Docker `/app`; the desktop app sets
+    /// `NEXUS_TOOLS_PATH`), built at the pinned nexus revision with `tls` by
+    /// `scripts/build-nexus-tools.sh`, which an operator can run too.
     pub fn detect_nexus_tools_path() -> Option<PathBuf> {
         if let Some(path) = std::env::var_os(NEXUS_TOOLS_PATH_VAR).filter(|p| !p.is_empty()) {
             return Some(PathBuf::from(path));
