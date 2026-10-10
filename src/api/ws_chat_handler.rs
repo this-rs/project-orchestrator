@@ -76,10 +76,6 @@ pub enum WsChatClientMessage {
         id: Option<String>,
         #[serde(default)]
         allow: bool,
-        /// How long an approval lasts: `once` (absent), `session`, `always`. A scope
-        /// the session does not declare is refused (`permission_scope_unsupported`).
-        #[serde(default)]
-        scope: crate::chat::types::PermissionAnswerScope,
     },
     /// Response to an input request
     InputResponse {
@@ -951,7 +947,7 @@ async fn handle_ws_chat_loop(
                                         }
                                     }
 
-                                    WsChatClientMessage::PermissionResponse { id, allow, scope } => {
+                                    WsChatClientMessage::PermissionResponse { id, allow } => {
                                         let request_id = id.clone().unwrap_or_default();
                                         let decision = if allow { "allow" } else { "deny" };
 
@@ -974,7 +970,6 @@ async fn handle_ws_chat_loop(
                                             session_id = %session_id,
                                             request_id = %request_id,
                                             decision,
-                                            scope = scope.as_str(),
                                             routing,
                                             "Permission decision"
                                         );
@@ -985,23 +980,9 @@ async fn handle_ws_chat_loop(
                                         // NOT be persisted or broadcast as user_message events.
                                         // Same routing as POST .../permissions/{request_id}.
                                         let send_result = chat_manager
-                                            .route_permission_response(&session_id, &request_id, allow, scope, false)
+                                            .route_permission_response(&session_id, &request_id, allow, false)
                                             .await;
-                                        if let Err(crate::chat::manager::PermissionDeliveryError::ScopeUnsupported(scope)) = &send_result {
-                                            // Refused, not answered: the request still waits, the same
-                                            // id may be answered again (with a scope the session offers).
-                                            responded_permission_ids.remove(&request_id);
-                                            let err = serde_json::json!({
-                                                "type": "error",
-                                                "message": format!(
-                                                    "This session cannot keep a permission for the scope '{}': answer with a scope it offers.",
-                                                    scope.as_str()
-                                                ),
-                                                "code": crate::chat::manager::PERMISSION_SCOPE_UNSUPPORTED_RPC,
-                                                "reason": scope.as_str(),
-                                            });
-                                            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
-                                        } else if let Err(e) = send_result {
+                                        if let Err(e) = send_result {
                                             warn!(
                                                 session_id = %session_id,
                                                 request_id = %request_id,

@@ -28,7 +28,6 @@ pub mod entity_extractor;
 pub mod envelope;
 pub mod feedback;
 pub(crate) mod hook_ledger;
-pub mod lasting_rules;
 pub mod manager;
 pub mod message_attachments;
 pub mod model_catalog;

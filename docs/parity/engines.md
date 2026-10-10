@@ -26,8 +26,8 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `set_model` | set_model en cours de conversation atteint le provider | ok | ok |
 | `cancel_tools` | cancel_tools arrête l'outil en cours, le tour continue | ok | ok |
 | `permissions.once` | une permission accordée une fois débloque l'outil | ok | ok |
-| `permissions.session` | une permission accordée pour la session n'est pas redemandée | ok | ok |
-| `permissions.always` | une permission accordée pour toujours est retenue au-delà de la session | ok | ok |
+| `permissions.session` | une permission accordée pour la session n'est pas redemandée | gap (harnais, P11) | gap (harnais, P11) |
+| `permissions.always` | une permission accordée pour toujours est retenue au-delà de la session | gap (harnais, P11) | gap (harnais, P11) |
 | `po_tools` | les outils project-orchestrator (MCP) sont donnés et appelables | ok | ok |
 | `nexus_tools` | Read / Edit / Bash s'exécutent sur le projet | not_measured | ok |
 | `enrichment` | le contexte du graphe précède le message du tour | ok | ok |
@@ -39,12 +39,16 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `cancel_task` | cancel_task arrête une tâche d'arrière-plan | ok | gap (harnais, P12) |
 | `system_init.degraded` | system_init n'annonce comme manquant qu'une limite du modèle (liste fermée) | ok | ok |
 
-`ok` : Claude Code 25/26, natif 23/26.
+`ok` : Claude Code 23/26, natif 21/26.
 
 ## Écarts déclarés
 
 | Moteur | Fonction | Cause | Tâche | Ce qui manque |
 |---|---|---|---|---|
+| Claude Code | `permissions.session` | harnais | P11 | la réponse de permission ne porte aucune portée : le backend n'écrit au CLI qu'un allow/deny ponctuel (pas d'updatedPermissions de session) |
+| Claude Code | `permissions.always` | harnais | P11 | aucune portée persistante (updatedPermissions vers les réglages) n'est écrite au CLI |
+| natif | `permissions.session` | harnais | P11 | le harnais natif sait retenir une portée session, mais le backend répond toujours allow_once : la permission est redemandée |
+| natif | `permissions.always` | harnais | P11 | le harnais natif ne déclare pas la portée always (permission_scopes = once, session) et le backend ne la transmet pas |
 | natif | `session_record` | harnais | P8 | le moteur agent ne met pas à jour le dossier de session à la fin d'un tour (message_count / total_cost_usd) |
 | natif | `background_tasks` | harnais | P4 | le natif ne rapporte pas de tâche d'arrière-plan (capacité background_tasks = false) : rien n'est suivi |
 | natif | `cancel_task` | harnais | P12 | cancel_task n'a pas de branche moteur agent (no-op idempotent) et le natif n'a pas de tâche à annuler |
