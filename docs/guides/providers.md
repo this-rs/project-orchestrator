@@ -54,6 +54,77 @@ secret value. It is for a signed-in person only (an agent token gets `403`, an u
 
 What was sent where is readable at `GET /api/chat/send-journal` (who, project, origin, model; never the content).
 
+## OpenClaw (delegating a conversation to an OpenClaw agent)
+
+OpenClaw speaks ACP through its bridge, `openclaw acp`, which connects to an OpenClaw Gateway.
+Declare it on the server, then register an ACP instance that names it:
+
+```sh
+CHAT_PROVIDER_ACP_COMMANDS='{"openclaw":["openclaw","acp","--url","wss://gateway.example:18789","--token-file","/etc/po/openclaw.token"]}'
+```
+
+```json
+{ "id": "openclaw", "kind": "acp", "preset": "openclaw", "label": "OpenClaw",
+  "default_model": "openclaw", "cost_source": "unknown", "credential_ref": "none" }
+```
+
+- **Use `--token-file`, never `--token`**: a token on the command line is visible to every user of
+  the machine in the process list (and an argument that looks like a secret is refused anyway).
+  The file belongs to the server's user, mode `0600`.
+- **No project-orchestrator tools in the session.** The bridge refuses MCP servers given per
+  session (`session/new` answers "ACP bridge mode does not support per-session MCP servers";
+  older versions **ignored them without a word**). The session is opened **without** the
+  project-orchestrator MCP server and says so: `degraded_features` carries
+  `project_orchestrator_tools` (the same banner as a remote Claude Code). How the server knows:
+  - **the declaration**, which wins over the name and the learned refusal for **every new
+    session** (a resumed one: see below): an entry may be an object,
+    `{"openclaw": {"argv": ["npx", "openclaw", "acp", "--token-file", "/etc/po/openclaw.token"], "per_session_mcp": false}}`.
+    Declare it for an older OpenClaw (nothing to learn: it says nothing) and for any agent
+    that takes no MCP server. `"per_session_mcp": true` forces the other way. An entry with
+    an unknown or misspelt field is left out, never half-read, with a warning naming it in the
+    server log (its instance then answers that the agent is not declared);
+  - **the name**, as a convenience: the PROGRAM the command runs is `openclaw` (file name, a
+    package version and one extension removed): `argv[0]` (`openclaw`, `/usr/bin/openclaw`,
+    `OpenClaw.cmd`), or what a known launcher runs, its options skipped (`npx [--yes]
+    openclaw[@version]`, `pnpx openclaw`, `npm exec|x [--] openclaw`, `pnpm [-C <dir>]
+    dlx|exec openclaw`, `yarn dlx|exec openclaw`, `bunx openclaw`, `node …/openclaw.mjs`,
+    `env [VAR=…] openclaw`), or the first word of a command line a launcher is given
+    (`npx -c "openclaw acp"`, `pnpm -c exec "openclaw acp"`, `env -S "openclaw acp"`).
+    An option value, another argument or a URL is never read
+    (`--config ~/.openclaw/openclaw.json`, `--profile openclaw`, `wss://gw/openclaw` leave the
+    agent its servers): a wrapper script of another name needs `"per_session_mcp": false`;
+  - **the refusal, learned**: an agent that refuses the servers is asked again once without
+    them (the session says so on the thread, `system:mcp_servers_refused`), and the next
+    sessions of that instance are opened without them. Learned **in memory**: a restart of the
+    server, or any change to the instance, forgets it (one more refused round-trip); a
+    resumed session keeps what its first opening found (its frozen capabilities, which a resume
+    never turns back to "takes servers", however many restarts later).
+
+  **A resumed session keeps what its opening found, whatever the declaration says now.** A
+  session opened without the servers (declared, named, refused) is resumed without them even
+  after the entry is changed to `"per_session_mcp": true` (an OpenClaw upgraded to take them):
+  the declaration applies to the sessions opened after it; open a new conversation to get the
+  PO tools. Chosen over letting the declaration win: its frozen capabilities are what the agent
+  actually did, and a wrong `true` would send the session's PO token, once more, to an agent
+  that refuses the servers.
+
+  **The PO token never outlives a refusal.** The project-orchestrator server of a session carries
+  a token bound to it. When the session comes out without its servers, whoever dropped them
+  (the server asking again, or nexus doing it inside `session/new` / `session/load`, which the
+  session's capabilities then say with `per_session_mcp: false`), that token was sent in the
+  refused request: it is revoked at once. An opening or a resume that fails before the session
+  is live revokes it too, and leaves no per-turn router behind.
+
+  To give OpenClaw the PO tools, configure them on the OpenClaw side
+  (`openclaw mcp set project-orchestrator '<json>'`: a stdio `command`, or the server's `/mcp`
+  over Streamable HTTP when `remote_mcp.enabled`, with its authentication).
+- **Other limits of the bridge**: no `fs/*` or `terminal/*` requests (the agent uses its own
+  tools), no model choice (the model name is a label), no system prompt, no knowledge-graph
+  hooks, no compaction signal, images not sent; permissions are relayed only while a turn is
+  running. Each session is an isolated OpenClaw session (`acp-bridge:<uuid>`) unless the
+  command targets one (`--session agent:main:main`).
+
+
 ## Files, shell and web of a native session (`nexus-tools`)
 
 A native session (an OpenAI-compatible instance) has no tool of its own: `Read`, `Bash`, `WebFetch`…
@@ -113,7 +184,7 @@ Two counters: *marginal* (reported or priced: real spend, the only one that can 
 |---|---|---|
 | `CHAT_PROVIDER_PATH` | `legacy` | `agent` forces Claude Code onto the agent engine (degraded, warned) |
 | `CHAT_PROVIDER_ENV_CREDENTIALS` | empty | server variables an instance may name as `env:<VAR>` |
-| `CHAT_PROVIDER_ACP_COMMANDS` | empty | JSON object of ACP agents an instance may launch |
+| `CHAT_PROVIDER_ACP_COMMANDS` | empty | JSON object of ACP agents an instance may launch: `name: [argv]` or `name: {"argv": [...], "per_session_mcp": false}` |
 | `CHAT_CHILD_ENV_INHERIT` | empty | extra variables handed to agent processes (never the server's own secrets) |
 
 ## Not verified

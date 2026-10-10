@@ -558,6 +558,7 @@ async fn native_session_tools(graph: Arc<MockGraphStore>, sid: &str) -> Vec<Stri
             max_tokens: None,
             kind: nexus_claude::agent::ProviderKind::Native,
             remote_cwd: None,
+            per_session_mcp: true,
             hooks: Some(crate::chat::manager::AgentHookScope {
                 project_slug: Some(PROJECT.into()),
                 task_id: None,

@@ -252,6 +252,12 @@ fn image_refusal(error: &ProviderError) -> Option<ChatEvent> {
 /// knows it, not the provider's capabilities, so it is added at adoption.
 pub const NEXUS_TOOLS_FEATURE: &str = "nexus_tools";
 
+/// The identifier of a session that has none of the project-orchestrator tools: it
+/// cannot carry an MCP server (`per_session_mcp` false: a remote Claude Code), or the
+/// host did not give it one because its agent refuses them (OpenClaw's ACP bridge,
+/// `ChatManager::carries_per_session_mcp`).
+pub const PO_TOOLS_FEATURE: &str = "project_orchestrator_tools";
+
 /// What a session on the agent engine does NOT do, as the identifiers the
 /// frontend knows (`hooks`, `message_queue`, `auto_continue`, `compaction`,
 /// `nats`, `enrichment`, `images`, and [`NEXUS_TOOLS_FEATURE`] added by the host).
@@ -284,7 +290,7 @@ pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
     // A session that cannot carry an MCP server (a remote Claude Code) has none
     // of the project-orchestrator tools.
     if !caps.per_session_mcp {
-        missing.push("project_orchestrator_tools");
+        missing.push(PO_TOOLS_FEATURE);
     }
     missing.into_iter().map(str::to_string).collect()
 }
@@ -1403,6 +1409,8 @@ pub(crate) mod fake {
         pub fail_open: Arc<StdMutex<Option<ProviderError>>>,
         /// Capabilities the sessions of this provider declare.
         pub caps: Arc<StdMutex<Capabilities>>,
+        /// The kind it says it is (Claude Code unless a test plays another).
+        pub kind: Arc<StdMutex<ProviderKind>>,
     }
 
     impl FakeProvider {
@@ -1411,6 +1419,7 @@ pub(crate) mod fake {
                 state: Arc::new(FakeState::default()),
                 fail_open: Arc::new(StdMutex::new(None)),
                 caps: Arc::new(StdMutex::new(Capabilities::none())),
+                kind: Arc::new(StdMutex::new(ProviderKind::ClaudeCode)),
             }
         }
         pub(crate) fn session(&self) -> Arc<FakeSession> {
@@ -1430,7 +1439,7 @@ pub(crate) mod fake {
             "claude-code"
         }
         fn kind(&self) -> ProviderKind {
-            ProviderKind::ClaudeCode
+            *self.kind.lock().unwrap()
         }
         async fn health(&self) -> ProviderHealth {
             ProviderHealth::ok(None)
@@ -1439,7 +1448,11 @@ pub(crate) mod fake {
             Ok(Vec::new())
         }
         fn capabilities(&self, _model: Option<&str>) -> Capabilities {
-            Capabilities::none()
+            // A local Claude Code takes MCP servers per session: the host gives it the
+            // PO server (`ChatManager::carries_per_session_mcp`).
+            let mut caps = Capabilities::none();
+            caps.per_session_mcp = true;
+            caps
         }
         async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
             if let Some(e) = self.fail_open.lock().unwrap().take() {
