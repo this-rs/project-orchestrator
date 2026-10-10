@@ -1,5 +1,5 @@
 %% name: po-provider-settings
-%% covers: backend:src/api/provider_handlers.rs
+%% covers: backend:src/api/provider_handlers.rs backend:src/api/network_tools_handlers.rs
 %% verified: 41425090
 %% ---
 %% PROUVE : les routes de réglages des providers (A15, A19, A24, A25, A28, A32, A37) : instances, test de
@@ -12,6 +12,7 @@
 %%   src/api/routing_handlers.rs  — get/put_routing, get/put/delete_project_routing (fichier possédé par po-cognitive-routing ; ses routes sont montrées ici)
 %%   src/api/routes.rs — le montage des routes (/api/chat/providers*, /api/projects/{slug}/llm-*)
 %%   src/auth/middleware.rs — is_human_only_mutation (la garde du middleware : préfixes + /api/projects/{slug}/llm-* et /routing)
+%%   src/api/network_tools_handlers.rs — outils réseau d'une session native (P6) : consentement par origine, navigateur, moteurs de recherche ; écrit les documents que nexus_tools::GraphConsents lit (po-chat-provider)
 %% ---
 %% NON ETABLI :
 %%   aucun essai contre un vrai endpoint ou un vrai Codex ; le test de connexion d'un codex/acp = health du processus ;
@@ -56,6 +57,13 @@ flowchart TD
         RNOOP["🟠 STOCKÉ et MONTRÉ (GET /api/chat/providers.routing), PAS APPLIQUÉ : aucune décision n'est prise par cette tranche (B-R4) ; primary + shadow = identité (agent_e2e_tests inchangée)"]
     end
 
+    subgraph nettools["Outils réseau d'une session native (P6) — network_tools_handlers.rs"]
+        NTORIG["✅ PUT/DELETE /api/projects/{slug}/network-tools/origins : tool_origin:&lt;origine&gt; sous project:&lt;slug&gt;, lu par GraphConsents (B40) ; une URL est réduite à son origine (origin_of) ; http(s) sans identifiants, sinon 400 invalid_tool_origin ; projet inconnu 404 project_not_found<br/>test : network_origin_consent_is_stored_where_the_gate_reads_it_and_revoked, network_origin_refuses_what_is_not_an_http_origin_with_a_typed_400_and_stores_nothing, network_tools_of_an_unknown_project_are_a_404"]
+        NTBROW["✅ PUT /api/projects/{slug}/network-tools/browser {allowed} : document browser ; l'attache réelle d'Obscura reste N23<br/>test : network_browser_authorisation_is_stored_read_by_the_gate_and_withdrawn"]
+        NTSE["✅ GET/POST /api/chat/search-engines, DELETE /{id} : search_provider:&lt;id&gt; (global), clé par référence vault: seulement (secret_value_refused) ; grant Provider("tool:&lt;id&gt;") par POST /api/vault/grants nommant exactement la référence ; supprimer révoque ses grants<br/>test : search_engine_is_declared_by_vault_reference_listed_and_removed, search_engine_refuses_a_raw_key_and_invalid_drafts_with_typed_codes, search_engine_key_is_granted_under_tool_id_only_by_its_reference_and_revoked_with_it"]
+        NTE2E["✅ consentement par la route ⇒ la session native suivante reçoit WebFetch ; révoqué ⇒ plus<br/>test : a_native_session_is_offered_webfetch_once_the_project_consents_to_an_origin_by_the_route, network_tools_mutations_are_refused_to_an_agent_token_and_reads_are_not"]
+    end
+
     JOURNAL["✅ GET /api/chat/send-journal : qui, projet, origine, modèle ; jamais le contenu ; humain seulement<br/>test : the_send_journal_is_readable_by_a_person_only_filtered_and_newest_first"]
     NOSEC["🟠 sans authentification (auth_config absent), require_human laisse tout passer (écart documenté dans le modèle de menace)"]
 
@@ -76,3 +84,7 @@ flowchart TD
     RGET -.-> RNOOP
     HUMAN --> JOURNAL
     HUMAN --> NOSEC
+    HUMAN --> NTORIG
+    HUMAN --> NTBROW
+    HUMAN --> NTSE
+    NTORIG --> NTE2E

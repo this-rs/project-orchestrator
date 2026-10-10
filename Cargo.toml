@@ -296,6 +296,8 @@ assets = [
     ["target/release/orchestrator", "/usr/bin/orchestrator", "755"],
     ["target/release/orch", "/usr/bin/orch", "755"],
     ["target/release/mcp_server", "/usr/bin/orchestrator-mcp", "755"],
+    # The files, shell and web tools of a native session, next to the server (P6).
+    ["target/release/nexus-tools", "/usr/bin/nexus-tools", "755"],
     ["config.yaml.example", "/etc/project-orchestrator/config.yaml.example", "644"],
     ["packaging/debian/project-orchestrator.service", "/lib/systemd/system/project-orchestrator.service", "644"],
     ["packaging/debian/docker-compose.services.yml", "/etc/project-orchestrator/docker-compose.services.yml", "644"],
@@ -321,6 +323,7 @@ assets = [
     { source = "target/release/orchestrator", dest = "/usr/bin/orchestrator", mode = "755" },
     { source = "target/release/orch", dest = "/usr/bin/orch", mode = "755" },
     { source = "target/release/mcp_server", dest = "/usr/bin/orchestrator-mcp", mode = "755" },
+    { source = "target/release/nexus-tools", dest = "/usr/bin/nexus-tools", mode = "755" },
     { source = "config.yaml.example", dest = "/etc/project-orchestrator/config.yaml.example", mode = "644", config = "noreplace" },
     { source = "packaging/debian/project-orchestrator.service", dest = "/lib/systemd/system/project-orchestrator.service", mode = "644" },
     { source = "packaging/debian/docker-compose.services.yml", dest = "/etc/project-orchestrator/docker-compose.services.yml", mode = "644" },
