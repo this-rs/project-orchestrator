@@ -267,6 +267,15 @@ pub(crate) async fn validate_provider_grant(
     instance: &str,
     secrets: &SecretSelector,
 ) -> Result<(), AppError> {
+    // A search engine is a tool provider, granted under `tool:<id>` (A26): the same rule, on
+    // the engine's own credential reference.
+    if instance.starts_with(crate::chat::provider::nexus_tools::TOOL_PROVIDER_PREFIX) {
+        let engine = super::network_tools_handlers::search_engine_for_grant(graph, instance)
+            .await
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::NotFound(format!("unknown search engine '{instance}'")))?;
+        return names_only_the_reference(instance, &engine.credential_ref, secrets);
+    }
     let record = crate::chat::provider::store::instance(graph, instance)
         .await
         .map_err(AppError::Internal)?
@@ -275,16 +284,24 @@ pub(crate) async fn validate_provider_grant(
                 "unknown provider instance '{instance}' (claude-code has no key to grant)"
             ))
         })?;
+    names_only_the_reference(instance, &record.credential_ref, secrets)
+}
+
+/// A provider grant names exactly the secret of the provider's `credential_ref`, never `all`.
+fn names_only_the_reference(
+    provider: &str,
+    credential_ref: &str,
+    secrets: &SecretSelector,
+) -> Result<(), AppError> {
     let SecretSelector::Names(names) = secrets else {
         return Err(AppError::BadRequest(
             "a provider grant names its secret: `all` is not accepted".to_string(),
         ));
     };
-    let allowed = record.credential_ref.strip_prefix("vault:");
+    let allowed = credential_ref.strip_prefix("vault:");
     if names.is_empty() || names.iter().any(|n| Some(n.as_str()) != allowed) {
         return Err(AppError::BadRequest(format!(
-            "instance '{instance}' reads the secret named in its credential_ref ({}); a grant to it can name only that",
-            record.credential_ref
+            "instance '{provider}' reads the secret named in its credential_ref ({credential_ref}); a grant to it can name only that"
         )));
     }
     Ok(())

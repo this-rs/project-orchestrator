@@ -5539,6 +5539,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_listen_for_result_completed() {
+        // RUNNER_CANCEL is global: without the lock this test can clear the flag
+        // test_listen_for_result_cancelled just set, which then waits for the
+        // safety timeout holding TEST_MUTEX (seen in CI: ~50 min, four tests stuck).
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
         let runner = test_plan_runner();
         let (tx, rx) = broadcast::channel::<ChatEvent>(16);
         let run_id = Uuid::new_v4();
@@ -5615,6 +5620,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_listen_for_result_tracks_errors() {
+        // RUNNER_CANCEL is global: without the lock this test can clear the flag
+        // test_listen_for_result_cancelled just set, which then waits for the
+        // safety timeout holding TEST_MUTEX (seen in CI: ~50 min, four tests stuck).
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
         let runner = test_plan_runner();
         let (tx, rx) = broadcast::channel::<ChatEvent>(16);
         let run_id = Uuid::new_v4();
@@ -5660,6 +5670,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_listen_for_result_error_truncation() {
+        // RUNNER_CANCEL is global: without the lock this test can clear the flag
+        // test_listen_for_result_cancelled just set, which then waits for the
+        // safety timeout holding TEST_MUTEX (seen in CI: ~50 min, four tests stuck).
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
         let runner = test_plan_runner();
         let (tx, rx) = broadcast::channel::<ChatEvent>(16);
         let run_id = Uuid::new_v4();
@@ -5698,6 +5713,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_listen_for_result_channel_closed() {
+        // RUNNER_CANCEL is global: without the lock this test can clear the flag
+        // test_listen_for_result_cancelled just set, which then waits for the
+        // safety timeout holding TEST_MUTEX (seen in CI: ~50 min, four tests stuck).
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
         let runner = test_plan_runner();
         let (tx, rx) = broadcast::channel::<ChatEvent>(16);
         let run_id = Uuid::new_v4();

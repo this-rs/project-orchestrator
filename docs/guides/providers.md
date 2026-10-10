@@ -87,6 +87,48 @@ CHAT_PROVIDER_ACP_COMMANDS='{"openclaw":["openclaw","acp","--url","wss://gateway
   running. Each session is an isolated OpenClaw session (`acp-bridge:<uuid>`) unless the
   command targets one (`--session agent:main:main`).
 
+
+## Files, shell and web of a native session (`nexus-tools`)
+
+A native session (an OpenAI-compatible instance) has no tool of its own: `Read`, `Bash`, `WebFetch`…
+come from the `nexus-tools` executable, attached to each session. Without it the session has none of
+them and its `system_init.degraded_features` lists `nexus_tools`.
+
+**Where it is.** Every release ships it **next to the `orchestrator` executable**, built at the nexus
+revision the server pins, with https:
+
+| Channel | Path |
+|---|---|
+| archives (`orchestrator[-full]-<v>-<os>-<arch>`) and `install.sh` / `install.ps1` | beside `orchestrator`, `nexus-tools` (`nexus-tools.exe` on Windows) |
+| Homebrew | `$(brew --prefix)/bin/nexus-tools` |
+| `.deb` / `.rpm` | `/usr/bin/nexus-tools` |
+| Docker image | `/app/nexus-tools` |
+| desktop app | a resource of the app; the app sets `NEXUS_TOOLS_PATH` to it |
+
+The server looks, in order: `NEXUS_TOOLS_PATH` (an operator's choice, taken as is), next to its own
+executable, then the `PATH`. To build it yourself: `scripts/build-nexus-tools.sh <root>` (same
+revision, `--features tls`; without `tls`, `WebFetch` over https fails).
+
+**What a project agrees to.** File and shell tools are bounded by the session's directories and
+policy. The network tools follow the project's consent, per **origin** (scheme, host, non-default port):
+
+1. `PUT /api/projects/{slug}/network-tools/origins` with `{"origin": "https://docs.rs"}`. Once a project
+   has consented to one origin, its native sessions are offered `WebFetch`; each call is still refused
+   for an origin that was not consented (`tool_origin_not_allowed`). Revoke with
+   `DELETE /api/projects/{slug}/network-tools/origins?origin=https://docs.rs`.
+2. `WebSearch` needs a **search engine**: `POST /api/chat/search-engines` with
+   `{"id": "brave", "engine": "brave", "credential_ref": "vault:brave"}` (or
+   `{"id": "home", "engine": "searxng", "base_url": "http://localhost:8888"}`). The key is a vault
+   reference, never a value. Grant it with `POST /api/vault/grants`, scope
+   `{"kind":"provider","value":"tool:brave"}`, naming exactly that secret. The project then consents to
+   the engine's origin (`https://api.search.brave.com` for Brave). A locked vault or a missing grant
+   leaves the engine out of the session; no fallback.
+3. The browser: `PUT /api/projects/{slug}/network-tools/browser` with `{"allowed": true}`. It is attached
+   only once its executable is also configured (N23, not shipped yet).
+
+`GET /api/projects/{slug}/network-tools` shows all three. Only a signed-in person changes them (an agent
+token gets `403`).
+
 ## Routing, roles, aliases, policy
 
 Resolution order: existing session (frozen) > explicit request > task alias > run > project role >

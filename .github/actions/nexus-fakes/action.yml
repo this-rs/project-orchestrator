@@ -2,6 +2,9 @@ name: Build the nexus fake servers
 description: >
   Installs `fake_openai`, `fake_mcp`, `fake_claude` and `fake_acp` of the nexus repository, and
   the real `nexus-tools`, at the revision Cargo.toml pins, and exports NEXUS_FAKES_DIR.
+  `nexus-tools` is built exactly as the release ships it (scripts/build-nexus-tools.sh:
+  same pinned revision, `--features tls`), so this is also the CI check that the pin
+  builds the shipped tools.
   src/chat/agent_e2e_tests.rs drives the agent engine against them;
   src/chat/engine_parity_tests.rs plays ONE scenario on the Claude Code engine
   (fake_claude) and on the native harness (fake_openai + fake_mcp + nexus-tools) and
@@ -14,9 +17,19 @@ runs:
       run: |
         REV=$(sed -n 's/^nexus-claude = .*rev = "\([0-9a-f]\{40\}\)".*/\1/p' Cargo.toml | head -n1)
         test -n "$REV"
-        cargo install --git https://github.com/this-rs/nexus.git --rev "$REV" \
-          --features "provider-native testkit" --root "$RUNNER_TEMP/nexus-fakes" \
-          --bin fake_openai --bin fake_mcp --bin fake_claude --bin fake_acp nexus-claude
-        cargo install --git https://github.com/this-rs/nexus.git --rev "$REV" \
-          --root "$RUNNER_TEMP/nexus-fakes" --bin nexus-tools nexus-tools
-        echo "NEXUS_FAKES_DIR=$RUNNER_TEMP/nexus-fakes/bin" >> "$GITHUB_ENV"
+        # One directory per pinned revision in the tool cache: a self-hosted runner keeps it and
+        # skips the cargo installs until the pin moves (a new pin = a new directory, so the check
+        # that the pin builds the shipped tools still runs once per pin); a hosted runner starts
+        # empty and installs every time.
+        ROOT="$RUNNER_TOOL_CACHE/nexus-fakes/$REV-tls-acp"
+        if [ -x "$ROOT/bin/fake_openai" ] && [ -x "$ROOT/bin/fake_mcp" ] \
+          && [ -x "$ROOT/bin/fake_claude" ] && [ -x "$ROOT/bin/fake_acp" ] && [ -x "$ROOT/bin/nexus-tools" ]; then
+          echo "nexus fakes for $REV already installed in $ROOT"
+        else
+          cargo install --git https://github.com/this-rs/nexus.git --rev "$REV" \
+            --features "provider-native testkit" --root "$ROOT" \
+            --bin fake_openai --bin fake_mcp --bin fake_claude --bin fake_acp nexus-claude
+          # The shipped nexus-tools (tls on), as release.yml builds it.
+          scripts/build-nexus-tools.sh "$ROOT"
+        fi
+        echo "NEXUS_FAKES_DIR=$ROOT/bin" >> "$GITHUB_ENV"
