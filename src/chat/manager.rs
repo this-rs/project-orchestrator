@@ -122,6 +122,51 @@ pub(crate) fn auto_refused_by_locked_vault(
         && !vault_backed.is_empty()
 }
 
+/// Most models offered instead of unlocking the vault.
+pub(crate) const MAX_LOCKED_VAULT_FALLBACKS: usize = 3;
+
+/// The models Auto could still open on without the vault, best first: its own
+/// pick, then the eligible alternatives by score. None of them is keyed in the
+/// vault (those came back unhealthy, but the filter says it outright). Empty
+/// when every usable model needs the vault: unlocking is then the only way.
+pub(crate) fn locked_vault_fallbacks(
+    decision: &super::provider::cognitive::decision::CognitiveDecision,
+    vault_backed: &[String],
+) -> Vec<super::provider::errors::FallbackModel> {
+    let mut eligible: Vec<_> = decision
+        .alternatives
+        .iter()
+        .filter(|a| a.rejected.is_none())
+        .collect();
+    eligible.sort_by(|a, b| {
+        b.score
+            .unwrap_or(f64::MIN)
+            .total_cmp(&a.score.unwrap_or(f64::MIN))
+    });
+    let mut out: Vec<super::provider::errors::FallbackModel> = Vec::new();
+    for pick in decision
+        .chosen
+        .iter()
+        .chain(eligible.into_iter().map(|a| &a.pick))
+    {
+        if vault_backed.contains(&pick.provider_id)
+            || out
+                .iter()
+                .any(|f| f.provider_id == pick.provider_id && f.model == pick.model)
+        {
+            continue;
+        }
+        out.push(super::provider::errors::FallbackModel {
+            provider_id: pick.provider_id.clone(),
+            model: pick.model.clone(),
+        });
+        if out.len() == MAX_LOCKED_VAULT_FALLBACKS {
+            break;
+        }
+    }
+    out
+}
+
 pub(crate) const OOB_TRIGGER_CAP_INTERACTIVE: u32 = 50;
 /// Same cap for runner sessions, more conservative since they run
 /// autonomously without a human watching.
@@ -10615,7 +10660,9 @@ impl ChatManager {
                     "Auto routing refused: the vault is locked and holds candidates' keys"
                 );
                 return Err(anyhow::Error::new(
-                    nexus_claude::agent::ProviderError::CredentialsLocked,
+                    super::provider::errors::AutoVaultLocked {
+                        fallbacks: locked_vault_fallbacks(decision, &vault_backed),
+                    },
                 ));
             }
         }
@@ -22836,6 +22883,86 @@ mod auto_open_bounds_tests {
             true,
             &keyed
         ));
+    }
+
+    fn decision_with(
+        chosen: Option<(&str, &str)>,
+        alternatives: &[(&str, &str, Option<f64>, bool)],
+    ) -> crate::chat::provider::cognitive::decision::CognitiveDecision {
+        use crate::chat::provider::cognitive::candidates::RejectReason;
+        use crate::chat::provider::cognitive::decision::{
+            CognitiveDecision, DecisionAlternative, Pick,
+        };
+        use crate::chat::provider::cognitive::mode::LearningStage;
+        use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
+        CognitiveDecision {
+            id: Uuid::new_v4(),
+            at: chrono::Utc::now(),
+            signature: TaskSignature::utility(TaskClass::UtilityCompaction, 9_000, None),
+            chosen: chosen.map(|(p, m)| Pick::new(p, m)),
+            score: None,
+            explored: false,
+            reason: "test".into(),
+            alternatives: alternatives
+                .iter()
+                .map(|(p, m, score, rejected)| DecisionAlternative {
+                    pick: Pick::new(*p, *m),
+                    score: *score,
+                    rejected: rejected.then_some(RejectReason::Unhealthy),
+                })
+                .collect(),
+            applied: true,
+            mode: ProviderRoutingMode::Full,
+            stage: LearningStage::Auto,
+            session_id: None,
+            task_id: None,
+            run_id: None,
+            turn_index: None,
+            outcome: None,
+            used: None,
+        }
+    }
+
+    fn picks(f: &[crate::chat::provider::errors::FallbackModel]) -> Vec<(String, String)> {
+        f.iter()
+            .map(|f| (f.provider_id.clone(), f.model.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn fallbacks_are_the_pick_then_eligible_alternatives_without_the_vault() {
+        let d = decision_with(
+            Some(("codex", "gpt-5")),
+            &[
+                ("codex", "gpt-5", Some(0.9), false),
+                ("ollama", "qwen3", Some(0.4), false),
+                ("openclaw", "default", Some(0.7), false),
+                ("openai", "gpt-5", Some(0.95), false),
+                ("claude-code", "opus", None, true),
+                ("lmstudio", "llama", Some(0.1), false),
+            ],
+        );
+        let out = locked_vault_fallbacks(&d, &ids(&["openai"]));
+        assert_eq!(
+            picks(&out),
+            vec![
+                ("codex".into(), "gpt-5".into()),
+                ("openclaw".into(), "default".into()),
+                ("ollama".into(), "qwen3".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_model_in_the_vault_leaves_only_unlocking() {
+        let d = decision_with(
+            None,
+            &[
+                ("openai", "gpt-5", None, true),
+                ("claude-code", "opus", None, true),
+            ],
+        );
+        assert!(locked_vault_fallbacks(&d, &ids(&["openai"])).is_empty());
     }
 
     #[test]

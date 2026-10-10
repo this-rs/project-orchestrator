@@ -32,6 +32,31 @@ pub struct OpenFailure {
     /// Delay asked by the provider before retrying, in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
+    /// Models the conversation can open on instead, without the vault (Auto
+    /// refused on a locked vault). Empty: nothing to offer but unlocking.
+    /// `Some` (maybe empty) only for that refusal: the client tells it from a
+    /// named instance's locked credential by the field's presence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallbacks: Option<Vec<FallbackModel>>,
+}
+
+/// A model offered instead when Auto cannot route with the vault locked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FallbackModel {
+    /// Provider instance id.
+    pub provider_id: String,
+    /// Model id on that instance.
+    pub model: String,
+}
+
+/// Auto refused because the vault is locked and holds keys of candidates it
+/// would have routed to. Answers `credentials_locked` (423) with `fallbacks`:
+/// the person unlocks, or picks one of the models that need no vault.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("the vault is locked: Auto cannot route to the providers whose key it holds")]
+pub struct AutoVaultLocked {
+    /// Accessible models, best first.
+    pub fallbacks: Vec<FallbackModel>,
 }
 
 impl OpenFailure {
@@ -66,6 +91,12 @@ impl OpenFailure {
             body.insert(
                 "retry_after_ms".to_string(),
                 serde_json::Value::from(retry_after_ms),
+            );
+        }
+        if let Some(fallbacks) = &self.fallbacks {
+            body.insert(
+                "fallbacks".to_string(),
+                serde_json::to_value(fallbacks).unwrap_or_default(),
             );
         }
         serde_json::Value::Object(body)
@@ -202,6 +233,7 @@ pub fn open_failure(err: &ProviderError, provider_id: Option<&str>) -> OpenFailu
         action,
         retryable: err.retryable(),
         retry_after_ms,
+        fallbacks: None,
     }
 }
 
@@ -236,7 +268,11 @@ pub fn sdk_open_error(context: &str, err: nexus_claude::SdkError) -> anyhow::Err
 /// "not an opening failure we can name" — the caller answers 500.
 pub fn classify_open_error(err: &anyhow::Error, provider_id: Option<&str>) -> Option<OpenFailure> {
     err.chain().find_map(|cause| {
-        if let Some(typed) = cause.downcast_ref::<ProviderError>() {
+        if let Some(locked) = cause.downcast_ref::<AutoVaultLocked>() {
+            let mut failure = open_failure(&ProviderError::CredentialsLocked, None);
+            failure.fallbacks = Some(locked.fallbacks.clone());
+            Some(failure)
+        } else if let Some(typed) = cause.downcast_ref::<ProviderError>() {
             Some(open_failure(typed, provider_id))
         } else {
             cause.downcast_ref::<ResolveError>().map(resolve_failure)
@@ -295,6 +331,7 @@ pub fn resolve_failure(err: &ResolveError) -> OpenFailure {
         action: None,
         retryable,
         retry_after_ms: None,
+        fallbacks: None,
     }
 }
 
@@ -794,5 +831,42 @@ mod tests {
             let production = text.split("#[cfg(test)]").next().unwrap_or(text);
             assert!(!production.contains("probe_unavailable"));
         }
+    }
+}
+
+#[cfg(test)]
+mod auto_vault_locked_tests {
+    use super::*;
+
+    #[test]
+    fn auto_on_a_locked_vault_is_credentials_locked_with_its_fallbacks() {
+        let err = anyhow::Error::new(AutoVaultLocked {
+            fallbacks: vec![FallbackModel {
+                provider_id: "ollama".into(),
+                model: "qwen3".into(),
+            }],
+        });
+        let failure = classify_open_error(&err, Some("claude-code")).expect("typed");
+        assert_eq!(failure.status, 423);
+        assert_eq!(failure.code, "credentials_locked");
+        // Auto chose no instance: none is named.
+        assert_eq!(failure.provider_id, None);
+        let body = failure.to_json();
+        assert_eq!(
+            body["fallbacks"],
+            serde_json::json!([{ "provider_id": "ollama", "model": "qwen3" }])
+        );
+        assert_eq!(serde_json::to_value(&failure).unwrap(), body);
+    }
+
+    #[test]
+    fn no_fallback_still_says_it_was_auto() {
+        let err = anyhow::Error::new(AutoVaultLocked { fallbacks: vec![] });
+        let body = classify_open_error(&err, None).expect("typed").to_json();
+        assert_eq!(body["code"], serde_json::json!("credentials_locked"));
+        assert_eq!(body["fallbacks"], serde_json::json!([]));
+        // Any other opening error carries no such field.
+        let named = open_failure(&ProviderError::CredentialsLocked, Some("openai")).to_json();
+        assert!(named.get("fallbacks").is_none());
     }
 }
