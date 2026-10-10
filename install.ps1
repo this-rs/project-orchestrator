@@ -122,6 +122,12 @@ function Main {
         # Install
         New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
         Copy-Item "$tmpDir\$archiveName\$BinaryName.exe" "$InstallDir\$BinaryName.exe" -Force
+        # nexus-tools: the files, shell and web tools of a native session. The server looks for it
+        # next to its own executable, so it goes in the same directory.
+        if (Test-Path "$tmpDir\$archiveName\nexus-tools.exe") {
+            Copy-Item "$tmpDir\$archiveName\nexus-tools.exe" "$InstallDir\nexus-tools.exe" -Force
+            Write-Info "Installed nexus-tools to $InstallDir\nexus-tools.exe"
+        }
 
         Write-Info "Installed $BinaryName to $InstallDir\$BinaryName.exe"
 

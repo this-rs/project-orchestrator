@@ -119,6 +119,17 @@ RUN find src -name "*.rs" -exec touch {} \;
 RUN cargo build --release
 
 # =============================================================================
+# Stage 2b: nexus-tools (the files, shell and web tools of a native session)
+# =============================================================================
+# Built at the nexus revision Cargo.toml pins, with https (`--features tls`), by the same script as
+# the release archives and the CI. Its own stage: it only reruns when Cargo.toml changes.
+FROM rust:1.98-trixie AS nexus-tools-builder
+WORKDIR /src
+COPY Cargo.toml ./
+COPY scripts/build-nexus-tools.sh ./scripts/
+RUN scripts/build-nexus-tools.sh /opt/nexus-tools
+
+# =============================================================================
 # Stage 3: Runtime image
 # =============================================================================
 # Must match builder glibc version (Trixie = glibc 2.40) so dynamically-linked
@@ -138,10 +149,12 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy all 3 binaries
+# Copy the binaries
 COPY --from=builder /app/target/release/orchestrator /app/orchestrator
 COPY --from=builder /app/target/release/orch /app/orch
 COPY --from=builder /app/target/release/mcp_server /app/mcp_server
+# nexus-tools NEXT TO the server: it finds it there (NEXUS_TOOLS_PATH overrides)
+COPY --from=nexus-tools-builder /opt/nexus-tools/bin/nexus-tools /app/nexus-tools
 
 # Copy tree-sitter queries if they exist (optional)
 COPY querie[s] ./queries/

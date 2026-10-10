@@ -204,7 +204,7 @@ main() {
 
   # Install all binaries
   mkdir -p "$INSTALL_DIR"
-  for bin in orchestrator orch mcp_server; do
+  for bin in orchestrator orch mcp_server nexus-tools; do
     if [ -f "${TMP_DIR}/${ARCHIVE_NAME}/${bin}" ]; then
       cp "${TMP_DIR}/${ARCHIVE_NAME}/${bin}" "${INSTALL_DIR}/${bin}"
       chmod +x "${INSTALL_DIR}/${bin}"
