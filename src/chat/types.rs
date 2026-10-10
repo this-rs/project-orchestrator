@@ -722,6 +722,11 @@ pub enum ChatEvent {
         /// 0-based index of the offending element of a list, when one is.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         index: Option<usize>,
+        /// The permission request a refusal is about (`permission_scope_unsupported`): the
+        /// `id` of the `permission_request` / `permission_response`, so a client with
+        /// several requests waiting puts the refusal on the right one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     /// User's decision on a permission request (allow or deny).
     /// Persisted alongside the original PermissionRequest so the decision
@@ -2211,6 +2216,7 @@ mod tests {
                 code: None,
                 reason: None,
                 index: None,
+                request_id: None,
             },
             ChatEvent::PermissionDecision {
                 id: "pr_1".into(),
@@ -2576,6 +2582,7 @@ mod tests {
                 code: None,
                 reason: None,
                 index: None,
+                request_id: None,
             },
             ChatEvent::PermissionRequest {
                 id: "pr1".into(),

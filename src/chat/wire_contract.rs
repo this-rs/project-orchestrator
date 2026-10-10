@@ -419,6 +419,8 @@ fn server_examples() -> Vec<ServerExample> {
                 code: Some(s("refs_invalid")),
                 reason: Some(s("unknown_kind")),
                 index: Some(2),
+                // Only a refused permission scope carries it (`permission_scope_unsupported`).
+                request_id: Some(s("pr_1")),
             },
             ChatEvent::Error {
                 message: s("Tool execution failed: permission denied"),
@@ -426,6 +428,7 @@ fn server_examples() -> Vec<ServerExample> {
                 code: None,
                 reason: None,
                 index: None,
+                request_id: None,
             },
         ),
         ServerExample::new(

@@ -75,7 +75,8 @@ impl Neo4jClient {
                     capabilities: $capabilities,
                     resume_token: $resume_token,
                     execution_place: $execution_place,
-                    access: $access
+                    access: $access,
+                    owner: $owner
                 })
                 WITH s
                 OPTIONAL MATCH (p:Project {slug: $project_slug})
@@ -111,7 +112,8 @@ impl Neo4jClient {
                     capabilities: $capabilities,
                     resume_token: $resume_token,
                     execution_place: $execution_place,
-                    access: $access
+                    access: $access,
+                    owner: $owner
                 })
                 "#,
             )
@@ -176,7 +178,8 @@ impl Neo4jClient {
                         session.resume_token.clone().unwrap_or_default(),
                     )
                     .param("execution_place", session.execution_place.as_str())
-                    .param("access", session.access.as_str()),
+                    .param("access", session.access.as_str())
+                    .param("owner", session.owner.clone().unwrap_or_default()),
             )
             .await?;
 
@@ -1070,6 +1073,7 @@ impl Neo4jClient {
             access: crate::chat::provider::policy::SessionAccess::parse_stored(
                 &node.get::<String>("access").unwrap_or_default(),
             ),
+            owner: non_empty("owner"),
         })
     }
 

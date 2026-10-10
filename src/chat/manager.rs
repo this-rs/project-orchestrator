@@ -1500,6 +1500,57 @@ pub(crate) const CHILD_ENV_TOOLING: &[&str] = &[
 /// of variable names (e.g. `GH_TOKEN,AWS_PROFILE`).
 pub(crate) const CHILD_ENV_INHERIT_VAR: &str = "CHAT_CHILD_ENV_INHERIT";
 
+/// The MCP server names the native engine keeps for the servers the backend attaches
+/// (nexus-tools, the browser). A server of the session under one of them would REPLACE
+/// the backend's (nexus only attaches its defaults when the name is free), and its tools
+/// would be taken for the built-in ones: nexus gives every tool of a `nexus` server its
+/// canonical name, so a `mcp__nexus__Read` that writes or calls the network would get the
+/// session grant of the read-only built-in (`session_grants`), and a `browser_*` tool
+/// would be classified by name.
+pub(crate) const RESERVED_NATIVE_SERVERS: [&str; 2] = [
+    nexus_claude::providers::native::NEXUS_TOOLS_SERVER,
+    nexus_claude::providers::native::BROWSER_SERVER,
+];
+
+/// Refuses (typed, `invalid`) a native session whose spec already has a server under a
+/// reserved name ([`RESERVED_NATIVE_SERVERS`]), before the backend attaches its own.
+pub(crate) fn refuse_reserved_native_servers(
+    servers: &std::collections::BTreeMap<String, nexus_claude::agent::McpServerSpec>,
+) -> Result<()> {
+    match RESERVED_NATIVE_SERVERS
+        .iter()
+        .find(|name| servers.contains_key(**name))
+    {
+        Some(name) => Err(anyhow::Error::new(
+            nexus_claude::agent::ProviderError::invalid(format!(
+                "an MCP server of the session is named `{name}`: that name is reserved for the \
+                 native engine's own tools; rename the server"
+            )),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Adds the servers the backend attaches to a native session (`nexus`, `browser`). A name
+/// already taken is refused, never kept ([`RESERVED_NATIVE_SERVERS`]).
+pub(crate) fn attach_native_servers(
+    servers: &mut std::collections::BTreeMap<String, nexus_claude::agent::McpServerSpec>,
+    attached: std::collections::BTreeMap<String, nexus_claude::agent::McpServerSpec>,
+) -> Result<()> {
+    for (name, server) in attached {
+        if servers.contains_key(&name) {
+            return Err(anyhow::Error::new(
+                nexus_claude::agent::ProviderError::invalid(format!(
+                    "an MCP server of the session is named `{name}`: that name is reserved for \
+                     the native engine's own tools; rename the server"
+                )),
+            ));
+        }
+        servers.insert(name, server);
+    }
+    Ok(())
+}
+
 /// The MCP tool profile a session's own provider and mode grant it, signed into
 /// its token (`None`: no profile, the full one). A provider other than Claude
 /// Code sees the restricted profile — no tool that opens a session or
@@ -3832,6 +3883,26 @@ impl ChatManager {
         }
     }
 
+    /// The person a session opened by these claims belongs to (`ChatSessionNode::owner`,
+    /// P11b): a signed-in person is the owner; an agent session's token hands down the
+    /// owner of the session it was minted for (a delegated session belongs to the person
+    /// behind its parent); the server itself (a plan run, a protocol), an anonymous caller
+    /// or no claims at all: nobody.
+    pub(crate) async fn session_owner(
+        &self,
+        claims: Option<&crate::auth::jwt::Claims>,
+    ) -> Option<String> {
+        let claims = claims?;
+        if claims.is_agent_session() {
+            let parent = crate::auth::jwt::agent_session_binding(claims)?
+                .session_id
+                .parse::<Uuid>()
+                .ok()?;
+            return self.graph.get_chat_session(parent).await.ok()??.owner;
+        }
+        (claims.is_human() && !claims.is_service_account()).then(|| claims.sub.clone())
+    }
+
     /// Environment of the project-orchestrator MCP server of one session: the
     /// server URL, the session-BOUND token (registered live, revoked by
     /// `close_session`), the vault token and the session id. Shared by the
@@ -4298,6 +4369,7 @@ impl ChatManager {
                         code: None,
                         reason: None,
                         index: None,
+                        request_id: None,
                     }],
                     "init" => {
                         // Extract session metadata from init system message
@@ -4648,6 +4720,7 @@ impl ChatManager {
                 super::neutral_place::ExecutionPlace::Project
             },
             access,
+            owner: self.session_owner(request.user_claims.as_ref()).await,
         };
         self.graph
             .create_chat_session(&session_node)
@@ -6107,6 +6180,7 @@ impl ChatManager {
                                     code: None,
                                     reason: None,
                                     index: None,
+                                    request_id: None,
                                 },
                                 &events_tx,
                                 &nats,
@@ -6770,6 +6844,7 @@ impl ChatManager {
                                             code: None,
                                             reason: None,
                                             index: None,
+                                            request_id: None,
                                         },
                                         &events_tx,
                                         &nats,
@@ -9772,6 +9847,7 @@ impl ChatManager {
                 code: Some("turn_abandoned".to_string()),
                 reason: None,
                 index: None,
+                request_id: None,
             },
             ChatEvent::StreamingStatus {
                 is_streaming: false,
@@ -11554,6 +11630,12 @@ impl ChatManager {
         // opening (#598); its profile is signed into a per-session token, its network tools
         // follow the project's consent by origin and the browser its authorisation (#596).
         let mut gate: Option<Vec<String>> = None;
+        // The names of the native engine's own servers are reserved (P11b): a server of
+        // the session named `nexus` would replace nexus-tools, and its tools would pass for
+        // the built-in ones (`mcp__nexus__Read` granted whole for the session).
+        if kind == nexus_claude::agent::ProviderKind::Native {
+            refuse_reserved_native_servers(&spec.mcp_servers)?;
+        }
         if kind == nexus_claude::agent::ProviderKind::Native && remote_cwd.is_none() {
             use super::provider::native_factory::runnable_nexus_tools;
             use super::provider::nexus_tools as nt;
@@ -11595,10 +11677,7 @@ impl ChatManager {
                             "search engine left out of the session"
                         );
                     }
-                    for (name, server) in attachment.servers {
-                        // A session that already names its own server keeps it.
-                        spec.mcp_servers.entry(name).or_insert(server);
-                    }
+                    attach_native_servers(&mut spec.mcp_servers, attachment.servers)?;
                     gate = Some(attachment.search_origins);
                 }
                 None => tracing::warn!(
@@ -13384,6 +13463,50 @@ mod tests {
         }
     }
 
+    /// Review #679 finding 6: a session belongs to the person who opened it, a delegated
+    /// session to the person behind its parent; the server's own sessions to nobody.
+    #[tokio::test]
+    async fn a_session_belongs_to_the_person_behind_it() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        let m = ChatManager::new_without_memory(graph, mock_app_state().meili, test_config());
+        let person = Uuid::new_v4();
+        let secret = "test-secret-key-minimum-32-chars!!";
+        let human = crate::auth::jwt::decode_jwt(
+            &crate::auth::jwt::encode_jwt(person, "p@ffs.holdings", "P", secret, 60).unwrap(),
+            secret,
+        )
+        .unwrap();
+        assert_eq!(
+            m.session_owner(Some(&human)).await,
+            Some(person.to_string())
+        );
+        let server = crate::auth::jwt::Claims::service_account("runner");
+        assert_eq!(m.session_owner(Some(&server)).await, None);
+        assert_eq!(m.session_owner(None).await, None);
+
+        // The agent session token of a session P owns opens sessions P owns.
+        let parent = crate::neo4j::models::ChatSessionNode {
+            owner: Some(person.to_string()),
+            ..crate::test_helpers::test_chat_session(None)
+        };
+        mock.create_chat_session(&parent).await.unwrap();
+        let binding = crate::auth::jwt::AgentSessionBinding {
+            session_id: parent.id.to_string(),
+            ceiling: None,
+            tool_profile: None,
+            third_party: false,
+        };
+        let (token, _) =
+            crate::auth::jwt::generate_session_token(&human, Some(&binding), secret, 60).unwrap();
+        let agent = crate::auth::jwt::decode_jwt(&token, secret).unwrap();
+        assert!(agent.is_agent_session());
+        assert_eq!(
+            m.session_owner(Some(&agent)).await,
+            Some(person.to_string())
+        );
+    }
+
     fn neutral_session() -> crate::neo4j::models::ChatSessionNode {
         let mut s = crate::test_helpers::test_chat_session(None);
         s.execution_place = crate::chat::neutral_place::ExecutionPlace::Neutral;
@@ -14008,6 +14131,50 @@ mod tests {
             .await
             .mcp_servers
             .contains_key("nexus"));
+    }
+
+    /// P11b point 7: a server of a native session named `nexus` (or `browser`) is refused,
+    /// never kept in place of the backend's: nexus would skip nexus-tools and give its tools
+    /// the built-in names, so a third party's `mcp__nexus__Read` would be granted whole
+    /// for the session.
+    #[test]
+    fn a_native_session_server_named_nexus_is_refused() {
+        use nexus_claude::agent::McpServerSpec;
+        use std::collections::BTreeMap;
+        let server = |command: &str| McpServerSpec::Stdio {
+            command: command.to_string(),
+            args: Vec::new(),
+            env: Default::default(),
+        };
+        for reserved in RESERVED_NATIVE_SERVERS {
+            let mut servers = BTreeMap::new();
+            servers.insert("project-orchestrator".to_string(), server("/po/mcp_server"));
+            servers.insert(reserved.to_string(), server("/tmp/someone-elses-server"));
+            let refused = refuse_reserved_native_servers(&servers).unwrap_err();
+            assert!(refused.to_string().contains(reserved), "{refused}");
+
+            // The attachment does not keep the session's server in its place either.
+            let attached = BTreeMap::from([(reserved.to_string(), server("/usr/bin/nexus-tools"))]);
+            assert!(attach_native_servers(&mut servers, attached).is_err());
+            assert!(matches!(
+                servers.get(reserved),
+                Some(McpServerSpec::Stdio { command, .. }) if command == "/tmp/someone-elses-server"
+            ));
+        }
+        // Without a reserved name, the backend's servers are attached.
+        let mut servers = BTreeMap::new();
+        servers.insert("project-orchestrator".to_string(), server("/po/mcp_server"));
+        servers.insert("acme".to_string(), server("/opt/acme"));
+        refuse_reserved_native_servers(&servers).unwrap();
+        attach_native_servers(
+            &mut servers,
+            BTreeMap::from([("nexus".to_string(), server("/usr/bin/nexus-tools"))]),
+        )
+        .unwrap();
+        assert!(matches!(
+            servers.get("nexus"),
+            Some(McpServerSpec::Stdio { command, .. }) if command == "/usr/bin/nexus-tools"
+        ));
     }
 
     /// `nexus-tools` is launched with the session's directory as its working
@@ -17429,6 +17596,7 @@ mod tests {
             resume_token: None,
             execution_place: Default::default(),
             access: Default::default(),
+            owner: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -17798,6 +17966,7 @@ mod tests {
             resume_token: None,
             execution_place: Default::default(),
             access: Default::default(),
+            owner: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -17837,6 +18006,7 @@ mod tests {
             resume_token: None,
             execution_place: Default::default(),
             access: Default::default(),
+            owner: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -18556,6 +18726,7 @@ mod tests {
                 code: None,
                 reason: None,
                 index: None,
+                request_id: None,
             },
             ChatEvent::Result {
                 session_id: "cli-123".into(),

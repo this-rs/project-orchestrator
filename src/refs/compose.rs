@@ -59,6 +59,7 @@ impl ComposeError {
                     .ok()
                     .and_then(|v| v.as_str().map(str::to_string)),
                 index: body.index,
+                request_id: None,
             },
             ComposeError::Attachments(e) => ChatEvent::Error {
                 message: format!("Failed to attach documents: {e}"),
@@ -66,6 +67,7 @@ impl ComposeError {
                 code: None,
                 reason: None,
                 index: None,
+                request_id: None,
             },
         }
     }

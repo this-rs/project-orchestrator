@@ -18,9 +18,12 @@
 //!    is `{reason}`: no path, no diff), its `shell` (an argv joined by spaces: `["rm",
 //!    "a b"]` and `["rm", "a", "b"]` read the same) or `request_permissions`; never ACP.
 //! 2. The tool must be a known one whose identical call does the same thing:
-//!    - a read-only built-in tool of `nexus-tools` (`Read`, `Glob`, `Grep`, `LS`,
+//!    - the read-only built-in tools of `nexus-tools` (`Read`, `Glob`, `Grep`, `LS`,
 //!      `NotebookRead`), identified FOR SURE (the adapter's `canonical` name AND the
-//!      `mcp__nexus__` name it belongs to), is covered whole: any later call of it;
+//!      `mcp__nexus__` name it belongs to): the identical call, never the whole tool
+//!      (P11b decision: a whole-tool grant would cover a later read of any path the
+//!      session can reach, the extra directories of a workspace included; nexus asks no
+//!      read today, so the identical call costs nothing);
 //!    - the file tools (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`), the reads of the
 //!      CLI (it only asks a read OUTSIDE the working directory, so never whole) and the
 //!      web tools (`WebFetch`, `WebSearch`): the identical call;
@@ -64,11 +67,6 @@ use serde_json::Value;
 /// The MCP server under which the native engine serves its built-in tools
 /// (`mcp__nexus__Read`).
 const NEXUS_TOOLS_SERVER: &str = nexus_claude::providers::native::NEXUS_TOOLS_SERVER;
-
-/// Read-only built-in tools of `nexus-tools` (no side effect): a session grant covers any
-/// later call of them on the native engine, once identified for sure
-/// ([`AskedCall::nexus_builtin`]).
-const READ_ONLY: &[&str] = &["Read", "Glob", "Grep", "LS", "NotebookRead"];
 
 /// Built-in tools (Claude Code CLI names, `nexus-tools` canonical names) whose input is the
 /// whole call and whose identical call does the same thing: granted for the identical call.
@@ -310,7 +308,6 @@ pub struct AskedCall {
 
 /// What a session grant of a call would be, before the input is looked at.
 enum Kind {
-    WholeTool,
     Exact,
     Command,
 }
@@ -379,9 +376,7 @@ impl AskedCall {
         match self.asker {
             Asker::Native => {
                 if let Some(name) = self.nexus_builtin() {
-                    return if READ_ONLY.contains(&name) {
-                        Some(Kind::WholeTool)
-                    } else if EXACT_TOOLS.contains(&name) {
+                    return if EXACT_TOOLS.contains(&name) {
                         Some(Kind::Exact)
                     } else if COMMAND_BUILTINS.contains(&name) {
                         Some(Kind::Command)
@@ -427,8 +422,6 @@ impl AskedCall {
 /// What one session grant covers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionGrant {
-    /// Any later call of this read-only tool.
-    WholeTool { tool: String },
     /// Exactly this call again.
     Exact { tool: String, input: String },
 }
@@ -437,7 +430,6 @@ impl SessionGrant {
     /// The grant as the user is shown it (`permission_decision.rule`).
     pub fn describe(&self) -> String {
         match self {
-            Self::WholeTool { tool } => format!("{tool} (read-only)"),
             Self::Exact { tool, input } => {
                 // A command reads as the command line; anything else as its input.
                 let command = serde_json::from_str::<Value>(input)
@@ -666,9 +658,6 @@ fn grant_with(call: &AskedCall, read_only_mcp: &[String]) -> Option<SessionGrant
         return None;
     }
     match call.kind(read_only_mcp)? {
-        Kind::WholeTool => Some(SessionGrant::WholeTool {
-            tool: call.tool.clone(),
-        }),
         Kind::Command if !command_is_grantable(call) => None,
         Kind::Exact | Kind::Command => Some(SessionGrant::Exact {
             tool: call.tool.clone(),
@@ -1257,7 +1246,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_only_tool_of_nexus_is_granted_whole_any_other_only_for_the_identical_call() {
+    fn a_tool_of_nexus_read_only_or_not_is_granted_only_for_the_identical_call() {
         let read = |path: &str| {
             call(
                 Asker::Native,
@@ -1266,12 +1255,34 @@ mod tests {
                 json!({ "file_path": path }),
             )
         };
+        // P11b decision: a read is granted for the identical call, never the whole tool (a
+        // whole-tool grant covers any later read the session can reach: any file of the
+        // project, the extra directories of a workspace).
         let grants = granted(&read("a.rs"));
-        assert!(grants.covering(&read("b.rs")).is_some());
+        assert!(grants.covering(&read("a.rs")).is_some());
+        assert!(grants.covering(&read("b.rs")).is_none());
+        assert!(grants
+            .covering(&read("/Users/me/.ssh/id_ed25519"))
+            .is_none());
         assert_eq!(
             grant_for(&read("a.rs")).unwrap().describe(),
-            "mcp__nexus__Read (read-only)"
+            r#"mcp__nexus__Read {"file_path":"a.rs"}"#
         );
+        for (tool, input) in [
+            ("Grep", json!({ "pattern": "fn main" })),
+            ("Glob", json!({ "pattern": "**/*.rs" })),
+            ("LS", json!({ "path": "src" })),
+            ("NotebookRead", json!({ "notebook_path": "a.ipynb" })),
+        ] {
+            let name = format!("mcp__nexus__{tool}");
+            let at = |input: Value| call(Asker::Native, &name, Some(tool), input);
+            let grants = granted(&at(input.clone()));
+            assert!(grants.covering(&at(input)).is_some(), "{tool}");
+            assert!(
+                grants.covering(&at(json!({ "path": "/" }))).is_none(),
+                "{tool}"
+            );
+        }
 
         let write = |path: &str, content: &str| {
             call(
@@ -1381,19 +1392,6 @@ mod tests {
                 }
             }
         }
-        // A whole-tool grant never covers a third party's tool of that name.
-        let mut grants = declared(&["mcp__other__Read"]);
-        grants.add(SessionGrant::WholeTool {
-            tool: "mcp__other__Read".into(),
-        });
-        assert!(grants
-            .covering(&call(
-                Asker::Native,
-                "mcp__other__Read",
-                None,
-                json!({ "file_path": "x" }),
-            ))
-            .is_none());
         // Nor a `nexus` tool the adapter did not name, even "declared".
         assert!(declared(&["mcp__nexus__Read"])
             .grant_for(&call(

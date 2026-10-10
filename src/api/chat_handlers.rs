@@ -880,6 +880,7 @@ const PERMISSION_GONE_REASON: &str = "le CLI qui demandait s'est arrêté ; cont
 /// - **200** `{ "routed": "local" | "remote" }` — delivered to the CLI.
 /// - **400** `permission_scope_unsupported` — the session does not offer that scope
 ///   (`capabilities.permission_scopes`); nothing was answered, the request still waits.
+/// - **403** — the session belongs to another person (`ChatSessionNode::owner`).
 /// - **404** — unknown session, or no such permission request on it.
 /// - **409** — the request was already decided (double click, two tabs).
 /// - **410** — the CLI that asked is gone; the answer is REFUSED, never
@@ -887,6 +888,7 @@ const PERMISSION_GONE_REASON: &str = "le CLI qui demandait s'est arrêté ; cont
 pub async fn respond_permission(
     State(state): State<OrchestratorState>,
     Path((session_id, request_id)): Path<(Uuid, String)>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
     Json(body): Json<PermissionAnswerRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::chat::attention::{permission_status, PermissionStatus};
@@ -899,11 +901,22 @@ pub async fn respond_permission(
         return Err(AppError::BadRequest("request_id must not be empty".into()));
     }
     let neo4j = state.orchestrator.neo4j();
-    neo4j
+    let session = neo4j
         .get_chat_session(session_id)
         .await
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Session {} not found", session_id)))?;
+    // Only the person the session belongs to answers it (review #679 finding 6): another
+    // signed-in user could otherwise approve, or grant for the session, a call in someone
+    // else's conversation.
+    if let Some(axum::Extension(caller)) = &claims {
+        if !session.answerable_by(&caller.sub) {
+            return Err(AppError::Forbidden(
+                "only the person this conversation belongs to can answer its permission requests"
+                    .to_string(),
+            ));
+        }
+    }
 
     let status = |events: Vec<crate::neo4j::models::ChatEventRecord>| {
         permission_status(&events, &request_id)
@@ -4301,6 +4314,66 @@ mod tests {
         let reason = body["error"].as_str().unwrap();
         assert!(reason.contains("s'est arrêté"), "{reason}");
         assert!(reason.contains("continue par un message"), "{reason}");
+    }
+
+    /// Review #679 finding 6: a person answers only the permission requests of THEIR
+    /// conversation. Another signed-in user gets 403 and nothing is answered (the request
+    /// still waits for its owner); the owner goes through (here 410: the CLI is gone).
+    #[tokio::test]
+    async fn only_the_owner_of_a_session_answers_its_permission_requests() {
+        let h = action_harness(None).await;
+        let owner = Uuid::new_v4();
+        let session = crate::neo4j::models::ChatSessionNode {
+            owner: Some(owner.to_string()),
+            ..test_chat_session(None)
+        };
+        h.graph.create_chat_session(&session).await.unwrap();
+        let sid = session.id;
+        seed_permission_request(&h, sid, 1, "req-owned").await;
+        let post_as = |person: Uuid| {
+            let token = crate::auth::jwt::encode_jwt(
+                person,
+                "someone@ffs.holdings",
+                "Someone",
+                "test-secret-key-minimum-32-chars!!",
+                28800,
+            )
+            .unwrap();
+            Request::builder()
+                .method("POST")
+                .uri(perm_uri(sid, "req-owned"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(r#"{"allow":true,"scope":"session"}"#))
+                .unwrap()
+        };
+
+        let (status, body) = call(&h.app, post_as(Uuid::new_v4())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        // Nothing was decided for the owner.
+        let events = h.graph.get_attention_events(&[sid]).await.unwrap();
+        assert_eq!(
+            crate::chat::attention::permission_status(&events, "req-owned"),
+            crate::chat::attention::PermissionStatus::Pending,
+        );
+
+        let (status, body) = call(&h.app, post_as(owner)).await;
+        assert_eq!(status, StatusCode::GONE, "the owner is let through: {body}");
+    }
+
+    /// A session nobody owns (opened by the server itself, or before owners existed) is
+    /// answered as before: by any signed-in person.
+    #[tokio::test]
+    async fn a_session_without_an_owner_is_answered_by_any_person() {
+        let h = action_harness(None).await;
+        let sid = seed_session(&h).await;
+        seed_permission_request(&h, sid, 1, "req-free").await;
+        let (status, body) = call(
+            &h.app,
+            auth_post(&perm_uri(sid, "req-free"), r#"{"allow":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE, "{body}");
     }
 
     #[tokio::test]
