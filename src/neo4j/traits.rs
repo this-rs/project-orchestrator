@@ -2098,6 +2098,17 @@ pub trait GraphStore: Send + Sync {
     /// survives idle-cleanup and is honored on resume/respawn)
     async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()>;
 
+    /// Replace the routing of ONE conversation (`PUT /api/chat/sessions/{id}/routing`):
+    /// mode, pool (JSON) and `routed_by`, `None` = cleared. Additive properties, read
+    /// with defaults. `false` when the session does not exist.
+    async fn update_chat_session_routing(
+        &self,
+        id: Uuid,
+        routing_mode: Option<&str>,
+        routing_pool: Option<&str>,
+        routed_by: Option<&str>,
+    ) -> Result<bool>;
+
     /// Settings of the provider harness (instances, consents, roles, aliases,
     /// policy), one JSON document per (scope, key). Scope is `global` or
     /// `project:<slug>`.

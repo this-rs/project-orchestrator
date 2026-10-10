@@ -1362,6 +1362,7 @@ fn delegation_chat_request(
 ) -> Result<crate::chat::types::ChatRequest, crate::chat::envelope::EnvelopeError> {
     let mut request = crate::chat::types::ChatRequest {
         access: None,
+        routing_pool: None,
         routing_mode: None,
         attachments: Vec::new(),
         refs: Vec::new(),

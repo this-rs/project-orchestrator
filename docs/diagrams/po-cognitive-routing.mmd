@@ -1,6 +1,6 @@
 %% name: po-cognitive-routing
 %% covers: backend:src/api/routing_handlers.rs backend:src/chat/provider/cognitive/** backend:src/neo4j/routing.rs backend:src/runner/routing.rs
-%% verified: 8b0b020f
+%% verified: 29a6f4d0
 %% ---
 %% PROUVE : la couche RÉGLAGES du routage cognitif (RFC v2, décision R2, tranche B-R1) : le mode de routage
 %%   (primary | mixed | full) et l'étape d'apprentissage (shadow | advisory | auto), réglés en global avec surcharge
@@ -20,6 +20,9 @@
 %%   src/chat/provider/cognitive/decider.rs — is_applied, decide_with (pur), CognitiveDecider (Decider), CognitiveRouting
 %%   src/neo4j/routing.rs — Neo4jClient::{get,list,observe}_routing_arm_impl, *_routing_decision_impl, Neo4jRoutingStore (RoutingArmStore sur GraphStore) ; neo4j/{traits,mock,impl_graph_store}.rs
 %%   src/chat/manager.rs — resolve_provider_choice, cognitive_decision, routing_pool, with_cognitive_routing ; src/chat/agent_e2e_tests.rs — mod cognitive_routing
+%%   src/chat/manager.rs — routing_pool_of, allowed_models_of, register_turn_router, set_session_routing ; src/chat/agent_hooks.rs — TurnRouter.choice, reroute ;
+%%   src/chat/types.rs — RoutingPoolEntry, settle_routing_pool, ChatRequest::settled_routing, SessionRoutingRequest, SessionRoutingError ;
+%%   src/api/chat_handlers.rs — set_session_routing (PUT /api/chat/sessions/{id}/routing) ; src/neo4j/chat.rs — update_chat_session_routing
 %%   src/chat/provider/cognitive/signature.rs — TaskClass, ChatIntent, TaskSignature (from_chat_request, from_task, from_delegation, utility, arm_key), ContextHints
 %%   src/chat/provider/cognitive/candidates.rs — ModelFacts (from_capabilities, estimated_turn_cost_usd), RejectReason, Slot, apply, Filtered, HealthCache
 %%   src/runner/persona.rs — profile_task (classification reprise) ; src/neurons/intent.rs — IntentDetector (mots-clés FR/EN)
@@ -188,4 +191,14 @@ flowchart TD
         TURNGAP["✅ wire_learning configure TurnRouting avec le décideur réel et ManagerPool (pool restreint au provider de la session) ; test : le même<br/>🟠 with_turn_decider reste un point d entrée de test ; le mode full par tour n a jamais tourné contre un vrai modèle"]
         TURN -.-> TURNGAP
     end
+
+    subgraph conv["Routage d'UNE conversation — le menu du chat (ChatRequest.routing_mode / routing_pool, PUT /api/chat/sessions/{id}/routing)"]
+        CONVOPEN["✅ à l'ouverture : ChatRequest::settled_routing (1 modèle coché = strict : provider + model nommés, primary, épinglé ; pool vide = aucun) ; cognitive_decision prend le routing_mode de la requête à la place des réglages (Auto = full) et restreint le pool aux couples cochés, routés comme full ; rien de nommé et aucune décision appliquée parmi eux = le premier coché (routed_by request), jamais un défaut non coché ; un pilote nommé avec un pool ouvre la conversation sans être épinglé<br/>test : the_models_ticked_are_the_only_candidates_when_a_conversation_opens (rouge sans la restriction), a_pool_is_routed_at_open_even_when_the_settings_say_primary, auto_in_the_request_routes_the_opening_even_when_the_settings_say_primary, one_model_ticked_at_open_is_strict"]
+        CONVTURN["✅ par tour : TurnRouter.choice (Mutex : réglages, explicit_model, allowed_models = modèles cochés du provider de la SESSION seulement ; vide = aucun changement) ; une session = un provider : changer de provider = switch-provider<br/>test : a_mixed_conversation_is_routed_among_its_pool_only, a_pilot_named_with_a_pool_is_not_a_pin"]
+        CONVPUT["✅ PUT /api/chat/sessions/{id}/routing {auto} | {auto:false, routing_pool} → ChatManager::set_session_routing : auto = full + pin retiré (« rendre la main à PO », routed_by auto) ; 1 modèle = primary, posé tout de suite (set_session_model) et épinglé, jamais substitué (A16, routed_by request) ; 2+ = mixed (routed_by auto) ; TurnRouter::reroute pour le tour suivant ; stocké sur le nœud ChatSession (routing_mode, routing_pool JSON, routed_by — additifs, lus avec défaut) ; JAMAIS les réglages globaux ou projet ; refus typés 400 invalid_routing_pool | routing_pool_other_provider, 404 ; humain seulement (middleware + handler)<br/>test : auto_on_an_open_conversation_hands_an_imposed_model_back_to_po (rouge sans la route), one_model_ticked_on_an_open_conversation_is_imposed_and_never_substituted, models_ticked_on_an_open_conversation_restrict_its_next_turns, a_conversations_routing_never_writes_the_global_or_project_settings, a_routing_that_needs_another_provider_or_no_model_is_refused_and_changes_nothing, human_only_mutation_matches_whole_segments_only<br/>🟠 à l'étape shadow/advisory, un modèle courant hors du pool y reste jusqu'à ce que le stage soit auto ; la reprise relit routing_mode/routing_pool du nœud (register_turn_router), sans test dédié"]
+        CONVOPEN --> CONVTURN
+        CONVPUT --> CONVTURN
+    end
+    BAPPLY -.-> CONVOPEN
+    TURN -.-> CONVTURN
     FACTSGAP -.-> TURN

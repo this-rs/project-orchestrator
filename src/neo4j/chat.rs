@@ -71,6 +71,7 @@ impl Neo4jClient {
                     provider_id: $provider_id,
                     routed_by: $routed_by,
                     routing_mode: $routing_mode,
+                    routing_pool: $routing_pool,
                     capabilities: $capabilities,
                     resume_token: $resume_token,
                     execution_place: $execution_place,
@@ -106,6 +107,7 @@ impl Neo4jClient {
                     provider_id: $provider_id,
                     routed_by: $routed_by,
                     routing_mode: $routing_mode,
+                    routing_pool: $routing_pool,
                     capabilities: $capabilities,
                     resume_token: $resume_token,
                     execution_place: $execution_place,
@@ -160,6 +162,10 @@ impl Neo4jClient {
                     .param(
                         "routing_mode",
                         session.routing_mode.clone().unwrap_or_default(),
+                    )
+                    .param(
+                        "routing_pool",
+                        session.routing_pool.clone().unwrap_or_default(),
                     )
                     .param(
                         "capabilities",
@@ -387,6 +393,29 @@ impl Neo4jClient {
             .param("model", model.to_string());
         self.graph.run(q).await?;
         Ok(())
+    }
+
+    /// Replace the routing of one conversation; an absent value is stored empty (read back
+    /// as `None`, like every optional session property). `false`: no such session.
+    pub async fn update_chat_session_routing(
+        &self,
+        id: Uuid,
+        routing_mode: Option<&str>,
+        routing_pool: Option<&str>,
+        routed_by: Option<&str>,
+    ) -> Result<bool> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $id}) \
+             SET s.routing_mode = $routing_mode, s.routing_pool = $routing_pool, \
+                 s.routed_by = $routed_by, s.updated_at = datetime() \
+             RETURN s.id AS id",
+        )
+        .param("id", id.to_string())
+        .param("routing_mode", routing_mode.unwrap_or_default().to_string())
+        .param("routing_pool", routing_pool.unwrap_or_default().to_string())
+        .param("routed_by", routed_by.unwrap_or_default().to_string());
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
     }
 
     /// One setting document of the provider harness.
@@ -1032,6 +1061,7 @@ impl Neo4jClient {
             provider_id: non_empty("provider_id"),
             routed_by: non_empty("routed_by"),
             routing_mode: non_empty("routing_mode"),
+            routing_pool: non_empty("routing_pool"),
             capabilities: non_empty("capabilities"),
             resume_token: non_empty("resume_token"),
             execution_place: ExecutionPlace::parse_stored(

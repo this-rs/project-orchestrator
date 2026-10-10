@@ -313,14 +313,13 @@ struct TurnState {
 pub(crate) struct TurnRouter {
     decider: Arc<dyn Decider>,
     pool: Arc<dyn PoolSource>,
-    /// Mode and stage, read once when the session opened.
-    routing: RoutingSettings,
+    /// Mode, stage, pin and pool of the conversation: read when the session opened,
+    /// replaced by `PUT /api/chat/sessions/{id}/routing` (never by the global settings).
+    choice: Mutex<RouterChoice>,
     provider_id: String,
     session_id: Option<Uuid>,
     project_slug: Option<String>,
     trust: bool,
-    /// The request named its model: it is never replaced.
-    explicit_model: bool,
     /// The session can switch model between turns (known once it is open).
     set_model_live: AtomicBool,
     /// The user changed the model by hand: no more automatic change.
@@ -328,6 +327,16 @@ pub(crate) struct TurnRouter {
     last_message: Mutex<Option<String>>,
     state: Mutex<TurnState>,
     timeout: Duration,
+}
+
+/// What the conversation asked of its routing, as the router holds it.
+#[derive(Debug, Clone)]
+struct RouterChoice {
+    routing: RoutingSettings,
+    /// The model is imposed (named by the request, or one model ticked): never replaced.
+    explicit_model: bool,
+    /// Models of this provider the conversation may be routed among (a pool); `None` = all.
+    allowed_models: Option<Vec<String>>,
 }
 
 /// What opens a [`TurnRouter`].
@@ -340,6 +349,7 @@ pub(crate) struct TurnRouterSpec {
     pub project_slug: Option<String>,
     pub trust: bool,
     pub explicit_model: bool,
+    pub allowed_models: Option<Vec<String>>,
     pub current_model: String,
     /// Index the next turn counted by the router itself gets (legacy engine).
     pub next_turn: u32,
@@ -356,12 +366,15 @@ impl TurnRouter {
         Self {
             decider: spec.decider,
             pool: spec.pool,
-            routing: spec.routing,
+            choice: Mutex::new(RouterChoice {
+                routing: spec.routing,
+                explicit_model: spec.explicit_model,
+                allowed_models: spec.allowed_models,
+            }),
             provider_id: spec.provider_id,
             session_id: spec.session_id,
             project_slug: spec.project_slug,
             trust: spec.trust,
-            explicit_model: spec.explicit_model,
             set_model_live: AtomicBool::new(false),
             manual: AtomicBool::new(false),
             last_message: Mutex::new(None),
@@ -388,6 +401,23 @@ impl TurnRouter {
     /// Whether the session can switch model between turns.
     pub(crate) fn set_model_live(&self, live: bool) {
         self.set_model_live.store(live, Ordering::SeqCst);
+    }
+
+    /// The conversation's routing changed (`PUT .../routing`): from the next turn on, `mode`
+    /// replaces the one the session opened with, `allowed_models` (this provider's models of
+    /// the pool) restricts the candidates, `explicit_model` pins the current model. Whatever
+    /// was set by hand before is forgotten: this IS the new choice by hand.
+    pub(crate) fn reroute(
+        &self,
+        mode: ProviderRoutingMode,
+        allowed_models: Option<Vec<String>>,
+        explicit_model: bool,
+    ) {
+        let mut choice = locked(&self.choice);
+        choice.routing.mode = mode;
+        choice.allowed_models = allowed_models;
+        choice.explicit_model = explicit_model;
+        self.manual.store(false, Ordering::SeqCst);
     }
 
     /// The user changed the model by hand: the router leaves the session alone.
@@ -423,8 +453,14 @@ impl TurnRouter {
 pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -> TurnDirective {
     // The harness knows the model the turn would run on, whoever changed it.
     locked(&router.state).current_model = ctx.current_model.clone();
-    if router.routing.mode != ProviderRoutingMode::Full
-        || router.explicit_model
+    let choice = locked(&router.choice).clone();
+    // `full` routes everything; a pool (mixed, models ticked in the menu) routes among them.
+    let routed =
+        choice.routing.mode == ProviderRoutingMode::Full || choice.allowed_models.is_some();
+    if !routed
+        || choice.explicit_model
+        // A pool none of whose models is on this provider: nothing to route among here.
+        || choice.allowed_models.as_ref().is_some_and(Vec::is_empty)
         || router.manual.load(Ordering::SeqCst)
         || !router.set_model_live.load(Ordering::SeqCst)
     {
@@ -434,8 +470,12 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
     let just_changed = locked(&router.state)
         .last_change_turn
         .is_some_and(|turn| turn.checked_add(1) == Some(ctx.turn_index));
-    let apply = router.routing.stage == LearningStage::Auto && !just_changed;
-    let mut settings = router.routing.clone();
+    let apply = choice.routing.stage == LearningStage::Auto && !just_changed;
+    let mut settings = choice.routing.clone();
+    // A pool is routed like `full` inside it, whatever the settings' mode.
+    if choice.allowed_models.is_some() {
+        settings.mode = ProviderRoutingMode::Full;
+    }
     if !apply {
         settings.stage = match settings.stage {
             LearningStage::Auto => LearningStage::Shadow,
@@ -450,7 +490,10 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
         ContextHints::default(),
     );
     let decision = tokio::time::timeout(router.timeout, async {
-        let pool = router.pool.pool(&router.provider_id).await;
+        let mut pool = router.pool.pool(&router.provider_id).await;
+        if let Some(allowed) = &choice.allowed_models {
+            pool.retain(|facts| allowed.iter().any(|m| m == &facts.model));
+        }
         let mut request = DecideRequest::new(signature, settings, pool);
         request.trust = router.trust;
         request.restrict_provider = Some(router.provider_id.clone());

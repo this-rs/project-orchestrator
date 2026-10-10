@@ -185,6 +185,115 @@ impl RunnerContext {
     }
 }
 
+/// One (provider, model) a conversation may be routed to: a model ticked in the chat menu.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingPoolEntry {
+    /// Provider instance id (`claude-code`, `local-llama`...).
+    pub provider: String,
+    /// Model id on that instance (never an alias name).
+    pub model: String,
+}
+
+/// Body of `PUT /api/chat/sessions/{id}/routing`: the chat menu of ONE existing
+/// conversation. The mode follows the ticks: `auto: true` = PO routes (`full`, the
+/// pool is ignored, a model imposed before is released); otherwise one model ticked =
+/// strict (`primary`, that model imposed), two or more = `mixed` among them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRoutingRequest {
+    /// Hand the conversation back to PO.
+    #[serde(default)]
+    pub auto: bool,
+    /// The models ticked (read when `auto` is false), same shape as `ChatRequest.routing_pool`.
+    #[serde(default)]
+    pub routing_pool: Vec<RoutingPoolEntry>,
+}
+
+/// Why `PUT /api/chat/sessions/{id}/routing` was refused (nothing was changed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRoutingError {
+    /// No such session.
+    NotFound,
+    /// Neither Auto nor any model ticked.
+    EmptyPool,
+    /// An entry without its provider or its model (index in the body).
+    BlankEntry(usize),
+    /// No ticked model is on the session's provider: a conversation runs on one
+    /// provider, moving it is `POST .../switch-provider`.
+    OtherProvider(String),
+}
+
+impl SessionRoutingError {
+    /// Stable machine code of the refusal.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotFound => "session_not_found",
+            Self::EmptyPool | Self::BlankEntry(_) => "invalid_routing_pool",
+            Self::OtherProvider(_) => "routing_pool_other_provider",
+        }
+    }
+}
+
+impl std::fmt::Display for SessionRoutingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "session not found"),
+            Self::EmptyPool => write!(f, "tick at least one model, or ask for auto"),
+            Self::BlankEntry(i) => write!(f, "routing_pool[{i}] needs a provider and a model"),
+            Self::OtherProvider(provider) => write!(
+                f,
+                "no ticked model is on '{provider}', the provider of this conversation: \
+                 move it with switch-provider"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SessionRoutingError {}
+
+/// The ticks of a pool, without blanks or duplicates, in the order given.
+/// `Err` names the first blank entry: a pool entry must name both halves.
+pub fn settle_routing_pool(pool: &[RoutingPoolEntry]) -> Result<Vec<RoutingPoolEntry>, usize> {
+    let mut settled: Vec<RoutingPoolEntry> = Vec::with_capacity(pool.len());
+    for (index, entry) in pool.iter().enumerate() {
+        let entry = RoutingPoolEntry {
+            provider: entry.provider.trim().to_owned(),
+            model: entry.model.trim().to_owned(),
+        };
+        if entry.provider.is_empty() || entry.model.is_empty() {
+            return Err(index);
+        }
+        if !settled.contains(&entry) {
+            settled.push(entry);
+        }
+    }
+    Ok(settled)
+}
+
+impl ChatRequest {
+    /// The routing the request asks for, read the way the chat menu means it: the mode
+    /// follows the ticks. An empty pool is no pool; a pool of ONE is strict (that
+    /// provider and that model, named as if the request had named them, `primary`,
+    /// never substituted); two or more stay a pool. `None` when nothing changes.
+    pub fn settled_routing(&self) -> Option<ChatRequest> {
+        let pool = self.routing_pool.as_ref()?;
+        let settled = settle_routing_pool(pool).unwrap_or_else(|_| pool.clone());
+        let mut request = self.clone();
+        match settled.as_slice() {
+            [] => request.routing_pool = None,
+            [only] => {
+                request.provider = Some(only.provider.clone());
+                request.model = Some(only.model.clone());
+                request.routing_mode =
+                    Some(crate::chat::provider::cognitive::ProviderRoutingMode::Primary);
+                request.routing_pool = None;
+            }
+            _ if settled == *pool => return None,
+            _ => request.routing_pool = Some(settled),
+        }
+        Some(request)
+    }
+}
+
 /// Request to send a chat message
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatRequest {
@@ -229,6 +338,14 @@ pub struct ChatRequest {
     /// conversation opens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing_mode: Option<crate::chat::provider::cognitive::ProviderRoutingMode>,
+    /// The (provider, model) pairs PO may route THIS conversation among (the models
+    /// ticked in the menu), sent with `routing_mode: mixed`. The candidates of the open-time
+    /// decision AND of every per-turn decision are restricted to it; a named pilot is not a
+    /// pin then. One entry = strict (that model, never substituted); absent or empty = every
+    /// eligible model. Per turn only the entries of the session's own provider count: a
+    /// conversation runs on ONE provider, moving it is `switch-provider`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_pool: Option<Vec<RoutingPoolEntry>>,
     /// Model alias set on the task (A16 level "task"). Internal.
     #[serde(skip)]
     pub task_alias: Option<String>,
@@ -1135,9 +1252,12 @@ pub struct ChatSession {
     /// Which precedence level chose the provider (`session`, `request`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routed_by: Option<String>,
-    /// Routing mode this conversation was opened with, when its request named one.
+    /// Routing mode of this conversation, when its request (or `PUT .../routing`) named one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing_mode: Option<String>,
+    /// The models PO may route this conversation among (`mixed`), as ticked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_pool: Option<Vec<RoutingPoolEntry>>,
 }
 
 /// What a chat session is doing *right now*, read from the live
@@ -2434,6 +2554,7 @@ mod tests {
     fn test_chat_session_serde_roundtrip() {
         let session = ChatSession {
             routing_mode: None,
+            routing_pool: None,
             id: "test-id".into(),
             cli_session_id: Some("cli-123".into()),
             project_slug: Some("my-project".into()),
@@ -2658,6 +2779,7 @@ mod tests {
     fn test_chat_session_with_workspace_and_add_dirs() {
         let session = ChatSession {
             routing_mode: None,
+            routing_pool: None,
             id: "s1".into(),
             cli_session_id: None,
             project_slug: Some("proj".into()),

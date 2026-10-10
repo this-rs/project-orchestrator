@@ -333,6 +333,10 @@ fn session_node_to_response(s: crate::neo4j::models::ChatSessionNode) -> ChatSes
         activity: None,
         provider_id: s.provider_id,
         routing_mode: s.routing_mode,
+        routing_pool: s
+            .routing_pool
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok()),
         capabilities: None,
         routed_by: s.routed_by,
         execution_place: s.execution_place,
@@ -1158,6 +1162,86 @@ pub async fn update_session(
 
     // Field-for-field copy of `session_node_to_response`, so a rename cannot
     // start answering a different shape from the rest of the endpoints.
+    let mut session = session_node_to_response(updated);
+    stamp_activity(&state, std::slice::from_mut(&mut session)).await;
+    Ok(Json(session))
+}
+
+// ============================================================================
+// Routing of one conversation (the chat menu)
+// ============================================================================
+
+/// PUT /api/chat/sessions/{id}/routing — change how THIS conversation is routed,
+/// from its next turn on.
+///
+/// Body `{ "auto": true }` hands the conversation back to PO (`routing_mode: full`,
+/// `routed_by: auto`, a model imposed before is released). Body
+/// `{ "auto": false, "routing_pool": [{ "provider", "model" }, ...] }`: one model ticked =
+/// strict (`primary`, that model imposed now and never substituted, `routed_by: request`),
+/// two or more = `mixed` (PO routes among them). Answers the session (`ChatSession`, with
+/// `routing_mode`, `routing_pool`, `routed_by`, `model`).
+///
+/// Stored on the session only: the global and project routing settings are never
+/// written. A conversation runs on ONE provider: per turn, only the ticked models of the
+/// session's provider are candidates; a strict model on another provider, or a pool
+/// with none on it, is refused (400 `routing_pool_other_provider`): moving the
+/// conversation is `POST .../switch-provider`. 400 `invalid_routing_pool`: nothing
+/// ticked, or an entry without provider or model. 404 unknown session. A person's
+/// call: 403 for an agent session token, like a model change (WebSocket only).
+pub async fn set_session_routing(
+    State(state): State<OrchestratorState>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    headers: axum::http::HeaderMap,
+    Path(session_id): Path<Uuid>,
+    Json(body): Json<crate::chat::types::SessionRoutingRequest>,
+) -> Result<Json<ChatSession>, AppError> {
+    use crate::chat::envelope;
+    use crate::chat::types::SessionRoutingError;
+    let caller = envelope::identify_caller(
+        claims.as_ref().map(|c| &c.0),
+        envelope::session_header(&headers),
+        state.auth_config.is_some(),
+    )?;
+    if matches!(caller, envelope::SpawnCaller::Agent { .. }) {
+        return Err(AppError::Forbidden(
+            "only a signed-in user can change how a conversation is routed".to_string(),
+        ));
+    }
+    let chat_manager = state
+        .chat_manager
+        .as_ref()
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
+    let updated = chat_manager
+        .set_session_routing(&session_id.to_string(), &body)
+        .await
+        .map_err(|error| match error.downcast_ref::<SessionRoutingError>() {
+            Some(SessionRoutingError::NotFound) => {
+                AppError::NotFound(format!("Session {session_id} not found"))
+            }
+            Some(refusal) => {
+                AppError::Provider(Box::new(crate::chat::provider::errors::OpenFailure {
+                    status: axum::http::StatusCode::BAD_REQUEST.as_u16(),
+                    code: refusal.code(),
+                    message: refusal.to_string(),
+                    provider_id: None,
+                    action: None,
+                    retryable: false,
+                    retry_after_ms: None,
+                }))
+            }
+            None => AppError::Internal(error),
+        })?;
+    state.event_bus.emit(
+        CrudEvent::new(
+            EntityType::ChatSession,
+            CrudAction::Updated,
+            session_id.to_string(),
+        )
+        .with_payload(serde_json::json!({
+            "routing_mode": updated.routing_mode,
+            "routed_by": updated.routed_by,
+        })),
+    );
     let mut session = session_node_to_response(updated);
     stamp_activity(&state, std::slice::from_mut(&mut session)).await;
     Ok(Json(session))
@@ -2532,6 +2616,7 @@ mod tests {
         );
         let request = crate::chat::types::ChatRequest {
             access: None,
+            routing_pool: None,
             routing_mode: None,
             attachments: Vec::new(),
             refs: Vec::new(),

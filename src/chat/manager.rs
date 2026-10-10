@@ -553,6 +553,8 @@ pub(crate) struct OpeningTurn<'a> {
     pub explicit_model: bool,
     /// The mode the request asked for; it replaces the one of the settings for this conversation.
     pub routing_mode: Option<super::provider::cognitive::ProviderRoutingMode>,
+    /// The pairs the request restricted routing to (`mixed`).
+    pub routing_pool: Option<Vec<super::types::RoutingPoolEntry>>,
     pub permission_mode: Option<&'a str>,
     /// The message of the turn about to start.
     pub message: &'a str,
@@ -1682,6 +1684,23 @@ impl ChatManager {
         )
     }
 
+    /// The models of `provider_id` a pool lets the per-turn decision choose among: `None`
+    /// without a pool (or with one model only: strict, a pin), `Some(empty)` when no ticked
+    /// model is on this provider (the conversation then stays on its model: moving to another
+    /// provider is `switch-provider`, never a per-turn change).
+    fn allowed_models_of(
+        pool: Option<&[super::types::RoutingPoolEntry]>,
+        provider_id: &str,
+    ) -> Option<Vec<String>> {
+        let pool = pool.filter(|p| p.len() > 1)?;
+        Some(
+            pool.iter()
+                .filter(|e| e.provider == provider_id)
+                .map(|e| e.model.clone())
+                .collect(),
+        )
+    }
+
     /// Builds and registers the per-turn router of a session being opened, `None` without
     /// a decider. The routing mode and stage are read ONCE here for the session's project.
     pub(crate) async fn register_turn_router(
@@ -1695,8 +1714,12 @@ impl ChatManager {
         let (decider, pool) = self.turn_routing.configured()?;
         // A model the request named, or the user set by hand, stays pinned across a
         // resume or a restart: the pin is stored, not only held by the router.
-        let pinned = turn.explicit_model || self.model_is_pinned(session_id).await;
-        if turn.explicit_model {
+        // A conversation given a pool (two models ticked or more) names its pilot, but PO still
+        // routes among the pool: the pilot is not a pin. One model ticked is strict: a pin.
+        let allowed_models = Self::allowed_models_of(turn.routing_pool.as_deref(), provider_id);
+        let named = turn.explicit_model && allowed_models.is_none();
+        let pinned = named || self.model_is_pinned(session_id).await;
+        if named {
             self.pin_session_model(session_id).await;
         }
         let routing = match super::provider::cognitive::load_routing(
@@ -1730,6 +1753,7 @@ impl ChatManager {
                 project_slug: project_slug.map(str::to_owned),
                 trust,
                 explicit_model: pinned,
+                allowed_models,
                 current_model: model.to_owned(),
                 next_turn: turn.next_turn,
             },
@@ -3994,6 +4018,9 @@ impl ChatManager {
         request: &ChatRequest,
         relay: Option<&str>,
     ) -> Result<CreateSessionResponse> {
+        // The menu's ticks, read once: one model ticked is strict, an empty pool is none.
+        let settled = request.settled_routing();
+        let request = settled.as_ref().unwrap_or(request);
         let session_id = Uuid::new_v4();
         if !request.cwd.trim().is_empty() {
             return self
@@ -4193,6 +4220,10 @@ impl ChatManager {
             provider_id: Some(provider_choice.provider_id.clone()),
             routed_by: Some(provider_choice.routed_by.as_str().to_string()),
             routing_mode: request.routing_mode.map(|m| m.as_str().to_owned()),
+            routing_pool: request
+                .routing_pool
+                .as_ref()
+                .and_then(|pool| serde_json::to_string(pool).ok()),
             capabilities: None,
             resume_token: None,
             execution_place: if super::neutral_place::is_neutral_path(&request.cwd) {
@@ -4318,6 +4349,7 @@ impl ChatManager {
                 OpeningTurn {
                     explicit_model: request.model.is_some(),
                     routing_mode: request.routing_mode,
+                    routing_pool: request.routing_pool.clone(),
                     permission_mode: request.permission_mode.as_deref(),
                     message: &crate::refs::turn::visible_text(&request.message),
                     next_turn: 1,
@@ -7275,6 +7307,7 @@ impl ChatManager {
             node.cwd.clone()
         };
         let request = ChatRequest {
+            routing_pool: None,
             routing_mode: None,
             attachments: Vec::new(),
             refs: Vec::new(),
@@ -7360,6 +7393,98 @@ impl ChatManager {
     /// caller confirms to the asker directly.
     pub async fn set_session_model(&self, session_id: &str, model: &str) -> Result<bool> {
         self.set_session_model_inner(session_id, model, true).await
+    }
+
+    /// Changes the routing of ONE existing conversation (`PUT /api/chat/sessions/{id}/routing`),
+    /// from its next turn on. Stored on the session node only: never in the global or project
+    /// settings. A refusal is a [`super::types::SessionRoutingError`] and changes nothing.
+    ///
+    /// * `auto`: PO routes (`full`); a model imposed before is released (`routed_by` `auto`).
+    /// * one model ticked: strict (`primary`); that model is imposed (set now if it differs,
+    ///   `routed_by` `request`) and never substituted.
+    /// * two or more: `mixed`; the per-turn decision chooses among the ticked models of the
+    ///   session's provider only (one session = one provider; another provider's ticks are
+    ///   stored, and only `switch-provider` moves the conversation there).
+    pub async fn set_session_routing(
+        &self,
+        session_id: &str,
+        body: &super::types::SessionRoutingRequest,
+    ) -> Result<ChatSessionNode> {
+        use super::provider::cognitive::ProviderRoutingMode as Mode;
+        use super::types::SessionRoutingError as Refused;
+        let uuid =
+            Uuid::parse_str(session_id).map_err(|_| anyhow::Error::new(Refused::NotFound))?;
+        let node = self
+            .graph
+            .get_chat_session(uuid)
+            .await?
+            .ok_or_else(|| anyhow::Error::new(Refused::NotFound))?;
+        let provider = node
+            .provider_id
+            .clone()
+            .unwrap_or_else(|| super::provider::resolver::CLAUDE_CODE.to_owned());
+        let router = self.turn_routing.get(session_id);
+        let (mode, pool, routed_by) = if body.auto {
+            self.unpin_session_model(session_id).await;
+            if let Some(router) = &router {
+                router.reroute(Mode::Full, None, false);
+            }
+            (Mode::Full, None, "auto")
+        } else {
+            let pool = super::types::settle_routing_pool(&body.routing_pool)
+                .map_err(|index| anyhow::Error::new(Refused::BlankEntry(index)))?;
+            match pool.as_slice() {
+                [] => return Err(anyhow::Error::new(Refused::EmptyPool)),
+                [only] => {
+                    if only.provider != provider {
+                        return Err(anyhow::Error::new(Refused::OtherProvider(provider)));
+                    }
+                    if node.model != only.model {
+                        // Pins it, ends the automatic changes and tells the clients.
+                        self.set_session_model(session_id, &only.model).await?;
+                    } else {
+                        self.pin_session_model(session_id).await;
+                    }
+                    if let Some(router) = &router {
+                        router.reroute(Mode::Primary, None, true);
+                    }
+                    (Mode::Primary, None, "request")
+                }
+                _ => {
+                    let allowed = Self::allowed_models_of(Some(&pool), &provider)
+                        .filter(|models| !models.is_empty())
+                        .ok_or_else(|| anyhow::Error::new(Refused::OtherProvider(provider)))?;
+                    self.unpin_session_model(session_id).await;
+                    if let Some(router) = &router {
+                        router.reroute(Mode::Mixed, Some(allowed), false);
+                    }
+                    (Mode::Mixed, Some(serde_json::to_string(&pool)?), "auto")
+                }
+            }
+        };
+        self.graph
+            .update_chat_session_routing(
+                uuid,
+                Some(mode.as_str()),
+                pool.as_deref(),
+                Some(routed_by),
+            )
+            .await?;
+        self.graph
+            .get_chat_session(uuid)
+            .await?
+            .ok_or_else(|| anyhow::Error::new(Refused::NotFound))
+    }
+
+    /// The model of the session is the router's again (Auto, or models ticked).
+    async fn unpin_session_model(&self, session_id: &str) {
+        if let Err(error) = self
+            .graph
+            .delete_llm_setting(&Self::pin_scope(session_id), Self::MODEL_PIN_KEY)
+            .await
+        {
+            warn!(session_id, %error, "model pin not removed: a resume may keep it pinned");
+        }
     }
 
     /// `manual`: the user asked for it, which ends the automatic model routing of the
@@ -9500,6 +9625,11 @@ impl ChatManager {
             .await
     }
 
+    /// The models ticked for the conversation being opened, `None` when nothing restricts it.
+    fn routing_pool_of(request: &ChatRequest) -> Option<&[super::types::RoutingPoolEntry]> {
+        request.routing_pool.as_deref().filter(|p| !p.is_empty())
+    }
+
     /// Same, tying the stored cognitive decision to the session being opened.
     pub(crate) async fn resolve_provider_choice_for(
         &self,
@@ -9585,6 +9715,16 @@ impl ChatManager {
                 pick.provider_id.clone(),
                 Some(pick.model.clone()),
             ));
+        }
+        // Models ticked, none named and no applied pick among them: the first ticked model
+        // opens the conversation, never a default the user did not tick.
+        if auto_pick.is_none() && input.request.is_none() {
+            if let Some(first) = Self::routing_pool_of(request).and_then(<[_]>::first) {
+                input.request = Some(resolver::Candidate::new(
+                    first.provider.clone(),
+                    Some(first.model.clone()),
+                ));
+            }
         }
         // `enforce` puts the policy's candidate where the global rule would be;
         // `shadow` changes nothing and is only recorded (A19).
@@ -9964,13 +10104,28 @@ impl ChatManager {
             ),
         };
         routing.set_hints(PriorHints::from_aliases(aliases));
-        let pool = self.routing_pool(routing, instances, store_catalog).await;
+        let mut pool = self.routing_pool(routing, instances, store_catalog).await;
         // A provider, model, alias or run the caller named is never substituted.
         let named = request.provider.is_some()
             || request.model.as_deref().is_some_and(|m| !m.is_empty())
             || request.task_alias.is_some()
             || request.persona_alias.is_some()
             || request.run_provider.is_some();
+        // The conversation's own mode replaces the settings' (the chat menu: Auto = full).
+        let mut settings = settings;
+        if let Some(mode) = request.routing_mode {
+            settings.mode = mode;
+        }
+        // The models ticked in the menu are the only candidates, and are routed like `full`
+        // inside them, whatever the settings' mode.
+        if let Some(ticked) = Self::routing_pool_of(request) {
+            pool.retain(|facts| {
+                ticked
+                    .iter()
+                    .any(|e| e.provider == facts.provider_id && e.model == facts.model)
+            });
+            settings.mode = super::provider::cognitive::ProviderRoutingMode::Full;
+        }
         let mut decide = DecideRequest::new(signature, settings, pool);
         decide.slot = if named {
             Slot::Explicit
@@ -10455,6 +10610,7 @@ impl ChatManager {
             OpeningTurn {
                 explicit_model: request.model.is_some(),
                 routing_mode: request.routing_mode,
+                routing_pool: request.routing_pool.clone(),
                 permission_mode: request.permission_mode.as_deref(),
                 message: &crate::refs::turn::visible_text(&request.message),
                 next_turn: 0,
@@ -10739,6 +10895,10 @@ impl ChatManager {
                 routing_mode: node.routing_mode.as_deref().and_then(|m| {
                     serde_json::from_value(serde_json::Value::String(m.to_owned())).ok()
                 }),
+                routing_pool: node
+                    .routing_pool
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok()),
                 explicit_model: false,
                 permission_mode: node.permission_mode.as_deref(),
                 message,
@@ -14204,6 +14364,7 @@ mod tests {
     fn runner_request(run_id: Uuid, plan_id: Uuid, task_id: Uuid) -> ChatRequest {
         ChatRequest {
             access: None,
+            routing_pool: None,
             routing_mode: None,
             attachments: Vec::new(),
             refs: Vec::new(),
@@ -15924,6 +16085,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_node_serialization() {
         let session = ChatSessionNode {
+            routing_pool: None,
             routing_mode: None,
             id: uuid::Uuid::new_v4(),
             cli_session_id: Some("cli-123".into()),
@@ -16292,6 +16454,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_node_serialization_with_conversation_id() {
         let session = ChatSessionNode {
+            routing_pool: None,
             routing_mode: None,
             id: uuid::Uuid::new_v4(),
             cli_session_id: None,
@@ -16330,6 +16493,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_node_serialization_without_conversation_id() {
         let session = ChatSessionNode {
+            routing_pool: None,
             routing_mode: None,
             id: uuid::Uuid::new_v4(),
             cli_session_id: None,

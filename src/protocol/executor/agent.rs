@@ -304,6 +304,7 @@ async fn execute_via_agent(
     let cwd = project_root.unwrap_or(".");
     let request = ChatRequest {
         access: None,
+        routing_pool: None,
         routing_mode: None,
         attachments: Vec::new(),
         refs: Vec::new(),
