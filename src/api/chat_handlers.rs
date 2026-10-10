@@ -850,9 +850,6 @@ pub async fn interrupt_session(
 #[serde(deny_unknown_fields)]
 pub struct PermissionAnswerRequest {
     pub allow: bool,
-    /// How long an approval lasts: `once` (absent), `session`, `always`.
-    #[serde(default)]
-    pub scope: crate::chat::types::PermissionAnswerScope,
 }
 
 /// Body of `POST /api/chat/sessions/{id}/messages`.
@@ -872,14 +869,12 @@ pub struct SendMessageRequest {
 const PERMISSION_GONE_REASON: &str = "le CLI qui demandait s'est arrêté ; continue par un message \
      (POST .../messages)";
 
-/// POST /api/chat/sessions/{id}/permissions/{request_id} `{ "allow": bool, "scope"?: "once" | "session" | "always" }`
+/// POST /api/chat/sessions/{id}/permissions/{request_id} `{ "allow": bool }`
 ///
 /// REST twin of the WS `permission_response` frame: both go through
 /// `ChatManager::route_permission_response`, so there is one routing.
 ///
 /// - **200** `{ "routed": "local" | "remote" }` — delivered to the CLI.
-/// - **400** `permission_scope_unsupported` — the session does not offer that scope
-///   (`capabilities.permission_scopes`); nothing was answered, the request still waits.
 /// - **404** — unknown session, or no such permission request on it.
 /// - **409** — the request was already decided (double click, two tabs).
 /// - **410** — the CLI that asked is gone; the answer is REFUSED, never
@@ -928,13 +923,7 @@ pub async fn respond_permission(
     }
 
     match chat_manager
-        .route_permission_response(
-            &session_id.to_string(),
-            &request_id,
-            body.allow,
-            body.scope,
-            true,
-        )
+        .route_permission_response(&session_id.to_string(), &request_id, body.allow, true)
         .await
     {
         Ok(route) => Ok(Json(serde_json::json!({ "routed": route }))),
@@ -950,13 +939,6 @@ pub async fn respond_permission(
                 ))),
                 _ => Err(already()),
             }
-        }
-        Err(PermissionDeliveryError::ScopeUnsupported(scope)) => {
-            Err(AppError::BadRequest(format!(
-                "{}: this session cannot keep a permission for the scope '{}'",
-                crate::chat::manager::PERMISSION_SCOPE_UNSUPPORTED_RPC,
-                scope.as_str()
-            )))
         }
         Err(PermissionDeliveryError::Failed(e)) => Err(AppError::Internal(e)),
     }
@@ -4316,7 +4298,6 @@ mod tests {
             ChatEvent::PermissionDecision {
                 id: "req-x".into(),
                 allow: true,
-                scope: None,
             },
         )
         .await;

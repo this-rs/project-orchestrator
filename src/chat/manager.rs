@@ -255,12 +255,12 @@ pub struct ActiveSession {
     /// (`post_stream::StepBudget`). `POST_STREAM_STEP_BUDGET` everywhere but in
     /// tests, which shorten it to watch a step overrun.
     pub post_stream_budget: Duration,
-    /// The permission requests of the CLI still waiting for an answer.
-    /// Key: request_id, Value: the tool input, the tool and the CLI's suggestions.
+    /// Stores the original tool input for pending permission requests.
+    /// Key: request_id, Value: the tool input JSON.
     /// When the user responds Allow, we include this input in `updatedInput`
     /// so the CLI doesn't lose the original command/parameters.
     pub pending_permission_inputs:
-        Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingPermission>>>,
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
     /// Whether auto-continue is enabled for this session.
     /// When `true`, the backend automatically sends "Continue" after error_max_turns.
     /// Toggled via WebSocket `set_auto_continue` message.
@@ -374,10 +374,6 @@ pub enum PermissionDeliveryError {
     /// The CLI is alive but the request is no longer waiting (already
     /// answered, or never asked).
     NotPending,
-    /// The approval asks for a scope (`session`, `always`) this session does not
-    /// declare, or cannot express for this request: REFUSED, never answered as a
-    /// narrower scope. The request is still waiting.
-    ScopeUnsupported(super::types::PermissionAnswerScope),
     Failed(anyhow::Error),
 }
 
@@ -386,11 +382,6 @@ impl std::fmt::Display for PermissionDeliveryError {
         match self {
             Self::SessionDead(id) => write!(f, "Session {id} not found or inactive"),
             Self::NotPending => write!(f, "Permission request is no longer pending"),
-            Self::ScopeUnsupported(scope) => write!(
-                f,
-                "permission scope {} is not supported by this session",
-                scope.as_str()
-            ),
             Self::Failed(e) => write!(f, "{e}"),
         }
     }
@@ -402,23 +393,6 @@ impl std::error::Error for PermissionDeliveryError {}
 /// on the owning instance: the asking instance turns it back into
 /// [`PermissionDeliveryError::NotPending`].
 pub(crate) const PERMISSION_NOT_PENDING_RPC: &str = "permission_not_pending";
-
-/// The `error` of a NATS `control_response` RPC whose scope the owning instance
-/// refused: the asking instance turns it back into
-/// [`PermissionDeliveryError::ScopeUnsupported`]. Also the `code` of the WS error.
-pub(crate) const PERMISSION_SCOPE_UNSUPPORTED_RPC: &str = "permission_scope_unsupported";
-
-/// A permission request of the CLI waiting for the user's answer
-/// (`ActiveSession::pending_permission_inputs`).
-#[derive(Debug, Clone, Default)]
-pub struct PendingPermission {
-    /// The original tool input, replayed as `updatedInput` (an empty `{}` would erase it).
-    pub input: serde_json::Value,
-    /// The tool asked for.
-    pub tool: String,
-    /// The CLI's `permission_suggestions`: the rules a lasting approval adds.
-    pub suggestions: Option<serde_json::Value>,
-}
 
 /// What delivering a permission answer to a legacy session reads, borrowed from the
 /// manager or from the NATS RPC listener of the session.
@@ -711,9 +685,6 @@ pub struct ChatManager {
     /// Root of the native sessions' transcripts (`<root>/<instance id>/<id>.json`, P14);
     /// `None`: kept in memory, lost with the process (nexus' default, the tests' too).
     pub(crate) native_transcripts: Option<std::path::PathBuf>,
-    /// The lasting permission rules of the native sessions (scope `always`,
-    /// `chat::lasting_rules`). None: a native session offers `once` and `session` only.
-    pub(crate) lasting_rules: Option<Arc<super::lasting_rules::LastingRules>>,
     /// How far the anchor resolver drives the context (`PO_ANCHOR_CONTEXT`, default `shadow`).
     pub(crate) anchor_mode: super::anchor_resolver::AnchorContextMode,
     /// What the turns of every session share in anchor mode (resolutions, shadow runs).
@@ -1340,46 +1311,10 @@ pub(crate) async fn agent_rpc(
     let outcome: Result<()> = match request.message_type.as_str() {
         "control_response" => {
             let allow = field("allow").and_then(|v| v.as_bool()).unwrap_or(false);
-            // A scope this instance does not know is refused, never read as once.
-            let scope = match field("scope")
-                .map(serde_json::from_value::<super::types::PermissionAnswerScope>)
-            {
-                None => Ok(super::types::PermissionAnswerScope::Once),
-                Some(Ok(scope)) => Ok(scope),
-                Some(Err(_)) => Err(()),
-            };
-            let answered = match (
-                field("request_id").and_then(|v| v.as_str().map(str::to_string)),
-                scope,
-            ) {
-                (None, _) => Err(PermissionDeliveryError::Failed(anyhow!(
-                    "a permission answer needs its request_id"
-                ))),
-                (Some(_), Err(())) => Err(PermissionDeliveryError::ScopeUnsupported(
-                    super::types::PermissionAnswerScope::Once,
-                )),
-                (Some(request_id), Ok(scope)) => {
-                    handle
-                        .answer_permission_scoped(&request_id, allow, scope)
-                        .await
-                }
-            };
-            return match answered {
-                Ok(()) => crate::events::ChatRpcResponse {
-                    success: true,
-                    error: None,
-                },
-                Err(PermissionDeliveryError::ScopeUnsupported(_)) => {
-                    crate::events::ChatRpcResponse {
-                        success: false,
-                        error: Some(PERMISSION_SCOPE_UNSUPPORTED_RPC.to_string()),
-                    }
-                }
-                Err(e) => crate::events::ChatRpcResponse {
-                    success: false,
-                    error: Some(e.to_string()),
-                },
-            };
+            match field("request_id").and_then(|v| v.as_str().map(str::to_string)) {
+                Some(request_id) => handle.answer_permission(&request_id, allow).await,
+                None => Err(anyhow!("a permission answer needs its request_id")),
+            }
         }
         "set_auto_continue" => {
             let enabled = field("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1714,7 +1649,6 @@ impl ChatManager {
                 crate::documents::store::default_storage_dir(),
             ),
             native_transcripts: None,
-            lasting_rules: None,
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
         }
@@ -1796,7 +1730,6 @@ impl ChatManager {
                 crate::documents::store::default_storage_dir(),
             ),
             native_transcripts: None,
-            lasting_rules: None,
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
         }
@@ -1829,34 +1762,6 @@ impl ChatManager {
     pub fn with_native_transcripts(mut self, root: impl Into<std::path::PathBuf>) -> Self {
         self.native_transcripts = Some(root.into());
         self
-    }
-
-    /// Keep the approvals `always` of the native sessions in `path`
-    /// (`chat::lasting_rules`): those sessions then offer the scope `always`.
-    pub fn with_lasting_rules(mut self, path: impl Into<std::path::PathBuf>) -> Self {
-        self.lasting_rules = Some(Arc::new(super::lasting_rules::LastingRules::new(path)));
-        self
-    }
-
-    /// The project whose lasting rules a session of `kind` gets: a native session run
-    /// on this host (a remote directory is another machine's), when the rules are kept:
-    /// its key, and the directory as the session sees it (paths are normalised against it).
-    fn lasting_project(
-        &self,
-        kind: nexus_claude::agent::ProviderKind,
-        cwd: &str,
-        remote_cwd: Option<&str>,
-    ) -> Option<(String, std::path::PathBuf)> {
-        (self.lasting_rules.is_some()
-            && kind == nexus_claude::agent::ProviderKind::Native
-            && remote_cwd.is_none())
-        .then(|| {
-            let dir = expand_tilde(cwd);
-            (
-                super::lasting_rules::project_key(&dir),
-                std::path::PathBuf::from(dir),
-            )
-        })
     }
 
     /// Turn `refs_v1` on or off (the default comes from the environment).
@@ -2910,10 +2815,6 @@ impl ChatManager {
                                     .and_then(|r| r.as_str())
                                     .map(str::to_string)
                             });
-                            let scope = answer
-                                .as_ref()
-                                .and_then(|v| v.get("scope").cloned())
-                                .map(serde_json::from_value::<super::types::PermissionAnswerScope>);
 
                             info!(
                                 session_id = %session_id,
@@ -2922,20 +2823,14 @@ impl ChatManager {
                                 "NATS RPC: answering a permission request of the CLI"
                             );
 
-                            match (request_id, scope) {
-                                (None, _) => crate::events::ChatRpcResponse {
+                            match request_id {
+                                None => crate::events::ChatRpcResponse {
                                     success: false,
                                     error: Some(
                                         "a permission answer needs its request_id".to_string(),
                                     ),
                                 },
-                                // A scope this instance does not know is refused, never read as once.
-                                (Some(_), Some(Err(_))) => crate::events::ChatRpcResponse {
-                                    success: false,
-                                    error: Some(PERMISSION_SCOPE_UNSUPPORTED_RPC.to_string()),
-                                },
-                                (Some(request_id), scope) => {
-                                    let scope = scope.and_then(Result::ok).unwrap_or_default();
+                                Some(request_id) => {
                                     let ctx = PermissionAnswer {
                                         active_sessions: &active_sessions,
                                         graph: &graph,
@@ -2947,7 +2842,6 @@ impl ChatManager {
                                         &session_id,
                                         &request_id,
                                         allow,
-                                        scope,
                                         true,
                                     )
                                     .await
@@ -2960,14 +2854,6 @@ impl ChatManager {
                                             crate::events::ChatRpcResponse {
                                                 success: false,
                                                 error: Some(PERMISSION_NOT_PENDING_RPC.to_string()),
-                                            }
-                                        }
-                                        Err(PermissionDeliveryError::ScopeUnsupported(_)) => {
-                                            crate::events::ChatRpcResponse {
-                                                success: false,
-                                                error: Some(
-                                                    PERMISSION_SCOPE_UNSUPPORTED_RPC.to_string(),
-                                                ),
                                             }
                                         }
                                         Err(e) => crate::events::ChatRpcResponse {
@@ -6224,8 +6110,6 @@ impl ChatManager {
                                                 continue;
                                             }
 
-                                            let suggestions = permission_suggestions(&msg);
-
                                             if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
                                                 // AskUserQuestion: auto-allow the control request so the CLI
                                                 // waits for the tool_result (user's answer) instead of blocking.
@@ -6248,10 +6132,10 @@ impl ChatManager {
                                                             info!(request_id = %id, "Auto-allowed AskUserQuestion control request");
                                                         }
                                                     }
-                                                } else if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
+                                                } else if let ChatEvent::PermissionRequest { ref id, ref input, .. } = evt {
                                                     // Regular permission: store original input for later response
                                                     if !id.is_empty() {
-                                                        store_pending_perm_input(&pending_perm_inputs, id, input, tool, suggestions).await;
+                                                        store_pending_perm_input(&pending_perm_inputs, id, input).await;
                                                     }
                                                 }
                                                 streaming_events.lock().await.push(evt);
@@ -6288,8 +6172,6 @@ impl ChatManager {
                                                     continue;
                                                 }
 
-                                                let suggestions = permission_suggestions(&msg);
-
                                                 if let Some(evt) = handle_control_msg(msg, &mut events_to_persist, &next_seq, current_parent_tool_use_id.clone()) {
                                                     // AskUserQuestion: auto-allow (same logic as above)
                                                     if let ChatEvent::AskUserQuestion { ref id, ref input, .. } = evt {
@@ -6311,9 +6193,9 @@ impl ChatManager {
                                                                 info!(request_id = %id, "Auto-allowed AskUserQuestion control request (drain)");
                                                             }
                                                         }
-                                                    } else if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
+                                                    } else if let ChatEvent::PermissionRequest { ref id, ref input, .. } = evt {
                                                         if !id.is_empty() {
-                                                            store_pending_perm_input(&pending_perm_inputs, id, input, tool, suggestions).await;
+                                                            store_pending_perm_input(&pending_perm_inputs, id, input).await;
                                                         }
                                                     }
                                                     streaming_events.lock().await.push(evt);
@@ -7466,18 +7348,12 @@ impl ChatManager {
         request_id: &str,
         allow: bool,
     ) -> Result<()> {
-        self.send_permission_response_inner(
-            session_id,
-            request_id,
-            allow,
-            super::types::PermissionAnswerScope::Once,
-            false,
-        )
-        .await
-        .map_err(|e| match e {
-            PermissionDeliveryError::Failed(e) => e,
-            other => anyhow!(other.to_string()),
-        })
+        self.send_permission_response_inner(session_id, request_id, allow, false)
+            .await
+            .map_err(|e| match e {
+                PermissionDeliveryError::Failed(e) => e,
+                other => anyhow!(other.to_string()),
+            })
     }
 
     /// Shared body of the permission answer. With `require_pending`, the
@@ -7491,7 +7367,6 @@ impl ChatManager {
         session_id: &str,
         request_id: &str,
         allow: bool,
-        scope: super::types::PermissionAnswerScope,
         require_pending: bool,
     ) -> std::result::Result<(), PermissionDeliveryError> {
         let answer = PermissionAnswer {
@@ -7500,31 +7375,19 @@ impl ChatManager {
             nats: self.nats.as_ref(),
             event_emitter: &self.event_emitter,
         };
-        Self::deliver_permission_answer(
-            answer,
-            session_id,
-            request_id,
-            allow,
-            scope,
-            require_pending,
-        )
-        .await
+        Self::deliver_permission_answer(answer, session_id, request_id, allow, require_pending)
+            .await
     }
 
     /// The body of [`Self::send_permission_response_inner`], without `self`: the
     /// NATS RPC listener of a legacy session answers through it too, so a permission
     /// granted on another instance is the same `control_response` (subtype, request_id,
     /// behavior) written on `stdin_tx`, never under the client lock that a turn holds.
-    ///
-    /// A lasting `scope` adds `updatedPermissions` to the approval ([`lasting_permission_updates`],
-    /// destination [`legacy_scope_destination`]); one that cannot be expressed is refused
-    /// ([`PermissionDeliveryError::ScopeUnsupported`]) and the request stays waiting.
     async fn deliver_permission_answer(
         ctx: PermissionAnswer<'_>,
         session_id: &str,
         request_id: &str,
         allow: bool,
-        scope: super::types::PermissionAnswerScope,
         require_pending: bool,
     ) -> std::result::Result<(), PermissionDeliveryError> {
         let (stdin_tx, pending_perm_inputs, events_tx, session_uuid, next_seq) = {
@@ -7558,43 +7421,25 @@ impl ChatManager {
         if require_pending && claimed.is_none() {
             return Err(PermissionDeliveryError::NotPending);
         }
+        let was_claimed = claimed.is_some();
+        let original_input = claimed.unwrap_or_else(|| serde_json::json!({}));
         // The entry is only really consumed once the decision reached the CLI:
         // on a failed send it is put back so a retry is still `pending`.
-        let restore_claim = |entry: Option<PendingPermission>| {
+        let restore_claim = |input: serde_json::Value| {
             let pending = pending_perm_inputs.clone();
             let request_id = request_id.to_string();
             async move {
-                if let Some(entry) = entry {
-                    pending.lock().await.insert(request_id, entry);
+                if was_claimed {
+                    pending.lock().await.insert(request_id, input);
                 }
             }
         };
-        // A lasting approval names the rules it adds; one it cannot name is refused,
-        // never written as a plain once.
-        let updated_permissions = match legacy_scope_destination(scope).filter(|_| allow) {
-            None => None,
-            Some(destination) => match lasting_permission_updates(claimed.as_ref(), destination) {
-                Some(updates) => Some(updates),
-                None => {
-                    restore_claim(claimed).await;
-                    return Err(PermissionDeliveryError::ScopeUnsupported(scope));
-                }
-            },
-        };
-        let original_input = claimed
-            .as_ref()
-            .map(|c| c.input.clone())
-            .unwrap_or_else(|| serde_json::json!({}));
 
         let permission_response = if allow {
-            let mut response = serde_json::json!({
+            serde_json::json!({
                 "behavior": "allow",
                 "updatedInput": original_input
-            });
-            if let Some(updates) = updated_permissions {
-                response["updatedPermissions"] = updates;
-            }
-            response
+            })
         } else {
             serde_json::json!({
                 "behavior": "deny",
@@ -7615,7 +7460,7 @@ impl ChatManager {
         let json = match serde_json::to_string(&control_response) {
             Ok(j) => j,
             Err(e) => {
-                restore_claim(claimed).await;
+                restore_claim(original_input).await;
                 return Err(PermissionDeliveryError::Failed(anyhow!(
                     "Failed to serialize control response: {}",
                     e
@@ -7627,12 +7472,11 @@ impl ChatManager {
             session_id = %session_id,
             request_id = %request_id,
             allow,
-            scope = scope.as_str(),
             "Sending permission control response to CLI (via stdin_tx, lock-free)"
         );
 
         if let Err(e) = stdin_tx.send(json).await {
-            restore_claim(claimed).await;
+            restore_claim(original_input).await;
             return Err(PermissionDeliveryError::Failed(anyhow!(
                 "Failed to send permission control response: {}",
                 e
@@ -7643,7 +7487,6 @@ impl ChatManager {
         let decision_event = ChatEvent::PermissionDecision {
             id: request_id.to_string(),
             allow,
-            scope: scope.lasting(allow),
         };
 
         // Broadcast to all connected WebSocket clients
@@ -7687,32 +7530,24 @@ impl ChatManager {
     ///
     /// `require_pending` makes the answer strict for a LOCAL session (see
     /// [`Self::send_permission_response_inner`]); a remote owner does its own
-    ///
-    /// `scope` says how long an approval lasts; a scope the session does not declare
-    /// is `ScopeUnsupported` wherever the session lives (never a narrower answer).
+    /// bookkeeping. No instance holds the session -> `SessionDead`.
     pub async fn route_permission_response(
         &self,
         session_id: &str,
         request_id: &str,
         allow: bool,
-        scope: super::types::PermissionAnswerScope,
         require_pending: bool,
     ) -> std::result::Result<DeliveryRoute, PermissionDeliveryError> {
         if let Some(handle) = self.agent_runtime.get(session_id).await {
             return handle
-                .answer_permission_scoped(request_id, allow, scope)
+                .answer_permission(request_id, allow)
                 .await
-                .map(|()| DeliveryRoute::Local);
+                .map(|()| DeliveryRoute::Local)
+                .map_err(PermissionDeliveryError::Failed);
         }
         if self.is_session_active(session_id).await {
             return self
-                .send_permission_response_inner(
-                    session_id,
-                    request_id,
-                    allow,
-                    scope,
-                    require_pending,
-                )
+                .send_permission_response_inner(session_id, request_id, allow, require_pending)
                 .await
                 .map(|()| DeliveryRoute::Local);
         }
@@ -7721,12 +7556,7 @@ impl ChatManager {
         // `request_id`: the CLI matches the control_response to its can_use_tool by it.
         // The owner answers strictly (a request no longer waiting is refused), so the
         // refusal comes back typed. Asked ONCE: a resend would write the answer twice.
-        let payload = serde_json::json!({
-            "allow": allow,
-            "request_id": request_id,
-            "scope": scope,
-        })
-        .to_string();
+        let payload = serde_json::json!({ "allow": allow, "request_id": request_id }).to_string();
         let Some(ref nats) = self.nats else {
             return Err(PermissionDeliveryError::SessionDead(session_id.to_string()));
         };
@@ -7737,9 +7567,6 @@ impl ChatManager {
             Some(answer) if answer.success => Ok(DeliveryRoute::Remote),
             Some(answer) if answer.error.as_deref() == Some(PERMISSION_NOT_PENDING_RPC) => {
                 Err(PermissionDeliveryError::NotPending)
-            }
-            Some(answer) if answer.error.as_deref() == Some(PERMISSION_SCOPE_UNSUPPORTED_RPC) => {
-                Err(PermissionDeliveryError::ScopeUnsupported(scope))
             }
             Some(answer) => {
                 debug!(
@@ -11381,7 +11208,7 @@ impl ChatManager {
         use nexus_claude::agent::{
             EnvSpec, McpServerSpec, SessionSpec, SystemPromptMode, SystemPromptSpec,
         };
-        let (mode, mut allowed, disallowed) = {
+        let (mode, allowed, disallowed) = {
             let perm = self.permission_config.read().await;
             (
                 permission_mode
@@ -11391,18 +11218,6 @@ impl ChatManager {
                 perm.disallowed_tools.clone(),
             )
         };
-        // What the user allowed `always` in this project (a native session): run without
-        // asking. `deny` and the read-only access are checked first, they still win.
-        if let (Some(rules), Some(project)) = (
-            self.lasting_rules.as_ref(),
-            self.lasting_project(kind, cwd, remote_cwd),
-        ) {
-            for rule in rules.allowed_for(&project.0) {
-                if !allowed.contains(&rule) {
-                    allowed.push(rule);
-                }
-            }
-        }
         let policy =
             super::provider::policy::tool_policy_with_access(&mode, &allowed, &disallowed, access)
                 .ok_or_else(|| {
@@ -11704,8 +11519,6 @@ impl ChatManager {
             &spec,
             self.config.nexus_tools_path.as_deref(),
         );
-        let lasting_project =
-            self.lasting_project(provider.kind(), &request.cwd, remote_cwd.as_deref());
         let session = provider.open(spec).await.map_err(|e| {
             // Nothing will ever use this session's token.
             crate::auth::agent_tokens::revoke_session(&sid);
@@ -11729,7 +11542,6 @@ impl ChatManager {
             1,
             tool_policy,
             nexus_missing,
-            lasting_project,
         )
         .await;
         if let Some(handle) = self.agent_runtime.get(&sid).await {
@@ -11791,7 +11603,6 @@ impl ChatManager {
         first_seq: i64,
         tool_policy: serde_json::Value,
         nexus_missing: bool,
-        lasting_project: Option<(String, std::path::PathBuf)>,
     ) {
         self.warn_if_forced(provider_id, session.as_ref());
         if let Some(router) = self.turn_routing.get(session_id) {
@@ -11830,13 +11641,6 @@ impl ChatManager {
                 extra_degraded,
             )
             .await;
-        if let (Some(rules), Some((project, cwd))) = (self.lasting_rules.clone(), lasting_project) {
-            handle.grant_lasting_rules(super::agent_runtime::LastingGrant {
-                rules,
-                project,
-                cwd,
-            });
-        }
         self.spawn_agent_nats_listeners(handle);
     }
 
@@ -12056,8 +11860,6 @@ impl ChatManager {
             &spec,
             self.config.nexus_tools_path.as_deref(),
         );
-        let lasting_project =
-            self.lasting_project(provider.kind(), &node.cwd, remote_cwd.as_deref());
         let session = match token {
             Some(token) => provider.resume(spec, token).await,
             None => provider.open(spec).await,
@@ -12076,7 +11878,6 @@ impl ChatManager {
             latest + 1,
             tool_policy,
             nexus_missing,
-            lasting_project,
         )
         .await;
         let handle = self
@@ -12537,73 +12338,11 @@ mod idle_expiry_tests {
 /// Extracted as a standalone async fn so that `tokio::select!` blocks don't
 /// struggle with type inference on `Arc<Mutex<HashMap>>` inline locks.
 async fn store_pending_perm_input(
-    map: &Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingPermission>>>,
+    map: &Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
     id: &str,
     input: &serde_json::Value,
-    tool: &str,
-    suggestions: Option<serde_json::Value>,
 ) {
-    map.lock().await.insert(
-        id.to_string(),
-        PendingPermission {
-            input: input.clone(),
-            tool: tool.to_string(),
-            suggestions,
-        },
-    );
-}
-
-/// The `permission_suggestions` of a `can_use_tool` request (`request.permission_suggestions`,
-/// or its camelCase spelling): the rules the CLI proposes for an approval that outlives the call.
-fn permission_suggestions(control_msg: &serde_json::Value) -> Option<serde_json::Value> {
-    let request = control_msg.get("request").unwrap_or(control_msg);
-    request
-        .get("permission_suggestions")
-        .or_else(|| request.get("permissionSuggestions"))
-        .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
-        .cloned()
-}
-
-/// The `updatedPermissions` a lasting approval writes to the CLI: the CLI's own
-/// suggestions moved to `destination` (`session` for the scope `session`,
-/// `localSettings` for `always`), the rewrite the nexus Claude Code facade does
-/// (`control::scoped_permission_updates`). Without a usable suggestion: for the session
-/// only, a rule for the tool (what the native harness approves for a session); never a
-/// whole-tool rule kept in the settings (`always`: one click must not allow any command
-/// of the tool forever). `None`: the scope cannot be expressed for this request.
-fn lasting_permission_updates(
-    pending: Option<&PendingPermission>,
-    destination: &str,
-) -> Option<serde_json::Value> {
-    let pending = pending?;
-    nexus_claude::providers::claude_code::control::scoped_permission_updates(
-        pending.suggestions.as_ref(),
-        destination,
-    )
-    .or_else(|| {
-        (destination == "session" && !pending.tool.is_empty() && pending.tool != "unknown").then(
-            || {
-                serde_json::json!([{
-                    "type": "addRules",
-                    "rules": [{ "toolName": pending.tool }],
-                    "behavior": "allow",
-                    "destination": destination,
-                }])
-            },
-        )
-    })
-}
-
-/// Where Claude Code keeps a lasting approval of a scope: `session` in memory for
-/// the session; `always` in `localSettings` (`<project>/.claude/settings.local.json`:
-/// this project, this user, not committed), the destination the CLI itself suggests
-/// and the one the nexus facade writes. `None` for `once`.
-fn legacy_scope_destination(scope: super::types::PermissionAnswerScope) -> Option<&'static str> {
-    match scope {
-        super::types::PermissionAnswerScope::Once => None,
-        super::types::PermissionAnswerScope::Session => Some("session"),
-        super::types::PermissionAnswerScope::Always => Some("localSettings"),
-    }
+    map.lock().await.insert(id.to_string(), input.clone());
 }
 
 /// Relay a permission request / question as a light `attention_changed` on
@@ -16060,13 +15799,7 @@ mod tests {
         })
         .await;
         manager
-            .route_permission_response(
-                &sid,
-                "perm-1",
-                true,
-                crate::chat::types::PermissionAnswerScope::Once,
-                true,
-            )
+            .route_permission_response(&sid, "perm-1", true, true)
             .await
             .unwrap();
         let answers = fake.state.permission_answers.lock().unwrap().clone();
@@ -17159,13 +16892,7 @@ mod tests {
 
         for attempt in 1..=2 {
             let err = manager
-                .send_permission_response_inner(
-                    &sid,
-                    "req-1",
-                    true,
-                    crate::chat::types::PermissionAnswerScope::Once,
-                    true,
-                )
+                .send_permission_response_inner(&sid, "req-1", true, true)
                 .await
                 .unwrap_err();
             assert!(
@@ -19914,7 +19641,7 @@ mod tests {
             .pending_permission_inputs
             .lock()
             .await
-            .insert("req-d".to_string(), PendingPermission::default());
+            .insert("req-d".to_string(), serde_json::json!({}));
         manager
             .active_sessions
             .write()
@@ -19954,14 +19681,11 @@ mod tests {
             "command": "echo \"hello\"",
             "description": "Print hello"
         });
-        session.pending_permission_inputs.lock().await.insert(
-            "req-allow-001".to_string(),
-            PendingPermission {
-                input: original_input.clone(),
-                tool: "Bash".to_string(),
-                suggestions: None,
-            },
-        );
+        session
+            .pending_permission_inputs
+            .lock()
+            .await
+            .insert("req-allow-001".to_string(), original_input.clone());
 
         let session_id = "test-perm-allow";
         manager
@@ -22722,14 +22446,7 @@ pub(crate) mod test_support {
         let pending_messages = Arc::new(Mutex::new(VecDeque::<PendingMessage>::new()));
         let mut pending = HashMap::new();
         for id in pending_permissions {
-            pending.insert(
-                (*id).to_string(),
-                super::PendingPermission {
-                    input: serde_json::json!({ "command": "ls" }),
-                    tool: "Bash".to_string(),
-                    suggestions: None,
-                },
-            );
+            pending.insert((*id).to_string(), serde_json::json!({ "command": "ls" }));
         }
         let session = ActiveSession {
             anchor: Default::default(),
