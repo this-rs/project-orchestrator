@@ -52,7 +52,7 @@
 //!      dropped.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -88,6 +88,61 @@ pub(crate) struct OobListenerDeps {
     /// The blobs of the attached documents (the images a turn sends inline).
     pub documents: crate::documents::store::DocumentStore,
     pub nats: Option<Arc<crate::events::NatsEmitter>>,
+}
+
+/// Where the turn and the OOB listener are in the CLI's output, counted in `result`s.
+///
+/// Both read the same output on subscriptions of their own, in the same order. The
+/// listener tells a turn's message from background output by `is_streaming` when it
+/// gets to the message: lagging behind the turn, it would get to the turn's last
+/// messages after the turn ended and take them for background output (a turn's own
+/// `tool_result` then started a turn of its own). So the turn does not end before the
+/// listener has reached the turn's `result`: every message before it was then seen
+/// while the turn was still streaming.
+#[derive(Debug, Default)]
+pub struct ResultCursor {
+    /// `result`s read by the turns of the session.
+    turn: AtomicU64,
+    /// `result`s the listener got to.
+    listener: AtomicU64,
+    /// Whether a listener reads the session (none on a mock transport).
+    listening: AtomicBool,
+}
+
+impl ResultCursor {
+    /// A turn read a `result` of the CLI.
+    pub(crate) fn turn_read_result(&self) {
+        self.turn.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The listener got to a `result`. Never behind the turns afterwards: a `result`
+    /// the listener missed (published before it subscribed) does not hold every later
+    /// turn.
+    fn listener_saw_result(&self) {
+        let next = self.listener.load(Ordering::SeqCst) + 1;
+        self.listener
+            .store(next.max(self.turn.load(Ordering::SeqCst)), Ordering::SeqCst);
+    }
+
+    /// Wait, up to `bound`, for the listener to reach the last `result` a turn read.
+    pub(crate) async fn wait_for_listener(&self, bound: Duration) {
+        let deadline = tokio::time::Instant::now() + bound;
+        while self.listening.load(Ordering::SeqCst)
+            && self.listener.load(Ordering::SeqCst) < self.turn.load(Ordering::SeqCst)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+/// Clears `ResultCursor::listening` when the listener stops, however it stops.
+struct Listening(Arc<ResultCursor>);
+
+impl Drop for Listening {
+    fn drop(&mut self) {
+        self.0.listening.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Spawn the OOB listener task for a session. Fire-and-forget — the task
@@ -149,6 +204,18 @@ pub(crate) fn spawn_oob_listener(
 
         info!(session_id = %session_id, "OOB listener started");
 
+        // Where this listener is, for the turns of the session (see `ResultCursor`).
+        let cursor = deps
+            .active_sessions
+            .read()
+            .await
+            .get(&session_id)
+            .map(|s| s.result_cursor.clone());
+        let _listening = cursor.clone().map(|cursor| {
+            cursor.listening.store(true, Ordering::SeqCst);
+            Listening(cursor)
+        });
+
         // Tool-use ids of sub-agent launches (`Agent` / `Task`). Everything a
         // sub-agent does is streamed with `parent_tool_use_id` = that id, and
         // none of it is an external event the main agent must react to.
@@ -172,7 +239,16 @@ pub(crate) fn spawn_oob_listener(
                 next = stream.next() => {
                     match next {
                         Some(Ok(message)) => {
+                            #[cfg(test)]
+                            if let Some(lag) = test_lag(&session_id) {
+                                tokio::time::sleep(lag).await;
+                            }
                             let message = ChatManager::mask_cli_message(message);
+                            // Everything before a turn's `result` has been handled: the turn
+                            // may end (it waits for this, `ResultCursor`).
+                            if let (Message::Result { .. }, Some(cursor)) = (&message, &cursor) {
+                                cursor.listener_saw_result();
+                            }
                             remember_subagent_launches(&message, &mut subagent_parents);
                             // The CLI's own count of running background tasks.
                             // Read from every message, in-stream ones included:
@@ -685,6 +761,22 @@ async fn check_and_record_trigger_cap(
 /// Minimum interval between two `last_activity` refreshes from background
 /// traffic — far below the idle timeout (minutes), far above message rate.
 const ACTIVITY_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Tests only: a delay the OOB listener of a session takes before handling each
+/// message, to play a listener that lags behind the turn (a loaded machine).
+#[cfg(test)]
+pub(crate) static TEST_LAG: std::sync::Mutex<Option<(String, Duration)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn test_lag(session_id: &str) -> Option<Duration> {
+    TEST_LAG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .filter(|(sid, _)| sid == session_id)
+        .map(|(_, lag)| *lag)
+}
 
 /// Upper bound on remembered sub-agent launches. A session launches a handful;
 /// the cap only guards a pathological one against unbounded growth.
