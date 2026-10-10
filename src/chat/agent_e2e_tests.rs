@@ -873,12 +873,45 @@ async fn a_nexus_tools_that_cannot_run_does_not_refuse_the_native_session() {
             ..Default::default()
         };
         let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config);
-        let mut req = request(Some("local"), Some("proj"), "default");
-        req.message = String::new();
-        manager
+        let req = request(Some("local"), Some("proj"), "default");
+        let created = manager
             .create_session(&req)
             .await
             .unwrap_or_else(|e| panic!("{}: {e:#}", program.display()));
+        let mut rx = manager.subscribe(&created.session_id).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        // And it says so: `nexus_tools` is among what the session does not have, on
+        // the `system_init` the interface reads (not only a line in the server log).
+        // The system_init is persisted by the out-of-turn pump, possibly after the Result.
+        let uuid = Uuid::parse_str(&created.session_id).unwrap();
+        let mut init = None;
+        let mut seen = Vec::new();
+        for _ in 0..100 {
+            let events = graph.get_chat_events(uuid, 0, 100).await.unwrap();
+            seen = events.iter().map(|r| r.event_type.clone()).collect();
+            init = events
+                .iter()
+                .filter_map(|r| serde_json::from_str::<ChatEvent>(&r.data).ok())
+                .find(|e| matches!(e, ChatEvent::SystemInit { .. }));
+            if init.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let Some(ChatEvent::SystemInit {
+            degraded_features, ..
+        }) = init
+        else {
+            panic!("{}: no system_init persisted: {seen:?}", program.display());
+        };
+        let degraded = degraded_features.unwrap_or_default();
+        assert!(
+            degraded
+                .iter()
+                .any(|f| f == super::agent_runtime::NEXUS_TOOLS_FEATURE),
+            "{}: {degraded:?}",
+            program.display()
+        );
     }
 }
 

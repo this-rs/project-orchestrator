@@ -246,9 +246,15 @@ fn image_refusal(error: &ProviderError) -> Option<ChatEvent> {
     }
 }
 
+/// The identifier of a native session that has no file, shell or web tool: its
+/// `nexus-tools` executable was not found, or is not runnable, when it was opened
+/// (`NEXUS_TOOLS_PATH`, next to the server, or on the `PATH`). It is the HOST that
+/// knows it, not the provider's capabilities, so it is added at adoption.
+pub const NEXUS_TOOLS_FEATURE: &str = "nexus_tools";
+
 /// What a session on the agent engine does NOT do, as the identifiers the
 /// frontend knows (`hooks`, `message_queue`, `auto_continue`, `compaction`,
-/// `nats`, `enrichment`, `images`).
+/// `nats`, `enrichment`, `images`, and [`NEXUS_TOOLS_FEATURE`] added by the host).
 ///
 /// Two sources, kept apart on purpose:
 /// - what THIS ENGINE (the backend) has not ported, whatever the provider can do:
@@ -1019,6 +1025,41 @@ impl AgentRuntime {
         tool_policy: serde_json::Value,
         services: Option<Arc<dyn TurnServices>>,
     ) -> Arc<AgentSessionHandle> {
+        self.adopt_with(
+            session_id,
+            provider_id,
+            session,
+            first_seq,
+            provider_kind,
+            tool_policy,
+            services,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// [`Self::adopt`] for a session the HOST knows lacks something its provider's
+    /// capabilities cannot say: `extra_degraded` is added to what the session does not
+    /// do (for instance [`NEXUS_TOOLS_FEATURE`], a native session whose `nexus-tools`
+    /// could not be attached).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn adopt_with(
+        &self,
+        session_id: &str,
+        provider_id: &str,
+        session: Arc<dyn AgentSession>,
+        first_seq: i64,
+        provider_kind: &str,
+        tool_policy: serde_json::Value,
+        services: Option<Arc<dyn TurnServices>>,
+        extra_degraded: Vec<String>,
+    ) -> Arc<AgentSessionHandle> {
+        let mut degraded = degraded_features(session.capabilities());
+        for feature in extra_degraded {
+            if !degraded.contains(&feature) {
+                degraded.push(feature);
+            }
+        }
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let handle = Arc::new(AgentSessionHandle {
             session_id: session_id.to_string(),
@@ -1031,7 +1072,7 @@ impl AgentRuntime {
             streaming_events: Mutex::new(Vec::new()),
             provider: serde_json::json!({ "id": provider_id, "kind": provider_kind }),
             tool_policy,
-            degraded: degraded_features(session.capabilities()),
+            degraded,
             next_seq: AtomicI64::new(first_seq),
             mapper: Mutex::new(EventMapper::new()),
             graph: Arc::clone(&self.graph),
@@ -1719,6 +1760,52 @@ mod adopt_tests {
         );
         assert!(!second.closed.is_cancelled());
         assert!(Arc::ptr_eq(&runtime.get("s").await.unwrap(), &second));
+    }
+
+    /// A native session opened without its `nexus-tools` says so: the host adds the
+    /// feature the provider's capabilities cannot report. A plain adoption does not.
+    #[tokio::test]
+    async fn a_session_the_host_knows_lacks_nexus_tools_reports_it_once() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let plain = runtime
+            .adopt(
+                "plain",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        assert!(!plain.degraded.iter().any(|f| f == NEXUS_TOOLS_FEATURE));
+
+        let missing = runtime
+            .adopt_with(
+                "missing",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+                vec![
+                    NEXUS_TOOLS_FEATURE.to_string(),
+                    NEXUS_TOOLS_FEATURE.to_string(),
+                ],
+            )
+            .await;
+        assert_eq!(
+            missing
+                .degraded
+                .iter()
+                .filter(|f| *f == NEXUS_TOOLS_FEATURE)
+                .count(),
+            1,
+            "listed once, whatever the caller passes"
+        );
     }
 }
 

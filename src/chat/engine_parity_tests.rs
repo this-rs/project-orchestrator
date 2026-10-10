@@ -565,6 +565,13 @@ fn gate(cc: &Measures, native: &Measures) {
 /// empty when the announcement is honest. The closed list: `images` when the
 /// model has no vision. (An unknown `context_window` is a limit of the model
 /// too, and is not a missing feature: it is never a reason to fail.)
+///
+/// `nexus_tools` (a native session whose `nexus-tools` executable is not found,
+/// `manager::lacks_nexus_tools`) is a limit of the INSTALLATION, neither of the
+/// model nor of the harness. It is deliberately NOT in the list: this scenario
+/// always runs with the real `nexus-tools` (`NEXUS_FAKES_DIR`, a missing binary
+/// fails the test), so announcing it here means the harness failed to attach a
+/// binary it had, which must fail rather than be accepted as an installation cause.
 fn not_model_limits(init: &ChatEvent) -> Vec<String> {
     let ChatEvent::SystemInit {
         degraded_features,
@@ -2911,8 +2918,10 @@ fn only_a_limit_of_the_model_may_be_announced_missing() {
     assert!(not_model_limits(&init(&[], true)).is_empty());
     assert!(not_model_limits(&init(&["images"], false)).is_empty());
     assert_eq!(not_model_limits(&init(&["images"], true)), vec!["images"]);
+    // An installation limit is not a limit of the model: the scenario always has nexus-tools.
+    let nexus = super::agent_runtime::NEXUS_TOOLS_FEATURE;
     assert_eq!(
-        not_model_limits(&init(&["hooks", "nexus_tools"], true)),
-        vec!["hooks", "nexus_tools"]
+        not_model_limits(&init(&["hooks", nexus], true)),
+        vec!["hooks", nexus]
     );
 }
