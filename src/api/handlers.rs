@@ -5776,47 +5776,25 @@ async fn start_plan_run(
             )));
         }
     }
-    let chat_manager = state
-        .chat_manager
-        .as_ref()
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
-
-    let graph = state.orchestrator.neo4j_arc();
-    let context_builder = state.orchestrator.context_builder().clone();
-    let mut config = state.orchestrator.runner_config();
-    // Override budget if the caller specified one
-    if let Some(budget) = max_cost_usd {
-        config.max_cost_usd = budget;
-    }
-
-    // Create a broadcast channel for RunnerEvents
-    let (event_tx, _) = tokio::sync::broadcast::channel(256);
-
-    let mut runner = crate::runner::PlanRunner::new(
-        chat_manager.clone(),
-        graph,
-        context_builder,
-        config,
-        event_tx,
-    );
-
-    // Inherit caller's auth claims so runner agents authenticate as the user
-    runner = runner.with_user_claims(caller_claims);
-    runner = runner.with_run_routing(routing.provider, routing.model, routing.max_tokens);
-    // Cognitive routing (B-R7): None until the decider is installed at startup.
-    runner = runner.with_routing(crate::runner::routing::installed());
-
-    // Bridge RunnerEvents to CrudEvent for WebSocket delivery
-    runner =
-        runner.with_event_emitter(state.event_bus.clone() as Arc<dyn crate::events::EventEmitter>);
-
-    let runner = Arc::new(runner);
+    let runner = plan_runner_factory(state)
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?
+        .build(crate::runner::RunOptions {
+            // Inherit caller's auth claims so runner agents authenticate as the user
+            claims: Some(caller_claims),
+            max_cost_usd,
+            provider: routing.provider,
+            model: routing.model,
+            max_tokens: routing.max_tokens,
+        });
 
     let start_result = runner
         .start(plan_id, trigger_source, cwd, project_slug)
         .await
         .map_err(|e| {
-            if e.to_string().contains("already has an active run") {
+            let message = e.to_string();
+            if message.contains("already has an active run")
+                || message.contains("another plan run is active")
+            {
                 AppError::Conflict(e.to_string())
             } else {
                 AppError::Internal(e)
@@ -5829,6 +5807,22 @@ async fn start_plan_run(
         total_waves: start_result.total_waves,
         total_tasks: start_result.total_tasks,
     })
+}
+
+/// The factory of this server's plan runners (chat manager, context builder,
+/// runner config, event bus): `None` without a chat manager. Every run started
+/// by the server is built here, the REST/MCP `run` and the triggers alike.
+pub(crate) fn plan_runner_factory(
+    state: &OrchestratorState,
+) -> Option<crate::runner::PlanRunnerFactory> {
+    let chat_manager = state.chat_manager.as_ref()?;
+    Some(crate::runner::PlanRunnerFactory::new(
+        chat_manager.clone(),
+        state.orchestrator.neo4j_arc(),
+        state.orchestrator.context_builder().clone(),
+        state.orchestrator.runner_config(),
+        Some(state.event_bus.clone() as Arc<dyn crate::events::EventEmitter>),
+    ))
 }
 
 /// Validate a per-task retry and put the task back to `pending`.
@@ -6140,6 +6134,14 @@ pub async fn create_trigger(
         }
     };
     let config = body.get("config").cloned().unwrap_or(serde_json::json!({}));
+    // A schedule trigger runs on its cron: refuse one the provider cannot read
+    // (it would never fire, silently).
+    if trigger_type == TriggerType::Schedule {
+        let cron = config.get("cron").and_then(|v| v.as_str()).ok_or_else(|| {
+            AppError::BadRequest("A schedule trigger needs config.cron (5 fields, UTC)".to_string())
+        })?;
+        crate::runner::providers::schedule::validate_cron(cron).map_err(AppError::BadRequest)?;
+    }
     let cooldown_secs = body
         .get("cooldown_secs")
         .and_then(|v| v.as_u64())
@@ -6280,9 +6282,15 @@ pub async fn list_trigger_firings(
 ///
 /// Validates HMAC-SHA256 signature (if configured), filters by event type
 /// and branch pattern, then evaluates the trigger.
+///
+/// The run inherits the caller's claims, as with `plan(action: "run")`: an
+/// agent session of a third-party lineage stays restricted in the run it
+/// starts (and a restricted or read-only token never reaches this route, see
+/// `tool_profile`).
 pub async fn receive_webhook(
     State(state): State<OrchestratorState>,
     Path(trigger_id): Path<Uuid>,
+    axum::Extension(caller_claims): axum::Extension<crate::auth::jwt::Claims>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -6357,25 +6365,73 @@ pub async fn receive_webhook(
         }
     }
 
-    // 6. Evaluate trigger
-    let engine = crate::runner::TriggerEngine::new(graph.clone());
-    match engine.evaluate_and_prepare(&trigger).await {
-        Ok(Some(source)) => {
-            engine
-                .record_fire(&trigger, None, Some(payload))
-                .await
-                .map_err(AppError::Internal)?;
-            Ok(Json(serde_json::json!({
-                "status": "fired",
-                "trigger_id": trigger_id,
-                "source": format!("{:?}", source),
-            })))
-        }
-        Ok(None) => Ok(Json(serde_json::json!({
+    // 6. Evaluate the guards, start the run, record the firing
+    let starter: Arc<dyn crate::runner::PlanRunStarter> = match plan_runner_factory(&state) {
+        Some(factory) => Arc::new(factory),
+        None => Arc::new(crate::runner::NoPlanRunner),
+    };
+    let dispatcher = crate::runner::TriggerDispatcher::new(
+        graph.clone(),
+        Arc::new(crate::runner::TriggerEngine::new(graph.clone())),
+        starter,
+    );
+    let outcome = dispatcher
+        .dispatch(
+            &trigger,
+            crate::runner::FireRequest {
+                dedupe_key: webhook_signal_key(&headers, &body),
+                payload: Some(payload),
+                claims: Some(caller_claims),
+            },
+        )
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(webhook_dispatch_response(trigger_id, outcome)))
+}
+
+/// Identity of a webhook delivery: GitHub's `X-GitHub-Delivery` id, otherwise
+/// the SHA-256 of the body. The same delivery seen twice starts one run.
+fn webhook_signal_key(headers: &axum::http::HeaderMap, body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    match headers
+        .get("x-github-delivery")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+    {
+        Some(delivery) => format!("webhook:delivery:{delivery}"),
+        None => format!("webhook:body:{}", hex::encode(Sha256::digest(body))),
+    }
+}
+
+/// The JSON answer of `receive_webhook` for what became of the trigger.
+///
+/// A start failure answers a generic message: the reason (paths, slugs, run
+/// ids) is in the firing, for whoever may read the trigger's firings.
+fn webhook_dispatch_response(
+    trigger_id: Uuid,
+    outcome: crate::runner::DispatchOutcome,
+) -> serde_json::Value {
+    match outcome {
+        crate::runner::DispatchOutcome::Started { firing, start } => serde_json::json!({
+            "status": "fired",
+            "trigger_id": trigger_id,
+            "firing_id": firing.map(|f| f.id),
+            "plan_run_id": start.run_id,
+        }),
+        crate::runner::DispatchOutcome::StartFailed { firing, .. } => serde_json::json!({
+            "status": "start_failed",
+            "trigger_id": trigger_id,
+            "firing_id": firing.id,
+            "error": "the plan run could not start; the reason is recorded in the trigger's firing",
+        }),
+        crate::runner::DispatchOutcome::Duplicate => serde_json::json!({
+            "status": "duplicate",
+            "reason": "This delivery was already handled"
+        }),
+        crate::runner::DispatchOutcome::Skipped => serde_json::json!({
             "status": "skipped",
             "reason": "Trigger guards not met (disabled, cooldown, or active run)"
-        }))),
-        Err(e) => Err(AppError::Internal(e)),
+        }),
     }
 }
 
@@ -9170,6 +9226,143 @@ mod tests {
         let Json(own) = get_run_status(State(state), Path(plan_b)).await.unwrap();
         assert_eq!(own.run_id, Some(run_b));
         assert_eq!(own.plan_id, Some(plan_b));
+        reset_runner_globals().await;
+    }
+
+    /// A schedule trigger with a cron the provider cannot read is refused (400).
+    #[tokio::test]
+    async fn test_create_trigger_validates_the_cron() {
+        let state = mock_server_state().await;
+        let plan_id = Uuid::new_v4();
+        for config in [
+            serde_json::json!({"cron": "every day"}),
+            serde_json::json!({"cron": "61 * * * *"}),
+            serde_json::json!({}),
+        ] {
+            let result = create_trigger(
+                State(state.clone()),
+                Path(plan_id),
+                Json(serde_json::json!({"trigger_type": "schedule", "config": config})),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(AppError::BadRequest(_))),
+                "{config} must be refused"
+            );
+        }
+        let created = create_trigger(
+            State(state.clone()),
+            Path(plan_id),
+            Json(
+                serde_json::json!({"trigger_type": "schedule", "config": {"cron": "0 3 * * 1-5"}}),
+            ),
+        )
+        .await;
+        assert!(created.is_ok());
+        // Other trigger types carry no cron.
+        let event = create_trigger(
+            State(state),
+            Path(plan_id),
+            Json(serde_json::json!({"trigger_type": "event", "config": {"event_type": "plan_completed"}})),
+        )
+        .await;
+        assert!(event.is_ok());
+    }
+
+    /// A webhook that passes the guards starts a real run of the trigger's
+    /// plan and the firing names it; without a runner the firing records why
+    /// no run started, and the caller gets no detail (no path, no slug).
+    #[tokio::test]
+    async fn test_receive_webhook_starts_the_plan_run() {
+        let _guard = crate::runner::runner::RUNNER_GLOBALS_TEST_LOCK.lock().await;
+        reset_runner_globals().await;
+        let app_state = crate::test_helpers::mock_app_state();
+        let chat_manager = Arc::new(crate::chat::manager::ChatManager::new_without_memory(
+            app_state.neo4j.clone(),
+            app_state.meili.clone(),
+            crate::chat::config::ChatConfig::default(),
+        ));
+        let without_runner = mock_server_state_from(app_state.clone()).await;
+        let graph = without_runner.orchestrator.neo4j_arc();
+        let mut with_runner = Arc::try_unwrap(mock_server_state_from(app_state).await)
+            .unwrap_or_else(|_| unreachable!("a fresh state has one owner"));
+        with_runner.chat_manager = Some(chat_manager);
+        let with_runner: OrchestratorState = Arc::new(with_runner);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (_, plan_id) =
+            crate::runner::dispatch::tests::completed_plan_in_git_repo(graph.as_ref(), dir.path())
+                .await;
+        // One trigger per call: a webhook trigger waits a minute between firings.
+        let new_trigger = || {
+            crate::runner::dispatch::tests::trigger_of(plan_id, crate::runner::TriggerType::Webhook)
+        };
+        let (failing, starting) = (new_trigger(), new_trigger());
+        graph.create_trigger(&failing).await.unwrap();
+        graph.create_trigger(&starting).await.unwrap();
+        let caller = crate::auth::jwt::Claims::service_account("webhook-caller");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-github-delivery", "d-1".parse().unwrap());
+        let body = axum::body::Bytes::from_static(br#"{"ref":"refs/heads/main"}"#);
+
+        // No chat manager: fired, not started, the firing says why.
+        let Json(resp) = receive_webhook(
+            State(without_runner),
+            Path(failing.id),
+            axum::Extension(caller.clone()),
+            headers.clone(),
+            body.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["status"], "start_failed", "{resp}");
+        let firings = graph.list_trigger_firings(failing.id, 10).await.unwrap();
+        assert_eq!(firings.len(), 1);
+        assert!(firings[0].plan_run_id.is_none());
+        let reason = firings[0].start_error.clone().expect("start_error");
+        // The answer to the caller carries none of it.
+        let answer = resp.to_string();
+        assert!(!answer.contains(&reason), "{answer}");
+        assert!(!answer.contains("chat manager"), "{answer}");
+
+        // With the server's runner: the run really starts.
+        let Json(resp) = receive_webhook(
+            State(with_runner.clone()),
+            Path(starting.id),
+            axum::Extension(caller.clone()),
+            headers.clone(),
+            body.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["status"], "fired", "{resp}");
+        let run_id: Uuid = serde_json::from_value(resp["plan_run_id"].clone()).unwrap();
+        let run = graph.get_plan_run(run_id).await.unwrap().expect("PlanRun");
+        assert_eq!(run.plan_id, plan_id);
+        assert!(matches!(
+            run.triggered_by,
+            crate::runner::TriggerSource::Webhook { trigger_id, .. } if trigger_id == starting.id
+        ));
+        let firings = graph.list_trigger_firings(starting.id, 10).await.unwrap();
+        assert_eq!(firings.len(), 1);
+        assert_eq!(firings[0].plan_run_id, Some(run_id));
+        crate::runner::dispatch::tests::wait_until_finished(graph.as_ref(), run_id).await;
+
+        // The same delivery again (cooldown aside): no second run.
+        let mut replayed = graph.get_trigger(starting.id).await.unwrap().unwrap();
+        replayed.last_fired = None;
+        graph.create_trigger(&replayed).await.unwrap();
+        let Json(resp) = receive_webhook(
+            State(with_runner),
+            Path(starting.id),
+            axum::Extension(caller),
+            headers,
+            body,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["status"], "duplicate", "{resp}");
+
         reset_runner_globals().await;
     }
 

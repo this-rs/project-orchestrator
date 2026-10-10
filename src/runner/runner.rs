@@ -196,6 +196,30 @@ pub static RUNNER_STATE: LazyLock<Arc<RwLock<Option<RunnerState>>>> =
 pub static RUNNER_CANCEL: LazyLock<Arc<AtomicBool>> =
     LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 
+/// Serializes `PlanRunner::start`: the check that no run is active and the
+/// write of the new run into the globals happen as one step.
+static RUNNER_START_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Why a new run cannot start while `state` holds the process's run: the
+/// runner has a single global run state (state, cancel flag, budget, vector
+/// collector), so a second run would take over the first one's. `None` when
+/// there is no run or it has ended.
+pub(crate) fn active_run_refusal(state: Option<&RunnerState>, plan_id: Uuid) -> Option<String> {
+    let s = state.filter(|s| s.status == PlanRunStatus::Running)?;
+    Some(if s.plan_id == plan_id {
+        format!(
+            "Plan {} already has an active run: {} (status: {}). Cancel it first.",
+            plan_id, s.run_id, s.status
+        )
+    } else {
+        format!(
+            "Plan {} not started: another plan run is active (run {} of plan {}), one run at a time.",
+            plan_id, s.run_id, s.plan_id
+        )
+    })
+}
+
 /// Serializes the tests (runner and API handlers) that touch the runner globals.
 #[cfg(test)]
 pub(crate) static RUNNER_GLOBALS_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
@@ -1081,6 +1105,13 @@ impl PlanRunner {
         cwd: String,
         project_slug: Option<String>,
     ) -> Result<StartResult> {
+        // 0. One run at a time in this process: held until the new run is in
+        //    the globals, so two starts cannot both pass the check.
+        let start_guard = RUNNER_START_LOCK.lock().await;
+        if let Some(refusal) = active_run_refusal(RUNNER_STATE.read().await.as_ref(), plan_id) {
+            return Err(anyhow!(refusal));
+        }
+
         // 1. Check no active run exists for this plan
         let active_runs = self.graph.list_active_plan_runs().await?;
         if let Some(existing) = active_runs.iter().find(|r| r.plan_id == plan_id) {
@@ -1126,6 +1157,7 @@ impl PlanRunner {
             let mut collector = VECTOR_COLLECTOR.write().await;
             *collector = VectorCollector::new();
         }
+        drop(start_guard);
 
         // Transition plan status to InProgress (idempotent — warn if already in_progress)
         if let Err(e) = self
@@ -1491,6 +1523,18 @@ impl PlanRunner {
                         resolved_cwd
                     );
                     resolved_cwd
+                }
+                // `.` with no project root to resolve it against would be the
+                // server's own working directory: never a place to run.
+                CwdResolution::NoRootPath { resolved_cwd }
+                    if resolved_cwd == "." || resolved_cwd.is_empty() =>
+                {
+                    return Err(anyhow!(
+                        "No directory to run in: cwd '{}' and no project root_path to resolve it \
+                         (project slug: {}). Pass an absolute cwd or a project with a root_path.",
+                        resolved_cwd,
+                        project_slug.as_deref().unwrap_or("none")
+                    ));
                 }
                 CwdResolution::Match { resolved_cwd }
                 | CwdResolution::NoRootPath { resolved_cwd } => resolved_cwd,
@@ -9825,5 +9869,88 @@ mod tests {
         let first_after = g.get_plan_run(first.run_id).await.unwrap().unwrap();
         assert_ne!(first_after.status, PlanRunStatus::Interrupted);
         reset_globals().await;
+    }
+
+    /// A run of plan A holds the globals: starting plan B is refused and A's
+    /// state, cancel flag and budget are left as they were.
+    #[tokio::test]
+    async fn start_refuses_while_another_plans_run_is_active() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        use crate::test_helpers::{test_plan, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+        let runner = Arc::new(runner);
+        let plan_b = test_plan();
+        graph.create_plan(&plan_b).await.unwrap();
+        graph.create_task(plan_b.id, &test_task()).await.unwrap();
+
+        let (run_a, plan_a) = (Uuid::new_v4(), Uuid::new_v4());
+        {
+            *RUNNER_STATE.write().await =
+                Some(RunnerState::new(run_a, plan_a, 3, TriggerSource::Manual));
+        }
+        // A is being cancelled, with a budget override.
+        RUNNER_CANCEL.store(true, Ordering::SeqCst);
+        RUNNER_BUDGET.store(7.5f64.to_bits(), Ordering::Relaxed);
+
+        let err = runner
+            .clone()
+            .start(plan_b.id, TriggerSource::Manual, "/tmp".to_string(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("another plan run is active"),
+            "{err}"
+        );
+
+        let global = RUNNER_STATE.read().await;
+        let state = global.as_ref().expect("A's state is still there");
+        assert_eq!((state.run_id, state.plan_id), (run_a, plan_a));
+        drop(global);
+        assert!(RUNNER_CANCEL.load(Ordering::SeqCst), "A's cancel flag kept");
+        assert_eq!(f64::from_bits(RUNNER_BUDGET.load(Ordering::Relaxed)), 7.5);
+        assert!(graph
+            .list_plan_runs(plan_b.id, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        reset_globals().await;
+    }
+
+    #[test]
+    fn active_run_refusal_only_for_a_running_state() {
+        let plan = Uuid::new_v4();
+        assert!(active_run_refusal(None, plan).is_none());
+        let mut state = RunnerState::new(Uuid::new_v4(), Uuid::new_v4(), 1, TriggerSource::Manual);
+        assert!(active_run_refusal(Some(&state), plan)
+            .unwrap()
+            .contains("another plan run is active"));
+        state.finalize(PlanRunStatus::Completed);
+        assert!(active_run_refusal(Some(&state), plan).is_none());
+        let own = RunnerState::new(Uuid::new_v4(), plan, 1, TriggerSource::Manual);
+        assert!(active_run_refusal(Some(&own), plan)
+            .unwrap()
+            .contains("already has an active run"));
+    }
+
+    /// `.` with no project root to resolve it (no slug, an unknown slug, or a
+    /// slug that could not be read) is refused, never the server's directory.
+    #[tokio::test]
+    async fn execute_plan_refuses_dot_without_a_project_root() {
+        let (runner, _graph) = test_plan_runner_with_graph();
+        for slug in [None, Some("no-such-project".to_string())] {
+            let err = runner
+                .execute_plan(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    vec![],
+                    ".".to_string(),
+                    slug,
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("No directory to run in"), "{err}");
+        }
     }
 }

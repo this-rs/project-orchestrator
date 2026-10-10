@@ -148,6 +148,8 @@ pub struct MockGraphStore {
     pub triggers: RwLock<HashMap<Uuid, crate::runner::Trigger>>,
     /// Trigger firings
     pub trigger_firings: RwLock<HashMap<Uuid, Vec<crate::runner::TriggerFiring>>>,
+    /// Last reserved signal key per trigger (`reserve_trigger_signal`).
+    pub trigger_reservations: RwLock<HashMap<Uuid, String>>,
 
     // Relationships (adjacency lists)
     pub plan_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
@@ -361,6 +363,7 @@ impl MockGraphStore {
             chat_events_released: tokio::sync::Notify::new(),
             triggers: RwLock::new(HashMap::new()),
             trigger_firings: RwLock::new(HashMap::new()),
+            trigger_reservations: RwLock::new(HashMap::new()),
             plan_tasks: RwLock::new(HashMap::new()),
             task_steps: RwLock::new(HashMap::new()),
             task_decisions: RwLock::new(HashMap::new()),
@@ -8404,8 +8407,12 @@ impl GraphStore for MockGraphStore {
         Ok(std::collections::HashMap::new())
     }
 
-    async fn get_task_plan_id(&self, _task_id: Uuid) -> Result<Option<Uuid>> {
-        Ok(None)
+    async fn get_task_plan_id(&self, task_id: Uuid) -> Result<Option<Uuid>> {
+        let pt = self.plan_tasks.read().await;
+        Ok(pt
+            .iter()
+            .find(|(_, ids)| ids.contains(&task_id))
+            .map(|(plan_id, _)| *plan_id))
     }
 
     // ========================================================================
@@ -12102,6 +12109,19 @@ impl GraphStore for MockGraphStore {
             t.last_fired = Some(firing.fired_at);
         }
         Ok(())
+    }
+
+    async fn reserve_trigger_signal(&self, trigger_id: Uuid, key: &str) -> anyhow::Result<bool> {
+        if !self.triggers.read().await.contains_key(&trigger_id) {
+            return Ok(false);
+        }
+        // One write lock for the read and the write: compare-and-set.
+        let mut reservations = self.trigger_reservations.write().await;
+        if reservations.get(&trigger_id).map(String::as_str) == Some(key) {
+            return Ok(false);
+        }
+        reservations.insert(trigger_id, key.to_string());
+        Ok(true)
     }
 
     async fn list_trigger_firings(

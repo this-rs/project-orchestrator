@@ -4127,6 +4127,10 @@ impl GraphStore for Neo4jClient {
         self.record_trigger_firing_impl(firing).await
     }
 
+    async fn reserve_trigger_signal(&self, trigger_id: Uuid, key: &str) -> anyhow::Result<bool> {
+        self.reserve_trigger_signal_impl(trigger_id, key).await
+    }
+
     async fn list_trigger_firings(
         &self,
         trigger_id: Uuid,

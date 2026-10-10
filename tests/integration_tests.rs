@@ -1121,6 +1121,7 @@ async fn test_trigger_firing_binds_plan_run_id() {
         plan_run_id: Some(run_id),
         fired_at: chrono::Utc::now(),
         source_payload: Some(serde_json::json!({"body": EVIL})),
+        start_error: None,
     };
     client.record_trigger_firing_impl(&linked).await.unwrap();
 
@@ -1150,25 +1151,34 @@ async fn test_trigger_firing_binds_plan_run_id() {
         plan_run_id: None,
         fired_at: chrono::Utc::now(),
         source_payload: None,
+        start_error: Some("Plan has no tasks to execute".to_string()),
     };
     client.record_trigger_firing_impl(&unlinked).await.unwrap();
-    let (exists, edges): (i64, i64) = {
+    let (exists, edges, start_error): (i64, i64, String) = {
         let mut r = raw
             .execute(
                 neo4rs::query(
                     "MATCH (f:TriggerFiring {id: $fid}) \
                      OPTIONAL MATCH (f)-[s:STARTED]->() \
-                     RETURN count(DISTINCT f) AS f, count(s) AS s",
+                     RETURN count(DISTINCT f) AS f, count(s) AS s, f.start_error AS e",
                 )
                 .param("fid", unlinked.id.to_string()),
             )
             .await
             .unwrap();
         let row = r.next().await.unwrap().unwrap();
-        (row.get("f").unwrap(), row.get("s").unwrap())
+        (
+            row.get("f").unwrap(),
+            row.get("s").unwrap(),
+            row.get("e").unwrap(),
+        )
     };
     assert_eq!(exists, 1, "the firing must be recorded without a run");
     assert_eq!(edges, 0, "no STARTED edge without a plan_run_id");
+    assert_eq!(
+        start_error, "Plan has no tasks to execute",
+        "why no run started is stored on the firing"
+    );
 
     raw.run(
         neo4rs::query(
@@ -1183,6 +1193,91 @@ async fn test_trigger_firing_binds_plan_run_id() {
     raw.run(
         neo4rs::query("MATCH (r:PlanRun {run_id: $rid}) DETACH DELETE r")
             .param("rid", run_id.to_string()),
+    )
+    .await
+    .unwrap();
+}
+
+/// The reservation of a trigger signal is a compare-and-set: of many
+/// concurrent reservations of the same key, exactly one wins; a new key wins
+/// again; an unknown trigger never does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_trigger_signal_reservation_is_atomic() {
+    use project_orchestrator::neo4j::client::Neo4jClient;
+    use project_orchestrator::runner::{Trigger, TriggerType};
+
+    let config = test_config();
+    let client = match Neo4jClient::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(e) => {
+            eprintln!("Skipping test: Neo4j not available: {e}");
+            return;
+        }
+    };
+    let raw = neo4rs::Graph::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    .unwrap();
+    let plan_id = Uuid::new_v4();
+    raw.run(
+        neo4rs::query("CREATE (:Plan {id: $pid, name: 'reservation-test'})")
+            .param("pid", plan_id.to_string()),
+    )
+    .await
+    .unwrap();
+    let trigger = Trigger {
+        id: Uuid::new_v4(),
+        plan_id,
+        trigger_type: TriggerType::Schedule,
+        config: serde_json::json!({"cron": "* * * * *"}),
+        enabled: true,
+        cooldown_secs: 0,
+        last_fired: None,
+        fire_count: 0,
+        created_at: chrono::Utc::now(),
+    };
+    client.create_trigger_impl(&trigger).await.unwrap();
+
+    let handles: Vec<_> = (0..16)
+        .map(|_| {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .reserve_trigger_signal_impl(trigger.id, "schedule:minute-1")
+                    .await
+                    .unwrap()
+            })
+        })
+        .collect();
+    let mut won = 0;
+    for handle in handles {
+        if handle.await.unwrap() {
+            won += 1;
+        }
+    }
+    assert_eq!(won, 1, "one reservation of one signal");
+    assert!(client
+        .reserve_trigger_signal_impl(trigger.id, "schedule:minute-2")
+        .await
+        .unwrap());
+    assert!(!client
+        .reserve_trigger_signal_impl(Uuid::new_v4(), "schedule:minute-1")
+        .await
+        .unwrap());
+
+    client.delete_trigger_impl(trigger.id).await.unwrap();
+    raw.run(
+        neo4rs::query("MATCH (p:Plan {id: $pid}) DETACH DELETE p")
+            .param("pid", plan_id.to_string()),
     )
     .await
     .unwrap();

@@ -689,6 +689,11 @@ pub struct TriggerFiring {
     pub fired_at: DateTime<Utc>,
     /// Optional payload from the trigger source (webhook body, event data, etc.)
     pub source_payload: Option<serde_json::Value>,
+    /// Why no run started although the trigger fired (plan without tasks,
+    /// active run, plan without a project or directory...). `None` when the
+    /// run started (`plan_run_id` is set).
+    #[serde(default)]
+    pub start_error: Option<String>,
 }
 
 // ============================================================================

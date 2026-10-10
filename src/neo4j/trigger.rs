@@ -175,7 +175,9 @@ impl Neo4jClient {
                 id: $id,
                 trigger_id: $trigger_id,
                 fired_at: datetime($fired_at),
-                source_payload: $source_payload
+                source_payload: $source_payload,
+                plan_run_id: $plan_run_id,
+                start_error: $start_error
             })
             CREATE (f)-[:FIRED_BY]->(t)
             SET t.fire_count = t.fire_count + 1,
@@ -193,7 +195,7 @@ impl Neo4jClient {
             );
         }
 
-        let mut q = query(&cypher)
+        let q = query(&cypher)
             .param("id", firing.id.to_string())
             .param("trigger_id", firing.trigger_id.to_string())
             .param("fired_at", firing.fired_at.to_rfc3339())
@@ -204,13 +206,48 @@ impl Neo4jClient {
                     .as_ref()
                     .map(|p| serde_json::to_string(p).unwrap_or_default())
                     .unwrap_or_default(),
+            )
+            .param(
+                "plan_run_id",
+                firing
+                    .plan_run_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+            )
+            .param(
+                "start_error",
+                firing.start_error.clone().unwrap_or_default(),
             );
-        if let Some(run_id) = firing.plan_run_id {
-            q = q.param("plan_run_id", run_id.to_string());
-        }
 
         self.graph.run(q).await?;
         Ok(())
+    }
+
+    /// Compare-and-set of the trigger's last reserved signal key.
+    ///
+    /// The first `SET` takes the write lock on the Trigger node before anything
+    /// is read, so two transactions with the same key are serialized and the
+    /// second reads the key the first committed: only one gets `true`.
+    pub async fn reserve_trigger_signal_impl(&self, trigger_id: Uuid, key: &str) -> Result<bool> {
+        let q = query(
+            r#"
+            MATCH (t:Trigger {id: $trigger_id})
+            SET t.reservation_lock = true
+            WITH t, coalesce(t.last_signal_key, '') <> $key AS won
+            FOREACH (_ IN CASE WHEN won THEN [1] ELSE [] END |
+                SET t.last_signal_key = $key)
+            REMOVE t.reservation_lock
+            RETURN won
+            "#,
+        )
+        .param("trigger_id", trigger_id.to_string())
+        .param("key", key.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => Ok(row.get::<bool>("won")?),
+            None => Ok(false),
+        }
     }
 
     /// List trigger firings for a given trigger, ordered by fired_at desc.
@@ -279,6 +316,7 @@ impl Neo4jClient {
         let fired_at: String = node.get("fired_at")?;
         let source_payload: Option<String> = node.get("source_payload").ok();
         let plan_run_id: Option<String> = node.get("plan_run_id").ok();
+        let start_error: Option<String> = node.get("start_error").ok();
 
         Ok(TriggerFiring {
             id: id.parse()?,
@@ -292,6 +330,7 @@ impl Neo4jClient {
                     serde_json::from_str(&s).ok()
                 }
             }),
+            start_error: start_error.filter(|e| !e.is_empty()),
         })
     }
 }

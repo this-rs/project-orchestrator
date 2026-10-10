@@ -3703,6 +3703,12 @@ pub trait GraphStore: Send + Sync {
     /// Record a trigger firing event.
     async fn record_trigger_firing(&self, firing: &crate::runner::TriggerFiring) -> Result<()>;
 
+    /// Reserve the signal `key` of trigger `trigger_id`, atomically: `true` for
+    /// the one caller whose key differs from the trigger's last reserved key
+    /// (which becomes `key`), `false` for every other (same key already taken,
+    /// or no such trigger). Several instances seeing the same signal start one run.
+    async fn reserve_trigger_signal(&self, trigger_id: Uuid, key: &str) -> Result<bool>;
+
     /// List all triggers across all plans, optionally filtered by type.
     async fn list_all_triggers(
         &self,

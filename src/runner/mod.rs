@@ -13,9 +13,11 @@
 //! ├── verifier.rs  — post-task verification: build, steps, git
 //! ├── enricher.rs  — post-task knowledge capture (V1: git-based)
 //! ├── trigger.rs   — TriggerEngine: evaluation + firing
+//! ├── dispatch.rs  — TriggerDispatcher: a firing trigger starts a plan run
 //! └── providers/   — trigger providers (schedule, webhook, event)
 //! ```
 
+pub mod dispatch;
 pub mod eligibility;
 pub mod enricher;
 pub mod feedback;
@@ -36,6 +38,10 @@ pub mod vector;
 pub mod verifier;
 
 // Re-export key types for convenience
+pub use dispatch::{
+    DispatchOutcome, FireRequest, NoPlanRunner, PlanRunStarter, PlanRunnerFactory, RunOptions,
+    TriggerDispatcher,
+};
 pub use enricher::{EnrichResult, TaskEnricher};
 pub use feedback::{
     contains_dissatisfaction, ManualCommitInfo, OverrideType, PostRunMessage,
