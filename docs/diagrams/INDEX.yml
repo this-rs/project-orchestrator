@@ -250,7 +250,7 @@ diagrams:
     mermaid_id: dc22b7048fb964b
     external: project-orchestrator/architecture-po/po-runner-orchestrator@3
     verified_at: 2026-10-10
-    verified_sha: 6c79054e
+    verified_sha: 501cb0b9
     # Arbitrage : src/orchestrator/{mod,runner}.rs scanne et synchronise le code
     # (scan_files, init_embedding_provider, should_ignore_path) : po-sync-parser en repond.
     covers:
@@ -261,7 +261,7 @@ diagrams:
     mermaid_id: d34a0124803e64e
     external: project-orchestrator/architecture-po/po-plan-triggers@1
     verified_at: 2026-10-10
-    verified_sha: 6c79054e
+    verified_sha: 501cb0b9
     # Scinde de po-runner-orchestrator (une question par diagramme) : un declencheur qui tire
     # (schedule, event, webhook) passe par TriggerDispatcher et demarre le run via PlanRunnerFactory.
     covers:

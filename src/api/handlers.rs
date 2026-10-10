@@ -6110,12 +6110,18 @@ pub async fn create_auto_pr(
 // ============================================================================
 
 /// POST /api/plans/:id/triggers — Create a trigger for a plan.
+///
+/// The caller is recorded as the trigger's author: a `schedule` or `event`
+/// trigger has nobody behind its signals, so its runs start as the author —
+/// with the identity, third-party lineage and ceiling `plan(action: "run")`
+/// would give that caller, never as the server's own account.
 pub async fn create_trigger(
     State(state): State<OrchestratorState>,
     Path(plan_id): Path<Uuid>,
+    axum::Extension(caller): axum::Extension<crate::auth::jwt::Claims>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    use crate::runner::{Trigger, TriggerType};
+    use crate::runner::{Trigger, TriggerAuthor, TriggerType};
 
     let trigger_type_str = body
         .get("trigger_type")
@@ -6157,6 +6163,7 @@ pub async fn create_trigger(
         last_fired: None,
         fire_count: 0,
         created_at: chrono::Utc::now(),
+        author: Some(TriggerAuthor::from_claims(&caller)),
     };
 
     let graph = state.orchestrator.neo4j_arc();
@@ -6212,13 +6219,21 @@ pub async fn delete_trigger(
 }
 
 /// PATCH /api/triggers/:id/enable — Enable a trigger.
+///
+/// Whoever enables the trigger becomes its author (see [`create_trigger`]):
+/// enabling a trigger someone else wrote is starting its runs as oneself, so a
+/// third-party session cannot turn a person's trigger into an unrestricted run.
 pub async fn enable_trigger(
     State(state): State<OrchestratorState>,
     Path(trigger_id): Path<Uuid>,
+    axum::Extension(caller): axum::Extension<crate::auth::jwt::Claims>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let graph = state.orchestrator.neo4j_arc();
     let trigger = graph
-        .update_trigger(trigger_id, Some(true), None, None)
+        .enable_trigger_as(
+            trigger_id,
+            &crate::runner::TriggerAuthor::from_claims(&caller),
+        )
         .await
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Trigger {} not found", trigger_id)))?;
@@ -6382,6 +6397,7 @@ pub async fn receive_webhook(
                 dedupe_key: webhook_signal_key(&headers, &body),
                 payload: Some(payload),
                 claims: Some(caller_claims),
+                chain_depth: None,
             },
         )
         .await
@@ -9242,6 +9258,7 @@ mod tests {
             let result = create_trigger(
                 State(state.clone()),
                 Path(plan_id),
+                axum::Extension(crate::auth::jwt::Claims::anonymous()),
                 Json(serde_json::json!({"trigger_type": "schedule", "config": config})),
             )
             .await;
@@ -9253,6 +9270,7 @@ mod tests {
         let created = create_trigger(
             State(state.clone()),
             Path(plan_id),
+            axum::Extension(crate::auth::jwt::Claims::anonymous()),
             Json(
                 serde_json::json!({"trigger_type": "schedule", "config": {"cron": "0 3 * * 1-5"}}),
             ),
@@ -9263,10 +9281,152 @@ mod tests {
         let event = create_trigger(
             State(state),
             Path(plan_id),
+            axum::Extension(crate::auth::jwt::Claims::anonymous()),
             Json(serde_json::json!({"trigger_type": "event", "config": {"event_type": "plan_completed"}})),
         )
         .await;
         assert!(event.is_ok());
+    }
+
+    /// (A, H6) A third-party session in `full` (trust) creates a `schedule`
+    /// trigger: when it fires, nobody is behind the minute, and the run's
+    /// agents must still be restricted, as `plan(action: "run")` would make
+    /// them for that session. Likewise when it enables a person's trigger. A
+    /// person's trigger keeps the full profile.
+    #[tokio::test]
+    async fn test_a_third_party_sessions_schedule_trigger_runs_restricted() {
+        use crate::auth::tool_profile::ToolProfile;
+        use crate::runner::dispatch::tests::{
+            agent_session_claims, completed_plan_in_git_repo, person_claims, RecordingStarter,
+        };
+        let app_state = crate::test_helpers::mock_app_state();
+        let chat_config = crate::chat::config::ChatConfig {
+            jwt_secret: Some("test-secret-key-minimum-32-chars!!".into()),
+            ..Default::default()
+        };
+        let manager = crate::chat::manager::ChatManager::new_without_memory(
+            app_state.neo4j.clone(),
+            app_state.meili.clone(),
+            chat_config,
+        );
+        let state = mock_server_state_from(app_state).await;
+        let graph = state.orchestrator.neo4j_arc();
+        let dir = tempfile::tempdir().unwrap();
+        let (_, plan_id) = completed_plan_in_git_repo(graph.as_ref(), dir.path()).await;
+
+        // A third-party session in trust: full profile, every trigger route open.
+        let third = agent_session_claims("third-s1", true, None, "bypassPermissions");
+        let binding = crate::auth::jwt::agent_session_binding(&third).unwrap();
+        let profile = ToolProfile::from_name(binding.tool_profile.as_deref());
+        assert_eq!(profile, ToolProfile::Full);
+        assert!(!profile.route_forbidden(
+            &axum::http::Method::POST,
+            &format!("/api/plans/{plan_id}/triggers")
+        ));
+
+        // The profile the agents of the run started by `trigger_id` get: the
+        // dispatch the schedule provider makes (no caller), then the claims
+        // the runner gives a task agent and the MCP token minted from them for
+        // a Claude Code agent in bypass, as `PlanRunner` does.
+        let profile_of_run = |trigger_id: Uuid, minute: &'static str| {
+            let (graph, manager) = (graph.clone(), &manager);
+            async move {
+                let trigger = graph.get_trigger(trigger_id).await.unwrap().unwrap();
+                let starter = Arc::new(RecordingStarter::on(graph.clone()));
+                let dispatcher = crate::runner::TriggerDispatcher::new(
+                    graph.clone(),
+                    Arc::new(crate::runner::TriggerEngine::new(graph.clone())),
+                    starter.clone(),
+                );
+                let outcome = dispatcher
+                    .dispatch(
+                        &trigger,
+                        crate::runner::FireRequest {
+                            dedupe_key: minute.to_string(),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let crate::runner::DispatchOutcome::Started { start, .. } = outcome else {
+                    panic!("expected a started run, got {outcome:?}");
+                };
+                let run_claims = starter.claims.lock().await[0].clone();
+                let agent = crate::runner::runner::agent_claims(run_claims.as_ref(), start.run_id);
+                let env = manager
+                    .po_mcp_env(
+                        Some("bypassPermissions"),
+                        Some(&agent),
+                        Some(&format!("agent-of-{}", start.run_id)),
+                        None,
+                        false,
+                    )
+                    .await;
+                for mut run in graph.list_active_plan_runs().await.unwrap() {
+                    run.finalize(crate::runner::PlanRunStatus::Completed);
+                    graph.update_plan_run(&run).await.unwrap();
+                }
+                ToolProfile::from_unverified_token(&env["PO_AUTH_TOKEN"])
+            }
+        };
+
+        // 1. Created by the third-party session: restricted.
+        let schedule =
+            serde_json::json!({"trigger_type": "schedule", "config": {"cron": "* * * * *"}});
+        let Json(created) = create_trigger(
+            State(state.clone()),
+            Path(plan_id),
+            axum::Extension(third.clone()),
+            Json(schedule.clone()),
+        )
+        .await
+        .unwrap();
+        let third_trigger: Uuid = serde_json::from_value(created["id"].clone()).unwrap();
+        let author = &created["author"];
+        assert_eq!(author["third_party"], true, "{created}");
+        assert_eq!(author["session_id"], "third-s1");
+        assert_eq!(author["ceiling"], "bypassPermissions");
+        let run_profile = profile_of_run(third_trigger, "schedule:m1").await;
+        assert_eq!(run_profile, ToolProfile::Restricted);
+        assert!(run_profile.route_forbidden(
+            &axum::http::Method::POST,
+            &format!("/api/plans/{plan_id}/run")
+        ));
+
+        // 2. A person's trigger: full, as `plan(run)` gives a person.
+        let Json(created) = create_trigger(
+            State(state.clone()),
+            Path(plan_id),
+            axum::Extension(person_claims()),
+            Json(schedule),
+        )
+        .await
+        .unwrap();
+        let person_trigger: Uuid = serde_json::from_value(created["id"].clone()).unwrap();
+        assert_eq!(
+            profile_of_run(person_trigger, "schedule:m2").await,
+            ToolProfile::Full
+        );
+
+        // 3. The third-party session enables the person's trigger: it is now
+        //    the author, and the runs are restricted.
+        let Json(disabled) = disable_trigger(State(state.clone()), Path(person_trigger))
+            .await
+            .unwrap();
+        assert_eq!(disabled["enabled"], false);
+        let Json(enabled) = enable_trigger(
+            State(state.clone()),
+            Path(person_trigger),
+            axum::Extension(third),
+        )
+        .await
+        .unwrap();
+        assert_eq!(enabled["enabled"], true);
+        assert_eq!(enabled["author"]["third_party"], true);
+        assert_eq!(
+            profile_of_run(person_trigger, "schedule:m3").await,
+            ToolProfile::Restricted
+        );
     }
 
     /// A webhook that passes the guards starts a real run of the trigger's

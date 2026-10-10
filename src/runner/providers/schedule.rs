@@ -123,10 +123,10 @@ async fn evaluate_schedule_triggers(
         let Some(minute) = due_minute(trigger, since, now) else {
             continue;
         };
+        // No caller behind a minute: the run starts as the trigger's author.
         let request = FireRequest {
             dedupe_key: format!("schedule:{}", minute.to_rfc3339()),
-            payload: None,
-            claims: None,
+            ..FireRequest::default()
         };
         match dispatcher.dispatch(trigger, request).await {
             Ok(DispatchOutcome::Started { start, .. }) => {

@@ -149,6 +149,8 @@ impl TriggerEngine {
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown")
                             .to_string(),
+                        // Set by the dispatcher from the event's chain.
+                        chain_depth: 1,
                     },
                     TriggerType::Chat => TriggerSource::Chat { session_id: None },
                 };
@@ -196,6 +198,7 @@ mod tests {
             last_fired: None,
             fire_count: 0,
             created_at: Utc::now(),
+            author: None,
         }
     }
 

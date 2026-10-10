@@ -4127,8 +4127,22 @@ impl GraphStore for Neo4jClient {
         self.record_trigger_firing_impl(firing).await
     }
 
-    async fn reserve_trigger_signal(&self, trigger_id: Uuid, key: &str) -> anyhow::Result<bool> {
-        self.reserve_trigger_signal_impl(trigger_id, key).await
+    async fn enable_trigger_as(
+        &self,
+        trigger_id: Uuid,
+        author: &crate::runner::TriggerAuthor,
+    ) -> anyhow::Result<Option<crate::runner::Trigger>> {
+        self.enable_trigger_as_impl(trigger_id, author).await
+    }
+
+    async fn reserve_trigger_signal(
+        &self,
+        trigger_id: Uuid,
+        key: &str,
+        cooldown_secs: u64,
+    ) -> anyhow::Result<crate::runner::SignalReservation> {
+        self.reserve_trigger_signal_impl(trigger_id, key, cooldown_secs)
+            .await
     }
 
     async fn list_trigger_firings(

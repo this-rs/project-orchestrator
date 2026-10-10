@@ -1,11 +1,22 @@
 //! Neo4j Trigger operations — trigger persistence and firing history
 
 use super::client::Neo4jClient;
-use crate::runner::{Trigger, TriggerFiring, TriggerType};
+use crate::runner::{SignalReservation, Trigger, TriggerAuthor, TriggerFiring, TriggerType};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use neo4rs::query;
 use uuid::Uuid;
+
+/// How long a reserved trigger signal is remembered: the same key seen again
+/// within this window is a duplicate.
+pub const TRIGGER_SIGNAL_RETENTION_HOURS: i64 = 24;
+
+/// A trigger's author as stored on the node: JSON, `""` for none.
+fn author_param(author: Option<&TriggerAuthor>) -> String {
+    author
+        .and_then(|a| serde_json::to_string(a).ok())
+        .unwrap_or_default()
+}
 
 impl Neo4jClient {
     /// Create a Trigger node and link it to a Plan via (:Trigger)-[:TRIGGERS]->(:Plan).
@@ -21,7 +32,8 @@ impl Neo4jClient {
                 enabled: $enabled,
                 cooldown_secs: $cooldown_secs,
                 fire_count: 0,
-                created_at: datetime($created_at)
+                created_at: datetime($created_at),
+                author: $author
             })
             CREATE (t)-[:TRIGGERS]->(p)
             RETURN t
@@ -36,7 +48,8 @@ impl Neo4jClient {
         )
         .param("enabled", trigger.enabled)
         .param("cooldown_secs", trigger.cooldown_secs as i64)
-        .param("created_at", trigger.created_at.to_rfc3339());
+        .param("created_at", trigger.created_at.to_rfc3339())
+        .param("author", author_param(trigger.author.as_ref()));
 
         self.graph.run(q).await?;
         Ok(trigger.clone())
@@ -163,6 +176,9 @@ impl Neo4jClient {
         .param("id", trigger_id.to_string());
 
         self.graph.run(q).await?;
+        let signals = query("MATCH (s:TriggerSignal {trigger_id: $id}) DELETE s")
+            .param("id", trigger_id.to_string());
+        self.graph.run(signals).await?;
         Ok(())
     }
 
@@ -181,7 +197,11 @@ impl Neo4jClient {
             })
             CREATE (f)-[:FIRED_BY]->(t)
             SET t.fire_count = t.fire_count + 1,
-                t.last_fired = datetime($fired_at)
+                t.last_fired = CASE
+                    WHEN t.last_fired IS NULL OR t.last_fired < datetime($fired_at)
+                    THEN datetime($fired_at)
+                    ELSE t.last_fired
+                END
             "#,
         );
 
@@ -223,31 +243,93 @@ impl Neo4jClient {
         Ok(())
     }
 
-    /// Compare-and-set of the trigger's last reserved signal key.
+    /// Enable the trigger and record its author, in one write.
+    pub async fn enable_trigger_as_impl(
+        &self,
+        trigger_id: Uuid,
+        author: &TriggerAuthor,
+    ) -> Result<Option<Trigger>> {
+        let q = query(
+            r#"
+            MATCH (t:Trigger {id: $id})
+            SET t.enabled = true, t.author = $author
+            REMOVE t.disabled_reason
+            RETURN t
+            "#,
+        )
+        .param("id", trigger_id.to_string())
+        .param("author", author_param(Some(author)));
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("t")?;
+            Ok(Some(self.node_to_trigger(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Reserve the signal `key` of a trigger: one `TriggerSignal` per
+    /// `(trigger_id, key)` (unique constraint `trigger_signal_key`), and the
+    /// cooldown read and `last_fired` written in the same statement.
     ///
     /// The first `SET` takes the write lock on the Trigger node before anything
-    /// is read, so two transactions with the same key are serialized and the
-    /// second reads the key the first committed: only one gets `true`.
-    pub async fn reserve_trigger_signal_impl(&self, trigger_id: Uuid, key: &str) -> Result<bool> {
+    /// is read, so two reservations of one trigger are serialized: the second
+    /// sees the signal and the `last_fired` the first committed. A signal
+    /// older than 24 h no longer counts (a delivery replayed after that starts
+    /// a run again); such signals are purged after each reservation.
+    pub async fn reserve_trigger_signal_impl(
+        &self,
+        trigger_id: Uuid,
+        key: &str,
+        cooldown_secs: u64,
+    ) -> Result<SignalReservation> {
         let q = query(
             r#"
             MATCH (t:Trigger {id: $trigger_id})
             SET t.reservation_lock = true
-            WITH t, coalesce(t.last_signal_key, '') <> $key AS won
-            FOREACH (_ IN CASE WHEN won THEN [1] ELSE [] END |
-                SET t.last_signal_key = $key)
+            WITH t
+            OPTIONAL MATCH (seen:TriggerSignal {trigger_id: $trigger_id, key: $key})
+            WHERE seen.reserved_at >= datetime() - duration({hours: $retention_hours})
+            WITH t, seen IS NULL AS fresh,
+                 ($cooldown_secs = 0 OR t.last_fired IS NULL
+                  OR t.last_fired + duration({seconds: $cooldown_secs}) <= datetime()) AS cooled
+            FOREACH (_ IN CASE WHEN fresh AND cooled THEN [1] ELSE [] END |
+                MERGE (s:TriggerSignal {trigger_id: $trigger_id, key: $key})
+                SET s.reserved_at = datetime(), t.last_fired = datetime())
             REMOVE t.reservation_lock
-            RETURN won
+            RETURN fresh, cooled
             "#,
         )
         .param("trigger_id", trigger_id.to_string())
-        .param("key", key.to_string());
+        .param("key", key.to_string())
+        .param("cooldown_secs", cooldown_secs as i64)
+        .param("retention_hours", TRIGGER_SIGNAL_RETENTION_HOURS);
 
         let mut result = self.graph.execute(q).await?;
-        match result.next().await? {
-            Some(row) => Ok(row.get::<bool>("won")?),
-            None => Ok(false),
+        let reservation = match result.next().await? {
+            Some(row) => match (row.get::<bool>("fresh")?, row.get::<bool>("cooled")?) {
+                (false, _) => SignalReservation::Duplicate,
+                (true, false) => SignalReservation::Cooldown,
+                (true, true) => SignalReservation::Reserved,
+            },
+            None => SignalReservation::Duplicate,
+        };
+        drop(result);
+
+        let purge = query(
+            r#"
+            MATCH (s:TriggerSignal)
+            WHERE s.reserved_at < datetime() - duration({hours: $retention_hours})
+            WITH s LIMIT 1000
+            DELETE s
+            "#,
+        )
+        .param("retention_hours", TRIGGER_SIGNAL_RETENTION_HOURS);
+        if let Err(e) = self.graph.run(purge).await {
+            tracing::warn!("Purge of old trigger signals failed (retried next time): {e:#}");
         }
+        Ok(reservation)
     }
 
     /// List trigger firings for a given trigger, ordered by fired_at desc.
@@ -287,6 +369,7 @@ impl Neo4jClient {
         let fire_count: i64 = node.get("fire_count").unwrap_or(0);
         let created_at: String = node.get("created_at")?;
         let last_fired: Option<String> = node.get("last_fired").ok();
+        let author: Option<String> = node.get("author").ok();
 
         let tt = match trigger_type.as_str() {
             "schedule" => TriggerType::Schedule,
@@ -306,6 +389,9 @@ impl Neo4jClient {
             last_fired: last_fired.and_then(|s| s.parse::<DateTime<Utc>>().ok()),
             fire_count: fire_count as u64,
             created_at: created_at.parse()?,
+            author: author
+                .filter(|a| !a.is_empty())
+                .and_then(|a| serde_json::from_str(&a).ok()),
         })
     }
 
