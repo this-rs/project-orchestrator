@@ -31,7 +31,9 @@
 //!      anything), and the MCP `readOnlyHint` annotation does not reach the backend (no
 //!      engine relays it in a permission request): an undeclared one is allowed once,
 //!      never for the session. A declared one named like a command tool still goes
-//!      through the command checks;
+//!      through the command checks. A declaration binds a name, not a server (a
+//!      project's `.mcp.json` may name a server like one configured elsewhere for the
+//!      CLI): the operator declares only tools of servers no project can redefine;
 //!    - a command (`Bash`, `Monitor`): the identical line, and only when EVERY simple
 //!      command of it is a program of [`SAFE_PROGRAMS`] (programs that execute nothing
 //!      from the project), none of its options able to run something or to write a file,
@@ -499,6 +501,9 @@ struct Word {
     /// It holds an unquoted glob character (`*`, `?`, `[`): the shell may expand it to
     /// file names the model chose (a file named `--pre=./x.sh`).
     glob: bool,
+    /// Some part of it was quoted (`'>'`, `">"x`): for the shell it is a literal word,
+    /// never a redirection operator, whatever it looks like.
+    quoted: bool,
 }
 
 /// The simple commands of a shell line, each as its words (quotes removed), split on
@@ -556,6 +561,7 @@ fn simple_commands(line: &str) -> Option<Vec<Vec<Word>>> {
             '^' | '~' | '#' => return None,
             '\'' | '"' => {
                 quote = Some(c);
+                word.quoted = true;
                 in_word = true;
             }
             // `2>&1`, `>&2`, `<&3`, `&>file`, `&>>file`: a redirection.
@@ -625,9 +631,11 @@ fn operands(args: &[Word]) -> usize {
             continue;
         }
         // `>out`, `2>>log`, `<in`, `&>f`, `>&2`: a redirection, its target attached or the
-        // next word.
+        // next word. Only an UNQUOTED word: a quoted one that looks like an operator is a
+        // literal operand for the shell (and does not hide the word after it). The program
+        // gets every word without its quotes, so options are read the same either way.
         let operator = text.trim_start_matches(|c: char| c.is_ascii_digit());
-        if operator.starts_with(['<', '>']) || operator.starts_with("&>") {
+        if !word.quoted && (operator.starts_with(['<', '>']) || operator.starts_with("&>")) {
             redirect_target = operator.trim_end_matches(['<', '>', '&', '|']).is_empty();
             continue;
         }
@@ -1023,6 +1031,32 @@ mod tests {
     /// a file are refused like those that run one (also abbreviated, with an attached or
     /// `=` value, inside a cluster); `uniq`'s second operand is the file it truncates. A
     /// glob next to such a program could become one of them: refused too.
+    /// The review of #688 at 60a277e7 (finding A): a quoted word that looks like a
+    /// redirection is a literal operand for the shell, so `uniq` gets it as its output
+    /// file; it must count, and must not hide the word after it.
+    #[test]
+    fn a_quoted_word_that_looks_like_a_redirection_still_counts_as_an_operand_of_uniq() {
+        for command in [
+            "uniq a.txt '>out.txt'",
+            "uniq a.txt \">out.txt\"",
+            "uniq '>' a.txt",
+            "uniq a.txt '2>' b.txt",
+            "uniq a.txt \"&>\" b.txt",
+            "uniq '<' a.txt",
+        ] {
+            refused_everywhere(command);
+        }
+        // An unquoted redirection is still one (conservatively, a quoted target counts).
+        for command in [
+            "uniq a.txt > out.txt",
+            "uniq a.txt 2>/dev/null",
+            "uniq < a.txt",
+        ] {
+            assert!(grant_for(&bash(command)).is_some(), "{command:?}");
+        }
+        assert!(grant_for(&bash("uniq a.txt >'out.txt'")).is_none());
+    }
+
     #[test]
     fn an_option_that_writes_a_file_is_refused() {
         for command in [

@@ -153,26 +153,45 @@ that cannot run code the model can change. Everything is an allowlist; anything 
 - **the identical call** (same tool, same input; a command's surrounding blanks trimmed, its
   `description` ignored, every other field compared) for: the file tools (`Write`, `Edit`,
   `MultiEdit`, `NotebookEdit`), a read of the Claude Code CLI (it asks a read only outside the
-  working directory, so never the whole tool), `WebFetch`, `WebSearch`, a third party's MCP tool
-  (`mcp__acme__Read` included);
-- **the identical command line** (`Bash`, `Monitor`, or a tool named like one) only when every
-  simple command of it (split on `; & | ( )` and new lines) runs one of these programs, plainly
-  named: `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `egrep`, `fgrep`, `rg` (without `--pre`,
-  `--pre-glob`, `--hostname-bin`), `find` (without `-exec`, `-execdir`, `-ok`, `-okdir`), `fd` /
-  `fdfind` (without `-x`, `-X`, `--exec`, `--exec-batch`), `sort` (without
-  `--compress-program`), `uniq`, `cut`, `tr`, `nl`, `diff`, `cmp`, `stat`, `file`, `du`, `df`,
-  `tree`, `pwd`, `echo`, `printf` (without `-v`), `which`, `basename`, `dirname`, `realpath`,
-  `readlink`, `whoami`, `uname`, `id`, `true`, `false`. A forbidden long option is refused
-  abbreviated too (`--compress`), and an unquoted glob is refused next to a program that has one
-  (a file named `--pre=./x.sh`). Everything else is refused: interpreters, shells, scripts given
-  by path, task runners and build tools, tools that load project files (`eslint`, `vite`,
-  `mypy`...), `git` (hooks, `core.fsmonitor`, diff drivers), `sed`, `awk`, `jq`, `tar`,
-  `sqlite3`, `xargs`, `env`, `sudo`, any builtin that changes how a name resolves (`export`,
-  `hash`, `enable`, `alias`, `cd`...), an assignment in front (`PATH=./bin ls`);
+  working directory, so never the whole tool), `WebFetch`, `WebSearch`;
+- **a third party's MCP tool, only when the operator declared it read-only**, by its exact name,
+  in `CHAT_READ_ONLY_MCP_TOOLS` (comma separated `mcp__<server>__<tool>`; no pattern, no server
+  alone, never a `nexus` tool; empty by default): then the identical call. A tool's name says
+  nothing of what it does, and the MCP `readOnlyHint` annotation does not reach the backend, so
+  an undeclared one (`mcp__acme__Read` included) is allowed `once` only, on every engine. A
+  declared tool named like a command tool also goes through the command checks below. **Limit:
+  a declaration binds a NAME, not a server.** The Claude Code CLI also loads the project's
+  `.mcp.json`, and a project server may take the name of a server configured elsewhere; a
+  configuration the model can edit could then put another program behind a declared name (the
+  CLI still asks to approve a new project server, and a new session is needed). Declare only
+  tools of servers the projects cannot redefine: the backend's own servers, or servers whose
+  name no project's `.mcp.json` uses (projects whose MCP configuration is not reviewed should
+  not have their servers approved for all). The backend does not pass a strict MCP
+  configuration to the CLI: it would drop every server configured outside the backend (user and
+  project scopes), i.e. the very servers one would declare, and the users' own tools with them;
+- **the identical command line** (`Bash`, `Monitor`, or a declared tool named like one) only
+  when every simple command of it (split on `; & | ( )` and new lines) runs one of these
+  programs, plainly named: `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `egrep`, `fgrep`, `rg`
+  (without `--pre`, `--pre-glob`, `--hostname-bin`), `find` (without `-exec`, `-execdir`, `-ok`,
+  `-okdir`, `-delete`, `-fprint`, `-fprint0`, `-fprintf`, `-fls`), `fd` / `fdfind` (without
+  `-x`, `-X`, `--exec`, `--exec-batch`), `sort` (without `--compress-program`, `-o`,
+  `--output`), `uniq` (one operand at most: its second is a file it writes), `cut`, `tr`, `nl`,
+  `diff`, `cmp`, `stat`, `file` (without `-C`, `--compile`), `du`, `df`, `tree` (without `-o`,
+  `-R`), `pwd`, `echo`, `printf` (without `-v`), `which`, `basename`, `dirname`, `realpath`,
+  `readlink`, `whoami`, `uname`, `id`, `true`, `false`. A forbidden option is refused
+  abbreviated too (`--compress`), with its value attached or after `=`, and inside a cluster of
+  short options; an unquoted glob is refused next to a program that has one (a file named like
+  the option). What the line writes is therefore only what its own redirections write. Everything
+  else is refused: interpreters, shells, scripts given by path, task runners and build tools,
+  tools that load project files (`eslint`, `vite`, `mypy`...), `git` (hooks, `core.fsmonitor`,
+  diff drivers), `sed`, `awk`, `jq`, `tar`, `sqlite3`, `xargs`, `env`, `tee`, `sudo`, any builtin
+  that changes how a name resolves (`export`, `hash`, `enable`, `alias`, `cd`...), an assignment
+  in front (`PATH=./bin ls`);
 - **a line that cannot be read for sure** gets no grant: an expansion (`$` outside single quotes,
   a backquote, `<(...)`), a brace outside quotes (`{bash,x.sh}` runs `bash x.sh`), a backslash
-  outside single quotes (`ba\⏎sh x.sh` is a line continuation), an unterminated quote, a control
-  character;
+  outside single quotes (`ba\⏎sh x.sh` is a line continuation), an unquoted `^`, `~` or `#`
+  (zsh's extended glob operators; a `~` home and a `#` comment go with them), an unterminated
+  quote, a control character;
 - **never** `SlashCommand`, `Skill` (they run a file the model can edit), `Task` / `Agent`,
   `TaskStop`, or a tool the backend does not know.
 

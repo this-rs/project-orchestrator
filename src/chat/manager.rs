@@ -11882,12 +11882,7 @@ impl ChatManager {
                 warn!(session_id, error = %e, "Failed to persist the provider snapshot (non-fatal)");
             }
         }
-        let kind_name = serde_json::to_value(kind)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_string))
-            // Never a guess: an unnamed kind is `unknown`, whose requests are never granted
-            // for the session (`session_grants::Asker::Other`, the most restrictive).
-            .unwrap_or_else(|| "unknown".to_string());
+        let kind_name = provider_kind_name(&kind);
         let extra_degraded = if nexus_missing {
             vec![super::agent_runtime::NEXUS_TOOLS_FEATURE.to_string()]
         } else {
@@ -12594,6 +12589,17 @@ mod idle_expiry_tests {
     }
 }
 
+/// The wire name of a provider kind (`claude_code`, `native`, `codex`...), from which a
+/// session's `session_grants::Asker` is derived. Never a guess: a kind that does not
+/// serialize to a name is `unknown`, whose requests are never granted for the session
+/// (`Asker::Other`, the most restrictive).
+fn provider_kind_name<K: serde::Serialize + ?Sized>(kind: &K) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Parse a raw SDK control message into a [`ChatEvent::PermissionRequest`] if it is
 /// a `can_use_tool` request.  Returns `None` for any other subtype.
 ///
@@ -12810,6 +12816,36 @@ pub(crate) fn legacy_messages_filter(conversation_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The review of #688 at 60a277e7 (finding D): a provider kind that does not
+    /// serialize to a name falls back to `unknown` (no session grant), never to a
+    /// permissive kind.
+    #[test]
+    fn an_unnamed_provider_kind_falls_back_to_unknown() {
+        use crate::chat::session_grants::Asker;
+        struct Unserializable;
+        impl serde::Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("no name"))
+            }
+        }
+        for name in [
+            provider_kind_name(&Unserializable),
+            provider_kind_name(&42),
+            provider_kind_name(&serde_json::json!({ "kind": "claude_code" })),
+        ] {
+            assert_eq!(name, "unknown");
+            assert_eq!(Asker::from_provider_kind(&name), Asker::Other);
+        }
+        assert_eq!(
+            provider_kind_name(&nexus_claude::agent::ProviderKind::Native),
+            "native"
+        );
+        assert_eq!(
+            provider_kind_name(&nexus_claude::agent::ProviderKind::ClaudeCode),
+            "claude_code"
+        );
+    }
 
     #[test]
     fn legacy_messages_filter_escapes_the_conversation_id() {
