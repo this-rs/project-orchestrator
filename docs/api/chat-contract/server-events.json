@@ -1165,6 +1165,64 @@
         }
       }
     },
+    "tool_timing": {
+      "examples": {
+        "full": {
+          "called_at": 1760099990.012,
+          "ended_at": 1760099999.123,
+          "id": "toolu_01Example0000000000000",
+          "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "permission_requested_at": 1760099990.461,
+          "permission_resolved_at": 1760099996.208,
+          "run_started_at": 1760099996.208,
+          "started_at": 1760099990.457,
+          "type": "tool_timing"
+        },
+        "minimal": {
+          "ended_at": 1760099999.123,
+          "id": "toolu_01Example0000000000000",
+          "type": "tool_timing"
+        }
+      },
+      "fields": {
+        "called_at": {
+          "required": false,
+          "type": "number"
+        },
+        "ended_at": {
+          "required": true,
+          "type": "number"
+        },
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "permission_requested_at": {
+          "required": false,
+          "type": "number"
+        },
+        "permission_resolved_at": {
+          "required": false,
+          "type": "number"
+        },
+        "run_started_at": {
+          "required": false,
+          "type": "number"
+        },
+        "started_at": {
+          "required": false,
+          "type": "number"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
     "tool_use": {
       "examples": {
         "full": {

@@ -46,7 +46,7 @@ const UPDATE_COMMAND: &str = "UPDATE_CHAT_CONTRACT=1 cargo test --lib chat::wire
 
 /// Every `ChatEvent` tag the examples must cover. Adding a variant means
 /// adding its tag here AND its examples in [`server_examples`].
-const EXPECTED_SERVER_TAGS: [&str; 35] = [
+const EXPECTED_SERVER_TAGS: [&str; 36] = [
     "active_tasks_update",
     "ask_user_question",
     "assistant_text",
@@ -77,6 +77,7 @@ const EXPECTED_SERVER_TAGS: [&str; 35] = [
     "thinking",
     "tool_cancelled",
     "tool_result",
+    "tool_timing",
     "tool_use",
     "tool_use_input_resolved",
     "tools_cancelled",
@@ -117,6 +118,7 @@ fn variant_tag(e: &ChatEvent) -> &'static str {
         ChatEvent::ToolResult { .. } => "tool_result",
         ChatEvent::ToolUseInputResolved { .. } => "tool_use_input_resolved",
         ChatEvent::ToolCancelled { .. } => "tool_cancelled",
+        ChatEvent::ToolTiming { .. } => "tool_timing",
         ChatEvent::PermissionRequest { .. } => "permission_request",
         ChatEvent::AskUserQuestion { .. } => "ask_user_question",
         ChatEvent::Result { .. } => "result",
@@ -292,6 +294,28 @@ fn server_examples() -> Vec<ServerExample> {
             },
             ChatEvent::ToolCancelled {
                 id: s(TOOL_USE_ID),
+                parent_tool_use_id: None,
+            },
+        ),
+        ServerExample::new(
+            ChatEvent::ToolTiming {
+                id: s(TOOL_USE_ID),
+                called_at: Some(1760099990.012),
+                started_at: Some(1760099990.457),
+                permission_requested_at: Some(1760099990.461),
+                permission_resolved_at: Some(1760099996.208),
+                run_started_at: Some(1760099996.208),
+                ended_at: 1760099999.123,
+                parent_tool_use_id: parent(),
+            },
+            ChatEvent::ToolTiming {
+                id: s(TOOL_USE_ID),
+                called_at: None,
+                started_at: None,
+                permission_requested_at: None,
+                permission_resolved_at: None,
+                run_started_at: None,
+                ended_at: 1760099999.123,
                 parent_tool_use_id: None,
             },
         ),

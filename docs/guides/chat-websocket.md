@@ -148,6 +148,7 @@ Events sent from the server to the client. Each event includes a `type` field an
 | `thinking` | Claude's extended thinking content | `content` |
 | `tool_use` | Claude is invoking a tool | `id`, `tool`, `input` |
 | `tool_result` | Result of a tool invocation | `id`, `result`, `is_error` |
+| `tool_timing` | When a tool call really ran, as the engine saw it; follows its `tool_result` (or `tool_cancelled`). Times in seconds, milliseconds as the fraction; the wait for a permission is `permission_requested_at`..`permission_resolved_at`, the run `run_started_at`..`ended_at` | `id`, `ended_at`, optional `called_at`, `started_at`, `permission_requested_at`, `permission_resolved_at`, `run_started_at`, `parent_tool_use_id` |
 | `tool_use_input_resolved` | Full input resolved for a tool_use (emitted when the complete input arrives after an initial empty one) | `id`, `input` |
 | `permission_request` | Claude needs permission to use a tool | `id`, `tool`, `input` |
 | `ask_user_question` | Claude asks the user a question (AskUserQuestion tool) | `id`, `tool_call_id`, `questions`, `input` |

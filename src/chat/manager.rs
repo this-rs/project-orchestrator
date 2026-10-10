@@ -4826,6 +4826,14 @@ impl ChatManager {
         } else {
             OOB_TRIGGER_CAP_INTERACTIVE
         };
+        // The tool clock of the session: timings of its tool calls, persisted and relayed.
+        super::tool_clock::spawn_legacy_tap(
+            session_id.to_string(),
+            &events_tx,
+            self.nats.clone(),
+            self.graph.clone(),
+            next_seq.clone(),
+        );
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous session with the same ID
@@ -8378,6 +8386,12 @@ impl ChatManager {
                 }],
             );
         }
+        // PreToolUse → the session's tool clock notes when the engine takes a call up
+        // (every session, runner or not: it adds nothing to the context).
+        super::tool_clock::clock_the_table(
+            &mut hooks,
+            super::tool_clock::ToolClock::for_session(&session_id),
+        );
         hooks
     }
 
@@ -8755,6 +8769,14 @@ impl ChatManager {
                 .await
                 .unwrap_or(self.config.auto_continue),
         ));
+        // The tool clock of the session: timings of its tool calls, persisted and relayed.
+        super::tool_clock::spawn_legacy_tap(
+            session_id.to_string(),
+            &events_tx,
+            self.nats.clone(),
+            self.graph.clone(),
+            next_seq.clone(),
+        );
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous resume/create of this session.
@@ -13509,8 +13531,9 @@ mod tests {
             keys
         };
         assert_eq!(table(true), ["PostToolUse", "PreCompact", "PreToolUse"]);
-        // A runner has its task context in the prompt: compaction guidance only.
-        assert_eq!(table(false), ["PreCompact"]);
+        // A runner has its task context in the prompt: compaction guidance, and the
+        // tool clock (PreToolUse, which adds nothing to the context).
+        assert_eq!(table(false), ["PreCompact", "PreToolUse"]);
     }
 
     #[tokio::test]
