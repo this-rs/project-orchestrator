@@ -76,7 +76,8 @@ CHAT_PROVIDER_ACP_COMMANDS='{"openclaw":["openclaw","acp","--url","wss://gateway
   older versions **ignored them without a word**). The session is opened **without** the
   project-orchestrator MCP server and says so: `degraded_features` carries
   `project_orchestrator_tools` (the same banner as a remote Claude Code). How the server knows:
-  - **the declaration**, which always wins: an entry may be an object,
+  - **the declaration**, which wins over the name and the learned refusal for **every new
+    session** (a resumed one: see below): an entry may be an object,
     `{"openclaw": {"argv": ["npx", "openclaw", "acp", "--token-file", "/etc/po/openclaw.token"], "per_session_mcp": false}}`.
     Declare it for an older OpenClaw (nothing to learn: it says nothing) and for any agent
     that takes no MCP server. `"per_session_mcp": true` forces the other way. An entry with
@@ -85,8 +86,11 @@ CHAT_PROVIDER_ACP_COMMANDS='{"openclaw":["openclaw","acp","--url","wss://gateway
   - **the name**, as a convenience: the PROGRAM the command runs is `openclaw` (file name, a
     package version and one extension removed): `argv[0]` (`openclaw`, `/usr/bin/openclaw`,
     `OpenClaw.cmd`), or what a known launcher runs, its options skipped (`npx [--yes]
-    openclaw[@version]`, `pnpm dlx|exec openclaw`, `bunx openclaw`, `node …/openclaw.mjs`,
-    `env [VAR=…] openclaw`). An option value, another argument or a URL is never read
+    openclaw[@version]`, `pnpx openclaw`, `npm exec|x [--] openclaw`, `pnpm [-C <dir>]
+    dlx|exec openclaw`, `yarn dlx|exec openclaw`, `bunx openclaw`, `node …/openclaw.mjs`,
+    `env [VAR=…] openclaw`), or the first word of a command line a launcher is given
+    (`npx -c "openclaw acp"`, `pnpm -c exec "openclaw acp"`, `env -S "openclaw acp"`).
+    An option value, another argument or a URL is never read
     (`--config ~/.openclaw/openclaw.json`, `--profile openclaw`, `wss://gw/openclaw` leave the
     agent its servers): a wrapper script of another name needs `"per_session_mcp": false`;
   - **the refusal, learned**: an agent that refuses the servers is asked again once without
@@ -95,6 +99,22 @@ CHAT_PROVIDER_ACP_COMMANDS='{"openclaw":["openclaw","acp","--url","wss://gateway
     server, or any change to the instance, forgets it (one more refused round-trip); a
     resumed session keeps what its first opening found (its frozen capabilities, which a resume
     never turns back to "takes servers", however many restarts later).
+
+  **A resumed session keeps what its opening found, whatever the declaration says now.** A
+  session opened without the servers (declared, named, refused) is resumed without them even
+  after the entry is changed to `"per_session_mcp": true` (an OpenClaw upgraded to take them):
+  the declaration applies to the sessions opened after it; open a new conversation to get the
+  PO tools. Chosen over letting the declaration win: its frozen capabilities are what the agent
+  actually did, and a wrong `true` would send the session's PO token, once more, to an agent
+  that refuses the servers.
+
+  **The PO token never outlives a refusal.** The project-orchestrator server of a session carries
+  a token bound to it. When the session comes out without its servers, whoever dropped them
+  (the server asking again, or nexus doing it inside `session/new` / `session/load`, which the
+  session's capabilities then say with `per_session_mcp: false`), that token was sent in the
+  refused request: it is revoked at once. An opening or a resume that fails before the session
+  is live revokes it too, and leaves no per-turn router behind.
+
   To give OpenClaw the PO tools, configure them on the OpenClaw side
   (`openclaw mcp set project-orchestrator '<json>'`: a stdio `command`, or the server's `/mcp`
   over Streamable HTTP when `remote_mcp.enabled`, with its authentication).

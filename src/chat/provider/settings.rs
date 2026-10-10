@@ -471,22 +471,29 @@ pub fn parse_acp_commands(raw: &str) -> std::collections::BTreeMap<String, AcpCo
 const ACP_AGENTS_WITHOUT_PER_SESSION_MCP: &[&str] = &["openclaw"];
 
 /// Launchers that run the program named after them (their options skipped): `npx`,
-/// `bunx`, `pnpm dlx` / `pnpm exec`, `env`, `node` (its script).
-const ACP_LAUNCHERS: &[&str] = &["npx", "bunx", "pnpm", "env", "node"];
+/// `bunx`, `pnpx`, `npm exec|x`, `pnpm dlx|exec`, `yarn dlx|exec`, `env`, `node` (its
+/// script). Those with a subcommand ([`LAUNCHER_SUBCOMMANDS`]) run a program only
+/// through it.
+const ACP_LAUNCHERS: &[&str] = &["npx", "bunx", "pnpx", "npm", "pnpm", "yarn", "env", "node"];
+
+/// The launchers that run a program only through a subcommand, and those subcommands
+/// (`npm install openclaw`, `pnpm add openclaw` run nothing named after them).
+const LAUNCHER_SUBCOMMANDS: &[(&str, &[&str])] = &[
+    ("npm", &["exec", "x"]),
+    ("pnpm", &["dlx", "exec"]),
+    ("yarn", &["dlx", "exec"]),
+];
 
 /// Options of those launchers that take the NEXT argument as their value
-/// (`npx -p <pkg>`, `env -u <var>`, `node -r <module>`): that value is not a program.
+/// (`npx -p <pkg>`, `env -u <var>`, `node -r <module>`, `pnpm -C <dir>`): that value
+/// is not a program.
 const LAUNCHER_OPTIONS_WITH_VALUE: &[&str] = &[
     "-p",
     "--package",
-    "-c",
-    "--call",
     "-u",
     "--unset",
     "-C",
     "--chdir",
-    "-S",
-    "--split-string",
     "-r",
     "--require",
     "--import",
@@ -495,7 +502,48 @@ const LAUNCHER_OPTIONS_WITH_VALUE: &[&str] = &[
     "--env-file",
     "--filter",
     "--dir",
+    "--cwd",
+    "--prefix",
+    "--workspace",
 ];
+
+/// How deep a command line given to a launcher ([`command_option`]) is read, nested
+/// in another one.
+const LAUNCHER_COMMAND_DEPTH: usize = 4;
+
+/// A command line split into words as a shell would for its first words: on white
+/// space, single and double quotes grouping (and removed). Nothing else is
+/// interpreted.
+fn command_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    for c in line.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => word.push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                in_word = true;
+            }
+            None if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            None => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
 
 /// The name a program position designates: its file name (both separators: a
 /// declaration may name a Windows path on any host), a package version removed
@@ -514,14 +562,50 @@ fn program_name(arg: &str) -> Option<String> {
     Some(name.to_ascii_lowercase())
 }
 
+/// Whether `arg` is the option of `launcher` that hands it a COMMAND LINE to run (its
+/// first word is a program): `Some(None)` when the line is the NEXT
+/// argument (`npx -c "…"`, `env -S "…"`), `Some(Some(line))` when it is glued to it
+/// (`npx --call=…`, `env --split-string=…`, `env -S…`). `env` reads `-S`, `node` none
+/// (its `-c` checks a script), the package launchers `-c`.
+fn command_option<'a>(launcher: &str, arg: &'a str) -> Option<Option<&'a str>> {
+    let (short, long) = match launcher {
+        "env" => ("-S", "--split-string"),
+        "node" => return None,
+        _ => ("-c", "--call"),
+    };
+    if arg == short || arg == long {
+        return Some(None);
+    }
+    if let Some(line) = arg
+        .strip_prefix(long)
+        .and_then(|rest| rest.strip_prefix('='))
+    {
+        return Some(Some(line));
+    }
+    if launcher == "env" {
+        if let Some(line) = arg.strip_prefix(short).filter(|line| !line.is_empty()) {
+            return Some(Some(line));
+        }
+    }
+    None
+}
+
 /// The programs a command runs, as far as its arguments tell: `argv[0]`, and, while
 /// that program is a known launcher ([`ACP_LAUNCHERS`]), the first argument after it
-/// that is neither an option, an option's value, nor an `env` assignment
-/// (`npx --yes openclaw`, `env FOO=1 openclaw`, `pnpm dlx openclaw`, `node
-/// …/openclaw.mjs`, `env npx openclaw`). Nothing else: an option's value, a path or
-/// a URL among the arguments is never taken for the program.
+/// (after its subcommand, [`LAUNCHER_SUBCOMMANDS`]) that is neither an option, an
+/// option's value, nor an `env` assignment (`npx --yes openclaw`, `env FOO=1
+/// openclaw`, `pnpm -C <dir> dlx openclaw`, `npm exec -- openclaw`, `node
+/// …/openclaw.mjs`, `env npx openclaw`), and the first word of a command line given to
+/// it (`npx -c "openclaw acp"`, `env -S "openclaw acp"`). Nothing else: an option's
+/// value, a path or a URL among the arguments is never taken for the program.
 fn acp_programs(argv: &[String]) -> Vec<String> {
     let mut programs = Vec::new();
+    collect_programs(argv, 0, &mut programs);
+    programs
+}
+
+/// [`acp_programs`] of `argv`, a command line `depth` levels deep in another one.
+fn collect_programs(argv: &[String], depth: usize, programs: &mut Vec<String>) {
     let mut at = 0;
     while let Some(arg) = argv.get(at) {
         let Some(name) = program_name(arg) else {
@@ -533,35 +617,85 @@ fn acp_programs(argv: &[String]) -> Vec<String> {
             break;
         }
         at += 1;
-        if name == "pnpm" {
-            // `pnpm dlx <pkg>` / `pnpm exec <bin>`; any other `pnpm` command runs no
-            // program named after it.
-            while argv.get(at).is_some_and(|a| a.starts_with('-')) {
-                at += 1;
+        // `pnpm -c exec "…"`: the positional after the subcommand is a command line.
+        let mut shell = false;
+        if let Some((_, subcommands)) = LAUNCHER_SUBCOMMANDS.iter().find(|(l, _)| *l == name) {
+            loop {
+                match argv.get(at).map(String::as_str) {
+                    Some("-c" | "--shell-mode") => {
+                        shell = true;
+                        at += 1;
+                    }
+                    Some(option) if LAUNCHER_OPTIONS_WITH_VALUE.contains(&option) => at += 2,
+                    Some(option) if option.starts_with('-') => at += 1,
+                    _ => break,
+                }
             }
-            match argv.get(at).map(String::as_str) {
-                Some("dlx" | "exec") => at += 1,
+            match argv.get(at) {
+                Some(sub) if subcommands.contains(&sub.as_str()) => at += 1,
+                // Any other command runs no program named after it.
                 _ => break,
             }
         }
         while let Some(next) = argv.get(at) {
-            if LAUNCHER_OPTIONS_WITH_VALUE.contains(&next.as_str()) {
+            if let Some(glued) = command_option(&name, next) {
+                let (line, after) = match glued {
+                    Some(line) => (Some(line), at + 1),
+                    None => (argv.get(at + 1).map(String::as_str), at + 2),
+                };
+                if depth >= LAUNCHER_COMMAND_DEPTH {
+                    return;
+                }
+                let words = command_words(line.unwrap_or_default());
+                if name == "env" {
+                    // `env -S "A=1 openclaw"` is `env A=1 openclaw`: the words are env's
+                    // own arguments, followed by the ones after them.
+                    let mut spliced = vec![name.clone()];
+                    spliced.extend(words);
+                    spliced.extend(argv.iter().skip(after).cloned());
+                    collect_programs(&spliced, depth + 1, programs);
+                    return;
+                }
+                shell_programs(&words, depth, programs);
+                at = after;
+            } else if LAUNCHER_OPTIONS_WITH_VALUE.contains(&next.as_str()) {
                 at += 2;
             } else if next.starts_with('-') || (name == "env" && next.contains('=')) {
                 at += 1;
+            } else if shell {
+                if depth < LAUNCHER_COMMAND_DEPTH {
+                    shell_programs(&command_words(next), depth, programs);
+                }
+                return;
             } else {
                 break;
             }
         }
     }
-    programs
+}
+
+/// The programs of a shell command line (`npx -c "…"`): its first word after the
+/// variable assignments (`OC_DEBUG=1 openclaw acp`).
+fn shell_programs(words: &[String], depth: usize, programs: &mut Vec<String>) {
+    let assignment = |word: &String| {
+        word.split_once('=').is_some_and(|(name, _)| {
+            name.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
+    let start = words.iter().take_while(|word| assignment(word)).count();
+    collect_programs(&words[start..], depth + 1, programs);
 }
 
 /// Whether the ACP agent this command starts takes MCP servers per session, as far
 /// as its arguments tell: `false` when a PROGRAM it runs ([`acp_programs`]: `argv[0]`,
 /// or what a known launcher runs) is a known agent that refuses them
 /// ([`ACP_AGENTS_WITHOUT_PER_SESSION_MCP`]) — `openclaw`, `/usr/bin/openclaw`,
-/// `npx openclaw acp`, `node …/openclaw.mjs`, `env openclaw`, `OpenClaw.cmd`. An
+/// `npx openclaw acp`, `npm exec openclaw`, `yarn dlx openclaw`, `pnpm -C <dir> dlx
+/// openclaw`, `npx -c "openclaw acp"`, `env -S "openclaw acp"`, `node
+/// …/openclaw.mjs`, `env openclaw`, `OpenClaw.cmd`. An
 /// option value (`--config ~/.openclaw/openclaw.json`, `--profile openclaw`) or a URL
 /// (`wss://gw/openclaw`) is not a program. A convenience: the declaration's
 /// `per_session_mcp` wins over it.
@@ -1522,6 +1656,97 @@ mod tests {
             assert!(!acp_command_carries_mcp(&argv(refuses)), "{refuses:?}");
         }
         assert!(acp_command_carries_mcp(&[]));
+    }
+
+    /// The launchers of round 2 are read again (review of #682): `npm exec|x`, `pnpx`,
+    /// `yarn dlx`, `pnpm` with an option that takes a value before its subcommand, and
+    /// a command line handed to the launcher (`npx -c`, `env -S`) run OpenClaw — while
+    /// an option's value, a path or a URL that names it still does not.
+    #[test]
+    fn openclaw_run_by_any_launcher_is_detected_and_a_named_argument_still_is_not() {
+        let argv = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        for refuses in [
+            &["npm", "exec", "openclaw", "acp"][..],
+            &["npm", "x", "openclaw", "acp"],
+            &["npm", "exec", "--yes", "--", "openclaw", "acp"],
+            &[
+                "npm",
+                "--prefix",
+                "/srv/oc",
+                "exec",
+                "--package",
+                "openclaw@2026.9.9",
+                "--",
+                "openclaw",
+                "acp",
+            ],
+            &["pnpx", "openclaw", "acp"],
+            &["yarn", "dlx", "openclaw", "acp"],
+            &[
+                "yarn", "--cwd", "/srv/oc", "dlx", "-p", "openclaw", "openclaw", "acp",
+            ],
+            &["pnpm", "-C", "/srv/oc", "dlx", "openclaw", "acp"],
+            &[
+                "pnpm", "--dir", "/srv/oc", "--silent", "exec", "openclaw", "acp",
+            ],
+            &["pnpm", "--filter", "gw", "exec", "openclaw", "acp"],
+            &["pnpm", "dlx", "-c", "openclaw acp"],
+            &["pnpm", "-c", "exec", "openclaw acp --token-file /run/oc"],
+            &["env", "-S", "openclaw acp"],
+            &["env", "--split-string=openclaw acp"],
+            &["env", "-Sopenclaw acp"],
+            &["/usr/bin/env", "-i", "-S", "OC_DEBUG=1 openclaw acp"],
+            &["env", "-S", "-u HOME", "openclaw", "acp"],
+            &["npx", "-c", "OC_DEBUG=1 openclaw acp"],
+            &["npx", "-c", "openclaw acp"],
+            &["npx", "--call", "'openclaw' acp"],
+            &["npx", "--call=openclaw acp"],
+            &["npm", "exec", "-c", "openclaw acp"],
+            &["env", "-S", "npx -c 'openclaw acp'"],
+        ] {
+            assert!(!acp_command_carries_mcp(&argv(refuses)), "{refuses:?}");
+        }
+        for carries in [
+            // The false positives of round 2 stay what they are.
+            &["my-agent", "--config", "~/.openclaw/openclaw.json"][..],
+            &["my-agent", "--token-file", "/etc/po/openclaw.token"],
+            &["my-agent", "--url", "wss://gw/openclaw"],
+            &["my-agent", "--profile", "openclaw"],
+            // A launcher command that runs nothing named after it.
+            &["npm", "install", "openclaw"],
+            &["npm", "--prefix", "/srv/openclaw", "start"],
+            &["yarn", "add", "openclaw"],
+            &["pnpm", "-C", "/srv/openclaw", "dlx", "my-agent"],
+            &[
+                "npm",
+                "exec",
+                "--package",
+                "openclaw",
+                "--",
+                "my-agent",
+                "--profile",
+                "openclaw",
+            ],
+            // A command line whose program is another one.
+            &["npx", "-c", "my-agent --profile openclaw"],
+            &["env", "-S", "my-agent --config ~/.openclaw/openclaw.json"],
+            &["env", "-S", "\"wss://gw/openclaw\" acp"],
+            &["pnpm", "-c", "exec", "my-agent openclaw"],
+            // `node -c` checks a script: it does not run a command line.
+            &["node", "-c", "/opt/oc/my-agent.mjs"],
+        ] {
+            assert!(acp_command_carries_mcp(&argv(carries)), "{carries:?}");
+        }
+        // Nested command lines stop at a depth, without panic or loop.
+        let mut line = "openclaw acp".to_string();
+        for _ in 0..10 {
+            line = format!("npx -c \"{}\"", line.replace('"', "'"));
+        }
+        let _ = acp_command_carries_mcp(&argv(&["env", "-S", &line]));
+        assert_eq!(
+            command_words(r#"a  "b c" 'd "e"' f"g"h"#),
+            vec!["a", "b c", "d \"e\"", "fgh"]
+        );
     }
 
     // ── claude_code_remote ────────────────────────────────────────────────
