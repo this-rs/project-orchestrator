@@ -637,6 +637,9 @@ pub struct ChatManager {
     /// The `refs_v1` switch (on unless `REFS_V1=0`): whether the API layer folds
     /// `refs` into messages and the server announces the capability.
     pub(crate) refs_v1: bool,
+    /// Where the documents attached to a message live: the agent engine reads the
+    /// attached images from it to send them inline (`documents.storage_dir`).
+    pub(crate) document_store: crate::documents::store::DocumentStore,
     /// How far the anchor resolver drives the context (`PO_ANCHOR_CONTEXT`, default `shadow`).
     pub(crate) anchor_mode: super::anchor_resolver::AnchorContextMode,
     /// What the turns of every session share in anchor mode (resolutions, shadow runs).
@@ -1142,6 +1145,8 @@ pub(crate) struct ManagerTurnServices {
     graph: Arc<dyn GraphStore>,
     enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
     turn_routing: Arc<super::agent_hooks::TurnRouting>,
+    /// Where the images attached to a message are read.
+    documents: crate::documents::store::DocumentStore,
     nats: Option<Arc<crate::events::NatsEmitter>>,
     /// The anchor state of the manager when these services were built.
     anchor: super::anchor_resolver::AnchorSession,
@@ -1203,6 +1208,13 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         .await;
         // No work log on this engine: the hint carries the task/step context alone.
         super::post_stream::continuation_message(&self.graph, ctx.project_slug.as_deref(), "").await
+    }
+
+    async fn images(
+        &self,
+        shown: &str,
+    ) -> std::result::Result<Vec<super::message_attachments::AttachedImage>, String> {
+        super::message_attachments::load_images(&self.graph, &self.documents, shown).await
     }
 
     fn publish(&self, session_id: &str, event: &ChatEvent) {
@@ -1540,6 +1552,9 @@ impl ChatManager {
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             turn_routing: Arc::new(super::agent_hooks::TurnRouting::default()),
             refs_v1: crate::refs::flag::from_env(),
+            document_store: crate::documents::store::DocumentStore::new(
+                crate::documents::store::default_storage_dir(),
+            ),
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
         }
@@ -1617,6 +1632,9 @@ impl ChatManager {
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             turn_routing: Arc::new(super::agent_hooks::TurnRouting::default()),
             refs_v1: crate::refs::flag::from_env(),
+            document_store: crate::documents::store::DocumentStore::new(
+                crate::documents::store::default_storage_dir(),
+            ),
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
         }
@@ -1635,6 +1653,12 @@ impl ChatManager {
         mode: super::anchor_resolver::AnchorContextMode,
     ) -> Self {
         self.anchor_mode = mode;
+        self
+    }
+
+    /// Where the attached documents live (`DocumentStore::from_config`).
+    pub fn with_document_store(mut self, store: crate::documents::store::DocumentStore) -> Self {
+        self.document_store = store;
         self
     }
 
@@ -10973,6 +10997,7 @@ impl ChatManager {
             graph: self.graph.clone(),
             enrichment_pipeline: self.enrichment_pipeline.clone(),
             turn_routing: Arc::clone(&self.turn_routing),
+            documents: self.document_store.clone(),
             nats: self.nats.clone(),
             anchor: self.anchor_session(),
         })
@@ -21691,6 +21716,7 @@ mod refs_turn_services_tests {
             enrichment_pipeline: Arc::new(pipeline),
             turn_routing: Arc::default(),
             nats: None,
+            documents: crate::documents::store::DocumentStore::new(std::env::temp_dir()),
             anchor: Default::default(),
         };
 

@@ -1584,6 +1584,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             chat_config,
         )
         .await
+        .with_document_store(documents::store::DocumentStore::from_config(&config))
         .with_event_emitter(event_bus.clone())
         .with_vault(vault.clone());
         // Pass config.yaml path so permission changes can be persisted to disk

@@ -1625,23 +1625,9 @@ pub async fn list_providers(
         ));
     }
 
-    // The historical engine sends images to Claude Code today; the neutral
-    // contract (A12) declares `images: false` because the agent path does not
-    // carry them yet. The listing tells the truth of the engine that will serve
-    // the session, so the UI keeps its attachments on the legacy path.
-    let legacy = state
-        .chat_manager
-        .as_ref()
-        .map(|m| m.config.provider_path == crate::chat::config::ProviderPath::Legacy)
-        .unwrap_or(true);
-    if legacy {
-        for m in &mut models {
-            if let Some(caps) = m.capabilities.as_object_mut() {
-                caps.insert("images".to_string(), serde_json::Value::Bool(true));
-            }
-        }
-    }
-
+    // `images` is what nexus declares for Claude Code (true since the façade
+    // writes image blocks, A12 revised), the same on both engines: the legacy
+    // engine no longer needs a forced value, the agent engine sends them inline.
     let mut entries = vec![listing::builtin_claude_code(
         health,
         models,
@@ -2040,6 +2026,19 @@ mod tests {
         assert_eq!(p["credential"], "none");
         assert!(p["health"]["state"].is_string());
         assert!(p["models"][0]["capabilities"].is_object());
+    }
+
+    /// The listing no longer forces `images` for Claude Code: nexus declares it,
+    /// for every model of the catalogue, whatever engine serves the session.
+    #[tokio::test]
+    async fn nexus_declares_images_for_claude_code_so_the_listing_forces_nothing() {
+        use nexus_claude::agent::AgentProvider;
+        use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
+        let provider = ClaudeCodeProvider::new(ClaudeCodeConfig::default());
+        assert!(provider.capabilities(None).images);
+        for m in provider.catalog().await.unwrap_or_default() {
+            assert!(provider.capabilities(Some(&m.id)).images, "{}", m.id);
+        }
     }
 
     #[tokio::test]

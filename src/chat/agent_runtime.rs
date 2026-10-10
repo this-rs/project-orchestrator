@@ -112,6 +112,72 @@ fn retry_delay_ms(error: &ProviderError, attempt: u32) -> u64 {
     (1000u64 << attempt.saturating_sub(1).min(5)).min(30_000)
 }
 
+/// The input of a turn: its text, then the images the user attached, in order
+/// (the ONE place the backend's attached images become the nexus input blocks).
+/// The text loses the "no text could be extracted… /raw" line of each image it
+/// carries inline (`without_notes_of_sent_images`): the picture itself is there.
+fn turn_input(text: String, images: &[super::message_attachments::AttachedImage]) -> TurnInput {
+    let text = super::message_attachments::without_notes_of_sent_images(&text, images);
+    let mut input = TurnInput::text(text);
+    input.blocks.extend(
+        images
+            .iter()
+            .map(|image| nexus_claude::agent::InputBlock::Image {
+                media_type: image.media_type.clone(),
+                data_base64: image.data_base64.clone(),
+            }),
+    );
+    input
+}
+
+/// The error a turn whose images were refused shows: `code: images_refused`, the
+/// `reason` (`unsupported`: the model has no vision; `invalid`: a picture the
+/// provider will not take; `unreadable`: the backend could not read it).
+fn images_refused(reason: &str, message: String) -> ChatEvent {
+    ChatEvent::Error {
+        message,
+        parent_tool_use_id: None,
+        code: Some("images_refused".to_string()),
+        reason: Some(reason.to_string()),
+        index: None,
+    }
+}
+
+/// Whether an `InvalidRequest` detail is one of nexus' refusals of an image
+/// (`providers::claude_code::input::check_image`). nexus gives these no stable
+/// code: the three messages are matched as nexus words them today, and
+/// `image_tests::the_nexus_image_refusals_are_recognised_as_nexus_words_them`
+/// produces them with nexus' own `content_blocks`, so a change of wording on
+/// the nexus side fails that test instead of silently changing the code.
+fn is_nexus_image_refusal(detail: &str) -> bool {
+    // "image media type `<type>` is not one of image/png, …"
+    (detail.starts_with("image media type `") && detail.contains("` is not one of "))
+        // "an image payload must be standard base64, without a `data:` prefix"
+        || detail.starts_with("an image payload must be standard base64")
+        // "an image is <n> bytes, more than the <max> bytes the CLI accepts"
+        || (detail.starts_with("an image is ") && detail.ends_with(" bytes the CLI accepts"))
+}
+
+/// What the wire says when the provider refuses a turn that carries images
+/// because of them: `Unsupported { images }`, or an `InvalidRequest` whose
+/// detail is one of nexus' image checks (type, base64, size —
+/// [`is_nexus_image_refusal`]). Any other failure, an unrelated
+/// `InvalidRequest` included, is not about the images (`None`): it goes the way
+/// of every failed turn.
+fn image_refusal(error: &ProviderError) -> Option<ChatEvent> {
+    match error {
+        ProviderError::Unsupported { capability } if capability == "images" => Some(images_refused(
+            "unsupported",
+            "Error: The active model does not take images: the message was not sent.".to_string(),
+        )),
+        ProviderError::InvalidRequest { detail } if is_nexus_image_refusal(detail) => Some(images_refused(
+            "invalid",
+            format!("Error: The provider refused the attached image ({detail}): the message was not sent."),
+        )),
+        _ => None,
+    }
+}
+
 /// What a session on the agent engine does NOT do, as the identifiers the
 /// frontend knows (`hooks`, `message_queue`, `auto_continue`, `compaction`,
 /// `nats`, `enrichment`, `images`).
@@ -168,6 +234,15 @@ pub trait TurnServices: Send + Sync {
     /// The system hint a turn continued automatically starts with
     /// (`post_stream::continuation_message`).
     async fn continuation(&self, session_id: &str) -> String;
+    /// The images attached to the user's message `shown` (its stored form), to
+    /// be sent inline with the turn. Err: an image that cannot be read, said on
+    /// the wire, the turn not sent. Default: none.
+    async fn images(
+        &self,
+        _shown: &str,
+    ) -> std::result::Result<Vec<super::message_attachments::AttachedImage>, String> {
+        Ok(Vec::new())
+    }
     /// Hands an event of the session to the other instances (NATS), as the Claude
     /// Code engine publishes each of its events. Default: nowhere.
     fn publish(&self, _session_id: &str, _event: &ChatEvent) {}
@@ -454,6 +529,7 @@ impl AgentSessionHandle {
     {
         // A Stop belongs to the turn it stopped: the new turn starts unstopped.
         self.interrupted.store(false, Ordering::SeqCst);
+        let from_user = kind == PendingMessageKind::User;
         match kind {
             PendingMessageKind::SystemHint => {
                 self.emit(ChatEvent::SystemHint {
@@ -491,8 +567,36 @@ impl AgentSessionHandle {
             tracing::info!(session_id = %self.session_id, "Turn stopped before it was sent");
             return Ok(None);
         }
-        let input = TurnInput::text(sent);
-        let stream = self.session.send_turn(input.clone()).await?;
+        // The images the user attached go with the turn, inline (the provider
+        // checks them: a refusal is said on the wire, the turn is not sent).
+        let images = match &self.services {
+            Some(services) if from_user => match services.images(shown).await {
+                Ok(images) => images,
+                Err(reason) => {
+                    tracing::warn!(session_id = %self.session_id, %reason, "an attached image could not be read");
+                    self.emit(images_refused(
+                        "unreadable",
+                        format!("Error: {reason}: the message was not sent."),
+                    ))
+                    .await;
+                    return Ok(None);
+                }
+            },
+            _ => Vec::new(),
+        };
+        let input = turn_input(sent, &images);
+        let stream = match self.session.send_turn(input.clone()).await {
+            Ok(stream) => stream,
+            Err(error) if !images.is_empty() => match image_refusal(&error) {
+                Some(event) => {
+                    tracing::info!(session_id = %self.session_id, %error, "the provider refused the attached images");
+                    self.emit(event).await;
+                    return Ok(None);
+                }
+                None => return Err(error),
+            },
+            Err(error) => return Err(error),
+        };
         self.streaming_text.lock().await.clear();
         self.streaming_events.lock().await.clear();
         self.emit(ChatEvent::StreamingStatus { is_streaming: true })
@@ -1547,5 +1651,166 @@ mod adopt_tests {
         );
         assert!(!second.closed.is_cancelled());
         assert!(Arc::ptr_eq(&runtime.get("s").await.unwrap(), &second));
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn the_turn_input_is_the_text_then_the_images_in_order() {
+        let images = [
+            super::super::message_attachments::AttachedImage {
+                media_type: "image/png".into(),
+                data_base64: "AAAA".into(),
+                source: attachment("image/png"),
+            },
+            super::super::message_attachments::AttachedImage {
+                media_type: "image/jpeg".into(),
+                data_base64: "BBBB".into(),
+                source: attachment("image/jpeg"),
+            },
+        ];
+        let input = turn_input("look".into(), &images);
+        assert_eq!(input.blocks.len(), 3);
+        assert!(
+            matches!(&input.blocks[0], nexus_claude::agent::InputBlock::Text { text } if text == "look")
+        );
+        assert!(matches!(
+            &input.blocks[2],
+            nexus_claude::agent::InputBlock::Image { media_type, data_base64 }
+                if media_type == "image/jpeg" && data_base64 == "BBBB"
+        ));
+        assert_eq!(turn_input("plain".into(), &[]), TurnInput::text("plain"));
+    }
+
+    #[test]
+    fn a_provider_refusal_of_the_images_is_a_typed_error_and_nothing_else_is() {
+        let reason = |e: &ProviderError| match image_refusal(e) {
+            Some(ChatEvent::Error { code, reason, .. }) => {
+                assert_eq!(code.as_deref(), Some("images_refused"));
+                reason
+            }
+            Some(other) => panic!("{other:?}"),
+            None => None,
+        };
+        assert_eq!(
+            reason(&ProviderError::unsupported("images")).as_deref(),
+            Some("unsupported")
+        );
+        // The Claude Code façade's own checks (type, size) refuse with InvalidRequest;
+        // the detail reaches the user.
+        let invalid = ProviderError::invalid("image media type `image/bmp` is not one of ...");
+        assert_eq!(reason(&invalid).as_deref(), Some("invalid"));
+        match image_refusal(&invalid) {
+            Some(ChatEvent::Error { message, .. }) => {
+                assert!(message.contains("image/bmp"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
+        // Another failure of the turn is not about the images.
+        assert!(image_refusal(&ProviderError::unsupported("hooks")).is_none());
+        assert!(image_refusal(&ProviderError::Overloaded).is_none());
+    }
+
+    fn attachment(mime: &str) -> super::super::message_attachments::MessageAttachment {
+        super::super::message_attachments::MessageAttachment {
+            id: uuid::Uuid::new_v4(),
+            filename: "x".into(),
+            mime_type: mime.into(),
+            size_bytes: 4,
+        }
+    }
+
+    fn image(media_type: &str, data_base64: &str) -> TurnInput {
+        TurnInput {
+            blocks: vec![
+                nexus_claude::agent::InputBlock::Text {
+                    text: "look".into(),
+                },
+                nexus_claude::agent::InputBlock::Image {
+                    media_type: media_type.into(),
+                    data_base64: data_base64.into(),
+                },
+            ],
+        }
+    }
+
+    /// The three refusals of nexus' image checks, PRODUCED by nexus
+    /// (`claude_code::input::content_blocks`), are `images_refused` / `invalid`:
+    /// a change of their wording in nexus fails here, not silently on the wire.
+    #[test]
+    fn the_nexus_image_refusals_are_recognised_as_nexus_words_them() {
+        use nexus_claude::providers::claude_code::input::{content_blocks, MAX_IMAGE_BYTES};
+        // A payload decoding to more than the cap (length a multiple of 4).
+        let too_big = "A".repeat((MAX_IMAGE_BYTES / 3 + 2) * 4);
+        for input in [
+            image("image/bmp", "AAAA"),
+            image("image/png", "data:image/png;base64,AAAA"),
+            image("image/png", &too_big),
+        ] {
+            let error = content_blocks(&input).expect_err("nexus refuses this image");
+            match image_refusal(&error) {
+                Some(ChatEvent::Error { code, reason, .. }) => {
+                    assert_eq!(code.as_deref(), Some("images_refused"), "{error}");
+                    assert_eq!(reason.as_deref(), Some("invalid"), "{error}");
+                }
+                other => panic!("{error} -> {other:?}"),
+            }
+        }
+    }
+
+    /// An `InvalidRequest` that is not about the image — on a turn that carries
+    /// one — keeps the usual path: never `images_refused`.
+    #[test]
+    fn an_invalid_request_without_image_wording_on_a_turn_with_an_image_is_not_images_refused() {
+        use nexus_claude::providers::claude_code::input::content_blocks;
+        let empty = content_blocks(&TurnInput { blocks: vec![] }).expect_err("no content");
+        for error in [
+            empty,
+            ProviderError::invalid("context length exceeded: 140000 tokens, 128000 allowed"),
+            ProviderError::invalid("unknown parameter: temperature"),
+            ProviderError::invalid("the image of the project is unclear"),
+        ] {
+            assert!(image_refusal(&error).is_none(), "{error}");
+        }
+    }
+
+    /// The text of a turn that carries an image inline loses that image's
+    /// "no text could be extracted… /raw" line (its heading stays); a turn
+    /// without images sends its text untouched.
+    #[test]
+    fn the_turn_text_drops_the_no_text_line_of_an_image_it_sends_inline() {
+        let source = attachment("image/png");
+        let note = format!(
+            "[no text could be extracted from this image/png file (4 bytes); the original is at GET /api/documents/{}/raw]\n",
+            source.id
+        );
+        let other = attachment("image/png");
+        let other_note = format!(
+            "[no text could be extracted from this image/png file (4 bytes); the original is at GET /api/documents/{}/raw]\n",
+            other.id
+        );
+        let text = format!(
+            "look\n\n### x (id {})\n{note}\n### y (id {})\n{other_note}",
+            source.id, other.id
+        );
+        let sent = super::super::message_attachments::AttachedImage {
+            media_type: "image/png".into(),
+            data_base64: "AAAA".into(),
+            source,
+        };
+        let input = turn_input(text.clone(), std::slice::from_ref(&sent));
+        let nexus_claude::agent::InputBlock::Text { text: carried } = &input.blocks[0] else {
+            panic!("text first");
+        };
+        assert!(!carried.contains(&note), "{carried}");
+        assert!(carried.contains(&format!("### x (id {})", sent.source.id)));
+        assert!(
+            carried.contains(&other_note),
+            "an image not sent keeps its line"
+        );
+        assert_eq!(turn_input(text.clone(), &[]), TurnInput::text(text));
     }
 }

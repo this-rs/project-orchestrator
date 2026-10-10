@@ -4829,9 +4829,9 @@ mod claude_code_resume_token {
     /// The Claude Code provider of nexus, its CLI the fake, which gets its transcript and
     /// its recording file through the session's environment.
     #[derive(Clone)]
-    struct FakeCli {
-        inner: Arc<ClaudeCodeProvider>,
-        env: Vec<(String, String)>,
+    pub(super) struct FakeCli {
+        pub(super) inner: Arc<ClaudeCodeProvider>,
+        pub(super) env: Vec<(String, String)>,
     }
 
     impl FakeCli {
@@ -5371,6 +5371,375 @@ mod cancel_tools {
         let chats = fake.chat_requests();
         let last = chats.last().expect("a request after the cancel")["body"].to_string();
         assert!(last.contains("cancelled"), "{last}");
+        manager.close_session(&sid).await.unwrap();
+    }
+}
+
+/// P3c (parity): the images a user attaches reach the model on the agent engine,
+/// inline with the turn — the native harness on a model with vision (an
+/// `image_url` part), Claude Code (an `image` block on the CLI's stdin) — and a
+/// model without vision refuses them on the wire, nothing sent.
+mod attached_images {
+    use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
+
+    use super::claude_code_resume_token::FakeCli;
+    use super::*;
+    use crate::documents::store::DocumentStore;
+    use crate::documents::DocumentFormat;
+    use crate::neo4j::document::Document;
+
+    /// A 1×1 PNG.
+    const PIXEL: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64,
+        0x60, 0xf8, 0x5f, 0x0f, 0x00, 0x02, 0x87, 0x01, 0x80, 0xeb, 0x47, 0xba, 0x92, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    fn pixel_base64() -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(PIXEL)
+    }
+
+    /// The pixel uploaded as a document (blob in `store`, node in `graph`), and
+    /// the stored form of a message `text` that attaches it — what the API layer
+    /// hands the manager (`message_attachments::compose`).
+    async fn attach_pixel(
+        graph: &Arc<MockGraphStore>,
+        store: &DocumentStore,
+        text: &str,
+    ) -> String {
+        let id = Uuid::new_v4();
+        let sha256 = store.put(PIXEL).unwrap();
+        graph.documents.write().await.insert(
+            id,
+            Document {
+                id,
+                filename: "pixel.png".to_string(),
+                format: DocumentFormat::Binary,
+                sha256,
+                size_bytes: PIXEL.len() as u64,
+                page_count: 0,
+                chunk_count: 0,
+                warnings: vec![],
+                created_at: Utc::now(),
+                project_id: None,
+                session_id: None,
+                extracted: false,
+                mime_type: Some("image/png".to_string()),
+            },
+        );
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        super::super::message_attachments::compose(&dyn_graph, text, &[id])
+            .await
+            .unwrap()
+    }
+
+    /// `fake_openai` serving model `m` with `catalogue` as its `/models` entry: the
+    /// tool probe, the opening turn (`hi there`), and the turn of the image.
+    fn script_with(catalogue: Value) -> Value {
+        json!([
+            sse_route("Call the ping tool now", vec![
+                delta(json!({"tool_calls": [{"index": 0, "id": "p1", "function": {"name": "ping", "arguments": "{}"}}]})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                json!("[DONE]"),
+            ]),
+            {"method": "GET", "path": "/v1/models", "status": 200,
+             "body": {"object": "list", "data": [catalogue]}},
+            sse_route("look at this", vec![
+                delta(json!({"content": "a single pixel"})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!("[DONE]"),
+            ]),
+            sse_route("hi there", vec![
+                delta(json!({"content": "hello"})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!("[DONE]"),
+            ]),
+        ])
+    }
+
+    /// A native session on `fake_openai`, its opening turn played; the receiver
+    /// subscribed before the next message.
+    async fn native_session(
+        catalogue: Value,
+    ) -> (
+        FakeOpenAi,
+        Arc<MockGraphStore>,
+        DocumentStore,
+        tempfile::TempDir,
+        ChatManager,
+        String,
+        broadcast::Receiver<ChatEvent>,
+    ) {
+        let fake = FakeOpenAi::start(script_with(catalogue));
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let blobs = tempfile::tempdir().unwrap();
+        let store = DocumentStore::new(blobs.path());
+        let manager = manager(graph.clone(), true).with_document_store(store.clone());
+        let created = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"));
+        let sid = created.session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        next_event(&mut rx, |e| {
+            matches!(
+                e,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            )
+        })
+        .await;
+        (fake, graph, store, blobs, manager, sid, rx)
+    }
+
+    /// (a) A model whose catalogue says vision: the image is an `image_url` part
+    /// of the user message the endpoint receives, and the session does not list
+    /// `images` among what it cannot do.
+    #[tokio::test]
+    async fn a_native_model_with_vision_receives_the_attached_image_as_an_image_url_part() {
+        let (fake, graph, store, _blobs, manager, sid, mut rx) =
+            native_session(json!({"id": "m", "context_length": 32000, "capabilities": ["vision"]}))
+                .await;
+        let caps = manager
+            .agent_runtime
+            .get(&sid)
+            .await
+            .unwrap()
+            .capabilities
+            .clone();
+        assert!(caps.images, "the catalogue says vision");
+        assert!(
+            !super::super::agent_runtime::degraded_features(&caps)
+                .iter()
+                .any(|d| d == "images"),
+            "a vision model does not lose images"
+        );
+
+        let message = attach_pixel(&graph, &store, "look at this").await;
+        manager.send_message(&sid, &message).await.unwrap();
+        next_event(
+            &mut rx,
+            |e| matches!(e, ChatEvent::AssistantText { content, .. } if content.contains("single pixel")),
+        )
+        .await;
+
+        let chats = fake.chat_requests();
+        let turn = chats
+            .iter()
+            .find(|r| r["body"].to_string().contains("look at this"))
+            .expect("the turn of the image reached the endpoint");
+        let user = turn["body"]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "user")
+            .unwrap();
+        let text = user["content"].to_string();
+        assert!(
+            !text.contains("no text could be extracted"),
+            "the image is sent, its /raw line is not: {text}"
+        );
+        assert!(
+            text.contains("pixel.png"),
+            "the document heading stays: {text}"
+        );
+        let parts = user["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a list of parts: {user}"));
+        assert_eq!(parts[0]["type"], "text", "{user}");
+        let image = parts
+            .iter()
+            .find(|p| p["type"] == "image_url")
+            .unwrap_or_else(|| panic!("an image_url part: {user}"));
+        assert_eq!(
+            image["image_url"]["url"],
+            format!("data:image/png;base64,{}", pixel_base64())
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// (c) A model whose catalogue says text only: the turn is refused with a
+    /// typed error on the wire (`images_refused` / `unsupported`), nothing reaches
+    /// the endpoint, and the session is usable again.
+    #[tokio::test]
+    async fn a_native_model_without_vision_refuses_the_image_on_the_wire_and_sends_nothing() {
+        let (fake, graph, store, _blobs, manager, sid, mut rx) = native_session(
+            json!({"id": "m", "context_length": 32000, "input_modalities": ["text"]}),
+        )
+        .await;
+        let caps = manager
+            .agent_runtime
+            .get(&sid)
+            .await
+            .unwrap()
+            .capabilities
+            .clone();
+        assert!(!caps.images);
+
+        let message = attach_pixel(&graph, &store, "look at this").await;
+        manager.send_message(&sid, &message).await.unwrap();
+        let error = next_event(&mut rx, |e| matches!(e, ChatEvent::Error { .. })).await;
+        match &error {
+            ChatEvent::Error {
+                message,
+                code,
+                reason,
+                ..
+            } => {
+                assert_eq!(code.as_deref(), Some("images_refused"), "{error:?}");
+                assert_eq!(reason.as_deref(), Some("unsupported"), "{error:?}");
+                assert!(message.contains("not sent"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        next_event(&mut rx, |e| {
+            matches!(
+                e,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            )
+        })
+        .await;
+        assert!(
+            !fake
+                .chat_requests()
+                .iter()
+                .any(|r| r["body"].to_string().contains("look at this")),
+            "nothing was sent"
+        );
+        // Stored for replay: a reload shows the refusal.
+        let stored = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 500)
+            .await
+            .unwrap();
+        assert!(
+            stored
+                .iter()
+                .any(|e| e.event_type == "error" && e.data.contains("images_refused")),
+            "{:?}",
+            stored.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// (b) Claude Code on the agent engine (the real nexus façade, `fake_claude`
+    /// as its CLI): the user line written on stdin carries the text and the image
+    /// block, base64 inline.
+    #[tokio::test]
+    async fn claude_code_on_the_agent_engine_writes_the_attached_image_on_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let stdin_out = dir.path().join("stdin.jsonl");
+        let lines = [
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 15000}),
+            json!({"op": "emit_json", "json": {
+                "type": "system", "subtype": "init", "session_id": "cli-images",
+                "model": "fake-claude", "cwd": ".", "tools": ["Read"],
+                "permissionMode": "default", "apiKeySource": "none"}}),
+            json!({"op": "emit_json", "json": {
+                "type": "assistant", "message": {"id": "msg_fake", "type": "message",
+                "role": "assistant", "model": "fake-claude",
+                "content": [{"type": "text", "text": "a pixel"}], "stop_reason": "end_turn"}}}),
+            json!({"op": "emit_json", "json": {
+                "type": "result", "subtype": "success", "duration_ms": 12,
+                "duration_api_ms": 7, "is_error": false, "num_turns": 1,
+                "session_id": "cli-images", "total_cost_usd": 0.0001,
+                "usage": {"input_tokens": 3, "output_tokens": 5}, "result": "a pixel"}}),
+            json!({"op": "wait_eof", "timeout_ms": 15000, "optional": true}),
+        ];
+        std::fs::write(
+            &transcript,
+            lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let mut config = ClaudeCodeConfig::default();
+        config.cli_path = Some(fake_bin("fake_claude"));
+        let provider = FakeCli {
+            inner: Arc::new(ClaudeCodeProvider::new(config)),
+            env: vec![
+                (
+                    "FAKE_CLAUDE_TRANSCRIPT".into(),
+                    transcript.display().to_string(),
+                ),
+                (
+                    "FAKE_CLAUDE_STDIN_OUT".into(),
+                    stdin_out.display().to_string(),
+                ),
+            ],
+        };
+        let graph = Arc::new(MockGraphStore::new());
+        let store = DocumentStore::new(dir.path().join("blobs"));
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let chat_config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, chat_config)
+            .with_provider_source(Arc::new(provider))
+            .with_document_store(store.clone());
+
+        let mut req = request(None, None, "default");
+        req.message = attach_pixel(&graph, &store, "look at this").await;
+        req.cwd = dir.path().display().to_string();
+        let created = manager.create_session(&req).await.unwrap();
+        let sid = created.session_id;
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        let uuid = Uuid::parse_str(&sid).unwrap();
+        let mut answered = false;
+        for _ in 0..400 {
+            answered = graph
+                .get_chat_events(uuid, 0, 500)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e.event_type == "result");
+            if answered {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(answered, "the CLI answered the turn");
+
+        let written = std::fs::read_to_string(&stdin_out).expect("stdin recorded");
+        assert!(
+            !written.contains("no text could be extracted"),
+            "the image is sent, its /raw line is not: {written}"
+        );
+        assert!(
+            written.contains("pixel.png"),
+            "the document heading stays: {written}"
+        );
+        let user: Value = written
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|l| l["type"] == "user")
+            .unwrap_or_else(|| panic!("a user line: {written}"));
+        let blocks = user["message"]["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a list of blocks: {user}"));
+        assert!(
+            blocks.iter().any(|b| b["type"] == "text"
+                && b["text"].as_str().unwrap_or("").contains("look at this")),
+            "{user}"
+        );
+        let image = blocks
+            .iter()
+            .find(|b| b["type"] == "image")
+            .unwrap_or_else(|| panic!("an image block: {user}"));
+        assert_eq!(image["source"]["type"], "base64");
+        assert_eq!(image["source"]["media_type"], "image/png");
+        assert_eq!(image["source"]["data"], pixel_base64());
         manager.close_session(&sid).await.unwrap();
     }
 }
