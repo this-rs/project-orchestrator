@@ -271,6 +271,16 @@ fn main() {
                 } else {
                     tracing::warn!("Bundled mcp_server not found at: {}", mcp_path.display());
                 }
+
+                // nexus-tools: the files, shell and web tools of a native session. The release
+                // bundles it as a resource; the server looks next to ITS executable, which here
+                // is the app's, so it is named explicitly. An operator's NEXUS_TOOLS_PATH wins.
+                let tools_name = format!("nexus-tools{}", std::env::consts::EXE_SUFFIX);
+                let tools_path = resource_dir.join(&tools_name);
+                if std::env::var_os("NEXUS_TOOLS_PATH").is_none() && tools_path.exists() {
+                    tracing::info!("nexus-tools path: {}", tools_path.display());
+                    std::env::set_var("NEXUS_TOOLS_PATH", &tools_path);
+                }
             }
 
             // Create the main window PROGRAMMATICALLY (not from tauri.conf.json)

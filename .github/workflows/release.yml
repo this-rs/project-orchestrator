@@ -245,6 +245,17 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y patchelf
 
+      # nexus-tools: the files, shell and web tools of a NATIVE session (Read, Bash, WebFetch...).
+      # Without it a native session has none of them and reports `nexus_tools` in its
+      # degraded_features. It ships NEXT TO the orchestrator executable in every archive (light and
+      # full), and from there in Homebrew, .deb, .rpm and the desktop app; the server finds it there
+      # (src/chat/config.rs, detect_nexus_tools_path; NEXUS_TOOLS_PATH overrides). Built at the
+      # nexus revision Cargo.toml pins, with https (`--features tls`): scripts/build-nexus-tools.sh,
+      # the same script the CI runs (.github/actions/nexus-fakes).
+      - name: Build nexus-tools (pinned nexus revision, tls)
+        shell: bash
+        run: scripts/build-nexus-tools.sh "$RUNNER_TEMP/nexus-tools" --target ${{ matrix.target }} --target-dir target/nexus-tools
+
       # --- Light variant (no embedded frontend) ---
 
       - name: Build light variant (native)
@@ -264,6 +275,7 @@ jobs:
           for bin in orchestrator orch mcp_server; do
             cp "target/${{ matrix.target }}/release/${bin}" "staging/${ARCHIVE_NAME}/"
           done
+          cp "$RUNNER_TEMP/nexus-tools/bin/nexus-tools" "staging/${ARCHIVE_NAME}/"
           if [ -d "queries" ]; then
             cp -r queries "staging/${ARCHIVE_NAME}/"
           fi
@@ -294,6 +306,7 @@ jobs:
           foreach ($bin in @("orchestrator", "orch", "mcp_server")) {
             Copy-Item "target/${{ matrix.target }}/release/${bin}.exe" "staging/${archiveName}/"
           }
+          Copy-Item "$env:RUNNER_TEMP/nexus-tools/bin/nexus-tools.exe" "staging/${archiveName}/"
           if (Test-Path "queries") {
             Copy-Item -Recurse "queries" "staging/${archiveName}/"
           }
@@ -334,6 +347,7 @@ jobs:
           for bin in orchestrator orch mcp_server; do
             cp "target/${{ matrix.target }}/release/${bin}" "staging/${ARCHIVE_NAME}/"
           done
+          cp "$RUNNER_TEMP/nexus-tools/bin/nexus-tools" "staging/${ARCHIVE_NAME}/"
           if [ -d "queries" ]; then
             cp -r queries "staging/${ARCHIVE_NAME}/"
           fi
@@ -371,6 +385,7 @@ jobs:
           foreach ($bin in @("orchestrator", "orch", "mcp_server")) {
             Copy-Item "target/${{ matrix.target }}/release/${bin}.exe" "staging/${archiveName}/"
           }
+          Copy-Item "$env:RUNNER_TEMP/nexus-tools/bin/nexus-tools.exe" "staging/${archiveName}/"
           if (Test-Path "queries") {
             Copy-Item -Recurse "queries" "staging/${archiveName}/"
           }
@@ -451,7 +466,7 @@ jobs:
           tar xzf "artifact/${ARCHIVE_NAME}.tar.gz" -C artifact/
           # cargo-deb --target expects binaries in target/<triple>/release/
           mkdir -p "target/${{ matrix.target }}/release"
-          for bin in orchestrator orch mcp_server; do
+          for bin in orchestrator orch mcp_server nexus-tools; do
             cp "artifact/${ARCHIVE_NAME}/${bin}" "target/${{ matrix.target }}/release/${bin}"
           done
           chmod +x target/${{ matrix.target }}/release/*
@@ -547,7 +562,7 @@ jobs:
           tar xzf "artifact/${ARCHIVE_NAME}.tar.gz" -C artifact/
           # cargo-generate-rpm --target expects binaries in target/<triple>/release/
           mkdir -p "target/${{ matrix.target }}/release"
-          for bin in orchestrator orch mcp_server; do
+          for bin in orchestrator orch mcp_server nexus-tools; do
             cp "artifact/${ARCHIVE_NAME}/${bin}" "target/${{ matrix.target }}/release/${bin}"
           done
           chmod +x target/${{ matrix.target }}/release/*
@@ -798,6 +813,11 @@ jobs:
           chmod +x target/release/mcp_server
           echo "✅ mcp_server extracted to target/release/"
           ls -la target/release/mcp_server
+          # nexus-tools rides along as a resource of the app (the overlay is passed to `cargo tauri build`);
+          # the app points NEXUS_TOOLS_PATH at it (desktop/src-tauri/src/main.rs).
+          cp "mcp-artifact/${ARCHIVE_NAME}/nexus-tools" target/release/nexus-tools
+          chmod +x target/release/nexus-tools
+          echo '{"bundle":{"resources":{"../../target/release/nexus-tools":"nexus-tools"}}}' > desktop/src-tauri/tauri.nexus-tools.json
 
       - name: Extract mcp_server to target/release (Windows)
         if: runner.os == 'Windows'
@@ -811,6 +831,9 @@ jobs:
           # Tauri resource path expects "mcp_server" without .exe extension
           Copy-Item "target/release/mcp_server.exe" "target/release/mcp_server"
           Write-Host "✅ mcp_server extracted to target/release/"
+          # nexus-tools rides along as a resource of the app, under its .exe name (see the Unix step).
+          Copy-Item "mcp-artifact/${archiveName}/nexus-tools.exe" "target/release/nexus-tools.exe"
+          Set-Content -Path "desktop/src-tauri/tauri.nexus-tools.json" -Value '{"bundle":{"resources":{"../../target/release/nexus-tools.exe":"nexus-tools.exe"}}}'
 
       # --- Windows: Bundle ALL MSVC Runtime DLLs + VC++ Redistributable ---
       # ort-sys (ONNX Runtime) is compiled with dynamic CRT (/MD).
@@ -943,7 +966,7 @@ jobs:
           TAURI_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           TAURI_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         # Legacy: arguments after `--` go to cargo. `custom-protocol` is what makes the app load its embedded frontend.
-        run: cargo tauri build --target ${{ matrix.tauri_target }} ${{ matrix.bundles && format('--bundles {0}', matrix.bundles) || '' }} ${{ matrix.legacy && '-- --no-default-features --features custom-protocol' || '' }}
+        run: cargo tauri build --target ${{ matrix.tauri_target }} --config tauri.nexus-tools.json ${{ matrix.bundles && format('--bundles {0}', matrix.bundles) || '' }} ${{ matrix.legacy && '-- --no-default-features --features custom-protocol' || '' }}
 
       # Free disk space after Tauri build completes.
       # The cargo build output (deps/, build/, .fingerprint/, incremental/) can

@@ -14,6 +14,7 @@ use super::graph_handlers;
 use super::handlers::{self, OrchestratorState};
 use super::hook_handlers;
 use super::mcp_federation_handlers;
+use super::network_tools_handlers;
 use super::neural_routing_handlers;
 use super::note_handlers;
 use super::persona_handlers;
@@ -2023,6 +2024,29 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/projects/{slug}/llm-roles",
             get(provider_handlers::get_project_roles).put(provider_handlers::put_project_roles),
+        )
+        // Network tools of a native session (P6): the project's consent by origin and its
+        // browser authorisation, and the search engines (tool providers `tool:<id>`).
+        .route(
+            "/api/projects/{slug}/network-tools",
+            get(network_tools_handlers::get_network_tools),
+        )
+        .route(
+            "/api/projects/{slug}/network-tools/origins",
+            put(network_tools_handlers::put_origin).delete(network_tools_handlers::delete_origin),
+        )
+        .route(
+            "/api/projects/{slug}/network-tools/browser",
+            put(network_tools_handlers::put_browser),
+        )
+        .route(
+            "/api/chat/search-engines",
+            get(network_tools_handlers::list_search_engines)
+                .post(network_tools_handlers::create_search_engine),
+        )
+        .route(
+            "/api/chat/search-engines/{id}",
+            delete(network_tools_handlers::delete_search_engine),
         )
         // Routing mode and learning stage (R2): global, with a per-project override.
         .route(
