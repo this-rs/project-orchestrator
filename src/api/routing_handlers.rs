@@ -802,6 +802,7 @@ mod tests {
             supports_tools: true,
             supports_images: false,
             context_window: Some(100_000),
+            window_unknown: None,
             price,
             cost_basis: CostBasis::Priced,
             healthy: Some(true),
