@@ -19,18 +19,42 @@ use serde_json::Value;
 /// Rewordings written before the first measurement, not tuned against it.
 /// Each pair is one message and a paraphrase in the same language.
 const PARAPHRASES: &[(&str, &str)] = &[
-    ("pourquoi le paiement échoue ?", "pourquoi le paiement ne passe pas ?"),
-    ("why does the payment fail?", "why doesn't the payment go through?"),
+    (
+        "pourquoi le paiement échoue ?",
+        "pourquoi le paiement ne passe pas ?",
+    ),
+    (
+        "why does the payment fail?",
+        "why doesn't the payment go through?",
+    ),
     ("il y a un bug dans le cache", "le cache se comporte mal"),
     ("there is a bug in the cache", "the cache misbehaves"),
-    ("ça plante au démarrage, aide-moi", "ça ne démarre plus, aide-moi"),
-    ("it crashes at startup, help me", "it won't start anymore, help me"),
-    ("comment fonctionne le cache ?", "peux-tu m'expliquer le cache ?"),
+    (
+        "ça plante au démarrage, aide-moi",
+        "ça ne démarre plus, aide-moi",
+    ),
+    (
+        "it crashes at startup, help me",
+        "it won't start anymore, help me",
+    ),
+    (
+        "comment fonctionne le cache ?",
+        "peux-tu m'expliquer le cache ?",
+    ),
     ("how does the cache work?", "can you explain the cache?"),
-    ("on doit ajouter une fonctionnalité de cache", "il faut créer un cache"),
+    (
+        "on doit ajouter une fonctionnalité de cache",
+        "il faut créer un cache",
+    ),
     ("we need to implement a cache", "we should set up a cache"),
-    ("quel est l'impact de cette modification ?", "quel est l'impact de ce changement ?"),
-    ("what is the impact of this change?", "what would this change affect?"),
+    (
+        "quel est l'impact de cette modification ?",
+        "quel est l'impact de ce changement ?",
+    ),
+    (
+        "what is the impact of this change?",
+        "what would this change affect?",
+    ),
 ];
 
 /// Minimum agreement per classifier and per invariant, asserted in CI.
@@ -49,13 +73,28 @@ struct Threshold {
 
 const THRESHOLDS: &[Threshold] = &[
     // lang: 16/16 after the fix.
-    Threshold { classifier: "intent", lang: 1.0, noise: 1.0, paraphrase: 0.5 },
+    Threshold {
+        classifier: "intent",
+        lang: 1.0,
+        noise: 1.0,
+        paraphrase: 0.5,
+    },
     // lang: 15/16. Residual: "comment les triggers sont-ils évalués ?" (explore)
     // vs "how are triggers evaluated?" (general): "how are" is too broad to add
     // (it matches "how are you").
-    Threshold { classifier: "task_class", lang: 0.9375, noise: 1.0, paraphrase: 0.5 },
+    Threshold {
+        classifier: "task_class",
+        lang: 0.9375,
+        noise: 1.0,
+        paraphrase: 0.5,
+    },
     // lang: 16/16 on the fixture, whose skill regexes are bilingual by design.
-    Threshold { classifier: "skills", lang: 1.0, noise: 1.0, paraphrase: 0.58 },
+    Threshold {
+        classifier: "skills",
+        lang: 1.0,
+        noise: 1.0,
+        paraphrase: 0.58,
+    },
 ];
 
 fn message(case: &Case) -> &str {
@@ -93,7 +132,9 @@ fn predict(classifier: &dyn Classifier, fixture: &Fixture, case: &Case) -> Strin
 fn pairs(fixture: &Fixture) -> Vec<(&Case, &Case)> {
     let mut out = Vec::new();
     for fr in fixture.cases.iter().filter(|c| c.lang == "fr") {
-        let Some(pair) = fr.pair.as_deref() else { continue };
+        let Some(pair) = fr.pair.as_deref() else {
+            continue;
+        };
         if let Some(en) = fixture
             .cases
             .iter()

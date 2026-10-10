@@ -11,10 +11,10 @@
 //! `rank_protocols` / `compute_affinity` / `ContextVector` (protocol/routing.rs).
 
 use chrono::{DateTime, Utc};
+use project_orchestrator::evaluation::embedded_fixtures;
 use project_orchestrator::events::{
     CrudAction, CrudEvent, EntityType, EventTrigger, RoutingDecision, TriggerRouter,
 };
-use project_orchestrator::evaluation::embedded_fixtures;
 use project_orchestrator::protocol::models::Protocol;
 use project_orchestrator::protocol::routing::{
     compute_affinity, rank_protocols, ContextVector, DimensionWeights, RelevanceVector,
@@ -43,7 +43,13 @@ fn orders(n: usize) -> Vec<Vec<usize>> {
     out
 }
 
-fn trigger(index: u128, name: &str, entity: &str, action: &str, payload: Option<Value>) -> EventTrigger {
+fn trigger(
+    index: u128,
+    name: &str,
+    entity: &str,
+    action: &str,
+    payload: Option<Value>,
+) -> EventTrigger {
     let epoch: DateTime<Utc> = DateTime::UNIX_EPOCH;
     EventTrigger {
         id: Uuid::from_u128(index + 1),
@@ -71,7 +77,11 @@ fn event(entity: &str, action: &str, payload: Value) -> CrudEvent {
 }
 
 /// The ranking as `(trigger id, score bits)`: exact, so a float tie is visible.
-fn ranking(triggers: &[EventTrigger], order: &[usize], ctx: &project_orchestrator::events::RoutingContext) -> Vec<(Uuid, u64)> {
+fn ranking(
+    triggers: &[EventTrigger],
+    order: &[usize],
+    ctx: &project_orchestrator::events::RoutingContext,
+) -> Vec<(Uuid, u64)> {
     let refs: Vec<&EventTrigger> = order.iter().map(|&i| &triggers[i]).collect();
     TriggerRouter::rank_triggers(&refs, ctx)
         .iter()
@@ -179,7 +189,13 @@ fn protocol_ranking_is_invariant_to_candidate_order_including_ties() {
     let protocols = vec![
         protocol(3, RelevanceVector::default()),
         protocol(1, RelevanceVector::default()),
-        protocol(2, RelevanceVector { phase: 0.9, ..RelevanceVector::default() }),
+        protocol(
+            2,
+            RelevanceVector {
+                phase: 0.9,
+                ..RelevanceVector::default()
+            },
+        ),
     ];
     let weights = DimensionWeights::default();
     let rank = |order: &[usize]| -> Vec<(Uuid, u64)> {
@@ -203,7 +219,10 @@ fn protocol_ranking_is_invariant_to_candidate_order_including_ties() {
 #[test]
 fn affinity_does_not_decrease_as_the_context_moves_toward_the_relevance() {
     // Phase distance from 1.0 down to 0.0 in 10 steps; the relevance sits at 0.0.
-    let relevance = RelevanceVector { phase: 0.0, ..RelevanceVector::default() };
+    let relevance = RelevanceVector {
+        phase: 0.0,
+        ..RelevanceVector::default()
+    };
     let weights = DimensionWeights::default();
     let mut previous = f64::NEG_INFINITY;
     for step in 0..=10 {
@@ -227,7 +246,10 @@ fn structure_is_monotone_in_each_count_it_is_meant_to_follow() {
     let mut previous = f64::NEG_INFINITY;
     for files in 0..=30 {
         let s = ContextVector::from_plan_context("execution", 5, 3, files, 0.0).structure;
-        assert!(s + 1e-12 >= previous, "structure dropped with files={files}");
+        assert!(
+            s + 1e-12 >= previous,
+            "structure dropped with files={files}"
+        );
         previous = s;
     }
     let mut previous = f64::NEG_INFINITY;
@@ -240,7 +262,10 @@ fn structure_is_monotone_in_each_count_it_is_meant_to_follow() {
     let mut previous = f64::NEG_INFINITY;
     for tasks in 0..=20 {
         let s = ContextVector::from_plan_context("execution", tasks, 0, 5, 0.0).structure;
-        assert!(s + 1e-12 >= previous, "structure dropped with tasks={tasks}");
+        assert!(
+            s + 1e-12 >= previous,
+            "structure dropped with tasks={tasks}"
+        );
         previous = s;
     }
 }
