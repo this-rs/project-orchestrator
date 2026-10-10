@@ -1252,6 +1252,8 @@ pub(crate) struct ManagerTurnServices {
     context_injector: Option<Arc<ContextInjector>>,
     /// The budget of each end-of-turn step (`post_stream::POST_STREAM_STEP_BUDGET`).
     step_budget: Duration,
+    /// A step made to never answer (tests only, `None` in production).
+    stall_step: Option<&'static str>,
 }
 
 /// What a session of the agent engine keeps for the end of its turns: the fields of
@@ -1268,18 +1270,156 @@ pub(crate) struct AgentTurnState {
     objectives: super::post_stream::ObjectiveCounters,
     /// The tools the session used (files, steps), live from its events.
     work_log: Arc<std::sync::Mutex<SessionWorkLog>>,
-    /// The context to re-inject after a compaction, waiting for the session's next
-    /// turn (`after_turn` sets it, `prepare` puts it in front of that turn). Never a
-    /// turn of its own: a turn started only to carry it would be measured against
-    /// the window right after the compaction, and could compact again (P8c, measured
-    /// in `routing_modes_e2e_tests` on integ/p8). One slot: several compactions
-    /// before the next turn re-inject once, the latest.
-    reinjection: Arc<std::sync::Mutex<Option<String>>>,
+    /// What waits for the session's next turn after a compaction: the re-injected
+    /// context and the objective reminder of that turn ([`HeldContext`]). Never a
+    /// turn of its own (P8c): a turn started only to carry it was measured against
+    /// the window right after the compaction and compacted again (measured in
+    /// `routing_modes_e2e_tests` on integ/p8). Persisted with the session (it
+    /// survives an idle close, a restart, a resume) and cleared only once a turn
+    /// carrying it was actually sent ([`TurnServices::turn_sent`]).
+    held: Arc<std::sync::Mutex<HeldContext>>,
     /// Tool calls announced and not yet answered: id → (tool, input so far).
     open_tools: Arc<std::sync::Mutex<HashMap<String, (String, serde_json::Value)>>>,
 }
 
+/// What waits for a session's next turn after a compaction (`AgentTurnState::held`).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HeldContext {
+    /// The project context re-injected after the compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// The objective reminder of the turn that compacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reminder: Option<String>,
+}
+
+impl HeldContext {
+    /// Where it is stored: one setting document per session.
+    const KEY: &'static str = "held_context";
+
+    fn scope(session_id: &str) -> String {
+        format!("session:{session_id}")
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.context.is_none() && self.reminder.is_none()
+    }
+
+    /// What goes in front of the next turn: the context, then the reminder.
+    pub fn prefix(&self) -> Option<String> {
+        match (&self.context, &self.reminder) {
+            (None, None) => None,
+            (Some(c), None) => Some(c.clone()),
+            (None, Some(r)) => Some(r.clone()),
+            (Some(c), Some(r)) => Some(format!(
+                "{c}
+
+{r}"
+            )),
+        }
+    }
+
+    /// The re-injected context cut to fit the model's window: at most
+    /// [`HELD_CONTEXT_WINDOW_SHARE`] of a known window (four characters a token),
+    /// never more than the builder's own cap (`MAX_MARKDOWN_CHARS`, 6000). It cannot
+    /// by itself push a turn over nexus' compaction threshold (80 % of the window)
+    /// unless the history alone is already past 75 %.
+    pub fn cap(context: &str, window_tokens: Option<u64>) -> String {
+        const BUILDER_CAP: usize = 6000;
+        let limit = window_tokens
+            .map(|w| ((w as f64) * HELD_CONTEXT_WINDOW_SHARE * 4.0) as usize)
+            .unwrap_or(BUILDER_CAP)
+            .min(BUILDER_CAP);
+        if context.chars().count() <= limit {
+            return context.to_string();
+        }
+        const TAIL: &str = "
+[… cut to fit the context window]
+</system-reminder>";
+        let keep = limit.saturating_sub(TAIL.chars().count());
+        let mut out: String = context.chars().take(keep).collect();
+        out.push_str(TAIL);
+        out
+    }
+
+    /// The held context of `session_id`, as stored (none: empty).
+    pub async fn load(graph: &Arc<dyn GraphStore>, session_id: &str) -> Self {
+        match graph
+            .get_llm_setting(&Self::scope(session_id), Self::KEY)
+            .await
+        {
+            Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or_default(),
+            _ => Self::default(),
+        }
+    }
+
+    /// Stores it (empty: clears it).
+    pub async fn store(&self, graph: &Arc<dyn GraphStore>, session_id: &str) -> Result<()> {
+        if self.is_empty() {
+            return Self::clear(graph, session_id).await;
+        }
+        graph
+            .put_llm_setting(
+                &Self::scope(session_id),
+                Self::KEY,
+                &serde_json::to_string(self)?,
+            )
+            .await
+    }
+
+    pub async fn clear(graph: &Arc<dyn GraphStore>, session_id: &str) -> Result<()> {
+        graph
+            .delete_llm_setting(&Self::scope(session_id), Self::KEY)
+            .await
+            .map(|_| ())
+    }
+}
+
+/// Largest share of the model's window the held context may take.
+pub(crate) const HELD_CONTEXT_WINDOW_SHARE: f64 = 0.05;
+
 impl ManagerTurnServices {
+    /// One end-of-turn step under its own budget ([`run_step`]); `stall_step` makes
+    /// the named one never answer (tests only: proves the budgets are per step).
+    async fn step<F: std::future::Future>(
+        &self,
+        after: &mut super::agent_runtime::AfterTurn,
+        session_id: &str,
+        name: &'static str,
+        fut: F,
+    ) -> Option<F::Output> {
+        let stalled = self.stall_step == Some(name);
+        run_step(after, session_id, name, self.step_budget, async move {
+            if stalled {
+                std::future::pending::<()>().await;
+            }
+            fut.await
+        })
+        .await
+    }
+
+    fn flush_open_tools(&self) {
+        let open: Vec<(String, serde_json::Value)> = self
+            .session
+            .open_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, call)| call)
+            .collect();
+        if open.is_empty() {
+            return;
+        }
+        let mut log = self
+            .session
+            .work_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (tool, input) in open {
+            log.record_tool_use(&tool, &input);
+        }
+    }
+
     fn work_summary(&self) -> String {
         self.session
             .work_log
@@ -1335,15 +1475,16 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             Some(md) => prepend_enrichment(&md, &body),
             None => body,
         };
-        // The context re-injected after the last compaction goes in front of this
-        // turn (the next one after it, whatever started it), once.
-        let prepared = match self
+        // What waits since the last compaction goes in front of this turn, whatever
+        // started it. Only read here: it is cleared once the turn is sent
+        // (`turn_sent`), so a turn stopped or refused before that keeps it.
+        let held = self
             .session
-            .reinjection
+            .held
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+            .prefix();
+        let prepared = match held {
             Some(context) => prepend_enrichment(&context, &prepared),
             None => prepared,
         };
@@ -1389,6 +1530,23 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
     /// its input was complete (Claude Code, ACP: `tool_use` with `{}`, then
     /// `tool_use_input_resolved`) is logged when its result (or its cancel) arrives,
     /// with the resolved input.
+    async fn turn_sent(&self, session_id: &str) {
+        let had = {
+            let mut held = self.session.held.lock().unwrap_or_else(|e| e.into_inner());
+            let had = !held.is_empty();
+            *held = HeldContext::default();
+            had
+        };
+        if had {
+            // A store that does not answer must not hold the turn: on its own.
+            let graph = self.graph.clone();
+            let sid = session_id.to_string();
+            super::post_stream::spawn_write(sid.clone(), "clear_held_context", async move {
+                HeldContext::clear(&graph, &sid).await
+            });
+        }
+    }
+
     fn observe(&self, _session_id: &str, event: &ChatEvent) {
         let mut open = self
             .session
@@ -1432,16 +1590,15 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         let uuid = Uuid::parse_str(session_id).ok();
         // Each step under its own budget, as `PostStreamHandler`'s (`StepBudget`): a
         // step that never answers is dropped and said, the next ones still run.
-        let budget = self.step_budget;
-        let ctx = run_step(
-            &mut after,
-            session_id,
-            "context",
-            budget,
-            super::post_stream::PostStreamContext::build(&self.graph, uuid),
-        )
-        .await
-        .unwrap_or_default();
+        let ctx = self
+            .step(
+                &mut after,
+                session_id,
+                "context",
+                super::post_stream::PostStreamContext::build(&self.graph, uuid),
+            )
+            .await
+            .unwrap_or_default();
         // 1. Post-compaction context re-injection.
         if outcome.compacted && !outcome.interrupted {
             let snapshot = self
@@ -1450,35 +1607,36 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .snapshot();
-            if let Some((hint, event)) = run_step(
-                &mut after,
-                session_id,
-                "post_compaction",
-                budget,
-                super::post_stream::post_compaction_recovery(
-                    &self.graph,
+            if let Some((hint, event)) = self
+                .step(
+                    &mut after,
                     session_id,
-                    ctx.project_slug.as_deref(),
-                    Some(snapshot),
-                ),
-            )
-            .await
+                    "post_compaction",
+                    super::post_stream::post_compaction_recovery(
+                        &self.graph,
+                        session_id,
+                        ctx.project_slug.as_deref(),
+                        Some(snapshot),
+                    ),
+                )
+                .await
             {
-                // Kept for the next turn, never queued as a turn of its own.
+                // Kept for the next turn, never queued as a turn of its own, and
+                // no bigger than the window allows (`HeldContext::cap`).
                 if let Some(hint) = hint {
-                    *self
-                        .session
-                        .reinjection
+                    self.session
+                        .held
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(hint);
+                        .unwrap_or_else(|e| e.into_inner())
+                        .context = Some(HeldContext::cap(&hint, outcome.context_window));
                 }
                 after.events.push(event);
             }
         }
-        // 2. Objective tracking. Not right after a compaction: no automated turn is
-        // started on a history just compacted (one compaction per user turn); the
-        // reminder comes at the next stall.
-        if !outcome.compacted {
+        // 2. Objective tracking, as on the Claude Code engine. After a turn that
+        // compacted, its reminder waits with the re-injected context, in front of
+        // the next turn, instead of starting a turn on a history just compacted.
+        {
             let had_conclusive = outcome
                 .tools
                 .iter()
@@ -1494,32 +1652,58 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
                 hit_error_max_turns: outcome.hit_turn_limit,
                 interrupted: outcome.interrupted,
             };
-            let reminder = run_step(
-                &mut after,
-                session_id,
-                "objective_tracking",
-                budget,
-                super::post_stream::objective_reminder(
-                    &self.graph,
-                    ctx.project_slug.as_deref(),
-                    &self.session.objectives,
-                    turn,
-                    self.work_summary(),
-                ),
-            )
-            .await
-            .flatten();
+            let reminder = self
+                .step(
+                    &mut after,
+                    session_id,
+                    "objective_tracking",
+                    super::post_stream::objective_reminder(
+                        &self.graph,
+                        ctx.project_slug.as_deref(),
+                        &self.session.objectives,
+                        turn,
+                        self.work_summary(),
+                    ),
+                )
+                .await
+                .flatten();
             if let Some(reminder) = reminder {
                 info!(session_id, "Objective tracker: injecting reminder");
-                after.hints.push(reminder);
+                if outcome.compacted {
+                    self.session
+                        .held
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .reminder = Some(reminder);
+                } else {
+                    after.hints.push(reminder);
+                }
             }
         }
+        // What waits for the next turn is stored with the session.
+        if outcome.compacted {
+            let held = self
+                .session
+                .held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            self.step(
+                &mut after,
+                session_id,
+                "hold_context",
+                held.store(&self.graph, session_id),
+            )
+            .await;
+        }
+        // Tools still open when the turn ended (an error, the turn limit) are
+        // logged as they stand: the work log misses none.
+        self.flush_open_tools();
         // 3. Memory / feedback / observations (the store write runs on its own).
-        run_step(
+        self.step(
             &mut after,
             session_id,
             "feedback",
-            budget,
             super::post_stream::record_turn_feedback(
                 super::post_stream::TurnFeedback {
                     graph: &self.graph,
@@ -9438,8 +9622,15 @@ impl ChatManager {
             let fetched = page.len();
             offset += fetched;
             // The sessions the agent engine served: it alone stores their provider
-            // snapshot (`finish_agent_open`), Claude Code forced onto it included.
-            sessions.extend(page.into_iter().filter(|s| s.capabilities.is_some()));
+            // snapshot (`finish_agent_open`), Claude Code forced onto it included;
+            // and any other provider than Claude Code (only the agent engine serves
+            // one), in case that snapshot write failed.
+            sessions.extend(page.into_iter().filter(|s| {
+                s.capabilities.is_some()
+                    || s.provider_id
+                        .as_deref()
+                        .is_some_and(|p| p != super::provider::resolver::CLAUDE_CODE)
+            }));
             if fetched < PAGE {
                 break;
             }
@@ -11967,6 +12158,7 @@ impl ChatManager {
             event_emitter: self.event_emitter.clone(),
             context_injector: self.context_injector.clone(),
             step_budget: super::post_stream::POST_STREAM_STEP_BUDGET,
+            stall_step: None,
         })
     }
 
@@ -11992,9 +12184,13 @@ impl ChatManager {
             .as_ref()
             .and_then(|n| n.spawned_by.as_deref())
             .and_then(parse_spawned_by);
+        // What waited for this session's next turn before it closed or the server
+        // restarted.
+        let held = HeldContext::load(&self.graph, session_id).await;
         AgentTurnState {
             memory,
             protocol_run_id: spawned.as_ref().and_then(|s| s.protocol_run_id),
+            held: Arc::new(std::sync::Mutex::new(held)),
             protocol_state: spawned.and_then(|s| s.protocol_state),
             objectives: super::post_stream::ObjectiveCounters {
                 enabled: true,
@@ -23225,6 +23421,7 @@ mod refs_turn_services_tests {
             event_emitter: None,
             context_injector: None,
             step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
+            stall_step: None,
         };
 
         let note = Uuid::new_v4();
@@ -23284,5 +23481,149 @@ mod agent_step_budget_tests {
             "{:?}",
             after.events
         );
+    }
+}
+
+/// What waits for a session's next turn after a compaction (`HeldContext`): kept
+/// across a restart, dropped only once a turn carrying it was sent, cut to the
+/// window; and the end-of-turn steps each under their own budget.
+#[cfg(test)]
+mod held_context_tests {
+    use super::*;
+    use crate::chat::agent_runtime::{TurnOutcome, TurnServices};
+
+    fn test_config() -> ChatConfig {
+        ChatConfig {
+            max_sessions: 10,
+            ..Default::default()
+        }
+    }
+
+    fn services(manager: &ChatManager, state: AgentTurnState) -> ManagerTurnServices {
+        ManagerTurnServices {
+            graph: manager.graph.clone(),
+            enrichment_pipeline: manager.enrichment_pipeline.clone(),
+            turn_routing: Arc::default(),
+            documents: crate::documents::store::DocumentStore::new(std::env::temp_dir()),
+            nats: None,
+            anchor: Default::default(),
+            session: state,
+            search: crate::test_helpers::mock_app_state().meili,
+            event_emitter: None,
+            context_injector: None,
+            step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
+            stall_step: None,
+        }
+    }
+
+    async fn world() -> (ChatManager, String) {
+        let state = crate::test_helpers::mock_app_state();
+        let graph = state.neo4j.clone();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let mut project = crate::test_helpers::test_project();
+        project.slug = "held".into();
+        graph.create_project(&project).await.unwrap();
+        let session = crate::test_helpers::test_chat_session(Some("held"));
+        graph.create_chat_session(&session).await.unwrap();
+        (manager, session.id.to_string())
+    }
+
+    async fn prepared(s: &ManagerTurnServices, sid: &str, text: &str) -> String {
+        let turn = crate::refs::turn::expand_user_turn_if(&s.graph, text, false).await;
+        s.prepare(sid, text, text, &turn).await
+    }
+
+    fn compacted() -> TurnOutcome {
+        TurnOutcome {
+            compacted: true,
+            ..Default::default()
+        }
+    }
+
+    /// The server goes down between the compaction and the next turn: the session
+    /// resumed on a new state still gets the context in front of that turn.
+    #[tokio::test]
+    async fn the_held_context_survives_a_restart() {
+        let (manager, sid) = world().await;
+        let before = services(&manager, manager.agent_turn_state(&sid).await);
+        before.after_turn(&sid, &compacted()).await;
+        drop(before);
+        let after = services(&manager, manager.agent_turn_state(&sid).await);
+        let sent = prepared(&after, &sid, "next").await;
+        assert!(sent.contains("Post-Compaction Context"), "{sent}");
+    }
+
+    /// A turn that was prepared but never sent (a Stop during the enrichment, a
+    /// refused image, a provider error) leaves the context for the next one; a turn
+    /// sent drops it.
+    #[tokio::test]
+    async fn the_held_context_is_dropped_only_once_a_turn_is_sent() {
+        let (manager, sid) = world().await;
+        let s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.after_turn(&sid, &compacted()).await;
+        let first = prepared(&s, &sid, "one").await;
+        assert!(first.contains("Post-Compaction Context"));
+        // `send_turn` failed: no `turn_sent`.
+        let again = prepared(&s, &sid, "two").await;
+        assert!(again.contains("Post-Compaction Context"), "kept: {again}");
+        s.turn_sent(&sid).await;
+        let then = prepared(&s, &sid, "three").await;
+        assert!(!then.contains("Post-Compaction Context"), "dropped: {then}");
+        // And from the store too, once the write landed.
+        for _ in 0..100 {
+            if HeldContext::load(&s.graph, &sid).await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the stored held context was not cleared");
+    }
+
+    #[test]
+    fn the_held_context_is_cut_to_a_share_of_the_window() {
+        let long = format!(
+            "<system-reminder>\n{}\n</system-reminder>",
+            "x".repeat(20_000)
+        );
+        let small = HeldContext::cap(&long, Some(8_000));
+        assert!(small.chars().count() <= 1_600, "{}", small.chars().count());
+        assert!(small.ends_with("</system-reminder>"));
+        let unknown = HeldContext::cap(&long, None);
+        assert!(unknown.chars().count() <= 6_000);
+        let big = HeldContext::cap(&long, Some(1_000_000));
+        assert!(
+            big.chars().count() <= 6_000,
+            "never above the builder's cap"
+        );
+        assert_eq!(HeldContext::cap("short", Some(8_000)), "short");
+    }
+
+    /// One step that never answers costs that step only: the next steps run, each in
+    /// its own budget (a shared budget would drop them with it).
+    #[tokio::test]
+    async fn a_stuck_step_does_not_take_the_next_ones_with_it() {
+        let (manager, sid) = world().await;
+        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.step_budget = Duration::from_millis(100);
+        s.stall_step = Some("context");
+        let started = std::time::Instant::now();
+        let after = s.after_turn(&sid, &TurnOutcome::default()).await;
+        assert!(
+            after.events.iter().any(|e| matches!(
+                e,
+                ChatEvent::Error { reason: Some(step), .. } if step == "context"
+            )),
+            "{:?}",
+            after.events
+        );
+        assert_eq!(
+            s.session
+                .objectives
+                .turns_since
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the objective step still ran after the stuck one"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

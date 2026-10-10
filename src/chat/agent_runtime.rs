@@ -84,6 +84,26 @@ fn retryable_failure(event: &AgentEvent) -> Option<ProviderError> {
     }
 }
 
+/// The terminal event of a turn stopped before the provider answered (a Stop during
+/// the pause before a retry).
+fn interrupted_done() -> AgentEvent {
+    AgentEvent::Done {
+        stop_reason: nexus_claude::agent::StopReason::Interrupted,
+        subtype: None,
+        is_error: false,
+        result_text: None,
+        usage: Default::default(),
+        cost: Default::default(),
+        duration_ms: 0,
+        duration_api_ms: None,
+        num_turns: 0,
+        model: None,
+        provider_session_id: None,
+        structured_output: None,
+        error: None,
+    }
+}
+
 /// Longest the runtime waits for the host's whole end of turn: four steps (context,
 /// re-injection, objectives, feedback), each bounded by the host to the post-stream
 /// step budget, plus a margin. A backstop: the steps' own budgets come first.
@@ -351,6 +371,8 @@ pub struct TurnOutcome {
     pub hit_turn_limit: bool,
     /// Auto-continue was allowed after it (a continuation is on its way).
     pub auto_continue_allowed: bool,
+    /// The model's context window as the session knows it (tokens), if known.
+    pub context_window: Option<u64>,
 }
 
 /// What the host asks of the session after a turn: events to emit, then system
@@ -395,6 +417,9 @@ pub trait TurnServices: Send + Sync {
     /// Sees each event of the session as it is emitted (the work log of the turn).
     /// Default: nothing.
     fn observe(&self, _session_id: &str, _event: &ChatEvent) {}
+    /// A turn was sent to the provider (`send_turn` accepted it): what `prepare`
+    /// put in front of it only for one turn may be dropped now. Default: nothing.
+    async fn turn_sent(&self, _session_id: &str) {}
     /// After each turn played (not one refused before it was sent): the
     /// Claude Code engine's post-stream steps — post-compaction re-injection,
     /// objective tracking, memory, feedback, observations. The host bounds each of
@@ -843,6 +868,9 @@ impl AgentSessionHandle {
             },
             Err(error) => return Err(error),
         };
+        if let Some(services) = &self.services {
+            services.turn_sent(&self.session_id).await;
+        }
         self.streaming_text.lock().await.clear();
         self.streaming_events.lock().await.clear();
         self.emit(ChatEvent::StreamingStatus { is_streaming: true })
@@ -926,7 +954,10 @@ impl AgentSessionHandle {
         input: TurnInput,
     ) -> (TurnOutcome, Vec<(String, Option<String>)>) {
         let mut attempt = 0u32;
-        let mut outcome = TurnOutcome::default();
+        let mut outcome = TurnOutcome {
+            context_window: self.capabilities.context_window.map(|w| w.value),
+            ..TurnOutcome::default()
+        };
         let mut pending_tools: Vec<(String, Option<String>)> = Vec::new();
         let mut tool_ids: Vec<String> = Vec::new();
         // What the turn cost, read on its `done` (`None`: no price, or no `done`).
@@ -993,6 +1024,11 @@ impl AgentSessionHandle {
                 .pause_unless_stopped(Duration::from_millis(delay))
                 .await
             {
+                // The turn ends as any stopped turn does: on its terminal event.
+                let stopped = interrupted_done();
+                for chat_event in self.mapper.lock().await.map(&stopped) {
+                    self.emit(chat_event).await;
+                }
                 break;
             }
             match self.session.send_turn(input.clone()).await {
@@ -2815,5 +2851,14 @@ mod retry_stop_tests {
             1,
             "no retry after the Stop"
         );
+        // The turn ended on its terminal event, as any stopped turn.
+        let mut ended = false;
+        while let Ok(event) = rx.try_recv() {
+            ended |= matches!(
+                event,
+                ChatEvent::Result { ref stop_reason, .. } if stop_reason.as_deref() == Some("interrupted")
+            );
+        }
+        assert!(ended, "a result with stop_reason interrupted");
     }
 }
