@@ -459,18 +459,10 @@ fn server_examples() -> Vec<ServerExample> {
             },
             ChatEvent::RefsResolved { refs: vec![] },
         ),
-        ServerExample::new(
-            ChatEvent::PermissionDecision {
-                id: s("perm_0001"),
-                allow: true,
-                scope: Some(crate::chat::types::PermissionAnswerScope::Session),
-            },
-            ChatEvent::PermissionDecision {
-                id: s("perm_0001"),
-                allow: true,
-                scope: None,
-            },
-        ),
+        ServerExample::same(ChatEvent::PermissionDecision {
+            id: s("perm_0001"),
+            allow: true,
+        }),
         ServerExample::new(
             ChatEvent::PermissionModeChanged {
                 mode: s("acceptEdits"),
@@ -717,12 +709,7 @@ fn client_examples() -> Vec<ClientExample> {
         },
         ClientExample {
             tag: "permission_response",
-            full: json!({
-                "type": "permission_response",
-                "id": "perm_0001",
-                "allow": true,
-                "scope": "session"
-            }),
+            full: json!({ "type": "permission_response", "id": "perm_0001", "allow": true }),
             minimal: json!({ "type": "permission_response" }),
         },
         ClientExample {

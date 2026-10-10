@@ -7,57 +7,6 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
-// PermissionAnswerScope — how long a permission granted by the user lasts
-// ---------------------------------------------------------------------------
-
-/// How long an approval given to a permission request lasts (`scope` of the
-/// `permission_response` frame, of `POST .../permissions/{request_id}` and of
-/// the NATS `control_response` RPC). Absent means `once`.
-///
-/// - `once`: this call only.
-/// - `session`: the same tool is not asked again in this session.
-/// - `always`: not asked again in this project, after a restart too. Claude
-///   Code persists it itself (its `localSettings`); a native session has it
-///   from the backend's lasting rules (`chat::lasting_rules`).
-///
-/// A scope the session does not declare (`capabilities.permission_scopes`) is
-/// REFUSED with a typed error, never answered as a narrower one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PermissionAnswerScope {
-    #[default]
-    Once,
-    Session,
-    Always,
-}
-
-impl PermissionAnswerScope {
-    /// The wire name (`once`, `session`, `always`).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Once => "once",
-            Self::Session => "session",
-            Self::Always => "always",
-        }
-    }
-
-    /// The scope as nexus names it.
-    pub fn to_nexus(self) -> nexus_claude::agent::PermissionScope {
-        match self {
-            Self::Once => nexus_claude::agent::PermissionScope::Once,
-            Self::Session => nexus_claude::agent::PermissionScope::Session,
-            Self::Always => nexus_claude::agent::PermissionScope::Always,
-        }
-    }
-
-    /// Wire form of [`ChatEvent::PermissionDecision::scope`]: only an approval
-    /// that outlives the call says how long.
-    pub fn lasting(self, allow: bool) -> Option<Self> {
-        (allow && self != Self::Once).then_some(self)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // SpawnedBy — typed origin for sessions spawned by the pipeline or runner
 // ---------------------------------------------------------------------------
 
@@ -739,10 +688,6 @@ pub enum ChatEvent {
         id: String,
         /// Whether the tool was allowed
         allow: bool,
-        /// How long the approval lasts, when it outlives the call (`session`,
-        /// `always`). Absent: this call only, or a refusal.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        scope: Option<PermissionAnswerScope>,
     },
     /// Permission mode was changed mid-session
     PermissionModeChanged {
@@ -2219,12 +2164,10 @@ mod tests {
             ChatEvent::PermissionDecision {
                 id: "pr_1".into(),
                 allow: true,
-                scope: Some(PermissionAnswerScope::Session),
             },
             ChatEvent::PermissionDecision {
                 id: "pr_2".into(),
                 allow: false,
-                scope: None,
             },
             ChatEvent::ModelChanged {
                 model: "claude-opus-4-6".into(),
