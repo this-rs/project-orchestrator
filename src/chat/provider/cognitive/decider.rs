@@ -107,8 +107,32 @@ fn reason_of(signature: &TaskSignature, best: &Scored, explored: bool, kept: boo
     )
 }
 
+/// Reason code of a compaction decision: the summary model cannot be chosen. The legacy
+/// engine's summary is written by the Claude Code CLI on the session's model, the native
+/// one by nexus on the session's endpoint and active model (`CompactionConfig` has no model
+/// field): the decision is recorded, never applied.
+pub const COMPACTION_MODEL_NOT_SELECTABLE: &str = "compaction_model_not_selectable";
+
 /// The decision for `request`, without touching any store.
 pub fn decide_with(
+    id: Uuid,
+    at: DateTime<Utc>,
+    request: &DecideRequest,
+    arms: &[ArmStats],
+    hints: &PriorHints,
+) -> CognitiveDecision {
+    let mut decision = decide_free(id, at, request, arms, hints);
+    if let Some(code) = request.not_selectable {
+        // Taken and stored for learning, but the work runs where it runs: never applied.
+        decision.applied = false;
+        decision.reason = format!("{code}: {}", decision.reason);
+        decision.used = request.current.clone();
+    }
+    decision
+}
+
+/// [`decide_with`] as if the chosen pair could always be used.
+fn decide_free(
     id: Uuid,
     at: DateTime<Utc>,
     request: &DecideRequest,
@@ -409,6 +433,22 @@ mod tests {
             assert_eq!(e.applied, executor_applied, "executor {mode:?} {stage:?}");
             assert_eq!((p.mode, p.stage), (mode, stage));
         }
+    }
+
+    #[tokio::test]
+    async fn a_work_whose_model_cannot_be_chosen_is_decided_and_stored_never_applied() {
+        let compaction = TaskSignature::utility(TaskClass::UtilityCompaction, 9_000, Some("po"));
+        let mut req = request(compaction, ProviderRoutingMode::Full, LearningStage::Auto);
+        req.current = Some(Pick::new("glm", "big"));
+        req.not_selectable = Some(COMPACTION_MODEL_NOT_SELECTABLE);
+        let (decision, store) = decide(&req).await;
+        assert!(decision.chosen.is_some(), "the choice is still made");
+        assert!(!decision.applied, "full + auto would apply it otherwise");
+        assert!(decision
+            .reason
+            .starts_with("compaction_model_not_selectable: "));
+        assert_eq!(decision.used, Some(Pick::new("glm", "big")));
+        assert_eq!(store.decision(decision.id).await.unwrap(), Some(decision));
     }
 
     #[tokio::test]

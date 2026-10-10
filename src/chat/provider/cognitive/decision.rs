@@ -144,6 +144,11 @@ pub struct DecideRequest {
     pub run_id: Option<Uuid>,
     /// Turn index.
     pub turn_index: Option<u32>,
+    /// The work cannot run on another pair than `current`, whatever is chosen (the
+    /// compaction summary: neither engine lets the caller name its model). The decision
+    /// is still taken and stored, never applied, its reason prefixed with this code and
+    /// `used` set to `current`.
+    pub not_selectable: Option<&'static str>,
 }
 
 impl DecideRequest {
@@ -161,6 +166,7 @@ impl DecideRequest {
             task_id: None,
             run_id: None,
             turn_index: None,
+            not_selectable: None,
         }
     }
 }

@@ -726,6 +726,8 @@ pub(crate) struct CompactionNotifier {
     context_source: CompactionContextSource,
     /// Session work log for enriching custom_instructions during compaction
     work_log: Option<Arc<tokio::sync::Mutex<SessionWorkLog>>>,
+    /// The per-turn routers: the session's records the compaction decision (shadow).
+    routing: Option<Arc<super::agent_hooks::TurnRouting>>,
 }
 
 impl CompactionNotifier {
@@ -741,7 +743,29 @@ impl CompactionNotifier {
             graph: None,
             context_source: CompactionContextSource::None,
             work_log: None,
+            routing: None,
         }
+    }
+
+    /// Attach the per-turn routers, so a compaction records its routing decision.
+    pub(crate) fn with_routing(mut self, routing: Arc<super::agent_hooks::TurnRouting>) -> Self {
+        self.routing = Some(routing);
+        self
+    }
+
+    /// Records, without holding the compaction back, the cognitive decision about the
+    /// summary (never applied: the summary model cannot be chosen on either engine).
+    fn record_routing_decision(&self) {
+        let Some(router) = self
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.get(&self.session_id))
+        else {
+            return;
+        };
+        tokio::spawn(async move {
+            super::agent_hooks::record_compaction_decision(&router).await;
+        });
     }
 
     /// Attach a graph store and context source for building custom_instructions.
@@ -820,6 +844,7 @@ impl nexus_claude::HookCallback for CompactionNotifier {
         // Build custom instructions (async, best-effort)
         // This runs BEFORE emitting the event so the instructions are ready for the output.
         let custom_instructions = self.build_custom_instructions().await;
+        self.record_routing_decision();
 
         if let nexus_claude::HookInput::PreCompact(pre_compact) = input {
             let event = ChatEvent::CompactionStarted {
@@ -8310,7 +8335,8 @@ impl ChatManager {
         };
         let notifier = CompactionNotifier::new(events_tx, nats, session_id.clone())
             .with_context(self.graph.clone(), context_source)
-            .with_work_log(work_log);
+            .with_work_log(work_log)
+            .with_routing(Arc::clone(&self.turn_routing));
         hooks.insert(
             "PreCompact".to_string(),
             vec![nexus_claude::HookMatcher {
@@ -8534,7 +8560,8 @@ impl ChatManager {
                 session_id.to_string(),
             )
             .with_context(self.graph.clone(), context_source)
-            .with_work_log(work_log.clone());
+            .with_work_log(work_log.clone())
+            .with_routing(Arc::clone(&self.turn_routing));
             hooks.insert(
                 "PreCompact".to_string(),
                 vec![nexus_claude::HookMatcher {
