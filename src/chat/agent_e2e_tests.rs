@@ -1187,6 +1187,58 @@ mod cognitive_routing {
         assert_eq!(all[0].session_id, Some(session));
     }
 
+    fn pool_of(models: &[(&str, &str)]) -> Option<Vec<crate::chat::types::RoutingPoolEntry>> {
+        Some(
+            models
+                .iter()
+                .map(|(provider, model)| crate::chat::types::RoutingPoolEntry {
+                    provider: (*provider).into(),
+                    model: (*model).into(),
+                })
+                .collect(),
+        )
+    }
+
+    /// The pool restricts the decision taken when the conversation OPENS, not only the
+    /// per-turn ones: a model nobody ticked never opens it.
+    #[tokio::test]
+    async fn the_models_ticked_are_the_only_candidates_when_a_conversation_opens() {
+        let s = setup("full", "auto", true).await;
+        let mut r = pilot_request();
+        r.routing_mode = Some(crate::chat::provider::cognitive::ProviderRoutingMode::Mixed);
+        r.routing_pool = pool_of(&[("local", "not-m"), ("local", "other")]);
+        let c = choose(&s, &r).await;
+        assert_eq!(
+            (c.provider_id.as_str(), c.model.as_deref(), c.routed_by),
+            ("local", Some("not-m"), RoutedBy::Request),
+            "local/m was not ticked: the first ticked model opens it"
+        );
+    }
+
+    /// A pool is routed at open inside it, whatever the settings' mode (primary here).
+    #[tokio::test]
+    async fn a_pool_is_routed_at_open_even_when_the_settings_say_primary() {
+        let s = setup("primary", "auto", true).await;
+        let mut r = pilot_request();
+        r.routing_mode = Some(crate::chat::provider::cognitive::ProviderRoutingMode::Mixed);
+        r.routing_pool = pool_of(&[("local", "m"), ("claude-code", "x")]);
+        let c = choose(&s, &r).await;
+        assert_eq!(c.routed_by, RoutedBy::Auto);
+        assert_eq!(
+            (c.provider_id.as_str(), c.model.as_deref()),
+            ("local", Some("m"))
+        );
+    }
+
+    /// Auto in the chat menu (`routing_mode: full`) routes the opening too, whatever the settings.
+    #[tokio::test]
+    async fn auto_in_the_request_routes_the_opening_even_when_the_settings_say_primary() {
+        let s = setup("primary", "auto", true).await;
+        let mut r = pilot_request();
+        r.routing_mode = Some(crate::chat::provider::cognitive::ProviderRoutingMode::Full);
+        assert_eq!(choose(&s, &r).await.routed_by, RoutedBy::Auto);
+    }
+
     #[tokio::test]
     async fn a_manual_switch_to_another_model_counts_as_an_override_when_the_session_closes() {
         let s = setup("full", "auto", true).await;
@@ -1755,6 +1807,7 @@ mod turn_routing {
     struct Rig {
         manager: ChatManager,
         decider: Arc<FakeDecider>,
+        graph: Arc<MockGraphStore>,
         provider: Arc<ScriptedProvider>,
         sid: String,
         rx: broadcast::Receiver<ChatEvent>,
@@ -1803,6 +1856,7 @@ mod turn_routing {
         Rig {
             manager,
             decider,
+            graph,
             provider,
             sid: created.session_id,
             rx,
@@ -2110,7 +2164,13 @@ mod turn_routing {
     #[tokio::test]
     async fn a_mixed_conversation_is_routed_among_its_pool_only() {
         let mut r = rig("primary", "auto", true, None, vec![Answer::Pick("big")]).await;
-        reopen_with_pool(&r, Some(ProviderRoutingMode::Mixed), Some(&["big"])).await;
+        // Two ticks ("medium" is not offered by this provider): one alone would be strict.
+        reopen_with_pool(
+            &r,
+            Some(ProviderRoutingMode::Mixed),
+            Some(&["big", "medium"]),
+        )
+        .await;
         r.manager.apply_turn_directive(&r.sid, DEBUG).await;
         let requests = r.decider.requests.lock().unwrap().clone();
         assert_eq!(
@@ -2160,6 +2220,240 @@ mod turn_routing {
         router.set_model_live(true);
         r.manager.apply_turn_directive(&r.sid, DEBUG).await;
         assert_eq!(r.decider.calls(), 1);
+    }
+
+    // ── PUT /api/chat/sessions/{id}/routing: the menu of an open conversation ──
+
+    fn auto() -> crate::chat::types::SessionRoutingRequest {
+        crate::chat::types::SessionRoutingRequest {
+            auto: true,
+            routing_pool: Vec::new(),
+        }
+    }
+
+    fn ticked(models: &[(&str, &str)]) -> crate::chat::types::SessionRoutingRequest {
+        crate::chat::types::SessionRoutingRequest {
+            auto: false,
+            routing_pool: models
+                .iter()
+                .map(|(provider, model)| crate::chat::types::RoutingPoolEntry {
+                    provider: (*provider).to_owned(),
+                    model: (*model).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    async fn pinned(r: &Rig) -> bool {
+        r.graph
+            .get_llm_setting(&format!("session:{}", r.sid), "model_pinned")
+            .await
+            .unwrap()
+            .is_some_and(|v| v == "true")
+    }
+
+    /// "Rendre la main a PO": Auto on a conversation whose model was imposed releases it.
+    #[tokio::test]
+    async fn auto_on_an_open_conversation_hands_an_imposed_model_back_to_po() {
+        let mut r = rig(
+            "primary",
+            "auto",
+            true,
+            Some("small"),
+            vec![Answer::Pick("big")],
+        )
+        .await;
+        assert!(r.turn(DEBUG).await.is_empty());
+        assert_eq!(r.decider.calls(), 0, "imposed: PO is not even asked");
+        assert!(pinned(&r).await);
+
+        let node = r
+            .manager
+            .set_session_routing(&r.sid, &auto())
+            .await
+            .unwrap();
+        assert_eq!(node.routing_mode.as_deref(), Some("full"));
+        assert_eq!(node.routed_by.as_deref(), Some("auto"));
+        assert_eq!(node.routing_pool, None);
+        assert!(
+            !pinned(&r).await,
+            "the pin is released, a resume routes too"
+        );
+
+        assert_eq!(r.turn(DEBUG).await, ["big"], "the next turn is routed");
+    }
+
+    /// A model changed by hand ends the automatic changes; Auto starts them again.
+    #[tokio::test]
+    async fn auto_after_a_model_changed_by_hand_routes_the_next_turn_again() {
+        let mut r = rig("full", "auto", true, None, vec![Answer::Pick("big")]).await;
+        r.manager.set_session_model(&r.sid, "small").await.unwrap();
+        let by_hand = r.turn(DEBUG).await;
+        assert!(!by_hand.iter().any(|m| m == "big"), "{by_hand:?}");
+        assert_eq!(r.decider.calls(), 0, "set by hand: PO is not asked");
+
+        r.manager
+            .set_session_routing(&r.sid, &auto())
+            .await
+            .unwrap();
+        assert!(!pinned(&r).await);
+        assert_eq!(r.turn(DEBUG).await, ["big"]);
+    }
+
+    /// A16: one model ticked is imposed, and never substituted afterwards.
+    #[tokio::test]
+    async fn one_model_ticked_on_an_open_conversation_is_imposed_and_never_substituted() {
+        let mut r = rig("full", "auto", true, None, vec![Answer::Pick("big")]).await;
+        let node = r
+            .manager
+            .set_session_routing(&r.sid, &ticked(&[("claude-code", "small")]))
+            .await
+            .unwrap();
+        assert_eq!(node.routing_mode.as_deref(), Some("primary"));
+        assert_eq!(node.routed_by.as_deref(), Some("request"));
+        assert_eq!(node.model, "small", "set now, not at some later turn");
+        assert!(pinned(&r).await);
+
+        let mut seen = r.turn(DEBUG).await;
+        seen.extend(r.turn(DEBUG).await);
+        assert!(
+            !seen.iter().any(|m| m == "big"),
+            "the router never replaces an imposed model: {seen:?}"
+        );
+        assert_eq!(
+            r.decider.calls(),
+            0,
+            "full settings, but this conversation is strict"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_ticked_on_an_open_conversation_restrict_its_next_turns() {
+        let mut r = rig("primary", "auto", true, None, vec![Answer::Pick("big")]).await;
+        assert!(r.turn(DEBUG).await.is_empty());
+        assert_eq!(
+            r.decider.calls(),
+            0,
+            "primary: not routed before the change"
+        );
+
+        let node = r
+            .manager
+            .set_session_routing(
+                &r.sid,
+                &ticked(&[("claude-code", "big"), ("local-llama", "qwen")]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(node.routing_mode.as_deref(), Some("mixed"));
+        let stored: Vec<crate::chat::types::RoutingPoolEntry> =
+            serde_json::from_str(node.routing_pool.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            stored.len(),
+            2,
+            "every tick is kept, the other provider's too"
+        );
+
+        assert_eq!(r.turn(DEBUG).await, ["big"]);
+        let requests = r.decider.requests.lock().unwrap();
+        let offered: Vec<&str> = requests[0].pool.iter().map(|f| f.model.as_str()).collect();
+        assert_eq!(
+            offered,
+            ["big"],
+            "only this provider's ticked models are candidates"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conversations_routing_never_writes_the_global_or_project_settings() {
+        let r = rig("primary", "shadow", true, None, vec![Answer::Stay]).await;
+        let settings = || async {
+            let all = r.graph.llm_settings.read().await;
+            let mut kept: Vec<((String, String), String)> = all
+                .iter()
+                .filter(|((scope, _), _)| !scope.starts_with("session:"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            kept.sort();
+            kept
+        };
+        let before = settings().await;
+        for body in [
+            auto(),
+            ticked(&[("claude-code", "small")]),
+            ticked(&[("claude-code", "small"), ("claude-code", "big")]),
+            auto(),
+        ] {
+            r.manager.set_session_routing(&r.sid, &body).await.unwrap();
+        }
+        assert_eq!(
+            settings().await,
+            before,
+            "only the session's own scope changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_routing_that_needs_another_provider_or_no_model_is_refused_and_changes_nothing() {
+        use crate::chat::types::SessionRoutingError as Refused;
+        let r = rig("primary", "auto", true, None, vec![Answer::Stay]).await;
+        let refusal = |body| {
+            let manager = &r.manager;
+            let sid = r.sid.clone();
+            async move {
+                manager
+                    .set_session_routing(&sid, &body)
+                    .await
+                    .unwrap_err()
+                    .downcast::<Refused>()
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            refusal(ticked(&[("local-llama", "qwen")])).await,
+            Refused::OtherProvider("claude-code".into())
+        );
+        assert_eq!(
+            refusal(ticked(&[("local-llama", "qwen"), ("local-llama", "mini")])).await,
+            Refused::OtherProvider("claude-code".into())
+        );
+        assert_eq!(refusal(ticked(&[])).await, Refused::EmptyPool);
+        assert_eq!(
+            refusal(ticked(&[("claude-code", " ")])).await,
+            Refused::BlankEntry(0)
+        );
+        let node = r
+            .graph
+            .get_chat_session(Uuid::parse_str(&r.sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.routing_mode, None);
+        assert_eq!(node.routing_pool, None);
+        let missing = r
+            .manager
+            .set_session_routing(&Uuid::new_v4().to_string(), &auto())
+            .await
+            .unwrap_err();
+        assert_eq!(missing.downcast_ref::<Refused>(), Some(&Refused::NotFound));
+    }
+
+    /// One model ticked when the conversation opens is strict: imposed, not a pool of one.
+    #[tokio::test]
+    async fn one_model_ticked_at_open_is_strict() {
+        let mut req = request(None, None, "default");
+        req.routing_mode = Some(ProviderRoutingMode::Mixed);
+        req.routing_pool = Some(vec![crate::chat::types::RoutingPoolEntry {
+            provider: "claude-code".into(),
+            model: "small".into(),
+        }]);
+        let settled = req.settled_routing().expect("a pool of one is settled");
+        assert_eq!(settled.provider.as_deref(), Some("claude-code"));
+        assert_eq!(settled.model.as_deref(), Some("small"));
+        assert_eq!(settled.routing_mode, Some(ProviderRoutingMode::Primary));
+        assert_eq!(settled.routing_pool, None);
+        req.routing_pool = Some(Vec::new());
+        assert_eq!(req.settled_routing().unwrap().routing_pool, None);
     }
 
     #[tokio::test]
@@ -3311,6 +3605,7 @@ mod parity {
                 project_slug: None,
                 trust: false,
                 explicit_model: false,
+                allowed_models: None,
                 current_model: "m".into(),
                 next_turn: 0,
             },

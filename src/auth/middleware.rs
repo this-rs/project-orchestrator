@@ -173,6 +173,9 @@ pub fn is_human_only_mutation(method: &axum::http::Method, path: &str) -> bool {
         // Answering a permission prompt IS the human's decision: an agent that
         // could post it would approve its own tool calls.
         || (path.starts_with("/api/chat/sessions/") && path.contains("/permissions/"))
+        // How a conversation is routed is the person's menu: an agent that could
+        // change it would pick its own model.
+        || (path.starts_with("/api/chat/sessions/") && path.ends_with(HUMAN_ONLY_PROJECT_ROUTING))
 }
 
 /// The session id a `/api/chat/sessions/{id}[/...]` path acts on, if it is one.
@@ -882,6 +885,7 @@ mod tests {
         let created = manager
             .create_session(&crate::chat::types::ChatRequest {
                 access: None,
+                routing_pool: None,
                 routing_mode: None,
                 attachments: Vec::new(),
                 refs: Vec::new(),
@@ -991,6 +995,10 @@ mod tests {
         assert!(
             is_human_only_mutation(&Method::POST, "/api/chat/sessions/abc/permissions/req-1"),
             "an agent must not answer permission prompts"
+        );
+        assert!(
+            is_human_only_mutation(&Method::PUT, "/api/chat/sessions/abc/routing"),
+            "an agent must not choose the model of its conversation"
         );
         assert!(!is_human_only_mutation(
             &Method::POST,

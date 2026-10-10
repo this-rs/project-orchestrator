@@ -7839,6 +7839,24 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn update_chat_session_routing(
+        &self,
+        id: Uuid,
+        routing_mode: Option<&str>,
+        routing_pool: Option<&str>,
+        routed_by: Option<&str>,
+    ) -> Result<bool> {
+        let mut sessions = self.chat_sessions.write().await;
+        let Some(session) = sessions.get_mut(&id) else {
+            return Ok(false);
+        };
+        session.routing_mode = routing_mode.map(str::to_owned);
+        session.routing_pool = routing_pool.map(str::to_owned);
+        session.routed_by = routed_by.map(str::to_owned);
+        session.updated_at = Utc::now();
+        Ok(true)
+    }
+
     async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>> {
         Ok(self
             .llm_settings

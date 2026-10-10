@@ -1917,6 +1917,12 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/sessions/{id}/interrupt",
             post(chat_handlers::interrupt_session),
         )
+        // How THIS conversation is routed (the chat menu: Auto or the models ticked),
+        // stored on the session, never in the settings. Human only.
+        .route(
+            "/api/chat/sessions/{id}/routing",
+            put(chat_handlers::set_session_routing),
+        )
         // Continue the conversation on another provider (B-SW): a new session,
         // the earlier conversation relayed to it, the old one closed.
         .route(

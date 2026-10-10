@@ -2492,6 +2492,17 @@ impl GraphStore for Neo4jClient {
         self.update_chat_session_model(id, model).await
     }
 
+    async fn update_chat_session_routing(
+        &self,
+        id: Uuid,
+        routing_mode: Option<&str>,
+        routing_pool: Option<&str>,
+        routed_by: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        self.update_chat_session_routing(id, routing_mode, routing_pool, routed_by)
+            .await
+    }
+
     async fn get_llm_setting(&self, scope: &str, key: &str) -> anyhow::Result<Option<String>> {
         self.get_llm_setting(scope, key).await
     }

@@ -395,6 +395,29 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Replace the routing of one conversation; an absent value is stored empty (read back
+    /// as `None`, like every optional session property). `false`: no such session.
+    pub async fn update_chat_session_routing(
+        &self,
+        id: Uuid,
+        routing_mode: Option<&str>,
+        routing_pool: Option<&str>,
+        routed_by: Option<&str>,
+    ) -> Result<bool> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $id}) \
+             SET s.routing_mode = $routing_mode, s.routing_pool = $routing_pool, \
+                 s.routed_by = $routed_by, s.updated_at = datetime() \
+             RETURN s.id AS id",
+        )
+        .param("id", id.to_string())
+        .param("routing_mode", routing_mode.unwrap_or_default().to_string())
+        .param("routing_pool", routing_pool.unwrap_or_default().to_string())
+        .param("routed_by", routed_by.unwrap_or_default().to_string());
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
     /// One setting document of the provider harness.
     pub async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>> {
         let q = query("MATCH (s:LlmSetting {scope: $scope, key: $key}) RETURN s.value AS value")

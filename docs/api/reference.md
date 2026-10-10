@@ -280,6 +280,24 @@ curl -H "Authorization: Bearer <JWT>" \
   http://localhost:8080/api/chat/sessions/{id}
 ```
 
+### PUT /api/chat/sessions/{id}/routing -- Protected (human only)
+
+Change how THIS conversation is routed, from its next turn on (the chat menu). Stored on
+the session only, never in the global or project routing settings.
+
+- `{"auto": true}`: hand it back to PO (`routing_mode: full`, `routed_by: auto`, an imposed model is released).
+- `{"auto": false, "routing_pool": [{"provider": "claude-code", "model": "claude-opus-5"}]}`: one model = strict
+  (`primary`, that model set now and never substituted); two or more = `mixed` (PO routes among them).
+
+One conversation = one provider: per turn, only the ticked models of the session's provider are candidates;
+moving to another provider is `POST /api/chat/sessions/{id}/switch-provider`. Answers the `ChatSession`.
+400 `invalid_routing_pool` | `routing_pool_other_provider`, 404 unknown session, 403 agent token.
+
+```bash
+curl -X PUT -H "Authorization: Bearer <JWT>" -H "Content-Type: application/json" \
+  -d '{"auto": true}' http://localhost:8080/api/chat/sessions/{id}/routing
+```
+
 ### DELETE /api/chat/sessions/{id} -- Protected
 
 Delete a session.

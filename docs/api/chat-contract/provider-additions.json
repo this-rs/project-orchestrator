@@ -69,7 +69,12 @@
           "mixed",
           "full"
         ],
-        "doc": "mode de routage en vigueur quand la session a été ouverte (réglage projet > global > défaut primary). Pas encore émis (B-R4)"
+        "doc": "mode de routage de CETTE conversation quand sa requete (routing_mode a la creation) ou PUT /api/chat/sessions/{id}/routing en a nomme un ; absent = les reglages (projet > global > defaut primary) decident"
+      },
+      "routing_pool": {
+        "type": "array<{provider: string, model: string}> | absent",
+        "required": false,
+        "doc": "les modeles coches parmi lesquels PO route cette conversation (mode mixed) ; absent = aucune restriction (Auto, strict, ou rien choisi)"
       },
       "route_reason": {
         "type": "string | null",
@@ -87,7 +92,31 @@
         "type": "string",
         "required": false,
         "doc": "id d'instance ; sur une session existante, un provider différent → 409 provider_conflict"
+      },
+      "routing_mode": {
+        "type": "string",
+        "required": false,
+        "enum": [
+          "primary",
+          "mixed",
+          "full"
+        ],
+        "doc": "le menu du chat, lu a l'ouverture : full = Auto (PO route l'ouverture ET chaque tour, quels que soient les reglages) ; primary = strict (provider + model nommes) ; mixed = routing_pool. Absent = les reglages decident. Jamais ecrit dans les reglages globaux ou projet"
+      },
+      "routing_pool": {
+        "type": "array<{provider: string, model: string}>",
+        "required": false,
+        "doc": "mixed : les modeles coches (model = id reel, jamais un nom d'alias). Ils sont les SEULS candidats de la decision d'ouverture et de chaque decision par tour, routes comme full a l'interieur ; le pilote nomme (provider/model) ouvre la conversation mais n'est pas epingle. Sans pilote : choix du routeur parmi eux, sinon le premier coche (routed_by request). 1 entree = strict (ce provider et ce modele, primary, epingle, jamais substitue) ; vide ou absent = tout modele eligible. Une conversation tourne sur UN provider : un pool qui couvre plusieurs providers choisit le provider a l'ouverture ; ensuite seuls les modeles coches de CE provider comptent par tour, changer de provider = POST /api/chat/sessions/{id}/switch-provider"
       }
+    },
+    "PUT /api/chat/sessions/{id}/routing": {
+      "doc": "LIVRE. Change le routage d'UNE conversation existante a partir de son prochain tour. Stocke sur la session (routing_mode, routing_pool, routed_by), JAMAIS dans les reglages globaux ou projet. Humain seulement : 403 pour un jeton d'agent (comme set_model, qui n'existe que sur le WebSocket)",
+      "body": {
+        "auto": "boolean (defaut false) : true = rendre la main a PO (routing_mode full, routed_by auto, routing_pool efface, le modele impose avant est libere) ; routing_pool ignore",
+        "routing_pool": "array<{provider, model}> (meme forme que CreateSessionRequest.routing_pool), lu si auto = false : 1 modele = strict (primary, ce modele est pose tout de suite - model_changed - puis jamais substitue, routed_by request) ; 2+ = mixed (PO route parmi les modeles coches du provider de la session, routed_by auto ; les coches d'un autre provider sont gardees mais inertes jusqu'a un switch-provider)"
+      },
+      "response": "200 ChatSession (routing_mode, routing_pool, routed_by, model a jour)",
+      "errors": "400 {error, code, retryable:false} : invalid_routing_pool (rien coche sans auto, ou une entree sans provider ou sans model) | routing_pool_other_provider (strict sur un autre provider, ou aucun modele coche sur le provider de la session : utiliser switch-provider) ; 404 session inconnue ; 403 jeton d'agent. Un refus ne change rien"
     },
     "CreateSessionResponse": {
       "execution_place": {
