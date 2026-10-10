@@ -15,11 +15,18 @@ runs:
     - name: Optimise dependencies, keep line tables only, no incremental state
       shell: bash
       run: |
-        mkdir -p "$HOME/.cargo"
-        cat >> "$HOME/.cargo/config.toml" <<'TOML'
+        # CARGO_HOME, not $HOME/.cargo: on a self-hosted runner CARGO_HOME points at the
+        # runner's own directory, and $HOME is the operator's account. Written ONCE: a persistent
+        # runner keeps the file, and appending the table again would make cargo reject a
+        # duplicate key on every later run.
+        CFG="${CARGO_HOME:-$HOME/.cargo}/config.toml"
+        mkdir -p "$(dirname "$CFG")"
+        if ! grep -qF '[profile.dev.package."*"]' "$CFG" 2>/dev/null; then
+          cat >> "$CFG" <<'TOML'
         [profile.dev.package."*"]
         opt-level = 2
         TOML
+        fi
         {
           # A clean checkout never reads incremental state; it only bloats the cache.
           echo "CARGO_INCREMENTAL=0"

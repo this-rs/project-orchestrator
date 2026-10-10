@@ -215,7 +215,13 @@ jobs:
   # ==========================================================================
   unit-tests:
     name: Unit Tests
-    runs-on: ubuntu-latest
+    # Self-hosted (more cores, persistent target directory) for pushes and for PRs whose
+    # branch lives in THIS repository; a PR from a fork never reaches the self-hosted runner
+    # (the repository also requires approval for every external contributor's run).
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","po-ci"]') || 'ubuntu-latest' }}
+    # A hung test used to hold a job for 1-2 hours; nextest kills it after 5 min (see
+    # .config/nextest.toml), this is the backstop.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
 
@@ -224,12 +230,18 @@ jobs:
 
       - uses: ./.github/actions/test-profile
 
+      # The self-hosted runner keeps its target directory between runs: restoring and saving
+      # GitHub's cache there would only cost time.
       - name: Cache cargo registry
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "ci-test-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
           save-if: ${{ env.CACHE_SAVE == 'true' && env.CACHE_FRESH == '' }}
           cache-workspace-crates: true
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
 
       # src/chat/agent_e2e_tests.rs needs the nexus fake servers (see the action).
       - name: Build the nexus fake servers used by the agent e2e tests
@@ -240,7 +252,9 @@ jobs:
         # neural-routing-* crates carry their own #[cfg(test)] suites that the
         # root-only `cargo test --lib` never executed). Desktop excluded — see
         # the clippy step.
-        run: cargo test --workspace --exclude project-orchestrator-desktop --lib
+        # nextest: one process per test (no shared globals between tests), all cores, and a
+        # per-test timeout that NAMES a hung test instead of letting it hold the job.
+        run: cargo nextest run --profile ci --workspace --exclude project-orchestrator-desktop --lib
 
       - name: Run parser tests
         run: cargo test --test parser_tests
@@ -261,7 +275,8 @@ jobs:
   # ==========================================================================
   integration-tests:
     name: Integration Tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","po-ci"]') || 'ubuntu-latest' }}
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: read
@@ -275,8 +290,8 @@ jobs:
           NEO4J_AUTH: neo4j/testpassword
           NEO4J_PLUGINS: '["apoc"]'
         ports:
-          - 7687:7687
-          - 7474:7474
+          - 7687
+          - 7474
         options: >-
           --health-cmd "cypher-shell -u neo4j -p testpassword 'RETURN 1' || exit 1"
           --health-interval 10s
@@ -293,7 +308,7 @@ jobs:
           MEILI_MASTER_KEY: test-master-key
           MEILI_NO_ANALYTICS: true
         ports:
-          - 7700:7700
+          - 7700
         options: >-
           --health-cmd "curl -sf http://localhost:7700/health || exit 1"
           --health-interval 5s
@@ -309,6 +324,7 @@ jobs:
       - uses: ./.github/actions/test-profile
 
       - name: Cache cargo registry
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "ci-test-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
@@ -318,17 +334,17 @@ jobs:
       - name: Wait for services to be ready
         run: |
           echo "Waiting for Neo4j..."
-          timeout 60 bash -c 'until curl -sf http://localhost:7474 > /dev/null 2>&1; do sleep 2; done'
+          timeout 60 bash -c 'until curl -sf http://localhost:${{ job.services.neo4j.ports['7474'] }} > /dev/null 2>&1; do sleep 2; done'
           echo "Waiting for Meilisearch..."
-          timeout 60 bash -c 'until curl -sf http://localhost:7700/health > /dev/null 2>&1; do sleep 2; done'
+          timeout 60 bash -c 'until curl -sf http://localhost:${{ job.services.meilisearch.ports['7700'] }}/health > /dev/null 2>&1; do sleep 2; done'
           echo "All services are ready!"
 
       - name: Run integration tests
         env:
-          NEO4J_URI: bolt://localhost:7687
+          NEO4J_URI: bolt://localhost:${{ job.services.neo4j.ports['7687'] }}
           NEO4J_USER: neo4j
           NEO4J_PASSWORD: testpassword
-          MEILISEARCH_URL: http://localhost:7700
+          MEILISEARCH_URL: http://localhost:${{ job.services.meilisearch.ports['7700'] }}
           MEILISEARCH_KEY: test-master-key
         run: |
           # harness_neo4j: the Cypher of the provider settings; REQUIRED here, so a
@@ -447,7 +463,9 @@ jobs:
   # ==========================================================================
   coverage:
     name: Code Coverage
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","po-ci"]') || 'ubuntu-latest' }}
+    # Backstop: a hung test used to keep this job alive for 1-2 hours.
+    timeout-minutes: 50
     permissions:
       contents: read
       packages: read
@@ -461,8 +479,8 @@ jobs:
           NEO4J_AUTH: neo4j/testpassword
           NEO4J_PLUGINS: '["apoc"]'
         ports:
-          - 7687:7687
-          - 7474:7474
+          - 7687
+          - 7474
         options: >-
           --health-cmd "cypher-shell -u neo4j -p testpassword 'RETURN 1' || exit 1"
           --health-interval 10s
@@ -478,7 +496,7 @@ jobs:
           MEILI_MASTER_KEY: test-master-key
           MEILI_NO_ANALYTICS: true
         ports:
-          - 7700:7700
+          - 7700
         options: >-
           --health-cmd "curl -sf http://localhost:7700/health || exit 1"
           --health-interval 5s
@@ -495,6 +513,7 @@ jobs:
       - uses: ./.github/actions/test-profile
 
       - name: Cache cargo registry
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "ci-cov-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
@@ -506,8 +525,8 @@ jobs:
 
       - name: Wait for services to be ready
         run: |
-          timeout 90 bash -c 'until curl -sf http://localhost:7474 > /dev/null 2>&1; do sleep 2; done'
-          timeout 60 bash -c 'until curl -sf http://localhost:7700/health > /dev/null 2>&1; do sleep 2; done'
+          timeout 90 bash -c 'until curl -sf http://localhost:${{ job.services.neo4j.ports['7474'] }} > /dev/null 2>&1; do sleep 2; done'
+          timeout 60 bash -c 'until curl -sf http://localhost:${{ job.services.meilisearch.ports['7700'] }}/health > /dev/null 2>&1; do sleep 2; done'
           echo "Neo4j + Meilisearch ready"
 
       # Coverage is collected in SEVERAL runs whose profraw data is then MERGED
@@ -536,7 +555,7 @@ jobs:
       # The Unit Tests job has no Neo4j and no PARITY_NEO4J_URI: it skips.
       - name: Collect coverage — unit tests (workspace)
         env:
-          PARITY_NEO4J_URI: bolt://localhost:7687
+          PARITY_NEO4J_URI: bolt://localhost:${{ job.services.neo4j.ports['7687'] }}
           PARITY_NEO4J_USER: neo4j
           PARITY_NEO4J_PASSWORD: testpassword
           HARNESS_NEO4J_REQUIRED: "1"
@@ -554,10 +573,10 @@ jobs:
       # method here runs against Neo4j, so its lines count.
       - name: Collect coverage — Neo4j integration suites
         env:
-          NEO4J_URI: bolt://localhost:7687
+          NEO4J_URI: bolt://localhost:${{ job.services.neo4j.ports['7687'] }}
           NEO4J_USER: neo4j
           NEO4J_PASSWORD: testpassword
-          MEILISEARCH_URL: http://localhost:7700
+          MEILISEARCH_URL: http://localhost:${{ job.services.meilisearch.ports['7700'] }}
           MEILISEARCH_KEY: test-master-key
         run: |
           cargo llvm-cov --no-report --no-fail-fast \
