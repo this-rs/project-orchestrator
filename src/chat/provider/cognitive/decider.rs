@@ -93,6 +93,10 @@ fn reason_of(signature: &TaskSignature, best: &Scored, explored: bool, kept: boo
     } else {
         "no run observed yet".to_owned()
     });
+    if signature.needs_images {
+        // F-R4: the pool was constrained, nothing was substituted.
+        parts.push("reads the attached images (models without vision excluded)".to_owned());
+    }
     if explored {
         parts.push("picked by the exploration draw".to_owned());
     }

@@ -309,6 +309,12 @@ async fn stored_place_and_access(
     }
 }
 
+/// What a stored capabilities snapshot says of `images`; `None` when there is no snapshot
+/// or it does not say.
+fn snapshot_images(capabilities: Option<&serde_json::Value>) -> Option<bool> {
+    capabilities?.get("images")?.as_bool()
+}
+
 /// Convert a ChatSessionNode to a ChatSession API response (without links).
 fn session_node_to_response(s: crate::neo4j::models::ChatSessionNode) -> ChatSession {
     ChatSession {
@@ -339,6 +345,7 @@ fn session_node_to_response(s: crate::neo4j::models::ChatSessionNode) -> ChatSes
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok()),
         capabilities: None,
+        effective_capabilities: None,
         routed_by: s.routed_by,
         execution_place: s.execution_place,
         access: s.access,
@@ -532,8 +539,15 @@ pub async fn get_session(
         .capabilities
         .as_deref()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+    let snapshot_images = snapshot_images(capabilities.as_ref());
     let mut session = session_node_to_response(node);
     session.capabilities = capabilities;
+    // F-R4: what the next turn can really carry, given the routing candidates.
+    if let Some(chat_manager) = state.chat_manager.as_ref() {
+        session.effective_capabilities = chat_manager
+            .effective_capabilities(&session_id.to_string(), snapshot_images)
+            .await;
+    }
 
     // Enrich with linked entities (best-effort — don't fail if enrichment fails)
     if let Ok(links) = neo4j.get_session_links(session_id).await {
@@ -1256,7 +1270,15 @@ pub async fn set_session_routing(
             "routed_by": updated.routed_by,
         })),
     );
+    let snapshot = updated
+        .capabilities
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
     let mut session = session_node_to_response(updated);
+    // F-R4: the routing changed, so may what the next turn can carry.
+    session.effective_capabilities = chat_manager
+        .effective_capabilities(&session_id.to_string(), snapshot_images(snapshot.as_ref()))
+        .await;
     stamp_activity(&state, std::slice::from_mut(&mut session)).await;
     Ok(Json(session))
 }

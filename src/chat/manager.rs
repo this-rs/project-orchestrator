@@ -1769,9 +1769,14 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         // instance), right before it is sent — what the user typed, not the
         // `<po-refs>`/`<po-attachments>` blocks around it.
         if let Some(router) = self.turn_routing.get(session_id) {
-            router.set_last_message(&crate::refs::turn::visible_text(shown));
+            router.set_turn_input(shown);
         }
         prepared
+    }
+
+    async fn model_for_images(&self, session_id: &str) -> Option<String> {
+        let router = self.turn_routing.get(session_id)?;
+        super::agent_hooks::model_for_images(&router).await
     }
 
     async fn continuation(&self, session_id: &str) -> String {
@@ -2780,10 +2785,11 @@ impl ChatManager {
         let Some(router) = self.turn_routing.get(session_id) else {
             return;
         };
-        // The routing reads what the user typed, not the blocks around it.
+        // The routing reads what the user typed, not the blocks around it, and whether an
+        // image goes with it.
+        router.set_turn_input(message);
         let typed = crate::refs::turn::visible_text(message);
         let message = typed.as_str();
-        router.set_last_message(message);
         let ctx = router.next_turn_context(message.chars().count());
         let before = ctx.current_model.clone();
         let directive = super::agent_hooks::directive_for_turn(&router, &ctx).await;
@@ -2796,6 +2802,36 @@ impl ChatManager {
                 router.forget_change(&before);
             }
         }
+    }
+
+    /// What the conversation can really do for its next turn, given its routing (F-R4,
+    /// decision 11cefdb2): `snapshot_images` is what the capabilities snapshot of its
+    /// opening model says (`None`: no snapshot stored). The live router answers
+    /// (`agent_hooks::effective_images`); without one (the session is not open here, or no
+    /// cognitive router is configured) the snapshot stands, said so (`no_router`). `None`:
+    /// nothing to say (no snapshot, no router).
+    pub(crate) async fn effective_capabilities(
+        &self,
+        session_id: &str,
+        snapshot_images: Option<bool>,
+    ) -> Option<super::types::EffectiveCapabilities> {
+        use super::types::{EffectiveCapabilities, EffectiveCapability, EffectiveCause};
+        let images = match self.turn_routing.get(session_id) {
+            Some(router) => {
+                let images =
+                    super::agent_hooks::effective_images(&router, snapshot_images.unwrap_or(false))
+                        .await;
+                // Without a snapshot, a fallback on it has nothing to say.
+                if snapshot_images.is_none()
+                    && images.source == super::types::EffectiveSource::Snapshot
+                {
+                    return None;
+                }
+                images
+            }
+            None => EffectiveCapability::snapshot(snapshot_images?, EffectiveCause::NoRouter),
+        };
+        Some(EffectiveCapabilities { images })
     }
 
     /// Mode `full`, before a turn starts, on both engines: when the router's decision names
@@ -2820,8 +2856,9 @@ impl ChatManager {
         if streaming {
             return false;
         }
-        // The routing reads what the user typed, not the blocks around it.
-        router.set_last_message(&crate::refs::turn::visible_text(message));
+        // The routing reads what the user typed, not the blocks around it, and whether an
+        // image goes with it.
+        router.set_turn_input(message);
         let super::agent_hooks::ProviderPlan::Move { pick, decision } =
             super::agent_hooks::plan_provider_move(&router).await
         else {

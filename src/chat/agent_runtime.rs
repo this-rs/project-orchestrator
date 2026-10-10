@@ -449,6 +449,13 @@ pub trait TurnServices: Send + Sync {
     ) -> std::result::Result<Vec<super::message_attachments::AttachedImage>, String> {
         Ok(Vec::new())
     }
+    /// The model the turn about to be sent must run on because it carries images the
+    /// model in force cannot read (F-R4): PO routes the turn to a candidate that reads
+    /// them, BEFORE it is sent (the provider checks the active model's vision when the
+    /// turn is sent). `None`: nothing to change. Default: never.
+    async fn model_for_images(&self, _session_id: &str) -> Option<String> {
+        None
+    }
     /// Hands an event of the session to the other instances (NATS), as the Claude
     /// Code engine publishes each of its events. Default: nowhere.
     fn publish(&self, _session_id: &str, _event: &ChatEvent) {}
@@ -904,6 +911,18 @@ impl AgentSessionHandle {
             },
             _ => Vec::new(),
         };
+        // F-R4: images the model in force cannot read go to a model PO routes to that
+        // reads them, made active before the turn is sent. A change that fails leaves the
+        // provider to say it refuses the images.
+        if !images.is_empty() {
+            if let Some(services) = &self.services {
+                if let Some(model) = services.model_for_images(&self.session_id).await {
+                    if let Err(error) = self.set_model(&model).await {
+                        tracing::warn!(session_id = %self.session_id, %model, %error, "the model that reads the images could not be made active");
+                    }
+                }
+            }
+        }
         let input = turn_input(sent, &images);
         let stream = match self.session.send_turn(input.clone()).await {
             Ok(stream) => stream,
@@ -2874,6 +2893,96 @@ mod after_turn_tests {
             }
         }
         assert_eq!(cancelled, ["t-left"], "only the tool left without a result");
+    }
+
+    /// F-R4: a turn with an image goes out with an image, and the model PO routes it to is
+    /// made active BEFORE it is sent (the provider checks the active model's vision when
+    /// the turn is sent, before any hook of the turn runs).
+    struct ImageHost {
+        state: Arc<super::fake::FakeState>,
+        turns_seen_when_asked: StdMutex<Option<usize>>,
+        route_to: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl TurnServices for ImageHost {
+        async fn prepare(
+            &self,
+            _session_id: &str,
+            _shown: &str,
+            sent: &str,
+            _turn: &crate::refs::turn::TurnExpansion,
+        ) -> String {
+            sent.to_string()
+        }
+        async fn continuation(&self, _session_id: &str) -> String {
+            String::new()
+        }
+        async fn images(
+            &self,
+            _shown: &str,
+        ) -> std::result::Result<Vec<super::super::message_attachments::AttachedImage>, String>
+        {
+            Ok(vec![super::super::message_attachments::AttachedImage {
+                media_type: "image/png".into(),
+                data_base64: "AAAA".into(),
+                source: super::super::message_attachments::MessageAttachment {
+                    id: uuid::Uuid::new_v4(),
+                    filename: "x.png".into(),
+                    mime_type: "image/png".into(),
+                    size_bytes: 4,
+                },
+            }])
+        }
+        async fn model_for_images(&self, _session_id: &str) -> Option<String> {
+            *self.turns_seen_when_asked.lock().unwrap() =
+                Some(self.state.turns_started.lock().unwrap().len());
+            self.route_to.map(str::to_string)
+        }
+    }
+
+    async fn image_turn(route_to: Option<&'static str>) -> (FakeProvider, Arc<ImageHost>) {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let host = Arc::new(ImageHost {
+            state: Arc::clone(&provider.state),
+            turns_seen_when_asked: StdMutex::new(None),
+            route_to,
+        });
+        let handle = runtime
+            .adopt(
+                "not-a-uuid",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                Some(host.clone() as Arc<dyn TurnServices>),
+            )
+            .await;
+        handle
+            .send_message("what is on this picture?")
+            .await
+            .unwrap();
+        until("the turn started", || {
+            !provider.state.turns_started.lock().unwrap().is_empty()
+        })
+        .await;
+        (provider, host)
+    }
+
+    #[tokio::test]
+    async fn an_image_turn_runs_on_the_model_po_routes_it_to_made_active_before_it_is_sent() {
+        let (provider, host) = image_turn(Some("vision")).await;
+        assert_eq!(*host.turns_seen_when_asked.lock().unwrap(), Some(0));
+        assert_eq!(*provider.state.models.lock().unwrap(), ["vision"]);
+    }
+
+    #[tokio::test]
+    async fn an_image_turn_with_nothing_to_route_keeps_its_model() {
+        let (provider, _host) = image_turn(None).await;
+        assert!(provider.state.models.lock().unwrap().is_empty());
     }
 }
 
