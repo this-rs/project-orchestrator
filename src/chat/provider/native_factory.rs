@@ -148,6 +148,13 @@ fn build_native(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
 ) -> Result<Arc<NativeProvider>, ProviderError> {
+    native_provider(record, vault).map(Arc::new)
+}
+
+fn native_provider(
+    record: &InstanceRecord,
+    vault: Option<Arc<VaultService>>,
+) -> Result<NativeProvider, ProviderError> {
     // A stored record is checked again here: an `env:` reference must name a
     // variable declared for provider credentials, whenever it was stored.
     super::settings::parse_credential_ref(
@@ -181,7 +188,28 @@ fn build_native(
     if record.cost_source == "free" {
         config.cost_basis = CostBasis::Free;
     }
-    Ok(Arc::new(NativeProvider::new(config, model_endpoint)))
+    Ok(NativeProvider::new(config, model_endpoint))
+}
+
+/// The native harness of a record that runs SESSIONS: its transcripts are kept in
+/// `<transcripts>/<instance id>/` (owner-only files) so a session resumes after a
+/// restart (P14). Without a root they stay in memory (nexus' default): the probes,
+/// listings and tests build that way.
+fn build_native_for_sessions(
+    record: &InstanceRecord,
+    vault: Option<Arc<VaultService>>,
+    transcripts: Option<&std::path::Path>,
+) -> Result<Arc<NativeProvider>, ProviderError> {
+    let Some(root) = transcripts else {
+        return build_native(record, vault);
+    };
+    let store = super::transcripts::store_for(root, &record.id).map_err(|e| {
+        // The path may name a user; keep only the kind of failure.
+        ProviderError::protocol(format!("transcript store unavailable: {:?}", e.kind()))
+    })?;
+    Ok(Arc::new(
+        native_provider(record, vault)?.with_transcript_store(store),
+    ))
 }
 
 /// The provider of a stored instance, by kind: the native harness over an
@@ -190,7 +218,7 @@ pub fn build_native_provider(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
 ) -> Result<Arc<dyn AgentProvider>, ProviderError> {
-    build_provider_with_handle(record, vault).map(|(provider, _)| provider)
+    build_provider_with_handle(record, vault, None).map(|(provider, _)| provider)
 }
 
 /// A provider and, for a native record, its concrete harness.
@@ -198,9 +226,12 @@ pub type BuiltProvider = (Arc<dyn AgentProvider>, Option<Arc<NativeProvider>>);
 
 /// Same, also returning the concrete native harness when the record is one: only
 /// it can run a capability probe (the trait has no such method).
+/// `transcripts`: where the native sessions keep their conversations
+/// ([`build_native_for_sessions`]).
 pub fn build_provider_with_handle(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
+    transcripts: Option<&std::path::Path>,
 ) -> Result<BuiltProvider, ProviderError> {
     match record.kind.as_str() {
         "codex" => build_codex(record, vault).map(|p| (p, None)),
@@ -209,7 +240,7 @@ pub fn build_provider_with_handle(
             build_remote_claude(record, vault).map(|p| (p, None))
         }
         _ => {
-            let native = build_native(record, vault)?;
+            let native = build_native_for_sessions(record, vault, transcripts)?;
             Ok((Arc::clone(&native) as Arc<dyn AgentProvider>, Some(native)))
         }
     }

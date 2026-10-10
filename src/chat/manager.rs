@@ -640,6 +640,9 @@ pub struct ChatManager {
     /// Where the documents attached to a message live: the agent engine reads the
     /// attached images from it to send them inline (`documents.storage_dir`).
     pub(crate) document_store: crate::documents::store::DocumentStore,
+    /// Root of the native sessions' transcripts (`<root>/<instance id>/<id>.json`, P14);
+    /// `None`: kept in memory, lost with the process (nexus' default, the tests' too).
+    pub(crate) native_transcripts: Option<std::path::PathBuf>,
     /// How far the anchor resolver drives the context (`PO_ANCHOR_CONTEXT`, default `shadow`).
     pub(crate) anchor_mode: super::anchor_resolver::AnchorContextMode,
     /// What the turns of every session share in anchor mode (resolutions, shadow runs).
@@ -1578,6 +1581,7 @@ impl ChatManager {
             document_store: crate::documents::store::DocumentStore::new(
                 crate::documents::store::default_storage_dir(),
             ),
+            native_transcripts: None,
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
         }
@@ -1658,6 +1662,7 @@ impl ChatManager {
             document_store: crate::documents::store::DocumentStore::new(
                 crate::documents::store::default_storage_dir(),
             ),
+            native_transcripts: None,
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
         }
@@ -1682,6 +1687,13 @@ impl ChatManager {
     /// Where the attached documents live (`DocumentStore::from_config`).
     pub fn with_document_store(mut self, store: crate::documents::store::DocumentStore) -> Self {
         self.document_store = store;
+        self
+    }
+
+    /// Keep the native sessions' transcripts under `root` so they resume after a
+    /// restart (`provider::transcripts`). Applies to the providers built afterwards.
+    pub fn with_native_transcripts(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.native_transcripts = Some(root.into());
         self
     }
 
@@ -10517,9 +10529,12 @@ impl ChatManager {
                 }
             }
         }
-        let (provider, concrete) =
-            native_factory::build_provider_with_handle(&record, self.vault.clone())
-                .map_err(anyhow::Error::new)?;
+        let (provider, concrete) = native_factory::build_provider_with_handle(
+            &record,
+            self.vault.clone(),
+            self.native_transcripts.as_deref(),
+        )
+        .map_err(anyhow::Error::new)?;
         {
             let mut probers = self.native_probers.write().await;
             match concrete {
@@ -11423,6 +11438,29 @@ impl ChatManager {
         // makes it again.
         super::neutral_place::remove_for(session_id);
         closed
+    }
+
+    /// Delete a session: close it if it is live, remove what it keeps on disk (the
+    /// transcript of a native session, P14), then the node. `Ok(false)`: no such
+    /// session. A CLOSED session keeps its transcript (it stays resumable): only a
+    /// deletion removes it, and before the node, which is what names it. A transcript
+    /// that cannot be removed fails the deletion (the conversation would stay on disk
+    /// with nothing left to find it); a retry removes both.
+    pub async fn delete_session(&self, session_id: Uuid) -> Result<bool> {
+        let _ = self.close_session(&session_id.to_string()).await;
+        if let Some(node) = self.graph.get_chat_session(session_id).await? {
+            if let (Some(root), Some(provider), Some(token)) = (
+                self.native_transcripts.as_deref(),
+                node.provider_id.as_deref(),
+                node.resume_token.as_deref(),
+            ) {
+                super::provider::transcripts::remove_for_token(root, provider, token).map_err(
+                    // The path may name a user; keep only the kind of failure.
+                    |e| anyhow!("removing the session's transcript failed: {:?}", e.kind()),
+                )?;
+            }
+        }
+        self.graph.delete_chat_session(session_id).await
     }
 
     async fn close_session_inner(&self, session_id: &str) -> Result<()> {
