@@ -642,6 +642,60 @@ pub fn test_persona(name: &str, model_preference: Option<&str>) -> PersonaNode {
     }
 }
 
+/// The real router (no-auth mode) on a loopback port, its chat served by
+/// `manager` over `graph`: what a WebSocket client of `/ws/chat/{id}` talks to
+/// in the tests.
+pub async fn serve_chat(
+    manager: Arc<crate::chat::manager::ChatManager>,
+    graph: Arc<MockGraphStore>,
+) -> std::net::SocketAddr {
+    use crate::api::handlers::ServerState;
+    use crate::orchestrator::watcher::FileWatcher;
+    use crate::orchestrator::Orchestrator;
+
+    let app_state = mock_app_state_with_graph(graph);
+    let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+    let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+        orchestrator.clone(),
+    )));
+    let state = Arc::new(ServerState {
+        orchestrator,
+        watcher,
+        chat_manager: Some(manager),
+        event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+            crate::events::EventBus::default(),
+        ))),
+        nats_emitter: None,
+        auth_config: None,
+        serve_frontend: false,
+        frontend_path: "./dist".to_string(),
+        setup_completed: true,
+        server_port: 0,
+        public_url: None,
+        remote_mcp: crate::RemoteMcpConfig::default(),
+        ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        registry_remote_url: None,
+        oidc_client: None,
+        neural_router: mock_neural_router(),
+        trajectory_collector: std::sync::RwLock::new(None),
+        trajectory_store_neo4j: None,
+        trajectory_store: None,
+        identity: None,
+        reactor_counters: std::sync::OnceLock::new(),
+        confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+        mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+        model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+        vault: crate::vault::VaultService::ephemeral(),
+    });
+    let app = crate::api::routes::create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    addr
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,58 +766,4 @@ mod tests {
         let result = nm.create_note(req, "test-agent").await;
         assert!(result.is_ok());
     }
-}
-
-/// The real router (no-auth mode) on a loopback port, its chat served by
-/// `manager` over `graph`: what a WebSocket client of `/ws/chat/{id}` talks to
-/// in the tests.
-pub async fn serve_chat(
-    manager: Arc<crate::chat::manager::ChatManager>,
-    graph: Arc<MockGraphStore>,
-) -> std::net::SocketAddr {
-    use crate::api::handlers::ServerState;
-    use crate::orchestrator::watcher::FileWatcher;
-    use crate::orchestrator::Orchestrator;
-
-    let app_state = mock_app_state_with_graph(graph);
-    let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
-    let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
-        orchestrator.clone(),
-    )));
-    let state = Arc::new(ServerState {
-        orchestrator,
-        watcher,
-        chat_manager: Some(manager),
-        event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
-            crate::events::EventBus::default(),
-        ))),
-        nats_emitter: None,
-        auth_config: None,
-        serve_frontend: false,
-        frontend_path: "./dist".to_string(),
-        setup_completed: true,
-        server_port: 0,
-        public_url: None,
-        remote_mcp: crate::RemoteMcpConfig::default(),
-        ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
-        registry_remote_url: None,
-        oidc_client: None,
-        neural_router: mock_neural_router(),
-        trajectory_collector: std::sync::RwLock::new(None),
-        trajectory_store_neo4j: None,
-        trajectory_store: None,
-        identity: None,
-        reactor_counters: std::sync::OnceLock::new(),
-        confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
-        mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
-        model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
-        vault: crate::vault::VaultService::ephemeral(),
-    });
-    let app = crate::api::routes::create_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    addr
 }
