@@ -3529,6 +3529,16 @@ impl ChatManager {
                 }
             }
         }
+        // The agent engine's sessions are live too (their permissions and background
+        // tasks are not tracked here: P11 / P4).
+        for handle in self.agent_runtime.handles().await {
+            if let Ok(id) = handle.session_id.parse::<Uuid>() {
+                snap.live.insert(id);
+                if handle.is_streaming.load(Ordering::SeqCst) {
+                    snap.streaming.insert(id);
+                }
+            }
+        }
         for (id, pending) in inputs {
             let ids: std::collections::HashSet<String> =
                 pending.lock().await.keys().cloned().collect();
@@ -4345,10 +4355,9 @@ impl ChatManager {
         relay: Option<&super::relay::RelayedFrom>,
         session_id: Uuid,
     ) -> Result<CreateSessionResponse> {
-        // Check max sessions
+        // Check max sessions: both engines' live sessions count.
         {
-            let sessions = self.active_sessions.read().await;
-            if sessions.len() >= self.config.max_sessions {
+            if self.active_session_count().await >= self.config.max_sessions {
                 return Err(anyhow!(
                     "Maximum number of active sessions reached ({})",
                     self.config.max_sessions
@@ -11698,6 +11707,8 @@ impl ChatManager {
                 extra_degraded,
             )
             .await;
+        // A failed turn is retried as the chat's configuration says, on both engines.
+        handle.configure_retry(self.config.retry.clone());
         self.spawn_agent_nats_listeners(handle);
     }
 
@@ -12133,6 +12144,22 @@ impl ChatManager {
                         );
                     }
                 }
+                // The agent engine's sessions, by the same rule. It tracks no
+                // background task of its own (P4): a running turn keeps it.
+                for handle in manager.agent_runtime.handles().await {
+                    let idle = handle.idle_for();
+                    let is_streaming = handle.is_streaming.load(Ordering::SeqCst);
+                    if session_is_expired(idle, timeout, is_streaming, 0) {
+                        expired.push(handle.session_id.clone());
+                    } else if idle > timeout {
+                        debug!(
+                            session_id = %handle.session_id,
+                            idle_secs = idle.as_secs(),
+                            is_streaming,
+                            "Idle agent session kept alive: a turn is running"
+                        );
+                    }
+                }
 
                 for id in expired {
                     info!("Cleaning up timed-out session {}", id);
@@ -12144,9 +12171,10 @@ impl ChatManager {
         });
     }
 
-    /// Get the number of currently active sessions
+    /// Get the number of currently active sessions, on both engines.
     pub async fn active_session_count(&self) -> usize {
-        self.active_sessions.read().await.len()
+        let legacy = self.active_sessions.read().await.len();
+        legacy + self.agent_runtime.len().await
     }
 }
 

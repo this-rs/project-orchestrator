@@ -7126,3 +7126,119 @@ mod native_session_record {
         after.close_session(&sid).await.unwrap();
     }
 }
+
+/// P8 — the lifecycle of the agent engine's sessions follows the chat's
+/// configuration as the legacy engine's do: the idle cleanup closes them, they
+/// count in `max_sessions` / `active_session_count`, and their retries follow
+/// `RetryConfig`. Before, they were invisible to all three.
+mod agent_lifecycle {
+    use super::*;
+
+    fn configured(
+        graph: Arc<MockGraphStore>,
+        edit: impl FnOnce(&mut super::super::config::ChatConfig),
+    ) -> Arc<ChatManager> {
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph;
+        let mut config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: None,
+            nexus_browser_path: None,
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        edit(&mut config);
+        Arc::new(ChatManager::new_without_memory(
+            dyn_graph,
+            state.meili,
+            config,
+        ))
+    }
+
+    async fn native_world() -> (FakeOpenAi, Arc<MockGraphStore>) {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        (fake, graph)
+    }
+
+    async fn idle(manager: &ChatManager, sid: &str) {
+        for _ in 0..400 {
+            if !manager.is_session_streaming(sid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the opening turn never ended");
+    }
+
+    #[tokio::test]
+    async fn an_idle_native_session_is_closed_by_the_cleanup() {
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |c| c.session_timeout = Duration::from_millis(300));
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        idle(&manager, &sid).await;
+        manager.start_cleanup_task();
+        for _ in 0..200 {
+            if !manager.agent_runtime.owns(&sid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("an idle native session outlived the session timeout");
+    }
+
+    #[tokio::test]
+    async fn native_sessions_count_toward_max_sessions_and_get_the_chat_retry_config() {
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |c| {
+            c.max_sessions = 1;
+            c.retry = super::super::config::RetryConfig {
+                max_attempts: 7,
+                initial_delay_ms: 5,
+                backoff_multiplier: 1.5,
+            };
+        });
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        assert_eq!(manager.active_session_count().await, 1);
+        let live = manager.live_session_snapshot().await;
+        assert!(
+            live.live.contains(&Uuid::parse_str(&sid).unwrap()),
+            "the cockpit sees the native session live"
+        );
+        let second = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await;
+        let err = second.expect_err("the limit refuses a second session");
+        assert!(
+            err.to_string()
+                .contains("Maximum number of active sessions"),
+            "{err:#}"
+        );
+        let retry = manager
+            .agent_runtime
+            .get(&sid)
+            .await
+            .unwrap()
+            .retry_config();
+        assert_eq!(
+            (retry.max_attempts, retry.initial_delay_ms),
+            (7, 5),
+            "the chat's RetryConfig, not a constant"
+        );
+        manager.close_session(&sid).await.unwrap();
+        assert_eq!(manager.active_session_count().await, 0);
+    }
+}

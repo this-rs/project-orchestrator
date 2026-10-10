@@ -25,6 +25,7 @@ use nexus_claude::agent::{
 use tokio::sync::{broadcast, Mutex, RwLock};
 use uuid::Uuid;
 
+use super::config::RetryConfig;
 use super::manager::{CancelToolsResult, ChatManager, CANCEL_TOOLS_CAP, CANCEL_TOOLS_WINDOW_SECS};
 use super::provider::event_map::{out_of_band_to_chat_events, EventMapper};
 use super::types::{ChatEvent, PendingMessage, PendingMessageKind};
@@ -65,9 +66,6 @@ pub(crate) fn mask_agent_event_with(
     }
 }
 
-/// Retries of a turn that failed before showing anything (`done.error` retryable).
-const MAX_RETRIES: u32 = 3;
-
 /// The failure that ends a turn and is worth trying again: a retryable
 /// `done.error` of an error turn, or a retryable terminal `error`.
 fn retryable_failure(event: &AgentEvent) -> Option<ProviderError> {
@@ -100,16 +98,17 @@ fn shows_content(event: &AgentEvent) -> bool {
     )
 }
 
-/// Delay before attempt `n`: what the provider asked (`retry_after`), else an
-/// exponential backoff from one second, never beyond thirty.
-fn retry_delay_ms(error: &ProviderError, attempt: u32) -> u64 {
+/// Delay before attempt `n`: what the provider asked (`retry_after`, never beyond
+/// thirty seconds), else the backoff of the chat's `RetryConfig` — the one the Claude
+/// Code engine applies (`stream_response`).
+fn retry_delay_ms(error: &ProviderError, attempt: u32, retry: &RetryConfig) -> u64 {
     if let ProviderError::RateLimited {
         retry_after_ms: Some(ms),
     } = error
     {
         return (*ms).min(30_000);
     }
-    (1000u64 << attempt.saturating_sub(1).min(5)).min(30_000)
+    retry.delay_for_attempt(attempt)
 }
 
 /// The input of a turn: its text, then the images the user attached, in order
@@ -392,11 +391,18 @@ pub struct AgentSessionHandle {
     /// The next user message was already counted when the session was created
     /// (the opening message: `message_count` starts at 1).
     opening_counted: AtomicBool,
+    /// How a turn that failed before showing anything is retried: the chat's
+    /// `RetryConfig` (`configure_retry`), as on the Claude Code engine.
+    retry: std::sync::RwLock<RetryConfig>,
+    /// When the session last did something (an event, a message): what the idle
+    /// cleanup reads (`ChatManager::start_cleanup_task`).
+    last_activity: std::sync::Mutex<Instant>,
 }
 
 impl AgentSessionHandle {
     /// Persists (except transient events) and broadcasts one event.
     pub async fn emit(&self, mut event: ChatEvent) {
+        self.touch();
         // What only the session owner knows rides on `system_init`.
         if let ChatEvent::SystemInit {
             provider,
@@ -475,6 +481,28 @@ impl AgentSessionHandle {
                 "Failed to persist the resume token (retried at the next turn)"
             ),
         }
+    }
+
+    /// Retries this session's failed turns as `retry` says (the chat's configuration).
+    pub fn configure_retry(&self, retry: RetryConfig) {
+        *self.retry.write().unwrap_or_else(|e| e.into_inner()) = retry;
+    }
+
+    pub(crate) fn retry_config(&self) -> RetryConfig {
+        self.retry.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The session did something now.
+    pub fn touch(&self) {
+        *self.last_activity.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    /// How long the session has done nothing.
+    pub fn idle_for(&self) -> Duration {
+        self.last_activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .elapsed()
     }
 
     /// The opening message of the session was counted when the session was created:
@@ -801,6 +829,8 @@ impl AgentSessionHandle {
         let mut hit_turn_limit = false;
         // What the turn cost, read on its `done` (`None`: no price, or no `done`).
         let mut turn_cost: Option<f64> = None;
+        let retry_config = self.retry_config();
+        let max_attempts = retry_config.max_attempts;
         loop {
             // Did the turn already show the user anything? A turn that did is
             // never replayed: it would repeat text or tool calls.
@@ -817,7 +847,7 @@ impl AgentSessionHandle {
                     self.sync_resume_token().await;
                 }
                 if !shown {
-                    retry = retryable_failure(&event).filter(|_| attempt < MAX_RETRIES);
+                    retry = retryable_failure(&event).filter(|_| attempt < max_attempts);
                     if retry.is_some() {
                         break;
                     }
@@ -844,10 +874,10 @@ impl AgentSessionHandle {
             }
             let Some(error) = retry else { break };
             attempt += 1;
-            let delay = retry_delay_ms(&error, attempt);
+            let delay = retry_delay_ms(&error, attempt, &retry_config);
             self.emit(ChatEvent::Retrying {
                 attempt,
-                max_attempts: MAX_RETRIES,
+                max_attempts,
                 delay_ms: delay,
                 error_message: format!(
                     "Error: {}",
@@ -1073,6 +1103,11 @@ impl AgentRuntime {
         self.sessions.read().await.is_empty()
     }
 
+    /// Every live session.
+    pub async fn handles(&self) -> Vec<Arc<AgentSessionHandle>> {
+        self.sessions.read().await.values().cloned().collect()
+    }
+
     /// Registers a session just opened by a provider and starts its
     /// out-of-turn pump. `first_seq` is the next event number to persist.
     #[allow(clippy::too_many_arguments)]
@@ -1153,6 +1188,8 @@ impl AgentRuntime {
             cost_figure: super::session_record::CostFigure::of_kind(provider_kind),
             record: Mutex::new(()),
             opening_counted: AtomicBool::new(false),
+            retry: std::sync::RwLock::new(RetryConfig::default()),
+            last_activity: std::sync::Mutex::new(Instant::now()),
         });
         if let Some(oob) = session.out_of_band() {
             let pump = Arc::clone(&handle);
@@ -1563,28 +1600,28 @@ mod mask_tests {
     }
 
     #[test]
-    fn the_retry_delay_follows_the_provider_then_backs_off() {
+    fn the_retry_delay_follows_the_provider_then_the_chat_retry_config() {
+        let config = RetryConfig::default();
+        let limited = |ms| ProviderError::RateLimited {
+            retry_after_ms: Some(ms),
+        };
+        assert_eq!(retry_delay_ms(&limited(40), 1, &config), 40);
+        assert_eq!(retry_delay_ms(&limited(900_000), 1, &config), 30_000);
+        // The backoff of the Claude Code engine: initial × multiplier^(n-1).
+        assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 1, &config), 1000);
+        assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 3, &config), 4000);
+        let operator = RetryConfig {
+            max_attempts: 5,
+            initial_delay_ms: 10,
+            backoff_multiplier: 3.0,
+        };
+        assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 1, &operator), 10);
+        assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 3, &operator), 90);
         assert_eq!(
-            retry_delay_ms(
-                &ProviderError::RateLimited {
-                    retry_after_ms: Some(40)
-                },
-                1
-            ),
-            40
+            retry_delay_ms(&ProviderError::Overloaded, 3, &operator),
+            operator.delay_for_attempt(3),
+            "the same figure as stream_response"
         );
-        assert_eq!(
-            retry_delay_ms(
-                &ProviderError::RateLimited {
-                    retry_after_ms: Some(900_000)
-                },
-                1
-            ),
-            30_000
-        );
-        assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 1), 1000);
-        assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 3), 4000);
-        assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 20), 30_000);
     }
 
     #[test]
@@ -2239,5 +2276,88 @@ mod session_record_tests {
             "1 at creation + one user message: {n:?}"
         );
         assert_eq!(n.total_cost_usd, Some(0.0), "a free turn is a real 0");
+    }
+}
+
+/// A turn of the agent engine that fails before showing anything is retried as the
+/// chat's `RetryConfig` says — the figures the Claude Code engine uses — not by a
+/// constant of its own.
+#[cfg(test)]
+mod retry_config_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+
+    fn overloaded() -> AgentEvent {
+        AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Error,
+            subtype: None,
+            is_error: true,
+            result_text: None,
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 0,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: Some(ProviderError::Overloaded),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_retries_follow_the_chat_retry_config() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = runtime
+            .adopt(
+                "not-a-uuid",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        handle.configure_retry(RetryConfig {
+            max_attempts: 1,
+            initial_delay_ms: 7,
+            backoff_multiplier: 2.0,
+        });
+        let mut rx = handle.events_tx.subscribe();
+        handle.send_message("hello").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut attempts_seen = 0;
+        loop {
+            let turns = provider.state.turns_started.lock().unwrap().len();
+            if turns > attempts_seen {
+                attempts_seen = turns;
+                provider.state.push(overloaded());
+            }
+            if !handle.is_streaming.load(Ordering::SeqCst) && attempts_seen > 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the turn never ended");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            attempts_seen, 2,
+            "the turn, then ONE retry (max_attempts = 1)"
+        );
+        let mut retrying = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ChatEvent::Retrying {
+                attempt,
+                max_attempts,
+                delay_ms,
+                ..
+            } = event
+            {
+                retrying.push((attempt, max_attempts, delay_ms));
+            }
+        }
+        assert_eq!(retrying, [(1, 1, 7)]);
     }
 }
