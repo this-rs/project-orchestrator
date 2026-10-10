@@ -241,7 +241,7 @@ impl CancelRelayError {
             Self::SessionGone {
                 kind: CancelKind::Tools,
             } => {
-                "The session left the instance that was asked and no other instance answered in time: the tools may not have been stopped."
+                "The session left the instance that was asked and no other instance answered in time: the tools may or may not have been stopped."
             }
             Self::OwnerProtocol(_) => "The instance holding this session sent an unreadable answer.",
             Self::OwnerFailed(_) => "The instance holding this session failed to cancel.",
@@ -609,6 +609,17 @@ mod tests {
                 relay_error.failure().retryable
             ),
             (410, false)
+        );
+        // Both are possible (the instance that lost the session may have stopped
+        // them before it did): the message says so, as `reference.md` does
+        // (review of #685, finding 4).
+        assert!(
+            relay_error
+                .failure()
+                .message
+                .ends_with("the tools may or may not have been stopped."),
+            "{}",
+            relay_error.failure().message
         );
     }
 

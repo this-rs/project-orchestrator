@@ -1406,10 +1406,6 @@ pub(crate) async fn neural_reinforcement(
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 /// A frame a task spawned by the connection sends to its client: the event with
 /// `seq` 0, like every live event of the loop (`send_chat_event!`), so a client
 /// that orders or dedups by `seq` reads it the same way.
@@ -1420,6 +1416,10 @@ fn control_frame(event: &crate::chat::types::ChatEvent) -> Option<String> {
         .insert("seq".to_string(), serde_json::json!(0));
     Some(value.to_string())
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {

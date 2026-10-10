@@ -5969,12 +5969,18 @@ impl ChatManager {
                                      so next message triggers resume_session",
                                     session_id, err_str
                                 );
-                                Self::forget_active_session(&active_sessions, &session_id).await;
-                                notify_attention(
-                                    &event_emitter,
-                                    AttentionSubject::Session(session_id.to_string()),
-                                    AttentionReason::SessionInactive,
-                                );
+                                // Only the entry of THIS client: a resume that
+                                // replaced it meanwhile keeps its session and its
+                                // NATS listeners (review of #685, finding 2).
+                                if Self::forget_if_client(&active_sessions, &session_id, &client)
+                                    .await
+                                {
+                                    notify_attention(
+                                        &event_emitter,
+                                        AttentionSubject::Session(session_id.to_string()),
+                                        AttentionReason::SessionInactive,
+                                    );
+                                }
                             }
 
                             emit_chat(
@@ -6587,13 +6593,21 @@ impl ChatManager {
                                              active_sessions so the next message resumes it",
                                             session_id
                                         );
-                                        Self::forget_active_session(&active_sessions, &session_id)
-                                            .await;
-                                        notify_attention(
-                                            &event_emitter,
-                                            AttentionSubject::Session(session_id.to_string()),
-                                            AttentionReason::SessionInactive,
-                                        );
+                                        // Only the entry of THIS client (review of
+                                        // #685, finding 2).
+                                        if Self::forget_if_client(
+                                            &active_sessions,
+                                            &session_id,
+                                            &client,
+                                        )
+                                        .await
+                                        {
+                                            notify_attention(
+                                                &event_emitter,
+                                                AttentionSubject::Session(session_id.to_string()),
+                                                AttentionReason::SessionInactive,
+                                            );
+                                        }
                                     }
                                     emit_chat(
                                         ChatEvent::Error {
@@ -7601,24 +7615,6 @@ impl ChatManager {
         client.is_alive().await
     }
 
-    /// Removes a legacy session from `active_sessions` AND ends its per-session
-    /// NATS listeners (`nats_cancel`). A removal that leaves them running keeps an
-    /// instance answering for a session it no longer holds — after a resume on
-    /// another instance, its `gone` could reach a canceller before the real
-    /// owner's answer (review N1 of #663). Every removal goes through here (or
-    /// cancels `nats_cancel` itself: `close_session`, a replaced session,
-    /// [`Self::forget_if_client`]).
-    pub(crate) async fn forget_active_session(
-        active_sessions: &RwLock<HashMap<String, ActiveSession>>,
-        session_id: &str,
-    ) -> Option<ActiveSession> {
-        let removed = active_sessions.write().await.remove(session_id);
-        if let Some(session) = &removed {
-            session.nats_cancel.cancel();
-        }
-        removed
-    }
-
     /// Removes a legacy session from `active_sessions` when its CLI process is
     /// gone (stdout at EOF). A session being streamed holds the client lock and
     /// is left alone: its own stream reports a death.
@@ -7645,8 +7641,17 @@ impl ChatManager {
         true
     }
 
-    /// [`Self::forget_active_session`], only while the entry is still the one of
-    /// `client` (`Arc::ptr_eq`, under the write lock). Whether it was removed.
+    /// Removes a legacy session from `active_sessions` AND ends its per-session
+    /// NATS listeners (`nats_cancel`), only while the entry is still the one of
+    /// `client` (`Arc::ptr_eq`, under the write lock): a resume that replaced it
+    /// keeps its session and its listeners (review of #673, finding 4; of #685,
+    /// finding 2). Whether it was removed.
+    ///
+    /// A removal that leaves the listeners running keeps an instance answering for
+    /// a session it no longer holds: after a resume on another instance, its `gone`
+    /// could reach a canceller before the real owner's answer (review N1 of #663).
+    /// Every removal of a dead CLI goes through here; the others cancel
+    /// `nats_cancel` themselves (`close_session`, a replaced session).
     async fn forget_if_client(
         active_sessions: &RwLock<HashMap<String, ActiveSession>>,
         session_id: &str,
@@ -10017,6 +10022,24 @@ impl ChatManager {
 
         let (history, cap, window, events_tx, tasks_arc) = session_state?;
 
+        // A task already being stopped (its grace period runs, pid kept) is not
+        // signalled again, nor counted in the cap: a retry after a `session_gone`
+        // or an `owner_timeout` from a real owner that did stop it, or a second
+        // click, would otherwise SIGINT the same pid twice (review of #685,
+        // finding 3). Checked again under the lock below (two concurrent cancels).
+        if Self::task_already_stopping(&tasks_arc, task_id).await {
+            debug!(
+                session_id = %session_id,
+                task_id = %task_id,
+                "cancel_task: already being stopped; idempotent no-op"
+            );
+            return Some(CancelTaskResult {
+                task_id: task_id.to_string(),
+                killed_pids: Vec::new(),
+                capped: false,
+            });
+        }
+
         // Rate cap.
         let capped = !Self::check_and_record_cancel_cap(&history, cap, window).await;
         if capped {
@@ -10042,6 +10065,14 @@ impl ChatManager {
         let (snapshot, task_pid) = {
             let mut tasks = tasks_arc.lock().await;
             let pid = if let Some(entry) = tasks.get_mut(task_id) {
+                if entry.pending_removal_at.is_some() {
+                    // A concurrent cancel marked it first and signals it.
+                    return Some(CancelTaskResult {
+                        task_id: task_id.to_string(),
+                        killed_pids: Vec::new(),
+                        capped: false,
+                    });
+                }
                 entry.pending_removal_at = Some(std::time::Instant::now());
                 let captured = entry.pid;
                 info!(
@@ -10101,6 +10132,18 @@ impl ChatManager {
             killed_pids,
             capped: false,
         })
+    }
+
+    /// Whether `task_id` is tracked and already being stopped (`pending_removal_at`).
+    async fn task_already_stopping(
+        tasks: &Mutex<HashMap<String, BackgroundTaskInfo>>,
+        task_id: &str,
+    ) -> bool {
+        tasks
+            .lock()
+            .await
+            .get(task_id)
+            .is_some_and(|t| t.pending_removal_at.is_some())
     }
 
     /// Snapshot the current background task tracking map for a session.
@@ -11864,6 +11907,47 @@ impl ChatManager {
         self.spawn_agent_nats_listeners(handle);
     }
 
+    /// The loop of an agent-engine cancel listener: hands each request to `on_request`
+    /// until the session closes. `biased`, the close first: once `closed` is
+    /// cancelled no request is read any more, even one already waiting, so a session
+    /// being closed (or adopted again) does not ask its provider session to cancel
+    /// (review of #685, finding 1; the legacy listeners do the same since #673).
+    async fn serve_agent_cancels<M>(
+        mut requests: impl futures::Stream<Item = M> + Unpin,
+        closed: CancellationToken,
+        mut on_request: impl FnMut(M),
+    ) {
+        loop {
+            tokio::select! {
+                biased;
+                _ = closed.cancelled() => break,
+                msg = requests.next() => {
+                    let Some(msg) = msg else { break };
+                    on_request(msg);
+                }
+            }
+        }
+    }
+
+    /// `work` (a cancel asked of an agent-engine session from another instance),
+    /// unless the session closed meanwhile: then `session_gone`, which a v2 asker
+    /// reads as provisional (the real owner, if any, still answers), instead of what a
+    /// provider session being closed would say (`failed`, `refused`: final answers
+    /// that would beat the real owner's). A request read just before the close lands
+    /// here (review of #685, finding 1).
+    async fn unless_agent_closed<T>(
+        closed: &CancellationToken,
+        kind: super::cancel_relay::CancelKind,
+        work: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        if closed.is_cancelled() {
+            return Err(anyhow::Error::new(
+                super::cancel_relay::CancelRelayError::SessionGone { kind },
+            ));
+        }
+        work.await
+    }
+
     /// What the other instances can ask of a session of the agent engine this
     /// instance runs, as for a Claude Code session (`spawn_nats_*_listener`):
     /// an interrupt, a cancel of the running tools, a streaming snapshot (a
@@ -11902,40 +11986,32 @@ impl ChatManager {
             // (`cancel_relay::OWNER_CANCEL_BOUND`).
             let (nats, handle, sid) = (nats.clone(), Arc::clone(&handle), sid.clone());
             tokio::spawn(async move {
-                let Ok(mut sub) = nats.subscribe_cancel_tools(&sid).await else {
+                let Ok(sub) = nats.subscribe_cancel_tools(&sid).await else {
                     warn!(session_id = %sid, "agent engine: NATS cancel_tools subscription failed");
                     return;
                 };
-                loop {
-                    tokio::select! {
-                        _ = handle.closed.cancelled() => break,
-                        msg = sub.next() => {
-                            let Some(msg) = msg else { break };
-                            let (nats, handle) = (nats.clone(), Arc::clone(&handle));
-                            tokio::spawn(async move {
-                                let work = handle.cancel_tools();
-                                let asker_v2 = super::cancel_relay::asker_v2(&msg.payload);
-                                match msg.reply {
-                                    Some(reply_to) => {
-                                        super::cancel_relay::answer(
-                                            &nats,
-                                            reply_to,
-                                            asker_v2,
-                                            super::cancel_relay::CancelKind::Tools,
-                                            work,
-                                        )
-                                        .await
-                                    }
-                                    None => {
-                                        if let Err(e) = work.await {
-                                            warn!(session_id = %handle.session_id, error = %e, "agent engine: NATS cancel_tools failed");
-                                        }
-                                    }
+                let closed = handle.closed.clone();
+                Self::serve_agent_cancels(sub, closed, move |msg: async_nats::Message| {
+                    let (nats, handle) = (nats.clone(), Arc::clone(&handle));
+                    tokio::spawn(async move {
+                        let kind = super::cancel_relay::CancelKind::Tools;
+                        let work =
+                            Self::unless_agent_closed(&handle.closed, kind, handle.cancel_tools());
+                        let asker_v2 = super::cancel_relay::asker_v2(&msg.payload);
+                        match msg.reply {
+                            Some(reply_to) => {
+                                super::cancel_relay::answer(&nats, reply_to, asker_v2, kind, work)
+                                    .await
+                            }
+                            None => {
+                                if let Err(e) = work.await {
+                                    warn!(session_id = %handle.session_id, error = %e, "agent engine: NATS cancel_tools failed");
                                 }
-                            });
+                            }
                         }
-                    }
-                }
+                    });
+                })
+                .await;
             });
         }
         {
@@ -11944,31 +12020,32 @@ impl ChatManager {
             // One task per request, bounded.
             let (nats, handle, sid) = (nats.clone(), Arc::clone(&handle), sid.clone());
             tokio::spawn(async move {
-                let Ok(mut sub) = nats.subscribe_cancel_task(&sid).await else {
+                let Ok(sub) = nats.subscribe_cancel_task(&sid).await else {
                     warn!(session_id = %sid, "agent engine: NATS cancel_task subscription failed");
                     return;
                 };
-                loop {
-                    tokio::select! {
-                        _ = handle.closed.cancelled() => break,
-                        msg = sub.next() => {
-                            let Some(msg) = msg else { break };
-                            let Some(reply_to) = msg.reply else { continue };
-                            let task_id = super::cancel_relay::task_id_of(&msg.payload);
-                            let (nats, handle) = (nats.clone(), Arc::clone(&handle));
-                            tokio::spawn(async move {
-                                super::cancel_relay::answer(
-                                    &nats,
-                                    reply_to,
-                                    super::cancel_relay::asker_v2(&msg.payload),
-                                    super::cancel_relay::CancelKind::Task,
-                                    handle.cancel_task(&task_id),
-                                )
-                                .await;
-                            });
-                        }
-                    }
-                }
+                let closed = handle.closed.clone();
+                Self::serve_agent_cancels(sub, closed, move |msg: async_nats::Message| {
+                    let Some(reply_to) = msg.reply else { return };
+                    let task_id = super::cancel_relay::task_id_of(&msg.payload);
+                    let (nats, handle) = (nats.clone(), Arc::clone(&handle));
+                    tokio::spawn(async move {
+                        let kind = super::cancel_relay::CancelKind::Task;
+                        super::cancel_relay::answer(
+                            &nats,
+                            reply_to,
+                            super::cancel_relay::asker_v2(&msg.payload),
+                            kind,
+                            Self::unless_agent_closed(
+                                &handle.closed,
+                                kind,
+                                handle.cancel_task(&task_id),
+                            ),
+                        )
+                        .await;
+                    });
+                })
+                .await;
             });
         }
         {
@@ -21854,6 +21931,251 @@ mod tests {
         assert!(old_token.is_cancelled());
     }
 
+    /// Review of #685, finding 3: a task already being stopped (its grace period
+    /// runs, its pid kept) is not signalled again by a second cancel_task (a retry
+    /// after a `session_gone`, a second click), nor counted twice in the cap.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_task_already_being_stopped_is_not_signalled_again() {
+        let mut task = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let task_pid = task.id();
+        let (session, _) = create_dummy_session(false, "", vec![]);
+        let history = session.cancel_task_history.clone();
+        session.active_background_tasks.lock().await.insert(
+            "tool_Twice".into(),
+            BackgroundTaskInfo {
+                id: "tool_Twice".into(),
+                kind: BackgroundTaskKind::BashBackground,
+                description: "sleep".into(),
+                started_at: chrono::Utc::now(),
+                last_seen_at: chrono::Utc::now(),
+                pid: Some(task_pid),
+                parent_tool_use_id: Some("tool_Twice".into()),
+                pending_removal_at: None,
+            },
+        );
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-twice".into(), session);
+
+        let first = manager.cancel_task("s-twice", "tool_Twice").await.unwrap();
+        assert!(first.killed_pids.contains(&task_pid), "{first:?}");
+        assert!(!task.wait().unwrap().success(), "signalled once");
+
+        let again = manager.cancel_task("s-twice", "tool_Twice").await.unwrap();
+        assert!(!again.capped && again.killed_pids.is_empty(), "{again:?}");
+        assert_eq!(history.lock().await.len(), 1, "counted once");
+    }
+
+    /// A connected CLI whose turn ends before any `Result` (it died mid-turn).
+    struct DiesMidTurn;
+
+    #[async_trait::async_trait]
+    impl nexus_claude::transport::Transport for DiesMidTurn {
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        async fn connect(&mut self) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        async fn send_message(
+            &mut self,
+            _: nexus_claude::transport::InputMessage,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        fn receive_messages(
+            &mut self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = nexus_claude::Result<nexus_claude::Message>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+        async fn send_control_request(
+            &mut self,
+            _: nexus_claude::ControlRequest,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        async fn receive_control_response(
+            &mut self,
+        ) -> nexus_claude::Result<Option<nexus_claude::ControlResponse>> {
+            Ok(None)
+        }
+        async fn send_sdk_control_request(
+            &mut self,
+            _: serde_json::Value,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        async fn send_sdk_control_response(
+            &mut self,
+            _: serde_json::Value,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        async fn disconnect(&mut self) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Review of #685, finding 2: a turn that finds its CLI dead drops the session
+    /// only while the entry is still the one of that CLI. A resume that replaced
+    /// it during the turn keeps its session and its NATS listeners (before: the
+    /// new session was removed and its listeners cancelled). The turn waits for
+    /// its CLI (held by the test) while the entry is replaced.
+    async fn a_turn_on_a_dead_cli_leaves_the_session_that_replaced_it(dead: InteractiveClient) {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let sid = Uuid::new_v4().to_string();
+        let (mut old, _) = create_dummy_session(false, "", vec![]);
+        old.client = Arc::new(Mutex::new(dead));
+        let (old_client, old_streaming) = (old.client.clone(), old.is_streaming.clone());
+        let mut events = old.events_tx.subscribe();
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(sid.clone(), old);
+
+        let held = old_client.lock().await;
+        manager.send_message(&sid, "hi").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !old_streaming.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the turn started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (new, _) = create_dummy_session(false, "", vec![]);
+        let (new_client, new_token) = (new.client.clone(), new.nats_cancel.clone());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(sid.clone(), new);
+        drop(held);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Ok(ChatEvent::Error { .. }) => break,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => panic!("no error event"),
+                }
+            }
+        })
+        .await
+        .expect("the turn reports its dead CLI");
+        let sessions = manager.active_sessions.read().await;
+        let kept = sessions
+            .get(&sid)
+            .expect("the session that replaced it stays");
+        assert!(Arc::ptr_eq(&kept.client, &new_client));
+        assert!(!new_token.is_cancelled(), "its NATS listeners keep running");
+    }
+
+    /// The write fails (`Not connected`): the "CLI appears dead" path.
+    #[tokio::test]
+    async fn a_turn_whose_write_finds_the_cli_dead_leaves_the_session_that_replaced_it() {
+        a_turn_on_a_dead_cli_leaves_the_session_that_replaced_it(create_dummy_client()).await;
+    }
+
+    /// The stream ends before a `Result`: the "CLI left before answering" path.
+    #[tokio::test]
+    async fn a_turn_whose_cli_ends_before_a_result_leaves_the_session_that_replaced_it() {
+        let mut dead = InteractiveClient::from_transport(Box::new(DiesMidTurn));
+        dead.connect().await.unwrap();
+        a_turn_on_a_dead_cli_leaves_the_session_that_replaced_it(dead).await;
+    }
+
+    /// Review of #685, finding 1: an agent-engine cancel listener reads no request
+    /// once its session closed, even one already waiting (`biased`, the close
+    /// first). Without it `select!` picks a ready branch at random: over 64 runs a
+    /// request would be read.
+    #[tokio::test]
+    async fn an_agent_cancel_listener_reads_no_request_once_the_session_closed() {
+        let closed = CancellationToken::new();
+        closed.cancel();
+        for _ in 0..64 {
+            let mut read = 0;
+            ChatManager::serve_agent_cancels(
+                futures::stream::iter([1, 2, 3]),
+                closed.clone(),
+                |_| read += 1,
+            )
+            .await;
+            assert_eq!(read, 0);
+        }
+        // Open, it serves every request until the subscription ends.
+        let mut read = 0;
+        ChatManager::serve_agent_cancels(
+            futures::stream::iter([1, 2, 3]),
+            CancellationToken::new(),
+            |_| read += 1,
+        )
+        .await;
+        assert_eq!(read, 3);
+    }
+
+    /// Review of #685, finding 1: a cancel read just before the session closed is
+    /// answered `gone` (provisional: the real owner still answers), not with what
+    /// the closing provider session says (a result, a refusal or a failure, all
+    /// final: they would beat the real owner's answer).
+    #[tokio::test]
+    async fn a_cancel_on_a_closing_agent_session_answers_gone() {
+        use super::super::cancel_relay::{CancelKind, CancelReply};
+        let (manager, _graph, _fake) = agent_manager();
+        let sid = manager
+            .create_session(&agent_request("first"))
+            .await
+            .unwrap()
+            .session_id;
+        let handle = manager.agent_runtime.get(&sid).await.expect("a handle");
+        // Open, the provider answers.
+        let open = CancelReply::of(
+            ChatManager::unless_agent_closed(
+                &handle.closed,
+                CancelKind::Tools,
+                handle.cancel_tools(),
+            )
+            .await,
+        );
+        assert!(!open.is_gone());
+
+        handle.closed.cancel();
+        let tools = CancelReply::of(
+            ChatManager::unless_agent_closed(
+                &handle.closed,
+                CancelKind::Tools,
+                handle.cancel_tools(),
+            )
+            .await,
+        );
+        assert!(tools.is_gone());
+        let task = CancelReply::of(
+            ChatManager::unless_agent_closed(
+                &handle.closed,
+                CancelKind::Task,
+                handle.cancel_task("tool_T"),
+            )
+            .await,
+        );
+        assert!(task.is_gone());
+    }
+
     #[tokio::test]
     async fn test_cancel_task_rate_cap_enforced() {
         let (mut session, _) = create_dummy_session(false, "", vec![]);
@@ -22135,11 +22457,16 @@ mod tests {
                 kind: super::super::cancel_relay::CancelKind::Task
             })
         );
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "answered, not timed out"
+            elapsed >= super::super::cancel_relay::GONE_GRACE && elapsed < Duration::from_secs(3),
+            "answered after the grace, not timed out: {elapsed:?}"
         );
+        // Measured from the cancel_tools alone (review of #685, finding 5): it waits
+        // for a real owner up to the asker's deadline (3 s here), and no longer.
+        let started = std::time::Instant::now();
         let gone = far.cancel_running_tools("s-far").await.unwrap_err();
+        let elapsed = started.elapsed();
         let gone = gone.downcast_ref::<CancelRelayError>().cloned();
         assert_eq!(
             gone,
@@ -22149,8 +22476,8 @@ mod tests {
         );
         assert!(!gone.unwrap().failure().retryable);
         assert!(
-            started.elapsed() < Duration::from_secs(8),
-            "answered at the deadline, not after"
+            elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(5),
+            "answered at the deadline, not before nor long after: {elapsed:?}"
         );
         token.cancel();
     }
