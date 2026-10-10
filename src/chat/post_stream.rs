@@ -1385,6 +1385,7 @@ mod integration_tests {
                 nats_cancel: CancellationToken::new(),
                 interrupt_token: CancellationToken::new(),
                 turn_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                result_cursor: Default::default(),
                 stream_task: Arc::new(std::sync::Mutex::new(None)),
                 post_stream_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
                 pending_permission_inputs: Arc::new(Mutex::new(HashMap::new())),

@@ -7020,3 +7020,160 @@ mod legacy_interrupt_stale_result {
         queued_message_after(1500).await;
     }
 }
+
+/// The listener of out-of-turn output (`oob_listener`) reads the CLI's output on a
+/// subscription of its own, and decides "in a turn or not" from `is_streaming` when
+/// it gets to a message. Lagging behind the turn (a loaded machine), it used to get
+/// to the turn's last `tool_result` after the turn had ended, took it for background
+/// output and started a turn of its own with it ("[tool_result] …"): every later
+/// turn was then one `result` behind. Seen by the parity matrix on main (cancel_tools
+/// and nats.cancel_tools, "tour poursuivi=false").
+mod legacy_oob_lag {
+    use super::*;
+
+    fn emit(v: Value) -> Value {
+        json!({"op": "emit_json", "json": v})
+    }
+
+    fn text(t: &str, id: &str) -> Value {
+        emit(json!({"type": "assistant", "message": {
+            "id": id, "type": "message", "role": "assistant",
+            "model": "fake-claude", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": t}]}}))
+    }
+
+    fn result_ok(t: &str) -> Value {
+        emit(json!({"type": "result", "subtype": "success",
+            "duration_ms": 1, "duration_api_ms": 1, "is_error": false, "num_turns": 1,
+            "session_id": "fake-cli-session", "total_cost_usd": 0.0, "result": t}))
+    }
+
+    fn transcript() -> Vec<Value> {
+        vec![
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            emit(json!({"type": "system", "subtype": "init",
+                "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                "permissionMode": "default", "apiKeySource": "none"})),
+            text("ready", "msg_1"),
+            result_ok("ready"),
+            // A turn whose last tool_result is followed at once by its answer.
+            json!({"op": "await_stdin", "contains": "SECOND-MESSAGE", "timeout_ms": 30000}),
+            emit(json!({"type": "assistant", "message": {
+                "id": "msg_2", "type": "message", "role": "assistant",
+                "model": "fake-claude", "stop_reason": "tool_use",
+                "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                             "input": {"command": "ls"}}]}})),
+            emit(
+                json!({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "a.rs",
+                 "is_error": false}]}}),
+            ),
+            text("answered second", "msg_3"),
+            result_ok("answered second"),
+            json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_lagging_oob_listener_does_not_replay_the_turns_tool_result_as_a_new_turn() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("transcript.jsonl");
+        let lines: String = transcript().iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&script, lines).unwrap();
+        let wrapper = dir.path().join("claude");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nFAKE_CLAUDE_TRANSCRIPT='{}' FAKE_CLAUDE_STDIN_OUT='{}' \
+                 FAKE_CLAUDE_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                script.display(),
+                dir.path().join("stdin.jsonl").display(),
+                fake_bin("fake_claude").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Legacy,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: None,
+            nexus_browser_path: None,
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config);
+        manager
+            .update_claude_cli_path(Some(wrapper.display().to_string()))
+            .await;
+
+        let mut req = request(None, None, "default");
+        req.message = "FIRST-MESSAGE".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(!manager.agent_runtime.owns(&sid).await, "legacy engine");
+        let id = Uuid::parse_str(&sid).unwrap();
+        let stored = |needle: &'static str| {
+            let graph = graph.clone();
+            async move {
+                graph
+                    .get_chat_events(id, 0, 500)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.data.contains(needle))
+            }
+        };
+        let mut ready = false;
+        for _ in 0..400 {
+            if stored("\"ready\"").await && !manager.is_session_streaming(&sid).await {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(ready, "the first turn ended");
+
+        // From now on the OOB listener of this session lags behind the turn.
+        *crate::chat::oob_listener::TEST_LAG.lock().unwrap() =
+            Some((sid.clone(), Duration::from_millis(150)));
+        manager.send_message(&sid, "SECOND-MESSAGE").await.unwrap();
+        let mut answered = false;
+        for _ in 0..400 {
+            if stored("answered second").await {
+                answered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Long enough for a lagging listener to get to every message of the turn.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        *crate::chat::oob_listener::TEST_LAG.lock().unwrap() = None;
+
+        let stdin = std::fs::read_to_string(dir.path().join("stdin.jsonl")).unwrap_or_default();
+        let events: Vec<(String, String)> = graph
+            .get_chat_events(id, 0, 500)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| (e.event_type.clone(), e.data.chars().take(80).collect()))
+            .collect();
+        assert!(answered, "the turn answered: {events:?}");
+        assert!(
+            !stdin.contains("[tool_result]"),
+            "the turn's own tool_result started a turn of its own: {stdin}"
+        );
+        assert!(
+            !events.iter().any(|(t, _)| t == "background_output"),
+            "the turn's own output was taken for background output: {events:?}"
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
+}
