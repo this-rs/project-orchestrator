@@ -7222,8 +7222,8 @@ mod permission_scopes {
 
     // ---------------------------------------------------------------- legacy
 
-    /// One turn, four `can_use_tool` the CLI waits on in turn: `git status` twice, then
-    /// `git status >> ~/.zshrc`, then `sudo ls`.
+    /// One turn, five `can_use_tool` the CLI waits on in turn: `ls -la` twice, then
+    /// `ls -la >> ~/.zshrc`, then `sudo ls`, then `./x.sh`.
     fn legacy_transcript() -> Vec<Value> {
         let ask = |id: &str, command: &str| {
             vec![
@@ -7241,10 +7241,11 @@ mod permission_scopes {
                 "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
                 "permissionMode": "default", "apiKeySource": "none"})),
         ];
-        t.extend(ask("req-s1", "git status"));
-        t.extend(ask("req-s2", "git status"));
-        t.extend(ask("req-redirect", "git status >> ~/.zshrc"));
+        t.extend(ask("req-s1", "ls -la"));
+        t.extend(ask("req-s2", "ls -la"));
+        t.extend(ask("req-redirect", "ls -la >> ~/.zshrc"));
         t.extend(ask("req-wrap", "sudo ls"));
+        t.extend(ask("req-script", "./x.sh"));
         t.extend(vec![
             emit(json!({"type": "assistant", "message": {
                 "id": "msg_fake_2", "type": "message", "role": "assistant",
@@ -7369,7 +7370,7 @@ mod permission_scopes {
             .session_id;
         assert!(!manager.agent_runtime.owns(&sid).await, "legacy engine");
 
-        // `session` on `git status`: a plain allow for the CLI, no rule handed to it.
+        // `session` on `ls -la`: a plain allow for the CLI, no rule handed to it.
         waits(&manager, &sid, "req-s1").await;
         manager
             .route_permission_response(&sid, "req-s1", true, PermissionAnswerScope::Session, true)
@@ -7379,7 +7380,7 @@ mod permission_scopes {
         assert_eq!(answer["behavior"], "allow", "{answer}");
         assert_eq!(
             answer["updatedInput"],
-            json!({"command": "git status"}),
+            json!({"command": "ls -la"}),
             "{answer}"
         );
         assert!(answer.get("updatedPermissions").is_none(), "{answer}");
@@ -7388,8 +7389,23 @@ mod permission_scopes {
         let answer = answer_read(dir.path(), "req-s2").await;
         assert_eq!(answer["behavior"], "allow", "{answer}");
         assert!(answer.get("updatedPermissions").is_none(), "{answer}");
+        // A Deny clicked just before the backend's answer, through the WebSocket: refused
+        // like REST and NATS (the request no longer waits), never a second answer to the CLI
+        // nor a stored refusal of a call that ran.
+        let late = crate::api::ws_chat_handler::answer_permission_frame(
+            &manager,
+            &sid,
+            "req-s2",
+            false,
+            PermissionAnswerScope::Once,
+        )
+        .await;
+        assert!(
+            matches!(late, Err(PermissionDeliveryError::NotPending)),
+            "{late:?}"
+        );
 
-        // `git status >> ~/.zshrc` is not covered: it waits for the user; `always` is
+        // `ls -la >> ~/.zshrc` is not covered: it waits for the user; `always` is
         // refused, typed, and the request still waits.
         waits(&manager, &sid, "req-redirect").await;
         let refused = manager
@@ -7440,9 +7456,34 @@ mod permission_scopes {
             .await
             .unwrap();
 
+        // A local script: the model could edit it and rerun the "identical" call. Refused.
+        waits(&manager, &sid, "req-script").await;
+        let refused = manager
+            .route_permission_response(
+                &sid,
+                "req-script",
+                true,
+                PermissionAnswerScope::Session,
+                true,
+            )
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(PermissionDeliveryError::ScopeUnsupported(
+                    PermissionAnswerScope::Session
+                ))
+            ),
+            "{refused:?}"
+        );
+        manager
+            .route_permission_response(&sid, "req-script", false, PermissionAnswerScope::Once, true)
+            .await
+            .unwrap();
+
         // The decisions say how long, and exactly what, was granted (the backend's own
         // decision is stored with the turn: compare without the order).
-        let mut seen: Vec<String> = decisions(&graph, &sid, 4)
+        let mut seen: Vec<String> = decisions(&graph, &sid, 5)
             .await
             .iter()
             .map(|(scope, rule)| format!("{scope} {rule}"))
@@ -7451,12 +7492,21 @@ mod permission_scopes {
         assert_eq!(
             seen,
             vec![
-                "\"session\" \"Bash: git status\"",
-                "\"session\" \"Bash: git status\"",
+                "\"session\" \"Bash: ls -la\"",
+                "\"session\" \"Bash: ls -la\"",
+                "null null",
                 "null null",
                 "null null",
             ]
         );
+        // One answer per request reached the CLI (the late Deny wrote nothing).
+        let stdin = std::fs::read_to_string(dir.path().join("stdin.jsonl")).unwrap_or_default();
+        let answers_to_s2 = stdin
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["type"] == "control_response" && v["response"]["request_id"] == "req-s2")
+            .count();
+        assert_eq!(answers_to_s2, 1, "{stdin}");
         manager.close_session(&sid).await.unwrap();
     }
 

@@ -17,7 +17,7 @@ use uuid::Uuid;
 /// - `once`: this call only.
 /// - `session`: the backend answers itself the later requests of THIS session the
 ///   grant covers (`chat::session_grants`: the identical call; any call of a read-only
-///   tool). Never handed to the provider as a rule.
+///   built-in tool of `nexus-tools`). Never handed to the provider as a rule.
 /// - `always`: part of the contract, refused on every engine in this lot (P11b: lasting
 ///   rules need a hardened matcher first).
 ///

@@ -984,9 +984,8 @@ async fn handle_ws_chat_loop(
                                         // control protocol (JSON: {"allow": true/false}) and must
                                         // NOT be persisted or broadcast as user_message events.
                                         // Same routing as POST .../permissions/{request_id}.
-                                        let send_result = chat_manager
-                                            .route_permission_response(&session_id, &request_id, allow, scope, false)
-                                            .await;
+                                        let send_result =
+                                            answer_permission_frame(chat_manager, &session_id, &request_id, allow, scope).await;
                                         if let Err(crate::chat::manager::PermissionDeliveryError::ScopeUnsupported(scope)) = &send_result {
                                             // Refused, not answered: the request still waits, the same
                                             // id may be answered again (with a scope the session offers).
@@ -1293,6 +1292,23 @@ pub fn spawn_entity_extraction(state: &OrchestratorState, session_id: &str, mess
             .await;
         }
     });
+}
+
+/// A `permission_response` frame, delivered like `POST .../permissions/{id}` and the NATS
+/// RPC: STRICTLY. An answer to a request that no longer waits (the backend answered it
+/// under a session grant a moment before, another tab did) is refused (`NotPending`):
+/// never a second `control_response` for one request, never a stored decision that
+/// contradicts what ran.
+pub(crate) async fn answer_permission_frame(
+    chat_manager: &crate::chat::manager::ChatManager,
+    session_id: &str,
+    request_id: &str,
+    allow: bool,
+    scope: crate::chat::types::PermissionAnswerScope,
+) -> Result<DeliveryRoute, crate::chat::manager::PermissionDeliveryError> {
+    chat_manager
+        .route_permission_response(session_id, request_id, allow, scope, true)
+        .await
 }
 
 /// Phase 2 of the entity extraction: Hebbian learning via chat.

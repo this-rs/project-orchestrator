@@ -858,8 +858,10 @@ mod tests {
         let mut state = MapState::new();
         let mut mapper = EventMapper::new();
         for (name, msg) in corpus() {
-            // The legacy init says which engine it is; the mapper leaves that to the
-            // session owner (the runtime stamps `engine` and `degraded_features`).
+            // The legacy init says which engine it is and what it declares; the mapper
+            // leaves that to the session owner (the agent runtime stamps `engine`,
+            // `degraded_features` and `capabilities` on `system_init`, `emit_one`). The
+            // legacy declaration is checked for what it is, then left out of the comparison.
             let legacy: Vec<Value> = ChatManager::message_to_events(&msg)
                 .iter()
                 .map(|e| {
@@ -867,6 +869,13 @@ mod tests {
                     if let Some(o) = v.as_object_mut() {
                         o.remove("engine");
                         o.remove("degraded_features");
+                        if o.get("type").and_then(Value::as_str) == Some("system_init") {
+                            assert_eq!(
+                                o.remove("capabilities"),
+                                Some(crate::chat::manager::legacy_capabilities()),
+                                "message `{name}`"
+                            );
+                        }
                     }
                     v
                 })
@@ -874,6 +883,25 @@ mod tests {
             let via_contract = mapped(&msg, &mut state, &mut mapper);
             assert_eq!(via_contract, legacy, "message `{name}` maps differently");
         }
+    }
+
+    /// The two engines that drive Claude Code declare the same approval scopes: the
+    /// legacy one (`LEGACY_PERMISSION_SCOPES`, in its `system_init`) and the agent one
+    /// (the Claude Code provider's own, without `always`, as `offered_capabilities`).
+    #[test]
+    fn both_claude_code_engines_declare_the_same_permission_scopes() {
+        let provider = nexus_claude::providers::claude_code::ClaudeCodeConfig::default()
+            .capabilities(None)
+            .permission_scopes
+            .into_iter()
+            .filter(|s| *s != nexus_claude::agent::PermissionScope::Always)
+            .map(|s| serde_json::to_value(s).unwrap())
+            .collect::<Vec<_>>();
+        let legacy = crate::chat::manager::LEGACY_PERMISSION_SCOPES
+            .iter()
+            .map(|s| serde_json::to_value(s).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(provider, legacy);
     }
 
     #[test]
