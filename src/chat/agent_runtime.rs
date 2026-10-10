@@ -20,14 +20,15 @@ use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use nexus_claude::agent::{
     AgentEvent, AgentProvider, AgentSession, CancelScope, Capabilities, InterruptScope,
-    PermissionDecision, PolicyMode, ProviderError, TurnInput,
+    PermissionDecision, PermissionScope, PolicyMode, ProviderError, TurnInput,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use uuid::Uuid;
 
+use super::manager::PermissionDeliveryError;
 use super::manager::{CancelToolsResult, ChatManager, CANCEL_TOOLS_CAP, CANCEL_TOOLS_WINDOW_SECS};
 use super::provider::event_map::{out_of_band_to_chat_events, EventMapper};
-use super::types::{ChatEvent, PendingMessage, PendingMessageKind};
+use super::types::{ChatEvent, PendingMessage, PendingMessageKind, PermissionAnswerScope};
 use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::GraphStore;
 
@@ -384,11 +385,63 @@ pub struct AgentSessionHandle {
     cancel_tools_cap: u32,
     /// The window of the cap (`CANCEL_TOOLS_WINDOW_SECS`).
     cancel_tools_window: Duration,
+    /// Where an approval `always` is kept when the provider has no lasting scope of
+    /// its own (the native harness): set once, right after adoption
+    /// ([`Self::grant_lasting_rules`]). Unset: the session offers the scopes its
+    /// provider declares, nothing more.
+    lasting: std::sync::OnceLock<LastingGrant>,
+    /// The call each permission request still waiting asks for (request id -> call):
+    /// what an approval `always` derives its rule from.
+    asked_calls: std::sync::Mutex<HashMap<String, super::lasting_rules::AskedCall>>,
+}
+
+/// The backend's lasting rules for one session: the store and the project the
+/// session runs in (`chat::lasting_rules`).
+pub struct LastingGrant {
+    pub rules: Arc<super::lasting_rules::LastingRules>,
+    pub project: String,
+    /// The session's directory, as nexus normalises paths against it.
+    pub cwd: std::path::PathBuf,
 }
 
 impl AgentSessionHandle {
-    /// Persists (except transient events) and broadcasts one event.
-    pub async fn emit(&self, mut event: ChatEvent) {
+    /// Persists (except transient events) and broadcasts one event. A permission
+    /// request the project's lasting rules cover (an earlier `always`) is answered here,
+    /// `once`, its decision emitted with the scope `always`: the user is not asked.
+    pub async fn emit(&self, event: ChatEvent) {
+        let Some(covered) = self.emit_one(event).await else {
+            return;
+        };
+        let answered = self
+            .session
+            .answer_permission(&covered, PermissionDecision::allow_once())
+            .await;
+        match answered {
+            Ok(()) => {
+                self.asked_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&covered);
+                let _ = self
+                    .emit_one(ChatEvent::PermissionDecision {
+                        id: covered,
+                        allow: true,
+                        scope: Some(PermissionAnswerScope::Always),
+                    })
+                    .await;
+            }
+            // Left waiting: the user answers it.
+            Err(e) => tracing::warn!(
+                session_id = %self.session_id,
+                error = %e,
+                "a call the lasting rules cover could not be allowed: the user is asked"
+            ),
+        }
+    }
+
+    /// [`Self::emit`] for one event; returns the id of a permission request the
+    /// lasting rules cover.
+    async fn emit_one(&self, mut event: ChatEvent) -> Option<String> {
         // What only the session owner knows rides on `system_init`.
         if let ChatEvent::SystemInit {
             provider,
@@ -405,9 +458,34 @@ impl AgentSessionHandle {
             degraded_features.get_or_insert_with(|| self.degraded.clone());
             provider.get_or_insert_with(|| self.provider.clone());
             capabilities.get_or_insert_with(|| {
-                serde_json::to_value(&self.capabilities).unwrap_or_default()
+                serde_json::to_value(self.offered_capabilities()).unwrap_or_default()
             });
             tool_policy.get_or_insert_with(|| self.tool_policy.clone());
+        }
+        let mut covered = None;
+        if let ChatEvent::PermissionRequest {
+            id,
+            tool,
+            input,
+            canonical,
+            ..
+        } = &event
+        {
+            let call = super::lasting_rules::AskedCall {
+                tool: tool.clone(),
+                canonical: canonical.clone(),
+                input: input.clone(),
+            };
+            if let Some(grant) = self.lasting.get() {
+                let rules = grant.rules.allowed_for(&grant.project);
+                if super::lasting_rules::matches_call(&rules, &call, &grant.cwd) {
+                    covered = Some(id.clone());
+                }
+            }
+            self.asked_calls
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(id.clone(), call);
         }
         match &event {
             ChatEvent::StreamDelta { text, .. } => self.streaming_text.lock().await.push_str(text),
@@ -436,6 +514,7 @@ impl AgentSessionHandle {
             services.publish(&self.session_id, &event);
         }
         let _ = self.events_tx.send(event);
+        covered
     }
 
     /// Persists the provider's resume token when it is not the one the graph holds.
@@ -853,20 +932,113 @@ impl AgentSessionHandle {
             .push_back(PendingMessage::system_hint(hint));
     }
 
-    /// Answers a permission request.
+    /// Answers a permission request for this call only.
     pub async fn answer_permission(&self, request_id: &str, allow: bool) -> Result<()> {
-        let decision = if allow {
-            PermissionDecision::allow_once()
-        } else {
+        self.answer_permission_scoped(request_id, allow, PermissionAnswerScope::Once)
+            .await
+            .map_err(|e| match e {
+                PermissionDeliveryError::Failed(e) => e,
+                other => anyhow!(other.to_string()),
+            })
+    }
+
+    /// Sets where this session keeps an approval `always` its provider cannot keep:
+    /// the session then offers `always` ([`Self::offered_capabilities`]). Only for a
+    /// provider that asks interactively (it declares `session`) and does not keep
+    /// `always` itself. Called once, right after adoption.
+    pub fn grant_lasting_rules(&self, grant: LastingGrant) {
+        let scopes = &self.capabilities.permission_scopes;
+        if scopes.contains(&PermissionScope::Session) && !scopes.contains(&PermissionScope::Always)
+        {
+            let _ = self.lasting.set(grant);
+        }
+    }
+
+    /// The capabilities this session offers: its provider's, plus `always` when the
+    /// backend keeps it ([`Self::grant_lasting_rules`]). What `system_init` carries.
+    pub fn offered_capabilities(&self) -> Capabilities {
+        let mut caps = self.capabilities.clone();
+        if self.lasting.get().is_some()
+            && !caps.permission_scopes.contains(&PermissionScope::Always)
+        {
+            caps.permission_scopes.push(PermissionScope::Always);
+        }
+        caps
+    }
+
+    /// Answers a permission request; an approval lasts as long as `scope` says. A
+    /// scope the session does not offer is refused ([`PermissionDeliveryError::ScopeUnsupported`]),
+    /// never answered as a narrower one; the request then stays waiting.
+    ///
+    /// `always` on a provider without it (native): the rule scoped on this call
+    /// (`lasting_rules::rules_for_call`: a command prefix, a path, a domain) is recorded
+    /// for the project FIRST (a failed write answers nothing), then the provider is
+    /// answered `once`: the backend answers the next covered calls of this session itself
+    /// ([`Self::emit`]), and the sessions opened later get the rule in their policy. A
+    /// call no rule can name without widening it is refused (`ScopeUnsupported`).
+    pub async fn answer_permission_scoped(
+        &self,
+        request_id: &str,
+        allow: bool,
+        scope: PermissionAnswerScope,
+    ) -> std::result::Result<(), PermissionDeliveryError> {
+        let decision = if !allow {
             PermissionDecision::deny()
+        } else {
+            let wanted = scope.to_nexus();
+            // `once` is what every provider answers (a provider listing no scope at all
+            // still takes it, as it always did).
+            let provider_scope = if scope == PermissionAnswerScope::Once
+                || self.capabilities.permission_scopes.contains(&wanted)
+            {
+                wanted
+            } else if let (PermissionAnswerScope::Always, Some(grant)) = (scope, self.lasting.get())
+            {
+                let call = self
+                    .asked_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(request_id)
+                    .cloned();
+                let rules = call
+                    .and_then(|call| super::lasting_rules::rules_for_call(&call, &grant.cwd))
+                    .ok_or(PermissionDeliveryError::ScopeUnsupported(scope))?;
+                grant
+                    .rules
+                    .allow(&grant.project, &rules)
+                    .map_err(PermissionDeliveryError::Failed)?;
+                tracing::info!(
+                    session_id = %self.session_id,
+                    rules = ?rules,
+                    project = %grant.project,
+                    "permission granted always: lasting rule recorded"
+                );
+                PermissionScope::Once
+            } else {
+                return Err(PermissionDeliveryError::ScopeUnsupported(scope));
+            };
+            PermissionDecision::Allow {
+                scope: provider_scope,
+                updated_input: None,
+            }
         };
         self.session
             .answer_permission(request_id, decision)
             .await
-            .map_err(anyhow::Error::new)?;
+            .map_err(|e| match e {
+                ProviderError::Unsupported { .. } => {
+                    PermissionDeliveryError::ScopeUnsupported(scope)
+                }
+                other => PermissionDeliveryError::Failed(anyhow::Error::new(other)),
+            })?;
+        self.asked_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(request_id);
         self.emit(ChatEvent::PermissionDecision {
             id: request_id.to_string(),
             allow,
+            scope: scope.lasting(allow),
         })
         .await;
         Ok(())
@@ -1089,6 +1261,8 @@ impl AgentRuntime {
             cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
+            lasting: std::sync::OnceLock::new(),
+            asked_calls: std::sync::Mutex::new(HashMap::new()),
         });
         if let Some(oob) = session.out_of_band() {
             let pump = Arc::clone(&handle);
