@@ -169,11 +169,13 @@ impl TriggerRouter {
             })
             .collect();
 
-        // Sort descending by score (stable sort keeps insertion order for ties)
+        // Descending by score. Exact ties are ordered by trigger id, so the
+        // ranking does not depend on the order the candidates were passed in.
         decisions.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.trigger_id.cmp(&b.trigger_id))
         });
         decisions
     }
