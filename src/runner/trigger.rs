@@ -1,7 +1,7 @@
 //! TriggerEngine — evaluates trigger guards and fires plan runs.
 //!
-//! The engine checks: enabled, cooldown, no active run, then fires
-//! via PlanRunner::start() and records the firing in Neo4j.
+//! The engine checks the guards (enabled, cooldown, no active run) and records
+//! firings in Neo4j. `runner::dispatch::TriggerDispatcher` starts the run.
 
 use crate::neo4j::traits::GraphStore;
 use crate::runner::models::{Trigger, TriggerFiring, TriggerSource, TriggerType};
@@ -79,15 +79,17 @@ impl TriggerEngine {
         Ok(EvalResult::Fire)
     }
 
-    /// Fire a trigger: record the firing and return the firing record.
+    /// Record a firing of `trigger`: the run it started (`plan_run_id`) or
+    /// why none started (`start_error`).
     ///
-    /// The caller is responsible for actually starting the plan run
-    /// (via PlanRunner::start) after this method returns.
+    /// Starting the run is the job of `runner::dispatch::TriggerDispatcher`,
+    /// which calls this once the start has succeeded or failed.
     pub async fn record_fire(
         &self,
         trigger: &Trigger,
         plan_run_id: Option<Uuid>,
         source_payload: Option<serde_json::Value>,
+        start_error: Option<String>,
     ) -> Result<TriggerFiring> {
         let firing = TriggerFiring {
             id: Uuid::new_v4(),
@@ -95,6 +97,7 @@ impl TriggerEngine {
             plan_run_id,
             fired_at: Utc::now(),
             source_payload,
+            start_error,
         };
 
         self.graph.record_trigger_firing(&firing).await?;
@@ -245,7 +248,10 @@ mod tests {
         mock.create_trigger(&trigger).await.unwrap();
 
         let engine = TriggerEngine::new(mock.clone());
-        let firing = engine.record_fire(&trigger, None, None).await.unwrap();
+        let firing = engine
+            .record_fire(&trigger, None, None, None)
+            .await
+            .unwrap();
 
         assert_eq!(firing.trigger_id, trigger.id);
         assert!(firing.plan_run_id.is_none());

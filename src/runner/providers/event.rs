@@ -6,13 +6,13 @@
 use super::TriggerProvider;
 use crate::events::CrudEvent;
 use crate::neo4j::traits::GraphStore;
+use crate::runner::dispatch::{DispatchOutcome, TriggerDispatcher};
 use crate::runner::models::TriggerType;
-use crate::runner::trigger::TriggerEngine;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Event-based trigger provider for plan chaining.
 ///
@@ -23,7 +23,7 @@ use tracing::{debug, error, info};
 /// ```
 pub struct EventProvider {
     graph: Arc<dyn GraphStore>,
-    engine: Arc<TriggerEngine>,
+    dispatcher: Arc<TriggerDispatcher>,
     event_rx: broadcast::Receiver<CrudEvent>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
@@ -38,13 +38,13 @@ impl std::fmt::Debug for EventProvider {
 impl EventProvider {
     pub fn new(
         graph: Arc<dyn GraphStore>,
-        engine: Arc<TriggerEngine>,
+        dispatcher: Arc<TriggerDispatcher>,
         event_rx: broadcast::Receiver<CrudEvent>,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             graph,
-            engine,
+            dispatcher,
             event_rx,
             shutdown_tx,
             shutdown_rx,
@@ -56,7 +56,7 @@ impl EventProvider {
 impl TriggerProvider for EventProvider {
     async fn setup(&self) -> Result<()> {
         let graph = self.graph.clone();
-        let engine = self.engine.clone();
+        let dispatcher = self.dispatcher.clone();
         let mut event_rx = self.event_rx.resubscribe();
         let mut shutdown_rx = self.shutdown_rx.clone();
 
@@ -68,7 +68,7 @@ impl TriggerProvider for EventProvider {
                     result = event_rx.recv() => {
                         match result {
                             Ok(event) => {
-                                if let Err(e) = handle_event(&graph, &engine, &event).await {
+                                if let Err(e) = handle_event(&graph, &dispatcher, &event).await {
                                     error!("EventProvider error handling event: {}", e);
                                 }
                             }
@@ -106,7 +106,7 @@ impl TriggerProvider for EventProvider {
 /// Handle a single CrudEvent: check all Event-type triggers for matches.
 async fn handle_event(
     graph: &Arc<dyn GraphStore>,
-    engine: &TriggerEngine,
+    dispatcher: &TriggerDispatcher,
     event: &CrudEvent,
 ) -> Result<()> {
     // Build the event type string for matching (e.g., "plan_updated", "task_created")
@@ -149,22 +149,29 @@ async fn handle_event(
             }
         }
 
-        // Evaluate the trigger
-        match engine.evaluate_and_prepare(trigger).await? {
-            Some(source) => {
-                let payload = serde_json::to_value(event).ok();
-                engine.record_fire(trigger, None, payload).await?;
+        // Evaluate the guards, start the run, record the firing
+        let payload = serde_json::to_value(event).ok();
+        match dispatcher.dispatch(trigger, payload).await {
+            Ok(DispatchOutcome::Started { start, .. }) => {
                 info!(
-                    "Event trigger {} fired for plan {} on event {} (source: {:?})",
-                    trigger.id, trigger.plan_id, event_type, source
+                    "Event trigger {} started run {} of plan {} on event {}",
+                    trigger.id, start.run_id, trigger.plan_id, event_type
                 );
             }
-            None => {
+            Ok(DispatchOutcome::StartFailed { error, .. }) => {
+                warn!(
+                    "Event trigger {} fired on event {}, plan {} not started: {}",
+                    trigger.id, event_type, trigger.plan_id, error
+                );
+            }
+            Ok(DispatchOutcome::Skipped) => {
                 debug!(
                     "Event trigger {} for plan {} matched but guards not met",
                     trigger.id, trigger.plan_id
                 );
             }
+            // One trigger that cannot be evaluated does not stop the others.
+            Err(e) => error!("Event trigger {} dispatch error: {:#}", trigger.id, e),
         }
     }
 
@@ -180,16 +187,48 @@ mod tests {
     use super::*;
     use crate::events::{CrudAction, EntityType};
     use crate::neo4j::mock::MockGraphStore;
+    use crate::runner::dispatch::tests::{runnable_plan, trigger_of, RecordingStarter};
     use crate::runner::models::Trigger;
+    use crate::runner::trigger::TriggerEngine;
     use chrono::Utc;
     use uuid::Uuid;
+
+    fn dispatcher_on(
+        mock: &Arc<MockGraphStore>,
+    ) -> (Arc<TriggerDispatcher>, Arc<RecordingStarter>) {
+        let starter = Arc::new(RecordingStarter::on(mock.clone()));
+        let dispatcher = Arc::new(TriggerDispatcher::new(
+            mock.clone(),
+            Arc::new(TriggerEngine::new(mock.clone())),
+            starter.clone(),
+        ));
+        (dispatcher, starter)
+    }
+
+    fn event_trigger(plan_id: Uuid, config: serde_json::Value) -> Trigger {
+        let mut trigger = trigger_of(plan_id, TriggerType::Event);
+        trigger.config = config;
+        trigger
+    }
+
+    fn plan_completed(plan_id: Uuid) -> CrudEvent {
+        CrudEvent {
+            entity_type: EntityType::Plan,
+            action: CrudAction::Updated,
+            entity_id: plan_id.to_string(),
+            related: None,
+            payload: serde_json::json!({"status": "completed"}),
+            timestamp: Utc::now().to_rfc3339(),
+            project_id: None,
+        }
+    }
 
     #[tokio::test]
     async fn test_event_provider_setup_teardown() {
         let mock = Arc::new(MockGraphStore::new());
-        let engine = Arc::new(TriggerEngine::new(mock.clone()));
+        let (dispatcher, _) = dispatcher_on(&mock);
         let (tx, rx) = broadcast::channel::<CrudEvent>(16);
-        let provider = EventProvider::new(mock, engine, rx);
+        let provider = EventProvider::new(mock, dispatcher, rx);
 
         assert_eq!(provider.provider_type(), TriggerType::Event);
         provider.setup().await.unwrap();
@@ -199,87 +238,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_event_fires_matching_trigger() {
+    async fn a_matching_event_starts_a_run() {
         let mock = Arc::new(MockGraphStore::new());
-
-        let plan_id = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = runnable_plan(&mock, dir.path()).await;
         let source_plan_id = Uuid::new_v4();
-        let trigger = Trigger {
-            id: Uuid::new_v4(),
+        let trigger = event_trigger(
             plan_id,
-            trigger_type: TriggerType::Event,
-            config: serde_json::json!({
+            serde_json::json!({
                 "event_type": "plan_completed",
                 "entity_id": source_plan_id.to_string()
             }),
-            enabled: true,
-            cooldown_secs: 0,
-            last_fired: None,
-            fire_count: 0,
-            created_at: Utc::now(),
-        };
+        );
         mock.create_trigger(&trigger).await.unwrap();
+        let (dispatcher, starter) = dispatcher_on(&mock);
 
-        let engine = Arc::new(TriggerEngine::new(mock.clone()));
+        handle_event(
+            &(mock.clone() as Arc<dyn GraphStore>),
+            &dispatcher,
+            &plan_completed(source_plan_id),
+        )
+        .await
+        .unwrap();
 
-        // Simulate a plan_completed event
-        let event = CrudEvent {
-            entity_type: EntityType::Plan,
-            action: CrudAction::Updated,
-            entity_id: source_plan_id.to_string(),
-            related: None,
-            payload: serde_json::json!({"status": "completed"}),
-            timestamp: Utc::now().to_rfc3339(),
-            project_id: None,
-        };
-
-        handle_event(&(mock.clone() as Arc<dyn GraphStore>), &engine, &event)
-            .await
-            .unwrap();
-
-        // Verify firing was recorded
+        let calls = starter.calls.lock().await;
+        assert_eq!(calls.len(), 1, "the run was started");
+        assert_eq!(calls[0].0, plan_id);
+        assert_eq!(
+            calls[0].1,
+            crate::runner::TriggerSource::Event {
+                trigger_id: trigger.id,
+                source_event: "plan_completed".to_string(),
+            }
+        );
         let firings = mock.list_trigger_firings(trigger.id, 10).await.unwrap();
         assert_eq!(firings.len(), 1);
+        let run_id = firings[0].plan_run_id.expect("plan_run_id in the firing");
+        assert!(mock.get_plan_run(run_id).await.unwrap().is_some());
+        assert!(firings[0].source_payload.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_event_start_failure_is_recorded_in_the_firing() {
+        let mock = Arc::new(MockGraphStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = runnable_plan(&mock, dir.path()).await;
+        let trigger = event_trigger(plan_id, serde_json::json!({"event_type": "plan_completed"}));
+        mock.create_trigger(&trigger).await.unwrap();
+        let dispatcher = TriggerDispatcher::new(
+            mock.clone(),
+            Arc::new(TriggerEngine::new(mock.clone())),
+            Arc::new(crate::runner::dispatch::NoPlanRunner),
+        );
+
+        handle_event(
+            &(mock.clone() as Arc<dyn GraphStore>),
+            &dispatcher,
+            &plan_completed(Uuid::new_v4()),
+        )
+        .await
+        .unwrap();
+
+        let firings = mock.list_trigger_firings(trigger.id, 10).await.unwrap();
+        assert_eq!(firings.len(), 1);
+        assert!(firings[0].plan_run_id.is_none());
+        assert!(firings[0].start_error.is_some());
     }
 
     #[tokio::test]
     async fn test_handle_event_skips_non_matching() {
         let mock = Arc::new(MockGraphStore::new());
-
-        let plan_id = Uuid::new_v4();
-        let trigger = Trigger {
-            id: Uuid::new_v4(),
-            plan_id,
-            trigger_type: TriggerType::Event,
-            config: serde_json::json!({
-                "event_type": "task_completed"
-            }),
-            enabled: true,
-            cooldown_secs: 0,
-            last_fired: None,
-            fire_count: 0,
-            created_at: Utc::now(),
-        };
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = runnable_plan(&mock, dir.path()).await;
+        let trigger = event_trigger(plan_id, serde_json::json!({"event_type": "task_completed"}));
         mock.create_trigger(&trigger).await.unwrap();
+        let (dispatcher, starter) = dispatcher_on(&mock);
 
-        let engine = Arc::new(TriggerEngine::new(mock.clone()));
+        // A plan_completed event does NOT match a task_completed trigger
+        handle_event(
+            &(mock.clone() as Arc<dyn GraphStore>),
+            &dispatcher,
+            &plan_completed(Uuid::new_v4()),
+        )
+        .await
+        .unwrap();
 
-        // Send a plan_completed event — should NOT match task_completed trigger
-        let event = CrudEvent {
-            entity_type: EntityType::Plan,
-            action: CrudAction::Updated,
-            entity_id: Uuid::new_v4().to_string(),
-            related: None,
-            payload: serde_json::json!({"status": "completed"}),
-            timestamp: Utc::now().to_rfc3339(),
-            project_id: None,
-        };
-
-        handle_event(&(mock.clone() as Arc<dyn GraphStore>), &engine, &event)
-            .await
-            .unwrap();
-
-        // No firing recorded
+        assert!(starter.calls.lock().await.is_empty());
         let firings = mock.list_trigger_firings(trigger.id, 10).await.unwrap();
         assert_eq!(firings.len(), 0);
     }

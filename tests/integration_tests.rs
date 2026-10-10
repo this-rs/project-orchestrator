@@ -1121,6 +1121,7 @@ async fn test_trigger_firing_binds_plan_run_id() {
         plan_run_id: Some(run_id),
         fired_at: chrono::Utc::now(),
         source_payload: Some(serde_json::json!({"body": EVIL})),
+        start_error: None,
     };
     client.record_trigger_firing_impl(&linked).await.unwrap();
 
@@ -1150,25 +1151,34 @@ async fn test_trigger_firing_binds_plan_run_id() {
         plan_run_id: None,
         fired_at: chrono::Utc::now(),
         source_payload: None,
+        start_error: Some("Plan has no tasks to execute".to_string()),
     };
     client.record_trigger_firing_impl(&unlinked).await.unwrap();
-    let (exists, edges): (i64, i64) = {
+    let (exists, edges, start_error): (i64, i64, String) = {
         let mut r = raw
             .execute(
                 neo4rs::query(
                     "MATCH (f:TriggerFiring {id: $fid}) \
                      OPTIONAL MATCH (f)-[s:STARTED]->() \
-                     RETURN count(DISTINCT f) AS f, count(s) AS s",
+                     RETURN count(DISTINCT f) AS f, count(s) AS s, f.start_error AS e",
                 )
                 .param("fid", unlinked.id.to_string()),
             )
             .await
             .unwrap();
         let row = r.next().await.unwrap().unwrap();
-        (row.get("f").unwrap(), row.get("s").unwrap())
+        (
+            row.get("f").unwrap(),
+            row.get("s").unwrap(),
+            row.get("e").unwrap(),
+        )
     };
     assert_eq!(exists, 1, "the firing must be recorded without a run");
     assert_eq!(edges, 0, "no STARTED edge without a plan_run_id");
+    assert_eq!(
+        start_error, "Plan has no tasks to execute",
+        "why no run started is stored on the firing"
+    );
 
     raw.run(
         neo4rs::query(
