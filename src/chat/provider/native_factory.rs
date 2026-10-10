@@ -289,7 +289,11 @@ fn build_acp(record: &InstanceRecord) -> Result<Arc<dyn AgentProvider>, Provider
     let command = super::settings::acp_commands()
         .remove(name)
         .ok_or_else(|| ProviderError::invalid("that ACP agent is not declared on this server"))?;
+    // An agent known to refuse MCP servers per session (OpenClaw's ACP bridge) is
+    // declared so: the provider says `per_session_mcp: false` and is given none.
+    let per_session_mcp = super::settings::acp_command_carries_mcp(&command);
     let mut config = AcpConfig::new(record.id.clone(), command);
+    config.per_session_mcp = per_session_mcp;
     config.default_model = record.default_model.clone();
     config.cost_basis = cost_basis_of(record);
     config.validate()?;
