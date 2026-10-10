@@ -12337,7 +12337,7 @@ mod schema_drift_tests {
         // ConnectServerBody
         ("mcp_federation", "args"), ("mcp_federation", "command"), ("mcp_federation", "display_name"), ("mcp_federation", "env"), ("mcp_federation", "headers"), ("mcp_federation", "transport"), ("mcp_federation", "url"),
         // CreateNoteBody (create/supersede)
-        ("note", "anchors"), ("note", "assertion_rule"), ("note", "run_id"), ("note", "scope"),
+        ("note", "anchors"), ("note", "assertion_rule"), ("note", "run_id"), ("note", "scope"), ("note", "sharing_consent"),
         // CreatePersonaBody / ImportPersonaBody / AutoBuildPersonaBody
         ("persona", "conflict_strategy"), ("persona", "depth"), ("persona", "entry_function"), ("persona", "file_pattern"), ("persona", "origin"), ("persona", "package"),
         // CreatePlanRequest / DelegateTaskRequest (provider, model and task_class are the explicit choice of the delegating agent)

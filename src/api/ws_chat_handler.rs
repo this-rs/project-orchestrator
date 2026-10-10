@@ -1264,99 +1264,122 @@ pub fn spawn_entity_extraction(state: &OrchestratorState, session_id: &str, mess
             }
         }
 
-        // Phase 2: Neural reinforcement (Hebbian learning via chat)
-        // Find notes linked to discussed entities, boost their energy,
-        // and reinforce synapses between co-activated notes.
-        if !should_reinforce || reinforcement_entities.is_empty() {
-            return;
+        if should_reinforce && !reinforcement_entities.is_empty() {
+            neural_reinforcement(
+                neo4j.as_ref(),
+                session_uuid,
+                &reinforcement_entities,
+                &ar_config,
+            )
+            .await;
         }
+    });
+}
 
-        let mut all_notes: Vec<crate::notes::Note> = Vec::new();
-        let mut all_note_ids: Vec<uuid::Uuid> = Vec::new();
-        let mut boost_count = 0u64;
+/// Phase 2 of the entity extraction: Hebbian learning via chat.
+///
+/// Finds the notes linked to the discussed entities, boosts the energy of those
+/// of the session's project only (a file path can anchor notes of other
+/// projects, which this session must not warm), and reinforces the synapses
+/// between co-activated notes, per project.
+pub(crate) async fn neural_reinforcement(
+    neo4j: &dyn crate::neo4j::traits::GraphStore,
+    session_uuid: uuid::Uuid,
+    reinforcement_entities: &[(String, String)],
+    ar_config: &crate::neurons::config::AutoReinforcementConfig,
+) {
+    let session_project = crate::notes::coactivation::session_project_id(neo4j, session_uuid).await;
+    let mut all_notes: Vec<crate::notes::Note> = Vec::new();
+    let mut all_note_ids: Vec<uuid::Uuid> = Vec::new();
+    let mut boost_count = 0u64;
 
-        for (entity_type_str, entity_id) in &reinforcement_entities {
-            // Map Neo4j label to notes::EntityType
-            let entity_type = match entity_type_str.as_str() {
-                "File" => crate::notes::EntityType::File,
-                "Function" => crate::notes::EntityType::Function,
-                "Struct" => crate::notes::EntityType::Struct,
-                "Trait" => crate::notes::EntityType::Trait,
-                "Enum" => crate::notes::EntityType::Enum,
-                _ => continue,
-            };
+    for (entity_type_str, entity_id) in reinforcement_entities {
+        // Map Neo4j label to notes::EntityType
+        let entity_type = match entity_type_str.as_str() {
+            "File" => crate::notes::EntityType::File,
+            "Function" => crate::notes::EntityType::Function,
+            "Struct" => crate::notes::EntityType::Struct,
+            "Trait" => crate::notes::EntityType::Trait,
+            "Enum" => crate::notes::EntityType::Enum,
+            _ => continue,
+        };
 
-            match neo4j.get_notes_for_entity(&entity_type, entity_id).await {
-                Ok(notes) => {
-                    for note in &notes {
-                        // Boost energy for each note linked to a discussed entity
-                        if let Err(e) = neo4j
-                            .boost_energy(note.id, ar_config.chat_energy_boost)
-                            .await
-                        {
-                            debug!(
-                                note_id = %note.id,
-                                error = %e,
-                                "Chat neural reinforcement: energy boost failed"
-                            );
-                        } else {
-                            boost_count += 1;
-                        }
+        match neo4j.get_notes_for_entity(&entity_type, entity_id).await {
+            Ok(notes) => {
+                for note in &notes {
+                    // Energy only for the notes of the session's project;
+                    // a session without project warms nothing.
+                    if session_project.is_none() || note.project_id != session_project {
                         all_note_ids.push(note.id);
                         all_notes.push(note.clone());
+                        continue;
                     }
+                    if let Err(e) = neo4j
+                        .boost_energy(note.id, ar_config.chat_energy_boost)
+                        .await
+                    {
+                        debug!(
+                            note_id = %note.id,
+                            error = %e,
+                            "Chat neural reinforcement: energy boost failed"
+                        );
+                    } else {
+                        boost_count += 1;
+                    }
+                    all_note_ids.push(note.id);
+                    all_notes.push(note.clone());
+                }
+            }
+            Err(e) => {
+                debug!(
+                    entity_type = %entity_type_str,
+                    entity_id = %entity_id,
+                    error = %e,
+                    "Chat neural reinforcement: get_notes_for_entity failed"
+                );
+            }
+        }
+    }
+
+    // Reinforce synapses between co-activated notes (Hebbian: "fire together, wire together")
+    if all_note_ids.len() >= 2 {
+        all_note_ids.sort();
+        all_note_ids.dedup();
+        if all_note_ids.len() >= 2 {
+            // Notes linked to an entity may belong to several projects: synapses
+            // never cross projects, so reinforce each project on its own.
+            match crate::notes::coactivation::reinforce_per_project(
+                neo4j,
+                &all_notes,
+                ar_config.chat_synapse_boost,
+            )
+            .await
+            {
+                Ok(synapse_count) => {
+                    debug!(
+                        session_id = %session_uuid,
+                        energy_boosts = boost_count,
+                        synapses_reinforced = synapse_count,
+                        notes_activated = all_note_ids.len(),
+                        "Chat neural reinforcement complete"
+                    );
                 }
                 Err(e) => {
                     debug!(
-                        entity_type = %entity_type_str,
-                        entity_id = %entity_id,
+                        session_id = %session_uuid,
                         error = %e,
-                        "Chat neural reinforcement: get_notes_for_entity failed"
+                        "Chat neural reinforcement: synapse reinforcement failed"
                     );
                 }
             }
         }
-
-        // Reinforce synapses between co-activated notes (Hebbian: "fire together, wire together")
-        if all_note_ids.len() >= 2 {
-            all_note_ids.sort();
-            all_note_ids.dedup();
-            if all_note_ids.len() >= 2 {
-                // Notes linked to an entity may belong to several projects: synapses
-                // never cross projects, so reinforce each project on its own.
-                match crate::notes::coactivation::reinforce_per_project(
-                    neo4j.as_ref(),
-                    &all_notes,
-                    ar_config.chat_synapse_boost,
-                )
-                .await
-                {
-                    Ok(synapse_count) => {
-                        debug!(
-                            session_id = %session_uuid,
-                            energy_boosts = boost_count,
-                            synapses_reinforced = synapse_count,
-                            notes_activated = all_note_ids.len(),
-                            "Chat neural reinforcement complete"
-                        );
-                    }
-                    Err(e) => {
-                        debug!(
-                            session_id = %session_uuid,
-                            error = %e,
-                            "Chat neural reinforcement: synapse reinforcement failed"
-                        );
-                    }
-                }
-            }
-        } else if boost_count > 0 {
-            debug!(
-                session_id = %session_uuid,
-                energy_boosts = boost_count,
-                "Chat neural reinforcement: energy only (< 2 notes for synapses)"
-            );
-        }
-    });
+    } else if boost_count > 0 {
+        debug!(
+            session_id = %session_uuid,
+            energy_boosts = boost_count,
+            "Chat neural reinforcement: energy only (< 2 notes for synapses)"
+        );
+    }
 }
 
 // ============================================================================
@@ -1592,5 +1615,86 @@ mod tests {
                 is_streaming: false
             }
         ));
+    }
+
+    // ---- energy boost is scoped to the session project (T0f) ----
+
+    async fn seeded_note(
+        mock: &crate::neo4j::mock::MockGraphStore,
+        project: Uuid,
+        path: &str,
+    ) -> Uuid {
+        use crate::neo4j::traits::GraphStore;
+        let mut n = crate::notes::Note::new(
+            Some(project),
+            crate::notes::NoteType::Guideline,
+            "n".into(),
+            "t".into(),
+        );
+        n.energy = 0.3;
+        n.last_activated = None;
+        mock.create_note(&n).await.unwrap();
+        mock.link_note_to_entity(n.id, &crate::notes::EntityType::File, path, None, None)
+            .await
+            .unwrap();
+        n.id
+    }
+
+    #[tokio::test]
+    async fn neural_reinforcement_boosts_only_the_session_project() {
+        use crate::neo4j::traits::GraphStore;
+        let mock = crate::neo4j::mock::MockGraphStore::new();
+        let mut project = crate::test_helpers::test_project();
+        project.slug = "mine".into();
+        let other = Uuid::new_v4();
+        mock.create_project(&project).await.unwrap();
+        let session = crate::test_helpers::test_chat_session(Some("mine"));
+        mock.create_chat_session(&session).await.unwrap();
+
+        let mine_a = seeded_note(&mock, project.id, "src/shared.rs").await;
+        let mine_b = seeded_note(&mock, project.id, "src/shared.rs").await;
+        let foreign = seeded_note(&mock, other, "src/shared.rs").await;
+
+        let cfg = crate::neurons::config::AutoReinforcementConfig::default();
+        neural_reinforcement(
+            &mock,
+            session.id,
+            &[("File".to_string(), "src/shared.rs".to_string())],
+            &cfg,
+        )
+        .await;
+
+        for id in [mine_a, mine_b] {
+            let n = mock.get_note(id).await.unwrap().unwrap();
+            assert!(n.last_activated.is_some(), "own note must be boosted");
+            assert!(n.energy > 0.3);
+        }
+        let f = mock.get_note(foreign).await.unwrap().unwrap();
+        assert!(
+            f.last_activated.is_none(),
+            "foreign note must not be boosted"
+        );
+        assert!((f.energy - 0.3).abs() < 1e-9);
+        assert!(mock.get_synapses(foreign).await.unwrap().is_empty());
+        assert_eq!(mock.get_synapses(mine_a).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn neural_reinforcement_without_session_project_boosts_nothing() {
+        use crate::neo4j::traits::GraphStore;
+        let mock = crate::neo4j::mock::MockGraphStore::new();
+        let session = crate::test_helpers::test_chat_session(None);
+        mock.create_chat_session(&session).await.unwrap();
+        let a = seeded_note(&mock, Uuid::new_v4(), "src/x.rs").await;
+        let cfg = crate::neurons::config::AutoReinforcementConfig::default();
+        neural_reinforcement(
+            &mock,
+            session.id,
+            &[("File".to_string(), "src/x.rs".to_string())],
+            &cfg,
+        )
+        .await;
+        let n = mock.get_note(a).await.unwrap().unwrap();
+        assert!(n.last_activated.is_none());
     }
 }

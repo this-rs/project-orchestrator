@@ -334,7 +334,8 @@ jobs:
           # harness_neo4j: the Cypher of the provider settings; REQUIRED here, so a
           # missing Neo4j fails instead of passing silently.
           HARNESS_NEO4J_REQUIRED=1 cargo test --test integration_tests --test data_migrations \
-            --test workspace_tests --test neo4j_store_tests --test harness_neo4j
+            --test workspace_tests --test neo4j_store_tests --test harness_neo4j \
+            --test neo4j_note_consent
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
@@ -527,7 +528,18 @@ jobs:
       - name: Build the nexus fake servers used by the agent e2e tests
         uses: ./.github/actions/nexus-fakes
 
+      # PARITY_NEO4J_URI here (this job has the Neo4j service) is what makes the
+      # one lib test that needs a real Neo4j, neo4j::mock::cross_project_parity,
+      # actually run; HARNESS_NEO4J_REQUIRED turns a missing Neo4j into a
+      # failure. Its own variable, not NEO4J_URI: the config tests of lib.rs
+      # clear NEO4J_* in the same process while tests run in parallel.
+      # The Unit Tests job has no Neo4j and no PARITY_NEO4J_URI: it skips.
       - name: Collect coverage — unit tests (workspace)
+        env:
+          PARITY_NEO4J_URI: bolt://localhost:7687
+          PARITY_NEO4J_USER: neo4j
+          PARITY_NEO4J_PASSWORD: testpassword
+          HARNESS_NEO4J_REQUIRED: "1"
         run: |
           cargo llvm-cov --no-report --no-fail-fast \
             --workspace --exclude project-orchestrator-desktop --lib \

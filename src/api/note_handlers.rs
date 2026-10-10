@@ -126,6 +126,9 @@ pub struct CreateNoteBody {
     pub assertion_rule: Option<crate::notes::AssertionRule>,
     /// Optional protocol run ID for PRODUCED_DURING relation
     pub run_id: Option<Uuid>,
+    /// Optional sharing consent persisted at creation (default `not_set`)
+    #[serde(default)]
+    pub sharing_consent: Option<crate::episodes::distill_models::SharingConsent>,
 }
 
 /// Request to update a note
@@ -216,6 +219,7 @@ pub async fn create_note(
         anchors: body.anchors,
         assertion_rule: body.assertion_rule,
         run_id: None, // run_id is handled at the handler level, not passed down
+        sharing_consent: body.sharing_consent,
     };
 
     let note = state
@@ -557,6 +561,7 @@ pub async fn supersede_note(
         anchors: body.anchors,
         assertion_rule: body.assertion_rule,
         run_id: None,
+        sharing_consent: body.sharing_consent,
     };
 
     let new_note = state

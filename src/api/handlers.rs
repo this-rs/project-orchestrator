@@ -3780,6 +3780,7 @@ pub async fn persist_health_report(
 
     // 4. Create the note
     let create_req = CreateNoteRequest {
+        sharing_consent: None,
         project_id: Some(project_id),
         note_type: NoteType::Observation,
         content,
@@ -9174,7 +9175,10 @@ mod tests {
 
     /// Build a mock OrchestratorState for handler tests.
     async fn mock_server_state() -> OrchestratorState {
-        let state = crate::test_helpers::mock_app_state();
+        mock_server_state_from(crate::test_helpers::mock_app_state()).await
+    }
+
+    async fn mock_server_state_from(state: crate::AppState) -> OrchestratorState {
         let event_bus = Arc::new(crate::events::HybridEmitter::new(Arc::new(
             crate::events::EventBus::default(),
         )));
@@ -9212,6 +9216,96 @@ mod tests {
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
             vault: crate::vault::VaultService::ephemeral(),
         })
+    }
+
+    /// The isomorphic pass is project-wide: notes of another project anchored
+    /// on the same file path must be neither boosted nor wired.
+    #[tokio::test]
+    async fn test_reinforce_isomorphic_ignores_notes_of_other_projects() {
+        use crate::notes::{EntityType, Note, NoteType};
+        let graph = crate::neo4j::mock::MockGraphStore::new();
+        graph
+            .isomorphic_groups
+            .write()
+            .await
+            .push(crate::graph::models::IsomorphicGroup {
+                wl_hash: 7,
+                members: vec!["src/a.rs".into(), "src/b.rs".into()],
+                size: 2,
+            });
+        let state = mock_server_state_from(crate::test_helpers::mock_app_state_with(
+            graph,
+            crate::meilisearch::mock::MockSearchStore::new(),
+        ))
+        .await;
+        let neo4j = state.orchestrator.neo4j_arc();
+        let project = test_project();
+        neo4j.create_project(&project).await.unwrap();
+        let other = Uuid::new_v4();
+
+        let mut ids = Vec::new();
+        for (owner, path) in [
+            (project.id, "src/a.rs"),
+            (project.id, "src/b.rs"),
+            (other, "src/a.rs"),
+        ] {
+            let mut n = Note::new(Some(owner), NoteType::Guideline, "n".into(), "t".into());
+            n.energy = 0.3;
+            n.last_activated = None;
+            neo4j.create_note(&n).await.unwrap();
+            neo4j
+                .link_note_to_entity(n.id, &EntityType::File, path, None, None)
+                .await
+                .unwrap();
+            ids.push(n.id);
+        }
+
+        let Json(out) = reinforce_isomorphic_synapses(
+            State(state.clone()),
+            Json(FabricProjectRequest {
+                project_id: project.id,
+            }),
+        )
+        .await
+        .unwrap();
+        // 2 own notes = 1 pair = 2 directed synapses; the foreign note adds none.
+        assert_eq!(out["synapses_reinforced"], 2);
+        assert_eq!(out["groups_with_notes"], 1);
+        assert!(neo4j.get_synapses(ids[2]).await.unwrap().is_empty());
+        for own in &ids[..2] {
+            let n = neo4j.get_note(*own).await.unwrap().unwrap();
+            assert!(n.last_activated.is_some(), "own note boosted");
+        }
+        let foreign = neo4j.get_note(ids[2]).await.unwrap().unwrap();
+        assert!(foreign.last_activated.is_none(), "foreign note not boosted");
+
+        // One own note + one foreign note: nothing to wire at all.
+        let lone = test_project();
+        neo4j.create_project(&lone).await.unwrap();
+        let mut n = Note::new(Some(lone.id), NoteType::Guideline, "n".into(), "t".into());
+        n.last_activated = None;
+        neo4j.create_note(&n).await.unwrap();
+        neo4j
+            .link_note_to_entity(n.id, &EntityType::File, "src/a.rs", None, None)
+            .await
+            .unwrap();
+        let Json(out) = reinforce_isomorphic_synapses(
+            State(state.clone()),
+            Json(FabricProjectRequest {
+                project_id: lone.id,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["groups_with_notes"], 0);
+        assert_eq!(out["synapses_reinforced"], 0);
+        assert!(neo4j
+            .get_note(n.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_activated
+            .is_none());
     }
 
     fn watch_router(state: OrchestratorState) -> Router {

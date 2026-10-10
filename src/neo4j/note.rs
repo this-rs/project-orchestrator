@@ -173,7 +173,8 @@ impl Neo4jClient {
                 assertion_rule_json: $assertion_rule_json,
                 scar_intensity: $scar_intensity,
                 memory_horizon: $memory_horizon,
-                activation_count: $activation_count
+                activation_count: $activation_count,
+                sharing_consent: $sharing_consent
             })
             "#,
         )
@@ -217,7 +218,8 @@ impl Neo4jClient {
         )
         .param("scar_intensity", note.scar_intensity)
         .param("memory_horizon", note.memory_horizon.to_string())
-        .param("activation_count", note.activation_count);
+        .param("activation_count", note.activation_count)
+        .param("sharing_consent", note.sharing_consent.as_db_str());
 
         self.graph.run(q).await?;
 
@@ -1809,24 +1811,25 @@ impl Neo4jClient {
                                 c
                             }
                         };
-                        let Some(coupling) = coupling else { continue };
-
-                        if coupling < 0.2 && !force_cross_project {
-                            // Suppress low-coupling cross-project propagation
-                            tracing::debug!(
-                                note_id = %pn.note.id,
-                                source_project = %src_pid,
-                                note_project = %pid,
-                                coupling,
-                                "Suppressed cross-project note propagation (coupling < 0.2)"
-                            );
-                            continue;
-                        }
-
-                        // Weight the score by coupling strength
-                        pn.relevance_score *= coupling;
-                        if pn.relevance_score >= min_score {
-                            filtered_notes.push(pn);
+                        match crate::notes::PropagationScope::weigh_foreign(
+                            pn.relevance_score,
+                            coupling,
+                            force_cross_project,
+                            min_score,
+                        ) {
+                            Some(weighted) => {
+                                pn.relevance_score = weighted;
+                                filtered_notes.push(pn);
+                            }
+                            None => {
+                                tracing::debug!(
+                                    note_id = %pn.note.id,
+                                    source_project = %src_pid,
+                                    note_project = %pid,
+                                    ?coupling,
+                                    "Suppressed cross-project note propagation (coupling)"
+                                );
+                            }
                         }
                     }
                     _ => {

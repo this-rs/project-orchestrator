@@ -542,6 +542,7 @@ pub async fn create_rfc(
         .and_then(|s| s.parse::<NoteImportance>().ok());
 
     let request = CreateNoteRequest {
+        sharing_consent: None,
         project_id: body.project_id,
         note_type: NoteType::Rfc,
         content,
@@ -1007,6 +1008,7 @@ mod tests {
             ]
         });
         let req = CreateNoteRequest {
+            sharing_consent: None,
             project_id: Some(project_id),
             note_type: NoteType::Rfc,
             content: content.to_string(),
