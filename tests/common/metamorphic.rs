@@ -125,6 +125,6 @@ pub fn punctuation_noise(message: &str) -> Vec<String> {
     vec![
         format!("{message} !!!"),
         format!("{message}..."),
-        message.replace('?', "").replace('!', "").trim().to_string(),
+        message.replace(['?', '!'], "").trim().to_string(),
     ]
 }

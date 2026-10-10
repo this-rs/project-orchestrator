@@ -161,7 +161,7 @@ fn trigger_ties_are_ordered_by_id_not_by_input_position() {
 
 #[test]
 fn a_candidate_scoring_below_the_best_never_changes_the_best() {
-    let triggers = vec![
+    let triggers = [
         trigger(1, "exact", "note", "created", None),
         trigger(2, "other_entity", "plan", "status_changed", None),
     ];
@@ -186,7 +186,7 @@ fn protocol(index: u128, relevance: RelevanceVector) -> Protocol {
 fn protocol_ranking_is_invariant_to_candidate_order_including_ties() {
     let ctx = ContextVector::from_plan_context("execution", 6, 4, 8, 0.4);
     // Two protocols with the default (neutral) relevance: an exact tie.
-    let protocols = vec![
+    let protocols = [
         protocol(3, RelevanceVector::default()),
         protocol(1, RelevanceVector::default()),
         protocol(
