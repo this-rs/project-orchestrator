@@ -73,14 +73,27 @@ CHAT_PROVIDER_ACP_COMMANDS='{"openclaw":["openclaw","acp","--url","wss://gateway
   The file belongs to the server's user, mode `0600`.
 - **No project-orchestrator tools in the session.** The bridge refuses MCP servers given per
   session (`session/new` answers "ACP bridge mode does not support per-session MCP servers";
-  older versions ignored them without a word). The server knows it from the program's name
-  (`openclaw`, whatever its path): the session is opened **without** the project-orchestrator
-  MCP server and says so, `degraded_features` carries `project_orchestrator_tools` (the same
-  banner as a remote Claude Code). An ACP agent declared under another name that refuses
-  them the same way opens its first session again without them (and says so); the next
-  sessions of that instance are opened without them from the start. To give OpenClaw the PO tools, configure them on the
-  OpenClaw side (`openclaw mcp set project-orchestrator '<json>'`: a stdio `command`, or the
-  server's `/mcp` over Streamable HTTP when `remote_mcp.enabled`, with its authentication).
+  older versions **ignored them without a word**). The session is opened **without** the
+  project-orchestrator MCP server and says so: `degraded_features` carries
+  `project_orchestrator_tools` (the same banner as a remote Claude Code). How the server knows:
+  - **the declaration**, which always wins: an entry may be an object,
+    `{"openclaw": {"argv": ["npx", "openclaw", "acp", "--token-file", "/etc/po/openclaw.token"], "per_session_mcp": false}}`.
+    Declare it for an older OpenClaw (nothing to learn: it says nothing) and for any agent
+    that takes no MCP server. `"per_session_mcp": true` forces the other way. An entry with
+    an unknown or misspelt field is left out, never half-read (its instance then answers that the
+    agent is not declared);
+  - **the name**, as a convenience: any argument whose file name is `openclaw` (one
+    extension removed: `openclaw`, `/usr/bin/openclaw`, `npx openclaw`, `pnpm dlx openclaw`,
+    `bunx openclaw`, `node …/openclaw.mjs`, `env openclaw`, `OpenClaw.cmd`). An argument such
+    as a path `/run/openclaw` counts too: declare `"per_session_mcp": true` if that is wrong;
+  - **the refusal, learned**: an agent that refuses the servers is asked again once without
+    them (the session says so on the thread, `system:mcp_servers_refused`), and the next
+    sessions of that instance are opened without them. Learned **in memory**: a restart of the
+    server, or any change to the instance, forgets it (one more refused round-trip); a
+    resumed session keeps what its first opening found (its frozen capabilities).
+  To give OpenClaw the PO tools, configure them on the OpenClaw side
+  (`openclaw mcp set project-orchestrator '<json>'`: a stdio `command`, or the server's `/mcp`
+  over Streamable HTTP when `remote_mcp.enabled`, with its authentication).
 - **Other limits of the bridge**: no `fs/*` or `terminal/*` requests (the agent uses its own
   tools), no model choice (the model name is a label), no system prompt, no knowledge-graph
   hooks, no compaction signal, images not sent; permissions are relayed only while a turn is
@@ -147,7 +160,7 @@ Two counters: *marginal* (reported or priced: real spend, the only one that can 
 |---|---|---|
 | `CHAT_PROVIDER_PATH` | `legacy` | `agent` forces Claude Code onto the agent engine (degraded, warned) |
 | `CHAT_PROVIDER_ENV_CREDENTIALS` | empty | server variables an instance may name as `env:<VAR>` |
-| `CHAT_PROVIDER_ACP_COMMANDS` | empty | JSON object of ACP agents an instance may launch |
+| `CHAT_PROVIDER_ACP_COMMANDS` | empty | JSON object of ACP agents an instance may launch: `name: [argv]` or `name: {"argv": [...], "per_session_mcp": false}` |
 | `CHAT_CHILD_ENV_INHERIT` | empty | extra variables handed to agent processes (never the server's own secrets) |
 
 ## Not verified
