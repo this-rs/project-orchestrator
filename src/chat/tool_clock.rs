@@ -11,41 +11,40 @@
 //!
 //! ## What is measured
 //!
-//! One [`ToolClock`] per session, fed from two doors that both engines have:
+//! One [`ToolClock`] per session ([`ToolClock::for_session`]), fed where each
+//! engine produces what it knows, never from a relay:
 //!
-//! - the **PreToolUse hook** of the shared hook table (`graph_hook_table`): the
-//!   moment the engine takes the call up (the Claude Code CLI, or the agent
-//!   engine through `GraphSessionHooks::before_tool`). On both engines it runs
-//!   BEFORE the permission is asked;
-//! - the **chat events** of the session: `tool_use` (announced),
-//!   `permission_request` / `ask_user_question` (the engine waits for the user),
-//!   `permission_decision` (the user answered), `tool_result` (the engine has the
-//!   result).
+//! - the **PreToolUse callbacks** of the shared hook table (`graph_hook_table`),
+//!   wrapped by [`clock_the_table`]: the moment the engine takes the call up (the
+//!   Claude Code CLI, or the agent engine through `GraphSessionHooks::before_tool`).
+//!   On both engines it runs BEFORE the permission is asked;
+//! - the **chat events**, observed where the engine emits them (the legacy stream
+//!   loop and its interrupt cleanup, `AgentSessionHandle::emit`): `tool_use`
+//!   (announced), `permission_request` (matched to its call by `tool_use_id`) and
+//!   `ask_user_question` (the engine waits for the user), `tool_result` /
+//!   `tool_cancelled` (the call is over);
+//! - the user's **answer to a permission**, noted by [`ToolClock::decided`] BEFORE
+//!   it is handed to the CLI or the provider (a fast tool's result cannot overtake
+//!   it), and taken back by [`ToolClock::undecided`] when the hand-over fails.
 //!
-//! When the result arrives, the clock answers one [`ChatEvent::ToolTiming`] for
-//! the call: every time it knows, in seconds since the epoch with the
-//! milliseconds as the fraction (the unit of `created_at`), and `run_started_at`,
-//! when the tool itself started running: the permission's answer when one was
-//! asked, else the take-up by the engine, else the announcement. A permission
-//! asked and never answered (a question answered by the result itself) leaves
-//! `run_started_at` out rather than count the wait as run time.
+//! When the call is over, the clock answers one [`ChatEvent::ToolTiming`], which
+//! the engine stores and relays right after the result, in the same order.
+//! Times: seconds since the epoch, the milliseconds as the fraction.
 //!
-//! The legacy engine is fed by [`spawn_legacy_tap`] (a subscriber of the
-//! session's broadcast, which persists and relays the timing); the agent engine
-//! feeds its clock from its own `emit`.
+//! `run_started_at` is when the tool itself started running, and only a time the
+//! engine saw: the permission's answer when one was asked and allowed, else the
+//! take-up. It is absent rather than guessed: a denied permission (the tool never
+//! ran), a permission never answered (a cancellation, a question answered by the
+//! result itself), an engine that runs no host hook (remote cwd, Codex, ACP
+//! sessions of the agent engine). `incomplete` says the clock may have missed a
+//! wait (a permission request that named no call).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use chrono::{DateTime, Utc};
-use serde_json::Value;
-use tokio::sync::broadcast;
-use uuid::Uuid;
 
 use super::types::ChatEvent;
-use crate::neo4j::models::ChatEventRecord;
-use crate::neo4j::traits::GraphStore;
 
 /// Seconds since the epoch, the milliseconds as the fraction (the chat wire's unit).
 fn seconds(at: DateTime<Utc>) -> f64 {
@@ -54,23 +53,25 @@ fn seconds(at: DateTime<Utc>) -> f64 {
 
 #[derive(Default)]
 struct Call {
-    tool: Option<String>,
-    input: Option<Value>,
     parent: Option<String>,
     called_at: Option<DateTime<Utc>>,
     started_at: Option<DateTime<Utc>>,
     permission_requested_at: Option<DateTime<Utc>>,
-    permission_resolved_at: Option<DateTime<Utc>>,
+    /// The answer: when, and whether the tool may run.
+    permission_resolved: Option<(DateTime<Utc>, bool)>,
+    /// A question to the user: its answer is the result, the call never "runs".
+    question: bool,
+    incomplete: bool,
 }
 
 #[derive(Default)]
 struct State {
     calls: HashMap<String, Call>,
-    /// Permission request id → tool call id.
+    /// Permission (or question) request id → tool call id, while the call lasts.
     requests: HashMap<String, String>,
 }
 
-/// The times of the tool calls of one session, until their result.
+/// The times of the tool calls of one session, until they are over.
 #[derive(Default)]
 pub(crate) struct ToolClock {
     state: Mutex<State>,
@@ -82,8 +83,8 @@ fn registry() -> &'static Mutex<HashMap<String, Weak<ToolClock>>> {
 }
 
 impl ToolClock {
-    /// The clock of a session: the hook and the event feeder of one session share
-    /// it. It lives as long as one of them holds it.
+    /// The clock of a session: every door of one session shares it. It lives as
+    /// long as one of them holds it.
     pub(crate) fn for_session(session_id: &str) -> Arc<ToolClock> {
         let mut clocks = registry().lock().unwrap_or_else(|e| e.into_inner());
         clocks.retain(|_, clock| clock.strong_count() > 0);
@@ -100,65 +101,81 @@ impl ToolClock {
     }
 
     /// The engine takes the call up (PreToolUse). The first take-up counts.
-    pub(crate) fn taken_up(&self, id: &str, tool: &str, input: &Value, at: DateTime<Utc>) {
+    pub(crate) fn taken_up(&self, id: &str, at: DateTime<Utc>) {
+        self.state()
+            .calls
+            .entry(id.to_string())
+            .or_default()
+            .started_at
+            .get_or_insert(at);
+    }
+
+    /// The user answered `request_id`, at `at`; call it BEFORE the answer is handed
+    /// to the engine. The first answer counts.
+    pub(crate) fn decided(&self, request_id: &str, allow: bool, at: DateTime<Utc>) {
         let mut state = self.state();
-        let call = state.calls.entry(id.to_string()).or_default();
-        call.started_at.get_or_insert(at);
-        call.tool.get_or_insert_with(|| tool.to_string());
-        if call.input.as_ref().is_none_or(is_empty) {
-            call.input = Some(input.clone());
+        let Some(call_id) = state.requests.get(request_id).cloned() else {
+            return;
+        };
+        if let Some(call) = state.calls.get_mut(&call_id) {
+            call.permission_resolved.get_or_insert((at, allow));
         }
     }
 
-    /// Note what `event` says about a call; on its result, the call's timing.
+    /// The answer to `request_id` could not be handed over: it is pending again.
+    pub(crate) fn undecided(&self, request_id: &str) {
+        let mut state = self.state();
+        let Some(call_id) = state.requests.get(request_id).cloned() else {
+            return;
+        };
+        if let Some(call) = state.calls.get_mut(&call_id) {
+            call.permission_resolved = None;
+        }
+    }
+
+    /// Note what `event` says about a call; when it ends one, that call's timing.
     pub(crate) fn observe(&self, event: &ChatEvent, at: DateTime<Utc>) -> Option<ChatEvent> {
         let mut state = self.state();
         match event {
             ChatEvent::ToolUse {
                 id,
-                tool,
-                input,
                 parent_tool_use_id,
                 ..
             } => {
                 let call = state.calls.entry(id.clone()).or_default();
                 call.called_at.get_or_insert(at);
-                call.tool = Some(tool.clone());
-                call.parent = parent_tool_use_id.clone();
-                if !is_empty(input) {
-                    call.input = Some(input.clone());
-                }
-                None
-            }
-            ChatEvent::ToolUseInputResolved { id, input, .. } => {
-                if let Some(call) = state.calls.get_mut(id) {
-                    call.input = Some(input.clone());
+                if call.parent.is_none() {
+                    call.parent = parent_tool_use_id.clone();
                 }
                 None
             }
             ChatEvent::PermissionRequest {
-                id, tool, input, ..
+                id, tool_use_id, ..
             } => {
-                if let Some(call_id) = asked_call(&state.calls, tool, input) {
-                    if let Some(call) = state.calls.get_mut(&call_id) {
-                        call.permission_requested_at = Some(at);
+                match tool_use_id {
+                    Some(call_id) => {
+                        let call = state.calls.entry(call_id.clone()).or_default();
+                        call.permission_requested_at.get_or_insert(at);
+                        state.requests.insert(id.clone(), call_id.clone());
                     }
-                    state.requests.insert(id.clone(), call_id);
+                    // A request that names no call: any open call may have waited.
+                    None => state.calls.values_mut().for_each(|c| c.incomplete = true),
                 }
                 None
             }
             ChatEvent::AskUserQuestion {
                 id, tool_call_id, ..
-            } => {
+            } if !tool_call_id.is_empty() => {
                 let call = state.calls.entry(tool_call_id.clone()).or_default();
-                call.permission_requested_at = Some(at);
+                call.permission_requested_at.get_or_insert(at);
+                call.question = true;
                 state.requests.insert(id.clone(), tool_call_id.clone());
                 None
             }
-            ChatEvent::PermissionDecision { id, .. } => {
-                if let Some(call_id) = state.requests.remove(id) {
+            ChatEvent::PermissionDecision { id, allow } => {
+                if let Some(call_id) = state.requests.get(id).cloned() {
                     if let Some(call) = state.calls.get_mut(&call_id) {
-                        call.permission_resolved_at = Some(at);
+                        call.permission_resolved.get_or_insert((at, *allow));
                     }
                 }
                 None
@@ -167,15 +184,11 @@ impl ToolClock {
                 id,
                 parent_tool_use_id,
                 ..
-            }
-            | ChatEvent::ToolCancelled {
+            } => end(&mut state, id, parent_tool_use_id, false, at),
+            ChatEvent::ToolCancelled {
                 id,
                 parent_tool_use_id,
-            } => {
-                let call = state.calls.remove(id)?;
-                state.requests.retain(|_, call_id| call_id != id);
-                Some(timing(id, call, parent_tool_use_id.clone(), at))
-            }
+            } => end(&mut state, id, parent_tool_use_id, true, at),
             // The turn is over: a call without a result will not get one.
             ChatEvent::Result { .. } => {
                 state.calls.clear();
@@ -187,49 +200,38 @@ impl ToolClock {
     }
 }
 
-fn is_empty(input: &Value) -> bool {
-    match input {
-        Value::Null => true,
-        Value::Object(map) => map.is_empty(),
-        _ => false,
-    }
-}
-
-/// The call a permission request is about: a call of that tool still waiting for
-/// its result and not asked yet, the one with the same input first, else the one
-/// the engine took up last.
-fn asked_call(calls: &HashMap<String, Call>, tool: &str, input: &Value) -> Option<String> {
-    let waiting: Vec<(&String, &Call)> = calls
-        .iter()
-        .filter(|(_, c)| c.permission_requested_at.is_none() && c.tool.as_deref() == Some(tool))
-        .collect();
-    waiting
-        .iter()
-        .find(|(_, c)| c.input.as_ref() == Some(input))
-        .or_else(|| {
-            waiting
-                .iter()
-                .max_by_key(|(_, c)| c.started_at.or(c.called_at))
-        })
-        .map(|(id, _)| (*id).clone())
-}
-
-fn timing(id: &str, call: Call, parent: Option<String>, ended_at: DateTime<Utc>) -> ChatEvent {
-    let run_started_at = if call.permission_requested_at.is_some() {
-        call.permission_resolved_at
-    } else {
-        call.started_at.or(call.called_at)
+/// The timing of the call `id`, which is over (once: the call is taken out).
+fn end(
+    state: &mut State,
+    id: &str,
+    parent: &Option<String>,
+    cancelled: bool,
+    at: DateTime<Utc>,
+) -> Option<ChatEvent> {
+    let call = state.calls.remove(id)?;
+    state.requests.retain(|_, call_id| call_id != id);
+    let asked = call.permission_requested_at.is_some();
+    let run_started_at = match (asked, call.question, call.permission_resolved) {
+        (_, true, _) => None,
+        (true, false, Some((resolved, true))) => Some(resolved),
+        (true, false, _) => None,
+        (false, false, _) => call.started_at,
     };
-    ChatEvent::ToolTiming {
+    Some(ChatEvent::ToolTiming {
         id: id.to_string(),
         called_at: call.called_at.map(seconds),
         started_at: call.started_at.map(seconds),
         permission_requested_at: call.permission_requested_at.map(seconds),
-        permission_resolved_at: call.permission_resolved_at.map(seconds),
+        permission_resolved_at: call.permission_resolved.map(|(at, _)| seconds(at)),
+        permission_outcome: call
+            .permission_resolved
+            .map(|(_, allow)| if allow { "allowed" } else { "denied" }.to_string()),
         run_started_at: run_started_at.map(seconds),
-        ended_at: seconds(ended_at),
-        parent_tool_use_id: parent.or(call.parent),
-    }
+        ended_at: seconds(at),
+        cancelled,
+        incomplete: call.incomplete,
+        parent_tool_use_id: parent.clone().or(call.parent),
+    })
 }
 
 /// A PreToolUse callback that tells the clock when the engine takes a call up,
@@ -244,7 +246,7 @@ pub(crate) struct ToolClockHook {
 }
 
 /// Puts the session's clock on every PreToolUse callback of `table`, or adds it
-/// alone when the table has none (a runner session).
+/// alone when the table has none for every tool (a runner session).
 pub(crate) fn clock_the_table(table: &mut super::agent_hooks::HookTable, clock: Arc<ToolClock>) {
     let matchers = table.entry("PreToolUse".to_string()).or_default();
     for matcher in matchers.iter_mut() {
@@ -274,9 +276,8 @@ impl nexus_claude::HookCallback for ToolClockHook {
         tool_use_id: Option<&str>,
         context: &nexus_claude::HookContext,
     ) -> std::result::Result<nexus_claude::HookJSONOutput, nexus_claude::SdkError> {
-        if let (nexus_claude::HookInput::PreToolUse(pre), Some(id)) = (input, tool_use_id) {
-            self.clock
-                .taken_up(id, &pre.tool_name, &pre.tool_input, Utc::now());
+        if let (nexus_claude::HookInput::PreToolUse(_), Some(id)) = (input, tool_use_id) {
+            self.clock.taken_up(id, Utc::now());
         }
         match &self.inner {
             Some(inner) => inner.execute(input, tool_use_id, context).await,
@@ -290,67 +291,43 @@ impl nexus_claude::HookCallback for ToolClockHook {
     }
 }
 
-/// Feeds the clock of a legacy (Claude Code CLI) session from its broadcast, and
-/// persists and relays each timing like the session's other events. It holds the
-/// sender weakly: it ends with the session's channel.
-pub(crate) fn spawn_legacy_tap(
-    session_id: String,
-    events_tx: &broadcast::Sender<ChatEvent>,
-    nats: Option<Arc<crate::events::NatsEmitter>>,
-    graph: Arc<dyn GraphStore>,
-    next_seq: Arc<AtomicI64>,
-) {
-    let clock = ToolClock::for_session(&session_id);
-    let mut rx = events_tx.subscribe();
-    let tx = events_tx.downgrade();
-    let uuid = Uuid::parse_str(&session_id).ok();
-    tokio::spawn(async move {
-        loop {
-            let event = match rx.recv().await {
-                Ok(event) => event,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
-            };
-            let Some(timing) = clock.observe(&event, Utc::now()) else {
-                continue;
-            };
-            if let Some(uuid) = uuid {
-                let record = ChatEventRecord {
-                    id: Uuid::new_v4(),
-                    session_id: uuid,
-                    seq: next_seq.fetch_add(1, Ordering::SeqCst),
-                    event_type: timing.event_type().to_string(),
-                    data: serde_json::to_string(&timing).unwrap_or_default(),
-                    created_at: Utc::now(),
-                };
-                let _ = graph.store_chat_events(uuid, vec![record]).await;
-            }
-            if let Some(nats) = &nats {
-                nats.publish_chat_event(&session_id, timing.clone());
-            }
-            let Some(tx) = tx.upgrade() else { break };
-            let _ = tx.send(timing);
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{json, Value};
+    use uuid::Uuid;
 
     fn at(ms: i64) -> DateTime<Utc> {
         DateTime::from_timestamp_millis(ms).unwrap()
     }
 
-    fn tool_use(id: &str, tool: &str, input: Value) -> ChatEvent {
+    fn tool_use(id: &str) -> ChatEvent {
         ChatEvent::ToolUse {
             id: id.into(),
-            tool: tool.into(),
-            input,
+            tool: "Bash".into(),
+            input: json!({}),
             parent_tool_use_id: None,
             category: None,
             canonical: None,
+        }
+    }
+
+    fn asks(request: &str, call: Option<&str>) -> ChatEvent {
+        ChatEvent::PermissionRequest {
+            id: request.into(),
+            tool: "Bash".into(),
+            input: json!({"command": "ls"}),
+            parent_tool_use_id: None,
+            category: None,
+            canonical: None,
+            tool_use_id: call.map(str::to_string),
+        }
+    }
+
+    fn decision(request: &str, allow: bool) -> ChatEvent {
+        ChatEvent::PermissionDecision {
+            id: request.into(),
+            allow,
         }
     }
 
@@ -363,7 +340,14 @@ mod tests {
         }
     }
 
-    fn timing_fields(event: ChatEvent) -> Value {
+    fn cancelled(id: &str) -> ChatEvent {
+        ChatEvent::ToolCancelled {
+            id: id.into(),
+            parent_tool_use_id: None,
+        }
+    }
+
+    fn fields(event: ChatEvent) -> Value {
         assert_eq!(event.event_type(), "tool_timing");
         serde_json::to_value(event).unwrap()
     }
@@ -371,81 +355,131 @@ mod tests {
     #[test]
     fn a_call_without_permission_runs_from_its_take_up_to_its_result() {
         let clock = ToolClock::default();
-        assert!(clock
-            .observe(&tool_use("t1", "Read", json!({})), at(1_000))
-            .is_none());
-        clock.taken_up("t1", "Read", &json!({"file_path": "a"}), at(1_250));
-        let t = timing_fields(clock.observe(&result("t1"), at(1_900)).unwrap());
+        assert!(clock.observe(&tool_use("t1"), at(1_000)).is_none());
+        clock.taken_up("t1", at(1_250));
+        let t = fields(clock.observe(&result("t1"), at(1_900)).unwrap());
         assert_eq!(t["id"], "t1");
         assert_eq!(t["called_at"], 1.0);
         assert_eq!(t["started_at"], 1.25);
         assert_eq!(t["run_started_at"], 1.25);
         assert_eq!(t["ended_at"], 1.9);
         assert!(t.get("permission_requested_at").is_none(), "{t}");
+        assert!(
+            t.get("cancelled").is_none() && t.get("incomplete").is_none(),
+            "{t}"
+        );
     }
 
     #[test]
-    fn the_wait_for_a_permission_is_not_run_time() {
+    fn the_wait_for_an_allowed_permission_is_not_run_time() {
         let clock = ToolClock::default();
-        let input = json!({"command": "ls"});
-        clock.observe(&tool_use("t1", "Bash", input.clone()), at(1_000));
-        clock.taken_up("t1", "Bash", &input, at(1_100));
-        clock.observe(
-            &ChatEvent::PermissionRequest {
-                id: "req-1".into(),
-                tool: "Bash".into(),
-                input: input.clone(),
-                parent_tool_use_id: None,
-                category: None,
-                canonical: None,
-            },
-            at(1_200),
-        );
-        clock.observe(
-            &ChatEvent::PermissionDecision {
-                id: "req-1".into(),
-                allow: true,
-            },
-            at(9_200),
-        );
-        let t = timing_fields(clock.observe(&result("t1"), at(9_500)).unwrap());
+        clock.observe(&tool_use("t1"), at(1_000));
+        clock.taken_up("t1", at(1_100));
+        clock.observe(&asks("req-1", Some("t1")), at(1_200));
+        clock.observe(&decision("req-1", true), at(9_200));
+        let t = fields(clock.observe(&result("t1"), at(9_500)).unwrap());
         assert_eq!(t["started_at"], 1.1);
         assert_eq!(t["permission_requested_at"], 1.2);
         assert_eq!(t["permission_resolved_at"], 9.2);
+        assert_eq!(t["permission_outcome"], "allowed");
         assert_eq!(t["run_started_at"], 9.2);
         assert_eq!(t["ended_at"], 9.5);
     }
 
     #[test]
-    fn a_permission_goes_to_the_call_with_the_same_input() {
+    fn a_denied_permission_is_not_a_run() {
         let clock = ToolClock::default();
-        clock.observe(&tool_use("a", "Bash", json!({"command": "ls"})), at(1_000));
-        clock.observe(
-            &tool_use("b", "Bash", json!({"command": "rm x"})),
-            at(1_001),
-        );
-        clock.taken_up("b", "Bash", &json!({"command": "rm x"}), at(1_002));
-        clock.observe(
-            &ChatEvent::PermissionRequest {
-                id: "r".into(),
-                tool: "Bash".into(),
-                input: json!({"command": "ls"}),
-                parent_tool_use_id: None,
-                category: None,
-                canonical: None,
-            },
-            at(1_500),
-        );
-        let a = timing_fields(clock.observe(&result("a"), at(2_000)).unwrap());
-        assert_eq!(a["permission_requested_at"], 1.5);
-        let b = timing_fields(clock.observe(&result("b"), at(2_100)).unwrap());
+        clock.observe(&tool_use("t1"), at(1_000));
+        clock.taken_up("t1", at(1_100));
+        clock.observe(&asks("req-1", Some("t1")), at(1_200));
+        clock.observe(&decision("req-1", false), at(3_000));
+        // The engine answers the denial with an error result.
+        let t = fields(clock.observe(&result("t1"), at(3_010)).unwrap());
+        assert_eq!(t["permission_outcome"], "denied");
+        assert_eq!(t["permission_resolved_at"], 3.0);
+        assert!(t.get("run_started_at").is_none(), "{t}");
+    }
+
+    #[test]
+    fn without_a_take_up_the_run_start_is_absent_not_the_announcement() {
+        // An engine that runs no host hook (remote cwd, Codex, ACP): only the
+        // announcement and the result are known.
+        let clock = ToolClock::default();
+        clock.observe(&tool_use("t1"), at(1_000));
+        let t = fields(clock.observe(&result("t1"), at(5_000)).unwrap());
+        assert_eq!(t["called_at"], 1.0);
+        assert!(t.get("started_at").is_none(), "{t}");
+        assert!(t.get("run_started_at").is_none(), "{t}");
+    }
+
+    #[test]
+    fn a_permission_goes_to_the_call_it_names() {
+        let clock = ToolClock::default();
+        // Two calls of the same tool with the same input: only the id tells them apart.
+        clock.observe(&tool_use("a"), at(1_000));
+        clock.observe(&tool_use("b"), at(1_001));
+        clock.taken_up("a", at(1_002));
+        clock.taken_up("b", at(1_003));
+        clock.observe(&asks("r", Some("a")), at(1_500));
+        let b = fields(clock.observe(&result("b"), at(2_000)).unwrap());
         assert!(b.get("permission_requested_at").is_none(), "{b}");
+        assert_eq!(b["run_started_at"], 1.003);
+        let a = fields(clock.observe(&result("a"), at(2_100)).unwrap());
+        assert_eq!(a["permission_requested_at"], 1.5);
+    }
+
+    #[test]
+    fn a_request_naming_no_call_marks_the_open_calls_incomplete() {
+        let clock = ToolClock::default();
+        clock.observe(&tool_use("a"), at(1_000));
+        clock.observe(&asks("r", None), at(1_100));
+        let a = fields(clock.observe(&result("a"), at(2_000)).unwrap());
+        assert_eq!(a["incomplete"], true);
+    }
+
+    #[test]
+    fn an_answer_noted_before_the_hand_over_survives_a_result_that_overtakes_its_event() {
+        let clock = ToolClock::default();
+        clock.observe(&tool_use("t1"), at(1_000));
+        clock.observe(&asks("req-1", Some("t1")), at(1_100));
+        clock.decided("req-1", true, at(2_000));
+        // The tool was fast: its result comes before the decision event.
+        let t = fields(clock.observe(&result("t1"), at(2_050)).unwrap());
+        assert_eq!(t["permission_resolved_at"], 2.0);
+        assert_eq!(t["run_started_at"], 2.0);
+        // The late decision event changes nothing (the call is over).
+        assert!(clock.observe(&decision("req-1", true), at(2_100)).is_none());
+    }
+
+    #[test]
+    fn an_answer_that_could_not_be_handed_over_is_pending_again() {
+        let clock = ToolClock::default();
+        clock.observe(&tool_use("t1"), at(1_000));
+        clock.observe(&asks("req-1", Some("t1")), at(1_100));
+        clock.decided("req-1", true, at(2_000));
+        clock.undecided("req-1");
+        clock.decided("req-1", true, at(3_000));
+        let t = fields(clock.observe(&result("t1"), at(3_500)).unwrap());
+        assert_eq!(t["permission_resolved_at"], 3.0);
+    }
+
+    #[test]
+    fn an_interrupt_during_the_permission_wait_is_a_cancelled_call_that_never_ran() {
+        let clock = ToolClock::default();
+        clock.observe(&tool_use("t1"), at(1_000));
+        clock.taken_up("t1", at(1_050));
+        clock.observe(&asks("req-1", Some("t1")), at(1_100));
+        let t = fields(clock.observe(&cancelled("t1"), at(4_000)).unwrap());
+        assert_eq!(t["cancelled"], true);
+        assert_eq!(t["ended_at"], 4.0);
+        assert!(t.get("permission_resolved_at").is_none(), "{t}");
+        assert!(t.get("run_started_at").is_none(), "{t}");
     }
 
     #[test]
     fn a_question_answered_by_the_result_has_no_run_start() {
         let clock = ToolClock::default();
-        clock.observe(&tool_use("q", "AskUserQuestion", json!({})), at(1_000));
+        clock.observe(&tool_use("q"), at(1_000));
         clock.observe(
             &ChatEvent::AskUserQuestion {
                 id: "req".into(),
@@ -457,25 +491,45 @@ mod tests {
             },
             at(1_100),
         );
-        let t = timing_fields(clock.observe(&result("q"), at(5_000)).unwrap());
+        clock.observe(&decision("req", true), at(1_101));
+        let t = fields(clock.observe(&result("q"), at(5_000)).unwrap());
         assert_eq!(t["permission_requested_at"], 1.1);
         assert!(t.get("run_started_at").is_none(), "{t}");
     }
 
     #[test]
-    fn a_result_of_an_unknown_call_and_the_end_of_a_turn_give_no_timing() {
+    fn one_timing_per_call_and_none_after_the_end_of_a_turn() {
         let clock = ToolClock::default();
         assert!(clock.observe(&result("never-seen"), at(1)).is_none());
-        clock.observe(&tool_use("t", "Read", json!({})), at(2));
+        clock.observe(&tool_use("t"), at(2));
+        assert!(clock.observe(&result("t"), at(3)).is_some());
+        assert!(
+            clock.observe(&result("t"), at(4)).is_none(),
+            "a second result"
+        );
+        assert!(
+            clock.observe(&cancelled("t"), at(5)).is_none(),
+            "a late cancel"
+        );
+        clock.observe(&tool_use("u"), at(6));
         clock.observe(
             &serde_json::from_value::<ChatEvent>(json!({
                 "type": "result", "session_id": "s", "duration_ms": 0,
                 "subtype": "success", "is_error": false
             }))
             .unwrap(),
-            at(3),
+            at(7),
         );
-        assert!(clock.observe(&result("t"), at(4)).is_none());
+        assert!(clock.observe(&result("u"), at(8)).is_none());
+    }
+
+    #[test]
+    fn every_door_of_a_session_shares_one_clock() {
+        let sid = Uuid::new_v4().to_string();
+        let first = ToolClock::for_session(&sid);
+        assert!(Arc::ptr_eq(&first, &ToolClock::for_session(&sid)));
+        let other = ToolClock::for_session(&Uuid::new_v4().to_string());
+        assert!(!Arc::ptr_eq(&first, &other));
     }
 
     struct Says(&'static str);
@@ -533,7 +587,7 @@ mod tests {
             panic!("a sync answer")
         };
         assert_eq!(sync.reason.as_deref(), Some("skill context"));
-        let t = timing_fields(clock.observe(&result("t1"), Utc::now()).unwrap());
+        let t = fields(clock.observe(&result("t1"), Utc::now()).unwrap());
         assert!(t["started_at"].is_f64(), "{t}");
     }
 
@@ -547,47 +601,49 @@ mod tests {
             .execute(&pre_tool_use("Read"), Some("t2"), &ctx)
             .await
             .unwrap();
-        let t = timing_fields(clock.observe(&result("t2"), Utc::now()).unwrap());
+        let t = fields(clock.observe(&result("t2"), Utc::now()).unwrap());
         assert!(t["started_at"].is_f64(), "{t}");
     }
 
+    /// Legacy engine: the answer is on the clock once `send_permission_response`
+    /// returns, BEFORE the decision event goes anywhere (the CLI already has it).
     #[tokio::test]
-    async fn the_legacy_tap_persists_and_relays_the_timing_of_a_result() {
-        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
-        let sid = Uuid::new_v4();
-        let (tx, mut rx) = broadcast::channel(16);
-        spawn_legacy_tap(
-            sid.to_string(),
-            &tx,
-            None,
-            graph.clone(),
-            Arc::new(AtomicI64::new(7)),
+    async fn a_legacy_permission_answer_is_on_the_clock_when_it_reaches_the_cli() {
+        let state = crate::test_helpers::mock_app_state();
+        let manager = crate::chat::manager::ChatManager::new_without_memory(
+            state.neo4j,
+            state.meili,
+            crate::chat::manager::test_support::chat_config(),
         );
-        tx.send(tool_use("t1", "Read", json!({}))).unwrap();
-        tx.send(result("t1")).unwrap();
-        let relayed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if let Ok(e @ ChatEvent::ToolTiming { .. }) = rx.recv().await {
-                    return e;
-                }
-            }
-        })
-        .await
-        .expect("a tool_timing on the channel");
-        let t = timing_fields(relayed);
-        assert_eq!(t["id"], "t1");
-        let stored = graph.get_chat_events(sid, 0, 10).await.unwrap();
-        assert_eq!(stored.len(), 1, "only the timing is the tap's to persist");
-        assert_eq!(stored[0].event_type, "tool_timing");
-        assert_eq!(stored[0].seq, 7);
-    }
-
-    #[test]
-    fn the_hook_and_the_feeder_of_a_session_share_one_clock() {
         let sid = Uuid::new_v4().to_string();
-        let first = ToolClock::for_session(&sid);
-        assert!(Arc::ptr_eq(&first, &ToolClock::for_session(&sid)));
-        let other = ToolClock::for_session(&Uuid::new_v4().to_string());
-        assert!(!Arc::ptr_eq(&first, &other));
+        let client = nexus_claude::InteractiveClient::new(nexus_claude::ClaudeCodeOptions {
+            model: Some("test".into()),
+            cli_path: Some("/nonexistent/claude".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let (mut stdin_rx, _queue) =
+            crate::chat::manager::test_support::insert_session_with_client(
+                &manager,
+                &sid,
+                client,
+                false,
+                &["req-1"],
+            )
+            .await
+            .unwrap();
+        let clock = ToolClock::for_session(&sid);
+        clock.observe(&tool_use("t1"), Utc::now());
+        clock.observe(&asks("req-1", Some("t1")), Utc::now());
+
+        manager
+            .send_permission_response(&sid, "req-1", true)
+            .await
+            .unwrap();
+        let written = stdin_rx.try_recv().expect("the CLI got the answer");
+        assert!(written.contains("req-1"), "{written}");
+        let t = fields(clock.observe(&result("t1"), Utc::now()).unwrap());
+        assert_eq!(t["permission_outcome"], "allowed", "{t}");
+        assert!(t["run_started_at"].is_f64(), "{t}");
     }
 }

@@ -4826,14 +4826,6 @@ impl ChatManager {
         } else {
             OOB_TRIGGER_CAP_INTERACTIVE
         };
-        // The tool clock of the session: timings of its tool calls, persisted and relayed.
-        super::tool_clock::spawn_legacy_tap(
-            session_id.to_string(),
-            &events_tx,
-            self.nats.clone(),
-            self.graph.clone(),
-            next_seq.clone(),
-        );
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous session with the same ID
@@ -5839,6 +5831,9 @@ impl ChatManager {
         let session_uuid = Uuid::parse_str(&session_id).ok();
         let mut assistant_text_parts: Vec<String> = Vec::new();
         let mut events_to_persist: Vec<ChatEventRecord> = Vec::new();
+        // When each tool call of the turn really ran (`tool_clock`): a `tool_timing`
+        // is stored and sent right after the result or the cancellation it times.
+        let tool_clock = super::tool_clock::ToolClock::for_session(&session_id);
 
         // What the CLI is given: the prompt as one string, or — with images — the
         // text and image blocks, checked by nexus (`agent_runtime::CliInput`). An
@@ -6031,6 +6026,7 @@ impl ChatManager {
                                               current_parent: Option<String>|
                      -> Option<ChatEvent> {
                         let event = parse_permission_control_msg(&control_msg, current_parent)?;
+                        tool_clock.observe(&event, chrono::Utc::now());
 
                         match &event {
                             ChatEvent::PermissionRequest { id, tool, .. } => {
@@ -6474,6 +6470,8 @@ impl ChatManager {
                                         pending_tool_calls.remove(id);
                                     }
 
+                                    let timing = tool_clock.observe(&event, chrono::Utc::now());
+
                                     // Persist structured events (skip transient: stream_delta, streaming_status)
                                     if !matches!(
                                         event,
@@ -6568,6 +6566,23 @@ impl ChatManager {
                                     }
 
                                     emit_chat(event, &events_tx, &nats, &session_id);
+                                    // The timing of the call this event ended: stored in the
+                                    // turn's batch right after it, sent right after it.
+                                    if let Some(timing) = timing {
+                                        if let Some(uuid) = session_uuid {
+                                            events_to_persist.push(ChatEventRecord {
+                                                id: Uuid::new_v4(),
+                                                session_id: uuid,
+                                                seq: next_seq.fetch_add(1, Ordering::SeqCst),
+                                                event_type: timing.event_type().to_string(),
+                                                data: serde_json::to_string(&timing)
+                                                    .unwrap_or_default(),
+                                                created_at: chrono::Utc::now(),
+                                            });
+                                        }
+                                        streaming_events.lock().await.push(timing.clone());
+                                        emit_chat(timing, &events_tx, &nats, &session_id);
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -7492,7 +7507,11 @@ impl ChatManager {
             "Sending permission control response to CLI (via stdin_tx, lock-free)"
         );
 
+        // On the tool clock BEFORE the CLI has it: a fast tool's result cannot overtake it.
+        let tool_clock = super::tool_clock::ToolClock::for_session(session_id);
+        tool_clock.decided(request_id, allow, chrono::Utc::now());
         if let Err(e) = stdin_tx.send(json).await {
+            tool_clock.undecided(request_id);
             restore_claim(original_input).await;
             return Err(PermissionDeliveryError::Failed(anyhow!(
                 "Failed to send permission control response: {}",
@@ -8769,14 +8788,6 @@ impl ChatManager {
                 .await
                 .unwrap_or(self.config.auto_continue),
         ));
-        // The tool clock of the session: timings of its tool calls, persisted and relayed.
-        super::tool_clock::spawn_legacy_tap(
-            session_id.to_string(),
-            &events_tx,
-            self.nats.clone(),
-            self.graph.clone(),
-            next_seq.clone(),
-        );
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous resume/create of this session.
@@ -12470,6 +12481,12 @@ fn parse_permission_control_msg(
         parent_tool_use_id: current_parent,
         category: None,
         canonical: None,
+        tool_use_id: request_data
+            .get("toolUseId")
+            .or_else(|| request_data.get("tool_use_id"))
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -18229,6 +18246,7 @@ mod tests {
                 parent_tool_use_id: None,
                 category: None,
                 canonical: None,
+                tool_use_id: None,
             },
             ChatEvent::Error {
                 message: "Something went wrong".into(),

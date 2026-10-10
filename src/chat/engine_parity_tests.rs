@@ -769,35 +769,48 @@ impl Stage {
     }
 }
 
-/// `ok` when the record of a session carries what its conversation produced.
-/// The persisted `tool_timing` of the call `id`, which waited for a permission:
-/// taken up, then asked, then answered (where it starts to run), then ended, in
-/// that order.
+/// The persisted `tool_timing` of the call `id`, which waited for a permission that
+/// was allowed: taken up, then asked, then answered (where it starts to run), then
+/// ended, in that order; stored once, after the call's result.
 fn timing_verdict(persisted: &[ChatEvent], id: &str) -> (bool, String) {
-    let Some(ChatEvent::ToolTiming {
+    let is_timing = |e: &ChatEvent| matches!(e, ChatEvent::ToolTiming { id: t, .. } if t == id);
+    let Some(at) = persisted.iter().position(&is_timing) else {
+        return (false, format!("aucun tool_timing persisté pour {id}"));
+    };
+    let ChatEvent::ToolTiming {
         started_at,
         permission_requested_at,
         permission_resolved_at,
+        permission_outcome,
         run_started_at,
         ended_at,
         ..
-    }) = persisted
-        .iter()
-        .find(|e| matches!(e, ChatEvent::ToolTiming { id: t, .. } if t == id))
+    } = &persisted[at]
     else {
-        return (false, format!("aucun tool_timing persisté pour {id}"));
+        unreachable!("found as a tool_timing")
     };
+    let after_result = persisted[..at]
+        .iter()
+        .any(|e| matches!(e, ChatEvent::ToolResult { id: r, .. } if r == id));
+    let once = persisted.iter().filter(|e| is_timing(e)).count() == 1;
     let seen = format!(
         "pris={started_at:?} demandé={permission_requested_at:?} répondu={permission_resolved_at:?} \
-         exécuté={run_started_at:?} fin={ended_at}"
+         issue={permission_outcome:?} exécuté={run_started_at:?} fin={ended_at} \
+         après le résultat={after_result} une fois={once}"
     );
     let ordered = match (started_at, permission_requested_at, permission_resolved_at) {
         (Some(s), Some(q), Some(r)) => s <= q && q <= r && r <= ended_at,
         _ => false,
     };
-    (ordered && run_started_at == permission_resolved_at, seen)
+    let ok = ordered
+        && run_started_at == permission_resolved_at
+        && permission_outcome.as_deref() == Some("allowed")
+        && after_result
+        && once;
+    (ok, seen)
 }
 
+/// `ok` when the record of a session carries what its conversation produced.
 fn record_verdict(node: &crate::neo4j::models::ChatSessionNode, sent: i64) -> (bool, String) {
     let cost = node.total_cost_usd.unwrap_or(0.0);
     let ok = node.message_count >= sent
