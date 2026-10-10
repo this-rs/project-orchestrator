@@ -7608,6 +7608,139 @@ mod post_turn {
         );
     }
 
+    async fn idle(r: &super::parity::Rig) {
+        for _ in 0..400 {
+            if !r.manager.is_session_streaming(&r.sid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the session never went idle");
+    }
+
+    async fn sent_count(r: &super::parity::Rig, n: usize) {
+        for _ in 0..400 {
+            if r.sent().len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{n} turns were never sent: {:#?}", r.sent());
+    }
+
+    fn compaction() -> Step {
+        Step::Emit(AgentEvent::Compaction {
+            phase: CompactionPhase::Completed,
+            trigger: None,
+            pre_tokens: Some(1000),
+        })
+    }
+
+    /// What the session keeps in the store for its next turn.
+    async fn stored(r: &super::parity::Rig) -> super::super::manager::HeldContext {
+        let graph: Arc<dyn GraphStore> = r.graph.clone();
+        super::super::manager::HeldContext::load(&graph, &r.sid).await
+    }
+
+    /// Through the real `ManagerTurnServices`: a compaction, then the next turn hit
+    /// by a 429 (retried with the same text), the retry stopped by the user — the
+    /// provider ended it `done interrupted` and recorded it (nexus' native loop
+    /// keeps an interrupted turn in its history). The context rode that one turn:
+    /// the turn after it does not carry it again, and the store holds nothing.
+    #[tokio::test]
+    async fn the_held_context_rides_one_turn_across_a_429_and_a_stop() {
+        let limited = AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Error,
+            subtype: None,
+            is_error: true,
+            result_text: None,
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 0,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: Some(nexus_claude::agent::ProviderError::RateLimited {
+                retry_after_ms: Some(5),
+            }),
+        };
+        let r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![compaction(), steps::done(&caps())],
+                vec![Step::Emit(limited)],
+                vec![Step::AwaitInterrupt],
+                vec![steps::done(&caps())],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        idle(&r).await;
+        assert!(
+            stored(&r).await.context.is_some(),
+            "held after the compaction"
+        );
+        r.manager.send_message(&r.sid, "next").await.unwrap();
+        // The turn, then its retry after the 429: stopped while it runs.
+        sent_count(&r, 3).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        r.manager.interrupt(&r.sid).await.unwrap();
+        idle(&r).await;
+        r.manager.send_message(&r.sid, "then").await.unwrap();
+        sent_count(&r, 4).await;
+        idle(&r).await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 4, "{sent:#?}");
+        assert!(
+            sent[1].contains("Post-Compaction Context") && sent[1].contains("next"),
+            "{}",
+            sent[1]
+        );
+        assert_eq!(sent[1], sent[2], "the retry sends the same turn");
+        assert!(
+            !sent[3].contains("Post-Compaction Context"),
+            "injected once, not again after the Stop: {}",
+            sent[3]
+        );
+        assert!(stored(&r).await.is_empty(), "cleared from the store too");
+    }
+
+    /// A turn that carried the held context, was answered AND compacted again holds
+    /// the NEW context, in memory and in the store: the clear of the answered turn
+    /// and the store of its compaction are one ordered write, so a restart or an
+    /// idle close still finds it.
+    #[tokio::test]
+    async fn a_turn_that_compacts_again_keeps_its_new_context_stored() {
+        let r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![compaction(), steps::done(&caps())],
+                vec![compaction(), steps::done(&caps())],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        r.manager.send_message(&r.sid, "one").await.unwrap();
+        idle(&r).await;
+        r.manager.send_message(&r.sid, "two").await.unwrap();
+        idle(&r).await;
+        // Whatever the store does after the turn, give it the time to land.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            stored(&r).await.context.is_some(),
+            "the context of the second compaction is stored"
+        );
+        r.manager.send_message(&r.sid, "three").await.unwrap();
+        sent_count(&r, 3).await;
+        idle(&r).await;
+        let sent = r.sent();
+        assert!(sent[1].contains("Post-Compaction Context"), "{}", sent[1]);
+        assert!(sent[2].contains("Post-Compaction Context"), "{}", sent[2]);
+    }
+
     #[tokio::test]
     async fn cancel_task_on_the_agent_engine_is_refused_typed() {
         let r = rig(ProviderKind::Native, vec![vec![steps::done(&caps())]]).await;
