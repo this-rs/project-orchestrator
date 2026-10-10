@@ -1984,6 +1984,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         mcp_registry: mcp_registry.clone(),
         model_catalog: chat::model_catalog::ModelCatalogCache::new_with_notifier(
             config.anthropic_api_key.clone(),
+            Some(vault.clone()),
             catalog_emitter,
             catalog_graph,
         ),
