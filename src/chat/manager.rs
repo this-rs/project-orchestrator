@@ -923,6 +923,20 @@ pub struct SpawnedByContext {
 /// reminder should still fire — the agent may be concluding prematurely.
 ///
 /// Returns `true` if the tool use is a finalization/wrap-up action.
+/// The title (80 characters at most) and the preview (200 at most) of a session named from
+/// its first message; a longer text is cut on a character boundary and ends with `...`.
+pub(crate) fn title_and_preview(msg: &str) -> (String, String) {
+    let cut = |max: usize| {
+        if msg.chars().count() > max {
+            let truncated: String = msg.chars().take(max - 3).collect();
+            format!("{}...", truncated.trim_end())
+        } else {
+            msg.to_string()
+        }
+    };
+    (cut(80), cut(200))
+}
+
 fn is_conclusive_tool(tool_name: &str, input: &serde_json::Value) -> bool {
     if tool_name == "Bash" {
         if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
@@ -5174,36 +5188,8 @@ impl ChatManager {
             );
         }
 
-        // Auto-generate title and preview from the first user message — what the
-        // user typed, never the `<po-refs>`/`<po-attachments>` blocks around it.
-        {
-            let typed = crate::refs::turn::visible_text(&request.message);
-            let msg = &typed;
-            let title = if msg.chars().count() > 80 {
-                let truncated: String = msg.chars().take(77).collect();
-                format!("{}...", truncated.trim_end())
-            } else {
-                msg.to_string()
-            };
-            let preview = if msg.chars().count() > 200 {
-                let truncated: String = msg.chars().take(197).collect();
-                format!("{}...", truncated.trim_end())
-            } else {
-                msg.to_string()
-            };
-            let _ = self
-                .graph
-                .update_chat_session(
-                    session_id,
-                    None,
-                    Some(title),
-                    None,
-                    None,
-                    None,
-                    Some(preview),
-                )
-                .await;
-        }
+        self.name_session_from_first_message(session_id, &request.message)
+            .await;
 
         // Send the initial message and start streaming in a background task
         let session_id_str = session_id.to_string();
@@ -11620,6 +11606,26 @@ impl ChatManager {
 
     /// Opens a session on the provider-neutral engine and sends the first
     /// message. The `ChatSession` node is already persisted by `create_session`.
+    /// Title and preview of a session, from its first user message: what the user typed,
+    /// never the `<po-refs>`/`<po-attachments>` blocks around it. One writer for both
+    /// engines (Claude Code and agent).
+    async fn name_session_from_first_message(&self, session_id: Uuid, message: &str) {
+        let typed = crate::refs::turn::visible_text(message);
+        let (title, preview) = title_and_preview(&typed);
+        let _ = self
+            .graph
+            .update_chat_session(
+                session_id,
+                None,
+                Some(title),
+                None,
+                None,
+                None,
+                Some(preview),
+            )
+            .await;
+    }
+
     async fn open_agent_session(&self, o: AgentOpen<'_>) -> Result<CreateSessionResponse> {
         let AgentOpen {
             request,
@@ -11770,6 +11776,10 @@ impl ChatManager {
                 if runner { 5 } else { 0 },
             );
         }
+        // The agent engine names its session the way Claude Code's does: it used to leave the
+        // title and the preview empty, so a conversation on another provider stayed unnamed.
+        self.name_session_from_first_message(session_id, &request.message)
+            .await;
         if let Some(handle) = self.agent_runtime.get(&sid).await {
             // A relayed conversation says so first, on the thread.
             if let Some(relay) = relay {
@@ -16298,6 +16308,9 @@ mod tests {
             "no resume token before the provider names one"
         );
         assert_eq!(node.provider_id.as_deref(), Some("claude-code"));
+        // The agent engine names the session from the first message, as Claude Code does.
+        assert_eq!(node.title.as_deref(), Some("hello"));
+        assert_eq!(node.preview.as_deref(), Some("hello"));
 
         fake.state.push(AgentEvent::Text {
             text: "hi!".into(),
@@ -19105,6 +19118,19 @@ mod tests {
     // ====================================================================
     // Title truncation logic (mirrors send_message_internal behavior)
     // ====================================================================
+
+    #[test]
+    fn title_and_preview_cut_on_characters_and_keep_short_text_whole() {
+        let (t, p) = title_and_preview("Bonjour");
+        assert_eq!((t.as_str(), p.as_str()), ("Bonjour", "Bonjour"));
+        let (t, p) = title_and_preview(&"é".repeat(100));
+        assert_eq!(t.chars().count(), 80);
+        assert!(t.ends_with("..."));
+        assert_eq!(p.chars().count(), 100, "under 200: whole");
+        let (_, p) = title_and_preview(&"a".repeat(300));
+        assert_eq!(p.chars().count(), 200);
+        assert!(p.ends_with("..."));
+    }
 
     #[test]
     fn test_title_generation_short_message() {
