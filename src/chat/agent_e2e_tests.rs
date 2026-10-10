@@ -7407,8 +7407,19 @@ mod background_tasks {
     async fn remote_claude_code(
         nats: Option<Arc<NatsEmitter>>,
     ) -> (ChatManager, String, broadcast::Receiver<ChatEvent>) {
+        claude_code_session(false, false, nats).await
+    }
+
+    /// A Claude Code session (scripted) whose first turn reports the task `b7`;
+    /// `tool_cancel` as given; `stall`: its `cancel_tools(task { id: "stuck" })`
+    /// never returns (a provider that hangs).
+    async fn claude_code_session(
+        tool_cancel: bool,
+        stall: bool,
+        nats: Option<Arc<NatsEmitter>>,
+    ) -> (ChatManager, String, broadcast::Receiver<ChatEvent>) {
         let mut capabilities = caps();
-        capabilities.tool_cancel = false;
+        capabilities.tool_cancel = tool_cancel;
         capabilities.background_tasks = true;
         let task = BackgroundTask {
             id: "bash-7".into(),
@@ -7442,8 +7453,13 @@ mod background_tasks {
             max_sessions: 10,
             ..Default::default()
         };
+        let source: Arc<dyn super::super::agent_runtime::ProviderSource> = if stall {
+            Arc::new(Stalling(provider))
+        } else {
+            Arc::new(provider)
+        };
         let mut manager = ChatManager::new_without_memory(graph, state.meili, config)
-            .with_provider_source(Arc::new(provider));
+            .with_provider_source(source);
         if let Some(nats) = nats {
             manager = manager.with_nats(nats);
         }
@@ -7534,5 +7550,575 @@ mod background_tasks {
             .expect_err("never a success");
         assert_typed_refusal(&error);
         refusal_on_the_wire(&mut rx).await;
+    }
+
+    // ------------------------------------------------------------------------
+    // Review of #663: never a success the owner did not report, across instances.
+    // ------------------------------------------------------------------------
+
+    use super::super::cancel_relay::{CancelKind, CancelRelayError};
+    use async_trait::async_trait;
+    use nexus_claude::agent::{
+        AgentProvider, AgentSession, CancelOutcome, CancelScope, Capabilities, EventStream,
+        InterruptOutcome, InterruptScope, ModelInfo, PermissionDecision, PolicyMode,
+        ProviderHealth, QuestionAnswer, ResumeToken, SessionSpec, TurnInput,
+    };
+
+    /// The scripted provider, its sessions hanging on `cancel_tools(task { id: "stuck" })`.
+    struct Stalling(Tapped);
+
+    struct StallingSession(Arc<dyn AgentSession>);
+
+    #[async_trait]
+    impl AgentSession for StallingSession {
+        fn capabilities(&self) -> &Capabilities {
+            self.0.capabilities()
+        }
+        fn resume_token(&self) -> Option<ResumeToken> {
+            self.0.resume_token()
+        }
+        async fn send_turn(&self, input: TurnInput) -> Result<EventStream, ProviderError> {
+            self.0.send_turn(input).await
+        }
+        async fn answer_permission(
+            &self,
+            request_id: &str,
+            decision: PermissionDecision,
+        ) -> Result<(), ProviderError> {
+            self.0.answer_permission(request_id, decision).await
+        }
+        async fn answer_question(
+            &self,
+            question_id: &str,
+            answer: QuestionAnswer,
+        ) -> Result<(), ProviderError> {
+            self.0.answer_question(question_id, answer).await
+        }
+        async fn interrupt(
+            &self,
+            scope: InterruptScope,
+        ) -> Result<InterruptOutcome, ProviderError> {
+            self.0.interrupt(scope).await
+        }
+        async fn cancel_tools(&self, scope: CancelScope) -> Result<CancelOutcome, ProviderError> {
+            if matches!(&scope, CancelScope::Task { id } if id == "stuck") {
+                std::future::pending::<()>().await;
+            }
+            // A provider that takes its time (an owner slower than a stale `gone`).
+            if matches!(&scope, CancelScope::Task { id } if id == "slow") {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            self.0.cancel_tools(scope).await
+        }
+        async fn set_model(&self, model: &str) -> Result<(), ProviderError> {
+            self.0.set_model(model).await
+        }
+        async fn set_policy_mode(
+            &self,
+            mode: PolicyMode,
+            native: Option<&str>,
+        ) -> Result<(), ProviderError> {
+            self.0.set_policy_mode(mode, native).await
+        }
+        fn out_of_band(&self) -> Option<EventStream> {
+            self.0.out_of_band()
+        }
+        async fn close(&self) -> Result<(), ProviderError> {
+            self.0.close().await
+        }
+    }
+
+    #[async_trait]
+    impl AgentProvider for Stalling {
+        fn id(&self) -> &str {
+            self.0.id()
+        }
+        fn kind(&self) -> ProviderKind {
+            self.0.kind()
+        }
+        async fn health(&self) -> ProviderHealth {
+            self.0.health().await
+        }
+        async fn catalog(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            self.0.catalog().await
+        }
+        fn capabilities(&self, model: Option<&str>) -> Capabilities {
+            self.0.capabilities(model)
+        }
+        async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            Ok(Arc::new(StallingSession(self.0.open(spec).await?)))
+        }
+        async fn resume(
+            &self,
+            spec: SessionSpec,
+            token: ResumeToken,
+        ) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            Ok(Arc::new(StallingSession(self.0.resume(spec, token).await?)))
+        }
+    }
+
+    impl super::super::agent_runtime::ProviderSource for Stalling {
+        fn get(&self, provider_id: &str) -> Option<Arc<dyn AgentProvider>> {
+            (provider_id == "claude-code")
+                .then(|| Arc::new(Stalling(self.0.clone())) as Arc<dyn AgentProvider>)
+        }
+    }
+
+    fn relay_error(error: &anyhow::Error) -> Option<CancelRelayError> {
+        error.downcast_ref::<CancelRelayError>().cloned()
+    }
+
+    /// Asks again while the owner's listener may still be subscribing (the
+    /// broker answers "no responders" until it is).
+    async fn until_subscribed<T>(
+        mut ask: impl FnMut() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send>,
+        >,
+    ) -> anyhow::Result<T> {
+        for _ in 0..30 {
+            match ask().await {
+                Err(e) if relay_error(&e) == Some(CancelRelayError::OwnerUnreachable) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                other => return other,
+            }
+        }
+        ask().await
+    }
+
+    /// Point 1: nobody holds the session — real NATS (and the test broker) answer
+    /// "no responders" at once: a typed `owner_unreachable`, fast, for both cancels.
+    #[tokio::test]
+    async fn a_cancel_nobody_holds_is_owner_unreachable_at_once_not_a_success() {
+        let broker = TestBroker::start().await;
+        let far = far_manager(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+        let sid = Uuid::new_v4().to_string();
+        let started = std::time::Instant::now();
+        let task = far
+            .cancel_task(&sid, "b1")
+            .await
+            .expect_err("not a success");
+        assert_eq!(relay_error(&task), Some(CancelRelayError::OwnerUnreachable));
+        let tools = far
+            .cancel_running_tools(&sid)
+            .await
+            .expect_err("not a success");
+        assert_eq!(
+            relay_error(&tools),
+            Some(CancelRelayError::OwnerUnreachable)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Point 1: an owner that subscribes but never answers — `owner_timeout`.
+    #[tokio::test]
+    async fn a_silent_owner_is_owner_timeout_not_a_success() {
+        let broker = TestBroker::start().await;
+        let sid = Uuid::new_v4().to_string();
+        let silent = NatsEmitter::new(broker.client().await, "events");
+        let _task_sub = silent.subscribe_cancel_task(&sid).await.unwrap();
+        let _tools_sub = silent.subscribe_cancel_tools(&sid).await.unwrap();
+        silent.client().flush().await.unwrap();
+        let far = far_manager(Arc::new(
+            NatsEmitter::new(broker.client().await, "events")
+                .with_cancel_rpc_timeout(Duration::from_millis(400)),
+        ));
+        let task = far
+            .cancel_task(&sid, "b1")
+            .await
+            .expect_err("not a success");
+        assert_eq!(
+            relay_error(&task),
+            Some(CancelRelayError::OwnerTimeout {
+                kind: CancelKind::Task
+            })
+        );
+        let tools = far
+            .cancel_running_tools(&sid)
+            .await
+            .expect_err("not a success");
+        assert_eq!(
+            relay_error(&tools),
+            Some(CancelRelayError::OwnerTimeout {
+                kind: CancelKind::Tools
+            })
+        );
+    }
+
+    /// Point 1: an answer that is not one — `owner_protocol`.
+    #[tokio::test]
+    async fn an_unreadable_answer_is_owner_protocol_not_a_success() {
+        use futures::StreamExt;
+        let broker = TestBroker::start().await;
+        let sid = Uuid::new_v4().to_string();
+        let liar = NatsEmitter::new(broker.client().await, "events");
+        let mut sub = liar.subscribe_cancel_task(&sid).await.unwrap();
+        liar.client().flush().await.unwrap();
+        let client = liar.client().clone();
+        tokio::spawn(async move {
+            while let Some(msg) = sub.next().await {
+                if let Some(reply) = msg.reply {
+                    let _ = client.publish(reply, "{\"ok\": true}".into()).await;
+                }
+            }
+        });
+        let far = far_manager(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+        let error = far
+            .cancel_task(&sid, "b1")
+            .await
+            .expect_err("not a success");
+        assert!(
+            matches!(
+                relay_error(&error),
+                Some(CancelRelayError::OwnerProtocol(_))
+            ),
+            "{error:#}"
+        );
+    }
+
+    /// Point 3: cancel-tools across instances is request/reply too: the owner's
+    /// refusal (`Unsupported { tool_cancel }`) comes back typed, not a 200.
+    #[tokio::test]
+    async fn a_cancel_tools_refused_by_the_owner_comes_back_typed_over_nats() {
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let (_manager, sid, mut rx) = remote_claude_code(Some(owner)).await;
+        let far = Arc::new(far_manager(Arc::new(NatsEmitter::new(
+            broker.client().await,
+            "events",
+        ))));
+        let error = until_subscribed(|| {
+            let (far, sid) = (Arc::clone(&far), sid.clone());
+            Box::pin(async move { far.cancel_running_tools(&sid).await })
+        })
+        .await
+        .expect_err("never a success");
+        assert_typed_refusal(&error);
+        refusal_on_the_wire(&mut rx).await;
+    }
+
+    /// Point 2: the owner bounds each cancel and answers every request in its own
+    /// task: a provider that hangs on one task answers `timeout` within the bound
+    /// (typed `owner_timeout`, before the asker's own 10 s), while a second request
+    /// sent meanwhile is answered at once.
+    #[tokio::test]
+    async fn a_hanging_cancel_on_the_owner_is_bounded_and_does_not_hold_the_next_one() {
+        use super::super::cancel_relay::OWNER_CANCEL_BOUND;
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let (_manager, sid, _rx) = claude_code_session(true, true, Some(owner)).await;
+        let far = Arc::new(far_manager(Arc::new(NatsEmitter::new(
+            broker.client().await,
+            "events",
+        ))));
+        // Subscribed: a first, quick cancel answers.
+        until_subscribed(|| {
+            let (far, sid) = (Arc::clone(&far), sid.clone());
+            Box::pin(async move { far.cancel_task(&sid, "nobody").await })
+        })
+        .await
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let stuck = {
+            let (far, sid) = (Arc::clone(&far), sid.clone());
+            tokio::spawn(async move { far.cancel_task(&sid, "stuck").await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let quick = far.cancel_task(&sid, "b7").await.unwrap();
+        assert!(!quick.capped, "{quick:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the second request was not held by the first: {:?}",
+            started.elapsed()
+        );
+        let error = stuck.await.unwrap().expect_err("never a success");
+        assert_eq!(
+            relay_error(&error),
+            Some(CancelRelayError::OwnerTimeout {
+                kind: CancelKind::Task
+            })
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= OWNER_CANCEL_BOUND && took < OWNER_CANCEL_BOUND + Duration::from_millis(1500),
+            "the owner's bound answered, not the asker's timeout: {took:?}"
+        );
+    }
+
+    async fn post(addr: std::net::SocketAddr, path: &str) -> (u16, Value) {
+        let res = reqwest::Client::new()
+            .post(format!("http://{addr}{path}"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        let status = res.status().as_u16();
+        (status, res.json().await.unwrap_or(Value::Null))
+    }
+
+    /// Point 5: through the real router — a refusal is 422 `unsupported` on both
+    /// routes, a session nobody holds is 409 `owner_unreachable`.
+    #[tokio::test]
+    async fn the_cancel_routes_answer_the_typed_refusals() {
+        let (manager, sid, _rx) = remote_claude_code(None).await;
+        let addr =
+            crate::test_helpers::serve_chat(Arc::new(manager), Arc::new(MockGraphStore::new()))
+                .await;
+        for path in [
+            format!("/api/chat/sessions/{sid}/cancel-task/b7"),
+            format!("/api/chat/sessions/{sid}/cancel-tools"),
+        ] {
+            let (status, body) = post(addr, &path).await;
+            assert_eq!(status, 422, "{path}: {body}");
+            assert_eq!(body["code"], "unsupported", "{path}: {body}");
+            assert!(
+                body["error"].as_str().unwrap_or("").contains("tool_cancel"),
+                "{body}"
+            );
+        }
+
+        let broker = TestBroker::start().await;
+        let far = far_manager(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+        let addr =
+            crate::test_helpers::serve_chat(Arc::new(far), Arc::new(MockGraphStore::new())).await;
+        let nobody = Uuid::new_v4();
+        for path in [
+            format!("/api/chat/sessions/{nobody}/cancel-task/b1"),
+            format!("/api/chat/sessions/{nobody}/cancel-tools"),
+        ] {
+            let (status, body) = post(addr, &path).await;
+            assert_eq!(status, 409, "{path}: {body}");
+            assert_eq!(body["code"], "owner_unreachable", "{path}: {body}");
+            assert_eq!(body["retryable"], false, "{body}");
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Review round 2 of #663.
+    // ------------------------------------------------------------------------
+
+    /// N1: an instance that no longer holds the session answers `gone` at once;
+    /// the instance that holds it answers later (its provider takes 500 ms). The
+    /// asker keeps the real answer, never the stale 410.
+    #[tokio::test]
+    async fn a_stale_gone_never_beats_the_real_owners_answer() {
+        use futures::StreamExt;
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let (_manager, sid, _rx) = claude_code_session(true, true, Some(owner)).await;
+        let far = Arc::new(far_manager(Arc::new(NatsEmitter::new(
+            broker.client().await,
+            "events",
+        ))));
+        until_subscribed(|| {
+            let (far, sid) = (Arc::clone(&far), sid.clone());
+            Box::pin(async move { far.cancel_task(&sid, "nobody").await })
+        })
+        .await
+        .unwrap();
+        // The stale instance: answers `gone` to every request, at once.
+        let stale = NatsEmitter::new(broker.client().await, "events");
+        let mut sub = stale.subscribe_cancel_task(&sid).await.unwrap();
+        stale.client().flush().await.unwrap();
+        let client = stale.client().clone();
+        tokio::spawn(async move {
+            while let Some(msg) = sub.next().await {
+                if let Some(reply) = msg.reply {
+                    let _ = client
+                        .publish(reply, "{\"v\":2,\"gone\":true}".into())
+                        .await;
+                }
+            }
+        });
+        let answered = far.cancel_task(&sid, "slow").await.unwrap();
+        assert_eq!(answered.task_id, "slow");
+        assert!(!answered.capped, "{answered:?}");
+    }
+
+    /// N1 (the other half): only `gone` comes back — after the grace, `session_gone`,
+    /// now retryable (the session moved: asking again reaches its new owner).
+    #[tokio::test]
+    async fn only_a_gone_is_session_gone_and_retryable() {
+        use futures::StreamExt;
+        let broker = TestBroker::start().await;
+        let sid = Uuid::new_v4().to_string();
+        let stale = NatsEmitter::new(broker.client().await, "events");
+        let mut sub = stale.subscribe_cancel_task(&sid).await.unwrap();
+        stale.client().flush().await.unwrap();
+        let client = stale.client().clone();
+        tokio::spawn(async move {
+            while let Some(msg) = sub.next().await {
+                if let Some(reply) = msg.reply {
+                    let _ = client.publish(reply, "\"gone\"".into()).await;
+                }
+            }
+        });
+        let far = far_manager(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+        let started = std::time::Instant::now();
+        let error = far.cancel_task(&sid, "b1").await.unwrap_err();
+        assert_eq!(relay_error(&error), Some(CancelRelayError::SessionGone));
+        assert!(started.elapsed() >= super::super::cancel_relay::GONE_GRACE);
+        let failure = relay_error(&error).unwrap().failure();
+        assert_eq!((failure.status, failure.retryable), (410, true));
+    }
+
+    /// N2: a timed-out cancel_tools is NOT retryable (a late cancel may have
+    /// happened; a retry would stop tools started since); a timed-out cancel_task is.
+    #[tokio::test]
+    async fn a_timed_out_cancel_tools_is_not_retryable_through_the_router() {
+        let broker = TestBroker::start().await;
+        let sid = Uuid::new_v4();
+        let silent = NatsEmitter::new(broker.client().await, "events");
+        let _tools = silent
+            .subscribe_cancel_tools(&sid.to_string())
+            .await
+            .unwrap();
+        let _task = silent
+            .subscribe_cancel_task(&sid.to_string())
+            .await
+            .unwrap();
+        silent.client().flush().await.unwrap();
+        let far = far_manager(Arc::new(
+            NatsEmitter::new(broker.client().await, "events")
+                .with_cancel_rpc_timeout(Duration::from_millis(400)),
+        ));
+        let addr =
+            crate::test_helpers::serve_chat(Arc::new(far), Arc::new(MockGraphStore::new())).await;
+        let (status, body) = post(addr, &format!("/api/chat/sessions/{sid}/cancel-tools")).await;
+        assert_eq!(
+            (status, &body["code"]),
+            (504, &json!("owner_timeout")),
+            "{body}"
+        );
+        assert_eq!(body["retryable"], false, "{body}");
+        let (status, body) = post(addr, &format!("/api/chat/sessions/{sid}/cancel-task/b1")).await;
+        assert_eq!(
+            (status, &body["code"]),
+            (504, &json!("owner_timeout")),
+            "{body}"
+        );
+        assert_eq!(body["retryable"], true, "{body}");
+    }
+
+    /// N3: the WebSocket `cancel_tools` no longer holds the connection's loop while
+    /// the owner is asked (here a silent one): the next frame of the client is
+    /// answered at once, and the failure comes back as a typed `error` frame.
+    #[tokio::test]
+    async fn a_ws_cancel_tools_does_not_block_the_socket_and_reports_its_failure() {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let broker = TestBroker::start().await;
+        // The session exists (the socket opens on it) but no instance holds it live.
+        let graph = Arc::new(MockGraphStore::new());
+        let node = crate::test_helpers::test_chat_session(None);
+        graph.create_chat_session(&node).await.unwrap();
+        let sid = node.id.to_string();
+        let silent = NatsEmitter::new(broker.client().await, "events");
+        let _tools = silent.subscribe_cancel_tools(&sid).await.unwrap();
+        silent.client().flush().await.unwrap();
+        let far = far_manager(Arc::new(
+            NatsEmitter::new(broker.client().await, "events")
+                .with_cancel_rpc_timeout(Duration::from_secs(3)),
+        ));
+        let addr = crate::test_helpers::serve_chat(Arc::new(far), graph).await;
+        let url = format!("ws://{addr}/ws/chat/{sid}?last_event=999999999999999");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        ws.send(WsMessage::text("ready")).await.unwrap();
+        ws.send(WsMessage::text(json!({"type": "cancel_tools"}).to_string()))
+            .await
+            .unwrap();
+        let sent = std::time::Instant::now();
+        ws.send(WsMessage::text(
+            json!({"type": "queue_op", "op": "snapshot"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let mut queue_seen = None;
+        let mut error = None;
+        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(Ok(msg)) = ws.next().await {
+                let WsMessage::Text(t) = msg else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(t.as_str()) else {
+                    continue;
+                };
+                if v["type"] == "pending_queue" && queue_seen.is_none() {
+                    queue_seen = Some(sent.elapsed());
+                }
+                if v["type"] == "error" && v["code"] == "cancel_failed" {
+                    error = Some(v);
+                    return;
+                }
+            }
+        })
+        .await;
+        let queue_seen = queue_seen.expect("the queue_op was answered");
+        assert!(
+            queue_seen < Duration::from_secs(2),
+            "the socket was not held by the cancel: {queue_seen:?}"
+        );
+        let error = error.expect("a typed error frame for the failed cancel");
+        assert_eq!(error["reason"], "owner_timeout", "{error}");
+    }
+
+    /// N4 (rolling upgrade): an older instance asks without `v` and reads only
+    /// `{"result"|"refused"|"failed"}`: it gets exactly that, never a bare string it
+    /// would take for a failure.
+    #[tokio::test]
+    async fn an_older_asker_gets_the_format_it_reads() {
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let (_manager, sid, _rx) = claude_code_session(true, false, Some(owner)).await;
+        let old = NatsEmitter::new(broker.client().await, "events");
+        let mut reply = None;
+        for _ in 0..30 {
+            match old
+                .client()
+                .request(
+                    old.cancel_task_subject(&sid),
+                    serde_json::to_vec(&json!({"task_id": "b7"}))
+                        .unwrap()
+                        .into(),
+                )
+                .await
+            {
+                Ok(msg) => {
+                    reply = Some(serde_json::from_slice::<Value>(&msg.payload).unwrap());
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        let reply = reply.expect("the owner answered");
+        assert!(reply.get("v").is_none(), "{reply}");
+        assert_eq!(reply["result"]["task_id"], "b7", "{reply}");
+    }
+
+    /// N6: the local cancel is bounded like the relayed one: a provider that hangs
+    /// is `owner_timeout` after `OWNER_CANCEL_BOUND`, not a request that never ends.
+    #[tokio::test]
+    async fn a_hanging_local_cancel_is_bounded() {
+        use super::super::cancel_relay::OWNER_CANCEL_BOUND;
+        let (manager, sid, _rx) = claude_code_session(true, true, None).await;
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            OWNER_CANCEL_BOUND + Duration::from_secs(3),
+            manager.cancel_task(&sid, "stuck"),
+        )
+        .await
+        .expect("answered within the bound");
+        let error = outcome.expect_err("never a success");
+        assert_eq!(
+            relay_error(&error),
+            Some(CancelRelayError::OwnerTimeout {
+                kind: CancelKind::Task
+            })
+        );
+        assert!(started.elapsed() >= OWNER_CANCEL_BOUND);
     }
 }

@@ -680,13 +680,21 @@ pub async fn delete_session(
 ///
 /// ## Response codes
 ///
-/// Always **200** with `CancelToolsResult { cli_pid, killed_pids,
-/// capped }`. The frontend distinguishes:
+/// **200** with `CancelToolsResult { cli_pid, killed_pids, capped }` when the
+/// instance holding the session acted (here or over NATS). The frontend distinguishes:
 /// - `capped: false, !killed_pids.is_empty()` → tool(s) cancelled OK
 /// - `capped: false, killed_pids.is_empty()` → no tool was running
 ///   (agent thinking, between turns) — silently no-op
 /// - `capped: true` → rate cap hit (10/60s/session), display a
 ///   "slow down" toast and disable the button briefly
+///
+/// Otherwise a typed body `{error, code, retryable}` (`cancel_error`): 422
+/// `unsupported` (the provider cannot: Claude Code over SSH), 409
+/// `owner_unreachable` (no instance holds the session live — with or without
+/// NATS), 504 `owner_timeout` (`retryable: false` here: a late cancel may have
+/// happened, a retry would stop tools started since), 410 `session_gone`
+/// (retryable: the session moved), 502 `owner_protocol` / `owner_failed` /
+/// `relay_failed`.
 ///
 /// **404** — `chat_manager` not configured (server not started with
 /// chat support).
@@ -698,10 +706,10 @@ pub async fn delete_session(
 ///
 /// ## Cross-instance routing
 ///
-/// If the session lives on another instance, the request is forwarded
-/// transparently via the NATS subject `events.chat.{id}.cancel_tools`.
-/// The local response will have `cli_pid: None, killed_pids: []` since
-/// the SIGINT happens remotely.
+/// If the session lives on another instance, the request goes over NATS
+/// (`events.chat.{id}.cancel_tools`, request/reply, `chat::cancel_relay`) and
+/// the answer is the owner's: what it stopped (its `cli_pid`, `killed_pids`),
+/// or its typed refusal / the typed reason there is none (above).
 pub async fn cancel_tools(
     State(state): State<OrchestratorState>,
     Path(session_id): Path<Uuid>,
@@ -714,8 +722,9 @@ pub async fn cancel_tools(
         .cancel_running_tools(&session_id.to_string())
         .await
         // A provider that cannot stop tools (Claude Code over SSH: no `tool_cancel`)
-        // is a typed refusal (422 `unsupported`), never a 500 nor a success.
-        .map_err(|e| AppError::from_open_error(e, None))?;
+        // is a typed refusal (422 `unsupported`), never a 500 nor a success; so is
+        // a session another instance holds and does not answer for (`cancel_error`).
+        .map_err(cancel_error)?;
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
@@ -1104,12 +1113,15 @@ pub async fn get_live_activity(
 ///
 /// ## Response codes
 ///
-/// Always **200** with `CancelTaskResult { task_id, killed_pids,
-/// capped }`:
-/// - `capped: false` → cancel applied (idempotent on unknown
-///   task_id / unknown session — see `ChatManager::cancel_task`).
+/// **200** with `CancelTaskResult { task_id, killed_pids, capped }` when the
+/// instance holding the session acted (here or over NATS):
+/// - `capped: false` → cancel applied (idempotent on an unknown or ended
+///   task_id — see `ChatManager::cancel_task`).
 /// - `capped: true` → rate cap hit (30/5min/session); display a
 ///   "slow down" toast and disable the button briefly.
+///
+/// Otherwise the typed bodies of `cancel_tools` (`cancel_error`); here a 504
+/// `owner_timeout` IS retryable: a stopped task stays stopped.
 ///
 /// **404** — `chat_manager` not configured.
 pub async fn cancel_task(
@@ -1125,7 +1137,7 @@ pub async fn cancel_task(
         .await
         // Same refusal as cancel-tools, also when the session lives on another
         // instance (its answer comes back over NATS).
-        .map_err(|e| AppError::from_open_error(e, None))?;
+        .map_err(cancel_error)?;
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
@@ -4879,5 +4891,30 @@ mod switch_provider_tests {
         );
         // And it is not one of the switch's own answers.
         assert!(!matches!(&told, AppError::NotFound(_)), "{told:?}");
+    }
+}
+
+/// The HTTP answer of a cancel (`cancel-tools`, `cancel-task`) that did not
+/// happen: the provider's refusal (`unsupported` 422, …, `chat::provider::errors`)
+/// or why the instance holding the session gave no answer
+/// (`chat::cancel_relay::CancelRelayError`: `owner_unreachable` 409,
+/// `owner_timeout` 504, `session_gone` 410, `owner_protocol` / `owner_failed` 502).
+/// Anything else is a 500.
+pub(crate) fn cancel_error(error: anyhow::Error) -> AppError {
+    use crate::chat::cancel_relay::CancelRelayError;
+    if let Some(relay) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CancelRelayError>())
+    {
+        let failure = relay.failure();
+        tracing::warn!(code = failure.code, error = %error, "cancel: no answer from the instance holding the session");
+        return AppError::Provider(Box::new(failure));
+    }
+    match crate::chat::provider::errors::classify_open_error(&error, None) {
+        Some(failure) => {
+            tracing::warn!(code = failure.code, error = %error, "cancel refused by the provider");
+            AppError::Provider(Box::new(failure))
+        }
+        None => AppError::Internal(error),
     }
 }

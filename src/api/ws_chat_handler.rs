@@ -645,8 +645,19 @@ async fn handle_ws_chat_loop(
         }};
     }
 
+    // Frames that tasks spawned by this connection send to its client (a
+    // cancel_tools answered after the loop moved on, review N3 of #663).
+    let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
     loop {
         tokio::select! {
+            Some(frame) = ctl_rx.recv() => {
+                if ws_sender.send(Message::Text(frame.into())).await.is_err() {
+                    debug!("WebSocket send failed (control frame), client disconnected");
+                    break;
+                }
+            }
+
             // Forward local broadcast events to the WebSocket client
             event = async {
                 match &mut event_rx {
@@ -928,23 +939,36 @@ async fn handle_ws_chat_loop(
                                         // turn. Broadcast of ChatEvent::ToolsCancelled
                                         // happens inside cancel_running_tools so
                                         // multi-tab clients see the cancel.
-                                        match chat_manager.cancel_running_tools(&session_id).await {
-                                            Ok(result) => {
-                                                debug!(
-                                                    session_id = %session_id,
-                                                    killed = result.killed_pids.len(),
-                                                    capped = result.capped,
-                                                    "WS: cancel_tools done"
-                                                );
+                                        // Spawned (review N3): a cancel relayed to another
+                                        // instance may take up to its timeout, and this loop
+                                        // forwards the session's events meanwhile. A failure
+                                        // the client was not already told of comes back as a
+                                        // typed `error { code: cancel_failed, reason }` frame.
+                                        let (manager, sid, tx) = (
+                                            std::sync::Arc::clone(chat_manager),
+                                            session_id.clone(),
+                                            ctl_tx.clone(),
+                                        );
+                                        tokio::spawn(async move {
+                                            match manager.cancel_running_tools(&sid).await {
+                                                Ok(result) => {
+                                                    debug!(
+                                                        session_id = %sid,
+                                                        killed = result.killed_pids.len(),
+                                                        capped = result.capped,
+                                                        "WS: cancel_tools done"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    warn!(session_id = %sid, error = %e, "WS: cancel_tools failed");
+                                                    if let Some(event) = crate::chat::cancel_relay::ws_error_event(&e) {
+                                                        if let Ok(frame) = serde_json::to_string(&event) {
+                                                            let _ = tx.send(frame);
+                                                        }
+                                                    }
+                                                }
                                             }
-                                            Err(e) => {
-                                                warn!(
-                                                    session_id = %session_id,
-                                                    error = %e,
-                                                    "WS: cancel_tools failed"
-                                                );
-                                            }
-                                        }
+                                        });
                                     }
 
                                     WsChatClientMessage::PermissionResponse { id, allow } => {

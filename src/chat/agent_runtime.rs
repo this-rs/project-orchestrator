@@ -936,7 +936,15 @@ impl AgentSessionHandle {
                 capped: true,
             });
         }
-        let outcome = match self.session.cancel_tools(CancelScope::All).await {
+        // Bounded like a cancel relayed from another instance (review N6): a
+        // provider that hangs is `owner_timeout` (not retryable for cancel_tools).
+        let call = tokio::time::timeout(
+            super::cancel_relay::OWNER_CANCEL_BOUND,
+            self.session.cancel_tools(CancelScope::All),
+        )
+        .await
+        .map_err(|_| cancel_timeout(super::cancel_relay::CancelKind::Tools))?;
+        let outcome = match call {
             Ok(outcome) => outcome,
             Err(error) => return Err(self.cancel_refused(error).await),
         };
@@ -992,20 +1000,22 @@ impl AgentSessionHandle {
             return Ok(result(Vec::new(), true));
         }
         let known = self.mapper.lock().await.provider_task(task_id);
-        let provider_id = match known {
+        let provider_id = match &known {
             // Over already: nothing to stop, nothing changes (as on Claude Code).
             Some((_, false)) => return Ok(result(Vec::new(), false)),
-            Some((id, true)) => id,
+            Some((id, true)) => id.clone(),
             // No snapshot named it (yet): the provider decides.
             None => task_id.to_string(),
         };
-        match self
-            .session
-            .cancel_tools(CancelScope::Task {
+        let call = tokio::time::timeout(
+            super::cancel_relay::OWNER_CANCEL_BOUND,
+            self.session.cancel_tools(CancelScope::Task {
                 id: provider_id.clone(),
-            })
-            .await
-        {
+            }),
+        )
+        .await
+        .map_err(|_| cancel_timeout(super::cancel_relay::CancelKind::Task))?;
+        match call {
             Ok(outcome) => {
                 let diagnostic = outcome.diagnostic.unwrap_or_default();
                 tracing::info!(
@@ -1021,7 +1031,13 @@ impl AgentSessionHandle {
             // An id the provider does not know (or no longer runs): the idempotent
             // no-op of the Claude Code engine.
             Err(ProviderError::InvalidRequest { detail }) => {
-                tracing::debug!(session_id = %self.session_id, task_id, %detail, "cancel_task: unknown task, no-op");
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    task_id,
+                    %detail,
+                    known_in_snapshot = known.is_some(),
+                    "cancel_task: the provider does not know this task (unknown id, already over, or a Stop that came before the first background_tasks snapshot named it): idempotent no-op"
+                );
                 Ok(result(Vec::new(), false))
             }
             Err(error) => Err(self.cancel_refused(error).await),
@@ -1074,6 +1090,11 @@ impl AgentSessionHandle {
         .await;
         Ok(())
     }
+}
+
+/// A cancel the provider did not answer within `OWNER_CANCEL_BOUND`.
+fn cancel_timeout(kind: super::cancel_relay::CancelKind) -> anyhow::Error {
+    anyhow::Error::new(super::cancel_relay::CancelRelayError::OwnerTimeout { kind })
 }
 
 /// The wire form of a cancel (`cancel_tools`, `cancel_task`) the provider refused
