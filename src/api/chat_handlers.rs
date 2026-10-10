@@ -1124,15 +1124,18 @@ pub async fn cancel_task(
     let result = chat_manager
         .cancel_task(&session_id.to_string(), &task_id)
         .await
-        .map_err(|e| {
-            match e.downcast_ref::<crate::chat::manager::CancelTaskUnsupported>() {
-                // A session of the agent engine: refused, said so (501).
-                Some(unsupported) => AppError::NotImplemented(unsupported.to_string()),
-                None => AppError::Internal(e),
-            }
-        })?;
+        .map_err(cancel_task_error)?;
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
+}
+
+/// The error of `cancel_task` as the route answers it.
+fn cancel_task_error(e: anyhow::Error) -> AppError {
+    match e.downcast_ref::<crate::chat::manager::CancelTaskUnsupported>() {
+        // A session of the agent engine: refused, said so (501).
+        Some(unsupported) => AppError::NotImplemented(unsupported.to_string()),
+        None => AppError::Internal(e),
+    }
 }
 
 // ============================================================================
@@ -1860,6 +1863,21 @@ pub async fn associate_session(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cancel_task_refused_by_the_agent_engine_is_a_501_not_a_500() {
+        let refused = anyhow::Error::new(crate::chat::manager::CancelTaskUnsupported {
+            session_id: "s".into(),
+        });
+        assert!(matches!(
+            super::cancel_task_error(refused),
+            crate::api::handlers::AppError::NotImplemented(_)
+        ));
+        assert!(matches!(
+            super::cancel_task_error(anyhow::anyhow!("boom")),
+            crate::api::handlers::AppError::Internal(_)
+        ));
+    }
+
     use super::*;
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
