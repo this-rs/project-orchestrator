@@ -370,6 +370,21 @@ pub enum DeliveryRoute {
     ResumedAfterSendFailure,
 }
 
+/// The approval scopes the Claude Code engine (legacy path) offers: `once`, and `session`
+/// kept by the backend (`chat::session_grants`). Never `always` in this lot (P11b).
+/// Declared in its `system_init.capabilities` and checked by
+/// [`ChatManager::deliver_permission_answer`]: what is accepted is what is declared.
+pub const LEGACY_PERMISSION_SCOPES: &[super::types::PermissionAnswerScope] = &[
+    super::types::PermissionAnswerScope::Once,
+    super::types::PermissionAnswerScope::Session,
+];
+
+/// `system_init.capabilities` of the Claude Code engine: only what this engine declares
+/// itself (`permission_scopes`); a client keeps its Claude Code profile for the rest.
+pub fn legacy_capabilities() -> serde_json::Value {
+    serde_json::json!({ "permission_scopes": LEGACY_PERMISSION_SCOPES })
+}
+
 /// Why a permission answer was not delivered.
 #[derive(Debug)]
 pub enum PermissionDeliveryError {
@@ -4296,7 +4311,7 @@ impl ChatManager {
                             mcp_servers,
                             permission_mode,
                             provider: None,
-                            capabilities: None,
+                            capabilities: Some(legacy_capabilities()),
                             tool_policy: None,
                             policy_mode: None,
                             // The historical engine does everything: nothing is missing.
@@ -6146,34 +6161,29 @@ impl ChatManager {
                     };
 
                     // A decision the backend made itself (a request a session grant covers): persisted
-
-                    // and broadcast like the request it answers.
-
+                    // and broadcast like the request it answers, and the attention it raised cleared
+                    // (`attention_changed`, as for a decision of the user).
                     let record_decision =
                         |event: ChatEvent,
-
                          events_to_persist: &mut Vec<ChatEventRecord>,
-
                          next_seq: &std::sync::atomic::AtomicI64| {
                             if let Some(uuid) = session_uuid {
                                 let seq = next_seq.fetch_add(1, Ordering::SeqCst);
-
                                 events_to_persist.push(ChatEventRecord {
                                     id: Uuid::new_v4(),
-
                                     session_id: uuid,
-
                                     seq,
-
                                     event_type: event.event_type().to_string(),
-
                                     data: serde_json::to_string(&event).unwrap_or_default(),
-
                                     created_at: chrono::Utc::now(),
                                 });
                             }
-
                             emit_chat(event, &events_tx, &nats, &session_id);
+                            notify_attention(
+                                &event_emitter,
+                                AttentionSubject::Session(session_id.to_string()),
+                                AttentionReason::PermissionDecision,
+                            );
                         };
 
                     // Main stream loop — uses tokio::select! to listen for BOTH stream
@@ -7545,6 +7555,11 @@ impl ChatManager {
         scope: super::types::PermissionAnswerScope,
         require_pending: bool,
     ) -> std::result::Result<(), PermissionDeliveryError> {
+        // What is accepted is what the engine declares (`system_init.capabilities`), as on
+        // the agent engine: a scope it does not declare is refused, never narrowed.
+        if allow && !LEGACY_PERMISSION_SCOPES.contains(&scope) {
+            return Err(PermissionDeliveryError::ScopeUnsupported(scope));
+        }
         let (stdin_tx, pending_perm_inputs, events_tx, session_uuid, next_seq, session_grants) = {
             let mut sessions = ctx.active_sessions.write().await;
             let session = sessions
@@ -12595,8 +12610,12 @@ async fn answer_granted_request(
         }
     })
     .to_string();
-    pending.lock().await.remove(id);
+    // Claimed before the write, like an answer of the user: whoever claims first answers,
+    // never two answers to one request (a request already claimed is left alone). Given
+    // back if the write fails: the request then still waits for the user.
+    let claimed = pending.lock().await.remove(id)?;
     if tx.send(line).await.is_err() {
+        pending.lock().await.insert(id.to_string(), claimed);
         return None;
     }
     info!(request_id = %id, rule = %grant.describe(), "permission covered by a session grant: answered by the backend");
@@ -16783,6 +16802,21 @@ mod tests {
         let wire = serde_json::to_value(&events[0]).unwrap();
         assert_eq!(wire["engine"], "legacy", "{wire}");
         assert_eq!(wire["degraded_features"], serde_json::json!([]), "{wire}");
+    }
+
+    #[test]
+    fn the_legacy_system_init_declares_the_permission_scopes_the_engine_accepts() {
+        let msg = Message::System {
+            subtype: "init".into(),
+            data: serde_json::json!({"session_id": "cli-1", "model": "m"}),
+        };
+        let events = ChatManager::message_to_events(&msg);
+        let wire = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(
+            wire["capabilities"]["permission_scopes"],
+            serde_json::json!(["once", "session"]),
+            "{wire}"
+        );
     }
 
     fn done_event(

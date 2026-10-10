@@ -132,21 +132,35 @@ messages yet. Both are also logged by the server with the step name.
 ```
 
 `scope` (optional, default `once`) says how long an approval lasts: `once` (this call) or
-`session`. A `session` approval is decided by the BACKEND (`chat::session_grants`), never handed to
-the provider as a rule (no nexus `allow` entry, no `updatedPermissions` to the CLI): the provider
-is answered `once`, and the backend answers itself the later requests of the SAME session that
-the grant covers — the identical call (same tool, same input; a command's surrounding blanks
-trimmed), or any call of a read-only tool (`Read`, `Glob`, `Grep`, `LS`). A command that runs
-another command (`env`, `sudo`, `bash -c`, `xargs`, `timeout`, `ssh`, `docker exec`..., by
-basename) cannot be granted for the session. Only requests the provider asked reach the backend,
-after its own policy (read-only access, denies, trust) and the project's consent. Another session,
-or the same one after a restart, asks again. `always` is part of the contract but refused on every
-engine for now (P11b). A scope that cannot be kept is refused with an `error` frame
-`{"code": "permission_scope_unsupported", "reason": "<scope>"}`; nothing is answered and the
-request stays waiting. The resulting `permission_decision` carries `scope` and `rule` (what a
-session grant covers, e.g. `Bash: git status`). The REST twin
+`session`. Both engines declare what they accept in `system_init.capabilities.permission_scopes`
+(the Claude Code engine: `["once", "session"]`); a scope not declared is refused. A `session`
+approval is decided by the BACKEND (`chat::session_grants`), never handed to the provider as a
+rule (no nexus `allow` entry, no `updatedPermissions` to the CLI): the provider is answered
+`once`, and the backend answers itself the later requests of the SAME session that the grant
+covers. A grant never covers more than what the user approved:
+
+- the identical call: same tool, same input (a command's surrounding blanks trimmed, its
+  `description` ignored, every other field compared);
+- any call of a read-only built-in tool of the native engine (`mcp__nexus__Read`, `Glob`, `Grep`,
+  `LS`), identified by the adapter, never by the name's suffix: a third party's `mcp__acme__Read`
+  only gets the identical call. On the Claude Code engine a read is only granted for the identical
+  call too (the CLI asks a read only outside the working directory);
+- no session grant at all (refused) for a command that may run code the user did not see in the
+  line: one that runs another command (`env`, `sudo`, `bash -c`, `xargs`, `ssh`, `docker
+  exec`..., by basename), a program given by path (`./x.sh`), an interpreter (`python3`, `node`...),
+  a task runner or build tool (`make`, `npm`, `cargo`...), `git` (hooks, repository
+  configuration), `find -exec`, a command or process substitution, anywhere in the line.
+
+Only requests the provider asked reach the backend, after its own policy (read-only access,
+denies, trust) and the project's consent. Another session, or the same one after a restart, asks
+again. `always` is part of the contract but refused on every engine for now (P11b). A scope that
+cannot be kept is refused with an `error` frame `{"code": "permission_scope_unsupported",
+"reason": "<scope>"}`; nothing is answered and the request stays waiting. An answer to a request
+that no longer waits (answered by the backend under a grant, or from another tab) is ignored,
+on the WebSocket as on REST and NATS. The resulting `permission_decision` carries `scope` and
+`rule` (what a session grant covers, e.g. `Bash: ls -la`). The REST twin
 `POST /api/chat/sessions/{id}/permissions/{request_id}` takes `{"allow", "scope"?}` (400
-`permission_scope_unsupported`).
+`permission_scope_unsupported`); it is a human route (an agent session token gets 403).
 
 #### `input_response` -- Respond to an input request
 

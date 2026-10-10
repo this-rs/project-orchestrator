@@ -1228,26 +1228,16 @@ fn transcript_main(k: Keys, cwd: &str) -> Vec<Value> {
         text("answered five"),
         result_ok("answered five"),
     ]);
-    // TURN-PERM-S: `git status` granted for the session, then the identical call again
+    // TURN-PERM-S: `ls -la` granted for the session, then the identical call again
     // (the backend answers it). TURN-PERM-A: an `always` (refused), then once.
     t.extend(vec![
         await_in(&k.k("TURN-PERM-S")),
-        cc_tool_use("t5s", "Bash", json!({"command": "git status"})),
-        permission_request(
-            "req-perm-s",
-            "Bash",
-            json!({"command": "git status"}),
-            "t5s",
-        ),
+        cc_tool_use("t5s", "Bash", json!({"command": "ls -la"})),
+        permission_request("req-perm-s", "Bash", json!({"command": "ls -la"}), "t5s"),
         await_in("req-perm-s"),
         cc_tool_result("t5s", "clean", false),
-        cc_tool_use("t5t", "Bash", json!({"command": "git status"})),
-        permission_request(
-            "req-perm-t",
-            "Bash",
-            json!({"command": "git status"}),
-            "t5t",
-        ),
+        cc_tool_use("t5t", "Bash", json!({"command": "ls -la"})),
+        permission_request("req-perm-t", "Bash", json!({"command": "ls -la"}), "t5t"),
         await_in("req-perm-t"),
         cc_tool_result("t5t", "clean", false),
         text("answered perm s"),
