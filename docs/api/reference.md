@@ -329,10 +329,16 @@ typed error body `{error, code, retryable}`, never a `200`:
 | 410 | `session_gone` | only the instance that just lost the session answered. cancel-task: after a 1.5 s grace for the real owner, `retryable: true` (asking again reaches the new owner). cancel-tools: only once the asker's 10 s are over (a real owner slower than 1.5 s still answers), `retryable: false` (the tools may or may not have been stopped; a retry would stop tools started since) |
 | 502 | `owner_protocol` / `owner_failed` / `relay_failed` | unreadable answer / the owner failed / the request could not be sent |
 
-Asking cancel-task again for a task already being stopped (a retry after a
-`410`/`504`, a second click, within the 5 s it stays listed as stopping) is a no-op:
-`200` with empty `killed_pids`, the signal is not sent twice and the cap does not
-count it.
+Asking cancel-task again for a task already signalled (a retry after a
+`410`/`504`, a second click, two concurrent stops, within the 5 s it stays listed as
+stopping) is a no-op: `200` with empty `killed_pids`, the signal is not sent twice
+and the cap counts it once. A task stopped in its first second, before its process
+is known, answers `200` with empty `killed_pids` too; its process is signalled as
+soon as it is found (about a second later), and until then asking again is not a
+no-op. When several processes started in that same second (two tools at once), none
+is signalled automatically, since the first one found may belong to the other tool:
+asking again signals the one recorded. A task whose process was found dead is never
+signalled (its pid may belong to another process by then): asking is the no-op.
 
 A provider refusal is also announced on the session's stream as
 `error { code: "cancel_refused", reason: <capability> }`. Over the WebSocket, a
