@@ -1501,9 +1501,22 @@ mod tests {
             &["pnpm", "--silent", "exec", "openclaw", "acp"],
             &["bunx", "openclaw", "acp"],
             &["node", "/opt/oc/dist/openclaw.mjs", "acp"],
-            &["node", "--require", "/opt/trace.js", "/opt/oc/openclaw.mjs", "acp"],
+            &[
+                "node",
+                "--require",
+                "/opt/trace.js",
+                "/opt/oc/openclaw.mjs",
+                "acp",
+            ],
             &["env", "openclaw", "acp"],
-            &["/usr/bin/env", "-u", "HOME", "OC_DEBUG=1", "openclaw", "acp"],
+            &[
+                "/usr/bin/env",
+                "-u",
+                "HOME",
+                "OC_DEBUG=1",
+                "openclaw",
+                "acp",
+            ],
             &["env", "npx", "openclaw", "acp"],
         ] {
             assert!(!acp_command_carries_mcp(&argv(refuses)), "{refuses:?}");
