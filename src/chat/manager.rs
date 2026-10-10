@@ -31,7 +31,7 @@ use nexus_claude::{
     StreamDelta, StreamEventData,
 };
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -234,6 +234,18 @@ pub struct ActiveSession {
     /// in `stream_response`, even when the CLI is silent (e.g., executing `sleep 60`).
     /// A NEW token is created at each stream start (CancellationToken is not resettable).
     pub interrupt_token: CancellationToken,
+    /// Generation of the turn: bumped each time `stream_response` installs a new
+    /// `interrupt_token`. The interrupt watchdog compares it to know whether the
+    /// turn it cancelled is still the one running (`abandon_turn_if_stuck`).
+    pub turn_generation: Arc<AtomicU64>,
+    /// The task running the current turn (`stream_response`, then whatever it
+    /// drains next). Registered by `track_stream_task` at every spawn; aborted by
+    /// the interrupt watchdog when the turn ignores its cancellation.
+    pub stream_task: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
+    /// How long one post-stream step may hold a turn of this session
+    /// (`post_stream::StepBudget`). `POST_STREAM_STEP_BUDGET` everywhere but in
+    /// tests, which shorten it to watch a step overrun.
+    pub post_stream_budget: Duration,
     /// Stores the original tool input for pending permission requests.
     /// Key: request_id, Value: the tool input JSON.
     /// When the user responds Allow, we include this input in `updatedInput`
@@ -398,6 +410,13 @@ pub struct CancelToolsResult {
     /// 429 or display a "slow down" toast.
     pub capped: bool,
 }
+
+/// How long a stopped turn may take to end before the interrupt watchdog
+/// ends it (`ChatManager::abandon_turn_if_stuck`). A turn that honours its
+/// cancellation ends within milliseconds; its post-stream steps are each
+/// bounded by `post_stream::POST_STREAM_STEP_BUDGET` and run after the Stop
+/// is acknowledged, so this only needs to cover the acknowledgement itself.
+pub(crate) const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
 
 /// Outcome of [`ChatManager::interrupt_scoped`]. Surfaced to REST callers
 /// so a client can tell a real interrupt from a silent no-op: before this,
@@ -2934,7 +2953,9 @@ impl ChatManager {
                             let search_clone = search.clone();
                             let documents_clone = documents.clone();
 
-                            tokio::spawn(async move {
+                            let active_sessions_for_turn = active_sessions.clone();
+                            let session_id_for_turn = session_id.clone();
+                            let turn_task = tokio::spawn(async move {
                                 Self::stream_response(
                                     client,
                                     events_tx,
@@ -2961,6 +2982,12 @@ impl ChatManager {
                                 )
                                 .await;
                             });
+                            Self::track_stream_task(
+                                &active_sessions_for_turn,
+                                &session_id_for_turn,
+                                turn_task.abort_handle(),
+                            )
+                            .await;
 
                             crate::events::ChatRpcResponse {
                                 success: true,
@@ -4737,6 +4764,9 @@ impl ChatManager {
                     child_pid,
                     nats_cancel: nats_cancel.clone(),
                     interrupt_token: interrupt_token.clone(),
+                    turn_generation: Arc::new(AtomicU64::new(0)),
+                    stream_task: Arc::new(std::sync::Mutex::new(None)),
+                    post_stream_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
                     pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
                         std::collections::HashMap::new(),
                     )),
@@ -4950,7 +4980,8 @@ impl ChatManager {
         let search = self.search.clone();
         let documents = self.document_store.clone();
 
-        tokio::spawn(async move {
+        let session_id_for_turn = session_id_str.clone();
+        let turn_task = tokio::spawn(async move {
             Self::stream_response(
                 client,
                 events_tx_clone,
@@ -4977,6 +5008,12 @@ impl ChatManager {
             )
             .await;
         });
+        Self::track_stream_task(
+            &self.active_sessions,
+            &session_id_for_turn,
+            turn_task.abort_handle(),
+        )
+        .await;
 
         Ok(CreateSessionResponse {
             session_id: session_id.to_string(),
@@ -5565,6 +5602,8 @@ impl ChatManager {
                 let token = CancellationToken::new();
                 session.interrupt_token = token.clone();
                 session.interrupt_flag.store(false, Ordering::SeqCst);
+                // A new turn: a watchdog armed for the previous one stands down.
+                session.turn_generation.fetch_add(1, Ordering::SeqCst);
                 token
             } else {
                 warn!(
@@ -6546,8 +6585,39 @@ impl ChatManager {
         }
 
         // ===== POST-STREAM PROCESSING =====
-        // All post-stream logic delegated to PostStreamHandler (see post_stream.rs)
-        let post_ctx = super::post_stream::PostStreamContext::build(&graph, session_uuid).await;
+        // All post-stream logic delegated to PostStreamHandler (see post_stream.rs).
+        //
+        // Nothing below may hold the turn for good. Before this, one store
+        // call that never answered (Neo4j, Meilisearch: no client timeout)
+        // kept `is_streaming` true past the reach of any Stop — the loop
+        // above, the only reader of `interrupt_token`, was over — and the
+        // queued messages were never sent (note 1a31aadb, 2026-10-05; session
+        // b4c28b9f, 2026-10-09). So:
+        // - the turn's events are written in a task of their own, started
+        //   first: no step before them, and no abandoned turn, can lose them;
+        // - every other step runs under the session's step budget: past it
+        //   the step is dropped, logged and reported (`StepBudget`);
+        // - the interrupt watchdog (`abandon_turn_if_stuck`) ends a stopped
+        //   turn that still does not get there.
+        let persist_write = super::post_stream::spawn_persist_events(
+            &graph,
+            session_uuid,
+            &session_id,
+            events_to_persist,
+        );
+        let steps = super::post_stream::StepBudget {
+            session_id: session_id.clone(),
+            budget: super::post_stream::step_budget_of(&active_sessions, &session_id).await,
+            events_tx: events_tx.clone(),
+            nats: nats.clone(),
+        };
+        let post_ctx = steps
+            .run(
+                "context",
+                super::post_stream::PostStreamContext::build(&graph, session_uuid),
+            )
+            .await
+            .unwrap_or_default();
         let post_handler = super::post_stream::PostStreamHandler {
             graph: graph.clone(),
             pending_messages: pending_messages.clone(),
@@ -6570,17 +6640,32 @@ impl ChatManager {
         };
 
         // 1. Post-compaction context re-injection
-        post_handler
-            .handle_post_compaction(needs_post_compaction_injection)
+        steps
+            .run(
+                "post_compaction",
+                post_handler.handle_post_compaction(needs_post_compaction_injection),
+            )
             .await;
 
         // 2. Lock-free interrupt + ToolCancelled
-        post_handler
-            .handle_interrupt_cleanup(&stdin_tx_for_auto_allow, &pending_tool_calls)
+        steps
+            .run(
+                "interrupt_cleanup",
+                post_handler
+                    .handle_interrupt_cleanup(&stdin_tx_for_auto_allow, &pending_tool_calls),
+            )
             .await;
 
-        // 3. Auto-continue
-        let auto_continue_allowed = post_handler.handle_auto_continue(hit_error_max_turns).await;
+        // 3. Auto-continue (its own pause comes on top of the budget)
+        let auto_continue_allowed = steps
+            .run_for(
+                "auto_continue",
+                steps.budget
+                    + std::time::Duration::from_millis(super::post_stream::AUTO_CONTINUE_DELAY_MS),
+                post_handler.handle_auto_continue(hit_error_max_turns),
+            )
+            .await
+            .unwrap_or(false);
 
         // 4. Objective tracking — uses had_productive_tool_use (not had_tool_use)
         // so that conclusive-only turns (git commit/push) still trigger reminders.
@@ -6589,25 +6674,39 @@ impl ChatManager {
         // A turn refused before it was sent (its images) did not stop the agent:
         // no objective reminder starts a turn without the user's picture.
         if cli_input.is_some() {
-            post_handler
-                .handle_objective_tracking(
-                    had_productive_tool_use,
-                    had_conclusive_tool_use,
-                    auto_continue_allowed,
-                    hit_error_max_turns,
+            steps
+                .run(
+                    "objective_tracking",
+                    post_handler.handle_objective_tracking(
+                        had_productive_tool_use,
+                        had_conclusive_tool_use,
+                        auto_continue_allowed,
+                        hit_error_max_turns,
+                    ),
                 )
                 .await;
         }
 
-        // 5. Streaming status update
+        // 5. Streaming status update (a lock, nothing remote: never bounded)
         let has_pending = post_handler.finalize_streaming_status().await;
 
-        // 6. Batch-persist events to Neo4j
-        post_handler.persist_events(events_to_persist).await;
+        // 6. The turn's events, written since the loop ended: wait for them up
+        // to the budget (the history stays in order when the store is healthy);
+        // past it the write goes on alone and the clients are told.
+        if let Some(write) = persist_write {
+            steps.wait_for_write("persist_events", write).await;
+        }
 
-        // 7. Memory / feedback / RFC
-        post_handler
-            .handle_feedback(&assistant_text_parts, &memory_manager, &context_injector)
+        // 7. Memory / feedback / RFC (its store write runs in its own task)
+        steps
+            .run(
+                "feedback",
+                post_handler.handle_feedback(
+                    &assistant_text_parts,
+                    &memory_manager,
+                    &context_injector,
+                ),
+            )
             .await;
 
         // 8. Drain pending messages queue
@@ -6839,7 +6938,8 @@ impl ChatManager {
         let search = self.search.clone();
         let documents = self.document_store.clone();
 
-        tokio::spawn(async move {
+        let session_id_for_turn = session_id_str.clone();
+        let turn_task = tokio::spawn(async move {
             Self::stream_response(
                 client,
                 events_tx,
@@ -6866,6 +6966,12 @@ impl ChatManager {
             )
             .await;
         });
+        Self::track_stream_task(
+            &self.active_sessions,
+            &session_id_for_turn,
+            turn_task.abort_handle(),
+        )
+        .await;
 
         Ok(())
     }
@@ -8512,6 +8618,9 @@ impl ChatManager {
                     child_pid,
                     nats_cancel: nats_cancel.clone(),
                     interrupt_token: interrupt_token.clone(),
+                    turn_generation: Arc::new(AtomicU64::new(0)),
+                    stream_task: Arc::new(std::sync::Mutex::new(None)),
+                    post_stream_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
                     pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
                         std::collections::HashMap::new(),
                     )),
@@ -8657,7 +8766,8 @@ impl ChatManager {
         let search = self.search.clone();
         let documents = self.document_store.clone();
 
-        tokio::spawn(async move {
+        let session_id_for_turn = session_id_str.clone();
+        let turn_task = tokio::spawn(async move {
             Self::stream_response(
                 client,
                 events_tx,
@@ -8684,6 +8794,12 @@ impl ChatManager {
             )
             .await;
         });
+        Self::track_stream_task(
+            &self.active_sessions,
+            &session_id_for_turn,
+            turn_task.abort_handle(),
+        )
+        .await;
 
         Ok(())
     }
@@ -9088,6 +9204,165 @@ impl ChatManager {
         self.interrupt_scoped(session_id, true).await.map(|_| ())
     }
 
+    /// Remember the task that runs the turn of `session_id`, so the interrupt
+    /// watchdog can abort it. Called right after every `tokio::spawn` of
+    /// `stream_response`; the drain's recursive call runs in the same task.
+    pub(crate) async fn track_stream_task(
+        active_sessions: &Arc<RwLock<HashMap<String, ActiveSession>>>,
+        session_id: &str,
+        handle: tokio::task::AbortHandle,
+    ) {
+        let sessions = active_sessions.read().await;
+        if let Some(session) = sessions.get(session_id) {
+            *session
+                .stream_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+        }
+    }
+
+    /// Arm [`Self::abandon_turn_if_stuck`] for `session_id`, in the background.
+    pub(crate) fn spawn_interrupt_watchdog(&self, session_id: &str, grace: Duration) {
+        let active_sessions = self.active_sessions.clone();
+        let event_emitter = self.event_emitter.clone();
+        let nats = self.nats.clone();
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            Self::abandon_turn_if_stuck(active_sessions, event_emitter, nats, session_id, grace)
+                .await;
+        });
+    }
+
+    /// The turn of `session_id` was told to stop (flag, token, control request).
+    /// Wait up to `grace` for it to end on its own; when it does not, end it from
+    /// here: the task is aborted, the status goes back to idle, the clients learn
+    /// why. Returns whether the turn had to be abandoned.
+    ///
+    /// Why a turn can ignore its stop: the cancellation token is read by the
+    /// stream loop's `select!` only. Once the loop is over (post-stream steps:
+    /// persistence, memory) or while the loop body sits on an await of its own
+    /// (a store call), nothing reads it. Observed on 2026-10-09 (session
+    /// b4c28b9f): the CLI had answered, `result` was published, and the turn
+    /// stayed "streaming" for two hours; two Stops were delivered to nothing.
+    ///
+    /// A turn that ends, or a new turn that starts (`turn_generation` moved),
+    /// before the grace is over stands the watchdog down.
+    ///
+    /// Aborting the task drops what it held. Past the loop that is nothing
+    /// the next turn needs. Inside the loop, the SDK control receiver taken for
+    /// the turn goes with it: permission requests of that CLI are no longer
+    /// answered until the session is resumed. A session stuck for good was the
+    /// alternative.
+    ///
+    /// What the turn already wrote is safe: past the loop its events are written
+    /// in a task of their own (`post_stream::spawn_persist_events`), which the
+    /// abort does not reach. Inside the loop they are not written yet (the loop
+    /// collects them for one batch at its end): an abort there loses them, and
+    /// the `turn_abandoned` message says so.
+    ///
+    /// Messages held during the turn stay queued: the end of the next turn
+    /// drains them, as it always does.
+    pub(crate) async fn abandon_turn_if_stuck(
+        active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+        event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
+        nats: Option<Arc<crate::events::NatsEmitter>>,
+        session_id: String,
+        grace: Duration,
+    ) -> bool {
+        let (is_streaming, generation, turn) = {
+            let sessions = active_sessions.read().await;
+            let Some(session) = sessions.get(&session_id) else {
+                return false;
+            };
+            (
+                session.is_streaming.clone(),
+                session.turn_generation.clone(),
+                session.turn_generation.load(Ordering::SeqCst),
+            )
+        };
+        if !is_streaming.load(Ordering::SeqCst) {
+            return false;
+        }
+        // The runtime clock (not `std`): paused in tests, it moves with `sleep`.
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            tokio::time::sleep(left.min(Duration::from_millis(100))).await;
+            if !is_streaming.load(Ordering::SeqCst) || generation.load(Ordering::SeqCst) != turn {
+                return false;
+            }
+        }
+
+        let (task, events_tx, streaming_text, streaming_events) = {
+            let sessions = active_sessions.read().await;
+            let Some(session) = sessions.get(&session_id) else {
+                return false;
+            };
+            if !session.is_streaming.load(Ordering::SeqCst)
+                || session.turn_generation.load(Ordering::SeqCst) != turn
+            {
+                return false;
+            }
+            let task = session
+                .stream_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            (
+                task,
+                session.events_tx.clone(),
+                session.streaming_text.clone(),
+                session.streaming_events.clone(),
+            )
+        };
+        let task_aborted = task.map(|handle| handle.abort()).is_some();
+        warn!(
+            session_id = %session_id,
+            grace_ms = grace.as_millis() as u64,
+            task_aborted,
+            "Stop ignored by the turn: abandoned by the watchdog, the session is idle again"
+        );
+
+        is_streaming.store(false, Ordering::SeqCst);
+        streaming_text.lock().await.clear();
+        streaming_events.lock().await.clear();
+        for event in [
+            ChatEvent::Error {
+                message: format!(
+                    "The turn was stopped, but it did not end within {}s and was abandoned. \
+                     The conversation is free again; messages held during the turn are still queued \
+                     and go out after the next one. If the turn was stopped before its answer was \
+                     complete, part of it may be missing after a reload.",
+                    grace.as_secs()
+                ),
+                parent_tool_use_id: None,
+                code: Some("turn_abandoned".to_string()),
+                reason: None,
+                index: None,
+            },
+            ChatEvent::StreamingStatus {
+                is_streaming: false,
+            },
+        ] {
+            let _ = events_tx.send(event.clone());
+            if let Some(ref nats) = nats {
+                nats.publish_chat_event(&session_id, event);
+            }
+        }
+        if let Some(ref emitter) = event_emitter {
+            emitter.emit_updated(
+                crate::events::EntityType::ChatSession,
+                &session_id,
+                serde_json::json!({ "is_streaming": false }),
+                None,
+            );
+        }
+        true
+    }
+
     /// Interrupt the current turn of a session, choosing whether the
     /// running tool subprocesses go down with it.
     ///
@@ -9217,6 +9492,12 @@ impl ChatManager {
                 descendants_killed = outcome.killed_pids.len(),
                 "Interrupt: flag set, token cancelled, control_request sent"
             );
+
+            // The token only reaches the stream loop. A turn past its loop —
+            // in its post-stream steps, or wedged on an await inside the loop
+            // body — ignores it, and `is_streaming` would stay true for good.
+            // The watchdog gives it `INTERRUPT_GRACE` to end, then ends it.
+            self.spawn_interrupt_watchdog(session_id, INTERRUPT_GRACE);
         } else {
             debug!(
                 session_id = %session_id,
@@ -17081,6 +17362,9 @@ mod tests {
             child_pid: None,
             nats_cancel: CancellationToken::new(),
             interrupt_token: CancellationToken::new(),
+            turn_generation: Arc::new(AtomicU64::new(0)),
+            stream_task: Arc::new(std::sync::Mutex::new(None)),
+            post_stream_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -17229,6 +17513,208 @@ mod tests {
             events_rx,
             interrupt_flag,
         )
+    }
+
+    // ── Interrupt watchdog: a turn that ignores its Stop is abandoned ──
+
+    /// Every event the session has broadcast so far.
+    fn drain_events(rx: &mut broadcast::Receiver<ChatEvent>) -> Vec<ChatEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    async fn session_is_streaming(manager: &ChatManager, session_id: &str) -> bool {
+        manager.active_sessions.read().await[session_id]
+            .is_streaming
+            .load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_ignores_its_stop_is_abandoned_after_the_grace() {
+        let (manager, session_id, _pending, mut events, _flag) =
+            manager_with_streaming_session().await;
+        // The turn's task: past its loop, sitting on an await that never answers.
+        let turn = tokio::spawn(std::future::pending::<()>());
+        ChatManager::track_stream_task(&manager.active_sessions, &session_id, turn.abort_handle())
+            .await;
+
+        let abandoned = ChatManager::abandon_turn_if_stuck(
+            manager.active_sessions.clone(),
+            None,
+            None,
+            session_id.clone(),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(
+            abandoned,
+            "the turn did not end within the grace: abandoned"
+        );
+        assert!(!session_is_streaming(&manager, &session_id).await);
+        let err = turn.await.expect_err("the turn's task was aborted");
+        assert!(err.is_cancelled());
+        let events = drain_events(&mut events);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ChatEvent::Error { code: Some(code), .. } if code == "turn_abandoned"
+            )),
+            "the clients learn why: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            )),
+            "the composer is released: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_ends_within_the_grace_is_left_alone() {
+        let (manager, session_id, _pending, mut events, _flag) =
+            manager_with_streaming_session().await;
+        let is_streaming = manager.active_sessions.read().await[&session_id]
+            .is_streaming
+            .clone();
+        let turn = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            is_streaming.store(false, Ordering::SeqCst);
+        });
+        ChatManager::track_stream_task(&manager.active_sessions, &session_id, turn.abort_handle())
+            .await;
+
+        let abandoned = ChatManager::abandon_turn_if_stuck(
+            manager.active_sessions.clone(),
+            None,
+            None,
+            session_id.clone(),
+            Duration::from_millis(500),
+        )
+        .await;
+
+        assert!(!abandoned, "the turn ended on its own");
+        turn.await.expect("the task was not aborted");
+        assert!(
+            drain_events(&mut events).is_empty(),
+            "nothing to tell the clients"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_newer_turn_is_never_abandoned_for_an_older_stop() {
+        let (manager, session_id, _pending, mut events, _flag) =
+            manager_with_streaming_session().await;
+        let generation = manager.active_sessions.read().await[&session_id]
+            .turn_generation
+            .clone();
+        // The stopped turn ends and the next one starts (still streaming) while
+        // the watchdog waits: it is not the watchdog's turn any more.
+        let bump = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            generation.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let abandoned = ChatManager::abandon_turn_if_stuck(
+            manager.active_sessions.clone(),
+            None,
+            None,
+            session_id.clone(),
+            Duration::from_millis(200),
+        )
+        .await;
+
+        bump.await.unwrap();
+        assert!(!abandoned);
+        assert!(
+            session_is_streaming(&manager, &session_id).await,
+            "the new turn runs on"
+        );
+        assert!(drain_events(&mut events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_idle_session_needs_no_watchdog() {
+        let (session, _pending) = create_dummy_session(false, "", vec![]);
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let session_id = Uuid::new_v4().to_string();
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(session_id.clone(), session);
+
+        let abandoned = ChatManager::abandon_turn_if_stuck(
+            manager.active_sessions.clone(),
+            None,
+            None,
+            session_id,
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(!abandoned);
+    }
+
+    #[tokio::test]
+    async fn the_interrupt_arms_the_watchdog() {
+        let (manager, session_id, _pending, mut events, interrupt_flag) =
+            manager_with_streaming_session().await;
+        let turn = tokio::spawn(std::future::pending::<()>());
+        ChatManager::track_stream_task(&manager.active_sessions, &session_id, turn.abort_handle())
+            .await;
+
+        manager.spawn_interrupt_watchdog(&session_id, Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(!session_is_streaming(&manager, &session_id).await);
+        assert!(turn.is_finished());
+        assert!(
+            !interrupt_flag.load(Ordering::SeqCst),
+            "the watchdog is not an interrupt"
+        );
+        assert!(drain_events(&mut events).iter().any(|e| matches!(
+            e,
+            ChatEvent::StreamingStatus {
+                is_streaming: false
+            }
+        )));
+    }
+
+    /// The regression itself, on the public path (`interrupt_scoped`), with a
+    /// paused clock: a turn whose task never reads its cancellation token used to
+    /// leave the session "streaming" for good — every Stop delivered, none
+    /// effective. Red without the watchdog: the assert on `is_streaming` fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_frees_a_session_whose_turn_ignores_it() {
+        let (manager, session_id, _pending, mut events, _flag) =
+            manager_with_streaming_session().await;
+
+        let outcome = manager.interrupt_scoped(&session_id, true).await.unwrap();
+        assert!(
+            outcome.delivered,
+            "the session is local: the Stop was delivered"
+        );
+
+        // Well past any grace the watchdog may give the turn.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        assert!(
+            !session_is_streaming(&manager, &session_id).await,
+            "a delivered Stop ends the turn even when its task ignores the token"
+        );
+        assert!(drain_events(&mut events).iter().any(|e| matches!(
+            e,
+            ChatEvent::StreamingStatus {
+                is_streaming: false
+            }
+        )));
     }
 
     fn held_texts(event: ChatEvent) -> Vec<String> {
@@ -18330,6 +18816,9 @@ mod tests {
             child_pid: None,
             nats_cancel: CancellationToken::new(),
             interrupt_token: CancellationToken::new(),
+            turn_generation: Arc::new(AtomicU64::new(0)),
+            stream_task: Arc::new(std::sync::Mutex::new(None)),
+            post_stream_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -21780,6 +22269,9 @@ pub(crate) mod test_support {
             child_pid: None,
             nats_cancel: CancellationToken::new(),
             interrupt_token: CancellationToken::new(),
+            turn_generation: Arc::new(AtomicU64::new(0)),
+            stream_task: Arc::new(std::sync::Mutex::new(None)),
+            post_stream_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(pending)),
             auto_continue: Arc::new(AtomicBool::new(false)),
             auto_continue_count: Arc::new(AtomicU32::new(0)),

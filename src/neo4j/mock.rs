@@ -139,6 +139,11 @@ pub struct MockGraphStore {
     pub fail_plan_run_updates: std::sync::Mutex<std::collections::HashSet<Uuid>>,
     /// Failure injection: plan ids whose `get_plan` errors.
     pub fail_get_plan: std::sync::Mutex<std::collections::HashSet<Uuid>>,
+    /// Stall injection: a `store_chat_events` batch holding an event of one of
+    /// these types does not return until `release_chat_events` lifts it — a
+    /// store that never answers, for the post-stream tests.
+    pub stall_chat_events_of: std::sync::Mutex<std::collections::HashSet<String>>,
+    chat_events_released: tokio::sync::Notify,
     /// Triggers
     pub triggers: RwLock<HashMap<Uuid, crate::runner::Trigger>>,
     /// Trigger firings
@@ -352,6 +357,8 @@ impl MockGraphStore {
             fail_agent_execution_updates: std::sync::Mutex::new(std::collections::HashSet::new()),
             fail_plan_run_updates: std::sync::Mutex::new(std::collections::HashSet::new()),
             fail_get_plan: std::sync::Mutex::new(std::collections::HashSet::new()),
+            stall_chat_events_of: std::sync::Mutex::new(std::collections::HashSet::new()),
+            chat_events_released: tokio::sync::Notify::new(),
             triggers: RwLock::new(HashMap::new()),
             trigger_firings: RwLock::new(HashMap::new()),
             plan_tasks: RwLock::new(HashMap::new()),
@@ -638,6 +645,22 @@ impl MockGraphStore {
             anyhow::bail!("injected failure of {name}");
         }
         Ok(())
+    }
+
+    /// Make every `store_chat_events` batch that holds an `event_type` event hang
+    /// until [`Self::release_chat_events`].
+    pub fn stall_chat_events(&self, event_type: &str) {
+        if let Ok(mut s) = self.stall_chat_events_of.lock() {
+            s.insert(event_type.to_string());
+        }
+    }
+
+    /// Lift [`Self::stall_chat_events`]: the batches it held go through.
+    pub fn release_chat_events(&self, event_type: &str) {
+        if let Ok(mut s) = self.stall_chat_events_of.lock() {
+            s.remove(event_type);
+        }
+        self.chat_events_released.notify_waiters();
     }
 
     /// Names of the store reads performed so far (see `read_log`).
@@ -8203,6 +8226,18 @@ impl GraphStore for MockGraphStore {
         session_id: Uuid,
         events: Vec<ChatEventRecord>,
     ) -> Result<()> {
+        loop {
+            // Created before the check: a release in between still wakes it.
+            let released = self.chat_events_released.notified();
+            let stalled = self
+                .stall_chat_events_of
+                .lock()
+                .is_ok_and(|s| events.iter().any(|e| s.contains(&e.event_type)));
+            if !stalled {
+                break;
+            }
+            released.await;
+        }
         let mut store = self.chat_events.write().await;
         let entry = store.entry(session_id).or_default();
         entry.extend(events);

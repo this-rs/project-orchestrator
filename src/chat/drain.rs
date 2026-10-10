@@ -6,6 +6,7 @@
 //! `stream_response` is called recursively to process it.
 
 use super::manager::{ActiveSession, ChatManager};
+use super::post_stream::{spawn_write, step_budget_of, StepBudget};
 use super::types::{ChatEvent, PendingMessage, PendingMessageKind};
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
@@ -109,21 +110,35 @@ pub(crate) async fn drain_pending_messages(
         let needs_persist_and_broadcast = !matches!(kind, PendingMessageKind::BackgroundOutput);
         if needs_persist_and_broadcast {
             if let Some(uuid) = session_uuid {
-                if matches!(kind, PendingMessageKind::User) {
-                    if let Ok(Some(node)) = graph.get_chat_session(uuid).await {
-                        let _ = graph
-                            .update_chat_session(
-                                uuid,
-                                None,
-                                None,
-                                Some(node.message_count + 1),
-                                None,
-                                None,
-                                None,
-                            )
-                            .await;
-                    }
-                }
+                // Writes in tasks of their own, awaited up to the step budget
+                // like the post-stream steps: a store that never answers must
+                // not keep the next turn from starting, and must not lose the
+                // message either (`spawn_write` lets it land late).
+                let steps = StepBudget {
+                    session_id: session_id.clone(),
+                    budget: step_budget_of(&active_sessions, &session_id).await,
+                    events_tx: events_tx.clone(),
+                    nats: nats.clone(),
+                };
+                let count_write = matches!(kind, PendingMessageKind::User).then(|| {
+                    let graph = graph.clone();
+                    spawn_write(session_id.clone(), "drain_message_count", async move {
+                        if let Some(node) = graph.get_chat_session(uuid).await? {
+                            graph
+                                .update_chat_session(
+                                    uuid,
+                                    None,
+                                    None,
+                                    Some(node.message_count + 1),
+                                    None,
+                                    None,
+                                    None,
+                                )
+                                .await?;
+                        }
+                        Ok(())
+                    })
+                });
 
                 let (event_type, event_data) = match kind {
                     PendingMessageKind::SystemHint => (
@@ -153,7 +168,22 @@ pub(crate) async fn drain_pending_messages(
                     data: event_data,
                     created_at: chrono::Utc::now(),
                 };
-                let _ = graph.store_chat_events(uuid, vec![event_record]).await;
+                let record_write = {
+                    let graph = graph.clone();
+                    spawn_write(session_id.clone(), "drain_persist", async move {
+                        graph.store_chat_events(uuid, vec![event_record]).await
+                    })
+                };
+                // One budget for both: they run side by side.
+                let count_wait = async {
+                    if let Some(write) = count_write {
+                        steps.wait_for_write("drain_message_count", write).await;
+                    }
+                };
+                tokio::join!(
+                    count_wait,
+                    steps.wait_for_write("drain_persist", record_write)
+                );
             }
 
             let chat_event = match kind {
