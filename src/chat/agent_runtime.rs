@@ -384,11 +384,22 @@ pub struct AgentSessionHandle {
     cancel_tools_cap: u32,
     /// The window of the cap (`CANCEL_TOOLS_WINDOW_SECS`).
     cancel_tools_window: Duration,
+    /// When its tool calls really ran (`tool_clock`): a `tool_timing` follows each result.
+    tool_clock: Arc<super::tool_clock::ToolClock>,
 }
 
 impl AgentSessionHandle {
-    /// Persists (except transient events) and broadcasts one event.
-    pub async fn emit(&self, mut event: ChatEvent) {
+    /// Persists (except transient events) and broadcasts one event, then the timing
+    /// of the tool call it ends, if it ends one.
+    pub async fn emit(&self, event: ChatEvent) {
+        let timing = self.tool_clock.observe(&event, chrono::Utc::now());
+        self.emit_one(event).await;
+        if let Some(timing) = timing {
+            self.emit_one(timing).await;
+        }
+    }
+
+    async fn emit_one(&self, mut event: ChatEvent) {
         // What only the session owner knows rides on `system_init`.
         if let ChatEvent::SystemInit {
             provider,
@@ -1088,6 +1099,7 @@ impl AgentRuntime {
             persisted_token: Mutex::new(session.resume_token().map(|t| t.to_wire())),
             cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_tools_cap: CANCEL_TOOLS_CAP,
+            tool_clock: super::tool_clock::ToolClock::for_session(session_id),
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
         });
         if let Some(oob) = session.out_of_band() {

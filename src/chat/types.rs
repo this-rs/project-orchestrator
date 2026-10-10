@@ -583,6 +583,35 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_tool_use_id: Option<String>,
     },
+    /// When a tool call really ran, as the engine saw it (`tool_clock`), emitted once
+    /// its result (or its cancellation) is in. Times: seconds since the epoch, the
+    /// milliseconds as the fraction (the unit of `created_at`); a time the engine
+    /// did not see is absent.
+    ToolTiming {
+        /// The tool_use ID.
+        id: String,
+        /// The model announced the call (`tool_use`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        called_at: Option<f64>,
+        /// The engine took the call up (PreToolUse hook), before any permission.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<f64>,
+        /// The engine asked the user (permission or question).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_requested_at: Option<f64>,
+        /// The user answered the permission.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_resolved_at: Option<f64>,
+        /// The tool itself started running: the answer when a permission was asked,
+        /// else the take-up, else the announcement. Absent when a question was
+        /// never answered apart from the result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_started_at: Option<f64>,
+        /// The engine had the result (or the call was cancelled).
+        ended_at: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
     /// Claude is asking for permission to use a tool
     PermissionRequest {
         id: String,
@@ -966,6 +995,7 @@ impl ChatEvent {
             ChatEvent::ToolResult { .. } => "tool_result",
             ChatEvent::ToolUseInputResolved { .. } => "tool_use_input_resolved",
             ChatEvent::ToolCancelled { .. } => "tool_cancelled",
+            ChatEvent::ToolTiming { .. } => "tool_timing",
             ChatEvent::PermissionRequest { .. } => "permission_request",
             ChatEvent::AskUserQuestion { .. } => "ask_user_question",
             ChatEvent::Result { .. } => "result",
@@ -1010,6 +1040,7 @@ impl ChatEvent {
                 Some(format!("tool_use_input_resolved:{}", id))
             }
             ChatEvent::ToolCancelled { id, .. } => Some(format!("tool_cancelled:{}", id)),
+            ChatEvent::ToolTiming { id, .. } => Some(format!("tool_timing:{}", id)),
             ChatEvent::PermissionRequest { id, .. } => Some(format!("permission_request:{}", id)),
             ChatEvent::AskUserQuestion { id, .. } => Some(format!("ask_user_question:{}", id)),
             ChatEvent::PermissionDecision { id, .. } => Some(format!("permission_decision:{}", id)),

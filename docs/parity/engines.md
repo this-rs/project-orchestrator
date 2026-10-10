@@ -28,6 +28,7 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `permissions.once` | une permission accordée une fois débloque l'outil | ok | ok |
 | `permissions.session` | une permission accordée pour la session n'est pas redemandée | gap (harnais, P11) | gap (harnais, P11) |
 | `permissions.always` | une permission accordée pour toujours est retenue au-delà de la session | gap (harnais, P11) | gap (harnais, P11) |
+| `tool_timing` | un outil qui a attendu une permission porte tool_timing persisté : prise en charge, attente, exécution, fin | ok | ok |
 | `po_tools` | les outils project-orchestrator (MCP) sont donnés et appelables | ok | ok |
 | `nexus_tools` | Read / Edit / Bash s'exécutent sur le projet | not_measured | ok |
 | `enrichment` | le contexte du graphe précède le message du tour | ok | ok |
@@ -39,7 +40,7 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `cancel_task` | cancel_task arrête une tâche d'arrière-plan | ok | gap (harnais, P12) |
 | `system_init.degraded` | system_init n'annonce comme manquant qu'une limite du modèle (liste fermée) | ok | ok |
 
-`ok` : Claude Code 23/26, natif 21/26.
+`ok` : Claude Code 24/27, natif 22/27.
 
 ## Écarts déclarés
 
