@@ -2564,6 +2564,7 @@ impl ChatManager {
         let retry_config = self.config.retry.clone();
         let enrichment_pipeline = self.enrichment_pipeline.clone();
         let search = self.search.clone();
+        let documents = self.document_store.clone();
 
         tokio::spawn(async move {
             let mut subscriber = match nats.subscribe_rpc_send(&session_id).await {
@@ -2896,6 +2897,7 @@ impl ChatManager {
                             let retry_config_clone = retry_config.clone();
                             let enrichment_pipeline_clone = enrichment_pipeline.clone();
                             let search_clone = search.clone();
+                            let documents_clone = documents.clone();
 
                             tokio::spawn(async move {
                                 Self::stream_response(
@@ -2920,6 +2922,7 @@ impl ChatManager {
                                     retry_config_clone,
                                     enrichment_pipeline_clone,
                                     search_clone,
+                                    documents_clone,
                                 )
                                 .await;
                             });
@@ -4802,6 +4805,7 @@ impl ChatManager {
                 retry_config: self.config.retry.clone(),
                 enrichment_pipeline: self.enrichment_pipeline.clone(),
                 search: self.search.clone(),
+                documents: self.document_store.clone(),
                 nats: self.nats.clone(),
             },
         );
@@ -4907,6 +4911,7 @@ impl ChatManager {
         let retry_config = self.config.retry.clone();
         let enrichment_pipeline = self.enrichment_pipeline.clone();
         let search = self.search.clone();
+        let documents = self.document_store.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -4931,6 +4936,7 @@ impl ChatManager {
                 retry_config,
                 enrichment_pipeline,
                 search,
+                documents,
             )
             .await;
         });
@@ -5500,6 +5506,7 @@ impl ChatManager {
         retry_config: super::config::RetryConfig,
         enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
         search: Arc<dyn crate::meilisearch::SearchStore>,
+        documents: crate::documents::store::DocumentStore,
     ) {
         // Helper closure: emit a ChatEvent to local broadcast + NATS (if configured)
         let emit_chat = |event: ChatEvent,
@@ -5574,6 +5581,11 @@ impl ChatManager {
         // is expanded exactly as before.
         let turn = crate::refs::turn::expand_user_turn_in(&graph, &prompt, &session_id).await;
 
+        // The images attached to the stored message (`message_attachments`, the
+        // loader of the agent engine): sent inline with the turn below. A turn
+        // without attachment (continuation, hint, tool output) has none.
+        let images = super::message_attachments::load_images(&graph, &documents, &prompt).await;
+
         // Tell the clients what the references resolved to (persisted for replay).
         if let Some(event) = turn.event() {
             emit_chat(event.clone(), &events_tx, &nats, &session_id);
@@ -5647,6 +5659,39 @@ impl ChatManager {
         let session_uuid = Uuid::parse_str(&session_id).ok();
         let mut assistant_text_parts: Vec<String> = Vec::new();
         let mut events_to_persist: Vec<ChatEventRecord> = Vec::new();
+
+        // What the CLI is given: the prompt as one string, or — with images — the
+        // text and image blocks, checked by nexus (`agent_runtime::CliInput`). An
+        // image that cannot be read or that nexus refuses: `images_refused` on the
+        // wire (persisted), NOTHING written on stdin, no retry; the session stays
+        // usable for the next message.
+        let cli_input = match images
+            .map_err(|reason| {
+                warn!(session_id = %session_id, %reason, "an attached image could not be read");
+                Box::new(super::agent_runtime::images_refused(
+                    "unreadable",
+                    format!("Error: {reason}: the message was not sent."),
+                ))
+            })
+            .and_then(|images| super::agent_runtime::CliInput::of(prompt, &images))
+        {
+            Ok(input) => Some(input),
+            Err(refusal) => {
+                info!(session_id = %session_id, "the attached images were refused: nothing sent to the CLI");
+                emit_chat((*refusal).clone(), &events_tx, &nats, &session_id);
+                if let Some(uuid) = session_uuid {
+                    events_to_persist.push(ChatEventRecord {
+                        id: Uuid::new_v4(),
+                        session_id: uuid,
+                        seq: next_seq.fetch_add(1, Ordering::SeqCst),
+                        event_type: refusal.event_type().to_string(),
+                        data: serde_json::to_string(&refusal).unwrap_or_default(),
+                        created_at: chrono::Utc::now(),
+                    });
+                }
+                None
+            }
+        };
         let mut emitted_tool_use_ids: std::collections::HashMap<String, Option<usize>> =
             std::collections::HashMap::new();
         let mut pending_tool_calls: std::collections::HashMap<String, Option<String>> =
@@ -5695,6 +5740,10 @@ impl ChatManager {
         let mut retry_attempt = 0u32;
 
         'retry_loop: loop {
+            // A refused turn is never sent (and so never retried).
+            let Some(input) = cli_input.clone() else {
+                break 'retry_loop;
+            };
             // Per-attempt state — reset on each retry iteration
             let mut should_retry = false;
             let mut last_retry_error = String::new();
@@ -5714,7 +5763,9 @@ impl ChatManager {
 
                 // Try to start the stream. If it fails with a retryable error,
                 // set should_retry and break to the retry decision block.
-                let stream_start = c.send_and_receive_stream(prompt.clone()).await;
+                // Every attempt writes the same input: a retry of a turn with
+                // images sends the images again, never the text alone.
+                let stream_start = input.send(&mut c).await;
                 let stream_ok = match stream_start {
                     Ok(s) => Some(s),
                     Err(e) => {
@@ -6496,14 +6547,18 @@ impl ChatManager {
         // so that conclusive-only turns (git commit/push) still trigger reminders.
         // Also passes had_conclusive_tool_use so that mixed turns (Edit + git commit)
         // still check for pending objectives.
-        post_handler
-            .handle_objective_tracking(
-                had_productive_tool_use,
-                had_conclusive_tool_use,
-                auto_continue_allowed,
-                hit_error_max_turns,
-            )
-            .await;
+        // A turn refused before it was sent (its images) did not stop the agent:
+        // no objective reminder starts a turn without the user's picture.
+        if cli_input.is_some() {
+            post_handler
+                .handle_objective_tracking(
+                    had_productive_tool_use,
+                    had_conclusive_tool_use,
+                    auto_continue_allowed,
+                    hit_error_max_turns,
+                )
+                .await;
+        }
 
         // 5. Streaming status update
         let has_pending = post_handler.finalize_streaming_status().await;
@@ -6540,6 +6595,7 @@ impl ChatManager {
             retry_config,
             enrichment_pipeline,
             search,
+            documents,
         )
         .await;
     }
@@ -6742,6 +6798,7 @@ impl ChatManager {
         let retry_config = self.config.retry.clone();
         let enrichment_pipeline = self.enrichment_pipeline.clone();
         let search = self.search.clone();
+        let documents = self.document_store.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -6766,6 +6823,7 @@ impl ChatManager {
                 retry_config,
                 enrichment_pipeline,
                 search,
+                documents,
             )
             .await;
         });
@@ -8518,6 +8576,7 @@ impl ChatManager {
                 retry_config: self.config.retry.clone(),
                 enrichment_pipeline: self.enrichment_pipeline.clone(),
                 search: self.search.clone(),
+                documents: self.document_store.clone(),
                 nats: self.nats.clone(),
             },
         );
@@ -8557,6 +8616,7 @@ impl ChatManager {
         let retry_config = self.config.retry.clone();
         let enrichment_pipeline = self.enrichment_pipeline.clone();
         let search = self.search.clone();
+        let documents = self.document_store.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -8581,6 +8641,7 @@ impl ChatManager {
                 retry_config,
                 enrichment_pipeline,
                 search,
+                documents,
             )
             .await;
         });

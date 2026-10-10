@@ -130,10 +130,78 @@ fn turn_input(text: String, images: &[super::message_attachments::AttachedImage]
     input
 }
 
+/// What the Claude Code engine (`ChatManager::stream_response`, the CLI
+/// subprocess) writes on the CLI's stdin for a turn.
+///
+/// - No image: the prompt as one string ([`InteractiveClient::send_and_receive_stream`]),
+///   byte for byte what this engine always wrote.
+/// - Images: the blocks of [`turn_input`] — the same input as the agent engine,
+///   text then images in the order they were attached — checked and turned into
+///   the CLI's blocks by nexus' own `claude_code::input::content_blocks` (type,
+///   standard base64, 5 MiB), written by `send_blocks_and_receive_stream`.
+///
+/// The manager holds it opaque: the SDK block type stays here. A retry sends the
+/// same value again (`send` on a clone): blocks stay blocks.
+///
+/// [`InteractiveClient::send_and_receive_stream`]: nexus_claude::InteractiveClient::send_and_receive_stream
+#[derive(Debug, Clone)]
+pub(crate) enum CliInput {
+    Text(String),
+    Blocks(Vec<nexus_claude::UserContentBlock>),
+}
+
+impl CliInput {
+    /// The input of a turn whose (enriched) prompt is `text` and whose attached
+    /// images are `images`.
+    ///
+    /// # Errors
+    ///
+    /// The `images_refused` event (`reason: invalid`) of an image nexus will not
+    /// hand the CLI: nothing is to be written, the caller says it on the wire.
+    pub(crate) fn of(
+        text: String,
+        images: &[super::message_attachments::AttachedImage],
+    ) -> std::result::Result<Self, Box<ChatEvent>> {
+        if images.is_empty() {
+            return Ok(Self::Text(text));
+        }
+        nexus_claude::providers::claude_code::input::content_blocks(&turn_input(text, images))
+            .map(Self::Blocks)
+            .map_err(|error| {
+                Box::new(image_refusal(&error).unwrap_or_else(|| {
+                    images_refused(
+                        "invalid",
+                        format!("Error: The attached images could not be sent ({error}): the message was not sent."),
+                    )
+                }))
+            })
+    }
+
+    /// Writes the turn on the CLI's stdin and streams its answer.
+    pub(crate) async fn send(
+        self,
+        client: &mut nexus_claude::InteractiveClient,
+    ) -> nexus_claude::Result<
+        impl futures::Stream<Item = nexus_claude::Result<nexus_claude::Message>> + '_,
+    > {
+        use futures::future::Either;
+        match self {
+            Self::Text(prompt) => client
+                .send_and_receive_stream(prompt)
+                .await
+                .map(Either::Left),
+            Self::Blocks(blocks) => client
+                .send_blocks_and_receive_stream(blocks)
+                .await
+                .map(Either::Right),
+        }
+    }
+}
+
 /// The error a turn whose images were refused shows: `code: images_refused`, the
 /// `reason` (`unsupported`: the model has no vision; `invalid`: a picture the
 /// provider will not take; `unreadable`: the backend could not read it).
-fn images_refused(reason: &str, message: String) -> ChatEvent {
+pub(crate) fn images_refused(reason: &str, message: String) -> ChatEvent {
     ChatEvent::Error {
         message,
         parent_tool_use_id: None,
@@ -1812,5 +1880,51 @@ mod image_tests {
             "an image not sent keeps its line"
         );
         assert_eq!(turn_input(text.clone(), &[]), TurnInput::text(text));
+    }
+
+    /// The legacy engine's input: no image → the prompt untouched (the string
+    /// path); a valid image → the CLI blocks, text then image; an image nexus
+    /// refuses → `images_refused` / `invalid`, nothing to send.
+    #[test]
+    fn the_cli_input_is_the_string_without_image_and_checked_blocks_with_one() {
+        let text = "look at this".to_string();
+        assert!(matches!(
+            CliInput::of(text.clone(), &[]),
+            Ok(CliInput::Text(t)) if t == text
+        ));
+
+        let pixel = super::super::message_attachments::AttachedImage {
+            media_type: "image/png".into(),
+            data_base64: "AAAA".into(),
+            source: attachment("image/png"),
+        };
+        match CliInput::of(text.clone(), std::slice::from_ref(&pixel)) {
+            Ok(CliInput::Blocks(blocks)) => assert_eq!(
+                blocks,
+                vec![
+                    nexus_claude::UserContentBlock::text(text.clone()),
+                    nexus_claude::UserContentBlock::image_base64("image/png", "AAAA"),
+                ]
+            ),
+            other => panic!("{other:?}"),
+        }
+
+        let svg = super::super::message_attachments::AttachedImage {
+            media_type: "image/svg+xml".into(),
+            ..pixel.clone()
+        };
+        let not_base64 = super::super::message_attachments::AttachedImage {
+            data_base64: "data:image/png;base64,AAAA".into(),
+            ..pixel
+        };
+        for bad in [svg, not_base64] {
+            match CliInput::of(text.clone(), std::slice::from_ref(&bad)).map_err(|e| *e) {
+                Err(ChatEvent::Error { code, reason, .. }) => {
+                    assert_eq!(code.as_deref(), Some("images_refused"));
+                    assert_eq!(reason.as_deref(), Some("invalid"));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 }
