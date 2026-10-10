@@ -28,9 +28,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+use nexus_claude::agent::ProviderError;
+
+use crate::chat::provider::credentials::VaultCredentialResolver;
+use crate::chat::provider::endpoint_guard::origin_of;
+use crate::chat::provider::settings::{
+    parse_credential_ref, CredentialSource as SettingsCredential,
+};
+use crate::chat::provider::store as provider_store;
 use crate::events::{EntityType, EventEmitter};
 use crate::neo4j::models::{AlertNode, AlertSeverity};
 use crate::neo4j::GraphStore;
+use crate::vault::VaultService;
 
 /// `alert_type` under which a newly released model is recorded. Doubles as
 /// the durable "already announced" marker — see `announce_new_models`.
@@ -44,6 +53,11 @@ const CACHE_TTL: Duration = Duration::from_secs(12 * 60 * 60); // 12h
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 const ANTHROPIC_MODELS_URL: &str = "https://api.anthropic.com/v1/models";
+
+/// When a refresh found no credential because the vault is locked, the next
+/// one is due after this rather than `CACHE_TTL`: unlocking the vault (from
+/// the chat or the vault page) then brings the live catalog without a restart.
+const LOCKED_VAULT_RETRY: Duration = Duration::from_secs(60);
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Defensive cap on pagination — the live catalog is small (dozens of
@@ -329,22 +343,121 @@ struct AnthropicModelEntry {
 }
 
 /// Where the live fetch gets its credential from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Resolution order: configured key (`anthropic.api_key` / env) > PO vault >
+/// Claude Code login. The configured key is the operator's explicit choice
+/// and needs no unlock, so it wins outright. The vault comes next: it is the
+/// user's explicit choice too, but it may be locked. The Claude Code login is
+/// an implicit borrow of another tool's session, hence last.
 enum CredentialSource {
     /// Never fetch — serve the static fallback. Used by tests and by the
     /// throwaway caches in handler test fixtures.
     None,
     /// An explicitly configured Anthropic API key.
     ApiKey(String),
-    /// Reuse Claude Code's own login (read fresh on every refresh, since the
-    /// CLI rotates the access token).
-    ClaudeCodeLogin,
+    /// No configured key: try the vault, then (optionally) Claude Code's own
+    /// login. Both are read fresh on every refresh — the vault may have been
+    /// unlocked since, and the CLI rotates its access token.
+    Chain {
+        vault: Option<VaultSource>,
+        claude_code_login: bool,
+    },
+}
+
+impl CredentialSource {
+    fn is_none(&self) -> bool {
+        matches!(self, CredentialSource::None)
+    }
+}
+
+/// The vault as a source of the Anthropic key — through the provider path,
+/// not a second mechanism.
+///
+/// The key is the one a stored provider instance whose origin is the Models
+/// API's (`https://api.anthropic.com`) names in its `credential_ref`
+/// (`vault:<name>`), read with `read_for_provider` under a grant of scope
+/// `Provider(<that instance>)`. Such a grant is validated at creation to name
+/// exactly that instance's key (`validate_provider_grant`), and the key is sent
+/// only to that instance's origin — the grant means nothing more than it
+/// already does.
+struct VaultSource {
+    vault: Arc<VaultService>,
+    graph: Arc<dyn GraphStore>,
+}
+
+/// What a vault lookup found for one refresh.
+enum VaultLookup {
+    Key(String),
+    /// A candidate exists but the vault is locked (or unavailable): skip it
+    /// this time, retry soon.
+    Locked,
+    /// No instance on this origin, or none with a grant.
+    Absent,
+}
+
+impl VaultSource {
+    async fn lookup(&self, models_url: &str) -> VaultLookup {
+        let Some(origin) = origin_of(models_url) else {
+            return VaultLookup::Absent;
+        };
+        let instances = match provider_store::instances(self.graph.as_ref()).await {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!(error = %e, "Model catalog: could not list provider instances; skipping the vault");
+                return VaultLookup::Absent;
+            }
+        };
+        let mut candidates: Vec<(String, String)> = instances
+            .into_iter()
+            .filter(|i| i.origin == origin)
+            .filter_map(|i| match parse_credential_ref(&i.credential_ref, &[]) {
+                Ok(SettingsCredential::Vault(name)) => Some((i.id, name)),
+                _ => None,
+            })
+            .collect();
+        candidates.sort();
+
+        let resolver = VaultCredentialResolver::new(Arc::clone(&self.vault));
+        let mut locked = false;
+        for (instance, name) in candidates {
+            match resolver.read_vault(&instance, &name) {
+                Ok(Some(secret)) => return VaultLookup::Key(secret.expose().to_string()),
+                Ok(None) => {}
+                Err(ProviderError::CredentialsLocked) => {
+                    tracing::info!(
+                        instance = %instance,
+                        "Model catalog: the vault is locked; its Anthropic key is skipped until the next refresh"
+                    );
+                    locked = true;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        instance = %instance,
+                        kind = e.kind(),
+                        "Model catalog: vault key not readable for this instance (no grant?)"
+                    );
+                }
+            }
+        }
+        if locked {
+            VaultLookup::Locked
+        } else {
+            VaultLookup::Absent
+        }
+    }
 }
 
 /// A credential resolved for one refresh.
 enum Credential {
     ApiKey(String),
     OAuth(String),
+}
+
+/// Outcome of one credential resolution: the credential (or why none), and
+/// whether a vault key was skipped because the vault is locked.
+struct Resolution {
+    credential: anyhow::Result<Credential>,
+    vault_locked: bool,
 }
 
 /// Extract a still-valid access token from Claude Code's credentials JSON
@@ -413,6 +526,10 @@ async fn read_claude_code_oauth_token() -> Option<String> {
 struct CacheState {
     models: Vec<ModelDefinition>,
     fetched_at: Instant,
+    /// How long after `fetched_at` the next refresh is due: `CACHE_TTL`, or
+    /// `LOCKED_VAULT_RETRY` after a refresh the locked vault left without a
+    /// credential.
+    ttl: Duration,
     refreshing: bool,
 }
 
@@ -429,6 +546,9 @@ pub struct ModelCatalogCache {
     http: reqwest::Client,
     credentials: CredentialSource,
     notifier: Option<Notifier>,
+    /// The Models API listing URL. A field (not the constant) only so a test
+    /// can point it at a fake server.
+    models_url: String,
 }
 
 impl ModelCatalogCache {
@@ -450,6 +570,7 @@ impl ModelCatalogCache {
                 // Force the first `get_models()` call to treat this as stale
                 // so a real fetch is scheduled immediately when a key exists.
                 fetched_at: Instant::now() - CACHE_TTL - Duration::from_secs(1),
+                ttl: CACHE_TTL,
                 refreshing: false,
             }),
             http: reqwest::Client::builder()
@@ -458,23 +579,32 @@ impl ModelCatalogCache {
                 .unwrap_or_else(|_| reqwest::Client::new()),
             credentials,
             notifier: None,
+            models_url: ANTHROPIC_MODELS_URL.to_string(),
         })
     }
 
     /// Production constructor: like `new`, plus the handles required to
     /// announce a model that appears in the live catalog for the first time.
     ///
-    /// Without an API key, falls back to Claude Code's own login rather than
-    /// to the static list — so a subscription-only install still sees new
-    /// models without any configuration.
+    /// Without an API key, reads the key from the vault (see [`VaultSource`]),
+    /// then falls back to Claude Code's own login rather than to the static
+    /// list — so a subscription-only install still sees new models without
+    /// any configuration.
     pub fn new_with_notifier(
         api_key: Option<String>,
+        vault: Option<Arc<VaultService>>,
         emitter: Arc<dyn EventEmitter>,
         graph: Arc<dyn GraphStore>,
     ) -> Arc<Self> {
         let credentials = match api_key {
             Some(key) if !key.trim().is_empty() => CredentialSource::ApiKey(key),
-            _ => CredentialSource::ClaudeCodeLogin,
+            _ => CredentialSource::Chain {
+                vault: vault.map(|vault| VaultSource {
+                    vault,
+                    graph: Arc::clone(&graph),
+                }),
+                claude_code_login: true,
+            },
         };
         Self::new_with_notifier_and_credentials(credentials, emitter, graph)
     }
@@ -497,14 +627,14 @@ impl ModelCatalogCache {
     pub async fn get_models(self: &Arc<Self>) -> Vec<ModelDefinition> {
         let needs_refresh = {
             let state = self.inner.read().await;
-            !state.refreshing && state.fetched_at.elapsed() >= CACHE_TTL
+            !state.refreshing && state.fetched_at.elapsed() >= state.ttl
         };
 
-        if needs_refresh && self.credentials != CredentialSource::None {
+        if needs_refresh && !self.credentials.is_none() {
             let mut state = self.inner.write().await;
             // Re-check under the write lock — another task may have started
             // the refresh between our read and this write.
-            if !state.refreshing && state.fetched_at.elapsed() >= CACHE_TTL {
+            if !state.refreshing && state.fetched_at.elapsed() >= state.ttl {
                 state.refreshing = true;
                 let this = Arc::clone(self);
                 tokio::spawn(async move {
@@ -520,7 +650,7 @@ impl ModelCatalogCache {
     /// an optional "refresh now" admin action). Falls back silently to the
     /// existing cache on any failure.
     async fn refresh(self: &Arc<Self>) {
-        let result = self.fetch_live_catalog().await;
+        let (result, vault_locked) = self.fetch_live_catalog().await;
 
         // Announcing touches Neo4j, so it happens after the write lock is
         // released — holding it across that I/O would stall every reader.
@@ -535,6 +665,7 @@ impl ModelCatalogCache {
                 announce = Some(models.clone());
                 state.models = models;
                 state.fetched_at = Instant::now();
+                state.ttl = CACHE_TTL;
             }
             Ok(_) => {
                 tracing::warn!(
@@ -542,13 +673,20 @@ impl ModelCatalogCache {
                 );
                 // Still bump fetched_at so we don't hammer the API every request.
                 state.fetched_at = Instant::now();
+                state.ttl = CACHE_TTL;
             }
             Err(err) => {
                 tracing::warn!(error = %err, "Failed to refresh Claude model catalog — keeping previous list");
-                // Bump fetched_at anyway (with a shorter effective backoff isn't
-                // worth the complexity here — 12h between attempts on a broken
-                // key/network is an acceptable ceiling on wasted calls).
+                // Bump fetched_at anyway: 12h between attempts on a broken
+                // key/network is an acceptable ceiling on wasted calls. The one
+                // exception is a vault that is merely locked — a person unlocks
+                // it in seconds, and the catalog should follow without a restart.
                 state.fetched_at = Instant::now();
+                state.ttl = if vault_locked {
+                    LOCKED_VAULT_RETRY
+                } else {
+                    CACHE_TTL
+                };
             }
         }
         state.refreshing = false;
@@ -659,31 +797,87 @@ impl ModelCatalogCache {
         Ok(keys)
     }
 
-    async fn resolve_credential(&self) -> anyhow::Result<Credential> {
-        match &self.credentials {
-            CredentialSource::None => anyhow::bail!("no credential configured"),
-            CredentialSource::ApiKey(key) => Ok(Credential::ApiKey(key.clone())),
-            CredentialSource::ClaudeCodeLogin => read_claude_code_oauth_token()
-                .await
-                .map(Credential::OAuth)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no ANTHROPIC_API_KEY and no valid Claude Code login found \
-                         (run `claude` once to log in, or set anthropic.api_key)"
-                    )
-                }),
+    /// Resolve the credential for one refresh, in the order documented on
+    /// [`CredentialSource`]. Nothing is cached: the vault and the Claude Code
+    /// login are read again on every refresh.
+    async fn resolve_credential(&self) -> Resolution {
+        let (vault, claude_code_login) = match &self.credentials {
+            CredentialSource::None => {
+                return Resolution {
+                    credential: Err(anyhow::anyhow!("no credential configured")),
+                    vault_locked: false,
+                }
+            }
+            CredentialSource::ApiKey(key) => {
+                return Resolution {
+                    credential: Ok(Credential::ApiKey(key.clone())),
+                    vault_locked: false,
+                }
+            }
+            CredentialSource::Chain {
+                vault,
+                claude_code_login,
+            } => (vault, *claude_code_login),
+        };
+
+        let mut vault_locked = false;
+        if let Some(vault) = vault {
+            match vault.lookup(&self.models_url).await {
+                VaultLookup::Key(key) => {
+                    return Resolution {
+                        credential: Ok(Credential::ApiKey(key)),
+                        vault_locked: false,
+                    }
+                }
+                VaultLookup::Locked => vault_locked = true,
+                VaultLookup::Absent => {}
+            }
+        }
+
+        if claude_code_login {
+            if let Some(token) = read_claude_code_oauth_token().await {
+                return Resolution {
+                    credential: Ok(Credential::OAuth(token)),
+                    vault_locked,
+                };
+            }
+        }
+
+        let credential = Err(if vault_locked {
+            anyhow::anyhow!(
+                "no ANTHROPIC_API_KEY, the vault is locked (its Anthropic key will be \
+                 tried again after unlock) and no valid Claude Code login found"
+            )
+        } else {
+            anyhow::anyhow!(
+                "no ANTHROPIC_API_KEY, no vault key granted to an Anthropic provider instance \
+                 and no valid Claude Code login found \
+                 (run `claude` once to log in, or set anthropic.api_key)"
+            )
+        });
+        Resolution {
+            credential,
+            vault_locked,
         }
     }
 
-    async fn fetch_live_catalog(&self) -> anyhow::Result<Vec<ModelDefinition>> {
-        let credential = self.resolve_credential().await?;
+    /// The live catalog, and whether a vault key was skipped because the vault
+    /// is locked (the caller then retries sooner).
+    async fn fetch_live_catalog(&self) -> (anyhow::Result<Vec<ModelDefinition>>, bool) {
+        let Resolution {
+            credential,
+            vault_locked,
+        } = self.resolve_credential().await;
+        let credential = match credential {
+            Ok(c) => c,
+            Err(e) => return (Err(e), vault_locked),
+        };
         let http = &self.http;
         let credential = &credential;
+        let url = self.models_url.as_str();
 
         let entries = collect_pages(|after_id| async move {
-            let mut req = http
-                .get(ANTHROPIC_MODELS_URL)
-                .header("anthropic-version", ANTHROPIC_VERSION);
+            let mut req = http.get(url).header("anthropic-version", ANTHROPIC_VERSION);
             req = match credential {
                 Credential::ApiKey(key) => req.header("x-api-key", key),
                 Credential::OAuth(token) => {
@@ -697,9 +891,9 @@ impl ModelCatalogCache {
             let page: AnthropicModelsResponse = resp.json().await?;
             Ok::<_, anyhow::Error>(page)
         })
-        .await?;
+        .await;
 
-        Ok(merge_catalog(&entries))
+        (entries.map(|e| merge_catalog(&e)), vault_locked)
     }
 }
 
@@ -1101,17 +1295,28 @@ mod tests {
     fn test_production_constructor_uses_claude_code_login_without_key() {
         let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let emitter = Arc::new(RecordingEmitter::default());
-        let cache = ModelCatalogCache::new_with_notifier(None, emitter.clone(), graph.clone());
-        assert_eq!(cache.credentials, CredentialSource::ClaudeCodeLogin);
+        let vault = VaultService::ephemeral();
+        let cache = ModelCatalogCache::new_with_notifier(
+            None,
+            Some(vault.clone()),
+            emitter.clone(),
+            graph.clone(),
+        );
+        assert!(matches!(
+            cache.credentials,
+            CredentialSource::Chain {
+                vault: Some(_),
+                claude_code_login: true
+            }
+        ));
 
-        let cache = ModelCatalogCache::new_with_notifier(Some("k".into()), emitter, graph);
-        assert_eq!(cache.credentials, CredentialSource::ApiKey("k".into()));
+        // A configured key wins outright: neither the vault nor the login is consulted.
+        let cache =
+            ModelCatalogCache::new_with_notifier(Some("k".into()), Some(vault), emitter, graph);
+        assert!(matches!(&cache.credentials, CredentialSource::ApiKey(k) if k == "k"));
 
         // The plain constructor (test fixtures) must stay offline.
-        assert_eq!(
-            ModelCatalogCache::new(None).credentials,
-            CredentialSource::None
-        );
+        assert!(ModelCatalogCache::new(None).credentials.is_none());
     }
 
     /// Records every CrudEvent it is handed, so a test can assert on what
@@ -1267,5 +1472,177 @@ mod tests {
         // stable fallback content).
         let models_again = cache.get_models().await;
         assert_eq!(models_again, models);
+    }
+
+    // ── The Anthropic key from the PO vault ─────────────────────────────
+
+    const VAULT_PASS: &str = "correct horse battery staple";
+    /// A dummy value: never a real key.
+    const DUMMY_KEY: &str = "sk-ant-dummy-catalog-0000";
+    /// A model only the fake Models API lists: its presence proves the live fetch.
+    const LIVE_ONLY_MODEL: &str = "claude-zeta-9-9";
+
+    /// A fake Models API that answers only to `x-api-key: DUMMY_KEY`.
+    async fn fake_models_api() -> wiremock::MockServer {
+        use wiremock::matchers::{header, method, path};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("x-api-key", DUMMY_KEY))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": [{"id": LIVE_ONLY_MODEL, "display_name": "Claude Zeta 9.9"}],
+                    "has_more": false,
+                    "last_id": LIVE_ONLY_MODEL,
+                })),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// An unlocked test vault holding the dummy key, a provider instance on the
+    /// fake server's origin naming it, and (optionally) the grant to that instance.
+    async fn vault_with_key(
+        server: &wiremock::MockServer,
+        granted: bool,
+    ) -> (Arc<VaultService>, Arc<dyn GraphStore>) {
+        use crate::chat::provider::settings::{InstanceRecord, GLOBAL, INSTANCE_PREFIX};
+        use crate::vault::grants::{GrantScope, SecretSelector};
+
+        let vault = VaultService::ephemeral();
+        vault
+            .init(VAULT_PASS.into(), chrono::Duration::hours(1))
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        vault.put("anthropic-key", DUMMY_KEY, None, now).unwrap();
+        if granted {
+            vault
+                .grant(
+                    SecretSelector::Names(["anthropic-key".to_string()].into()),
+                    GrantScope::Provider("anthropic".to_string()),
+                    chrono::Duration::hours(1),
+                    None,
+                    now,
+                )
+                .unwrap();
+        }
+
+        let base_url = format!("{}/v1", server.uri());
+        let record = InstanceRecord {
+            id: "anthropic".into(),
+            kind: "openai_compatible".into(),
+            preset: None,
+            label: "Anthropic".into(),
+            origin: origin_of(&base_url).unwrap(),
+            base_url,
+            default_model: None,
+            cost_source: "unknown".into(),
+            credential_ref: "vault:anthropic-key".into(),
+            host: None,
+            ssh_user: None,
+            ssh_port: None,
+            host_key: None,
+            remote_cwd: None,
+            allow_trust: false,
+        };
+        let graph = crate::neo4j::mock::MockGraphStore::new();
+        graph
+            .put_llm_setting(
+                GLOBAL,
+                &format!("{INSTANCE_PREFIX}{}", record.id),
+                &serde_json::to_string(&record).unwrap(),
+            )
+            .await
+            .unwrap();
+        (vault, Arc::new(graph))
+    }
+
+    /// No configured key and no Claude Code login: the vault is the only source.
+    fn vault_only_cache(
+        server: &wiremock::MockServer,
+        vault: Arc<VaultService>,
+        graph: Arc<dyn GraphStore>,
+    ) -> Arc<ModelCatalogCache> {
+        let cache = ModelCatalogCache::with_credentials(CredentialSource::Chain {
+            vault: Some(VaultSource { vault, graph }),
+            claude_code_login: false,
+        });
+        let mut cache = Arc::try_unwrap(cache).unwrap_or_else(|_| unreachable!());
+        cache.models_url = format!("{}/v1/models", server.uri());
+        Arc::new(cache)
+    }
+
+    fn ids(models: &[ModelDefinition]) -> Vec<String> {
+        models.iter().map(|m| m.id.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn test_vault_key_without_config_key_lists_live_models() {
+        let server = fake_models_api().await;
+        let (vault, graph) = vault_with_key(&server, true).await;
+        let cache = vault_only_cache(&server, vault, graph);
+
+        cache.refresh().await;
+
+        let models = cache.inner.read().await.models.clone();
+        assert!(
+            ids(&models).contains(&LIVE_ONLY_MODEL.to_string()),
+            "the live catalog must be fetched with the vault key, got {:?}",
+            ids(&models)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_locked_vault_serves_static_fallback_then_live_after_unlock() {
+        let server = fake_models_api().await;
+        let (vault, graph) = vault_with_key(&server, true).await;
+        vault.lock_now();
+        let cache = vault_only_cache(&server, vault.clone(), graph);
+
+        // Locked: skipped without a panic, static fallback, and the next
+        // refresh is due soon rather than in 12 hours.
+        cache.refresh().await;
+        {
+            let state = cache.inner.read().await;
+            assert_eq!(state.models, static_fallback_models());
+            assert_eq!(state.ttl, LOCKED_VAULT_RETRY);
+            assert!(!state.refreshing);
+        }
+
+        // Unlocked (as `VaultUnlock` from the chat does): the next refresh
+        // re-resolves the credential — no restart, nothing cached.
+        vault
+            .unlock(VAULT_PASS.into(), chrono::Duration::hours(1))
+            .await
+            .unwrap();
+        cache.refresh().await;
+        let state = cache.inner.read().await;
+        assert!(
+            ids(&state.models).contains(&LIVE_ONLY_MODEL.to_string()),
+            "after unlock the live catalog must appear, got {:?}",
+            ids(&state.models)
+        );
+        assert_eq!(state.ttl, CACHE_TTL);
+    }
+
+    #[tokio::test]
+    async fn test_ungranted_vault_key_is_not_used() {
+        let server = fake_models_api().await;
+        let (vault, graph) = vault_with_key(&server, false).await;
+        let cache = vault_only_cache(&server, vault, graph);
+
+        cache.refresh().await;
+
+        let state = cache.inner.read().await;
+        assert_eq!(state.models, static_fallback_models());
+        // Not a locked vault: no hurried retry.
+        assert_eq!(state.ttl, CACHE_TTL);
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty());
     }
 }

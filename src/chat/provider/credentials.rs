@@ -36,7 +36,7 @@ impl VaultCredentialResolver {
         Self { vault }
     }
 
-    pub(super) fn read_vault(
+    pub(crate) fn read_vault(
         &self,
         instance: &str,
         name: &str,
