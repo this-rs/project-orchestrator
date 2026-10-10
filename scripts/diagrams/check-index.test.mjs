@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { globToRegExp, parseIndex, parseHeader, checkDiagramFile, sharedOwnership, renderOrphans, localIndexOwners, orphanCeiling, orphanCeilingsByRepo, orphansByRepo } from './check-index.mjs';
+import { globToRegExp, parseIndex, parseHeader, checkDiagramFile, sharedOwnership, renderOrphans, localIndexOwners, orphanCeiling, orphanCeilingsByRepo, orphansByRepo, isExternal, checkExternalEntry } from './check-index.mjs';
 
 test('glob: **, *, braces', () => {
   assert.ok(globToRegExp('src/heartbeat/**').test('src/heartbeat/checks/git_drift.rs'));
@@ -510,6 +510,92 @@ test('cliquet par depot: --raise-ceiling avec raison releve aussi le plafond de 
     assert.equal(code, 0, out);
     assert.match(out, /plafond de backend releve 0 -> 1 : trois fichiers ajoutes en amont/);
     assert.equal(orphanCeilingsByRepo(readFileSync(p, 'utf8')).backend, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- diagrammes EXTERNES : ils vivent dans le service Mermaid de l'equipe, le depot ne garde que
+// l'entree. Depot public : aucun hote dans l'entree, seulement l'identifiant et l'emplacement.
+const ext = (extra) => parseIndex(`diagrams:\n  - name: po-x\n    owner: t\n${extra}    covers:\n      - "backend:src/own.rs"\n`)[0];
+const EXT_OK = '    status: verified\n    mermaid_id: abc123\n    external: po/doc/po-x@2\n    verified_at: 2026-10-10\n    verified_sha: 6c79054e\n';
+
+test('externe: une entree verified complete ne leve rien', () => {
+  const e = ext(EXT_OK);
+  assert.ok(isExternal(e));
+  assert.deepEqual(checkExternalEntry(e), []);
+  // mermaid_id seul suffit, external seul aussi
+  assert.deepEqual(checkExternalEntry(ext(EXT_OK.replace(/ {4}external:.*\n/, ''))), []);
+  assert.deepEqual(checkExternalEntry(ext(EXT_OK.replace(/ {4}mermaid_id:.*\n/, ''))), []);
+  assert.ok(!isExternal(ext('    status: verified\n')));
+});
+
+test('externe: identifiant absent, adresse hors site, releve incomplet ou planned sont des erreurs', () => {
+  assert.match(checkExternalEntry(ext(EXT_OK.replace('mermaid_id: abc123', 'mermaid_id:').replace(/ {4}external:.*\n/, ''))).join('\n'), /'mermaid_id' vide/);
+  assert.match(checkExternalEntry(ext(EXT_OK.replace('mermaid_id: abc123', 'mermaid_id:').replace(/ {4}external:.*\n/, ''))).join('\n'), /sans identifiant/);
+  // une adresse avec hote est refusee : le depot est public, l'hote ne s'y ecrit pas
+  assert.match(checkExternalEntry(ext(EXT_OK.replace('po/doc/po-x@2', 'https://example.com/po/doc/po-x@2'))).join('\n'), /sans hote/);
+  assert.match(checkExternalEntry(ext(EXT_OK.replace('po/doc/po-x@2', 'po/doc/po-x'))).join('\n'), /sans hote/);
+  // l'emplacement doit designer CE diagramme
+  assert.match(checkExternalEntry(ext(EXT_OK.replace('po/doc/po-x@2', 'po/doc/po-y@2'))).join('\n'), /designe le diagramme po-y/);
+  assert.match(checkExternalEntry(ext(EXT_OK.replace('6c79054e', 'HEAD'))).join('\n'), /verified_sha/);
+  assert.match(checkExternalEntry(ext(EXT_OK.replace(/ {4}verified_at:.*\n/, ''))).join('\n'), /verified_at/);
+  assert.match(checkExternalEntry(ext(EXT_OK.replace('status: verified', 'status: planned'))).join('\n'), /status devrait etre verified/);
+});
+
+function writeIndex(be, poX) {
+  writeFileSync(join(be, 'docs/diagrams/INDEX.yml'),
+    `diagrams:\n  - name: po-carte\n    owner: t\n    status: planned\n    role: index\n    covers:\n      - "backend:docs/diagrams/INDEX.yml"\n  - name: po-x\n    owner: t\n${poX}    covers:\n      - "backend:src/own.rs"\n`);
+}
+
+test('gate: une entree EXTERNE verified possede ses fichiers sans .mmd local', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    writeIndex(be, EXT_OK);
+    const { code, out } = run(be, nx, ['--write-orphans']);
+    assert.equal(code, 0, out);
+    // src/own.rs a un proprietaire : il ne reste que le fichier de nexus.
+    assert.match(out, /1 orphelins/);
+    assert.match(out, /1 verified/);
+    assert.doesNotMatch(readFileSync(join(be, 'docs/diagrams/ORPHANS.md'), 'utf8'), /own\.rs/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('gate: une entree externe sans identifiant echoue, et ne possede rien', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    writeIndex(be, EXT_OK.replace('mermaid_id: abc123', 'mermaid_id:').replace(/ {4}external:.*\n/, ''));
+    const { code, out } = run(be, nx);
+    assert.equal(code, 1, out);
+    assert.match(out, /po-x : diagramme externe sans identifiant/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('gate: une entree externe ET un .mmd local : deux sources, refuse', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    writeIndex(be, EXT_OK);
+    writeFileSync(join(be, 'docs/diagrams/po-x.mmd'), '%% name: po-x\n%% covers: backend:src/own.rs\n%% verified: 6c79054e\nflowchart TD\n');
+    const { code, out } = run(be, nx);
+    assert.equal(code, 1, out);
+    assert.match(out, /diagramme externe ET docs\/diagrams\/po-x\.mmd present/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('gate: le proprietaire unique vaut aussi pour une entree externe', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    writeFileSync(join(be, 'docs/diagrams/INDEX.yml'),
+      `diagrams:\n  - name: po-carte\n    owner: t\n    status: planned\n    role: index\n    covers:\n      - "backend:docs/diagrams/INDEX.yml"\n  - name: po-x\n    owner: t\n${EXT_OK}    covers:\n      - "backend:src/own.rs"\n  - name: po-y\n    owner: t\n    status: planned\n    covers:\n      - "backend:src/*.rs"\n`);
+    const { code, out } = run(be, nx);
+    assert.equal(code, 1, out);
+    assert.match(out, /backend:src\/own\.rs : couvert par 2 diagrammes \(po-x, po-y\)/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -5,6 +5,9 @@
 //   3. status verified => docs/diagrams/<name>.mmd existe, avec les en-tetes
 //      `%% name`, `%% covers` (identique a l'index) et `%% verified` (sha court) ;
 //      status planned => pas de fichier ; tout .mmd du dossier est dans l'index ;
+//      ou bien le diagramme est EXTERNE (service Mermaid de l'equipe, regle par defaut) : l'entree
+//      porte `mermaid_id` et/ou `external` (emplacement sans hote), plus `verified_at` et `verified_sha`, et aucun .mmd local ;
+//      une entree externe verified possede ses `covers` comme une entree locale (hors reseau) ;
 //   4. l'index porte la carte d'index `po-carte` (role: index) et toute carte provisoire
 //      reprise est declaree par `supersedes:` sur l'entree qui la remplace ;
 //   5. la regle du proprietaire unique vaut ENTRE les index : un depot voisin peut tenir son
@@ -95,6 +98,41 @@ export function checkDiagramFile(entry, text) {
   const got = (h.covers ?? '').split(/\s+/).filter(Boolean).sort().join(' ');
   if (got !== want) errs.push(`${entry.name} : '%% covers' differe de l'index`);
   if (!/^[0-9a-f]{7,40}$/.test(h.verified ?? '')) errs.push(`${entry.name} : '%% verified' doit etre un sha git court`);
+  return errs;
+}
+
+// --- diagramme EXTERNE : il vit dans le service Mermaid prive de l'equipe, le depot ne garde
+// que son entree d'index. Ce depot est PUBLIC : l'hote du service ne doit y figurer nulle part
+// (scripts/forbidden/check-forbidden-tokens.mjs) ; il est nomme hors depot (skill mermaid-design).
+// L'entree porte donc l'identifiant du diagramme (`mermaid_id`) et, au choix, son emplacement
+// SANS hote (`external: <workspace>/<session>/<name>@<version>`). Une entree est externe des
+// qu'elle porte l'une de ces cles, meme vide : une cle vide est une erreur, pas une entree locale.
+// Le controle reste HORS RESEAU : on verifie la forme de l'entree, jamais le service.
+// `verified_sha` est le sha du backend contre lequel le diagramme a ete relu : c'est ce qui
+// remplace l'en-tete `%% verified` d'un .mmd local.
+export function isExternal(entry) {
+  return Object.hasOwn(entry, 'mermaid_id') || Object.hasOwn(entry, 'external');
+}
+
+export function checkExternalEntry(entry) {
+  const errs = [];
+  const id = entry.mermaid_id ?? '';
+  const loc = entry.external ?? '';
+  if (Object.hasOwn(entry, 'mermaid_id') && !/^[A-Za-z0-9_-]+$/.test(id)) {
+    errs.push(`${entry.name} : 'mermaid_id' vide ou invalide : un diagramme externe doit nommer son identifiant dans le service`);
+  }
+  if (Object.hasOwn(entry, 'external')) {
+    const m = /^([a-z0-9-]+)\/([A-Za-z0-9._-]+)\/([a-z0-9-]+)@(\d+)$/.exec(loc);
+    if (!m) errs.push(`${entry.name} : 'external' doit etre <workspace>/<session>/<name>@<version>, sans hote (trouve : ${loc || 'vide'})`);
+    else if (m[3] !== entry.name) errs.push(`${entry.name} : 'external' designe le diagramme ${m[3]}, pas ${entry.name}`);
+  }
+  if (!id && !loc) errs.push(`${entry.name} : diagramme externe sans identifiant ('mermaid_id' ou 'external')`);
+  if (entry.status === 'verified') {
+    if (!/^[0-9a-f]{7,40}$/.test(entry.verified_sha ?? '')) errs.push(`${entry.name} : 'verified_sha' doit etre le sha git (court) du code contre lequel le diagramme a ete relu`);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(entry.verified_at ?? '')) errs.push(`${entry.name} : 'verified_at' doit etre une date AAAA-MM-JJ`);
+  } else {
+    errs.push(`${entry.name} : diagramme externe publie, status devrait etre verified (une entree planned n'a pas de diagramme)`);
+  }
   return errs;
 }
 
@@ -318,7 +356,11 @@ function main() {
     if (!/^(po-[a-z0-9-]+|[a-z0-9]+(-[a-z0-9]+)+)$/.test(e.name)) problems.push(`${e.name} : nom hors nomenclature`);
     if (e.supersedes) for (const old of e.supersedes.split(/[,\s]+/).filter(Boolean)) superseded.push({ old, by: e.name });
     const file = join(backendRoot, 'docs/diagrams', `${e.name}.mmd`);
-    if (e.status === 'verified') {
+    if (isExternal(e)) {
+      // Le diagramme vit dans le service Mermaid : une copie locale serait une deuxieme source.
+      problems.push(...checkExternalEntry(e));
+      if (existsSync(file)) problems.push(`${e.name} : diagramme externe ET docs/diagrams/${e.name}.mmd present ; une seule source`);
+    } else if (e.status === 'verified') {
       if (!existsSync(file)) problems.push(`${e.name} : status verified mais docs/diagrams/${e.name}.mmd est absent`);
       else problems.push(...checkDiagramFile(e, readFileSync(file, 'utf8')));
     } else if (existsSync(file)) problems.push(`${e.name} : fichier present, status devrait etre verified`);
