@@ -373,6 +373,15 @@ pub struct TurnOutcome {
     pub auto_continue_allowed: bool,
     /// The model's context window as the session knows it (tokens), if known.
     pub context_window: Option<u64>,
+    /// The turn ended on a `done` of the provider without error, `interrupted`
+    /// included: the provider recorded it in its history (nexus' native loop keeps
+    /// an interrupted turn, the user message pushed before the run), so what
+    /// `prepare` put in front of it only for one turn may be dropped now. Not on
+    /// `send_turn` accepting it: a provider may accept a turn before any request
+    /// (the native harness spawns its run), then fail it (a 429 once the retries
+    /// are spent). Not on the `done` the runtime makes itself for a Stop during the
+    /// pause before a retry: no attempt of the turn was answered.
+    pub answered: bool,
 }
 
 /// What the host asks of the session after a turn: events to emit, then system
@@ -417,12 +426,6 @@ pub trait TurnServices: Send + Sync {
     /// Sees each event of the session as it is emitted (the work log of the turn).
     /// Default: nothing.
     fn observe(&self, _session_id: &str, _event: &ChatEvent) {}
-    /// A turn ended on a `done` that is neither an error nor a Stop: the model
-    /// answered it, so what `prepare` put in front of it only for one turn may be
-    /// dropped now. Not on `send_turn` accepting it: a provider may accept a turn
-    /// before any request (the native harness spawns its run), then fail it (a 429
-    /// once the retries are spent). Default: nothing.
-    async fn turn_completed(&self, _session_id: &str) {}
     /// After each turn played (not one refused before it was sent): the
     /// Claude Code engine's post-stream steps — post-compaction re-injection,
     /// objective tracking, memory, feedback, observations. The host bounds each of
@@ -959,8 +962,6 @@ impl AgentSessionHandle {
             ..TurnOutcome::default()
         };
         let mut pending_tools: Vec<(String, Option<String>)> = Vec::new();
-        // The turn ended on a `done` the model answered (no error, no Stop).
-        let mut answered = false;
         let mut tool_ids: Vec<String> = Vec::new();
         // What the turn cost, read on its `done` (`None`: no price, or no `done`).
         let mut turn_cost: Option<f64> = None;
@@ -995,16 +996,15 @@ impl AgentSessionHandle {
                         ..
                     }
                 );
-                if let AgentEvent::Done {
-                    cost,
-                    is_error,
-                    stop_reason,
-                    ..
-                } = &event
-                {
+                if let AgentEvent::Done { cost, is_error, .. } = &event {
                     turn_cost = cost.usd;
-                    answered =
-                        !is_error && *stop_reason != nexus_claude::agent::StopReason::Interrupted;
+                    // `interrupted` too: the provider kept the turn in its history.
+                    // Only the provider's `done` comes here; the one made for a Stop
+                    // during the pause below does not. A Claude Code CLI `done` with
+                    // an error may already have written the prompt to its transcript:
+                    // the context then comes once more with the next turn (bounded
+                    // duplicate, not a loss).
+                    outcome.answered = !is_error;
                 }
                 let event = mask_agent_event(event);
                 let chat_events = self.mapper.lock().await.map(&event);
@@ -1054,11 +1054,6 @@ impl AgentSessionHandle {
         }
         // The record carries the turn's cost before the session is seen idle.
         self.add_turn_cost(turn_cost).await;
-        if answered {
-            if let Some(services) = &self.services {
-                services.turn_completed(&self.session_id).await;
-            }
-        }
         (outcome, pending_tools)
     }
 
@@ -2879,17 +2874,20 @@ mod retry_stop_tests {
 }
 
 /// What waits for the next turn after a compaction is dropped only when a turn
-/// carrying it was ANSWERED: the native harness accepts a turn before any request
-/// (its run is spawned) and may then fail it (a 429 once its retries are spent).
+/// carrying it was ANSWERED (`TurnOutcome::answered`): a provider `done` without
+/// error, `interrupted` included (the provider kept the turn). Not a turn accepted
+/// then failed (the native harness accepts before any request), not one whose
+/// retries ran out, not one stopped during the pause before a retry.
 #[cfg(test)]
-mod turn_completed_tests {
+mod answered_tests {
     use super::fake::FakeProvider;
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex as StdMutex;
 
+    /// The `answered` of each turn the host saw end.
     #[derive(Default)]
     struct Host {
-        completed: AtomicUsize,
+        answered: StdMutex<Vec<bool>>,
     }
 
     #[async_trait::async_trait]
@@ -2906,8 +2904,15 @@ mod turn_completed_tests {
         async fn continuation(&self, _session_id: &str) -> String {
             String::new()
         }
-        async fn turn_completed(&self, _session_id: &str) {
-            self.completed.fetch_add(1, Ordering::SeqCst);
+        async fn after_turn(&self, _session_id: &str, outcome: &TurnOutcome) -> AfterTurn {
+            self.answered.lock().unwrap().push(outcome.answered);
+            AfterTurn::default()
+        }
+    }
+
+    impl Host {
+        fn seen(&self) -> Vec<bool> {
+            self.answered.lock().unwrap().clone()
         }
     }
 
@@ -2933,23 +2938,16 @@ mod turn_completed_tests {
         }
     }
 
-    async fn play(provider: &FakeProvider, handle: &Arc<AgentSessionHandle>, end: AgentEvent) {
-        let before = provider.state.turns_started.lock().unwrap().len();
-        handle.send_message("go").await.unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while provider.state.turns_started.lock().unwrap().len() == before {
-            assert!(Instant::now() < deadline);
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        provider.state.push(end);
-        while handle.is_streaming.load(Ordering::SeqCst) {
-            assert!(Instant::now() < deadline);
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+    fn limited() -> AgentEvent {
+        done(
+            true,
+            Some(ProviderError::RateLimited {
+                retry_after_ms: Some(5),
+            }),
+        )
     }
 
-    #[tokio::test]
-    async fn a_turn_accepted_then_failed_does_not_count_as_completed() {
+    async fn session(retries: u32) -> (FakeProvider, Arc<AgentSessionHandle>, Arc<Host>) {
         let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let runtime = AgentRuntime::new(graph);
         let provider = FakeProvider::new();
@@ -2965,23 +2963,120 @@ mod turn_completed_tests {
                 Some(host.clone() as Arc<dyn TurnServices>),
             )
             .await;
+        handle.configure_retry(RetryConfig {
+            max_attempts: retries,
+            initial_delay_ms: 5,
+            backoff_multiplier: 1.0,
+        });
+        (provider, handle, host)
+    }
+
+    /// Sends a message and answers each attempt of its turn with the next of `ends`,
+    /// until the session is idle again.
+    async fn play(
+        provider: &FakeProvider,
+        handle: &Arc<AgentSessionHandle>,
+        ends: Vec<AgentEvent>,
+    ) {
+        let before = provider.state.turns_started.lock().unwrap().len();
+        handle.send_message("go").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut ends = ends.into_iter();
+        let mut answered = before;
+        loop {
+            let started = provider.state.turns_started.lock().unwrap().len();
+            if started > answered {
+                answered = started;
+                provider
+                    .state
+                    .push(ends.next().expect("an end for each attempt"));
+            }
+            if answered > before && !handle.is_streaming.load(Ordering::SeqCst) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the turn never ended");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(ends.next().is_none(), "every attempt was played");
+    }
+
+    #[tokio::test]
+    async fn a_turn_accepted_then_failed_is_not_answered() {
+        let (provider, handle, host) = session(0).await;
         // `send_turn` accepted it, then the endpoint refused it for good.
         play(
             &provider,
             &handle,
-            done(true, Some(ProviderError::Unauthorized)),
+            vec![done(true, Some(ProviderError::Unauthorized))],
         )
         .await;
+        play(&provider, &handle, vec![done(false, None)]).await;
+        assert_eq!(host.seen(), [false, true], "a failed turn keeps it");
+    }
+
+    /// A Stop the provider answered (`done interrupted`): nexus' native loop pushed
+    /// the user message before the run and keeps it, so the context was delivered.
+    #[tokio::test]
+    async fn a_turn_the_provider_ended_interrupted_is_answered() {
+        let (provider, handle, host) = session(0).await;
+        play(&provider, &handle, vec![interrupted_done()]).await;
+        assert_eq!(host.seen(), [true]);
+    }
+
+    #[tokio::test]
+    async fn a_retried_turn_then_answered_is_answered_once() {
+        let (provider, handle, host) = session(2).await;
+        play(&provider, &handle, vec![limited(), done(false, None)]).await;
         assert_eq!(
-            host.completed.load(Ordering::SeqCst),
-            0,
-            "a failed turn keeps it"
+            provider.state.turns_started.lock().unwrap().len(),
+            2,
+            "the turn and its retry"
         );
-        play(&provider, &handle, done(false, None)).await;
-        assert_eq!(
-            host.completed.load(Ordering::SeqCst),
-            1,
-            "an answered turn drops it"
-        );
+        assert_eq!(host.seen(), [true], "one turn, answered once");
+    }
+
+    #[tokio::test]
+    async fn a_turn_whose_retries_ran_out_is_not_answered() {
+        let (provider, handle, host) = session(1).await;
+        play(&provider, &handle, vec![limited(), limited()]).await;
+        assert_eq!(host.seen(), [false]);
+    }
+
+    /// The `done interrupted` the runtime makes for a Stop during the pause before a
+    /// retry ends the turn, but no attempt of it was answered: the context stays.
+    #[tokio::test]
+    async fn a_stop_during_the_pause_before_a_retry_is_not_answered() {
+        let (provider, handle, host) = session(3).await;
+        handle.configure_retry(RetryConfig {
+            max_attempts: 3,
+            initial_delay_ms: 10_000,
+            backoff_multiplier: 1.0,
+        });
+        let mut rx = handle.events_tx.subscribe();
+        handle.send_message("go").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while provider.state.turns_started.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        provider
+            .state
+            .push(done(true, Some(ProviderError::Overloaded)));
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("retrying")
+                .unwrap();
+            if matches!(event, ChatEvent::Retrying { .. }) {
+                break;
+            }
+        }
+        handle.interrupt().await.unwrap();
+        while handle.is_streaming.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(provider.state.turns_started.lock().unwrap().len(), 1);
+        assert_eq!(host.seen(), [false]);
     }
 }

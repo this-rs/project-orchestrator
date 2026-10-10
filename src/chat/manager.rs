@@ -1276,7 +1276,7 @@ pub(crate) struct AgentTurnState {
     /// the window right after the compaction and compacted again (measured in
     /// `routing_modes_e2e_tests` on integ/p8). Persisted with the session (it
     /// survives an idle close, a restart, a resume) and cleared only once a turn
-    /// carrying it was answered ([`TurnServices::turn_completed`]).
+    /// carrying it was answered ([`super::agent_runtime::TurnOutcome::answered`], in `after_turn`).
     held: Arc<std::sync::Mutex<HeldContext>>,
     /// Tool calls announced and not yet answered: id → (tool, input so far).
     open_tools: Arc<std::sync::Mutex<HashMap<String, (String, serde_json::Value)>>>,
@@ -1476,8 +1476,9 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             None => body,
         };
         // What waits since the last compaction goes in front of this turn, whatever
-        // started it. Only read here: it is cleared once the turn is sent
-        // (`turn_completed`), so a turn stopped, refused or failed keeps it.
+        // started it. Only read here: `after_turn` clears it once a turn carrying it
+        // was answered (`TurnOutcome::answered`), so a turn refused before it was
+        // sent, failed, or stopped before any attempt was answered keeps it.
         let held = self
             .session
             .held
@@ -1530,23 +1531,6 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
     /// its input was complete (Claude Code, ACP: `tool_use` with `{}`, then
     /// `tool_use_input_resolved`) is logged when its result (or its cancel) arrives,
     /// with the resolved input.
-    async fn turn_completed(&self, session_id: &str) {
-        let had = {
-            let mut held = self.session.held.lock().unwrap_or_else(|e| e.into_inner());
-            let had = !held.is_empty();
-            *held = HeldContext::default();
-            had
-        };
-        if had {
-            // A store that does not answer must not hold the turn: on its own.
-            let graph = self.graph.clone();
-            let sid = session_id.to_string();
-            super::post_stream::spawn_write(sid.clone(), "clear_held_context", async move {
-                HeldContext::clear(&graph, &sid).await
-            });
-        }
-    }
-
     fn observe(&self, _session_id: &str, event: &ChatEvent) {
         let mut open = self
             .session
@@ -1588,6 +1572,16 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
     ) -> super::agent_runtime::AfterTurn {
         let mut after = super::agent_runtime::AfterTurn::default();
         let uuid = Uuid::parse_str(session_id).ok();
+        // The turn carried what waited since the last compaction and was answered:
+        // dropped in memory before anything else (before the first await, so the
+        // backstop cannot skip it), a compaction of this same turn holding its own
+        // context again below. The store follows in ONE ordered write at the end.
+        let dropped = outcome.answered && {
+            let mut held = self.session.held.lock().unwrap_or_else(|e| e.into_inner());
+            let had = !held.is_empty();
+            *held = HeldContext::default();
+            had
+        };
         // Each step under its own budget, as `PostStreamHandler`'s (`StepBudget`): a
         // step that never answers is dropped and said, the next ones still run.
         let ctx = self
@@ -1680,7 +1674,9 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
                 }
             }
         }
-        // What waits for the next turn is stored with the session.
+        // What waits for the next turn is stored with the session: one write, after
+        // the turn's own clear, so a clear can never land after the store of this
+        // turn's compaction (and lose it on a restart or an idle close).
         if outcome.compacted {
             let held = self
                 .session
@@ -1693,6 +1689,14 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
                 session_id,
                 "hold_context",
                 held.store(&self.graph, session_id),
+            )
+            .await;
+        } else if dropped {
+            self.step(
+                &mut after,
+                session_id,
+                "clear_held_context",
+                HeldContext::clear(&self.graph, session_id),
             )
             .await;
         }
@@ -23558,30 +23562,34 @@ mod held_context_tests {
         assert!(sent.contains("Post-Compaction Context"), "{sent}");
     }
 
-    /// A turn that was prepared but never sent (a Stop during the enrichment, a
-    /// refused image, a provider error) leaves the context for the next one; a turn
-    /// sent drops it.
+    /// A turn that was prepared but not answered (a Stop during the enrichment, a
+    /// refused image, a provider error, a failure after `send_turn` accepted it)
+    /// leaves the context for the next one; a turn answered drops it, in memory and
+    /// in the store.
     #[tokio::test]
-    async fn the_held_context_is_dropped_only_once_a_turn_is_sent() {
+    async fn the_held_context_is_dropped_only_once_a_turn_is_answered() {
         let (manager, sid) = world().await;
         let s = services(&manager, manager.agent_turn_state(&sid).await);
         s.after_turn(&sid, &compacted()).await;
         let first = prepared(&s, &sid, "one").await;
         assert!(first.contains("Post-Compaction Context"));
-        // The turn failed: no `turn_completed`.
+        // The turn failed: not answered.
+        s.after_turn(&sid, &TurnOutcome::default()).await;
         let again = prepared(&s, &sid, "two").await;
         assert!(again.contains("Post-Compaction Context"), "kept: {again}");
-        s.turn_completed(&sid).await;
+        assert!(!HeldContext::load(&s.graph, &sid).await.is_empty());
+        s.after_turn(
+            &sid,
+            &TurnOutcome {
+                answered: true,
+                ..Default::default()
+            },
+        )
+        .await;
         let then = prepared(&s, &sid, "three").await;
         assert!(!then.contains("Post-Compaction Context"), "dropped: {then}");
-        // And from the store too, once the write landed.
-        for _ in 0..100 {
-            if HeldContext::load(&s.graph, &sid).await.is_empty() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("the stored held context was not cleared");
+        // And from the store too: written before `after_turn` returned.
+        assert!(HeldContext::load(&s.graph, &sid).await.is_empty());
     }
 
     #[test]
