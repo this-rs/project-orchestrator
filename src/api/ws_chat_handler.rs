@@ -271,25 +271,11 @@ async fn handle_ws_chat_loop(
 
                 // Normalize to flat format matching Phase 1.5 / live events.
                 // ChatEventRecord.data is a serde-serialized ChatEvent which already
-                // contains the "type" tag. We parse it, inject seq + replaying, and
-                // send it flat — so the frontend always receives the same JSON shape
-                // regardless of whether the event comes from replay, snapshot, or live.
-                let msg = match serde_json::from_str::<serde_json::Value>(&event.data) {
-                    Ok(serde_json::Value::Object(mut obj)) => {
-                        obj.insert("seq".to_string(), serde_json::json!(event.seq));
-                        obj.insert("replaying".to_string(), serde_json::json!(true));
-                        serde_json::Value::Object(obj)
-                    }
-                    _ => {
-                        // Fallback for malformed records: wrap in data field
-                        serde_json::json!({
-                            "seq": event.seq,
-                            "type": event.event_type,
-                            "data": serde_json::Value::String(event.data.clone()),
-                            "replaying": true,
-                        })
-                    }
-                };
+                // contains the "type" tag. We parse it, inject seq + replaying +
+                // created_at, and send it flat — so the frontend always receives the
+                // same JSON shape regardless of whether the event comes from replay,
+                // snapshot, or live.
+                let msg = replayed_frame(&event);
                 if ws_sender
                     .send(Message::Text(msg.to_string().into()))
                     .await
@@ -316,21 +302,7 @@ async fn handle_ws_chat_loop(
                         "Replaying message history (fallback)"
                     );
                     for event in &loaded.events {
-                        let msg = match serde_json::from_str::<serde_json::Value>(&event.data) {
-                            Ok(serde_json::Value::Object(mut obj)) => {
-                                obj.insert("seq".to_string(), serde_json::json!(event.seq));
-                                obj.insert("replaying".to_string(), serde_json::json!(true));
-                                serde_json::Value::Object(obj)
-                            }
-                            _ => {
-                                serde_json::json!({
-                                    "seq": event.seq,
-                                    "type": event.event_type,
-                                    "data": serde_json::Value::String(event.data.clone()),
-                                    "replaying": true,
-                                })
-                            }
-                        };
+                        let msg = replayed_frame(event);
                         if ws_sender
                             .send(Message::Text(msg.to_string().into()))
                             .await
@@ -621,12 +593,9 @@ async fn handle_ws_chat_loop(
     // StreamDelta/StreamingStatus have no fingerprint and always pass through.
     macro_rules! send_chat_event {
         ($event:expr, $ws:expr) => {{
-            // Serialize and send
-            match serde_json::to_value(&$event) {
-                Ok(mut val) => {
-                    if let Some(obj) = val.as_object_mut() {
-                        obj.insert("seq".to_string(), serde_json::json!(0));
-                    }
+            // Serialize (stamped with the forwarding time) and send
+            match live_frame(&$event, chrono::Utc::now()) {
+                Ok(val) => {
                     if $ws
                         .send(Message::Text(val.to_string().into()))
                         .await
@@ -1139,6 +1108,52 @@ async fn handle_ws_chat_loop(
     }
 
     info!(session_id = %session_id, "Chat WebSocket connection closed");
+}
+
+/// A server time on the chat wire: seconds since the epoch, with the
+/// milliseconds as the fraction (`1760099999.123`). The REST history and every
+/// WebSocket chat event frame carry `created_at` in this unit.
+pub(crate) fn wire_seconds(at: chrono::DateTime<chrono::Utc>) -> f64 {
+    at.timestamp_millis() as f64 / 1000.0
+}
+
+/// A persisted event as a replay frame: its payload, flat, plus `seq`,
+/// `replaying` and `created_at` (the time it was stored).
+fn replayed_frame(record: &crate::neo4j::models::ChatEventRecord) -> serde_json::Value {
+    let created_at = serde_json::json!(wire_seconds(record.created_at));
+    match serde_json::from_str::<serde_json::Value>(&record.data) {
+        Ok(serde_json::Value::Object(mut obj)) => {
+            obj.insert("seq".to_string(), serde_json::json!(record.seq));
+            obj.insert("replaying".to_string(), serde_json::json!(true));
+            obj.insert("created_at".to_string(), created_at);
+            serde_json::Value::Object(obj)
+        }
+        // Malformed record: wrap the raw payload in a data field.
+        _ => serde_json::json!({
+            "seq": record.seq,
+            "type": record.event_type,
+            "data": serde_json::Value::String(record.data.clone()),
+            "replaying": true,
+            "created_at": created_at,
+        }),
+    }
+}
+
+/// A live event (local broadcast or relayed over NATS) as a frame: its payload
+/// plus `seq: 0` and `created_at`, the time this server forwards it.
+fn live_frame(
+    event: &crate::chat::types::ChatEvent,
+    now: chrono::DateTime<chrono::Utc>,
+) -> serde_json::Result<serde_json::Value> {
+    let mut val = serde_json::to_value(event)?;
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("seq".to_string(), serde_json::json!(0));
+        obj.insert(
+            "created_at".to_string(),
+            serde_json::json!(wire_seconds(now)),
+        );
+    }
+    Ok(val)
 }
 
 /// Rate-limiter for neural reinforcement via chat.
