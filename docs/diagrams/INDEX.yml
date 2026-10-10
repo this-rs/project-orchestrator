@@ -78,6 +78,7 @@ diagrams:
     # scorer, decisions, feedback, rapport (B-R2..). Les routes /api/chat/routing vivent dans routing_handlers.rs.
     covers:
       - "backend:src/chat/provider/cognitive/**"
+      - "backend:src/chat/routing_modes_e2e_tests.rs"
       - "backend:src/api/routing_handlers.rs"
       - "backend:src/neo4j/routing.rs"
       - "backend:src/runner/routing.rs"

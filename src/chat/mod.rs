@@ -45,6 +45,8 @@ pub mod provider;
 mod refs_wiring_tests;
 pub mod relay;
 pub mod routing;
+#[cfg(test)]
+mod routing_modes_e2e_tests;
 pub(crate) mod skill_hook;
 pub mod stages;
 pub mod tree;

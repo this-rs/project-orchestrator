@@ -698,7 +698,7 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
             if choice.allowed_models.is_some() {
                 settings.mode = ProviderRoutingMode::Full;
             }
-            let mut pool = router.pool.pool(&router.provider_id).await;
+            let mut pool = provider_pool(router).await;
             if let Some(allowed) = &choice.allowed_models {
                 pool.retain(|facts| allowed.iter().any(|m| m == &facts.model));
             }
@@ -730,6 +730,86 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
         }
         _ => TurnDirective::none(),
     }
+}
+
+/// The models of the session's provider, with the consent of the session's PROJECT stated
+/// on each. [`PoolSource::pool`] knows no project: the manager's answers it without one,
+/// and without a project no stored instance is allowed, so every model came back
+/// `not_allowed` and a turn decided here was `no_candidate` (the opening turn, and every
+/// turn of a conversation routed among models ticked in the menu). The project's pool,
+/// narrowed to the provider, is asked first; a source that has none answers `pool`.
+async fn provider_pool(router: &TurnRouter) -> Vec<ModelFacts> {
+    let project = tokio::time::timeout(
+        router.timeout,
+        router.pool.project_pool(router.project_slug.as_deref()),
+    )
+    .await
+    .unwrap_or_default();
+    let mine: Vec<ModelFacts> = project
+        .into_iter()
+        .filter(|facts| facts.provider_id == router.provider_id)
+        .collect();
+    if mine.is_empty() {
+        router.pool.pool(&router.provider_id).await
+    } else {
+        mine
+    }
+}
+
+/// Records the cognitive decision for the compaction summary about to be written, in
+/// shadow: what the router would choose to summarise this conversation. It is never
+/// applied, because neither engine lets the caller choose the summary model (the Claude Code
+/// CLI compacts on the session's model; nexus' native compaction calls the session's own
+/// endpoint with its active model, and `CompactionConfig` has no model field). The stored
+/// decision says so (`compaction_model_not_selectable`) and names the pair the summary runs
+/// on (`used`). Every mode records it, like the opening decision; a failing or slow decider
+/// (2 s) only loses the record.
+pub(crate) async fn record_compaction_decision(router: &TurnRouter) -> Option<CognitiveDecision> {
+    use super::provider::cognitive::decider::COMPACTION_MODEL_NOT_SELECTABLE;
+    use super::provider::cognitive::signature::TaskClass;
+
+    let choice = locked(&router.choice).clone();
+    let current = Pick::new(&router.provider_id, &locked(&router.state).current_model);
+    // Every model the project consented to (the summary needs no tool and could run
+    // anywhere), else the session's provider's: the alternatives worth learning about.
+    let mut pool = match tokio::time::timeout(
+        router.timeout,
+        router.pool.project_pool(router.project_slug.as_deref()),
+    )
+    .await
+    {
+        Ok(pool) if !pool.is_empty() => pool,
+        _ => router.pool.pool(&router.provider_id).await,
+    };
+    if let Some(entries) = &choice.routing_pool {
+        pool.retain(|facts| {
+            entries
+                .iter()
+                .any(|e| e.provider == facts.provider_id && e.model == facts.model)
+        });
+    }
+    // The summary reads what the current model held when compaction started: about 80 %
+    // of its window (the threshold of both engines; the signature clamps it to its floor).
+    let need = pool
+        .iter()
+        .find(|f| f.provider_id == current.provider_id && f.model == current.model)
+        .and_then(|f| f.context_window)
+        .map_or(0, |window| window / 5 * 4);
+    let signature = TaskSignature::utility(
+        TaskClass::UtilityCompaction,
+        need,
+        router.project_slug.as_deref(),
+    );
+    let mut settings = choice.routing.clone();
+    settings.stage = LearningStage::Shadow;
+    let mut request = DecideRequest::new(signature, settings, pool);
+    request.trust = router.trust;
+    request.current = Some(current);
+    request.session_id = router.session_id;
+    request.not_selectable = Some(COMPACTION_MODEL_NOT_SELECTABLE);
+    let decision = router.ask(request).await?;
+    debug!(provider = %router.provider_id, reason = %decision.reason, "compaction decision recorded in shadow");
+    Some(decision)
 }
 
 /// The decider shared by the sessions and the pool it chooses in.
