@@ -15,10 +15,11 @@ use uuid::Uuid;
 /// the NATS `control_response` RPC). Absent means `once`.
 ///
 /// - `once`: this call only.
-/// - `session`: the same tool is not asked again in this session.
-/// - `always`: not asked again in this project, after a restart too. Claude
-///   Code persists it itself (its `localSettings`); a native session has it
-///   from the backend's lasting rules (`chat::lasting_rules`).
+/// - `session`: the backend answers itself the later requests of THIS session the
+///   grant covers (`chat::session_grants`: the identical call; any call of a read-only
+///   tool). Never handed to the provider as a rule.
+/// - `always`: part of the contract, refused on every engine in this lot (P11b: lasting
+///   rules need a hardened matcher first).
 ///
 /// A scope the session does not declare (`capabilities.permission_scopes`) is
 /// REFUSED with a typed error, never answered as a narrower one.
@@ -38,15 +39,6 @@ impl PermissionAnswerScope {
             Self::Once => "once",
             Self::Session => "session",
             Self::Always => "always",
-        }
-    }
-
-    /// The scope as nexus names it.
-    pub fn to_nexus(self) -> nexus_claude::agent::PermissionScope {
-        match self {
-            Self::Once => nexus_claude::agent::PermissionScope::Once,
-            Self::Session => nexus_claude::agent::PermissionScope::Session,
-            Self::Always => nexus_claude::agent::PermissionScope::Always,
         }
     }
 
@@ -743,6 +735,10 @@ pub enum ChatEvent {
         /// `always`). Absent: this call only, or a refusal.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope: Option<PermissionAnswerScope>,
+        /// What the approval covers, as the user is shown it, when it outlives the call
+        /// (`session`: the grant of `chat::session_grants`, e.g. `Bash: git status`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule: Option<String>,
     },
     /// Permission mode was changed mid-session
     PermissionModeChanged {
@@ -2220,11 +2216,13 @@ mod tests {
                 id: "pr_1".into(),
                 allow: true,
                 scope: Some(PermissionAnswerScope::Session),
+                rule: Some("Bash: git status".into()),
             },
             ChatEvent::PermissionDecision {
                 id: "pr_2".into(),
                 allow: false,
                 scope: None,
+                rule: None,
             },
             ChatEvent::ModelChanged {
                 model: "claude-opus-4-6".into(),

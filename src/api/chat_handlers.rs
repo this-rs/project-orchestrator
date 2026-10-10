@@ -4317,6 +4317,7 @@ mod tests {
                 id: "req-x".into(),
                 allow: true,
                 scope: None,
+                rule: None,
             },
         )
         .await;

@@ -396,6 +396,7 @@ mod tests {
                 id: "a".into(),
                 allow: true,
                 scope: None,
+                rule: None,
             },
         );
         assert_eq!(
@@ -433,6 +434,7 @@ mod tests {
                 id: id.into(),
                 allow: true,
                 scope: None,
+                rule: None,
             },
         )
     }

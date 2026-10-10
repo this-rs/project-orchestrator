@@ -464,11 +464,13 @@ fn server_examples() -> Vec<ServerExample> {
                 id: s("perm_0001"),
                 allow: true,
                 scope: Some(crate::chat::types::PermissionAnswerScope::Session),
+                rule: Some(s("Bash: git status")),
             },
             ChatEvent::PermissionDecision {
                 id: s("perm_0001"),
                 allow: true,
                 scope: None,
+                rule: None,
             },
         ),
         ServerExample::new(

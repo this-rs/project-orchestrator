@@ -131,20 +131,21 @@ messages yet. Both are also logged by the server with the step name.
 {"type": "permission_response", "id": "pr_1", "allow": true, "scope": "session"}
 ```
 
-`scope` (optional, default `once`) says how long an approval lasts: `once` (this call),
-`session` (the same tool is not asked again in this session), `always` (not asked again in
-this project, after a restart too). Only the scopes the session declares in
-`system_init.capabilities.permission_scopes` may be sent; another one is refused with an
-`error` frame `{"code": "permission_scope_unsupported", "reason": "<scope>"}` and the request
-stays waiting. Claude Code (legacy engine) writes the CLI's `permission_suggestions` back as
-`updatedPermissions` with the destination `session`, or `localSettings`
-(`<project>/.claude/settings.local.json`) for `always` (without a suggestion: a rule for the tool
-for `session` only; `always` is refused). A native session keeps `session` in its harness and
-`always` in the backend's rules (`<app dir>/permission-rules.json`, per project directory), scoped
-on the call as the nexus policy patterns are: `Bash(git status)` + `Bash(git status *)`, the file
-path, `WebFetch(domain:host)`, the exact argument otherwise; a compound or wrapped command gets no
-`always`. The resulting `permission_decision` carries the same `scope`. The REST
-twin `POST /api/chat/sessions/{id}/permissions/{request_id}` takes `{"allow", "scope"?}` (400
+`scope` (optional, default `once`) says how long an approval lasts: `once` (this call) or
+`session`. A `session` approval is decided by the BACKEND (`chat::session_grants`), never handed to
+the provider as a rule (no nexus `allow` entry, no `updatedPermissions` to the CLI): the provider
+is answered `once`, and the backend answers itself the later requests of the SAME session that
+the grant covers — the identical call (same tool, same input; a command's surrounding blanks
+trimmed), or any call of a read-only tool (`Read`, `Glob`, `Grep`, `LS`). A command that runs
+another command (`env`, `sudo`, `bash -c`, `xargs`, `timeout`, `ssh`, `docker exec`..., by
+basename) cannot be granted for the session. Only requests the provider asked reach the backend,
+after its own policy (read-only access, denies, trust) and the project's consent. Another session,
+or the same one after a restart, asks again. `always` is part of the contract but refused on every
+engine for now (P11b). A scope that cannot be kept is refused with an `error` frame
+`{"code": "permission_scope_unsupported", "reason": "<scope>"}`; nothing is answered and the
+request stays waiting. The resulting `permission_decision` carries `scope` and `rule` (what a
+session grant covers, e.g. `Bash: git status`). The REST twin
+`POST /api/chat/sessions/{id}/permissions/{request_id}` takes `{"allow", "scope"?}` (400
 `permission_scope_unsupported`).
 
 #### `input_response` -- Respond to an input request
