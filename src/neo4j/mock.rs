@@ -151,6 +151,9 @@ pub struct MockGraphStore {
     /// Stall injection: deletes of these setting keys do not return until
     /// [`Self::release_llm_setting_deletes`] — a slow store.
     pub stall_llm_setting_deletes_of: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Stall injection: reads of these setting keys do not return until
+    /// [`Self::release_llm_setting_reads`] — a store read that never answers.
+    pub stall_llm_setting_reads_of: std::sync::Mutex<std::collections::HashSet<String>>,
     llm_setting_writes_released: tokio::sync::Notify,
     /// Triggers
     pub triggers: RwLock<HashMap<Uuid, crate::runner::Trigger>>,
@@ -370,6 +373,7 @@ impl MockGraphStore {
             fail_llm_setting_writes_of: std::sync::Mutex::new(std::collections::HashSet::new()),
             fail_llm_setting_reads_of: std::sync::Mutex::new(std::collections::HashSet::new()),
             stall_llm_setting_deletes_of: std::sync::Mutex::new(std::collections::HashSet::new()),
+            stall_llm_setting_reads_of: std::sync::Mutex::new(std::collections::HashSet::new()),
             llm_setting_writes_released: tokio::sync::Notify::new(),
             triggers: RwLock::new(HashMap::new()),
             trigger_firings: RwLock::new(HashMap::new()),
@@ -708,6 +712,22 @@ impl MockGraphStore {
     /// Lift [`Self::stall_llm_setting_deletes`]: the deletes it held go through.
     pub fn release_llm_setting_deletes(&self, key: &str) {
         if let Ok(mut s) = self.stall_llm_setting_deletes_of.lock() {
+            s.remove(key);
+        }
+        self.llm_setting_writes_released.notify_waiters();
+    }
+
+    /// Make every read of the setting `key` hang until
+    /// [`Self::release_llm_setting_reads`].
+    pub fn stall_llm_setting_reads(&self, key: &str) {
+        if let Ok(mut s) = self.stall_llm_setting_reads_of.lock() {
+            s.insert(key.to_string());
+        }
+    }
+
+    /// Lift [`Self::stall_llm_setting_reads`]: the reads it held go through.
+    pub fn release_llm_setting_reads(&self, key: &str) {
+        if let Ok(mut s) = self.stall_llm_setting_reads_of.lock() {
             s.remove(key);
         }
         self.llm_setting_writes_released.notify_waiters();
@@ -7993,6 +8013,17 @@ impl GraphStore for MockGraphStore {
     }
 
     async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>> {
+        loop {
+            let released = self.llm_setting_writes_released.notified();
+            let stalled = self
+                .stall_llm_setting_reads_of
+                .lock()
+                .is_ok_and(|s| s.contains(key));
+            if !stalled {
+                break;
+            }
+            released.await;
+        }
         if self
             .fail_llm_setting_reads_of
             .lock()

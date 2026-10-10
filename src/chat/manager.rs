@@ -1291,9 +1291,13 @@ pub(crate) struct HeldSlot {
     memory: std::sync::Mutex<HeldMemory>,
     /// Orders the store writes of the session: each write takes it INSIDE its task,
     /// then stores what memory holds at that moment, so the last write to land is
-    /// the latest state (a clear can never land after a newer store). A reload
-    /// takes it too. Never held past [`HELD_WRITE_BUDGET_FACTOR`] × the step budget:
-    /// a store call that never answers is dropped and the slot stays unsynced.
+    /// the latest state (a clear can never land after a newer store, among the
+    /// writes that land within their bound — see [`Self::write_once`] for one that
+    /// was dropped). A reopen ([`Self::reopen`]) takes it too. Every holder bounds
+    /// its store call by [`HELD_WRITE_BUDGET_FACTOR`] × the step budget (a write and
+    /// the reopen's read alike: one that never answers is dropped, the slot kept
+    /// as it stands), so the lock is never held past that, and waiting for it is
+    /// bounded by the writes queued before.
     write: tokio::sync::Mutex<()>,
     /// A background retry of a failed write runs ([`Self::retry_in_background`]):
     /// at most one per session.
@@ -1391,9 +1395,53 @@ impl HeldSlot {
         true
     }
 
+    /// Replaces memory with what the store holds, as a new state of the session
+    /// starts from it: only a slot in step with the store reloads it, and only if
+    /// memory did not move during the read ([`Self::reload`]). Ordered after the
+    /// writes already started (their lock, waited for within `budget`; past it the
+    /// read goes on, the generation check alone keeping it safe). The read is
+    /// bounded like a write ([`HELD_WRITE_BUDGET_FACTOR`] × `budget`): a store that
+    /// does not answer, or cannot be read, keeps memory and releases the lock.
+    async fn reopen(&self, graph: &Arc<dyn GraphStore>, session_id: &str, budget: Duration) {
+        let _order = tokio::time::timeout(budget, self.write.lock()).await.ok();
+        let seen = {
+            let m = self.lock();
+            (m.stored == Some(m.generation)).then_some(m.generation)
+        };
+        let Some(seen) = seen else {
+            return;
+        };
+        let bound = budget * HELD_WRITE_BUDGET_FACTOR;
+        let read = match tokio::time::timeout(bound, HeldContext::load(graph, session_id)).await {
+            Ok(read) => read,
+            Err(_) => Err(anyhow!(
+                "the store did not answer within {} ms",
+                bound.as_millis()
+            )),
+        };
+        match read {
+            Ok(stored) => {
+                self.reload(stored, seen);
+            }
+            Err(e) => warn!(
+                session_id,
+                "held context: the store could not be read, memory kept: {e:#}"
+            ),
+        }
+    }
+
     /// Writes what memory holds to the store, ordered after the writes already
     /// started, the store call bounded ([`HELD_WRITE_BUDGET_FACTOR`] × `budget`).
     /// The slot is in step only if memory did not move since the write read it.
+    ///
+    /// A store call dropped by the bound may still land on the server, later. If a
+    /// newer write lands first, the dropped one overwrites it there while the slot
+    /// believes itself in step: no retry, and the newer state is lost at a restart
+    /// (memory stays right while the process lives). It takes a store slower than
+    /// the bound (60 s in production). A write conditional on a version would close
+    /// it, but the generation lives in this process only (it restarts at 0, and
+    /// another instance has its own): it would need a durable version and a delete
+    /// turned into a versioned tombstone in the `GraphStore` setting API.
     async fn write_once(
         &self,
         graph: &Arc<dyn GraphStore>,
@@ -1468,9 +1516,11 @@ impl HeldSlot {
         let slot = Arc::clone(self);
         tokio::spawn(async move {
             let mut delay = HELD_RETRY_FIRST_DELAY;
+            let mut in_step = false;
             for attempt in 1..=HELD_RETRY_ATTEMPTS {
                 tokio::time::sleep(delay).await;
                 if !slot.unsynced() {
+                    in_step = true;
                     break;
                 }
                 match slot.write_once(&graph, &sid, budget).await {
@@ -1482,11 +1532,18 @@ impl HeldSlot {
                     }
                 }
                 if !slot.unsynced() {
+                    in_step = true;
                     break;
                 }
                 delay *= 2;
             }
             slot.retrying.store(false, SeqCst);
+            // A write that failed after the last check found the slot in step saw
+            // this loop still running and left the retry to it: retry it now. Not
+            // after the attempts ran out (the next turn writes again).
+            if in_step && slot.lock().stored.is_none() {
+                slot.retry_in_background(graph, sid, budget);
+            }
         });
     }
 }
@@ -12383,38 +12440,21 @@ impl ChatManager {
     /// session in this process landed (waited for within the step budget). When
     /// memory and store may diverge (a write failed or still runs, a turn of an
     /// earlier handle changed memory and has not written it yet) or the store
-    /// cannot be read, memory.
+    /// cannot be read in time ([`HeldSlot::reopen`]), memory.
     async fn held_slot(&self, session_id: &str) -> Arc<HeldSlot> {
         let slot = {
             let mut slots = self.held_slots.lock().unwrap_or_else(|e| e.into_inner());
             Arc::clone(slots.entry(session_id.to_string()).or_default())
         };
-        {
-            let _order = tokio::time::timeout(
-                super::post_stream::POST_STREAM_STEP_BUDGET,
-                slot.write.lock(),
-            )
-            .await
-            .ok();
-            // Only a slot in step with the store reloads it, and only if memory did
-            // not move during the read (an earlier handle's `after_turn` still
-            // runs: `close` does not stop it, `adopt` replaces a live handle).
-            let seen = {
-                let m = slot.lock();
-                (m.stored == Some(m.generation)).then_some(m.generation)
-            };
-            if let Some(seen) = seen {
-                match HeldContext::load(&self.graph, session_id).await {
-                    Ok(stored) => {
-                        slot.reload(stored, seen);
-                    }
-                    Err(e) => warn!(
-                        session_id,
-                        "held context: the store could not be read, memory kept: {e:#}"
-                    ),
-                }
-            }
-        }
+        // Only a slot in step with the store reloads it, and only if memory did not
+        // move during the read (an earlier handle's `after_turn` still runs: `close`
+        // does not stop it, `adopt` replaces a live handle).
+        slot.reopen(
+            &self.graph,
+            session_id,
+            super::post_stream::POST_STREAM_STEP_BUDGET,
+        )
+        .await;
         slot
     }
 
@@ -23865,12 +23905,15 @@ mod held_context_tests {
     /// (`persistence_delayed`); the next turn compacts again meanwhile, and its
     /// store is ORDERED after that clear — the newer context is what the store ends
     /// with, not an empty one landed last, also once the stalled store answers.
+    /// The budget (1 s: the clear dropped after 2 s) leaves the stalled clear in
+    /// flight well after the newer store would land without the lock, so the test
+    /// is red without it however slow the machine.
     #[tokio::test]
     async fn a_slow_clear_is_said_late_and_a_newer_store_lands_after_it() {
         let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let (manager, sid) = world_on(mock.clone()).await;
         let mut s = services(&manager, manager.agent_turn_state(&sid).await);
-        s.step_budget = Duration::from_millis(200);
+        s.step_budget = Duration::from_secs(1);
         s.after_turn(&sid, &compacted()).await;
         mock.stall_llm_setting_deletes(HeldContext::KEY);
         let started = std::time::Instant::now();
@@ -24006,6 +24049,45 @@ mod held_context_tests {
             "a read error is not an empty context"
         );
         mock.fail_llm_setting_reads(HeldContext::KEY, false);
+    }
+
+    /// The store read of a reopen never answers: it is dropped after twice the step
+    /// budget, memory is kept, and the session's write lock is released — the next
+    /// writes are not stuck behind it. Red without the bound: the reopen never
+    /// returns, holding the lock.
+    #[tokio::test]
+    async fn a_store_read_that_never_answers_at_reopen_releases_the_lock() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_on(mock.clone()).await;
+        let s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.after_turn(&sid, &compacted()).await;
+        assert!(!s.session.held.unsynced());
+        mock.stall_llm_setting_reads(HeldContext::KEY);
+        let budget = Duration::from_millis(100);
+        let reopen = tokio::time::timeout(
+            Duration::from_secs(5),
+            s.session.held.reopen(&s.graph, &sid, budget),
+        )
+        .await;
+        assert!(reopen.is_ok(), "the reopen waited on the store for good");
+        assert!(
+            s.session.held.write.try_lock().is_ok(),
+            "the write lock is released"
+        );
+        assert!(
+            s.session.held.held().context.is_some(),
+            "a read that never answers is not an empty context"
+        );
+        // A write goes through meanwhile.
+        s.session.held.edit(|h| *h = HeldContext::default());
+        s.session
+            .held
+            .write_once(&s.graph, &sid, budget)
+            .await
+            .unwrap();
+        assert!(!s.session.held.unsynced());
+        mock.release_llm_setting_reads(HeldContext::KEY);
+        assert!(HeldContext::load(&s.graph, &sid).await.unwrap().is_empty());
     }
 
     /// A failed write is retried in the background, without waiting for a turn: a
