@@ -6254,6 +6254,237 @@ mod legacy_session_record {
         assert_eq!(node.cli_session_id.as_deref(), Some("fake-cli-session"));
         manager.close_session(&sid).await.unwrap();
     }
+
+    /// A turn whose wrap-up never returns, on the legacy engine with a real
+    /// (fake) CLI: the CLI has answered (`result`), then the store that should
+    /// save the turn never answers. Measured on 2026-10-05 (note 1a31aadb) and
+    /// 2026-10-09 (session b4c28b9f): the turn stayed "streaming" for hours and
+    /// every Stop was delivered to nothing.
+    mod stuck_after_result {
+        use super::*;
+        use std::sync::atomic::Ordering;
+
+        async fn is_streaming(manager: &ChatManager, sid: &str) -> bool {
+            manager
+                .active_sessions
+                .read()
+                .await
+                .get(sid)
+                .is_some_and(|s| s.is_streaming.load(Ordering::SeqCst))
+        }
+
+        /// Waits up to `secs` for the session to be idle; says whether it got there.
+        async fn idle_within(manager: &ChatManager, sid: &str, secs: u64) -> bool {
+            for _ in 0..secs * 20 {
+                if !is_streaming(manager, sid).await {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            false
+        }
+
+        /// The persisted events of `sid` whose type is `event_type`, once there
+        /// are `count` of them.
+        async fn persisted_until(
+            graph: &MockGraphStore,
+            sid: &str,
+            event_type: &str,
+            count: usize,
+        ) {
+            let id = Uuid::parse_str(sid).unwrap();
+            let mut seen = 0;
+            for _ in 0..400 {
+                seen = graph
+                    .chat_events
+                    .read()
+                    .await
+                    .get(&id)
+                    .map(|events| events.iter().filter(|e| e.event_type == event_type).count())
+                    .unwrap_or(0);
+                if seen >= count {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("{count} `{event_type}` event(s) never persisted for {sid}: {seen}");
+        }
+
+        fn received(rx: &mut broadcast::Receiver<ChatEvent>) -> Vec<ChatEvent> {
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+            events
+        }
+
+        fn has_error(events: &[ChatEvent], code: &str, reason: Option<&str>) -> bool {
+            events.iter().any(|e| {
+                matches!(e, ChatEvent::Error { code: Some(c), reason: r, .. }
+                    if c == code && (reason.is_none() || r.as_deref() == reason))
+            })
+        }
+
+        /// `turns` turns of the CLI (costs 0.01, 0.02...); the second one takes
+        /// its time, room to hold a message during it.
+        fn transcript(turns: usize) -> Vec<Value> {
+            let mut transcript = vec![];
+            for n in 1..=turns {
+                let mut t = turn(&format!("answer {n}"), n as f64 / 100.0).to_vec();
+                if n == 1 {
+                    t.insert(
+                        1,
+                        json!({"op": "emit_json", "json": {"type": "system", "subtype": "init",
+                            "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                            "permissionMode": "default", "apiKeySource": "none"}}),
+                    );
+                }
+                if n == 2 {
+                    t.insert(1, json!({"op": "sleep", "ms": 1500}));
+                }
+                transcript.extend(t);
+            }
+            transcript.push(json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}));
+            transcript
+        }
+
+        /// A session whose first turn is over and saved, then a store that
+        /// never saves a `result` again, then a second turn with a message held
+        /// during it (`queue_user_message`: it interrupts nothing). Returns once
+        /// the CLI has answered the second turn (its cost is written).
+        ///
+        /// The held message is what keeps the session "streaming" past the CLI's
+        /// answer: `finalize_streaming_status` leaves it for the drain to send —
+        /// the drain that comes after the write that never answers.
+        async fn stuck_after_second_result(
+            turns: usize,
+            budget: Option<Duration>,
+        ) -> (
+            tempfile::TempDir,
+            Arc<MockGraphStore>,
+            ChatManager,
+            String,
+            broadcast::Receiver<ChatEvent>,
+        ) {
+            let (dir, graph, manager) = legacy(&transcript(turns)).await;
+            let mut req = request(None, None, "default");
+            req.message = "message one".into();
+            req.cwd = dir.path().display().to_string();
+            let sid = manager
+                .create_session(&req)
+                .await
+                .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+                .session_id;
+            record_until(&graph, &sid, |n| n.total_cost_usd == Some(0.01)).await;
+            assert!(idle_within(&manager, &sid, 15).await, "the first turn ends");
+            persisted_until(&graph, &sid, "result", 1).await;
+
+            if let Some(budget) = budget {
+                manager
+                    .active_sessions
+                    .write()
+                    .await
+                    .get_mut(&sid)
+                    .unwrap()
+                    .post_stream_budget = budget;
+            }
+            graph.stall_chat_events("result");
+            let rx = manager.subscribe(&sid).await.unwrap();
+            manager.send_message(&sid, "message two").await.unwrap();
+            for _ in 0..100 {
+                if is_streaming(&manager, &sid).await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(is_streaming(&manager, &sid).await, "the second turn runs");
+            assert!(
+                manager
+                    .queue_user_message(&sid, "message three")
+                    .await
+                    .unwrap(),
+                "held during the second turn"
+            );
+            record_until(&graph, &sid, |n| n.total_cost_usd == Some(0.02)).await;
+            (dir, graph, manager, sid, rx)
+        }
+
+        /// The Stop on a turn stuck after `result`: the interrupt watchdog ends
+        /// it, the clients learn why, the turn's events still land once the store
+        /// answers, the session takes the next message and the held one goes
+        /// out after it. Red without the watchdog: the session stays "streaming"
+        /// whatever the Stop (until the 30 s step budget, without it for good).
+        #[tokio::test]
+        async fn a_stop_frees_a_turn_whose_wrap_up_never_returns() {
+            let (_dir, graph, manager, sid, mut rx) = stuck_after_second_result(4, None).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                is_streaming(&manager, &sid).await,
+                "the reproduction: the turn is stuck after its result"
+            );
+
+            let outcome = manager.interrupt_scoped(&sid, true).await.unwrap();
+            assert!(outcome.delivered, "the session is local: {outcome:?}");
+            assert!(
+                idle_within(&manager, &sid, 15).await,
+                "a delivered Stop frees the session even when its turn ignores the token"
+            );
+            let events = received(&mut rx);
+            assert!(
+                has_error(&events, "turn_abandoned", None),
+                "the clients learn why: {events:?}"
+            );
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    ChatEvent::StreamingStatus {
+                        is_streaming: false
+                    }
+                )),
+                "the composer is released: {events:?}"
+            );
+
+            // The turn's events were not dropped with it: they land when the
+            // store answers.
+            graph.release_chat_events("result");
+            persisted_until(&graph, &sid, "result", 2).await;
+
+            // The session is free: the next message gets its turn, and the
+            // message held during the abandoned one goes out after it.
+            manager.send_message(&sid, "message four").await.unwrap();
+            record_until(&graph, &sid, |n| n.total_cost_usd == Some(0.04)).await;
+            assert!(idle_within(&manager, &sid, 15).await, "the last turn ends");
+            persisted_until(&graph, &sid, "result", 4).await;
+            manager.close_session(&sid).await.unwrap();
+        }
+
+        /// Without any Stop, the case of note 1a31aadb: the write before the
+        /// drain never answers. Past the step budget it no longer holds the turn:
+        /// the held message goes out, the clients learn that the save is late
+        /// (`persistence_delayed`, the step named), every write lands when the
+        /// store answers. Red without the budget: the held message is never
+        /// sent, the session "streaming" for good.
+        #[tokio::test]
+        async fn a_wrap_up_that_never_returns_no_longer_holds_the_queue() {
+            let (_dir, graph, manager, sid, mut rx) =
+                stuck_after_second_result(3, Some(Duration::from_millis(300))).await;
+
+            record_until(&graph, &sid, |n| n.total_cost_usd == Some(0.03)).await;
+            assert!(
+                idle_within(&manager, &sid, 10).await,
+                "a store that never answers no longer pins the turn"
+            );
+            let events = received(&mut rx);
+            assert!(
+                has_error(&events, "persistence_delayed", Some("persist_events")),
+                "the clients learn that the save is late, and which one: {events:?}"
+            );
+
+            graph.release_chat_events("result");
+            persisted_until(&graph, &sid, "result", 3).await;
+            manager.close_session(&sid).await.unwrap();
+        }
+    }
 }
 
 /// P14: a native session's conversation lives in a transcript the resume token only

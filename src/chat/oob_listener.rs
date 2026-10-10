@@ -517,7 +517,7 @@ async fn maybe_trigger_stream(
     // below for the Arc::clone.
     let _ = client.clone();
 
-    tokio::spawn(async move {
+    let turn_task = tokio::spawn(async move {
         ChatManager::stream_response(
             client,
             events_tx,
@@ -551,6 +551,8 @@ async fn maybe_trigger_stream(
         )
         .await;
     });
+    ChatManager::track_stream_task(&deps.active_sessions, session_id, turn_task.abort_handle())
+        .await;
 }
 
 /// Emit a `ChatEvent::SessionError` describing subprocess death and log

@@ -107,6 +107,24 @@ If the session is not currently active (no CLI process running), the server auto
 {"type": "interrupt"}
 ```
 
+A delivered interrupt is followed by a watchdog. If the turn is still streaming
+5 s later (its task never read the cancellation: a store call that never
+answered, for instance), the server abandons the turn itself: the task is
+aborted, `streaming_status` goes to `false` and an `error` event with
+`code: "turn_abandoned"` says why. Messages held during the turn stay queued
+and go out after the next one. Events the turn had already handed to the
+store are still written; if it was stopped before its answer was complete,
+part of that answer may be missing after a reload.
+
+Each post-stream step (memory, auto-continue, objective reminder) runs under
+a 30 s budget, and so does the wait for the turn's own events to be saved. A
+step that overruns is skipped: `error` with `code: "post_stream_step_abandoned"`,
+`reason` naming the step. A save that overruns is not dropped: it keeps running
+and lands when the database answers, the turn goes on (queued messages are
+sent), and `error` with `code: "persistence_delayed"` (`reason`: the step, e.g.
+`persist_events`) tells the client that a reload may not show the latest
+messages yet. Both are also logged by the server with the step name.
+
 #### `permission_response` -- Respond to a permission request
 
 ```json
@@ -136,7 +154,7 @@ Events sent from the server to the client. Each event includes a `type` field an
 | `result` | Conversation turn completed | `session_id`, `duration_ms`, `cost_usd` (optional) |
 | `stream_delta` | Raw streaming text token (real-time) | `text` |
 | `streaming_status` | Stream state change | `is_streaming` (boolean) |
-| `error` | An error occurred | `message` |
+| `error` | An error occurred | `message`, `code` (optional, e.g. `turn_abandoned`, `persistence_delayed`, `post_stream_step_abandoned`, `refs_invalid`), `reason` (optional) |
 
 #### Special Control Events
 

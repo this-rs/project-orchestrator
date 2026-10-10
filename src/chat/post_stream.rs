@@ -19,17 +19,232 @@ use nexus_claude::{
     InteractiveClient,
 };
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use std::collections::VecDeque;
 
+/// Longest a single post-stream step may hold the turn.
+///
+/// Every step talks to a store (Neo4j, Meilisearch) through a client that has
+/// no timeout of its own. A call that never answered used to pin the turn:
+/// `is_streaming` stayed true (`finalize_streaming_status` leaves it true while
+/// messages are queued — the objective reminder it just queued, for one), the
+/// Stop had nothing left to cancel (the stream loop, the only reader of the
+/// cancellation token, was over), the queued messages were never sent.
+/// Measured on 2026-10-05 (session 3780028f, note 1a31aadb) and 2026-10-09
+/// (session b4c28b9f: the CLI answered at 20:03:04, the turn was still
+/// "streaming" at 22:00). Past this budget the turn goes on — see
+/// [`StepBudget`].
+pub(crate) const POST_STREAM_STEP_BUDGET: Duration = Duration::from_secs(30);
+
+/// Past this, a step or a write that did finish is logged with its duration:
+/// the budget above should stay far from what the stores actually take.
+const POST_STREAM_SLOW_STEP: Duration = Duration::from_secs(2);
+
+/// Error code of a post-stream step dropped past its budget (`reason`: the step).
+pub(crate) const STEP_ABANDONED_CODE: &str = "post_stream_step_abandoned";
+/// Error code of a store write still running past its budget (`reason`: the
+/// step). The write is not dropped: it lands when the store answers.
+pub(crate) const PERSISTENCE_DELAYED_CODE: &str = "persistence_delayed";
+
+/// Run `fut` under `budget`. Past the budget it is dropped — cancelled at
+/// whatever await it was sitting on, releasing what it held — and `None`
+/// says so; the step is named in the warning so the next hang names its
+/// store. No event: [`StepBudget::run`] adds the one the clients see.
+pub(crate) async fn bounded<F: Future>(
+    session_id: &str,
+    step: &'static str,
+    budget: Duration,
+    fut: F,
+) -> Option<F::Output> {
+    let started = Instant::now();
+    match tokio::time::timeout(budget, fut).await {
+        Ok(out) => {
+            let elapsed = started.elapsed();
+            if elapsed > POST_STREAM_SLOW_STEP {
+                info!(
+                    session_id = %session_id,
+                    step,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "post-stream step was slow"
+                );
+            }
+            Some(out)
+        }
+        Err(_) => {
+            warn!(
+                session_id = %session_id,
+                step,
+                budget_ms = budget.as_millis() as u64,
+                "post-stream step did not finish within its budget: abandoned, the turn goes on"
+            );
+            None
+        }
+    }
+}
+
+/// Run a store write in a task of its own.
+///
+/// The write outlives whatever waits for it: a wait past its budget
+/// ([`StepBudget::wait_for_write`]), a turn abandoned by the interrupt
+/// watchdog. A write is never dropped: it lands when the store answers, and
+/// the log says so when it was late, or that it failed.
+pub(crate) fn spawn_write<F>(session_id: String, step: &'static str, write: F) -> JoinHandle<()>
+where
+    F: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let outcome = write.await;
+        let elapsed = started.elapsed();
+        match outcome {
+            Err(e) => warn!(
+                session_id = %session_id,
+                step,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "store write failed: {e:#}"
+            ),
+            Ok(()) if elapsed > POST_STREAM_SLOW_STEP => info!(
+                session_id = %session_id,
+                step,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "store write landed late"
+            ),
+            Ok(()) => {}
+        }
+    })
+}
+
+/// The budget of the post-stream steps of one turn, and where an overrun is
+/// reported: the server log (always, with the step) and the clients (an
+/// `error` event whose `code` says what happened and whose `reason` names
+/// the step). Nothing is lost silently.
+pub(crate) struct StepBudget {
+    pub session_id: String,
+    pub budget: Duration,
+    pub events_tx: broadcast::Sender<ChatEvent>,
+    pub nats: Option<Arc<crate::events::NatsEmitter>>,
+}
+
+impl StepBudget {
+    /// Run a step under the budget; past it the step is dropped and reported.
+    pub async fn run<F: Future>(&self, step: &'static str, fut: F) -> Option<F::Output> {
+        self.run_for(step, self.budget, fut).await
+    }
+
+    /// [`Self::run`] with a budget of its own (a step that sleeps on purpose).
+    pub async fn run_for<F: Future>(
+        &self,
+        step: &'static str,
+        budget: Duration,
+        fut: F,
+    ) -> Option<F::Output> {
+        let out = bounded(&self.session_id, step, budget, fut).await;
+        if out.is_none() {
+            self.report(
+                step,
+                STEP_ABANDONED_CODE,
+                format!(
+                    "A wrap-up step of this turn ({step}) did not finish within {}s and was skipped.",
+                    budget.as_secs()
+                ),
+            );
+        }
+        out
+    }
+
+    /// Wait for a write started by [`spawn_write`], up to the budget. Past it
+    /// the turn goes on and the clients learn that the write is late; the
+    /// write itself keeps running.
+    pub async fn wait_for_write(&self, step: &'static str, write: JoinHandle<()>) {
+        match tokio::time::timeout(self.budget, write).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(
+                session_id = %self.session_id,
+                step,
+                "store write task ended abnormally: {e}"
+            ),
+            Err(_) => {
+                warn!(
+                    session_id = %self.session_id,
+                    step,
+                    budget_ms = self.budget.as_millis() as u64,
+                    "store write still running past its budget: the turn goes on, the write too"
+                );
+                self.report(
+                    step,
+                    PERSISTENCE_DELAYED_CODE,
+                    format!(
+                        "Saving this conversation ({step}) is taking longer than {}s. \
+                         It will be saved when the database answers; until then a reload \
+                         may not show the latest messages.",
+                        self.budget.as_secs()
+                    ),
+                );
+            }
+        }
+    }
+
+    fn report(&self, step: &'static str, code: &str, message: String) {
+        let event = ChatEvent::Error {
+            message,
+            parent_tool_use_id: None,
+            code: Some(code.to_string()),
+            reason: Some(step.to_string()),
+            index: None,
+        };
+        let _ = self.events_tx.send(event.clone());
+        if let Some(ref nats) = self.nats {
+            nats.publish_chat_event(&self.session_id, event);
+        }
+    }
+}
+
+/// Persist the events a turn collected, in a task of its own ([`spawn_write`]):
+/// started as soon as the stream loop is over, so neither a slow step before
+/// it nor an abandoned turn can lose them. `None` when there is nothing to write.
+pub(crate) fn spawn_persist_events(
+    graph: &Arc<dyn GraphStore>,
+    session_uuid: Option<Uuid>,
+    session_id: &str,
+    events_to_persist: Vec<ChatEventRecord>,
+) -> Option<JoinHandle<()>> {
+    let uuid = session_uuid?;
+    if events_to_persist.is_empty() {
+        return None;
+    }
+    let graph = graph.clone();
+    Some(spawn_write(
+        session_id.to_string(),
+        "persist_events",
+        async move { graph.store_chat_events(uuid, events_to_persist).await },
+    ))
+}
+
+/// The step budget of `session_id` (its `post_stream_budget`), or the default.
+pub(crate) async fn step_budget_of(
+    active_sessions: &Arc<RwLock<HashMap<String, ActiveSession>>>,
+    session_id: &str,
+) -> Duration {
+    active_sessions
+        .read()
+        .await
+        .get(session_id)
+        .map(|s| s.post_stream_budget)
+        .unwrap_or(POST_STREAM_STEP_BUDGET)
+}
+
 /// Resolved project context from a single Neo4j lookup, shared across
 /// all post-stream consumers (compaction, auto-continue, objective tracker, feedback).
+#[derive(Default)]
 pub(crate) struct PostStreamContext {
     pub project_slug: Option<String>,
     pub project_id: Option<Uuid>,
@@ -500,85 +715,79 @@ impl PostStreamHandler {
         has_pending
     }
 
-    // ── Event persistence ─────────────────────────────────────────────────
-
-    /// Batch-persist collected events to Neo4j.
-    pub async fn persist_events(&self, events_to_persist: Vec<ChatEventRecord>) {
-        if let Some(uuid) = self.session_uuid {
-            if !events_to_persist.is_empty() {
-                if let Err(e) = self.graph.store_chat_events(uuid, events_to_persist).await {
-                    warn!(
-                        "Failed to persist chat events for session {}: {}",
-                        self.session_id, e
-                    );
-                }
-            }
-        }
-    }
-
     // ── Memory / feedback / RFC ───────────────────────────────────────────
 
     /// Record assistant response in memory, spawn feedback extraction and RFC detection.
+    ///
+    /// Nothing here waits on a store: the memory write (`store_messages`, an
+    /// HTTP call without a timeout of its own) runs in a task of its own
+    /// ([`spawn_write`]), after the memory lock is released — it used to be
+    /// awaited under that lock, so a store that never answered held the turn
+    /// AND the next turn's `record_user_message`.
     pub async fn handle_feedback(
         &self,
         assistant_text_parts: &[String],
         memory_manager: &Option<Arc<Mutex<ConversationMemoryManager>>>,
         context_injector: &Option<Arc<ContextInjector>>,
     ) {
-        if let Some(ref mm) = memory_manager {
-            let assistant_text = assistant_text_parts.join("");
-            if !assistant_text.is_empty() {
-                let mut mm = mm.lock().await;
-                mm.record_assistant_message(&assistant_text);
+        let Some(ref mm) = memory_manager else {
+            return;
+        };
+        let assistant_text = assistant_text_parts.join("");
+        if assistant_text.is_empty() {
+            return;
+        }
+        let pending = {
+            let mut mm = mm.lock().await;
+            mm.record_assistant_message(&assistant_text);
+            context_injector
+                .as_ref()
+                .map(|injector| (injector.clone(), mm.take_pending_messages()))
+        };
 
-                if let Some(uuid) = self.session_uuid {
-                    let project_id = self.ctx.project_id;
-                    super::feedback::spawn_feedback(
-                        self.graph.clone(),
-                        uuid,
-                        project_id,
-                        assistant_text.clone(),
-                        super::feedback::SessionDiscussedCache::new(),
-                    );
+        if let Some(uuid) = self.session_uuid {
+            let project_id = self.ctx.project_id;
+            super::feedback::spawn_feedback(
+                self.graph.clone(),
+                uuid,
+                project_id,
+                assistant_text.clone(),
+                super::feedback::SessionDiscussedCache::new(),
+            );
 
-                    // Observation auto-detection (RFC + all categories)
-                    let rfc_acc = {
-                        let sessions = self.active_sessions.read().await;
-                        sessions
-                            .get(&self.session_id)
-                            .map(|s| s.rfc_accumulator.clone())
-                    };
-                    if let Some(rfc_acc) = rfc_acc {
-                        super::feedback::spawn_observation_processing(
-                            self.graph.clone(),
-                            self.search.clone(),
-                            project_id,
-                            assistant_text.clone(),
-                            rfc_acc,
-                            Some(uuid),
-                            self.event_emitter.clone(),
-                        );
-                    }
-                }
+            // Observation auto-detection (RFC + all categories)
+            let rfc_acc = {
+                let sessions = self.active_sessions.read().await;
+                sessions
+                    .get(&self.session_id)
+                    .map(|s| s.rfc_accumulator.clone())
+            };
+            if let Some(rfc_acc) = rfc_acc {
+                super::feedback::spawn_observation_processing(
+                    self.graph.clone(),
+                    self.search.clone(),
+                    project_id,
+                    assistant_text.clone(),
+                    rfc_acc,
+                    Some(uuid),
+                    self.event_emitter.clone(),
+                );
+            }
+        }
 
-                // Store pending messages via ContextInjector
-                if let Some(ref injector) = context_injector {
-                    let pending = mm.take_pending_messages();
-                    if !pending.is_empty() {
-                        if let Err(e) = injector.store_messages(&pending).await {
-                            warn!(
-                                "Failed to store messages for session {}: {}",
-                                self.session_id, e
-                            );
-                        } else {
-                            debug!(
-                                "Stored {} messages for session {}",
-                                pending.len(),
-                                self.session_id
-                            );
-                        }
-                    }
-                }
+        // Store pending messages via ContextInjector
+        if let Some((injector, pending)) = pending {
+            if !pending.is_empty() {
+                let count = pending.len();
+                let session_id = self.session_id.clone();
+                spawn_write(self.session_id.clone(), "memory_store", async move {
+                    injector
+                        .store_messages(&pending)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    debug!("Stored {} messages for session {}", count, session_id);
+                    Ok(())
+                });
             }
         }
     }
@@ -1175,6 +1384,9 @@ mod integration_tests {
                 child_pid: None,
                 nats_cancel: CancellationToken::new(),
                 interrupt_token: CancellationToken::new(),
+                turn_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                stream_task: Arc::new(std::sync::Mutex::new(None)),
+                post_stream_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
                 pending_permission_inputs: Arc::new(Mutex::new(HashMap::new())),
                 auto_continue: Arc::new(AtomicBool::new(false)),
                 auto_continue_count: Arc::new(AtomicU32::new(0)),
@@ -1570,5 +1782,130 @@ mod integration_tests {
             "Auto-continue message too short ({} chars), expected >500",
             content.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod bounded_step_tests {
+    use super::bounded;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_step_that_finishes_in_time_returns_its_value() {
+        let out = bounded("s", "quick", Duration::from_millis(200), async { 7 }).await;
+        assert_eq!(out, Some(7));
+    }
+
+    #[tokio::test]
+    async fn a_step_that_never_answers_is_dropped_past_the_budget() {
+        let started = std::time::Instant::now();
+        let out = bounded(
+            "s",
+            "stuck",
+            Duration::from_millis(30),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert_eq!(out, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the budget bounds the wait, the future does not"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_step_releases_what_it_held() {
+        // What the step holds (here a lock) is released when it is dropped:
+        // the next step, and the next turn, are not left waiting on it.
+        let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let held = lock.clone();
+        let out = bounded("s", "holding", Duration::from_millis(30), async move {
+            let _guard = held.lock().await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert_eq!(out, None);
+        assert!(lock.try_lock().is_ok(), "the lock is free again");
+    }
+
+    fn budget(
+        ms: u64,
+    ) -> (
+        super::StepBudget,
+        tokio::sync::broadcast::Receiver<super::ChatEvent>,
+    ) {
+        let (events_tx, rx) = tokio::sync::broadcast::channel(16);
+        (
+            super::StepBudget {
+                session_id: "s".into(),
+                budget: Duration::from_millis(ms),
+                events_tx,
+                nats: None,
+            },
+            rx,
+        )
+    }
+
+    fn error_codes(
+        rx: &mut tokio::sync::broadcast::Receiver<super::ChatEvent>,
+    ) -> Vec<(String, String)> {
+        let mut codes = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let super::ChatEvent::Error {
+                code: Some(code),
+                reason: Some(reason),
+                ..
+            } = event
+            {
+                codes.push((code, reason));
+            }
+        }
+        codes
+    }
+
+    #[tokio::test]
+    async fn a_step_past_its_budget_is_reported_to_the_clients() {
+        let (steps, mut rx) = budget(30);
+        assert_eq!(steps.run("quick", async { 1 }).await, Some(1));
+        assert!(error_codes(&mut rx).is_empty(), "nothing to report");
+        assert_eq!(steps.run("stuck", std::future::pending::<()>()).await, None);
+        assert_eq!(
+            error_codes(&mut rx),
+            vec![(super::STEP_ABANDONED_CODE.to_string(), "stuck".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_past_its_budget_is_reported_and_still_lands() {
+        let (steps, mut rx) = budget(30);
+        let landed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let write = super::spawn_write("s".into(), "slow_write", {
+            let landed = landed.clone();
+            let gate = gate.clone();
+            async move {
+                gate.notified().await;
+                landed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        steps.wait_for_write("slow_write", write).await;
+        assert_eq!(
+            error_codes(&mut rx),
+            vec![(
+                super::PERSISTENCE_DELAYED_CODE.to_string(),
+                "slow_write".to_string()
+            )],
+            "the turn went on and said so"
+        );
+        // The wait is over, the write is not: it lands when the store answers.
+        gate.notify_one();
+        for _ in 0..100 {
+            if landed.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the write was dropped with the wait");
     }
 }
