@@ -225,17 +225,6 @@ const FUNCTIONS: &[(&str, &str)] = &[
 /// measures fails it too (update this list and regenerate the table).
 const EXPECTED: &[(Engine, &str, Expect)] = &[
     (
-        Engine::Native,
-        "resume",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "P14",
-            why: "les transcripts natifs sont en mémoire (MemoryTranscriptStore) : après un \
-                  redémarrage du backend le jeton relu du graphe ne désigne plus rien \
-                  (« unknown transcript: nothing to resume »)",
-        },
-    ),
-    (
         Engine::ClaudeCode,
         "nats.permission_response",
         Expect::Gap {
@@ -638,7 +627,8 @@ struct Stage {
     other: NatsEmitter,
     store: DocumentStore,
     dir: tempfile::TempDir,
-    _blobs: tempfile::TempDir,
+    /// The data directory: the documents' blobs, and the native transcripts (P14).
+    data: tempfile::TempDir,
 }
 
 impl Stage {
@@ -680,7 +670,7 @@ impl Stage {
             other,
             store,
             dir,
-            _blobs: blobs,
+            data: blobs,
         }
     }
 
@@ -744,7 +734,8 @@ impl Stage {
         let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
             .with_nats(owner)
             .with_refs_v1(true)
-            .with_document_store(self.store.clone());
+            .with_document_store(self.store.clone())
+            .with_native_transcripts(self.data.path().join("native-transcripts"));
         manager.update_claude_cli_path(Some(cli.path())).await;
         let real = manager
             .provider_for("local")

@@ -22,7 +22,7 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `nats.interrupt` | un Stop d'une autre instance (NATS) arrête le tour | ok | ok |
 | `nats.permission_response` | une réponse de permission d'une autre instance (NATS) débloque l'outil | gap (harnais, P13) | ok |
 | `nats.cancel_tools` | un cancel_tools d'une autre instance (NATS) arrête l'outil, le tour continue | ok | ok |
-| `resume` | après redémarrage du backend, la session reprend sur le jeton relu du graphe | ok | gap (harnais, P14) |
+| `resume` | après redémarrage du backend, la session reprend sur le jeton relu du graphe | ok | ok |
 | `set_model` | set_model en cours de conversation atteint le provider | ok | ok |
 | `cancel_tools` | cancel_tools arrête l'outil en cours, le tour continue | ok | ok |
 | `permissions.once` | une permission accordée une fois débloque l'outil | ok | ok |
@@ -39,7 +39,7 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `cancel_task` | cancel_task arrête une tâche d'arrière-plan | ok | gap (harnais, P12) |
 | `system_init.degraded` | system_init n'annonce comme manquant qu'une limite du modèle (liste fermée) | ok | ok |
 
-`ok` : Claude Code 22/26, natif 20/26.
+`ok` : Claude Code 22/26, natif 21/26.
 
 ## Écarts déclarés
 
@@ -48,7 +48,6 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | Claude Code | `nats.permission_response` | harnais | P13 | l'écouteur RPC NATS du moteur historique écrit au CLI une control_response sans request_id ni behavior (et sous le verrou du client) : l'outil reste bloqué alors que la RPC répond success |
 | Claude Code | `permissions.session` | harnais | P11 | la réponse de permission ne porte aucune portée : le backend n'écrit au CLI qu'un allow/deny ponctuel (pas d'updatedPermissions de session) |
 | Claude Code | `permissions.always` | harnais | P11 | aucune portée persistante (updatedPermissions vers les réglages) n'est écrite au CLI |
-| natif | `resume` | harnais | P14 | les transcripts natifs sont en mémoire (MemoryTranscriptStore) : après un redémarrage du backend le jeton relu du graphe ne désigne plus rien (« unknown transcript: nothing to resume ») |
 | natif | `permissions.session` | harnais | P11 | le harnais natif sait retenir une portée session, mais le backend répond toujours allow_once : la permission est redemandée |
 | natif | `permissions.always` | harnais | P11 | le harnais natif ne déclare pas la portée always (permission_scopes = once, session) et le backend ne la transmet pas |
 | natif | `session_record` | harnais | P8 | le moteur agent ne met pas à jour le dossier de session à la fin d'un tour (message_count / total_cost_usd) |
