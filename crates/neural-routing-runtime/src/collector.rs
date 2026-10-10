@@ -7,7 +7,7 @@
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -62,6 +62,24 @@ pub enum CollectorEvent {
     },
     /// Graceful shutdown — flush all pending data.
     Shutdown,
+    /// A turn of the session starts. The session's routing decision is replayed as
+    /// that turn's record (carrying `turn_index`); its tool calls and outcome go there.
+    TurnOpen { session_id: String },
+    /// A tool was called in the session. Attached to the open turn's record, or to the
+    /// session's routing record when no turn is open. `group` is the tool-reference
+    /// group of the tool, named as in `selected_tool_groups`, if it has one.
+    ToolCall {
+        session_id: String,
+        usage: ToolUsage,
+        group: Option<String>,
+    },
+    /// The open turn closes (the chat's `Result`). Fills the turn's outcome.
+    TurnClose {
+        session_id: String,
+        success: bool,
+        cost_usd: Option<f64>,
+        latency_ms: u64,
+    },
 }
 
 /// A single decision point captured from the hot path.
@@ -103,6 +121,24 @@ pub struct DecisionRecord {
     /// Protocol state name at the time of this decision (e.g., "implement", "review").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_state: Option<String>,
+    /// Outcome of the decision, filled when its turn closes (see [`CollectorEvent::TurnClose`]).
+    /// `None` while the turn is open. Kept out of `action_params` and out of the
+    /// context embedding: a decision never sees its own outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<serde_json::Value>,
+}
+
+/// `action_type` of the routing decision whose tool calls and turn outcome are labelled.
+pub const ROUTING_SECTIONS_ACTION: &str = "routing.select_sections";
+
+/// Whether a record is the session-level routing decision (emitted when the system
+/// prompt is built), as opposed to a per-turn copy of it (which carries `turn_index`).
+fn is_session_routing(record: &DecisionRecord) -> bool {
+    record.action_type == ROUTING_SECTIONS_ACTION
+        && record
+            .action_params
+            .get("turn_index")
+            .is_none_or(serde_json::Value::is_null)
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +242,57 @@ impl TrajectoryCollector {
         &self.vector_builder
     }
 
+    /// A collector whose events are read from the returned receiver instead of being
+    /// stored: for wiring checks and tests that run without a graph database.
+    pub fn detached(capacity: usize) -> (Self, mpsc::Receiver<CollectorEvent>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let collector = Self {
+            tx,
+            enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            vector_builder: Arc::new(DecisionVectorBuilder::new()),
+            trainer: None,
+        };
+        (collector, rx)
+    }
+
+    /// Start a turn of a session (fire-and-forget).
+    pub fn open_turn(&self, session_id: String) {
+        self.send(CollectorEvent::TurnOpen { session_id });
+    }
+
+    /// Record a tool call of a session (fire-and-forget).
+    pub fn record_tool_call(&self, session_id: String, usage: ToolUsage, group: Option<String>) {
+        self.send(CollectorEvent::ToolCall {
+            session_id,
+            usage,
+            group,
+        });
+    }
+
+    /// Close the open turn of a session and fill its outcome (fire-and-forget).
+    pub fn close_turn(
+        &self,
+        session_id: String,
+        success: bool,
+        cost_usd: Option<f64>,
+        latency_ms: u64,
+    ) {
+        self.send(CollectorEvent::TurnClose {
+            session_id,
+            success,
+            cost_usd,
+            latency_ms,
+        });
+    }
+
+    fn send(&self, event: CollectorEvent) {
+        if !self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        // try_send: non-blocking, drops if the channel is full (best effort, as record_decision).
+        let _ = self.tx.try_send(event);
+    }
+
     /// Record a decision point (fire-and-forget).
     ///
     /// Returns immediately. If the channel is full, the event is dropped
@@ -301,6 +388,158 @@ struct SessionBuffer {
     started_at: chrono::DateTime<Utc>,
     /// Monotonic instant of the last decision — used for stale session detection.
     last_decision_at: Instant,
+    /// The session-level routing decision, replayed as each turn's record.
+    routing: Option<DecisionRecord>,
+    /// Turns opened so far: the next turn's index.
+    turns_opened: u32,
+    /// Index in `decisions` of the open turn's record, if a turn is open.
+    open_turn: Option<usize>,
+    /// Tool-reference groups of the tools called in the open turn.
+    turn_groups: BTreeSet<String>,
+}
+
+impl SessionBuffer {
+    fn new() -> Self {
+        Self {
+            decisions: Vec::new(),
+            started_at: Utc::now(),
+            last_decision_at: Instant::now(),
+            routing: None,
+            turns_opened: 0,
+            open_turn: None,
+            turn_groups: BTreeSet::new(),
+        }
+    }
+}
+
+fn push_decision(sessions: &mut HashMap<String, SessionBuffer>, record: DecisionRecord) {
+    let buffer = sessions
+        .entry(record.session_id.clone())
+        .or_insert_with(SessionBuffer::new);
+    buffer.last_decision_at = Instant::now();
+    if is_session_routing(&record) {
+        buffer.routing = Some(record.clone());
+    }
+    buffer.decisions.push(record);
+}
+
+/// Start a turn: the session's routing decision is replayed as this turn's record.
+fn open_turn(sessions: &mut HashMap<String, SessionBuffer>, session_id: &str) {
+    let Some(buffer) = sessions.get_mut(session_id) else {
+        return;
+    };
+    let Some(mut record) = buffer.routing.clone() else {
+        return;
+    };
+    let turn_index = buffer.turns_opened;
+    buffer.turns_opened += 1;
+    if let Some(params) = record.action_params.as_object_mut() {
+        params.insert("turn_index".to_string(), serde_json::json!(turn_index));
+    }
+    record.tool_usages = Vec::new();
+    record.outcome = None;
+    buffer.last_decision_at = Instant::now();
+    buffer.decisions.push(record);
+    buffer.open_turn = Some(buffer.decisions.len() - 1);
+    buffer.turn_groups.clear();
+}
+
+fn record_tool_call(
+    sessions: &mut HashMap<String, SessionBuffer>,
+    session_id: &str,
+    usage: ToolUsage,
+    group: Option<String>,
+) {
+    let Some(buffer) = sessions.get_mut(session_id) else {
+        return;
+    };
+    buffer.last_decision_at = Instant::now();
+    let target = match buffer.open_turn {
+        Some(index) => {
+            if let Some(group) = group {
+                buffer.turn_groups.insert(group);
+            }
+            Some(index)
+        }
+        None => buffer.decisions.iter().rposition(is_session_routing),
+    };
+    if let Some(index) = target {
+        buffer.decisions[index].tool_usages.push(usage);
+    }
+}
+
+fn close_turn(
+    sessions: &mut HashMap<String, SessionBuffer>,
+    session_id: &str,
+    success: bool,
+    cost_usd: Option<f64>,
+    latency_ms: u64,
+) {
+    let Some(buffer) = sessions.get_mut(session_id) else {
+        return;
+    };
+    let Some(index) = buffer.open_turn.take() else {
+        return;
+    };
+    let record = &buffer.decisions[index];
+    let predicted: Vec<String> = record
+        .action_params
+        .get("selected_tool_groups")
+        .and_then(serde_json::Value::as_array)
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(|g| g.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let outcome = turn_outcome(
+        &predicted,
+        &buffer.turn_groups,
+        record.tool_usages.len(),
+        success,
+        cost_usd,
+        latency_ms,
+    );
+    buffer.decisions[index].outcome = Some(outcome);
+    buffer.turn_groups.clear();
+}
+
+/// The outcome of a closed turn, against the tool groups its routing decision predicted.
+///
+/// - `hits`: predicted groups the turn actually used;
+/// - `recall`: hits / groups used (`null` when the turn used no group);
+/// - `precision`: hits / groups predicted (`null` when none was predicted).
+///
+/// The training label is `hits`: the groups that were both called and predicted.
+pub fn turn_outcome(
+    predicted: &[String],
+    called_groups: &BTreeSet<String>,
+    tools_called: usize,
+    success: bool,
+    cost_usd: Option<f64>,
+    latency_ms: u64,
+) -> serde_json::Value {
+    let predicted: BTreeSet<&str> = predicted.iter().map(String::as_str).collect();
+    let hits: Vec<&str> = called_groups
+        .iter()
+        .map(String::as_str)
+        .filter(|g| predicted.contains(g))
+        .collect();
+    let recall =
+        (!called_groups.is_empty()).then(|| hits.len() as f64 / called_groups.len() as f64);
+    let precision = (!predicted.is_empty()).then(|| hits.len() as f64 / predicted.len() as f64);
+    serde_json::json!({
+        "predicted_groups": predicted.iter().copied().collect::<Vec<_>>(),
+        "called_groups": called_groups.iter().map(String::as_str).collect::<Vec<_>>(),
+        "hits": hits,
+        "recall": recall,
+        "precision": precision,
+        "tools_called": tools_called,
+        "success": success,
+        "cost_usd": cost_usd,
+        "latency_ms": latency_ms,
+    })
 }
 
 async fn run_collector_loop(
@@ -332,17 +571,24 @@ async fn run_collector_loop(
             event = rx.recv() => {
                 let Some(event) = event else { break };
                 match event {
-                    CollectorEvent::Decision(record) => {
-                        let session = sessions
-                            .entry(record.session_id.clone())
-                            .or_insert_with(|| SessionBuffer {
-                                decisions: Vec::new(),
-                                started_at: Utc::now(),
-                                last_decision_at: Instant::now(),
-                            });
-                        session.last_decision_at = Instant::now();
-                        session.decisions.push(record);
+                    CollectorEvent::Decision(record) => push_decision(&mut sessions, record),
+
+                    CollectorEvent::TurnOpen { session_id } => {
+                        open_turn(&mut sessions, &session_id);
                     }
+
+                    CollectorEvent::ToolCall {
+                        session_id,
+                        usage,
+                        group,
+                    } => record_tool_call(&mut sessions, &session_id, usage, group),
+
+                    CollectorEvent::TurnClose {
+                        session_id,
+                        success,
+                        cost_usd,
+                        latency_ms,
+                    } => close_turn(&mut sessions, &session_id, success, cost_usd, latency_ms),
 
                     CollectorEvent::EndSession {
                         session_id,
@@ -571,6 +817,7 @@ fn build_trajectory(
             cumulative_reward: 0.0,
             delta_ms,
             order: i,
+            outcome: decision.outcome.clone(),
         });
 
         tool_usages.push(decision.tool_usages.clone());
@@ -794,6 +1041,7 @@ mod tests {
             node_features: vec![],
             protocol_run_id: None,
             protocol_state: None,
+            outcome: None,
         }
     }
 
@@ -875,6 +1123,10 @@ mod tests {
             ],
             started_at: started,
             last_decision_at: Instant::now(),
+            routing: None,
+            turns_opened: 0,
+            open_turn: None,
+            turn_groups: Default::default(),
         };
 
         let pending = build_trajectory("s1", &buffer, 0.85, &builder);
@@ -988,6 +1240,10 @@ mod tests {
             decisions: vec![],
             started_at: Utc::now(),
             last_decision_at: Instant::now(),
+            routing: None,
+            turns_opened: 0,
+            open_turn: None,
+            turn_groups: Default::default(),
         };
 
         let pending = build_trajectory("empty", &buffer, 0.0, &builder);
@@ -1049,6 +1305,7 @@ mod tests {
                 node_features: vec![],
                 protocol_run_id: None,
                 protocol_state: None,
+                outcome: None,
             },
             DecisionRecord {
                 session_id: "s2".into(),
@@ -1076,6 +1333,7 @@ mod tests {
                 node_features: vec![],
                 protocol_run_id: None,
                 protocol_state: None,
+                outcome: None,
             },
             DecisionRecord {
                 session_id: "s2".into(),
@@ -1111,6 +1369,7 @@ mod tests {
                 node_features: vec![],
                 protocol_run_id: None,
                 protocol_state: None,
+                outcome: None,
             },
         ];
 
@@ -1118,6 +1377,10 @@ mod tests {
             decisions,
             started_at: started,
             last_decision_at: Instant::now(),
+            routing: None,
+            turns_opened: 0,
+            open_turn: None,
+            turn_groups: Default::default(),
         };
 
         let pending = build_trajectory("s2", &buffer, 0.78, &builder);
@@ -1172,6 +1435,10 @@ mod tests {
             ],
             started_at: Utc::now(),
             last_decision_at: Instant::now(),
+            routing: None,
+            turns_opened: 0,
+            open_turn: None,
+            turn_groups: Default::default(),
         };
 
         let pending = build_trajectory("embed-test", &buffer, 0.9, &builder);
@@ -1223,6 +1490,10 @@ mod tests {
             decisions: vec![decision],
             started_at: Utc::now(),
             last_decision_at: Instant::now(),
+            routing: None,
+            turns_opened: 0,
+            open_turn: None,
+            turn_groups: Default::default(),
         };
 
         let pending = build_trajectory("precomp", &buffer, 1.0, &builder);
@@ -1245,6 +1516,10 @@ mod tests {
             ],
             started_at: Utc::now(),
             last_decision_at: Instant::now(),
+            routing: None,
+            turns_opened: 0,
+            open_turn: None,
+            turn_groups: Default::default(),
         };
 
         let pending = build_trajectory("hist", &buffer, 0.8, &builder);
@@ -1274,6 +1549,10 @@ mod tests {
             ],
             started_at: Utc::now(),
             last_decision_at: Instant::now(),
+            routing: None,
+            turns_opened: 0,
+            open_turn: None,
+            turn_groups: Default::default(),
         };
 
         let pending = build_trajectory("reward-test", &buffer, 0.9, &builder);
@@ -1378,6 +1657,10 @@ mod tests {
             ],
             started_at: Utc::now() - chrono::Duration::seconds(120),
             last_decision_at: Instant::now(),
+            routing: None,
+            turns_opened: 0,
+            open_turn: None,
+            turn_groups: Default::default(),
         };
 
         // Session 2: 2 decisions with mixed confidence
@@ -1389,6 +1672,10 @@ mod tests {
             decisions: vec![d1, d2],
             started_at: Utc::now() - chrono::Duration::seconds(30),
             last_decision_at: Instant::now(),
+            routing: None,
+            turns_opened: 0,
+            open_turn: None,
+            turn_groups: Default::default(),
         };
 
         // Compute rewards
@@ -1451,6 +1738,10 @@ mod tests {
             decisions: vec![],
             started_at: Utc::now(),
             last_decision_at: Instant::now(),
+            routing: None,
+            turns_opened: 0,
+            open_turn: None,
+            turn_groups: Default::default(),
         };
         let reward = compute_auto_reward(&buf, &computer, &SessionHints::default());
         assert_eq!(reward, 0.0, "Empty session should have 0 reward");
@@ -1468,6 +1759,10 @@ mod tests {
             ],
             started_at: Utc::now() - chrono::Duration::seconds(300),
             last_decision_at: Instant::now(),
+            routing: None,
+            turns_opened: 0,
+            open_turn: None,
+            turn_groups: Default::default(),
         };
 
         // All failure
@@ -1481,6 +1776,10 @@ mod tests {
             decisions: vec![d_fail, d_fail2],
             started_at: Utc::now() - chrono::Duration::seconds(300),
             last_decision_at: Instant::now(),
+            routing: None,
+            turns_opened: 0,
+            open_turn: None,
+            turn_groups: Default::default(),
         };
 
         let reward_ok = compute_auto_reward(&buf_ok, &computer, &SessionHints::default());
@@ -1605,6 +1904,10 @@ mod tests {
             ],
             started_at: Utc::now() - chrono::Duration::seconds(300),
             last_decision_at: Instant::now(),
+            routing: None,
+            turns_opened: 0,
+            open_turn: None,
+            turn_groups: Default::default(),
         };
 
         // With no task hints (neutral 0.5 for task component)
@@ -1699,6 +2002,7 @@ mod tests {
             node_features: vec![],
             protocol_run_id: Some(run_id),
             protocol_state: Some("review".to_string()),
+            outcome: None,
         };
         assert_eq!(record.protocol_run_id, Some(run_id));
         assert_eq!(record.protocol_state, Some("review".to_string()));
@@ -1725,6 +2029,7 @@ mod tests {
             node_features: vec![],
             protocol_run_id: None,
             protocol_state: None,
+            outcome: None,
         };
         let d2 = DecisionRecord {
             protocol_run_id: Some(run_id),
@@ -1755,6 +2060,7 @@ mod tests {
             node_features: vec![],
             protocol_run_id: None,
             protocol_state: None,
+            outcome: None,
         };
         let decisions = [d1];
         let extracted: Option<uuid::Uuid> = decisions.iter().find_map(|d| d.protocol_run_id);
@@ -1780,6 +2086,10 @@ mod tests {
             decisions: vec![make_decision("stale-test", "code.search", 0)],
             started_at: Utc::now(),
             last_decision_at: Instant::now(),
+            routing: None,
+            turns_opened: 0,
+            open_turn: None,
+            turn_groups: Default::default(),
         };
         pending_flush.push(build_trajectory("stale-test", &buffer, 0.5, &builder));
 
@@ -1826,6 +2136,10 @@ mod tests {
                 ],
                 started_at: Utc::now(),
                 last_decision_at: Instant::now(),
+                routing: None,
+                turns_opened: 0,
+                open_turn: None,
+                turn_groups: Default::default(),
             };
             let reward = 0.5 + (i as f64) * 0.1;
             pending_flush.push(build_trajectory(&session_id, &buffer, reward, &builder));
@@ -1848,5 +2162,235 @@ mod tests {
             session_ids,
             vec!["stale-session-0", "stale-session-1", "stale-session-2"]
         );
+    }
+}
+
+#[cfg(test)]
+mod turn_tests {
+    use super::*;
+    use crate::routing_labels::routing_label_rows;
+
+    fn routing_record(session: &str, groups: &[&str]) -> DecisionRecord {
+        DecisionRecord {
+            session_id: session.to_string(),
+            context_embedding: vec![],
+            action_type: ROUTING_SECTIONS_ACTION.to_string(),
+            action_params: serde_json::json!({
+                "selected_sections": ["core"],
+                "selected_tool_groups": groups,
+                "detected_intent": "code",
+                "scaffolding_level": 1,
+                "section_weights": [["core", 1.0]],
+            }),
+            alternatives_count: 1,
+            chosen_index: 0,
+            confidence: 0.5,
+            tool_usages: vec![],
+            touched_entities: vec![],
+            timestamp_ms: 0,
+            query_embedding: vec![],
+            node_features: vec![],
+            protocol_run_id: None,
+            protocol_state: None,
+            outcome: None,
+        }
+    }
+
+    fn tool(name: &str, action: &str) -> ToolUsage {
+        ToolUsage {
+            tool_name: name.to_string(),
+            action: action.to_string(),
+            params_hash: "h".to_string(),
+            duration_ms: None,
+            success: true,
+        }
+    }
+
+    fn last_turn(buffer: &SessionBuffer) -> &DecisionRecord {
+        buffer
+            .decisions
+            .iter()
+            .rev()
+            .find(|d| d.action_params.get("turn_index").is_some())
+            .expect("a turn record")
+    }
+
+    #[test]
+    fn outcome_is_null_until_the_turn_closes_then_filled() {
+        let mut sessions = HashMap::new();
+        push_decision(&mut sessions, routing_record("s1", &["Core", "Knowledge"]));
+        open_turn(&mut sessions, "s1");
+        record_tool_call(
+            &mut sessions,
+            "s1",
+            tool("note", "get_context"),
+            Some("Knowledge".to_string()),
+        );
+        assert!(last_turn(&sessions["s1"]).outcome.is_none());
+
+        close_turn(&mut sessions, "s1", true, Some(0.02), 1200);
+        let outcome = last_turn(&sessions["s1"])
+            .outcome
+            .clone()
+            .expect("filled at close");
+        assert_eq!(outcome["hits"], serde_json::json!(["Knowledge"]));
+        assert_eq!(outcome["recall"], serde_json::json!(1.0));
+        assert_eq!(outcome["precision"], serde_json::json!(0.5));
+        assert_eq!(outcome["tools_called"], serde_json::json!(1));
+        assert_eq!(outcome["success"], serde_json::json!(true));
+        assert_eq!(outcome["cost_usd"], serde_json::json!(0.02));
+        assert_eq!(outcome["latency_ms"], serde_json::json!(1200));
+    }
+
+    #[test]
+    fn tool_calls_join_the_turn_record_of_their_own_session() {
+        let mut sessions = HashMap::new();
+        push_decision(&mut sessions, routing_record("s1", &["Core"]));
+        push_decision(&mut sessions, routing_record("s2", &["Core"]));
+        open_turn(&mut sessions, "s1");
+        open_turn(&mut sessions, "s2");
+
+        record_tool_call(
+            &mut sessions,
+            "s1",
+            tool("project", "get"),
+            Some("Core".into()),
+        );
+        record_tool_call(&mut sessions, "s1", tool("Grep", "default"), None);
+
+        assert_eq!(last_turn(&sessions["s1"]).tool_usages.len(), 2);
+        assert!(last_turn(&sessions["s2"]).tool_usages.is_empty());
+        // The session-level decisions carry no usage: the calls belong to the turn.
+        assert!(sessions["s1"]
+            .decisions
+            .iter()
+            .filter(|d| d.action_params.get("turn_index").is_none())
+            .all(|d| d.tool_usages.is_empty()));
+    }
+
+    #[test]
+    fn a_call_outside_any_turn_joins_the_session_routing_decision() {
+        let mut sessions = HashMap::new();
+        push_decision(&mut sessions, routing_record("s1", &["Core"]));
+        record_tool_call(&mut sessions, "s1", tool("code", "search"), None);
+        let session_record = sessions["s1"]
+            .decisions
+            .iter()
+            .find(|d| d.action_params.get("turn_index").is_none())
+            .unwrap();
+        assert_eq!(session_record.tool_usages.len(), 1);
+    }
+
+    #[test]
+    fn the_outcome_never_reaches_the_context_embedding() {
+        let vb = DecisionVectorBuilder::new();
+        let mut closed = HashMap::new();
+        push_decision(&mut closed, routing_record("s1", &["Core"]));
+        open_turn(&mut closed, "s1");
+        record_tool_call(
+            &mut closed,
+            "s1",
+            tool("project", "get"),
+            Some("Core".into()),
+        );
+        close_turn(&mut closed, "s1", true, None, 10);
+
+        let mut open = HashMap::new();
+        push_decision(&mut open, routing_record("s1", &["Core"]));
+        open_turn(&mut open, "s1");
+        record_tool_call(&mut open, "s1", tool("project", "get"), Some("Core".into()));
+
+        let a = build_trajectory("s1", &closed["s1"], 0.0, &vb);
+        let b = build_trajectory("s1", &open["s1"], 0.0, &vb);
+        let node_a = a.trajectory.nodes.last().unwrap();
+        let node_b = b.trajectory.nodes.last().unwrap();
+        assert!(node_a.outcome.is_some());
+        assert!(node_b.outcome.is_none());
+        assert_eq!(node_a.context_embedding, node_b.context_embedding);
+    }
+
+    /// Three scripted turns, no network: predicted {Core, Knowledge} each time.
+    #[test]
+    fn three_scripted_turns_export_three_labelled_rows() {
+        let vb = DecisionVectorBuilder::new();
+        let predicted = ["Core", "Knowledge"];
+        let mut sessions = HashMap::new();
+        push_decision(&mut sessions, routing_record("chat", &predicted));
+
+        // Turn 0: uses Knowledge only.
+        open_turn(&mut sessions, "chat");
+        record_tool_call(
+            &mut sessions,
+            "chat",
+            tool("note", "get_context"),
+            Some("Knowledge".into()),
+        );
+        close_turn(&mut sessions, "chat", true, Some(0.01), 900);
+
+        // Turn 1: uses CodeExploration, which was not predicted.
+        open_turn(&mut sessions, "chat");
+        record_tool_call(
+            &mut sessions,
+            "chat",
+            tool("code", "search"),
+            Some("CodeExploration".into()),
+        );
+        close_turn(&mut sessions, "chat", false, Some(0.03), 2500);
+
+        // Turn 2: uses Core and Knowledge.
+        open_turn(&mut sessions, "chat");
+        record_tool_call(
+            &mut sessions,
+            "chat",
+            tool("project", "get"),
+            Some("Core".into()),
+        );
+        record_tool_call(
+            &mut sessions,
+            "chat",
+            tool("note", "search"),
+            Some("Knowledge".into()),
+        );
+        close_turn(&mut sessions, "chat", true, Some(0.02), 1500);
+
+        // A fourth turn that never closes: it must not be exported.
+        open_turn(&mut sessions, "chat");
+        record_tool_call(
+            &mut sessions,
+            "chat",
+            tool("note", "search"),
+            Some("Knowledge".into()),
+        );
+
+        let trajectory = build_trajectory("chat", &sessions["chat"], 0.0, &vb).trajectory;
+        let rows = routing_label_rows(&[trajectory]);
+        assert_eq!(rows.len(), 3, "one row per closed turn");
+
+        assert_eq!(rows[0].turn_index, 0);
+        assert_eq!(rows[0].label, vec!["Knowledge".to_string()]);
+        assert_eq!(rows[0].outcome["recall"], serde_json::json!(1.0));
+        assert_eq!(rows[0].outcome["precision"], serde_json::json!(0.5));
+
+        assert_eq!(rows[1].turn_index, 1);
+        assert!(rows[1].label.is_empty());
+        assert_eq!(rows[1].outcome["success"], serde_json::json!(false));
+        assert_eq!(rows[1].outcome["cost_usd"], serde_json::json!(0.03));
+
+        assert_eq!(rows[2].turn_index, 2);
+        assert_eq!(
+            rows[2].label,
+            vec!["Core".to_string(), "Knowledge".to_string()]
+        );
+        assert_eq!(rows[2].outcome["precision"], serde_json::json!(1.0));
+
+        for row in &rows {
+            assert_eq!(row.decision, ROUTING_SECTIONS_ACTION);
+            assert_eq!(row.session_id, "chat");
+            assert_eq!(row.context["detected_intent"], serde_json::json!("code"));
+            assert_eq!(
+                row.context["section_weights"],
+                serde_json::json!([["core", 1.0]])
+            );
+        }
     }
 }

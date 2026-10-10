@@ -28,6 +28,56 @@ const THROTTLE_TTL_SECS: u64 = 60;
 /// Minimum result lines to consider a Grep result "noisy" enough for redirect.
 const MIN_NOISY_LINES: usize = 20;
 
+/// Where the tool calls of a chat session are recorded: the trajectory collector,
+/// under the chat session's id, so they join that session's routing decision.
+#[derive(Clone)]
+pub(crate) struct ToolTrace {
+    collector: Arc<neural_routing_runtime::TrajectoryCollector>,
+    session_id: String,
+}
+
+impl ToolTrace {
+    pub(crate) fn new(
+        collector: Arc<neural_routing_runtime::TrajectoryCollector>,
+        session_id: String,
+    ) -> Self {
+        Self {
+            collector,
+            session_id,
+        }
+    }
+
+    /// Record one tool call. The tool is named by its bare name (`code`, not
+    /// `mcp__project-orchestrator__code`), its group is the tool-reference group it
+    /// belongs to, if any.
+    fn record(&self, tool_name: &str, tool_input: &serde_json::Value) {
+        let bare = tool_name.rsplit("__").next().unwrap_or(tool_name);
+        let action = tool_input
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("default")
+            .to_string();
+        let mut keys: Vec<&str> = tool_input
+            .as_object()
+            .map(|m| m.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        keys.sort_unstable();
+        let usage = neural_routing_runtime::ToolUsage {
+            tool_name: bare.to_string(),
+            action,
+            params_hash: format!("{:?}", keys),
+            duration_ms: None,
+            // PostToolUse fires for calls that succeeded; failed calls come through
+            // PostToolUseFailure, which this hook is not registered for.
+            success: true,
+        };
+        let group =
+            super::prompt_sections::ToolRefGroupId::of_tool(bare).map(|g| format!("{:?}", g));
+        self.collector
+            .record_tool_call(self.session_id.clone(), usage, group);
+    }
+}
+
 /// PostToolUse hook that suggests MCP alternatives after noisy Grep results
 /// and alerts about co-changers after Edit/Write on bridge files.
 pub(crate) struct PostToolUseRedirectHook {
@@ -36,6 +86,8 @@ pub(crate) struct PostToolUseRedirectHook {
     throttle: Mutex<HashMap<String, Instant>>,
     /// The resolved project of the session (mode `on`); `None`: historical resolution.
     session_project: Option<Arc<super::anchor_resolver::SessionProject>>,
+    /// Records every tool call of the session, before any other check of the hook.
+    tool_trace: Option<ToolTrace>,
 }
 
 impl PostToolUseRedirectHook {
@@ -44,7 +96,14 @@ impl PostToolUseRedirectHook {
             graph_store,
             throttle: Mutex::new(HashMap::new()),
             session_project: None,
+            tool_trace: None,
         }
+    }
+
+    /// Record the session's tool calls into the trajectory collector.
+    pub(crate) fn with_tool_trace(mut self, trace: Option<ToolTrace>) -> Self {
+        self.tool_trace = trace;
+        self
     }
 
     /// Work for the project the session resolved instead of the tool cwd's.
@@ -175,6 +234,10 @@ impl nexus_claude::HookCallback for PostToolUseRedirectHook {
             nexus_claude::HookInput::PostToolUse(post) => post,
             _ => return Ok(Self::passthrough()),
         };
+
+        if let Some(trace) = &self.tool_trace {
+            trace.record(&post_tool.tool_name, &post_tool.tool_input);
+        }
 
         // Throttle check using tool_name + file context as key
         let throttle_key = format!(
@@ -329,6 +392,69 @@ mod tests {
         assert!(!hook.is_throttled("test_key"));
         assert!(hook.is_throttled("test_key")); // second call within TTL → throttled
         assert!(!hook.is_throttled("other_key")); // different key → not throttled
+    }
+
+    fn post_tool_input(tool_name: &str, tool_input: serde_json::Value) -> nexus_claude::HookInput {
+        nexus_claude::HookInput::PostToolUse(nexus_claude::PostToolUseHookInput {
+            session_id: "cli-session".to_string(),
+            transcript_path: "/tmp/t".to_string(),
+            cwd: "/tmp".to_string(),
+            permission_mode: None,
+            tool_name: tool_name.to_string(),
+            tool_input,
+            tool_response: serde_json::json!("ok"),
+            agent_id: None,
+            agent_type: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_is_recorded_under_the_chat_session_with_its_group() {
+        let (collector, mut events) = neural_routing_runtime::TrajectoryCollector::detached(8);
+        let chat_session = "5c1f0f3e-8a51-4c4e-9f0b-2d7f7a1e0a11".to_string();
+        let trace = ToolTrace::new(Arc::new(collector), chat_session.clone());
+        let hook = PostToolUseRedirectHook::new(Arc::new(MockGraphStore::new()))
+            .with_tool_trace(Some(trace));
+
+        let input = post_tool_input(
+            "mcp__project-orchestrator__note",
+            serde_json::json!({"action": "get_context", "note_id": "n"}),
+        );
+        hook.execute(&input, None, &test_context()).await.unwrap();
+
+        match events.try_recv() {
+            Ok(neural_routing_runtime::CollectorEvent::ToolCall {
+                session_id,
+                usage,
+                group,
+            }) => {
+                assert_eq!(session_id, chat_session, "joined to the chat session");
+                assert_eq!(usage.tool_name, "note", "bare tool name");
+                assert_eq!(usage.action, "get_context");
+                assert_eq!(group.as_deref(), Some("Knowledge"));
+            }
+            other => panic!("expected a ToolCall event, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tool_outside_every_group_is_recorded_without_one() {
+        let (collector, mut events) = neural_routing_runtime::TrajectoryCollector::detached(8);
+        let trace = ToolTrace::new(Arc::new(collector), "s".to_string());
+        let hook = PostToolUseRedirectHook::new(Arc::new(MockGraphStore::new()))
+            .with_tool_trace(Some(trace));
+
+        let input = post_tool_input("Grep", serde_json::json!({"pattern": "x"}));
+        hook.execute(&input, None, &test_context()).await.unwrap();
+
+        match events.try_recv() {
+            Ok(neural_routing_runtime::CollectorEvent::ToolCall { usage, group, .. }) => {
+                assert_eq!(usage.tool_name, "Grep");
+                assert_eq!(usage.action, "default");
+                assert!(group.is_none());
+            }
+            other => panic!("expected a ToolCall event, got {:?}", other.is_ok()),
+        }
     }
 
     #[test]

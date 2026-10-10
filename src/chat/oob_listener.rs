@@ -629,6 +629,8 @@ async fn maybe_trigger_stream(
             enrichment_pipeline,
             search,
             documents,
+            // Out-of-band output is not a user turn: it opens no tracked turn.
+            None,
         )
         .await;
     });

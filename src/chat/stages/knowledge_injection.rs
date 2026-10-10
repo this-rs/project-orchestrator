@@ -1212,6 +1212,7 @@ impl ParallelEnrichmentStage for KnowledgeInjectionStage {
                 node_features: vec![],
                 protocol_run_id: input.protocol_run_id,
                 protocol_state: input.protocol_state.clone(),
+                outcome: None,
             });
         }
 
