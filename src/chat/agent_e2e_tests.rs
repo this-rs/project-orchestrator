@@ -6819,3 +6819,204 @@ mod native_transcripts {
         assert!(!after.delete_session(uuid).await.unwrap(), "already gone");
     }
 }
+
+/// A message sent during a turn of the legacy Claude Code engine interrupts it, then
+/// runs. The CLI ends the interrupted turn with its own `result`, which may come
+/// LATE: after the queued turn has already subscribed to the CLI's output. That
+/// stale `result` must not end the queued turn (it used to: the queued turn ended at
+/// once, its real answer arrived with no turn to read it, and every later turn was
+/// one `result` behind — the parity matrix saw it under CI load).
+mod legacy_interrupt_stale_result {
+    use super::*;
+
+    fn emit(v: Value) -> Value {
+        json!({"op": "emit_json", "json": v})
+    }
+
+    fn text(t: &str, id: &str) -> Value {
+        emit(json!({"type": "assistant", "message": {
+            "id": id, "type": "message", "role": "assistant",
+            "model": "fake-claude", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": t}]}}))
+    }
+
+    fn result(subtype: &str, t: &str, is_error: bool) -> Value {
+        emit(json!({"type": "result", "subtype": subtype,
+            "duration_ms": 1, "duration_api_ms": 1, "is_error": is_error, "num_turns": 1,
+            "session_id": "fake-cli-session", "total_cost_usd": 0.0, "result": t}))
+    }
+
+    fn await_in(needle: &str) -> Value {
+        json!({"op": "await_stdin", "contains": needle, "timeout_ms": 15000, "optional": true})
+    }
+
+    /// The first turn stalls until it is interrupted; the CLI answers the interrupt
+    /// with its `result` only after `late_ms`; then the queued message is answered,
+    /// then a third one.
+    fn transcript(late_ms: u64) -> Vec<Value> {
+        vec![
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            emit(json!({"type": "system", "subtype": "init",
+                "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                "permissionMode": "default", "apiKeySource": "none"})),
+            text("working on it", "msg_1"),
+            await_in("\"interrupt\""),
+            json!({"op": "sleep", "ms": late_ms}),
+            result("error_during_execution", "", true),
+            await_in("SECOND-MESSAGE"),
+            text("answered second", "msg_2"),
+            result("success", "answered second", false),
+            await_in("THIRD-MESSAGE"),
+            text("answered third", "msg_3"),
+            result("success", "answered third", false),
+            json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}),
+        ]
+    }
+
+    struct Cli {
+        dir: tempfile::TempDir,
+        graph: Arc<MockGraphStore>,
+        manager: ChatManager,
+    }
+
+    impl Cli {
+        async fn start(late_ms: u64) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("transcript.jsonl");
+            let lines: String = transcript(late_ms)
+                .iter()
+                .map(|l| format!("{l}\n"))
+                .collect();
+            std::fs::write(&script, lines).unwrap();
+            let wrapper = dir.path().join("claude");
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nFAKE_CLAUDE_TRANSCRIPT='{}' FAKE_CLAUDE_STDIN_OUT='{}' \
+                     FAKE_CLAUDE_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                    script.display(),
+                    dir.path().join("stdin.jsonl").display(),
+                    fake_bin("fake_claude").display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let graph = Arc::new(MockGraphStore::new());
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Legacy,
+                mcp_server_path: fake_bin("fake_mcp"),
+                nexus_tools_path: None,
+                nexus_browser_path: None,
+                jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+                max_sessions: 10,
+                ..Default::default()
+            };
+            let manager =
+                ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config);
+            manager
+                .update_claude_cli_path(Some(wrapper.display().to_string()))
+                .await;
+            Self {
+                dir,
+                graph,
+                manager,
+            }
+        }
+
+        fn stdin(&self) -> String {
+            std::fs::read_to_string(self.dir.path().join("stdin.jsonl")).unwrap_or_default()
+        }
+
+        async fn read_by_cli(&self, needle: &str) {
+            for _ in 0..400 {
+                if self.stdin().contains(needle) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("the CLI never read {needle:?}: {}", self.stdin());
+        }
+
+        /// Whether `text` was stored as an answer of the assistant within `secs`.
+        async fn answered(&self, sid: &str, text: &str, secs: u64) -> bool {
+            let id = Uuid::parse_str(sid).unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+            while tokio::time::Instant::now() < deadline {
+                let events = self.graph.get_chat_events(id, 0, 500).await.unwrap();
+                if events
+                    .iter()
+                    .any(|e| e.event_type == "assistant_text" && e.data.contains(text))
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            false
+        }
+    }
+
+    async fn queued_message_after(late_ms: u64) {
+        let cli = Cli::start(late_ms).await;
+        let mut req = request(None, None, "default");
+        req.message = "FIRST-MESSAGE".into();
+        req.cwd = cli.dir.path().display().to_string();
+        let sid = cli
+            .manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(!cli.manager.agent_runtime.owns(&sid).await, "legacy engine");
+        cli.read_by_cli("FIRST-MESSAGE").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            cli.manager.is_session_streaming(&sid).await,
+            "the first turn runs"
+        );
+
+        // Sent while the first turn runs: queued, the turn is interrupted.
+        cli.manager
+            .send_message(&sid, "SECOND-MESSAGE")
+            .await
+            .unwrap();
+        cli.read_by_cli("SECOND-MESSAGE").await;
+        assert!(
+            cli.answered(&sid, "answered second", 10).await,
+            "the queued turn read its own answer (CLI result {late_ms} ms after the interrupt): {:?}\nstdin: {}",
+            cli.graph.get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 500).await.unwrap().iter().map(|e| (e.event_type.clone(), e.data.chars().take(90).collect::<String>())).collect::<Vec<_>>(),
+            cli.stdin()
+        );
+
+        // And the turns stay in step.
+        for _ in 0..200 {
+            if !cli.manager.is_session_streaming(&sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        cli.manager
+            .send_message(&sid, "THIRD-MESSAGE")
+            .await
+            .unwrap();
+        assert!(
+            cli.answered(&sid, "answered third", 10).await,
+            "the next turn reads its own answer"
+        );
+        cli.manager.close_session(&sid).await.unwrap();
+    }
+
+    /// The CLI answers the interrupt at once: the queued message runs.
+    #[tokio::test]
+    async fn a_queued_message_runs_after_the_interrupt() {
+        queued_message_after(0).await;
+    }
+
+    /// The CLI answers the interrupt late (a loaded machine): its stale `result`
+    /// does not end the queued turn.
+    #[tokio::test]
+    async fn a_late_result_of_the_interrupted_turn_does_not_end_the_queued_turn() {
+        queued_message_after(1500).await;
+    }
+}
