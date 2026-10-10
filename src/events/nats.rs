@@ -629,6 +629,7 @@ mod tests {
                 parent_tool_use_id: None,
                 category: None,
                 canonical: None,
+                tool_use_id: None,
             },
             ChatEvent::Result {
                 session_id: "sess-1".into(),

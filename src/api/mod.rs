@@ -4,6 +4,8 @@ pub mod attention;
 pub mod attention_aggregate;
 pub mod auth_handlers;
 pub mod chat_handlers;
+#[cfg(test)]
+mod chat_times_tests;
 pub mod code_handlers;
 pub mod document_handlers;
 pub mod environment_handlers;
