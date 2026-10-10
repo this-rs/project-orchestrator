@@ -32,11 +32,18 @@
 //! ## Per-turn routing (`before_turn`)
 //!
 //! In routing mode `full` with the learning stage `auto`, the model of a turn is chosen
-//! by the cognitive router, among the models of the session's OWN provider (a session
-//! keeps its provider). [`TurnRouter`] holds what that needs for one session and
-//! [`directive_for_turn`] is the one decision function: the agent engine reaches it
-//! through [`GraphSessionHooks::before_turn`], the legacy engine (Claude Code CLI) calls
-//! it from `ChatManager::send_message` and sends the `set_model` control frame itself.
+//! by the cognitive router. [`TurnRouter`] holds what that needs for one session and
+//! [`directive_for_turn`] is the one function that changes the model of a turn, among the
+//! models of the session's OWN provider (one session = one provider): the agent engine
+//! reaches it through [`GraphSessionHooks::before_turn`], the legacy engine (Claude Code
+//! CLI) calls it from `ChatManager::send_message` and sends the `set_model` control frame
+//! itself.
+//!
+//! In mode `full`, the decision may name ANOTHER provider. That is decided before the turn
+//! starts, by [`plan_provider_move`], which the host's send path calls on both engines
+//! (`ChatManager::send_message`): a move opens a new session through the relay
+//! (`moved_by: auto`) and the message is sent there, never to the old session. The hook
+//! then uses the decision already taken for its turn instead of asking again.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,9 +64,11 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::provider::cognitive::candidates::ModelFacts;
-use super::provider::cognitive::decision::{DecideRequest, Decider, Pick};
+use super::provider::cognitive::decider::HYSTERESIS_MARGIN;
+use super::provider::cognitive::decision::{CognitiveDecision, DecideRequest, Decider, Pick};
 use super::provider::cognitive::signature::{ContextHints, TaskSignature};
 use super::provider::cognitive::{LearningStage, ProviderRoutingMode, RoutingSettings};
+use super::types::RoutingPoolEntry;
 
 /// The table the Claude path hands to its CLI: event name → matchers.
 pub(crate) type HookTable = HashMap<String, Vec<HookMatcher>>;
@@ -294,19 +303,38 @@ impl SessionHooks for GraphSessionHooks {
 /// How long the decider may take before the turn goes on without it.
 pub(crate) const DECIDE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The models a provider instance offers, with their facts (the candidates of a
-/// per-turn decision are restricted to the session's provider).
+/// The models the per-turn decision chooses among.
 #[async_trait]
 pub trait PoolSource: Send + Sync {
-    /// Facts of the models of `provider_id` only.
+    /// Facts of the models of `provider_id` only (the candidates of a turn that stays on
+    /// its session's provider).
     async fn pool(&self, provider_id: &str) -> Vec<ModelFacts>;
+
+    /// Facts of every model of every instance, with the consent of `project_slug` stated
+    /// on each (`allowed_for_project`): the candidates of a turn in mode `full`, which may
+    /// move the conversation to another provider. Empty when the source knows no more than
+    /// one provider at a time: no move is then considered.
+    async fn project_pool(&self, _project_slug: Option<&str>) -> Vec<ModelFacts> {
+        Vec::new()
+    }
 }
 
 struct TurnState {
     current_model: String,
     last_change_turn: Option<u32>,
-    /// Turn counter of the legacy engine, which has no harness to count turns.
+    /// Index of the next turn: counted here for the legacy engine, which has no harness
+    /// to count turns, and copied from the harness on the agent engine.
     next_turn: u32,
+}
+
+/// A decision taken BEFORE its turn started (the provider check of mode `full`): the turn
+/// it was taken for uses it instead of asking again.
+#[derive(Debug, Clone)]
+struct PreDecided {
+    turn_index: u32,
+    pick: Option<Pick>,
+    /// The pick may be applied (stage `auto`, not right after a change).
+    apply: bool,
 }
 
 /// What the per-turn decision of ONE session needs.
@@ -324,6 +352,10 @@ pub(crate) struct TurnRouter {
     set_model_live: AtomicBool,
     /// The user changed the model by hand: no more automatic change.
     manual: AtomicBool,
+    /// The conversation reached this session by a provider move: the next provider check
+    /// is recorded, never applied (no two moves in a row).
+    moved_in: AtomicBool,
+    predecided: Mutex<Option<PreDecided>>,
     last_message: Mutex<Option<String>>,
     state: Mutex<TurnState>,
     timeout: Duration,
@@ -335,8 +367,14 @@ struct RouterChoice {
     routing: RoutingSettings,
     /// The model is imposed (named by the request, or one model ticked): never replaced.
     explicit_model: bool,
+    /// The provider is imposed (named by the request, `routed_by: request`): the
+    /// conversation is never moved off it automatically.
+    provider_imposed: bool,
     /// Models of this provider the conversation may be routed among (a pool); `None` = all.
     allowed_models: Option<Vec<String>>,
+    /// Every pair of the conversation's pool, whatever its provider: the candidates of a
+    /// provider check in mode `full`. `None` = no pool.
+    routing_pool: Option<Vec<RoutingPoolEntry>>,
 }
 
 /// What opens a [`TurnRouter`].
@@ -349,10 +387,14 @@ pub(crate) struct TurnRouterSpec {
     pub project_slug: Option<String>,
     pub trust: bool,
     pub explicit_model: bool,
+    pub provider_imposed: bool,
     pub allowed_models: Option<Vec<String>>,
+    pub routing_pool: Option<Vec<RoutingPoolEntry>>,
     pub current_model: String,
     /// Index the next turn counted by the router itself gets (legacy engine).
     pub next_turn: u32,
+    /// The session continues a conversation the router moved here (`moved_by: auto`).
+    pub moved_in: bool,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -363,13 +405,21 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 impl TurnRouter {
     pub(crate) fn new(spec: TurnRouterSpec) -> Self {
+        // The relayed turn (index 0) runs on the pair the move chose: nothing to ask.
+        let predecided = spec.moved_in.then_some(PreDecided {
+            turn_index: 0,
+            pick: None,
+            apply: false,
+        });
         Self {
             decider: spec.decider,
             pool: spec.pool,
             choice: Mutex::new(RouterChoice {
                 routing: spec.routing,
                 explicit_model: spec.explicit_model,
+                provider_imposed: spec.provider_imposed,
                 allowed_models: spec.allowed_models,
+                routing_pool: spec.routing_pool,
             }),
             provider_id: spec.provider_id,
             session_id: spec.session_id,
@@ -377,6 +427,8 @@ impl TurnRouter {
             trust: spec.trust,
             set_model_live: AtomicBool::new(false),
             manual: AtomicBool::new(false),
+            moved_in: AtomicBool::new(spec.moved_in),
+            predecided: Mutex::new(predecided),
             last_message: Mutex::new(None),
             state: Mutex::new(TurnState {
                 current_model: spec.current_model,
@@ -406,7 +458,9 @@ impl TurnRouter {
     /// The conversation's routing changed (`PUT .../routing`): from the next turn on, `mode`
     /// replaces the one the session opened with, `allowed_models` (this provider's models of
     /// the pool) restricts the candidates, `explicit_model` pins the current model. Whatever
-    /// was set by hand before is forgotten: this IS the new choice by hand.
+    /// was set by hand before is forgotten: this IS the new choice by hand, and a provider
+    /// imposed at the opening is released (`auto` lets PO choose the provider again; the
+    /// other choices never move the conversation).
     pub(crate) fn reroute(
         &self,
         mode: ProviderRoutingMode,
@@ -417,6 +471,8 @@ impl TurnRouter {
         choice.routing.mode = mode;
         choice.allowed_models = allowed_models;
         choice.explicit_model = explicit_model;
+        choice.provider_imposed = false;
+        choice.routing_pool = None;
         self.manual.store(false, Ordering::SeqCst);
     }
 
@@ -440,19 +496,182 @@ impl TurnRouter {
         state.current_model = model_before.to_owned();
         state.last_change_turn = None;
     }
+
+    /// The signature of the turn about to start, from the text it carries.
+    fn signature(&self) -> TaskSignature {
+        let message = locked(&self.last_message).clone().unwrap_or_default();
+        TaskSignature::from_chat_request(
+            &message,
+            false,
+            self.project_slug.as_deref(),
+            ContextHints::default(),
+        )
+    }
+
+    /// Asks the decider within the router's timeout; `None` (logged) when it fails or is slow.
+    async fn ask(&self, request: DecideRequest) -> Option<CognitiveDecision> {
+        match tokio::time::timeout(self.timeout, self.decider.decide(&request)).await {
+            Ok(Ok(decision)) => Some(decision),
+            Ok(Err(error)) => {
+                warn!(provider = %self.provider_id, error = %error, "turn routing failed: the model stays");
+                None
+            }
+            Err(_) => {
+                warn!(provider = %self.provider_id, "turn routing timed out: the model stays");
+                None
+            }
+        }
+    }
+}
+
+/// The settings a decision is asked with: `stage` drops from `auto` to `shadow` when the
+/// pick may not be applied, so the decision is recorded as what it is.
+fn settings_for(routing: &RoutingSettings, apply: bool) -> RoutingSettings {
+    let mut settings = routing.clone();
+    if !apply && settings.stage == LearningStage::Auto {
+        settings.stage = LearningStage::Shadow;
+    }
+    settings
+}
+
+/// What the turn about to start does about its provider.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ProviderPlan {
+    /// The turn runs on the session's provider (its model is still routed by
+    /// [`directive_for_turn`]).
+    Stay,
+    /// The decision names another provider: the conversation moves there before the turn
+    /// starts, and the turn runs on the new session. `decision` is the stored decision.
+    Move {
+        pick: Pick,
+        decision: Box<CognitiveDecision>,
+    },
+}
+
+/// Whether the turn about to start moves the conversation to ANOTHER provider (mode
+/// `full`). Called before the turn starts, by the host's send path: a session runs on one
+/// provider, so a move is never a [`TurnDirective`].
+///
+/// * not `full` (`mixed` stays on the session's provider), a model or a provider imposed
+///   (`routed_by: request`, pinned), a model changed by hand, a source that knows one
+///   provider only: nothing is asked, [`ProviderPlan::Stay`];
+/// * otherwise the decider chooses among every model the project consented to (the
+///   conversation's pool when it has one), the current pair in force. The decision is kept
+///   for the turn (the hook does not ask again) and recorded applied or not;
+/// * a move needs the stage `auto`, no move or model change on the previous turn, a pick
+///   that is not an exploration draw and that beats the current pair by the hysteresis
+///   margin. Anything else stays.
+pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
+    let choice = locked(&router.choice).clone();
+    if choice.routing.mode != ProviderRoutingMode::Full
+        || choice.explicit_model
+        || choice.provider_imposed
+        || router.manual.load(Ordering::SeqCst)
+    {
+        return ProviderPlan::Stay;
+    }
+    let mut pool = match tokio::time::timeout(
+        router.timeout,
+        router.pool.project_pool(router.project_slug.as_deref()),
+    )
+    .await
+    {
+        Ok(pool) => pool,
+        Err(_) => return ProviderPlan::Stay,
+    };
+    if let Some(entries) = &choice.routing_pool {
+        pool.retain(|facts| {
+            entries
+                .iter()
+                .any(|e| e.provider == facts.provider_id && e.model == facts.model)
+        });
+    }
+    if !pool
+        .iter()
+        .any(|facts| facts.provider_id != router.provider_id)
+    {
+        return ProviderPlan::Stay;
+    }
+    let (turn, current_model, just_changed) = {
+        let state = locked(&router.state);
+        let just_changed = state
+            .last_change_turn
+            .is_some_and(|t| t.checked_add(1) == Some(state.next_turn));
+        (state.next_turn, state.current_model.clone(), just_changed)
+    };
+    // No two moves in a row: the turn right after a move (or a model change) is only recorded.
+    let just_moved = router.moved_in.swap(false, Ordering::SeqCst);
+    let apply = choice.routing.stage == LearningStage::Auto && !just_moved && !just_changed;
+    let current = Pick::new(&router.provider_id, &current_model);
+    let mut request = DecideRequest::new(
+        router.signature(),
+        settings_for(&choice.routing, apply),
+        pool,
+    );
+    request.trust = router.trust;
+    request.current = Some(current.clone());
+    request.session_id = router.session_id;
+    request.turn_index = Some(turn);
+    let Some(decision) = router.ask(request).await else {
+        return ProviderPlan::Stay;
+    };
+    let apply = apply && decision.applied;
+    *locked(&router.predecided) = Some(PreDecided {
+        turn_index: turn,
+        pick: decision.chosen.clone(),
+        apply,
+    });
+    let pick = match &decision.chosen {
+        Some(pick) if apply && pick.provider_id != router.provider_id => pick.clone(),
+        _ => return ProviderPlan::Stay,
+    };
+    if decision.explored {
+        debug!(provider = %pick.provider_id, "an exploration draw never moves a conversation");
+        return ProviderPlan::Stay;
+    }
+    let score_of = |wanted: &Pick| {
+        decision
+            .alternatives
+            .iter()
+            .find(|a| a.pick == *wanted && a.rejected.is_none())
+            .and_then(|a| a.score)
+    };
+    if let (Some(best), Some(now)) = (
+        decision.score.or_else(|| score_of(&pick)),
+        score_of(&current),
+    ) {
+        if best - now < HYSTERESIS_MARGIN {
+            debug!(provider = %pick.provider_id, gap = best - now, "the gap is under the hysteresis margin: the provider stays");
+            return ProviderPlan::Stay;
+        }
+    }
+    ProviderPlan::Move {
+        pick,
+        decision: Box::new(decision),
+    }
 }
 
 /// The model of the turn about to start, `none` when it stays as it is.
 ///
 /// * not `full` mode, a model named by the request, a model changed by hand, a session
 ///   that cannot switch model live: nothing is asked and nothing changes;
+/// * a decision already taken for this turn by [`plan_provider_move`] is used as is (a
+///   pick on another provider changes nothing here: the move was the host's to make);
 /// * `full` mode before the `auto` stage (and the turn right after a change): the decider
 ///   is still asked, so the decision is recorded, but nothing is applied;
 /// * `full` + `auto`: the pick is used when the decision is applied and differs from the
 ///   current model. A failing or slow decider (2 s) never fails the turn.
 pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -> TurnDirective {
-    // The harness knows the model the turn would run on, whoever changed it.
-    locked(&router.state).current_model = ctx.current_model.clone();
+    {
+        // The harness knows the model the turn would run on, whoever changed it, and the
+        // index of the turn.
+        let mut state = locked(&router.state);
+        state.current_model = ctx.current_model.clone();
+        state.next_turn = ctx.turn_index.saturating_add(1);
+    }
+    let predecided = locked(&router.predecided)
+        .take()
+        .filter(|pre| pre.turn_index == ctx.turn_index);
     let choice = locked(&router.choice).clone();
     // `full` routes everything; a pool (mixed, models ticked in the menu) routes among them.
     let routed =
@@ -466,60 +685,44 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
     {
         return TurnDirective::none();
     }
-    // Never two changes in consecutive turns: the turn right after one is only recorded.
-    let just_changed = locked(&router.state)
-        .last_change_turn
-        .is_some_and(|turn| turn.checked_add(1) == Some(ctx.turn_index));
-    let apply = choice.routing.stage == LearningStage::Auto && !just_changed;
-    let mut settings = choice.routing.clone();
-    // A pool is routed like `full` inside it, whatever the settings' mode.
-    if choice.allowed_models.is_some() {
-        settings.mode = ProviderRoutingMode::Full;
-    }
-    if !apply {
-        settings.stage = match settings.stage {
-            LearningStage::Auto => LearningStage::Shadow,
-            other => other,
-        };
-    }
-    let message = locked(&router.last_message).clone().unwrap_or_default();
-    let signature = TaskSignature::from_chat_request(
-        &message,
-        false,
-        router.project_slug.as_deref(),
-        ContextHints::default(),
-    );
-    let decision = tokio::time::timeout(router.timeout, async {
-        let mut pool = router.pool.pool(&router.provider_id).await;
-        if let Some(allowed) = &choice.allowed_models {
-            pool.retain(|facts| allowed.iter().any(|m| m == &facts.model));
-        }
-        let mut request = DecideRequest::new(signature, settings, pool);
-        request.trust = router.trust;
-        request.restrict_provider = Some(router.provider_id.clone());
-        request.current = Some(Pick::new(&router.provider_id, &ctx.current_model));
-        request.session_id = router.session_id;
-        request.turn_index = Some(ctx.turn_index);
-        router.decider.decide(&request).await
-    })
-    .await;
-    let decision = match decision {
-        Ok(Ok(decision)) => decision,
-        Ok(Err(error)) => {
-            warn!(provider = %router.provider_id, error = %error, "turn routing failed: the model stays");
-            return TurnDirective::none();
-        }
-        Err(_) => {
-            warn!(provider = %router.provider_id, "turn routing timed out: the model stays");
-            return TurnDirective::none();
+    let pick = match predecided {
+        Some(pre) => pre.pick.filter(|_| pre.apply),
+        None => {
+            // Never two changes in consecutive turns: the turn right after one is only recorded.
+            let just_changed = locked(&router.state)
+                .last_change_turn
+                .is_some_and(|turn| turn.checked_add(1) == Some(ctx.turn_index));
+            let apply = choice.routing.stage == LearningStage::Auto && !just_changed;
+            let mut settings = settings_for(&choice.routing, apply);
+            // A pool is routed like `full` inside it, whatever the settings' mode.
+            if choice.allowed_models.is_some() {
+                settings.mode = ProviderRoutingMode::Full;
+            }
+            let mut pool = router.pool.pool(&router.provider_id).await;
+            if let Some(allowed) = &choice.allowed_models {
+                pool.retain(|facts| allowed.iter().any(|m| m == &facts.model));
+            }
+            let mut request = DecideRequest::new(router.signature(), settings, pool);
+            request.trust = router.trust;
+            request.restrict_provider = Some(router.provider_id.clone());
+            request.current = Some(Pick::new(&router.provider_id, &ctx.current_model));
+            request.session_id = router.session_id;
+            request.turn_index = Some(ctx.turn_index);
+            let Some(decision) = router.ask(request).await else {
+                return TurnDirective::none();
+            };
+            if !apply || !decision.applied {
+                return TurnDirective::none();
+            }
+            if let Some(pick) = &decision.chosen {
+                debug!(model = %pick.model, turn = ctx.turn_index, reason = %decision.reason, "turn routing decided");
+            }
+            decision.chosen
         }
     };
-    if !apply || !decision.applied {
-        return TurnDirective::none();
-    }
-    match decision.chosen {
+    match pick {
         Some(pick) if pick.provider_id == router.provider_id && pick.model != ctx.current_model => {
-            debug!(model = %pick.model, turn = ctx.turn_index, reason = %decision.reason, "turn routing changes the model");
+            debug!(model = %pick.model, turn = ctx.turn_index, "turn routing changes the model");
             let mut state = locked(&router.state);
             state.current_model = pick.model.clone();
             state.last_change_turn = Some(ctx.turn_index);
@@ -873,5 +1076,359 @@ mod tests {
             panic!("a PreCompact input is expected");
         };
         assert_eq!(pre.trigger, "auto");
+    }
+}
+
+/// The provider check of mode `full` ([`plan_provider_move`]) and how the hook of the same
+/// turn uses it, on a fake decider and a fake pool.
+#[cfg(test)]
+mod provider_move_tests {
+    use super::*;
+    use crate::chat::provider::cognitive::decision::DecisionAlternative;
+    use chrono::Utc;
+    use nexus_claude::agent::CostBasis;
+    use std::sync::Mutex as StdMutex;
+
+    fn facts(provider: &str, model: &str, allowed: bool) -> ModelFacts {
+        ModelFacts {
+            provider_id: provider.into(),
+            model: model.into(),
+            supports_tools: true,
+            supports_images: true,
+            context_window: Some(200_000),
+            price: None,
+            cost_basis: CostBasis::Unknown,
+            healthy: Some(true),
+            allowed_for_project: allowed,
+            sandboxed: false,
+        }
+    }
+
+    /// `local/m` (the session's), `local2/m`, `local3/m` (no consent).
+    struct ThreeProviders;
+
+    #[async_trait]
+    impl PoolSource for ThreeProviders {
+        async fn pool(&self, provider_id: &str) -> Vec<ModelFacts> {
+            self.project_pool(None)
+                .await
+                .into_iter()
+                .filter(|f| f.provider_id == provider_id)
+                .collect()
+        }
+        async fn project_pool(&self, _project_slug: Option<&str>) -> Vec<ModelFacts> {
+            vec![
+                facts("local", "m", true),
+                facts("local2", "m", true),
+                facts("local3", "m", false),
+            ]
+        }
+    }
+
+    /// Knows one provider at a time (the default `project_pool`).
+    struct OneProvider;
+
+    #[async_trait]
+    impl PoolSource for OneProvider {
+        async fn pool(&self, provider_id: &str) -> Vec<ModelFacts> {
+            vec![facts(provider_id, "m", true)]
+        }
+    }
+
+    /// Picks `pick` with `score`, the current pair scored `current_score`; applied in
+    /// `full` + `auto` like the real decider (pilot role).
+    struct Fake {
+        pick: Pick,
+        score: f64,
+        current_score: f64,
+        explored: bool,
+        requests: StdMutex<Vec<DecideRequest>>,
+    }
+
+    impl Fake {
+        fn picking(provider: &str, score: f64, current_score: f64) -> Arc<Self> {
+            Arc::new(Self {
+                pick: Pick::new(provider, "m"),
+                score,
+                current_score,
+                explored: false,
+                requests: StdMutex::new(Vec::new()),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+        fn last(&self) -> DecideRequest {
+            self.requests.lock().unwrap().last().cloned().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl Decider for Fake {
+        async fn decide(&self, request: &DecideRequest) -> anyhow::Result<CognitiveDecision> {
+            self.requests.lock().unwrap().push(request.clone());
+            let mut alternatives = vec![DecisionAlternative {
+                pick: self.pick.clone(),
+                score: Some(self.score),
+                rejected: None,
+            }];
+            if let Some(current) = request.current.clone().filter(|c| *c != self.pick) {
+                alternatives.push(DecisionAlternative {
+                    pick: current,
+                    score: Some(self.current_score),
+                    rejected: None,
+                });
+            }
+            Ok(CognitiveDecision {
+                id: Uuid::new_v4(),
+                at: Utc::now(),
+                signature: request.signature.clone(),
+                chosen: Some(self.pick.clone()),
+                score: Some(self.score),
+                explored: self.explored,
+                reason: "fake".into(),
+                alternatives,
+                applied: request.settings.mode == ProviderRoutingMode::Full
+                    && request.settings.stage == LearningStage::Auto,
+                mode: request.settings.mode,
+                stage: request.settings.stage,
+                session_id: request.session_id,
+                task_id: None,
+                run_id: None,
+                turn_index: request.turn_index,
+                outcome: None,
+                used: None,
+            })
+        }
+    }
+
+    fn spec(
+        decider: Arc<Fake>,
+        pool: Arc<dyn PoolSource>,
+        mode: ProviderRoutingMode,
+        stage: LearningStage,
+    ) -> TurnRouterSpec {
+        TurnRouterSpec {
+            decider,
+            pool,
+            routing: RoutingSettings {
+                mode,
+                stage,
+                ..RoutingSettings::default()
+            },
+            provider_id: "local".into(),
+            session_id: Some(Uuid::new_v4()),
+            project_slug: Some("proj".into()),
+            trust: false,
+            explicit_model: false,
+            provider_imposed: false,
+            allowed_models: None,
+            routing_pool: None,
+            current_model: "m".into(),
+            next_turn: 1,
+            moved_in: false,
+        }
+    }
+
+    fn router(spec: TurnRouterSpec) -> TurnRouter {
+        let router = TurnRouter::new(spec);
+        router.set_model_live(true);
+        router.set_last_message("why does this crash with a stack trace error");
+        router
+    }
+
+    fn full_auto(decider: Arc<Fake>) -> TurnRouter {
+        router(spec(
+            decider,
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Full,
+            LearningStage::Auto,
+        ))
+    }
+
+    fn is_move_to(plan: &ProviderPlan, provider: &str) -> bool {
+        matches!(plan, ProviderPlan::Move { pick, .. } if pick.provider_id == provider)
+    }
+
+    #[tokio::test]
+    async fn full_auto_a_pick_on_another_provider_is_a_move_decided_once_for_the_turn() {
+        let decider = Fake::picking("local2", 0.9, 0.5);
+        let router = full_auto(decider.clone());
+        let plan = plan_provider_move(&router).await;
+        assert!(is_move_to(&plan, "local2"), "{plan:?}");
+        let request = decider.last();
+        assert_eq!(
+            request.restrict_provider, None,
+            "every provider is a candidate"
+        );
+        assert_eq!(
+            request.pool.len(),
+            3,
+            "the project's instances, consent stated"
+        );
+        assert_eq!(request.current, Some(Pick::new("local", "m")));
+        assert_eq!(request.turn_index, Some(1));
+        // The hook of that turn (were it to start here) uses the same decision.
+        let directive = directive_for_turn(&router, &TurnContext::new(1, "m")).await;
+        assert_eq!(directive.model, None, "a move is never a model directive");
+        assert_eq!(decider.calls(), 1, "one decision per turn");
+    }
+
+    #[tokio::test]
+    async fn mixed_never_leaves_the_sessions_provider() {
+        let decider = Fake::picking("local2", 0.9, 0.1);
+        let mut s = spec(
+            decider.clone(),
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Mixed,
+            LearningStage::Auto,
+        );
+        s.allowed_models = Some(vec!["m".into()]);
+        let router = router(s);
+        assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
+        assert_eq!(decider.calls(), 0, "mixed asks no provider question");
+        // The model decision of the turn stays restricted to the session's provider.
+        directive_for_turn(&router, &TurnContext::new(1, "m")).await;
+        assert_eq!(decider.last().restrict_provider.as_deref(), Some("local"));
+        assert!(decider.last().pool.iter().all(|f| f.provider_id == "local"));
+    }
+
+    #[tokio::test]
+    async fn an_imposed_model_or_provider_is_never_moved_until_auto_is_chosen_again() {
+        let decider = Fake::picking("local2", 0.9, 0.1);
+        let mut pinned = spec(
+            decider.clone(),
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Full,
+            LearningStage::Auto,
+        );
+        pinned.explicit_model = true;
+        assert_eq!(
+            plan_provider_move(&router(pinned)).await,
+            ProviderPlan::Stay
+        );
+        let mut named = spec(
+            decider.clone(),
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Full,
+            LearningStage::Auto,
+        );
+        named.provider_imposed = true;
+        let named = router(named);
+        assert_eq!(plan_provider_move(&named).await, ProviderPlan::Stay);
+        assert_eq!(
+            decider.calls(),
+            0,
+            "an imposed pair is not even asked about"
+        );
+        // `PUT .../routing {auto: true}`: PO chooses the provider again.
+        named.reroute(ProviderRoutingMode::Full, None, false);
+        assert!(is_move_to(&plan_provider_move(&named).await, "local2"));
+    }
+
+    #[tokio::test]
+    async fn the_shadow_stage_records_the_provider_decision_and_moves_nothing() {
+        let decider = Fake::picking("local2", 0.9, 0.1);
+        let router = router(spec(
+            decider.clone(),
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Full,
+            LearningStage::Shadow,
+        ));
+        assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
+        assert_eq!(decider.calls(), 1, "asked, so recorded");
+        assert_eq!(decider.last().settings.stage, LearningStage::Shadow);
+        assert_eq!(decider.last().restrict_provider, None);
+        directive_for_turn(&router, &TurnContext::new(1, "m")).await;
+        assert_eq!(decider.calls(), 1, "the hook does not ask again");
+    }
+
+    #[tokio::test]
+    async fn a_gap_under_the_hysteresis_margin_or_an_exploration_draw_never_moves() {
+        let close = Fake::picking("local2", 0.65, 0.6);
+        assert_eq!(
+            plan_provider_move(&full_auto(close)).await,
+            ProviderPlan::Stay
+        );
+        let clear = Fake::picking("local2", 0.75, 0.6);
+        assert!(is_move_to(
+            &plan_provider_move(&full_auto(clear)).await,
+            "local2"
+        ));
+        let explored = Arc::new(Fake {
+            explored: true,
+            ..Arc::try_unwrap(Fake::picking("local2", 0.9, 0.1))
+                .ok()
+                .unwrap()
+        });
+        assert_eq!(
+            plan_provider_move(&full_auto(explored)).await,
+            ProviderPlan::Stay
+        );
+    }
+
+    #[tokio::test]
+    async fn the_turn_after_a_move_is_only_recorded_then_the_router_may_move_again() {
+        let decider = Fake::picking("local2", 0.9, 0.1);
+        let mut s = spec(
+            decider.clone(),
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Full,
+            LearningStage::Auto,
+        );
+        s.moved_in = true;
+        let router = router(s);
+        // The relayed turn (0) runs on the pair the move chose: nothing is asked.
+        directive_for_turn(&router, &TurnContext::new(0, "m")).await;
+        assert_eq!(decider.calls(), 0);
+        // The next turn: recorded, never applied (no two moves in a row).
+        assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
+        assert_eq!(decider.last().settings.stage, LearningStage::Shadow);
+        directive_for_turn(&router, &TurnContext::new(1, "m")).await;
+        // The one after may move.
+        assert!(is_move_to(&plan_provider_move(&router).await, "local2"));
+    }
+
+    #[tokio::test]
+    async fn the_conversations_pool_bounds_the_providers_checked() {
+        let decider = Fake::picking("local2", 0.9, 0.1);
+        let mut s = spec(
+            decider.clone(),
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Full,
+            LearningStage::Auto,
+        );
+        s.routing_pool = Some(vec![
+            RoutingPoolEntry {
+                provider: "local".into(),
+                model: "m".into(),
+            },
+            RoutingPoolEntry {
+                provider: "local2".into(),
+                model: "m".into(),
+            },
+        ]);
+        let router = router(s);
+        assert!(is_move_to(&plan_provider_move(&router).await, "local2"));
+        let providers: Vec<_> = decider
+            .last()
+            .pool
+            .iter()
+            .map(|f| f.provider_id.clone())
+            .collect();
+        assert_eq!(providers, ["local", "local2"]);
+    }
+
+    #[tokio::test]
+    async fn a_source_that_knows_one_provider_asks_no_provider_question() {
+        let decider = Fake::picking("local2", 0.9, 0.1);
+        let router = router(spec(
+            decider.clone(),
+            Arc::new(OneProvider),
+            ProviderRoutingMode::Full,
+            LearningStage::Auto,
+        ));
+        assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
+        assert_eq!(decider.calls(), 0);
     }
 }

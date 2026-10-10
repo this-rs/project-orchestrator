@@ -128,7 +128,9 @@ pub struct DecideRequest {
     pub pool: Vec<ModelFacts>,
     /// Whether the slot is automatic. An explicit slot is never decided.
     pub slot: Slot,
-    /// Whether the session would run in trust mode.
+    /// Whether the session would run in trust mode. Informative: it filters no candidate
+    /// (decision ebd2b7e7 refuses `Trust` only on a remote machine without `allow_trust`,
+    /// and a remote machine is never a candidate).
     pub trust: bool,
     /// Restrict the candidates to one instance (a live session keeps its provider).
     pub restrict_provider: Option<String>,

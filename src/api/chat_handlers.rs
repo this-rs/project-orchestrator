@@ -4774,7 +4774,23 @@ fn switch_error(error: anyhow::Error, session_id: &str) -> AppError {
         Some(SwitchProviderError::NotFound) => {
             AppError::NotFound(format!("Session {session_id} not found"))
         }
-        Some(refusal) => AppError::BadRequest(refusal.to_string()),
+        Some(refusal) => match refusal.code() {
+            Some(code) => {
+                AppError::Provider(Box::new(crate::chat::provider::errors::OpenFailure {
+                    status: 400,
+                    code,
+                    message: refusal.to_string(),
+                    provider_id: match refusal {
+                        SwitchProviderError::SameProvider(id) => Some(id.clone()),
+                        _ => None,
+                    },
+                    action: None,
+                    retryable: false,
+                    retry_after_ms: None,
+                }))
+            }
+            None => AppError::BadRequest(refusal.to_string()),
+        },
         None => {
             AppError::from_open_error(error, Some(crate::chat::provider::resolver::CLAUDE_CODE))
         }
@@ -4796,19 +4812,48 @@ mod switch_provider_tests {
     }
 
     #[test]
-    fn the_switchs_own_refusals_are_400_with_their_reason() {
-        for refusal in [
-            SwitchProviderError::InvalidSession,
-            SwitchProviderError::EmptyMessage,
-            SwitchProviderError::SameProvider("local".into()),
-        ] {
-            let text = refusal.to_string();
-            let err = switch_error(anyhow::Error::new(refusal), "abc");
-            assert!(
-                matches!(&err, AppError::BadRequest(m) if *m == text),
-                "{err:?}"
-            );
+    fn an_invalid_session_id_is_a_400_with_its_reason() {
+        let refusal = SwitchProviderError::InvalidSession;
+        let text = refusal.to_string();
+        let err = switch_error(anyhow::Error::new(refusal), "abc");
+        assert!(
+            matches!(&err, AppError::BadRequest(m) if *m == text),
+            "{err:?}"
+        );
+    }
+
+    /// The body of a coded refusal, as the client reads it.
+    fn coded(refusal: SwitchProviderError) -> serde_json::Value {
+        match switch_error(anyhow::Error::new(refusal), "abc") {
+            AppError::Provider(failure) => {
+                assert_eq!(failure.status, 400);
+                failure.to_json()
+            }
+            other => panic!("a typed refusal is expected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_empty_message_is_a_400_coded_empty_message_with_its_wording_kept() {
+        let body = coded(SwitchProviderError::EmptyMessage);
+        assert_eq!(body["code"], "empty_message");
+        assert_eq!(
+            body["error"],
+            "a message is needed to continue the conversation on the new provider"
+        );
+        assert_eq!(body["retryable"], false);
+    }
+
+    #[test]
+    fn the_same_provider_is_a_400_coded_same_provider_with_its_wording_kept() {
+        let body = coded(SwitchProviderError::SameProvider("local".into()));
+        assert_eq!(body["code"], "same_provider");
+        assert_eq!(
+            body["error"],
+            "the session is already on 'local': change its model instead"
+        );
+        assert_eq!(body["provider_id"], "local");
+        assert_eq!(body["retryable"], false);
     }
 
     #[test]

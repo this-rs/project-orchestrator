@@ -1,6 +1,6 @@
 %% name: po-chat-provider
 %% covers: backend:src/chat/provider/{catalog,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,nexus_tools,policy,resolver,settings,store}.rs
-%% verified: 29a6f4d0
+%% verified: 11f7d2d3
 %% ---
 %% PROUVE : le RÉSOLVEUR backend de provider (décisions A1, A16, A18, A29, A43) : quel
 %%   provider/modèle pour une demande, comment une erreur d'ouverture devient un statut HTTP
@@ -15,6 +15,7 @@
 %%   src/chat/provider/settings.rs — InstanceDraft, InstanceRecord, ConsentRecord, RoleAssignments, ModelAlias, ModelPolicy, parse_credential_ref ; src/api/provider_handlers.rs
 %%   src/chat/provider/{catalog,store,native_factory}.rs — StoreCatalog, resolve_input, lectures LlmSetting, build_native_provider
 %%   src/chat/provider/errors.rs   — OpenFailure, open_failure, resolve_failure, classify_open_error (ProviderError et ResolveError)
+%%   src/api/chat_handlers.rs — switch_error (refus de switch-provider) ; src/chat/types.rs — SwitchProviderError::code
 %%   src/chat/provider/event_map.rs — EventMapper, out_of_band_to_chat_events ; listing.rs — ProviderListing, assemble
 %%   src/chat/provider/credentials.rs — VaultCredentialResolver ; src/vault/service.rs — read_for_provider
 %%   src/chat/provider/nexus_tools.rs — attach, sign_profile, SessionToolsToken, check_call, ToolAccessHooks, ToolAccessError, resolve_search_key ;
@@ -51,7 +52,7 @@ flowchart TD
         PILOT["✅ rôle pilot : aucune bascule, à aucun niveau<br/>test : pilot_never_falls_back_at_any_level"]
         EXEC["✅ rôle executor : un niveau non explicite malsain ou interdit passe au suivant,<br/>routed_by = fallback ; jamais vers une instance interdite<br/>test : executor_falls_back_to_the_next_level_and_records_it,<br/>executor_fallback_skips_a_not_allowed_instance"]
         BUILTIN["✅ rien de configuré : claude-code s'il existe, est sain et autorisé<br/>(routed_by = claude_code), sinon no_provider<br/>test : builtin_claude_code_when_nothing_is_configured"]
-        AUTO["✅ RoutedBy::Auto (serde « auto ») et ProviderChoice.reason : Option&lt;String&gt; (additif, absent du fil sauf s'il est posé) : le niveau que le routeur cognitif (R2, po-cognitive-routing) produira ;<br/>PRODUIT par ChatManager::resolve_provider_choice quand un décideur cognitif est branché ET que le mode et le stage l'appliquent (mixed : exécutants ; full : tous ; advisory : exécutants ; shadow/primary : jamais) : le couple choisi remplit input.project_rule, puis routed_by = auto, route_rule = auto:&lt;classe&gt;, reason = la phrase du décideur ; une décision non appliquée ne pose que choice.shadow ; requête/tâche/persona/run explicites jamais substitués ; sans décideur, reason = None partout et le résolveur est inchangé (po-cognitive-routing) ;<br/>ChatRequest.routing_pool (modèles cochés) : seuls candidats de la décision d'ouverture ; rien de nommé ni appliqué parmi eux = input.request = le premier coché (routed_by request), jamais un niveau inférieur hors des coches ; un pool couvrant plusieurs providers choisit le provider À L'OUVERTURE, ensuite la session reste sur lui (switch-provider pour en changer)<br/>test : the_models_ticked_are_the_only_candidates_when_a_conversation_opens, a_pool_is_routed_at_open_even_when_the_settings_say_primary<br/>test (en plus) : mixed_routes_an_executor_by_auto_and_leaves_the_pilot_on_the_primary, primary_changes_nothing_at_any_stage_for_anyone, a_choice_the_caller_named_is_never_substituted<br/>test : routed_by_auto_round_trips_and_a_choice_carries_an_optional_reason, the_provider_additions_contract_lists_every_routed_by_level_and_the_routing_fields"]
+        AUTO["✅ RoutedBy::Auto (serde « auto ») et ProviderChoice.reason : Option&lt;String&gt; (additif, absent du fil sauf s'il est posé) : le niveau que le routeur cognitif (R2, po-cognitive-routing) produira ;<br/>PRODUIT par ChatManager::resolve_provider_choice quand un décideur cognitif est branché ET que le mode et le stage l'appliquent (mixed : exécutants ; full : tous ; advisory : exécutants ; shadow/primary : jamais) : le couple choisi remplit input.project_rule, puis routed_by = auto, route_rule = auto:&lt;classe&gt;, reason = la phrase du décideur ; une décision non appliquée ne pose que choice.shadow ; requête/tâche/persona/run explicites jamais substitués ; sans décideur, reason = None partout et le résolveur est inchangé (po-cognitive-routing) ;<br/>ChatRequest.routing_pool (modèles cochés) : seuls candidats de la décision d'ouverture ; rien de nommé ni appliqué parmi eux = input.request = le premier coché (routed_by request), jamais un niveau inférieur hors des coches ; un pool couvrant plusieurs providers choisit le provider À L'OUVERTURE, ensuite la session reste sur lui (switch-provider pour en changer ; en mode full + stage auto, le routeur peut l'y déplacer AVANT un tour par le même relais, moved_by auto, et la nouvelle session est routed_by auto : po-cognitive-routing, nœud CROSS)<br/>test : the_models_ticked_are_the_only_candidates_when_a_conversation_opens, a_pool_is_routed_at_open_even_when_the_settings_say_primary<br/>test (en plus) : mixed_routes_an_executor_by_auto_and_leaves_the_pilot_on_the_primary, primary_changes_nothing_at_any_stage_for_anyone, a_choice_the_caller_named_is_never_substituted<br/>test : routed_by_auto_round_trips_and_a_choice_carries_an_optional_reason, the_provider_additions_contract_lists_every_routed_by_level_and_the_routing_fields"]
         SESSION -- oui --> FROZEN
         SESSION -- non --> LEVELS
         LEVELS --> EXPLICIT
@@ -78,10 +79,12 @@ flowchart TD
     subgraph errors["errors.rs — erreurs d'ouverture typées"]
         OPEN["✅ open_failure(ProviderError) → OpenFailure {status, code, message, provider_id, action,<br/>retryable, retry_after_ms}<br/>cli_not_found 424, auth_required 424 (+ commande de login), credentials_locked 423,<br/>unauthorized 502 (jamais 401), endpoint_unreachable 502, model_no_tools 422,<br/>context_too_small 422, rate_limited 429, overloaded 503, timeout 504,<br/>process_exited 502, protocol 502, unsupported 422, turn_in_progress 409,<br/>invalid_request 400, closed 410 ; variante inconnue → 502 provider_error<br/>aucun détail interne dans le message<br/>test : un par code (17 tests)"]
         RFAIL["✅ resolve_failure(ResolveError) → provider_conflict 409, provider_unknown 404,<br/>endpoint_not_allowed 403, provider_unavailable 503, no_provider 409<br/>test : un par code (5 tests)"]
+        SWFAIL["✅ switch-provider (api/chat_handlers.rs switch_error) : ses propres refus portent un code dans la MÊME forme OpenFailure — empty_message 400, same_provider 400 (provider_id = celui de la session), retryable false, texte de error inchangé ; id invalide 400 sans code ; session inconnue 404 ; tout autre refus = celui de l'ouverture de la nouvelle session, tel quel (consentement → endpoint_not_allowed 403)<br/>test : an_empty_message_is_a_400_coded_empty_message_with_its_wording_kept, the_same_provider_is_a_400_coded_same_provider_with_its_wording_kept, an_invalid_session_id_is_a_400_with_its_reason, a_failure_of_opening_the_new_session_keeps_its_typed_status"]
     end
     NEXUS -.-> OPEN
     FROZEN -.-> RFAIL
     EXPLICIT -.-> RFAIL
+    OPEN -.-> SWFAIL
 
     subgraph policy["policy.rs — modes neutres EN PLUS des chaînes héritées"]
         PARSE["✅ parse_mode : default, acceptEdits, plan, bypassPermissions, auto, dontAsk, manual<br/>+ ask, auto_edits, plan_only, trust ; inconnu → None<br/>test : the_eleven_values_parse_and_round_trip"]

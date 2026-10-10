@@ -207,8 +207,11 @@
         "provider_unknown": 404,
         "endpoint_not_allowed": 403,
         "provider_unavailable": 503,
-        "no_provider": 409
+        "no_provider": 409,
+        "empty_message": 400,
+        "same_provider": 400
       },
+      "switch_provider_refusals": "POST /api/chat/sessions/{id}/switch-provider : empty_message (message vide) et same_provider (deja sur ce provider ; provider_id = celui de la session), 400, retryable:false, texte de error inchange ; 400 sans code pour un id de session invalide, 404 session inconnue ; tout autre refus est celui de l ouverture de la nouvelle session (consentement : endpoint_not_allowed 403, etc.)",
       "forbidden_403_prefixed": {
         "doc": "403 dont le corps est {\"error\": \"<code>: <message>\"} (pas de champ code séparé) — livrés",
         "codes": [

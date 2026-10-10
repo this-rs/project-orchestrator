@@ -148,7 +148,7 @@ pub fn decide_with(
         })
         .cloned()
         .collect();
-    let Some(filtered) = candidates::apply(request.slot, signature, &pool, request.trust) else {
+    let Some(filtered) = candidates::apply(request.slot, signature, &pool) else {
         debug_assert_eq!(request.slot, Slot::Explicit);
         decision.reason =
             "explicit choice: a provider named by the caller is never replaced".into();
@@ -434,6 +434,23 @@ mod tests {
         assert!(!decision.applied);
         assert!(decision.reason.contains("explicit"));
         assert!(store.decision(decision.id).await.unwrap().is_some());
+    }
+
+    /// A session in `Trust` (decision ebd2b7e7): every third party the open path accepts
+    /// stays a candidate, sandboxed or not; nothing is rejected for the policy mode.
+    #[tokio::test]
+    async fn a_trust_session_keeps_every_unsandboxed_third_party_as_a_candidate() {
+        let mut req = request(pilot(), ProviderRoutingMode::Full, LearningStage::Auto);
+        req.trust = true;
+        assert!(req.pool.iter().all(|f| !f.sandboxed));
+        let (decision, _) = decide(&req).await;
+        assert!(decision.chosen.is_some(), "{}", decision.reason);
+        assert!(decision.applied);
+        assert!(
+            decision.alternatives.iter().all(|a| a.rejected.is_none()),
+            "{:?}",
+            decision.alternatives
+        );
     }
 
     #[tokio::test]

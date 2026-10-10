@@ -552,6 +552,11 @@ struct AgentOpen<'a> {
 pub(crate) struct OpeningTurn<'a> {
     /// The request named its model.
     pub explicit_model: bool,
+    /// The request named its provider (`routed_by: request`): never moved automatically.
+    pub provider_imposed: bool,
+    /// The session continues a conversation the router moved here (`moved_by: auto`): its
+    /// model was chosen by the router, not imposed, and its next turn does not move again.
+    pub moved_in: bool,
     /// The mode the request asked for; it replaces the one of the settings for this conversation.
     pub routing_mode: Option<super::provider::cognitive::ProviderRoutingMode>,
     /// The pairs the request restricted routing to (`mixed`).
@@ -1718,7 +1723,7 @@ impl ChatManager {
         // A conversation given a pool (two models ticked or more) names its pilot, but PO still
         // routes among the pool: the pilot is not a pin. One model ticked is strict: a pin.
         let allowed_models = Self::allowed_models_of(turn.routing_pool.as_deref(), provider_id);
-        let named = turn.explicit_model && allowed_models.is_none();
+        let named = turn.explicit_model && !turn.moved_in && allowed_models.is_none();
         let pinned = named || self.model_is_pinned(session_id).await;
         if named {
             self.pin_session_model(session_id).await;
@@ -1754,9 +1759,12 @@ impl ChatManager {
                 project_slug: project_slug.map(str::to_owned),
                 trust,
                 explicit_model: pinned,
+                provider_imposed: turn.provider_imposed && !turn.moved_in,
                 allowed_models,
+                routing_pool: turn.routing_pool.clone(),
                 current_model: model.to_owned(),
                 next_turn: turn.next_turn,
+                moved_in: turn.moved_in,
             },
         ));
         router.set_last_message(turn.message);
@@ -1785,6 +1793,100 @@ impl ChatManager {
                 warn!(session_id, error = %error, "turn routing could not change the model");
                 router.forget_change(&before);
             }
+        }
+    }
+
+    /// Mode `full`, before a turn starts, on both engines: when the router's decision names
+    /// ANOTHER provider (`agent_hooks::plan_provider_move`), the conversation moves there
+    /// through the relay (`moved_by: auto`) and `message` is the first message of the new
+    /// session. Returns `true` when it moved: this session then starts no turn (it is
+    /// closed by the relay). A message for a running turn is queued on its session, never
+    /// moved. A refused move (the project's consent, the endpoint guard, the security gate,
+    /// all applied by the relay's opening) leaves the conversation where it is; the stored
+    /// decision then says why (`not_moved: <code>`).
+    pub(crate) async fn move_provider_before_turn(&self, session_id: &str, message: &str) -> bool {
+        let Some(router) = self.turn_routing.get(session_id) else {
+            return false;
+        };
+        let streaming = match self.agent_runtime.get(session_id).await {
+            Some(handle) => handle.is_streaming.load(Ordering::SeqCst),
+            None => match self.active_sessions.read().await.get(session_id) {
+                Some(session) => session.is_streaming.load(Ordering::SeqCst),
+                None => return false,
+            },
+        };
+        if streaming {
+            return false;
+        }
+        // The routing reads what the user typed, not the blocks around it.
+        router.set_last_message(&crate::refs::turn::visible_text(message));
+        let super::agent_hooks::ProviderPlan::Move { pick, decision } =
+            super::agent_hooks::plan_provider_move(&router).await
+        else {
+            return false;
+        };
+        match self
+            .relay_conversation(
+                session_id,
+                &pick.provider_id,
+                Some(&pick.model),
+                message,
+                None,
+                super::relay::MOVED_BY_AUTO,
+            )
+            .await
+        {
+            Ok(moved) => {
+                info!(
+                    from_session = session_id,
+                    to_session = %moved.session_id,
+                    provider = %pick.provider_id,
+                    model = %pick.model,
+                    reason = %decision.reason,
+                    "the router moved the conversation to another provider"
+                );
+                true
+            }
+            Err(error) => {
+                let code =
+                    super::provider::errors::classify_open_error(&error, Some(&pick.provider_id))
+                        .map(|failure| failure.code)
+                        .or_else(|| {
+                            error
+                                .downcast_ref::<super::types::SwitchProviderError>()
+                                .map(|_| "switch_refused")
+                        })
+                        .unwrap_or("open_failed");
+                warn!(
+                    session_id,
+                    provider = %pick.provider_id,
+                    code,
+                    error = %error,
+                    "the router's provider move was refused: the conversation stays"
+                );
+                self.record_refused_move(*decision, code).await;
+                false
+            }
+        }
+    }
+
+    /// The decision of a move that did not happen says so: not applied, and why.
+    async fn record_refused_move(
+        &self,
+        mut decision: super::provider::cognitive::decision::CognitiveDecision,
+        code: &str,
+    ) {
+        let Some(store) = self
+            .cognitive_routing
+            .as_ref()
+            .and_then(|routing| routing.store.clone())
+        else {
+            return;
+        };
+        decision.applied = false;
+        decision.reason = format!("{}; not_moved: {code}", decision.reason);
+        if let Err(error) = store.put_decision(&decision).await {
+            warn!(decision_id = %decision.id, %error, "the refused move was not recorded on its decision");
         }
     }
 
@@ -4221,7 +4323,14 @@ impl ChatManager {
             },
             spawned_by: request.spawned_by.clone(),
             provider_id: Some(provider_choice.provider_id.clone()),
-            routed_by: Some(provider_choice.routed_by.as_str().to_string()),
+            // A move by the router names its target, yet nobody imposed it: `auto`.
+            routed_by: Some(if super::relay::moved_by_auto(relay) {
+                super::provider::resolver::RoutedBy::Auto
+                    .as_str()
+                    .to_string()
+            } else {
+                provider_choice.routed_by.as_str().to_string()
+            }),
             routing_mode: request.routing_mode.map(|m| m.as_str().to_owned()),
             routing_pool: request
                 .routing_pool
@@ -4351,6 +4460,8 @@ impl ChatManager {
                 project_slug.as_deref(),
                 OpeningTurn {
                     explicit_model: request.model.is_some(),
+                    provider_imposed: request.provider.is_some(),
+                    moved_in: super::relay::moved_by_auto(relay),
                     routing_mode: request.routing_mode,
                     routing_pool: request.routing_pool.clone(),
                     permission_mode: request.permission_mode.as_deref(),
@@ -6469,6 +6580,11 @@ impl ChatManager {
 
     /// Send a follow-up message to an existing session
     pub async fn send_message(&self, session_id: &str, message: &str) -> Result<()> {
+        // Mode `full`: the turn may belong to another provider. A move sends the message
+        // to the new session, so this one starts no turn.
+        if self.move_provider_before_turn(session_id, message).await {
+            return Ok(());
+        }
         if let Some(handle) = self.agent_runtime.get(session_id).await {
             // The turn router learns the text when the turn is prepared
             // (`ManagerTurnServices::prepare`): a queued message must not overwrite it.
@@ -7281,6 +7397,30 @@ impl ChatManager {
         message: &str,
         claims: Option<crate::auth::jwt::Claims>,
     ) -> Result<super::types::SwitchProviderResponse> {
+        self.relay_conversation(
+            session_id,
+            provider,
+            model,
+            message,
+            claims,
+            super::relay::MOVED_BY_USER,
+        )
+        .await
+    }
+
+    /// [`Self::switch_session_provider`], saying who moves the conversation. A move by the
+    /// router (`moved_by: auto`) keeps the conversation's routing (its mode, its pool) on
+    /// the new session, whose pair is then not imposed: the router goes on choosing there.
+    /// A move by the user imposes its target (`routed_by: request`).
+    pub(crate) async fn relay_conversation(
+        &self,
+        session_id: &str,
+        provider: &str,
+        model: Option<&str>,
+        message: &str,
+        claims: Option<crate::auth::jwt::Claims>,
+        moved_by: &str,
+    ) -> Result<super::types::SwitchProviderResponse> {
         use super::relay;
         use super::types::SwitchProviderError;
 
@@ -7327,7 +7467,7 @@ impl ChatManager {
             ),
             from_session_id: session_id.to_string(),
             from_provider: current.clone(),
-            moved_by: relay::MOVED_BY_USER.to_string(),
+            moved_by: moved_by.to_string(),
             // The memory conversation goes on in the new session.
             conversation_id: node.conversation_id.clone(),
         };
@@ -7339,9 +7479,18 @@ impl ChatManager {
         } else {
             node.cwd.clone()
         };
+        let by_router = moved_by == relay::MOVED_BY_AUTO;
         let request = ChatRequest {
-            routing_pool: None,
-            routing_mode: None,
+            routing_pool: node
+                .routing_pool
+                .as_deref()
+                .filter(|_| by_router)
+                .and_then(|json| serde_json::from_str(json).ok()),
+            routing_mode: node
+                .routing_mode
+                .as_deref()
+                .filter(|_| by_router)
+                .and_then(|m| serde_json::from_value(serde_json::Value::String(m.to_owned())).ok()),
             attachments: Vec::new(),
             refs: Vec::new(),
             message: message.to_string(),
@@ -10702,6 +10851,8 @@ impl ChatManager {
             project_slug,
             OpeningTurn {
                 explicit_model: request.model.is_some(),
+                provider_imposed: request.provider.is_some(),
+                moved_in: super::relay::moved_by_auto(relay),
                 routing_mode: request.routing_mode,
                 routing_pool: request.routing_pool.clone(),
                 permission_mode: request.permission_mode.as_deref(),
@@ -11023,6 +11174,11 @@ impl ChatManager {
                     .and_then(|json| serde_json::from_str(json).ok()),
                 explicit_model: false,
                 permission_mode: node.permission_mode.as_deref(),
+                // A provider the request named stays imposed across a resume (a conversation
+                // opened with ticked models names its pilot without imposing it).
+                provider_imposed: node.routed_by.as_deref() == Some("request")
+                    && node.routing_pool.is_none(),
+                moved_in: false,
                 message,
                 next_turn: 0,
             },

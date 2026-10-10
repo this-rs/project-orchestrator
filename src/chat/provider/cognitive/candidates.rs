@@ -16,7 +16,7 @@ use nexus_claude::agent::{Capabilities, CostBasis, ModelPrice, SandboxLevel};
 use serde::{Deserialize, Serialize};
 
 use super::signature::TaskSignature;
-use crate::chat::provider::resolver::{is_remote_instance, CLAUDE_CODE};
+use crate::chat::provider::resolver::is_remote_instance;
 
 /// Output tokens assumed for the cost estimate of one median turn.
 const TURN_OUTPUT_TOKENS: f64 = 2_000.0;
@@ -108,7 +108,10 @@ pub enum RejectReason {
     NoImages,
     /// A median turn costs more than the marginal budget left.
     OverBudget,
-    /// Trust mode on a third party without a sandbox (A35).
+    /// Trust mode on a third party without a sandbox (A35). No longer produced: decision
+    /// ebd2b7e7 (2026-10-07) opens `Trust` on every provider except a remote machine without
+    /// `allow_trust`, and a remote machine is never a candidate ([`Self::Remote`]). Kept so
+    /// the decisions stored before still read.
     TrustWithoutSandbox,
 }
 
@@ -157,7 +160,7 @@ pub struct Filtered {
 
 /// Why the first failing constraint, if any. Order: ownership of the choice
 /// (remote, consent, health) before capability before money.
-fn check(signature: &TaskSignature, facts: &ModelFacts, trust: bool) -> Option<RejectReason> {
+fn check(signature: &TaskSignature, facts: &ModelFacts) -> Option<RejectReason> {
     if is_remote_instance(&facts.provider_id) {
         return Some(RejectReason::Remote);
     }
@@ -187,26 +190,22 @@ fn check(signature: &TaskSignature, facts: &ModelFacts, trust: bool) -> Option<R
     {
         return Some(RejectReason::OverBudget);
     }
-    if trust && !facts.sandboxed && facts.provider_id != CLAUDE_CODE {
-        return Some(RejectReason::TrustWithoutSandbox);
-    }
+    // `Trust` gates nothing here: the rule (decision ebd2b7e7, which replaces A35) refuses it
+    // only on a remote machine without `allow_trust` (`ChatManager::authorize_provider_use`),
+    // and a remote machine never gets this far. The sandbox level informs, it never filters.
     None
 }
 
-/// Filters `pool` for `signature`. `trust` is whether the session would run in
-/// trust mode. An explicit slot is outside the filter: `None`.
-pub fn apply(
-    slot: Slot,
-    signature: &TaskSignature,
-    pool: &[ModelFacts],
-    trust: bool,
-) -> Option<Filtered> {
+/// Filters `pool` for `signature`. An explicit slot is outside the filter: `None`.
+/// Whether the session runs in `Trust` filters nothing (see
+/// [`RejectReason::TrustWithoutSandbox`]).
+pub fn apply(slot: Slot, signature: &TaskSignature, pool: &[ModelFacts]) -> Option<Filtered> {
     if slot == Slot::Explicit {
         return None;
     }
     let mut filtered = Filtered::default();
     for facts in pool {
-        match check(signature, facts, trust) {
+        match check(signature, facts) {
             None => filtered.eligible.push(facts.clone()),
             Some(reason) => filtered.rejected.push(Rejected {
                 candidate: facts.clone(),
@@ -276,6 +275,7 @@ impl HealthCache {
 mod tests {
     use super::*;
     use crate::chat::provider::cognitive::signature::{ContextHints, TaskClass};
+    use crate::chat::provider::resolver::CLAUDE_CODE;
 
     fn good() -> ModelFacts {
         ModelFacts {
@@ -305,14 +305,14 @@ mod tests {
         TaskSignature::from_chat_request("hello", false, None, ContextHints::default())
     }
 
-    fn reason(signature: &TaskSignature, facts: ModelFacts, trust: bool) -> Option<RejectReason> {
-        let out = apply(Slot::Automatic, signature, &[facts], trust).unwrap();
+    fn reason(signature: &TaskSignature, facts: ModelFacts) -> Option<RejectReason> {
+        let out = apply(Slot::Automatic, signature, &[facts]).unwrap();
         out.rejected.into_iter().next().map(|r| r.reason)
     }
 
     #[test]
     fn a_pair_that_meets_every_constraint_is_eligible() {
-        let out = apply(Slot::Automatic, &tooled(), &[good()], false).unwrap();
+        let out = apply(Slot::Automatic, &tooled(), &[good()]).unwrap();
         assert_eq!(out.eligible, vec![good()]);
         assert!(out.rejected.is_empty());
     }
@@ -321,17 +321,14 @@ mod tests {
     fn a_remote_machine_is_never_a_candidate() {
         let mut facts = good();
         facts.provider_id = "claude-code@box".into();
-        assert_eq!(reason(&tooled(), facts, false), Some(RejectReason::Remote));
+        assert_eq!(reason(&tooled(), facts), Some(RejectReason::Remote));
     }
 
     #[test]
     fn a_pair_without_the_projects_consent_is_not_allowed() {
         let mut facts = good();
         facts.allowed_for_project = false;
-        assert_eq!(
-            reason(&tooled(), facts, false),
-            Some(RejectReason::NotAllowed)
-        );
+        assert_eq!(reason(&tooled(), facts), Some(RejectReason::NotAllowed));
     }
 
     #[test]
@@ -339,11 +336,11 @@ mod tests {
         let mut facts = good();
         facts.healthy = Some(false);
         assert_eq!(
-            reason(&tooled(), facts.clone(), false),
+            reason(&tooled(), facts.clone()),
             Some(RejectReason::Unhealthy)
         );
         facts.healthy = None;
-        assert_eq!(reason(&tooled(), facts, false), None);
+        assert_eq!(reason(&tooled(), facts), None);
     }
 
     #[test]
@@ -351,11 +348,11 @@ mod tests {
         let mut facts = good();
         facts.supports_tools = false;
         assert_eq!(
-            reason(&tooled(), facts.clone(), false),
+            reason(&tooled(), facts.clone()),
             Some(RejectReason::NoTools)
         );
         // A utility call needs none.
-        assert_eq!(reason(&signature(), facts, false), None);
+        assert_eq!(reason(&signature(), facts), None);
     }
 
     #[test]
@@ -364,7 +361,7 @@ mod tests {
         facts.context_window = Some(4_000);
         let need = signature().context_need_tokens;
         assert_eq!(
-            reason(&signature(), facts.clone(), false),
+            reason(&signature(), facts.clone()),
             Some(RejectReason::ContextTooSmall {
                 need,
                 have: Some(4_000)
@@ -372,7 +369,7 @@ mod tests {
         );
         facts.context_window = None;
         assert_eq!(
-            reason(&signature(), facts, false),
+            reason(&signature(), facts),
             Some(RejectReason::ContextTooSmall { need, have: None })
         );
     }
@@ -384,42 +381,40 @@ mod tests {
         let mut facts = good();
         facts.supports_images = false;
         assert_eq!(
-            reason(&with_images, facts.clone(), false),
+            reason(&with_images, facts.clone()),
             Some(RejectReason::NoImages)
         );
-        assert_eq!(reason(&tooled(), facts, false), None);
+        assert_eq!(reason(&tooled(), facts), None);
     }
 
     #[test]
     fn a_turn_dearer_than_the_budget_left_is_rejected_and_an_unknown_price_passes() {
         let mut signature = signature();
         signature.budget_remaining_usd = Some(0.000_001);
-        assert_eq!(
-            reason(&signature, good(), false),
-            Some(RejectReason::OverBudget)
-        );
+        assert_eq!(reason(&signature, good()), Some(RejectReason::OverBudget));
         // Unknown price: never zero, never a reason to refuse.
         let mut unpriced = good();
         unpriced.price = None;
-        assert_eq!(reason(&signature, unpriced, false), None);
+        assert_eq!(reason(&signature, unpriced), None);
         // A free or subscription model costs no marginal money.
         let mut free = good();
         free.cost_basis = CostBasis::Free;
-        assert_eq!(reason(&signature, free, false), None);
+        assert_eq!(reason(&signature, free), None);
     }
 
+    /// Decision ebd2b7e7: `Trust` opens on every provider except a remote machine without
+    /// `allow_trust`, the rule `authorize_provider_use` applies. The filter takes no trust
+    /// flag at all: an unsandboxed third party stays a candidate, and a remote machine is
+    /// out whatever its record says (a machine is chosen by a person).
     #[test]
-    fn trust_mode_needs_a_sandbox_unless_it_is_claude_code() {
-        assert_eq!(
-            reason(&tooled(), good(), true),
-            Some(RejectReason::TrustWithoutSandbox)
-        );
-        let mut sandboxed = good();
-        sandboxed.sandboxed = true;
-        assert_eq!(reason(&tooled(), sandboxed, true), None);
+    fn trust_rejects_no_provider_the_open_path_accepts() {
+        assert_eq!(reason(&tooled(), good()), None);
         let mut claude = good();
         claude.provider_id = CLAUDE_CODE.into();
-        assert_eq!(reason(&tooled(), claude, true), None);
+        assert_eq!(reason(&tooled(), claude), None);
+        let mut remote = good();
+        remote.provider_id = "claude-code@box".into();
+        assert_eq!(reason(&tooled(), remote), Some(RejectReason::Remote));
     }
 
     #[test]
@@ -427,7 +422,7 @@ mod tests {
         let mut facts = good();
         facts.allowed_for_project = false;
         facts.supports_tools = false;
-        assert_eq!(apply(Slot::Explicit, &tooled(), &[facts], false), None);
+        assert_eq!(apply(Slot::Explicit, &tooled(), &[facts]), None);
     }
 
     #[test]
@@ -436,10 +431,7 @@ mod tests {
         facts.allowed_for_project = false;
         facts.healthy = Some(false);
         facts.supports_tools = false;
-        assert_eq!(
-            reason(&tooled(), facts, false),
-            Some(RejectReason::NotAllowed)
-        );
+        assert_eq!(reason(&tooled(), facts), Some(RejectReason::NotAllowed));
     }
 
     #[test]
