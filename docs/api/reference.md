@@ -347,6 +347,63 @@ curl -X POST -H "Authorization: Bearer <JWT>" \
 
 ---
 
+## Network Tools of Native Sessions -- Protected
+
+What a project consents to for the network tools of `nexus-tools` (`WebFetch`, `WebSearch`, the
+browser), and the search engines. Mutations are human only (403 for an agent token). A refused body is
+400 `{error, code, retryable: false}` and never echoes the value sent. Shipping and the default path of
+`nexus-tools`: [Providers guide](../guides/providers.md#files-shell-and-web-of-a-native-session-nexus-tools).
+
+### GET /api/projects/{slug}/network-tools -- Protected
+
+```json
+{
+  "project": "my-project",
+  "origins": [{"origin": "https://docs.rs", "consented_by": "me@example.com", "consented_at": "2026-10-10T09:00:00Z"}],
+  "browser": {"allowed": true, "authorized_by": "me@example.com", "authorized_at": "2026-10-10T09:00:00Z"},
+  "search_engines": [{"id": "brave", "engine": "brave", "base_url": null, "credential_ref": "vault:brave",
+                      "origin": "https://api.search.brave.com", "grant_id": "tool:brave",
+                      "key_granted": true, "origin_consented": false}]
+}
+```
+
+404 `project_not_found`.
+
+### PUT /api/projects/{slug}/network-tools/origins -- Protected (human only)
+
+`{"origin": "https://docs.rs"}`. A URL is reduced to its origin (`https://Docs.rs:443/x` → `https://docs.rs`).
+Only `http`/`https`, no credentials: else 400 `invalid_tool_origin`. Answers the stored consent. A native
+session of the project is offered `WebFetch` once any origin is consented; each call is judged on its own origin.
+
+### DELETE /api/projects/{slug}/network-tools/origins?origin={origin} -- Protected (human only)
+
+204; 404 `tool_origin_not_found`. Running sessions read the consent at each call.
+
+### PUT /api/projects/{slug}/network-tools/browser -- Protected (human only)
+
+`{"allowed": true|false}` → `{allowed, authorized_by?, authorized_at?}`. 400 `invalid_browser_setting`.
+The browser is attached only when its executable is configured too (N23).
+
+### GET /api/chat/search-engines[?project={slug}] -- Protected
+
+The search engines (tool providers), each with `origin`, `grant_id` (`tool:<id>`), `key_granted`, and with
+`?project=` `origin_consented`.
+
+### POST /api/chat/search-engines -- Protected (human only)
+
+`{"id": "brave", "engine": "brave", "credential_ref": "vault:brave"}` or
+`{"id": "home", "engine": "searxng", "base_url": "http://localhost:8888"}`. 201 with the engine.
+Codes: `secret_value_refused` (a `key`, `api_key`, `token`... field), `invalid_search_engine`,
+`invalid_search_engine_id`, `unknown_search_engine`, `invalid_search_engine_url`, `invalid_credential_ref`,
+`credential_ref_required`; 409 `search_engine_exists`. The key is then granted with `POST /api/vault/grants`,
+scope `{"kind":"provider","value":"tool:<id>"}`, naming exactly the secret of `credential_ref`.
+
+### DELETE /api/chat/search-engines/{id} -- Protected (human only)
+
+204 (its `tool:<id>` grants are revoked too); 404 `search_engine_not_found`.
+
+---
+
 ## Health Check
 
 ### GET /health -- Public

@@ -7086,8 +7086,20 @@ mod legacy_oob_lag {
         ]
     }
 
+    /// A listener a little behind (150 ms per message).
     #[tokio::test]
     async fn a_lagging_oob_listener_does_not_replay_the_turns_tool_result_as_a_new_turn() {
+        lagging_listener(Duration::from_millis(150)).await;
+    }
+
+    /// A listener far behind: more than 3 s for the turn's four messages, longer than
+    /// any bounded wait of the turn — only a rule on the listener's side holds.
+    #[tokio::test]
+    async fn a_listener_lagging_longer_than_any_bound_still_does_not_replay_the_tool_result() {
+        lagging_listener(Duration::from_millis(800)).await;
+    }
+
+    async fn lagging_listener(lag: Duration) {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("transcript.jsonl");
@@ -7154,8 +7166,10 @@ mod legacy_oob_lag {
         assert!(ready, "the first turn ended");
 
         // From now on the OOB listener of this session lags behind the turn.
-        *crate::chat::oob_listener::TEST_LAG.lock().unwrap() =
-            Some((sid.clone(), Duration::from_millis(150)));
+        crate::chat::oob_listener::TEST_LAG
+            .lock()
+            .unwrap()
+            .push((sid.clone(), lag));
         manager.send_message(&sid, "SECOND-MESSAGE").await.unwrap();
         let mut answered = false;
         for _ in 0..400 {
@@ -7165,9 +7179,12 @@ mod legacy_oob_lag {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        // Long enough for a lagging listener to get to every message of the turn.
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        *crate::chat::oob_listener::TEST_LAG.lock().unwrap() = None;
+        // Long enough for the lagging listener to get to every message of the turn.
+        tokio::time::sleep(lag * 6 + Duration::from_secs(1)).await;
+        crate::chat::oob_listener::TEST_LAG
+            .lock()
+            .unwrap()
+            .retain(|(s, _)| s != &sid);
 
         let stdin = std::fs::read_to_string(dir.path().join("stdin.jsonl")).unwrap_or_default();
         let events: Vec<(String, String)> = graph
