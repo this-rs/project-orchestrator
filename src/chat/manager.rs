@@ -48,6 +48,11 @@ const BROADCAST_BUFFER: usize = 256;
 /// trusted (an unknown `--resume` target makes it exit within a second).
 const RESUME_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// How long an interrupted turn of the Claude CLI waits for the CLI's own `result` of
+/// that turn before it ends (see `stream_response`): a CLI answers an interrupt at
+/// once, a dead one does not hold the session longer than this.
+const INTERRUPTED_TURN_RESULT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// OOB-triggered `stream_response` rate cap for interactive sessions.
 /// A misbehaving Monitor or background Bash that emits constantly could
 /// otherwise loop the session and inflate the LLM bill — this caps the
@@ -2471,10 +2476,15 @@ impl ChatManager {
                         );
                         interrupt_flag.store(true, Ordering::SeqCst);
                         // Cancel the current interrupt_token to unblock stream_response's select!
+                        // and tell the CLI at once, as every local Stop does: the turn waits
+                        // for the CLI's result of the interrupted turn before it ends.
                         {
                             let sessions = active_sessions.read().await;
                             if let Some(session) = sessions.get(&session_id) {
                                 session.interrupt_token.cancel();
+                                if let Some(ref tx) = session.stdin_tx {
+                                    let _ = tx.try_send(InteractiveClient::build_interrupt_json());
+                                }
                             }
                         }
                     }
@@ -5977,6 +5987,7 @@ impl ChatManager {
                     //
                     // Now we select! between the two sources so control messages are
                     // processed even when the stream is idle (waiting for permission).
+                    let mut interrupted_in_stream = false;
                     loop {
                         let result = if let Some(ref mut rx) = sdk_control_rx {
                             tokio::select! {
@@ -5990,6 +6001,7 @@ impl ChatManager {
                                         "Interrupt token cancelled during stream for session {}",
                                         session_id
                                     );
+                                    interrupted_in_stream = true;
                                     break;
                                 }
 
@@ -6123,6 +6135,7 @@ impl ChatManager {
                                         "Interrupt token cancelled during stream for session {} (no control channel)",
                                         session_id
                                     );
+                                    interrupted_in_stream = true;
                                     break;
                                 }
 
@@ -6512,6 +6525,32 @@ impl ChatManager {
                                 break;
                             }
                         }
+                    }
+
+                    // An interrupted turn still gets its `result` from the CLI, AFTER the
+                    // interrupt. Read it here, before the turn ends: left unread, it reaches
+                    // the NEXT turn (a fresh subscription to the CLI's output, started by
+                    // the drain of the queued message), which ends on it at once — its real
+                    // answer then has no turn to read it and every later turn is one
+                    // `result` behind. Bounded: a CLI that never answers does not hold the
+                    // session.
+                    if interrupted_in_stream {
+                        let drained = tokio::time::timeout(INTERRUPTED_TURN_RESULT_GRACE, async {
+                            while let Some(item) = stream.next().await {
+                                match item {
+                                    Ok(Message::Result { .. }) => return true,
+                                    Ok(_) => continue,
+                                    Err(_) => return false,
+                                }
+                            }
+                            false
+                        })
+                        .await;
+                        debug!(
+                            session_id = %session_id,
+                            result_read = matches!(drained, Ok(true)),
+                            "interrupted turn: waited for the CLI's result"
+                        );
                     }
                 } // end if let Some(s) = stream_ok
             } // client lock released here
