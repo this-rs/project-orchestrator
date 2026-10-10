@@ -28,6 +28,16 @@ impl PoolSource for ManagerPool {
             .filter(|facts| facts.provider_id == provider_id)
             .collect()
     }
+
+    /// Every instance's models, the project's consent stated on each: a pair the project
+    /// did not consent to stays in the pool and is rejected by the filter (`not_allowed`),
+    /// so the decision lists it with its reason.
+    async fn project_pool(&self, project_slug: Option<&str>) -> Vec<ModelFacts> {
+        match self.0.upgrade() {
+            Some(manager) => manager.routing_pool_for(project_slug).await,
+            None => Vec::new(),
+        }
+    }
 }
 
 #[async_trait]

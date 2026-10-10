@@ -208,9 +208,17 @@ pub fn render_relay(events: &[ChatEvent], from: &str, to: &str, budget_chars: us
     }
 }
 
-/// Who moved a conversation through the switch route. (`auto` is reserved for the
-/// cognitive router, which does not move conversations across providers yet.)
+/// A conversation moved by the user, through the switch route.
 pub const MOVED_BY_USER: &str = "user";
+
+/// A conversation moved by the cognitive router (mode `full`, stage `auto`) before one of
+/// its turns: `agent_hooks::plan_provider_move`.
+pub const MOVED_BY_AUTO: &str = "auto";
+
+/// Whether `relay` is a move by the cognitive router.
+pub fn moved_by_auto(relay: Option<&RelayedFrom>) -> bool {
+    relay.is_some_and(|r| r.moved_by == MOVED_BY_AUTO)
+}
 
 /// A rendered relay with where it comes from: what a session being opened needs
 /// to send the relay in front of its first message AND to say so on its thread.

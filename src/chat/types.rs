@@ -942,8 +942,9 @@ pub enum ChatEvent {
         /// Oldest entries left out to fit the target's context window; the
         /// omission is stated to the model, never silent.
         omitted_entries: usize,
-        /// Who moved it: `user` (the switch route; the only value emitted today) or
-        /// `auto` (reserved for the cognitive router).
+        /// Who moved it: `user` (the switch route) or `auto` (the cognitive router, mode
+        /// `full` + stage `auto`, before a turn; the message of that turn is the first one
+        /// of the new session).
         moved_by: String,
         /// The memory conversation both sessions share (kept across the move), when
         /// the server records one.
@@ -1410,6 +1411,19 @@ impl std::fmt::Display for SwitchProviderError {
 }
 
 impl std::error::Error for SwitchProviderError {}
+
+impl SwitchProviderError {
+    /// Stable code of a refusal the client acts on (`{error, code, retryable: false}`),
+    /// `None` for the refusals told by their status alone. The message text stays as it
+    /// was: clients that predate the codes match it.
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::EmptyMessage => Some("empty_message"),
+            Self::SameProvider(_) => Some("same_provider"),
+            Self::InvalidSession | Self::NotFound => None,
+        }
+    }
+}
 
 /// Result of moving a conversation to another provider (B-SW).
 #[derive(Debug, Clone, Serialize, Deserialize)]

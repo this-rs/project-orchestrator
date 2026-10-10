@@ -292,6 +292,11 @@ the session only, never in the global or project routing settings.
 One conversation = one provider: per turn, only the ticked models of the session's provider are candidates;
 moving to another provider is `POST /api/chat/sessions/{id}/switch-provider`. Answers the `ChatSession`.
 400 `invalid_routing_pool` | `routing_pool_other_provider`, 404 unknown session, 403 agent token.
+In `auto` (mode `full`) with the learning stage `auto`, PO itself may move the conversation to another
+consented provider before a turn (never a provider or model the user imposed, never two moves in a row):
+the same relay as the switch route, stated by `conversation_relayed` with `moved_by: "auto"`.
+
+The switch route refuses with 400 `{error, code, retryable: false}`: `empty_message` (no message) and `same_provider` (already on that provider, `provider_id` set); 400 without code for an invalid session id, 404 unknown session; any other refusal is the one of opening the new session (e.g. 403 `endpoint_not_allowed` without the project's consent).
 
 ```bash
 curl -X PUT -H "Authorization: Bearer <JWT>" -H "Content-Type: application/json" \

@@ -2082,6 +2082,8 @@ mod turn_routing {
                 "manual-model",
                 None,
                 OpeningTurn {
+                    provider_imposed: false,
+                    moved_in: false,
                     routing_pool: None,
                     routing_mode: None,
                     explicit_model: false,
@@ -2119,6 +2121,8 @@ mod turn_routing {
                 "small",
                 None,
                 OpeningTurn {
+                    provider_imposed: false,
+                    moved_in: false,
                     routing_pool: pool.map(|models| {
                         models
                             .iter()
@@ -2198,6 +2202,8 @@ mod turn_routing {
                 "small",
                 None,
                 OpeningTurn {
+                    provider_imposed: false,
+                    moved_in: false,
                     routing_mode: Some(ProviderRoutingMode::Mixed),
                     routing_pool: Some(vec![
                         crate::chat::types::RoutingPoolEntry {
@@ -3187,6 +3193,516 @@ mod provider_switch {
             1
         );
     }
+
+    // ── The router moves a conversation (P1c): mode `full`, stage `auto` ──
+    //
+    // Before a turn starts, the decision of a conversation in `full` may name another
+    // provider: the conversation then moves through the same relay as the switch route,
+    // `moved_by: auto`, and the turn's message is answered by the new provider only.
+
+    mod auto_move {
+        use super::*;
+        use crate::chat::agent_hooks::PoolSource;
+        use crate::chat::provider::cognitive::candidates::ModelFacts;
+        use crate::chat::provider::cognitive::decision::{
+            DecideRequest, Decider, DecisionAlternative, Pick,
+        };
+        use crate::chat::provider::cognitive::{LearningStage, ProviderRoutingMode, ROUTING_KEY};
+        use crate::chat::types::{RoutingPoolEntry, SessionRoutingRequest};
+        use std::collections::VecDeque;
+        use std::sync::Mutex as StdMutex;
+
+        /// The instances of `world()` as the routing pool sees them: `local3` without the
+        /// project's consent.
+        struct Instances;
+
+        #[async_trait::async_trait]
+        impl PoolSource for Instances {
+            async fn pool(&self, provider_id: &str) -> Vec<ModelFacts> {
+                self.project_pool(None)
+                    .await
+                    .into_iter()
+                    .filter(|f| f.provider_id == provider_id)
+                    .collect()
+            }
+            async fn project_pool(&self, _project_slug: Option<&str>) -> Vec<ModelFacts> {
+                [
+                    ("claude-code", true),
+                    ("local", true),
+                    ("local2", true),
+                    ("local3", false),
+                ]
+                .iter()
+                .map(|(provider, allowed)| ModelFacts {
+                    provider_id: (*provider).into(),
+                    model: if *provider == "claude-code" {
+                        "fake-claude"
+                    } else {
+                        "m"
+                    }
+                    .into(),
+                    supports_tools: true,
+                    supports_images: false,
+                    context_window: Some(32_000),
+                    price: None,
+                    cost_basis: nexus_claude::agent::CostBasis::Free,
+                    healthy: Some(true),
+                    allowed_for_project: *allowed,
+                    sandboxed: false,
+                })
+                .collect()
+            }
+        }
+
+        /// Answers each provider check (a request across providers) with the next
+        /// provider of its queue (the last one repeats), clearly ahead of the current pair;
+        /// a model decision of the session's own provider keeps the current model.
+        struct Mover {
+            answers: StdMutex<VecDeque<&'static str>>,
+            checks: StdMutex<Vec<DecideRequest>>,
+        }
+
+        impl Mover {
+            fn new(answers: Vec<&'static str>) -> Arc<Self> {
+                Arc::new(Self {
+                    answers: StdMutex::new(answers.into()),
+                    checks: StdMutex::new(Vec::new()),
+                })
+            }
+            fn checks(&self) -> Vec<DecideRequest> {
+                self.checks.lock().unwrap().clone()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Decider for Mover {
+            async fn decide(&self, request: &DecideRequest) -> anyhow::Result<CognitiveDecision> {
+                let current = request.current.clone().unwrap_or_else(|| Pick::new("", ""));
+                let chosen = match &request.restrict_provider {
+                    Some(_) => current.clone(),
+                    None => {
+                        self.checks.lock().unwrap().push(request.clone());
+                        let mut queue = self.answers.lock().unwrap();
+                        let provider = if queue.len() > 1 {
+                            queue.pop_front().unwrap()
+                        } else {
+                            *queue.front().unwrap()
+                        };
+                        let model = if provider == "claude-code" {
+                            "fake-claude"
+                        } else {
+                            "m"
+                        };
+                        Pick::new(provider, model)
+                    }
+                };
+                let mut alternatives = vec![DecisionAlternative {
+                    pick: chosen.clone(),
+                    score: Some(0.9),
+                    rejected: None,
+                }];
+                if chosen != current {
+                    alternatives.push(DecisionAlternative {
+                        pick: current,
+                        score: Some(0.3),
+                        rejected: None,
+                    });
+                }
+                Ok(CognitiveDecision {
+                    id: Uuid::new_v4(),
+                    at: Utc::now(),
+                    signature: request.signature.clone(),
+                    chosen: Some(chosen.clone()),
+                    score: Some(0.9),
+                    explored: false,
+                    reason: format!("fake: {}/{}", chosen.provider_id, chosen.model),
+                    alternatives,
+                    applied: request.settings.mode == ProviderRoutingMode::Full
+                        && request.settings.stage == LearningStage::Auto,
+                    mode: request.settings.mode,
+                    stage: request.settings.stage,
+                    session_id: request.session_id,
+                    task_id: None,
+                    run_id: None,
+                    turn_index: request.turn_index,
+                    outcome: None,
+                    used: None,
+                })
+            }
+        }
+
+        async fn routing(w: &World, mode: &str, stage: &str) {
+            w.graph
+                .put_llm_setting(
+                    GLOBAL,
+                    ROUTING_KEY,
+                    &json!({ "mode": mode, "stage": stage }).to_string(),
+                )
+                .await
+                .unwrap();
+        }
+
+        /// `world()` with the router wired (and its decision store when `store`).
+        async fn auto_world(
+            stage: &str,
+            answers: Vec<&'static str>,
+            store: bool,
+        ) -> (World, Arc<Mover>) {
+            let mut w = world().await;
+            routing(&w, "full", stage).await;
+            let mover = Mover::new(answers);
+            let mut manager = manager(w.graph.clone(), true);
+            if store {
+                manager = manager.with_cognitive_routing(CognitiveRouting::new(Arc::new(
+                    Neo4jRoutingStore::new(w.graph.clone()),
+                )));
+            }
+            w.manager = manager.with_turn_decider(mover.clone(), Arc::new(Instances));
+            (w, mover)
+        }
+
+        /// "Auto" in the menu: the provider named at the opening is no longer imposed.
+        async fn hand_back_to_po(w: &World, session_id: &str) {
+            w.manager
+                .set_session_routing(
+                    session_id,
+                    &SessionRoutingRequest {
+                        auto: true,
+                        routing_pool: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn idle(w: &World, session_id: &str) {
+            for _ in 0..200 {
+                if !w.manager.is_session_streaming(session_id).await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("{session_id} never went idle");
+        }
+
+        fn requests_with(w: &World, needle: &str) -> Vec<String> {
+            w.fake
+                .chat_requests()
+                .iter()
+                .map(|r| r["body"].to_string())
+                .filter(|b| b.contains(needle))
+                .collect()
+        }
+
+        fn answers_on(events: &[ChatEvent]) -> usize {
+            events
+                .iter()
+                .filter(|e| matches!(e, ChatEvent::AssistantText { .. }))
+                .count()
+        }
+
+        /// Sends `text` to a session that stays, and waits for its answer there.
+        async fn answered_in_place(w: &World, session_id: &str, text: &str) {
+            let answers_before = answers_on(&stored_events(w, session_id).await);
+            let relayed_before = relayed_of(&stored_events(w, session_id).await).len();
+            w.manager.send_message(session_id, text).await.unwrap();
+            stored_until(w, session_id, |records| {
+                records
+                    .iter()
+                    .filter(|r| r.event_type == "assistant_text")
+                    .count()
+                    > answers_before
+            })
+            .await;
+            assert!(
+                w.manager.is_session_active(session_id).await,
+                "the conversation stays"
+            );
+            assert_eq!(
+                relayed_of(&stored_events(w, session_id).await).len(),
+                relayed_before,
+                "no move stated"
+            );
+        }
+
+        #[tokio::test]
+        async fn full_auto_a_turn_for_another_provider_moves_through_the_relay_and_is_answered_there(
+        ) {
+            let (w, mover) = auto_world("auto", vec!["local2"], false).await;
+            let old = first_turn(&w).await;
+            hand_back_to_po(&w, &old).await;
+            idle(&w, &old).await;
+            let mut old_rx = w.manager.subscribe(&old).await.unwrap();
+
+            w.manager
+                .send_message(&old, "second question")
+                .await
+                .unwrap();
+
+            let on_old = next_event(&mut old_rx, |e| {
+                matches!(e, ChatEvent::ConversationRelayed { .. })
+            })
+            .await;
+            let ChatEvent::ConversationRelayed {
+                from_session_id,
+                to_session_id,
+                from_provider,
+                to_provider,
+                moved_by,
+                ..
+            } = on_old.clone()
+            else {
+                unreachable!()
+            };
+            assert_eq!(moved_by, "auto");
+            assert_eq!(
+                (from_provider.as_str(), to_provider.as_str()),
+                ("local", "local2")
+            );
+            assert_eq!(from_session_id, old);
+            let new = to_session_id;
+
+            // Answered by the new provider, sent ONCE, with the history relayed in front.
+            stored_until(&w, &new, |records| {
+                records
+                    .iter()
+                    .any(|r| r.event_type == "assistant_text" && r.data.contains("the answer"))
+            })
+            .await;
+            let sent = requests_with(&w, "second question");
+            assert_eq!(sent.len(), 1, "the turn is sent once: {sent:?}");
+            assert!(
+                sent[0].contains("<conversation_relay from=\\\"local\\\" to=\\\"local2\\\">"),
+                "{}",
+                sent[0]
+            );
+            // The old session started no turn of its own and is closed.
+            assert!(!w.manager.is_session_active(&old).await);
+            assert!(
+                !stored_events(&w, &old).await.iter().any(
+                    |e| matches!(e, ChatEvent::UserMessage { content } if content == "second question")
+                ),
+                "the old thread never got the message"
+            );
+            // Both threads carry the same statement, `moved_by: auto`.
+            let as_json = |ev: &ChatEvent| serde_json::to_value(ev).unwrap();
+            for thread in [&old, &new] {
+                let stated = stored_events(&w, thread).await;
+                let relayed = relayed_of(&stated);
+                assert_eq!(relayed.len(), 1, "{thread}");
+                assert_eq!(as_json(relayed[0]), as_json(&on_old), "{thread}");
+            }
+            // Nobody imposed the target: the router goes on choosing there.
+            let node = w
+                .graph
+                .get_chat_session(Uuid::parse_str(&new).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(node.provider_id.as_deref(), Some("local2"));
+            assert_eq!(node.model, "m");
+            assert_eq!(node.routed_by.as_deref(), Some("auto"));
+            assert_eq!(node.routing_mode.as_deref(), Some("full"));
+            let checks = mover.checks();
+            assert_eq!(checks.len(), 1);
+            assert!(checks[0].pool.iter().any(|f| f.provider_id == "local2"));
+        }
+
+        #[tokio::test]
+        async fn two_consecutive_turns_do_not_flip_flop_between_providers() {
+            let (w, mover) = auto_world("auto", vec!["local2", "local"], false).await;
+            let old = first_turn(&w).await;
+            hand_back_to_po(&w, &old).await;
+            idle(&w, &old).await;
+            let mut old_rx = w.manager.subscribe(&old).await.unwrap();
+            w.manager
+                .send_message(&old, "second question")
+                .await
+                .unwrap();
+            let ChatEvent::ConversationRelayed {
+                to_session_id: new, ..
+            } = next_event(&mut old_rx, |e| {
+                matches!(e, ChatEvent::ConversationRelayed { .. })
+            })
+            .await
+            else {
+                unreachable!()
+            };
+            stored_until(&w, &new, |records| {
+                records
+                    .iter()
+                    .any(|r| r.event_type == "assistant_text" && r.data.contains("the answer"))
+            })
+            .await;
+            idle(&w, &new).await;
+
+            // The router now prefers the way back: right after a move, it is only recorded.
+            answered_in_place(&w, &new, "second question, again").await;
+            assert_eq!(
+                relayed_of(&stored_events(&w, &new).await).len(),
+                1,
+                "the move in only"
+            );
+            let checks = mover.checks();
+            assert_eq!(checks.len(), 2);
+            assert_eq!(
+                checks[1].settings.stage,
+                LearningStage::Shadow,
+                "recorded, not applied"
+            );
+            assert_eq!(checks[1].current, Some(Pick::new("local2", "m")));
+        }
+
+        #[tokio::test]
+        async fn the_shadow_stage_records_the_provider_decision_and_moves_nothing() {
+            let (w, mover) = auto_world("shadow", vec!["local2"], false).await;
+            let old = first_turn(&w).await;
+            hand_back_to_po(&w, &old).await;
+            idle(&w, &old).await;
+            answered_in_place(&w, &old, "second question").await;
+            let checks = mover.checks();
+            assert_eq!(checks.len(), 1, "the decision is taken, so recorded");
+            assert_eq!(checks[0].settings.stage, LearningStage::Shadow);
+            assert_eq!(requests_with(&w, "conversation_relay").len(), 0);
+        }
+
+        #[tokio::test]
+        async fn a_model_imposed_by_the_request_is_never_moved() {
+            let (w, mover) = auto_world("auto", vec!["local2"], false).await;
+            let mut req = request(Some("local"), Some("proj"), "default");
+            req.model = Some("m".into());
+            let old = w.manager.create_session(&req).await.unwrap().session_id;
+            stored_until(&w, &old, |records| {
+                records.iter().any(|r| r.event_type == "assistant_text")
+            })
+            .await;
+            idle(&w, &old).await;
+            answered_in_place(&w, &old, "second question").await;
+            assert!(
+                mover.checks().is_empty(),
+                "an imposed pair is not even asked about"
+            );
+        }
+
+        #[tokio::test]
+        async fn mixed_never_leaves_the_sessions_provider() {
+            let (w, mover) = auto_world("auto", vec!["local2"], false).await;
+            let old = first_turn(&w).await;
+            let pair = |provider: &str| RoutingPoolEntry {
+                provider: provider.into(),
+                model: "m".into(),
+            };
+            w.manager
+                .set_session_routing(
+                    &old,
+                    &SessionRoutingRequest {
+                        auto: false,
+                        routing_pool: vec![pair("local"), pair("local2")],
+                    },
+                )
+                .await
+                .unwrap();
+            idle(&w, &old).await;
+            answered_in_place(&w, &old, "second question").await;
+            assert!(mover.checks().is_empty(), "mixed asks no provider question");
+        }
+
+        #[tokio::test]
+        async fn a_move_the_projects_consent_refuses_stays_and_its_decision_says_why() {
+            // The fake decider ignores the consent the filter would apply: the relay's
+            // opening refuses on its own (endpoint_not_allowed), whoever asked.
+            let (w, _mover) = auto_world("auto", vec!["local3"], true).await;
+            let old = first_turn(&w).await;
+            hand_back_to_po(&w, &old).await;
+            idle(&w, &old).await;
+            answered_in_place(&w, &old, "second question").await;
+            let sent = requests_with(&w, "second question");
+            assert_eq!(sent.len(), 1);
+            assert!(
+                !sent[0].contains("conversation_relay"),
+                "sent to the old session"
+            );
+            let decisions = Neo4jRoutingStore::new(w.graph.clone())
+                .decisions(&DecisionFilter::default())
+                .await
+                .unwrap();
+            let refused = decisions
+                .iter()
+                .find(|d| d.chosen.as_ref().is_some_and(|p| p.provider_id == "local3"))
+                .expect("the decision of the refused move is stored");
+            assert!(!refused.applied);
+            assert!(
+                refused.reason.ends_with("not_moved: endpoint_not_allowed"),
+                "{}",
+                refused.reason
+            );
+        }
+
+        /// The legacy engine (the Claude CLI) moves the same way: the check is on the
+        /// manager's send path, before either engine starts the turn.
+        #[tokio::test]
+        async fn a_claude_code_cli_conversation_moves_too() {
+            let cli = FakeClaude::new();
+            let mut w = hybrid_world(&cli).await;
+            // Opened under `primary` (so the opening itself stays on Claude Code), stage auto.
+            routing(&w, "primary", "auto").await;
+            let mover = Mover::new(vec!["local"]);
+            w.manager = std::mem::replace(&mut w.manager, manager(w.graph.clone(), true))
+                .with_turn_decider(mover.clone(), Arc::new(Instances));
+            let cc1 = w
+                .manager
+                .create_session(&request(None, Some("proj"), "default"))
+                .await
+                .unwrap()
+                .session_id;
+            assert!(!w.manager.agent_runtime.owns(&cc1).await, "legacy engine");
+            stored_until(&w, &cc1, |records| {
+                records.iter().any(|r| r.event_type == "result")
+            })
+            .await;
+            idle(&w, &cc1).await;
+            hand_back_to_po(&w, &cc1).await;
+            let mut old_rx = w.manager.subscribe(&cc1).await.unwrap();
+
+            w.manager
+                .send_message(&cc1, "second question")
+                .await
+                .unwrap();
+
+            let ChatEvent::ConversationRelayed {
+                to_session_id: native,
+                moved_by,
+                from_provider,
+                to_provider,
+                ..
+            } = next_event(&mut old_rx, |e| {
+                matches!(e, ChatEvent::ConversationRelayed { .. })
+            })
+            .await
+            else {
+                unreachable!()
+            };
+            assert_eq!(moved_by, "auto");
+            assert_eq!(
+                (from_provider.as_str(), to_provider.as_str()),
+                ("claude-code", "local")
+            );
+            stored_until(&w, &native, |records| {
+                records
+                    .iter()
+                    .any(|r| r.event_type == "assistant_text" && r.data.contains("the answer"))
+            })
+            .await;
+            assert!(!w.manager.is_session_active(&cc1).await);
+            assert!(
+                !cli.stdin().contains("second question"),
+                "the CLI never got the turn: {}",
+                cli.stdin()
+            );
+            assert_eq!(mover.checks().len(), 1);
+            w.manager.close_session(&native).await.ok();
+        }
+    }
 }
 
 // ============================================================================
@@ -4056,9 +4572,12 @@ mod parity {
                 project_slug: None,
                 trust: false,
                 explicit_model: false,
+                provider_imposed: false,
                 allowed_models: None,
                 current_model: "m".into(),
                 next_turn: 0,
+                routing_pool: None,
+                moved_in: false,
             },
         ));
         r.manager.turn_routing.insert(&r.sid, Arc::clone(&router));
