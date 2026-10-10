@@ -218,7 +218,21 @@ pub fn build_native_provider(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
 ) -> Result<Arc<dyn AgentProvider>, ProviderError> {
-    build_provider_with_handle(record, vault, None).map(|(provider, _)| provider)
+    build_provider_with_handle(record, vault, None, &AcpSetup::default())
+        .map(|(provider, _)| provider)
+}
+
+/// Where the ACP instances of a server come from: the declared commands and the root
+/// of their dedicated `HOME`s. The default reads the declaration from
+/// `CHAT_PROVIDER_ACP_COMMANDS` and keeps nexus' default `HOME`
+/// (`<user data dir>/nexus/acp/<instance>/home`); a test gives both, so that it neither
+/// mutates the process environment nor writes in the user's real data directory.
+#[derive(Debug, Clone, Default)]
+pub struct AcpSetup {
+    /// Root of the `HOME` of each instance: `<root>/<instance>/home`.
+    pub homes: Option<std::path::PathBuf>,
+    /// The declared agents, instead of `CHAT_PROVIDER_ACP_COMMANDS`.
+    pub commands: Option<std::collections::BTreeMap<String, super::settings::AcpCommand>>,
 }
 
 /// A provider and, for a native record, its concrete harness.
@@ -227,15 +241,17 @@ pub type BuiltProvider = (Arc<dyn AgentProvider>, Option<Arc<NativeProvider>>);
 /// Same, also returning the concrete native harness when the record is one: only
 /// it can run a capability probe (the trait has no such method).
 /// `transcripts`: where the native sessions keep their conversations
-/// ([`build_native_for_sessions`]).
+/// ([`build_native_for_sessions`]). `acp`: the declared ACP agents and where their
+/// `HOME`s live ([`AcpSetup`]).
 pub fn build_provider_with_handle(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
     transcripts: Option<&std::path::Path>,
+    acp: &AcpSetup,
 ) -> Result<BuiltProvider, ProviderError> {
     match record.kind.as_str() {
         "codex" => build_codex(record, vault).map(|p| (p, None)),
-        "acp" => build_acp(record).map(|p| (p, None)),
+        "acp" => build_acp(record, acp).map(|p| (p, None)),
         super::settings::KIND_CLAUDE_CODE_REMOTE => {
             build_remote_claude(record, vault).map(|p| (p, None))
         }
@@ -280,20 +296,29 @@ fn build_codex(
 
 /// ACP: the command is the one DECLARED on the server under the instance's
 /// preset; the agent holds its own login (no credential).
-fn build_acp(record: &InstanceRecord) -> Result<Arc<dyn AgentProvider>, ProviderError> {
+fn build_acp(
+    record: &InstanceRecord,
+    acp: &AcpSetup,
+) -> Result<Arc<dyn AgentProvider>, ProviderError> {
     use nexus_claude::providers::acp::{AcpConfig, AcpProvider};
     let name = record
         .preset
         .as_deref()
         .ok_or_else(|| ProviderError::invalid("an ACP instance names a declared agent"))?;
-    let command = super::settings::acp_commands()
+    let command = acp
+        .commands
+        .clone()
+        .unwrap_or_else(super::settings::acp_commands)
         .remove(name)
         .ok_or_else(|| ProviderError::invalid("that ACP agent is not declared on this server"))?;
-    // An agent known to refuse MCP servers per session (OpenClaw's ACP bridge) is
-    // declared so: the provider says `per_session_mcp: false` and is given none.
-    let per_session_mcp = super::settings::acp_command_carries_mcp(&command);
-    let mut config = AcpConfig::new(record.id.clone(), command);
+    // An agent that takes no MCP server per session (declared so, or OpenClaw's ACP
+    // bridge by name): the provider says `per_session_mcp: false` and is given none.
+    let per_session_mcp = command.carries_mcp();
+    let mut config = AcpConfig::new(record.id.clone(), command.argv);
     config.per_session_mcp = per_session_mcp;
+    if let Some(root) = &acp.homes {
+        config.home = root.join(&record.id).join("home");
+    }
     config.default_model = record.default_model.clone();
     config.cost_basis = cost_basis_of(record);
     config.validate()?;

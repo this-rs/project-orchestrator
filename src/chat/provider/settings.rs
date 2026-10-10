@@ -376,20 +376,84 @@ fn check_url(url: &str, policy: &EndpointPolicy) -> Result<String, SettingsError
 /// Environment variable declaring the ACP agents an instance may launch: a
 /// JSON object, `{"opencode": ["opencode", "acp"]}`. EMPTY BY DEFAULT: an API
 /// body never carries a command line (that would be remote code execution as
-/// the server's user); it names a declared one by `preset`.
+/// the server's user); it names a declared one by `preset`. An entry may also be
+/// `{"argv": [...], "per_session_mcp": false}`: the agent takes no MCP server per
+/// session (see [`AcpCommand`]).
 pub const ACP_COMMANDS_VAR: &str = "CHAT_PROVIDER_ACP_COMMANDS";
 
+/// One declared ACP agent: the command that starts it and, when the operator says
+/// so, whether it takes MCP servers per session.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(untagged)]
+enum AcpCommandDecl {
+    Argv(Vec<String>),
+    Full(AcpCommandFull),
+}
+
+/// The object form of a declared ACP agent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcpCommandFull {
+    argv: Vec<String>,
+    #[serde(default)]
+    per_session_mcp: Option<bool>,
+}
+
+/// A declared ACP agent ([`ACP_COMMANDS_VAR`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpCommand {
+    /// Program and arguments.
+    pub argv: Vec<String>,
+    /// What the operator declared: `Some(false)` for an agent that takes no MCP
+    /// server per session (an OpenClaw launched through a wrapper, an older OpenClaw
+    /// that IGNORES them without a word). `None`: [`acp_command_carries_mcp`] decides.
+    pub per_session_mcp: Option<bool>,
+}
+
+impl AcpCommand {
+    /// Whether the agent takes MCP servers per session: the declaration, else the
+    /// name of a known agent among the arguments.
+    pub fn carries_mcp(&self) -> bool {
+        self.per_session_mcp
+            .unwrap_or_else(|| acp_command_carries_mcp(&self.argv))
+    }
+}
+
 /// The declared ACP commands.
-pub fn acp_commands() -> std::collections::BTreeMap<String, Vec<String>> {
+pub fn acp_commands() -> std::collections::BTreeMap<String, AcpCommand> {
     parse_acp_commands(&std::env::var(ACP_COMMANDS_VAR).unwrap_or_default())
 }
 
-/// Parses the declaration; anything malformed declares nothing.
-pub fn parse_acp_commands(raw: &str) -> std::collections::BTreeMap<String, Vec<String>> {
-    serde_json::from_str::<std::collections::BTreeMap<String, Vec<String>>>(raw)
+/// Parses the declaration: a malformed whole declares nothing, a malformed entry (an
+/// unknown field, a misspelt `per_session_mcp`) is left out, never half-read.
+pub fn parse_acp_commands(raw: &str) -> std::collections::BTreeMap<String, AcpCommand> {
+    serde_json::from_str::<std::collections::BTreeMap<String, serde_json::Value>>(raw)
         .unwrap_or_default()
         .into_iter()
-        .filter(|(name, argv)| valid_id(name) && !argv.is_empty() && !argv[0].trim().is_empty())
+        .filter_map(|(name, value)| {
+            serde_json::from_value::<AcpCommandDecl>(value)
+                .ok()
+                .map(|decl| (name, decl))
+        })
+        .map(|(name, decl)| {
+            let command = match decl {
+                AcpCommandDecl::Argv(argv) => AcpCommand {
+                    argv,
+                    per_session_mcp: None,
+                },
+                AcpCommandDecl::Full(AcpCommandFull {
+                    argv,
+                    per_session_mcp,
+                }) => AcpCommand {
+                    argv,
+                    per_session_mcp,
+                },
+            };
+            (name, command)
+        })
+        .filter(|(name, command)| {
+            valid_id(name) && !command.argv.is_empty() && !command.argv[0].trim().is_empty()
+        })
         .collect()
 }
 
@@ -400,32 +464,19 @@ pub fn parse_acp_commands(raw: &str) -> std::collections::BTreeMap<String, Vec<S
 /// gateway (`openclaw mcp set`).
 const ACP_AGENTS_WITHOUT_PER_SESSION_MCP: &[&str] = &["openclaw"];
 
-/// Whether the ACP agent this declared command starts takes MCP servers per session:
-/// `false` when its program (file name, without a Windows extension) is a known agent
-/// that refuses them ([`ACP_AGENTS_WITHOUT_PER_SESSION_MCP`]).
+/// Whether the ACP agent this command starts takes MCP servers per session, as far
+/// as its arguments tell: `false` when ANY argument's file name, with at most one
+/// extension removed, is a known agent that refuses them
+/// ([`ACP_AGENTS_WITHOUT_PER_SESSION_MCP`]) — `openclaw`, `/usr/bin/openclaw`,
+/// `npx openclaw acp`, `node …/openclaw.mjs`, `env openclaw`, `OpenClaw.cmd`. A
+/// convenience: the declaration's `per_session_mcp` wins over it.
 pub fn acp_command_carries_mcp(argv: &[String]) -> bool {
-    let Some(program) = argv.first() else {
-        return true;
-    };
-    // Both separators: a declaration may name a Windows path on any host.
-    let file = program.rsplit(['/', '\\']).next().unwrap_or(program);
-    let name = file.split('.').next().unwrap_or(file).to_ascii_lowercase();
-    !ACP_AGENTS_WITHOUT_PER_SESSION_MCP.contains(&name.as_str())
-}
-
-/// Whether a session of this instance can be given the project-orchestrator MCP
-/// server, as far as its RECORD says: an ACP instance whose declared agent refuses
-/// per-session MCP servers cannot ([`acp_command_carries_mcp`]); every other can (the
-/// provider's capabilities say the rest).
-pub fn instance_carries_mcp(record: &InstanceRecord) -> bool {
-    if record.kind != "acp" {
-        return true;
-    }
-    record
-        .preset
-        .as_deref()
-        .and_then(|name| acp_commands().remove(name))
-        .is_none_or(|argv| acp_command_carries_mcp(&argv))
+    !argv.iter().any(|arg| {
+        // Both separators: a declaration may name a Windows path on any host.
+        let file = arg.rsplit(['/', '\\']).next().unwrap_or(arg);
+        let name = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
+        ACP_AGENTS_WITHOUT_PER_SESSION_MCP.contains(&name.to_ascii_lowercase().as_str())
+    })
 }
 
 /// Kinds that run a local process instead of calling an endpoint: they have no
@@ -1281,24 +1332,47 @@ mod tests {
         );
         assert_eq!(declared.keys().collect::<Vec<_>>(), vec!["opencode"]);
         assert!(parse_acp_commands("not json").is_empty());
-        // OpenClaw's ACP bridge takes no MCP server per session, whatever the path.
+        // OpenClaw's ACP bridge takes no MCP server per session: found by name among
+        // ALL the arguments (wrappers included), one extension removed at most.
         let argv = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
-        assert!(acp_command_carries_mcp(&argv(&["opencode", "acp"])));
-        assert!(!acp_command_carries_mcp(&argv(&[
-            "openclaw",
-            "acp",
-            "--token-file",
-            "/run/oc"
-        ])));
-        assert!(!acp_command_carries_mcp(&argv(&[
-            "/usr/local/bin/openclaw",
-            "acp"
-        ])));
-        assert!(!acp_command_carries_mcp(&argv(&[
-            r"C:\tools\OpenClaw.cmd",
-            "acp"
-        ])));
+        for carries in [
+            &["opencode", "acp"][..],
+            &["node", "/opt/oc/openclaw.config.mjs", "acp"],
+            &["agent", "--url", "wss://openclaw.example/ws"],
+        ] {
+            assert!(acp_command_carries_mcp(&argv(carries)), "{carries:?}");
+        }
+        for refuses in [
+            &["openclaw", "acp", "--token-file", "/run/oc"][..],
+            &["/usr/local/bin/openclaw", "acp"],
+            &[r"C:\tools\OpenClaw.cmd", "acp"],
+            &["npx", "openclaw", "acp"],
+            &["pnpm", "dlx", "openclaw", "acp"],
+            &["bunx", "openclaw", "acp"],
+            &["node", "/opt/oc/dist/openclaw.mjs", "acp"],
+            &["env", "openclaw", "acp"],
+        ] {
+            assert!(!acp_command_carries_mcp(&argv(refuses)), "{refuses:?}");
+        }
         assert!(acp_command_carries_mcp(&[]));
+        // The declaration wins over the name, both ways.
+        let declared = parse_acp_commands(
+            r#"{"old": {"argv": ["my-bridge", "acp"], "per_session_mcp": false},
+                "named": ["openclaw", "acp"],
+                "forced": {"argv": ["openclaw", "acp"], "per_session_mcp": true},
+                "plain": {"argv": ["opencode", "acp"]},
+                "typo": {"argv": ["x"], "per_session_mpc": false}}"#,
+        );
+        assert_eq!(
+            declared.keys().collect::<Vec<_>>(),
+            vec!["forced", "named", "old", "plain"],
+            "an unknown field declares nothing"
+        );
+        assert!(!declared["old"].carries_mcp());
+        assert!(!declared["named"].carries_mcp());
+        assert!(declared["forced"].carries_mcp());
+        assert!(declared["plain"].carries_mcp());
+        assert_eq!(declared["old"].argv, argv(&["my-bridge", "acp"]));
         assert!(serde_json::from_value::<InstanceDraft>(
             serde_json::json!({"id": "a", "kind": "acp", "command": ["sh", "-c", "evil"]})
         )
