@@ -62,6 +62,7 @@ diagrams:
     file: docs/diagrams/po-provider-settings.mmd
     covers:
       - "backend:src/api/provider_handlers.rs"
+      - "backend:src/api/network_tools_handlers.rs"
   - name: po-chat-provider
     owner: theotime
     status: verified

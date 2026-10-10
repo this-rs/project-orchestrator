@@ -18,6 +18,7 @@ pub mod hook_handlers;
 #[cfg(test)]
 pub(crate) mod list_routes_tests;
 pub mod mcp_federation_handlers;
+pub mod network_tools_handlers;
 pub mod neural_routing_handlers;
 pub mod note_handlers;
 pub mod persona_handlers;
