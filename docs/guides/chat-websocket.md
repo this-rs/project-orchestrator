@@ -128,8 +128,24 @@ messages yet. Both are also logged by the server with the step name.
 #### `permission_response` -- Respond to a permission request
 
 ```json
-{"type": "permission_response", "id": "pr_1", "allow": true}
+{"type": "permission_response", "id": "pr_1", "allow": true, "scope": "session"}
 ```
+
+`scope` (optional, default `once`) says how long an approval lasts: `once` (this call),
+`session` (the same tool is not asked again in this session), `always` (not asked again in
+this project, after a restart too). Only the scopes the session declares in
+`system_init.capabilities.permission_scopes` may be sent; another one is refused with an
+`error` frame `{"code": "permission_scope_unsupported", "reason": "<scope>"}` and the request
+stays waiting. Claude Code (legacy engine) writes the CLI's `permission_suggestions` back as
+`updatedPermissions` with the destination `session`, or `localSettings`
+(`<project>/.claude/settings.local.json`) for `always` (without a suggestion: a rule for the tool
+for `session` only; `always` is refused). A native session keeps `session` in its harness and
+`always` in the backend's rules (`<app dir>/permission-rules.json`, per project directory), scoped
+on the call as the nexus policy patterns are: `Bash(git status)` + `Bash(git status *)`, the file
+path, `WebFetch(domain:host)`, the exact argument otherwise; a compound or wrapped command gets no
+`always`. The resulting `permission_decision` carries the same `scope`. The REST
+twin `POST /api/chat/sessions/{id}/permissions/{request_id}` takes `{"allow", "scope"?}` (400
+`permission_scope_unsupported`).
 
 #### `input_response` -- Respond to an input request
 

@@ -141,6 +141,8 @@ const HUMAN_ONLY_MUTATION_PREFIXES: &[&str] = &[
     "/api/chat/model-policy",
     "/api/chat/model-aliases",
     "/api/chat/routing",
+    // Search engines are tool providers: declaring one decides where a session's queries go (P6).
+    "/api/chat/search-engines",
 ];
 
 /// Per-project settings that decide where a project's content may go
@@ -149,6 +151,10 @@ const HUMAN_ONLY_PROJECT_SEGMENT: &str = "/llm-";
 /// The project's routing override (`/api/projects/{slug}/routing`): it decides
 /// which provider the project's sessions may be routed to.
 const HUMAN_ONLY_PROJECT_ROUTING: &str = "/routing";
+/// The project's network tools (`/api/projects/{slug}/network-tools/...`): the origins its
+/// sessions may reach and the browser (P6). An agent that could consent would open the web to
+/// itself.
+const HUMAN_ONLY_PROJECT_NETWORK_TOOLS: &str = "/network-tools";
 
 /// Whether `method path` is a mutation only a human session may perform.
 ///
@@ -169,7 +175,8 @@ pub fn is_human_only_mutation(method: &axum::http::Method, path: &str) -> bool {
     HUMAN_ONLY_MUTATION_PREFIXES.iter().any(|p| under(p))
         || (path.starts_with("/api/projects/")
             && (path.contains(HUMAN_ONLY_PROJECT_SEGMENT)
-                || path.ends_with(HUMAN_ONLY_PROJECT_ROUTING)))
+                || path.ends_with(HUMAN_ONLY_PROJECT_ROUTING)
+                || path.contains(HUMAN_ONLY_PROJECT_NETWORK_TOOLS)))
         // Answering a permission prompt IS the human's decision: an agent that
         // could post it would approve its own tool calls.
         || (path.starts_with("/api/chat/sessions/") && path.contains("/permissions/"))
@@ -991,6 +998,27 @@ mod tests {
         assert!(!is_human_only_mutation(
             &Method::GET,
             "/api/projects/p/routing"
+        ));
+        // P6: the network tools of a project and the search engines.
+        assert!(is_human_only_mutation(
+            &Method::PUT,
+            "/api/projects/p/network-tools/origins"
+        ));
+        assert!(is_human_only_mutation(
+            &Method::PUT,
+            "/api/projects/p/network-tools/browser"
+        ));
+        assert!(!is_human_only_mutation(
+            &Method::GET,
+            "/api/projects/p/network-tools"
+        ));
+        assert!(is_human_only_mutation(
+            &Method::POST,
+            "/api/chat/search-engines"
+        ));
+        assert!(is_human_only_mutation(
+            &Method::DELETE,
+            "/api/chat/search-engines/brave"
         ));
         assert!(
             is_human_only_mutation(&Method::POST, "/api/chat/sessions/abc/permissions/req-1"),
