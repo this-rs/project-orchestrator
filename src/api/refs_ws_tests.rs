@@ -11,12 +11,8 @@ use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use uuid::Uuid;
 
-use crate::api::handlers::ServerState;
-use crate::api::routes::create_router;
 use crate::chat::manager::{test_support, ChatManager};
 use crate::neo4j::GraphStore;
-use crate::orchestrator::watcher::FileWatcher;
-use crate::orchestrator::Orchestrator;
 use crate::refs::test_support::{task_titled, world};
 use crate::test_helpers::{mock_app_state_with_graph, test_chat_session};
 
@@ -59,45 +55,7 @@ async fn rig(refs_v1: bool) -> Rig {
         )
         .with_refs_v1(refs_v1),
     );
-    let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
-    let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
-        orchestrator.clone(),
-    )));
-    let state = Arc::new(ServerState {
-        orchestrator,
-        watcher,
-        chat_manager: Some(manager.clone()),
-        event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
-            crate::events::EventBus::default(),
-        ))),
-        nats_emitter: None,
-        auth_config: None,
-        serve_frontend: false,
-        frontend_path: "./dist".to_string(),
-        setup_completed: true,
-        server_port: 0,
-        public_url: None,
-        remote_mcp: crate::RemoteMcpConfig::default(),
-        ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
-        registry_remote_url: None,
-        oidc_client: None,
-        neural_router: crate::test_helpers::mock_neural_router(),
-        trajectory_collector: std::sync::RwLock::new(None),
-        trajectory_store_neo4j: None,
-        trajectory_store: None,
-        identity: None,
-        reactor_counters: std::sync::OnceLock::new(),
-        confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
-        mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
-        model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
-        vault: crate::vault::VaultService::ephemeral(),
-    });
-    let app = create_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+    let addr = crate::test_helpers::serve_chat(manager.clone(), graph.clone()).await;
     Rig {
         manager,
         graph,

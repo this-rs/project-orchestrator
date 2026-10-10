@@ -8923,6 +8923,17 @@ impl ChatManager {
     /// the SIGINT. The local rate cap still applies to prevent flooding
     /// NATS itself.
     pub async fn cancel_running_tools(&self, session_id: &str) -> Result<CancelToolsResult> {
+        // The agent engine: the session handle stops the tools through the
+        // provider (`AgentSession::cancel_tools`, scope all), under the same
+        // per-session cap, and announces `tools_cancelled` itself — stored and
+        // published to the other instances like every event of the session.
+        // The session is local: the signal is not sent over NATS, which would
+        // only come back to our own listener (`spawn_agent_nats_listeners`)
+        // and cancel twice.
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return handle.cancel_tools().await;
+        }
+
         // Look up session-local state in a single read lock.
         let session_state = {
             let sessions = self.active_sessions.read().await;
@@ -9223,7 +9234,7 @@ impl ChatManager {
     /// without the warning-emission gate — cancel_tools is user-driven
     /// and the caller surfaces the cap hit directly via the HTTP 429
     /// or `capped: true` response.
-    async fn check_and_record_cancel_cap(
+    pub(crate) async fn check_and_record_cancel_cap(
         history: &Arc<Mutex<VecDeque<Instant>>>,
         cap: u32,
         window: Duration,
@@ -10777,9 +10788,10 @@ impl ChatManager {
 
     /// What the other instances can ask of a session of the agent engine this
     /// instance runs, as for a Claude Code session (`spawn_nats_*_listener`):
-    /// an interrupt, a streaming snapshot (a client joining mid-turn there), and
-    /// the RPC send (a message, a held message, a queue op, a permission answer,
-    /// the auto-continue toggle). They end when the session closes.
+    /// an interrupt, a cancel of the running tools, a streaming snapshot (a
+    /// client joining mid-turn there), and the RPC send (a message, a held
+    /// message, a queue op, a permission answer, the auto-continue toggle).
+    /// They end when the session closes.
     fn spawn_agent_nats_listeners(&self, handle: Arc<super::agent_runtime::AgentSessionHandle>) {
         let Some(nats) = self.nats.clone() else {
             return;
@@ -10798,6 +10810,30 @@ impl ChatManager {
                         msg = sub.next() => {
                             if msg.is_none() { break; }
                             let _ = handle.interrupt().await;
+                        }
+                    }
+                }
+            });
+        }
+        {
+            // `cancel_tools` asked on another instance (`cancel_running_tools`
+            // there finds no local session and publishes): the handle applies
+            // the cap and stops the tools, as `spawn_nats_cancel_tools_listener`
+            // does for a Claude Code session.
+            let (nats, handle, sid) = (nats.clone(), Arc::clone(&handle), sid.clone());
+            tokio::spawn(async move {
+                let Ok(mut sub) = nats.subscribe_cancel_tools(&sid).await else {
+                    warn!(session_id = %sid, "agent engine: NATS cancel_tools subscription failed");
+                    return;
+                };
+                loop {
+                    tokio::select! {
+                        _ = handle.closed.cancelled() => break,
+                        msg = sub.next() => {
+                            if msg.is_none() { break; }
+                            if let Err(e) = handle.cancel_tools().await {
+                                warn!(session_id = %sid, error = %e, "agent engine: NATS cancel_tools failed");
+                            }
                         }
                     }
                 }
@@ -19619,6 +19655,30 @@ mod tests {
             ChatManager::check_and_record_cancel_cap(&history, cap, window).await,
             "after window expiry, calls should be allowed again"
         );
+    }
+
+    /// P5: through `cancel_running_tools` (what the WS `cancel_tools` frame and
+    /// the REST route call), a Claude Code session takes `CANCEL_TOOLS_CAP`
+    /// cancels per window, then refuses with `capped` — the agent engine
+    /// applies the same cap (`agent_e2e_tests::cancel_tools`).
+    #[tokio::test]
+    async fn test_cancel_running_tools_caps_a_claude_code_session() {
+        let (session, _) = create_dummy_session(false, "", vec![]);
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("legacy".into(), session);
+
+        for i in 0..CANCEL_TOOLS_CAP {
+            let result = manager.cancel_running_tools("legacy").await.unwrap();
+            assert!(!result.capped, "call {i} is within the cap");
+        }
+        let past = manager.cancel_running_tools("legacy").await.unwrap();
+        assert!(past.capped, "the call past the cap is refused");
+        assert!(past.killed_pids.is_empty());
     }
 
     #[test]
