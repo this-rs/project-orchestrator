@@ -572,6 +572,7 @@
           },
           "parent_tool_use_id": "toolu_01ParentTask0000000000",
           "tool": "Bash",
+          "tool_use_id": "toolu_01Example0000000000000",
           "type": "permission_request"
         },
         "minimal": {
@@ -604,6 +605,10 @@
         },
         "tool": {
           "required": true,
+          "type": "string"
+        },
+        "tool_use_id": {
+          "required": false,
           "type": "string"
         },
         "type": {
@@ -1169,9 +1174,12 @@
       "examples": {
         "full": {
           "called_at": 1760099990.012,
+          "cancelled": true,
           "ended_at": 1760099999.123,
           "id": "toolu_01Example0000000000000",
+          "incomplete": true,
           "parent_tool_use_id": "toolu_01ParentTask0000000000",
+          "permission_outcome": "allowed",
           "permission_requested_at": 1760099990.461,
           "permission_resolved_at": 1760099996.208,
           "run_started_at": 1760099996.208,
@@ -1189,6 +1197,10 @@
           "required": false,
           "type": "number"
         },
+        "cancelled": {
+          "required": false,
+          "type": "boolean"
+        },
         "ended_at": {
           "required": true,
           "type": "number"
@@ -1197,7 +1209,15 @@
           "required": true,
           "type": "string"
         },
+        "incomplete": {
+          "required": false,
+          "type": "boolean"
+        },
         "parent_tool_use_id": {
+          "required": false,
+          "type": "string"
+        },
+        "permission_outcome": {
           "required": false,
           "type": "string"
         },

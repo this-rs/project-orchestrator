@@ -297,6 +297,11 @@ fn server_examples() -> Vec<ServerExample> {
                 parent_tool_use_id: None,
             },
         ),
+        // `full` sets every optional field: the fields of the contract are derived
+        // from it, and the two booleans are absent when false. Hence `cancelled`
+        // (coherent here: an allowed call interrupted while it ran) and `incomplete`
+        // together with `run_started_at`, which the clock never sends together (an
+        // incomplete timing has no run start). Field coverage, not a real frame.
         ServerExample::new(
             ChatEvent::ToolTiming {
                 id: s(TOOL_USE_ID),
@@ -304,8 +309,11 @@ fn server_examples() -> Vec<ServerExample> {
                 started_at: Some(1760099990.457),
                 permission_requested_at: Some(1760099990.461),
                 permission_resolved_at: Some(1760099996.208),
+                permission_outcome: Some(s("allowed")),
                 run_started_at: Some(1760099996.208),
                 ended_at: 1760099999.123,
+                cancelled: true,
+                incomplete: true,
                 parent_tool_use_id: parent(),
             },
             ChatEvent::ToolTiming {
@@ -314,8 +322,11 @@ fn server_examples() -> Vec<ServerExample> {
                 started_at: None,
                 permission_requested_at: None,
                 permission_resolved_at: None,
+                permission_outcome: None,
                 run_started_at: None,
                 ended_at: 1760099999.123,
+                cancelled: false,
+                incomplete: false,
                 parent_tool_use_id: None,
             },
         ),
@@ -327,6 +338,7 @@ fn server_examples() -> Vec<ServerExample> {
                 parent_tool_use_id: parent(),
                 category: Some(s("read")),
                 canonical: Some(s("read_file")),
+                tool_use_id: Some(s(TOOL_USE_ID)),
             },
             ChatEvent::PermissionRequest {
                 id: s("perm_0001"),
@@ -335,6 +347,7 @@ fn server_examples() -> Vec<ServerExample> {
                 parent_tool_use_id: None,
                 category: None,
                 canonical: None,
+                tool_use_id: None,
             },
         ),
         ServerExample::new(

@@ -871,10 +871,17 @@ impl AgentSessionHandle {
         } else {
             PermissionDecision::deny()
         };
-        self.session
-            .answer_permission(request_id, decision)
-            .await
-            .map_err(anyhow::Error::new)?;
+        // On the tool clock BEFORE the provider has it: a fast tool's result cannot
+        // overtake it.
+        // A second answer (double click, two tabs) the provider refuses takes back
+        // only its own mark, never the first answer's.
+        let mark = self
+            .tool_clock
+            .decided(request_id, allow, chrono::Utc::now());
+        if let Err(e) = self.session.answer_permission(request_id, decision).await {
+            self.tool_clock.undecided(request_id, mark);
+            return Err(anyhow::Error::new(e));
+        }
         self.emit(ChatEvent::PermissionDecision {
             id: request_id.to_string(),
             allow,
@@ -1255,6 +1262,9 @@ pub(crate) mod fake {
         /// none at open, the one of the first `session_started` / `done` that carries
         /// one, the token's at resume.
         pub provider_session_id: StdMutex<Option<String>>,
+        /// When set, `answer_permission` waits for this signal before it returns: the
+        /// provider is slow to take the answer.
+        pub hold_answers: StdMutex<Option<Arc<tokio::sync::Notify>>>,
     }
 
     impl FakeState {
@@ -1334,11 +1344,18 @@ pub(crate) mod fake {
             request_id: &str,
             decision: PermissionDecision,
         ) -> Result<(), ProviderError> {
-            self.state
-                .permission_answers
-                .lock()
-                .unwrap()
-                .push((request_id.to_string(), decision));
+            let hold = self.state.hold_answers.lock().unwrap().clone();
+            if let Some(hold) = hold {
+                hold.notified().await;
+            }
+            let mut answers = self.state.permission_answers.lock().unwrap();
+            // As nexus does: a request is answered once.
+            if answers.iter().any(|(id, _)| id == request_id) {
+                return Err(ProviderError::invalid(format!(
+                    "no pending permission request {request_id}"
+                )));
+            }
+            answers.push((request_id.to_string(), decision));
             Ok(())
         }
         async fn answer_question(
@@ -2025,5 +2042,164 @@ mod image_tests {
                 other => panic!("{other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_timing_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+    use crate::neo4j::traits::GraphStore as _;
+    use serde_json::json;
+
+    /// The provider is slow to take the answer and the tool is fast: its result is
+    /// emitted before the decision event. The answer was put on the clock before it
+    /// was handed over, so the timing still has it, and the run starts there.
+    #[tokio::test]
+    async fn a_permission_answer_is_timed_even_when_the_result_overtakes_its_event() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph.clone());
+        let provider = FakeProvider::new();
+        let sid = Uuid::new_v4().to_string();
+        let handle = runtime
+            .adopt(
+                &sid,
+                "claude-code",
+                provider.session(),
+                1,
+                "native",
+                json!({}),
+                None,
+            )
+            .await;
+        handle
+            .emit(ChatEvent::ToolUse {
+                id: "t1".into(),
+                tool: "Bash".into(),
+                input: json!({"command": "ls"}),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+            })
+            .await;
+        handle
+            .emit(ChatEvent::PermissionRequest {
+                id: "req-1".into(),
+                tool: "Bash".into(),
+                input: json!({"command": "ls"}),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+                tool_use_id: Some("t1".into()),
+            })
+            .await;
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *provider.state.hold_answers.lock().unwrap() = Some(Arc::clone(&hold));
+        let answering = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move { handle.answer_permission("req-1", true).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle
+            .emit(ChatEvent::ToolResult {
+                id: "t1".into(),
+                result: json!("a.rs"),
+                is_error: false,
+                parent_tool_use_id: None,
+            })
+            .await;
+        hold.notify_one();
+        answering.await.unwrap().unwrap();
+
+        let stored = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 50)
+            .await
+            .unwrap();
+        let types: Vec<&str> = stored.iter().map(|r| r.event_type.as_str()).collect();
+        let result_at = types.iter().position(|t| *t == "tool_result").unwrap();
+        assert_eq!(types[result_at + 1], "tool_timing", "{types:?}");
+        let timing: serde_json::Value = serde_json::from_str(&stored[result_at + 1].data).unwrap();
+        assert_eq!(timing["permission_outcome"], "allowed", "{timing}");
+        assert_eq!(
+            timing["run_started_at"], timing["permission_resolved_at"],
+            "{timing}"
+        );
+        assert!(timing["run_started_at"].is_f64(), "{timing}");
+        assert_eq!(
+            types.iter().filter(|t| **t == "tool_timing").count(),
+            1,
+            "one timing per call: {types:?}"
+        );
+    }
+
+    /// A double click (or two tabs): the provider refuses the second answer to the
+    /// same request. Its failure must not erase the first answer from the clock.
+    #[tokio::test]
+    async fn a_second_answer_refused_by_the_provider_keeps_the_first_on_the_clock() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph.clone());
+        let provider = FakeProvider::new();
+        let sid = Uuid::new_v4().to_string();
+        let handle = runtime
+            .adopt(
+                &sid,
+                "claude-code",
+                provider.session(),
+                1,
+                "native",
+                json!({}),
+                None,
+            )
+            .await;
+        handle
+            .emit(ChatEvent::ToolUse {
+                id: "t1".into(),
+                tool: "Bash".into(),
+                input: json!({"command": "ls"}),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+            })
+            .await;
+        handle
+            .emit(ChatEvent::PermissionRequest {
+                id: "req-1".into(),
+                tool: "Bash".into(),
+                input: json!({"command": "ls"}),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+                tool_use_id: Some("t1".into()),
+            })
+            .await;
+        handle.answer_permission("req-1", true).await.unwrap();
+        assert!(
+            handle.answer_permission("req-1", false).await.is_err(),
+            "the provider refuses a second answer"
+        );
+        handle
+            .emit(ChatEvent::ToolResult {
+                id: "t1".into(),
+                result: json!("a.rs"),
+                is_error: false,
+                parent_tool_use_id: None,
+            })
+            .await;
+
+        let stored = graph
+            .get_chat_events(Uuid::parse_str(&sid).unwrap(), 0, 50)
+            .await
+            .unwrap();
+        let timing = stored
+            .iter()
+            .find(|r| r.event_type == "tool_timing")
+            .expect("a timing");
+        let timing: serde_json::Value = serde_json::from_str(&timing.data).unwrap();
+        assert_eq!(timing["permission_outcome"], "allowed", "{timing}");
+        assert!(timing["permission_resolved_at"].is_f64(), "{timing}");
+        assert_eq!(
+            timing["run_started_at"], timing["permission_resolved_at"],
+            "{timing}"
+        );
     }
 }

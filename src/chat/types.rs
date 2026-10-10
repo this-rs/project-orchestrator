@@ -599,16 +599,27 @@ pub enum ChatEvent {
         /// The engine asked the user (permission or question).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_requested_at: Option<f64>,
-        /// The user answered the permission.
+        /// The user answered the permission (noted before the answer reached the engine).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_resolved_at: Option<f64>,
-        /// The tool itself started running: the answer when a permission was asked,
-        /// else the take-up, else the announcement. Absent when a question was
-        /// never answered apart from the result.
+        /// `allowed` or `denied`; absent when no permission was answered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_outcome: Option<String>,
+        /// The tool itself started running, only as the engine saw it: the answer to
+        /// an allowed permission, else the take-up. Absent when the tool never ran
+        /// (denied, never answered, a question answered by its result), when the
+        /// engine runs no host hook, or when the timing is `incomplete`: never
+        /// estimated.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_started_at: Option<f64>,
-        /// The engine had the result (or the call was cancelled).
+        /// The engine had the result, or the call was cancelled.
         ended_at: f64,
+        /// The call ended by a cancellation (`tool_cancelled`), not a result.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cancelled: bool,
+        /// The clock may have missed a wait: a permission request named no call.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        incomplete: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_tool_use_id: Option<String>,
     },
@@ -625,6 +636,10 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         /// Stable alias of the tool, from the adapter.
         canonical: Option<String>,
+        /// The tool_use the permission is about, when the engine gives it (the CLI's
+        /// `can_use_tool`, the agent engine's `permission_ask`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_use_id: Option<String>,
     },
     /// Claude Code called the AskUserQuestion tool — display the interactive
     /// question widget instead of a permission approval dialog.
@@ -2046,6 +2061,7 @@ mod tests {
                 parent_tool_use_id: None,
                 category: None,
                 canonical: None,
+                tool_use_id: None,
             }
             .event_type(),
             "permission_request"
@@ -2141,6 +2157,7 @@ mod tests {
                 parent_tool_use_id: None,
                 category: None,
                 canonical: None,
+                tool_use_id: None,
             },
             ChatEvent::Result {
                 session_id: "cli-123".into(),
@@ -2560,6 +2577,7 @@ mod tests {
                 parent_tool_use_id: Some("p5".into()),
                 category: None,
                 canonical: None,
+                tool_use_id: None,
             },
             ChatEvent::ToolUseInputResolved {
                 id: "tu1".into(),
