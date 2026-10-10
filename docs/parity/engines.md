@@ -35,11 +35,11 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `provider_switch.relay` | la bascule vers ce moteur relaie la conversation sur le fil (conversation_relayed) | ok | ok |
 | `images` | une image jointe atteint le provider en bloc image | ok | ok |
 | `session_record` | le dossier de session porte message_count, total_cost_usd et un titre | ok | gap (harnais, P8) |
-| `background_tasks` | une tâche d'arrière-plan est suivie (active_tasks_update) | ok | gap (harnais, P4) |
-| `cancel_task` | cancel_task arrête une tâche d'arrière-plan | ok | gap (harnais, P12) |
+| `background_tasks` | une tâche d'arrière-plan est suivie (active_tasks_update) | ok | ok |
+| `cancel_task` | cancel_task arrête une tâche d'arrière-plan | ok | ok |
 | `system_init.degraded` | system_init n'annonce comme manquant qu'une limite du modèle (liste fermée) | ok | ok |
 
-`ok` : Claude Code 23/26, natif 21/26.
+`ok` : Claude Code 23/26, natif 23/26.
 
 ## Écarts déclarés
 
@@ -50,8 +50,6 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | natif | `permissions.session` | harnais | P11 | le harnais natif sait retenir une portée session, mais le backend répond toujours allow_once : la permission est redemandée |
 | natif | `permissions.always` | harnais | P11 | le harnais natif ne déclare pas la portée always (permission_scopes = once, session) et le backend ne la transmet pas |
 | natif | `session_record` | harnais | P8 | le moteur agent ne met pas à jour le dossier de session à la fin d'un tour (message_count / total_cost_usd) |
-| natif | `background_tasks` | harnais | P4 | le natif ne rapporte pas de tâche d'arrière-plan (capacité background_tasks = false) : rien n'est suivi |
-| natif | `cancel_task` | harnais | P12 | cancel_task n'a pas de branche moteur agent (no-op idempotent) et le natif n'a pas de tâche à annuler |
 
 ## Non mesuré
 

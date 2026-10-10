@@ -282,26 +282,6 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
                   (message_count / total_cost_usd)",
         },
     ),
-    (
-        Engine::Native,
-        "background_tasks",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "P4",
-            why: "le natif ne rapporte pas de tâche d'arrière-plan (capacité background_tasks = \
-                  false) : rien n'est suivi",
-        },
-    ),
-    (
-        Engine::Native,
-        "cancel_task",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "P12",
-            why: "cancel_task n'a pas de branche moteur agent (no-op idempotent) et le natif \
-                  n'a pas de tâche à annuler",
-        },
-    ),
 ];
 
 /// The verdicts of one engine, with what was seen (diagnostics, not in the table).

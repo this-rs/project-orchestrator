@@ -37,6 +37,12 @@ pub struct ChatRpcResponse {
     pub error: Option<String>,
 }
 
+/// How long a `cancel_task` asked of another instance waits for the owner's
+/// answer. Longer than the 2 s of a message RPC: stopping a task waits for the
+/// provider (the native harness calls `TaskStop` of `nexus-tools`, Claude Code
+/// may wait for the task's process to be identified).
+pub const CANCEL_TASK_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 // ============================================================================
 // Streaming snapshot types
 // ============================================================================
@@ -339,6 +345,62 @@ impl NatsEmitter {
             )
         })?;
         debug!(subject = %subject, "Subscribed to NATS cancel_tools");
+        Ok(subscriber)
+    }
+
+    // ========================================================================
+    // cancel_task: request/reply (the owner answers what it did, or why not)
+    // ========================================================================
+
+    /// Build the cancel-task subject for a session
+    /// (e.g. "events.chat.{session_id}.cancel_task").
+    pub fn cancel_task_subject(&self, session_id: &str) -> String {
+        format!("{}.chat.{}.cancel_task", self.subject_prefix, session_id)
+    }
+
+    /// Asks the instance that owns the session to stop one of its background
+    /// tasks, and waits for its answer: the request is `{"task_id"}`, the answer
+    /// the owner's JSON (`{"result": …}` or `{"refused": …}`, see
+    /// `ChatManager::cancel_task`). `None` when no instance answered within
+    /// `CANCEL_TASK_RPC_TIMEOUT` (nobody holds the session live).
+    pub async fn request_cancel_task(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Option<serde_json::Value> {
+        let subject = self.cancel_task_subject(session_id);
+        let payload = serde_json::to_vec(&serde_json::json!({ "task_id": task_id })).ok()?;
+        match tokio::time::timeout(
+            CANCEL_TASK_RPC_TIMEOUT,
+            self.client.request(subject.clone(), payload.into()),
+        )
+        .await
+        {
+            Ok(Ok(reply)) => serde_json::from_slice(&reply.payload)
+                .map_err(|e| warn!(subject = %subject, "Malformed cancel_task reply: {}", e))
+                .ok(),
+            Ok(Err(e)) => {
+                debug!(subject = %subject, "No cancel_task reply (session not active remotely): {}", e);
+                None
+            }
+            Err(_) => {
+                debug!(subject = %subject, "cancel_task request timed out");
+                None
+            }
+        }
+    }
+
+    /// Subscribe to cancel-task requests for a session (the owning instance
+    /// answers each on its reply subject).
+    pub async fn subscribe_cancel_task(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<async_nats::Subscriber> {
+        let subject = self.cancel_task_subject(session_id);
+        let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
+            anyhow::anyhow!("Failed to subscribe to NATS cancel_task {}: {}", subject, e)
+        })?;
+        debug!(subject = %subject, "Subscribed to NATS cancel_task");
         Ok(subscriber)
     }
 
