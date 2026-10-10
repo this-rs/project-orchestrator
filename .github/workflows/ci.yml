@@ -2,9 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "integ/**"]
   pull_request:
-    branches: [main]
+    # integ/<lot>: integration branches. A lot's PRs merge there after review on the FAST tier
+    # (lint, security, unit, integration); the lot reaches main through ONE PR integ/<lot> -> main,
+    # which runs everything (build, API, coverage and the parity matrix). See the FULL-tier `if`.
+    branches: [main, "integ/**"]
   # Cold run: nothing restored from any cache (see "Cache policy" below).
   schedule:
     - cron: "17 3 * * *"
@@ -55,6 +58,8 @@ jobs:
   # ==========================================================================
   build:
     name: Build
+    # FULL tier only: PRs into main, pushes to main, nightly and manual runs (all on main).
+    if: github.base_ref == 'main' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -358,6 +363,8 @@ jobs:
   # ==========================================================================
   api-tests:
     name: API Tests
+    # FULL tier only: PRs into main, pushes to main, nightly and manual runs (all on main).
+    if: github.base_ref == 'main' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     needs: [build, lint]
     permissions:
@@ -463,6 +470,8 @@ jobs:
   # ==========================================================================
   coverage:
     name: Code Coverage
+    # FULL tier only: PRs into main, pushes to main, nightly and manual runs (all on main).
+    if: github.base_ref == 'main' || github.ref == 'refs/heads/main'
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","po-ci"]') || 'ubuntu-latest' }}
     # Backstop: a hung test used to keep this job alive for 1-2 hours.
     timeout-minutes: 50
