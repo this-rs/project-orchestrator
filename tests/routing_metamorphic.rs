@@ -14,8 +14,11 @@
 //!  - `noise` — appending a semantically empty sentence must change nothing.
 //!  - `level` — raising the scaffolding level may only shrink the selection.
 
+mod common;
+
 use std::collections::BTreeSet;
 
+use common::metamorphic::{fmt_set, jaccard, Report, NOISE};
 use project_orchestrator::chat::routing::{HeuristicRouter, RoutingContext, RoutingProvider};
 
 // ============================================================================
@@ -36,81 +39,8 @@ fn decide(router: &dyn RoutingProvider, msg: &str, level: u8) -> BTreeSet<String
         .collect()
 }
 
-fn jaccard(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
-    let union = a.union(b).count();
-    if union == 0 {
-        return 1.0;
-    }
-    a.intersection(b).count() as f64 / union as f64
-}
-
-fn fmt(set: &BTreeSet<String>) -> String {
-    let v: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
-    v.join("+")
-}
-
-struct Report {
-    kind: &'static str,
-    n: usize,
-    agree: usize,
-    jaccard_sum: f64,
-    violations: Vec<String>,
-}
-
-impl Report {
-    fn new(kind: &'static str) -> Self {
-        Self {
-            kind,
-            n: 0,
-            agree: 0,
-            jaccard_sum: 0.0,
-            violations: Vec::new(),
-        }
-    }
-
-    fn observe(&mut self, label: &str, a: &BTreeSet<String>, b: &BTreeSet<String>) {
-        self.n += 1;
-        self.jaccard_sum += jaccard(a, b);
-        if a == b {
-            self.agree += 1;
-        } else {
-            let lost: Vec<&str> = a.difference(b).map(|s| s.as_str()).collect();
-            let gained: Vec<&str> = b.difference(a).map(|s| s.as_str()).collect();
-            self.violations.push(format!(
-                "    {label}\n      A = {}\n      B = {}\n      lost: [{}]  gained: [{}]",
-                fmt(a),
-                fmt(b),
-                lost.join(", "),
-                gained.join(", "),
-            ));
-        }
-    }
-
-    fn print(&self) {
-        let rate = self.agree as f64 / self.n.max(1) as f64;
-        println!(
-            "\n── invariant `{}` ───────────────────────────────────────────\n\
-             cases: {}   agreement: {}/{} = {:.0}%   mean jaccard: {:.3}",
-            self.kind,
-            self.n,
-            self.agree,
-            self.n,
-            rate * 100.0,
-            self.jaccard_sum / self.n.max(1) as f64
-        );
-        if self.violations.is_empty() {
-            println!("  no violations");
-        } else {
-            println!("  VIOLATIONS ({}):", self.violations.len());
-            for v in &self.violations {
-                println!("{v}");
-            }
-        }
-    }
-
-    fn agreement(&self) -> f64 {
-        self.agree as f64 / self.n.max(1) as f64
-    }
+fn observe_sets(report: &mut Report, label: &str, a: &BTreeSet<String>, b: &BTreeSet<String>) {
+    report.observe(label, &fmt_set(a), &fmt_set(b), jaccard(a, b));
 }
 
 // ============================================================================
@@ -252,13 +182,6 @@ const PAIRS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Sentences that carry no routing intent and must not change any decision.
-const NOISE: &[&str] = &[
-    " Merci d'avance.",
-    " On en reparle à la prochaine session.",
-    " C'est urgent.",
-];
-
 // ============================================================================
 // Invariant 1 — language
 // ============================================================================
@@ -271,7 +194,7 @@ fn metamorphic_language_invariance() {
     for (grp, fr, en) in PAIRS {
         let a = decide(&router, fr, 4);
         let b = decide(&router, en, 4);
-        report.observe(&format!("[{grp}] \"{fr}\"  vs  \"{en}\""), &a, &b);
+        observe_sets(&mut report, &format!("[{grp}] \"{fr}\"  vs  \"{en}\""), &a, &b);
     }
 
     report.print();
@@ -296,7 +219,8 @@ fn metamorphic_noise_invariance() {
         for noise in NOISE {
             let noised = format!("{fr}{noise}");
             let b = decide(&router, &noised, 4);
-            report.observe(
+            observe_sets(
+                &mut report,
                 &format!("[{grp}] +\"{}\" on \"{fr}\"", noise.trim()),
                 &base,
                 &b,
