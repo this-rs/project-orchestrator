@@ -41,6 +41,9 @@ class ProjectOrchestrator < Formula
     bin.install "orchestrator"
     bin.install "orch"
     bin.install "mcp_server"
+    # The files, shell and web tools of a native session, next to the server (P6). Absent from
+    # releases made before it shipped.
+    bin.install "nexus-tools" if File.exist?("nexus-tools")
 
     # ONNX Runtime dylib — present only in macOS x86_64 builds (dynamic linking
     # because ort-sys has no prebuilt static library for macOS Intel).
@@ -60,6 +63,7 @@ class ProjectOrchestrator < Formula
 
       The MCP server binary is at: #{opt_bin}/mcp_server
       The CLI tool is at: #{opt_bin}/orch
+      The native-session tools (nexus-tools) are at: #{opt_bin}/nexus-tools
 
       Before starting, ensure Neo4j and MeiliSearch are running.
     EOS
