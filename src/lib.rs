@@ -1596,6 +1596,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         .with_document_store(documents::store::DocumentStore::from_config(&config))
         // Native sessions resume after a restart: their transcripts live on disk (P14).
         .with_native_transcripts(chat::provider::transcripts::default_root())
+        // An approval `always` on a native session outlives it (P11, `chat::lasting_rules`).
+        .with_lasting_rules(chat::lasting_rules::default_path())
         .with_event_emitter(event_bus.clone())
         .with_vault(vault.clone());
         // Pass config.yaml path so permission changes can be persisted to disk
