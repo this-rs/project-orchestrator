@@ -35,9 +35,12 @@ impl std::fmt::Display for QueryIntentMode {
     }
 }
 
+// Each keyword list is bilingual by pair: a French keyword is added next to
+// its English counterpart. `plante` matters most: without it, "planté" falls
+// through to the PLAN keyword "plan" (substring match) instead of debug.
 const DEBUG_KEYWORDS: &[&str] = &[
-    "pourquoi", "échoue", "bug", "erreur", "crash", "plantage", "why", "fail", "broken", "error",
-    "panic", "trace", "fix", "debug",
+    "pourquoi", "échoue", "bug", "erreur", "crash", "plantage", "plante", "planté", "why", "fail",
+    "broken", "error", "panic", "trace", "fix", "debug",
 ];
 
 const EXPLORE_KEYWORDS: &[&str] = &[
@@ -46,8 +49,12 @@ const EXPLORE_KEYWORDS: &[&str] = &[
     "architecture",
     "structure",
     "how does",
+    "how do",
     "explain",
+    "expliqu",
     "what is",
+    "quelle est",
+    "c'est quoi",
     "overview",
     "comprendre",
     "understand",
@@ -56,6 +63,7 @@ const EXPLORE_KEYWORDS: &[&str] = &[
 const IMPACT_KEYWORDS: &[&str] = &[
     "impact",
     "modifier",
+    "modifie",
     "changer",
     "refactor",
     "change",
@@ -68,6 +76,7 @@ const IMPACT_KEYWORDS: &[&str] = &[
     "review",
     "audit",
     "coverage",
+    "couverture",
     "quality",
 ];
 
@@ -80,6 +89,7 @@ const PLAN_KEYWORDS: &[&str] = &[
     "create",
     "build",
     "add feature",
+    "add a ",
     "nouvelle",
     "design",
     "roadmap",
