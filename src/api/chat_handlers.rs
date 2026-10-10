@@ -713,7 +713,9 @@ pub async fn cancel_tools(
     let result = chat_manager
         .cancel_running_tools(&session_id.to_string())
         .await
-        .map_err(AppError::Internal)?;
+        // A provider that cannot stop tools (Claude Code over SSH: no `tool_cancel`)
+        // is a typed refusal (422 `unsupported`), never a 500 nor a success.
+        .map_err(|e| AppError::from_open_error(e, None))?;
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
@@ -1121,7 +1123,9 @@ pub async fn cancel_task(
     let result = chat_manager
         .cancel_task(&session_id.to_string(), &task_id)
         .await
-        .map_err(AppError::Internal)?;
+        // Same refusal as cancel-tools, also when the session lives on another
+        // instance (its answer comes back over NATS).
+        .map_err(|e| AppError::from_open_error(e, None))?;
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }

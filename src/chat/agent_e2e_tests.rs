@@ -7177,3 +7177,345 @@ mod legacy_oob_lag {
         manager.close_session(&sid).await.unwrap();
     }
 }
+
+/// P4 + P12 (parity): the background tasks of an agent-engine session reach the
+/// wire as on the Claude Code engine (`active_tasks_update`, keyed by the
+/// `tool_use` that started the task), `cancel_task` stops one through the
+/// provider — from this instance or from another one over NATS — and a provider
+/// that cannot stop it (Claude Code over SSH: no `tool_cancel`) is a typed
+/// refusal, never a success.
+mod background_tasks {
+    use nexus_claude::agent::{
+        AgentEvent, BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, ProviderError,
+        ProviderKind,
+    };
+    use nexus_claude::testkit::scripted::steps;
+    use nexus_claude::testkit::{Script, ScriptedProvider, Step};
+
+    use super::parity::{caps, Tapped};
+    use super::*;
+    use crate::events::nats_broker_test::TestBroker;
+    use crate::events::NatsEmitter;
+
+    /// The probe, the catalogue, then one turn that starts `sleep 30` in the
+    /// background with the `Bash` of the real `nexus-tools`, and answers.
+    fn background_sleep_script() -> Value {
+        json!([
+            sse_route("Call the ping tool now", vec![
+                delta(json!({"tool_calls": [{"index": 0, "id": "p1", "function": {"name": "ping", "arguments": "{}"}}]})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                json!("[DONE]"),
+            ]),
+            {"method": "GET", "path": "/v1/models", "status": 200,
+             "body": {"object": "list", "data": [{"id": "m", "context_length": 32000}]}},
+            sse_route("start the background sleep", vec![
+                delta(json!({"tool_calls": [{"index": 0, "id": "b1", "type": "function",
+                    "function": {"name": "mcp__nexus__Bash", "arguments": json!({
+                        "command": "sleep 30", "run_in_background": true,
+                        "description": "background sleep"}).to_string()}}]})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                json!("[DONE]"),
+            ]),
+            sse_route("\"role\":\"tool\"", vec![
+                delta(json!({"content": "started in the background"})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!("[DONE]"),
+            ]),
+        ])
+    }
+
+    /// A native session (fake_openai + fake_mcp + the real nexus-tools) in trust
+    /// mode, no opening turn; the manager on NATS when `nats` is given.
+    async fn native_session(
+        fake: &FakeOpenAi,
+        nats: Option<Arc<NatsEmitter>>,
+    ) -> (ChatManager, String, broadcast::Receiver<ChatEvent>) {
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: Some(fake_bin("nexus-tools")),
+            nexus_browser_path: None,
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let mut manager = ChatManager::new_without_memory(dyn_graph, state.meili, config);
+        if let Some(nats) = nats {
+            manager = manager.with_nats(nats);
+        }
+        let mut req = request(Some("local"), Some("proj"), "bypassPermissions");
+        req.message = String::new();
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        let rx = manager.subscribe(&sid).await.unwrap();
+        (manager, sid, rx)
+    }
+
+    /// Starts the background sleep and waits for it on the wire: the
+    /// `active_tasks_update` naming it by its `tool_use` (`b1`), with its process.
+    async fn start_background_sleep(
+        manager: &ChatManager,
+        sid: &str,
+        rx: &mut broadcast::Receiver<ChatEvent>,
+    ) -> u32 {
+        manager
+            .send_message(sid, "start the background sleep")
+            .await
+            .unwrap();
+        let update = next_event(rx, |e| {
+            matches!(e, ChatEvent::ActiveTasksUpdate { tasks } if tasks.iter().any(|t| t.id == "b1"))
+        })
+        .await;
+        let ChatEvent::ActiveTasksUpdate { tasks } = update else {
+            unreachable!()
+        };
+        let task = tasks.iter().find(|t| t.id == "b1").unwrap();
+        assert_eq!(
+            task.kind,
+            crate::chat::types::BackgroundTaskKind::BashBackground
+        );
+        let pid = task.pid.expect("the task's process is reported");
+        assert!(alive(pid), "the background sleep runs");
+        next_event(rx, |e| {
+            matches!(
+                e,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            )
+        })
+        .await;
+        // The snapshot route answers the same list.
+        let listed = manager.get_active_background_tasks(sid).await;
+        assert!(listed.iter().any(|t| t.id == "b1"), "{listed:?}");
+        pid
+    }
+
+    fn alive(pid: u32) -> bool {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    async fn gone_within(pid: u32, within: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        while tokio::time::Instant::now() < deadline {
+            if !alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        !alive(pid)
+    }
+
+    /// After the stop: an `active_tasks_update` without the task.
+    async fn task_left_the_list(rx: &mut broadcast::Receiver<ChatEvent>) {
+        next_event(rx, |e| {
+            matches!(e, ChatEvent::ActiveTasksUpdate { tasks } if !tasks.iter().any(|t| t.id == "b1"))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_native_background_task_is_on_the_wire_and_cancel_task_ends_its_process() {
+        let fake = FakeOpenAi::start(background_sleep_script());
+        let (manager, sid, mut rx) = native_session(&fake, None).await;
+        let pid = start_background_sleep(&manager, &sid, &mut rx).await;
+
+        let stopped = manager.cancel_task(&sid, "b1").await.unwrap();
+        assert!(!stopped.capped);
+        assert_eq!(stopped.task_id, "b1");
+        assert!(stopped.killed_pids.contains(&pid), "{stopped:?}");
+        assert!(
+            gone_within(pid, Duration::from_secs(10)).await,
+            "the process is gone"
+        );
+        task_left_the_list(&mut rx).await;
+        assert!(manager.get_active_background_tasks(&sid).await.is_empty());
+
+        // Clicking Stop again on the ended task: the idempotent no-op.
+        let again = manager.cancel_task(&sid, "b1").await.unwrap();
+        assert!(again.killed_pids.is_empty() && !again.capped, "{again:?}");
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancel_task_from_another_instance_ends_the_native_task_here() {
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let fake = FakeOpenAi::start(background_sleep_script());
+        let (manager, sid, mut rx) = native_session(&fake, Some(owner)).await;
+        let pid = start_background_sleep(&manager, &sid, &mut rx).await;
+
+        // The other instance holds no session: its cancel_task goes over NATS and
+        // comes back with what the owner did.
+        let other = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let far = far_manager(other);
+        let stopped = far.cancel_task(&sid, "b1").await.unwrap();
+        assert!(stopped.killed_pids.contains(&pid), "{stopped:?}");
+        assert!(
+            gone_within(pid, Duration::from_secs(10)).await,
+            "the process is gone"
+        );
+        task_left_the_list(&mut rx).await;
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// A manager with no session of its own, on NATS.
+    fn far_manager(nats: Arc<NatsEmitter>) -> ChatManager {
+        let state = mock_app_state();
+        let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        ChatManager::new_without_memory(graph, state.meili, config).with_nats(nats)
+    }
+
+    /// A Claude Code session that cannot stop a tool (over SSH: `tool_cancel`
+    /// absent, background tasks reported), its first turn reporting one task.
+    async fn remote_claude_code(
+        nats: Option<Arc<NatsEmitter>>,
+    ) -> (ChatManager, String, broadcast::Receiver<ChatEvent>) {
+        let mut capabilities = caps();
+        capabilities.tool_cancel = false;
+        capabilities.background_tasks = true;
+        let task = BackgroundTask {
+            id: "bash-7".into(),
+            kind: BackgroundTaskKind::Shell,
+            description: "tail -F deploy.log".into(),
+            status: BackgroundTaskStatus::Running,
+            started_at_ms: None,
+            tool_call_id: Some("b7".into()),
+            parent: None,
+            pid: None,
+        };
+        let turn: Vec<Step> = vec![
+            Step::Emit(AgentEvent::BackgroundTasks { tasks: vec![task] }),
+            steps::text("watching"),
+            steps::done(&capabilities),
+        ];
+        let script = Script::builder()
+            .capabilities(capabilities)
+            .turn(turn)
+            .build();
+        let provider = Tapped {
+            inner: Arc::new(ScriptedProvider::new("claude-code", script)),
+            kind: ProviderKind::ClaudeCode,
+            answers: Arc::default(),
+        };
+        let state = mock_app_state();
+        let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let mut manager = ChatManager::new_without_memory(graph, state.meili, config)
+            .with_provider_source(Arc::new(provider));
+        if let Some(nats) = nats {
+            manager = manager.with_nats(nats);
+        }
+        let mut req = request(None, None, "default");
+        req.message = String::new();
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        manager.send_message(&sid, "watch").await.unwrap();
+        next_event(&mut rx, |e| {
+            matches!(e, ChatEvent::ActiveTasksUpdate { tasks } if tasks.iter().any(|t| t.id == "b7"))
+        })
+        .await;
+        (manager, sid, rx)
+    }
+
+    /// The refusal as the HTTP layer answers it: 422 `unsupported`, naming the capability.
+    fn assert_typed_refusal(error: &anyhow::Error) {
+        let refusal = error
+            .chain()
+            .find_map(|c| c.downcast_ref::<ProviderError>())
+            .unwrap_or_else(|| panic!("a typed ProviderError: {error:#}"));
+        assert_eq!(
+            refusal,
+            &ProviderError::Unsupported {
+                capability: "tool_cancel".into()
+            }
+        );
+        // What `POST .../cancel-task/{id}` and `.../cancel-tools` answer (never a 500).
+        let failure = super::super::provider::errors::classify_open_error(error, None)
+            .expect("typed on the wire");
+        assert_eq!((failure.status, failure.code), (422, "unsupported"));
+        assert!(
+            failure.message.contains("tool_cancel"),
+            "{}",
+            failure.message
+        );
+        let answered = crate::api::handlers::AppError::from_open_error(
+            anyhow::Error::new(refusal.clone()).context("cancel"),
+            None,
+        );
+        assert!(
+            matches!(&answered, crate::api::handlers::AppError::Provider(f) if f.status == 422),
+            "the HTTP answer is the typed refusal"
+        );
+    }
+
+    async fn refusal_on_the_wire(rx: &mut broadcast::Receiver<ChatEvent>) {
+        let event = next_event(
+            rx,
+            |e| matches!(e, ChatEvent::Error { code: Some(code), .. } if code == "cancel_refused"),
+        )
+        .await;
+        let ChatEvent::Error { reason, .. } = event else {
+            unreachable!()
+        };
+        assert_eq!(reason.as_deref(), Some("tool_cancel"));
+    }
+
+    #[tokio::test]
+    async fn a_provider_without_tool_cancel_refuses_cancel_task_and_cancel_tools_typed() {
+        let (manager, sid, mut rx) = remote_claude_code(None).await;
+
+        let error = manager
+            .cancel_task(&sid, "b7")
+            .await
+            .expect_err("never a success");
+        assert_typed_refusal(&error);
+        refusal_on_the_wire(&mut rx).await;
+
+        let error = manager
+            .cancel_running_tools(&sid)
+            .await
+            .expect_err("never a success");
+        assert_typed_refusal(&error);
+        refusal_on_the_wire(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn a_cancel_task_refused_by_the_owner_comes_back_typed_over_nats() {
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let (_manager, sid, mut rx) = remote_claude_code(Some(owner)).await;
+        let far = far_manager(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+
+        let error = far
+            .cancel_task(&sid, "b7")
+            .await
+            .expect_err("never a success");
+        assert_typed_refusal(&error);
+        refusal_on_the_wire(&mut rx).await;
+    }
+}

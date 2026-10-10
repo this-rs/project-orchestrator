@@ -1,6 +1,6 @@
 %% name: po-chat-provider
 %% covers: backend:src/chat/provider/{catalog,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,nexus_tools,policy,resolver,settings,store}.rs
-%% verified: 11f7d2d3
+%% verified: 4983fbcd
 %% ---
 %% PROUVE : le RÉSOLVEUR backend de provider (décisions A1, A16, A18, A29, A43) : quel
 %%   provider/modèle pour une demande, comment une erreur d'ouverture devient un statut HTTP
@@ -98,7 +98,7 @@ flowchart TD
     WIRED["✅ branché sur le chemin actuel (Claude Code) : ChatManager enveloppe les erreurs SDK d'ouverture<br/>par sdk_open_error (ProviderError dans la chaîne anyhow) ; chat_handlers::create_session →<br/>AppError::from_open_error → AppError::Provider(OpenFailure) : statut + code + provider_id<br/>un CLI absent répond 424 cli_not_found au lieu d'un 500 muet<br/>test : a_missing_cli_answers_424_with_a_code_instead_of_a_mute_500,<br/>a_missing_cli_is_cli_not_found_424_not_a_mute_500<br/>🟠 le chemin WebSocket (reprise par message) n'émet pas encore le code"]
     OPEN --> WIRED
     subgraph evmap["event_map.rs — AgentEvent → ChatEvent (agent-contract §14)"]
-        EVMAP["✅ EventMapper::map (tour) et out_of_band_to_chat_events (hors tour, regroupés par seq → background_output) ;<br/>tool_call incomplet puis complet → tool_use puis tool_use_input_resolved ; Done sans subtype → sous-type hérité ;<br/>coût inconnu → cost_usd null (jamais 0) ; processus mort → session_error ; autres erreurs : texte écrit dans errors.rs<br/>(aucune URL ni identifiant) ; événement inconnu → rien<br/>test : replay_gives_the_same_chat_events_as_the_legacy_path (21 messages : map_message puis EventMapper == message_to_events),<br/>an_announced_tool_call_completes_as_input_resolved, a_dead_process_is_a_session_error_and_other_failures_leak_nothing,<br/>out_of_turn_messages_regroup_by_message_number<br/>🟠 aucun appelant de production (ChatManager sur AgentSession : tranche suivante)"]
+        EVMAP["✅ EventMapper::map (tour) et out_of_band_to_chat_events (hors tour, regroupés par seq → background_output) ;<br/>tool_call incomplet puis complet → tool_use puis tool_use_input_resolved ; Done sans subtype → sous-type hérité ;<br/>coût inconnu → cost_usd null (jamais 0) ; processus mort → session_error ; autres erreurs : texte écrit dans errors.rs<br/>(aucune URL ni identifiant) ; événement inconnu → rien ; background_tasks → active_tasks_update (running seulement, id = tool_use de lancement ; provider_task retrouve l id du provider pour cancel_task) ; task_update progress d une tâche de fond → background_output (source tool_result, correlation_id = tool_use)<br/>test : replay_gives_the_same_chat_events_as_the_legacy_path (21 messages : map_message puis EventMapper == message_to_events),<br/>an_announced_tool_call_completes_as_input_resolved, a_dead_process_is_a_session_error_and_other_failures_leak_nothing,<br/>out_of_turn_messages_regroup_by_message_number, a_background_tasks_snapshot_is_an_active_tasks_update_keyed_by_tool_use, a_progress_line_of_a_background_task_is_background_output<br/>🟠 aucun appelant de production (ChatManager sur AgentSession : tranche suivante)"]
     end
     NEXUS -.-> EVMAP
     subgraph listing["listing.rs — GET /api/chat/providers (A42)"]

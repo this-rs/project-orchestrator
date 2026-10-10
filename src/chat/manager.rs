@@ -495,6 +495,47 @@ pub struct CancelTaskResult {
     pub capped: bool,
 }
 
+/// The answer the owner of a session sends back over NATS for a `cancel_task`
+/// asked on another instance: `{"result": CancelTaskResult}`, `{"refused":
+/// ProviderError}` (the provider cannot: typed, as locally) or `{"failed": text}`.
+pub(crate) fn cancel_task_reply(outcome: &Result<CancelTaskResult>) -> serde_json::Value {
+    match outcome {
+        Ok(result) => serde_json::json!({ "result": result }),
+        Err(error) => match error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<nexus_claude::agent::ProviderError>())
+        {
+            Some(refusal) => serde_json::json!({ "refused": refusal }),
+            None => serde_json::json!({ "failed": error.to_string() }),
+        },
+    }
+}
+
+/// What the requesting instance returns for the owner's [`cancel_task_reply`]: the
+/// same `Ok` / typed `Err` the owner's caller would have had.
+pub(crate) fn cancel_task_from_reply(
+    task_id: &str,
+    reply: serde_json::Value,
+) -> Result<CancelTaskResult> {
+    if let Some(result) = reply.get("result") {
+        return serde_json::from_value(result.clone())
+            .map_err(|e| anyhow!("malformed cancel_task answer for {task_id}: {e}"));
+    }
+    if let Some(refusal) = reply
+        .get("refused")
+        .and_then(|r| serde_json::from_value::<nexus_claude::agent::ProviderError>(r.clone()).ok())
+    {
+        return Err(anyhow::Error::new(refusal));
+    }
+    let failed = reply
+        .get("failed")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("malformed answer");
+    Err(anyhow!(
+        "cancel_task failed on the instance holding the session: {failed}"
+    ))
+}
+
 /// Runtime-mutable environment config for Claude CLI subprocess.
 ///
 /// These fields can be changed at runtime via the REST API and are
@@ -4928,6 +4969,12 @@ impl ChatManager {
             self.active_sessions.clone(),
             nats_cancel.clone(),
         );
+        // cancel_task asked on another instance (request/reply).
+        self.spawn_nats_cancel_task_listener(
+            &session_id.to_string(),
+            self.active_sessions.clone(),
+            nats_cancel.clone(),
+        );
 
         // Spawn the per-session background-tasks poller (T12 of plan
         // 754a1379). Wakes up every BACKGROUND_TASKS_POLL_INTERVAL_SECS
@@ -8863,6 +8910,11 @@ impl ChatManager {
             self.active_sessions.clone(),
             nats_cancel.clone(),
         );
+        self.spawn_nats_cancel_task_listener(
+            session_id,
+            self.active_sessions.clone(),
+            nats_cancel.clone(),
+        );
 
         // Spawn the per-session background-tasks poller (T12 of plan
         // 754a1379). Mirror of `create_session` — without this spawn,
@@ -9874,11 +9926,19 @@ impl ChatManager {
     ///
     /// ## NATS routing
     ///
-    /// Cross-instance: if the session is owned by another instance,
-    /// publishes a `cancel_task` event over NATS so the owning instance
-    /// performs the local map mutation. (Mirror of
-    /// `publish_cancel_tools` — added in a follow-up alongside the
-    /// listener wiring.)
+    /// Cross-instance: if no session of this instance holds it, the request
+    /// goes over NATS (`events.chat.{id}.cancel_task`, request/reply) to the
+    /// instance that does — Claude Code (`spawn_nats_cancel_task_listener`) or
+    /// agent engine (`spawn_agent_nats_listeners`) — and its answer is returned:
+    /// what it stopped, `capped`, or its refusal (the `ProviderError` back in the
+    /// `Err`). No answer at all: no instance holds the session, the no-op below.
+    ///
+    /// ## Agent engine
+    ///
+    /// `AgentSessionHandle::cancel_task`: the provider stops the task
+    /// (`cancel_tools(task { id })`), a provider that cannot is a typed refusal
+    /// (`Err` holding `ProviderError::Unsupported`, `error { code: cancel_refused }`
+    /// on the wire), never a success.
     ///
     /// ## Returns
     ///
@@ -9892,8 +9952,47 @@ impl ChatManager {
     ///   task_id isn't in the map (idempotent — clicking Stop twice on
     ///   the same task is fine).
     pub async fn cancel_task(&self, session_id: &str, task_id: &str) -> Result<CancelTaskResult> {
+        // The agent engine: the session handle stops the task through its provider
+        // (`AgentSession::cancel_tools(task { id })`), under the same per-session cap,
+        // and refuses, typed, what the provider cannot do.
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return handle.cancel_task(task_id).await;
+        }
+        if let Some(result) =
+            Self::cancel_legacy_task(&self.active_sessions, &self.nats, session_id, task_id).await
+        {
+            return Ok(result);
+        }
+        // Not held here: the instance that holds the session answers over NATS
+        // (`spawn_nats_cancel_task_listener`, `spawn_agent_nats_listeners`) with what
+        // it did, or why it could not.
+        if let Some(ref nats) = self.nats {
+            if let Some(reply) = nats.request_cancel_task(session_id, task_id).await {
+                return cancel_task_from_reply(task_id, reply);
+            }
+        }
+        debug!(
+            session_id = %session_id,
+            task_id = %task_id,
+            "cancel_task: no instance holds the session; idempotent no-op"
+        );
+        Ok(CancelTaskResult {
+            task_id: task_id.to_string(),
+            killed_pids: Vec::new(),
+            capped: false,
+        })
+    }
+
+    /// [`Self::cancel_task`] on a Claude Code session of THIS instance; `None` when
+    /// it holds no such session. Callable without the manager (the NATS listener).
+    async fn cancel_legacy_task(
+        active_sessions: &RwLock<HashMap<String, ActiveSession>>,
+        nats: &Option<Arc<crate::events::NatsEmitter>>,
+        session_id: &str,
+        task_id: &str,
+    ) -> Option<CancelTaskResult> {
         let session_state = {
-            let sessions = self.active_sessions.read().await;
+            let sessions = active_sessions.read().await;
             sessions.get(session_id).map(|s| {
                 (
                     s.cancel_task_history.clone(),
@@ -9905,25 +10004,7 @@ impl ChatManager {
             })
         };
 
-        let (history, cap, window, events_tx, tasks_arc) = match session_state {
-            Some(state) => state,
-            None => {
-                debug!(
-                    session_id = %session_id,
-                    task_id = %task_id,
-                    "cancel_task: session not active locally; idempotent no-op"
-                );
-                if let Some(ref _nats) = self.nats {
-                    // TODO follow-up: nats.publish_cancel_task(session_id, task_id)
-                    // once the cross-instance listener exists.
-                }
-                return Ok(CancelTaskResult {
-                    task_id: task_id.to_string(),
-                    killed_pids: Vec::new(),
-                    capped: false,
-                });
-            }
-        };
+        let (history, cap, window, events_tx, tasks_arc) = session_state?;
 
         // Rate cap.
         let capped = !Self::check_and_record_cancel_cap(&history, cap, window).await;
@@ -9935,7 +10016,7 @@ impl ChatManager {
                 window_secs = window.as_secs(),
                 "cancel_task: rate cap hit, refusing"
             );
-            return Ok(CancelTaskResult {
+            return Some(CancelTaskResult {
                 task_id: task_id.to_string(),
                 killed_pids: Vec::new(),
                 capped: true,
@@ -10000,12 +10081,11 @@ impl ChatManager {
 
         let event = ChatEvent::ActiveTasksUpdate { tasks: snapshot };
         let _ = events_tx.send(event.clone());
-        if let Some(ref nats) = self.nats {
+        if let Some(nats) = nats {
             nats.publish_chat_event(session_id, event);
-            // TODO follow-up: nats.publish_cancel_task(session_id, task_id);
         }
 
-        Ok(CancelTaskResult {
+        Some(CancelTaskResult {
             task_id: task_id.to_string(),
             killed_pids,
             capped: false,
@@ -10023,6 +10103,9 @@ impl ChatManager {
     /// toolbar indicator and any in-progress MonitorCards before the
     /// next `ChatEvent::ActiveTasksUpdate` lands.
     pub async fn get_active_background_tasks(&self, session_id: &str) -> Vec<BackgroundTaskInfo> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return handle.active_background_tasks().await;
+        }
         // Drop the read lock on `active_sessions` before taking the
         // per-session mutex to avoid holding two locks simultaneously
         // and keep the borrow-checker happy (the inner Arc clone moves
@@ -10162,6 +10245,60 @@ impl ChatManager {
                             descendant_count = killed.len(),
                             "NATS cancel_tools received, SIGINT sent to descendants"
                         );
+                    }
+                }
+            }
+        });
+    }
+
+    /// Spawn the per-session NATS responder for `cancel_task` asked on another
+    /// instance (P12): request/reply on `events.chat.{id}.cancel_task`, answered
+    /// with [`cancel_task_reply`] of what [`Self::cancel_legacy_task`] did here —
+    /// the cap applies on this side, as for a local call. Ends with the session.
+    fn spawn_nats_cancel_task_listener(
+        &self,
+        session_id: &str,
+        active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+        cancel: CancellationToken,
+    ) {
+        let Some(nats) = self.nats.clone() else {
+            return;
+        };
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            let mut subscriber = match nats.subscribe_cancel_task(&session_id).await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    warn!(session_id = %session_id, "Failed to subscribe to NATS cancel_task: {}", e);
+                    return;
+                }
+            };
+            let nats_opt = Some(Arc::clone(&nats));
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    msg = subscriber.next() => {
+                        let Some(msg) = msg else { break };
+                        let Some(reply_to) = msg.reply else { continue };
+                        let task_id = serde_json::from_slice::<serde_json::Value>(&msg.payload)
+                            .ok()
+                            .and_then(|v| v.get("task_id").and_then(|t| t.as_str()).map(str::to_string))
+                            .unwrap_or_default();
+                        let Some(result) = Self::cancel_legacy_task(
+                            &active_sessions,
+                            &nats_opt,
+                            &session_id,
+                            &task_id,
+                        )
+                        .await
+                        else {
+                            // The session left this instance: no answer (the asker
+                            // times out on a session nobody holds).
+                            break;
+                        };
+                        if let Ok(payload) = serde_json::to_vec(&cancel_task_reply(&Ok(result))) {
+                            let _ = nats.client().publish(reply_to, payload.into()).await;
+                        }
                     }
                 }
             }
@@ -11700,6 +11837,34 @@ impl ChatManager {
                             if msg.is_none() { break; }
                             if let Err(e) = handle.cancel_tools().await {
                                 warn!(session_id = %sid, error = %e, "agent engine: NATS cancel_tools failed");
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        {
+            // `cancel_task` asked on another instance: the handle stops the task
+            // (cap included) and the asker gets what it did, or the typed refusal.
+            let (nats, handle, sid) = (nats.clone(), Arc::clone(&handle), sid.clone());
+            tokio::spawn(async move {
+                let Ok(mut sub) = nats.subscribe_cancel_task(&sid).await else {
+                    warn!(session_id = %sid, "agent engine: NATS cancel_task subscription failed");
+                    return;
+                };
+                loop {
+                    tokio::select! {
+                        _ = handle.closed.cancelled() => break,
+                        msg = sub.next() => {
+                            let Some(msg) = msg else { break };
+                            let Some(reply_to) = msg.reply else { continue };
+                            let task_id = serde_json::from_slice::<serde_json::Value>(&msg.payload)
+                                .ok()
+                                .and_then(|v| v.get("task_id").and_then(|t| t.as_str()).map(str::to_string))
+                                .unwrap_or_default();
+                            let outcome = handle.cancel_task(&task_id).await;
+                            if let Ok(payload) = serde_json::to_vec(&cancel_task_reply(&outcome)) {
+                                let _ = nats.client().publish(reply_to, payload.into()).await;
                             }
                         }
                     }
