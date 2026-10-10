@@ -50,7 +50,7 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | natif | `permissions.session` | harnais | P11 | le harnais natif sait retenir une portée session, mais le backend répond toujours allow_once : la permission est redemandée |
 | natif | `permissions.always` | harnais | P11 | le harnais natif ne déclare pas la portée always (permission_scopes = once, session) et le backend ne la transmet pas |
 | natif | `background_tasks` | harnais | P4 | le natif ne rapporte pas de tâche d'arrière-plan (capacité background_tasks = false) : rien n'est suivi |
-| natif | `cancel_task` | harnais | P12 | cancel_task n'a pas de branche moteur agent (no-op idempotent) et le natif n'a pas de tâche à annuler |
+| natif | `cancel_task` | harnais | P12 | cancel_task n'a pas de branche moteur agent : refus typé (CancelTaskUnsupported, 501 sur la route) et le natif n'a pas de tâche à annuler |
 
 ## Non mesuré
 

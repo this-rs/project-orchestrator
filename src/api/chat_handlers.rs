@@ -1109,6 +1109,9 @@ pub async fn get_live_activity(
 /// - `capped: true` → rate cap hit (30/5min/session); display a
 ///   "slow down" toast and disable the button briefly.
 ///
+/// **501** — the session runs on the agent engine, which tracks no background
+/// task yet (`CancelTaskUnsupported`, P12).
+///
 /// **404** — `chat_manager` not configured.
 pub async fn cancel_task(
     State(state): State<OrchestratorState>,
@@ -1121,7 +1124,13 @@ pub async fn cancel_task(
     let result = chat_manager
         .cancel_task(&session_id.to_string(), &task_id)
         .await
-        .map_err(AppError::Internal)?;
+        .map_err(|e| {
+            match e.downcast_ref::<crate::chat::manager::CancelTaskUnsupported>() {
+                // A session of the agent engine: refused, said so (501).
+                Some(unsupported) => AppError::NotImplemented(unsupported.to_string()),
+                None => AppError::Internal(e),
+            }
+        })?;
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }

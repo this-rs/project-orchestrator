@@ -84,6 +84,33 @@ fn retryable_failure(event: &AgentEvent) -> Option<ProviderError> {
     }
 }
 
+/// What one emitted event tells of the turn ([`TurnOutcome`]), and the tool calls
+/// still waiting for their result.
+fn track_turn(
+    outcome: &mut TurnOutcome,
+    pending_tools: &mut Vec<(String, Option<String>)>,
+    event: &ChatEvent,
+) {
+    match event {
+        ChatEvent::AssistantText { content, .. } => outcome.assistant_text.push_str(content),
+        ChatEvent::ToolUse {
+            id,
+            tool,
+            input,
+            parent_tool_use_id,
+            ..
+        } => {
+            outcome.tools.push((tool.clone(), input.clone()));
+            pending_tools.push((id.clone(), parent_tool_use_id.clone()));
+        }
+        ChatEvent::ToolResult { id, .. } | ChatEvent::ToolCancelled { id, .. } => {
+            pending_tools.retain(|(pending, _)| pending != id);
+        }
+        ChatEvent::CompactBoundary { .. } => outcome.compacted = true,
+        _ => {}
+    }
+}
+
 /// Whether an event is something the user has already seen of this turn.
 fn shows_content(event: &AgentEvent) -> bool {
     matches!(
@@ -288,6 +315,33 @@ pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
     missing.into_iter().map(str::to_string).collect()
 }
 
+/// What a turn of the agent engine did, for what the host does after it
+/// ([`TurnServices::after_turn`]) — what `stream_response` gathers for its
+/// post-stream steps.
+#[derive(Debug, Clone, Default)]
+pub struct TurnOutcome {
+    /// The assistant's text of the turn.
+    pub assistant_text: String,
+    /// The tools the turn called: name and input.
+    pub tools: Vec<(String, serde_json::Value)>,
+    /// The provider compacted the conversation during the turn (`compact_boundary`).
+    pub compacted: bool,
+    /// The turn was stopped (a Stop, or a message sent now).
+    pub interrupted: bool,
+    /// The turn stopped on its turn limit.
+    pub hit_turn_limit: bool,
+    /// Auto-continue was allowed after it (a continuation is on its way).
+    pub auto_continue_allowed: bool,
+}
+
+/// What the host asks of the session after a turn: events to emit, then system
+/// hints to queue (played as the next turns, as the Claude Code engine's queue).
+#[derive(Debug, Default)]
+pub struct AfterTurn {
+    pub events: Vec<ChatEvent>,
+    pub hints: Vec<String>,
+}
+
 /// What the host does around a turn of the agent engine, that the Claude Code
 /// engine does around its own (`ChatManager::stream_response`). The manager
 /// implements it; the runtime stays free of graph and transport concerns.
@@ -319,6 +373,17 @@ pub trait TurnServices: Send + Sync {
     /// Hands an event of the session to the other instances (NATS), as the Claude
     /// Code engine publishes each of its events. Default: nowhere.
     fn publish(&self, _session_id: &str, _event: &ChatEvent) {}
+    /// Sees each event of the session as it is emitted (the work log of the turn).
+    /// Default: nothing.
+    fn observe(&self, _session_id: &str, _event: &ChatEvent) {}
+    /// After each turn played (not one refused before it was sent): the
+    /// Claude Code engine's post-stream steps — post-compaction re-injection,
+    /// objective tracking, memory, feedback, observations. Run under the step
+    /// budget of the post-stream (`post_stream::POST_STREAM_STEP_BUDGET`): past it,
+    /// it is dropped, the turn goes on. Default: nothing.
+    async fn after_turn(&self, _session_id: &str, _outcome: &TurnOutcome) -> AfterTurn {
+        AfterTurn::default()
+    }
 }
 
 /// Where the runtime finds a provider instance by identifier. The nexus
@@ -448,6 +513,7 @@ impl AgentSessionHandle {
         }
         if let Some(services) = &self.services {
             services.publish(&self.session_id, &event);
+            services.observe(&self.session_id, &event);
         }
         let _ = self.events_tx.send(event);
     }
@@ -767,8 +833,13 @@ impl AgentSessionHandle {
         let mut turn = first;
         loop {
             if let Some((stream, input)) = turn.take() {
-                let hit_turn_limit = self.play(stream, input).await;
-                self.auto_continue_after(hit_turn_limit).await;
+                let (mut outcome, pending_tools) = self.play(stream, input).await;
+                outcome.interrupted = self.interrupted.load(Ordering::SeqCst);
+                self.cancel_pending_tools(outcome.interrupted, pending_tools)
+                    .await;
+                outcome.auto_continue_allowed =
+                    self.auto_continue_after(outcome.hit_turn_limit).await;
+                self.after_turn(&outcome).await;
             }
             let Some(next) = self.next_queued().await else {
                 return;
@@ -823,10 +894,16 @@ impl AgentSessionHandle {
     }
 
     /// Plays one turn to its terminal event, retrying a failure that showed nothing.
-    /// Answers whether the turn stopped on its turn limit (`max_turns`).
-    async fn play(&self, mut stream: nexus_claude::agent::EventStream, input: TurnInput) -> bool {
+    /// Answers what the turn did, and the tool calls it left without a result
+    /// (id, parent).
+    async fn play(
+        &self,
+        mut stream: nexus_claude::agent::EventStream,
+        input: TurnInput,
+    ) -> (TurnOutcome, Vec<(String, Option<String>)>) {
         let mut attempt = 0u32;
-        let mut hit_turn_limit = false;
+        let mut outcome = TurnOutcome::default();
+        let mut pending_tools: Vec<(String, Option<String>)> = Vec::new();
         // What the turn cost, read on its `done` (`None`: no price, or no `done`).
         let mut turn_cost: Option<f64> = None;
         let retry_config = self.retry_config();
@@ -853,7 +930,7 @@ impl AgentSessionHandle {
                     }
                 }
                 shown |= shows_content(&event);
-                hit_turn_limit |= matches!(
+                outcome.hit_turn_limit |= matches!(
                     event,
                     AgentEvent::Done {
                         stop_reason: nexus_claude::agent::StopReason::MaxTurns,
@@ -866,6 +943,7 @@ impl AgentSessionHandle {
                 let event = mask_agent_event(event);
                 let chat_events = self.mapper.lock().await.map(&event);
                 for chat_event in chat_events {
+                    track_turn(&mut outcome, &mut pending_tools, &chat_event);
                     self.emit(chat_event).await;
                 }
                 if terminal {
@@ -899,7 +977,62 @@ impl AgentSessionHandle {
         }
         // The record carries the turn's cost before the session is seen idle.
         self.add_turn_cost(turn_cost).await;
-        hit_turn_limit
+        (outcome, pending_tools)
+    }
+
+    /// A stopped turn's tool calls left without a result are said cancelled
+    /// (`tool_cancelled`, persisted) — the Claude Code engine's
+    /// `PostStreamHandler::handle_interrupt_cleanup`.
+    async fn cancel_pending_tools(
+        &self,
+        interrupted: bool,
+        pending: Vec<(String, Option<String>)>,
+    ) {
+        if !interrupted {
+            return;
+        }
+        for (id, parent_tool_use_id) in pending {
+            self.emit(ChatEvent::ToolCancelled {
+                id,
+                parent_tool_use_id,
+            })
+            .await;
+        }
+    }
+
+    /// The host's end of turn ([`TurnServices::after_turn`]), bounded: its events
+    /// are emitted, its hints queued.
+    async fn after_turn(&self, outcome: &TurnOutcome) {
+        let Some(services) = &self.services else {
+            return;
+        };
+        let Some(after) = super::post_stream::bounded(
+            &self.session_id,
+            "after_turn",
+            super::post_stream::POST_STREAM_STEP_BUDGET,
+            services.after_turn(&self.session_id, outcome),
+        )
+        .await
+        else {
+            self.emit(ChatEvent::Error {
+                message: "Error: the end-of-turn processing took too long: skipped".into(),
+                parent_tool_use_id: None,
+                code: Some(super::post_stream::STEP_ABANDONED_CODE.to_string()),
+                reason: Some("after_turn".to_string()),
+                index: None,
+            })
+            .await;
+            return;
+        };
+        for event in after.events {
+            self.emit(event).await;
+        }
+        if !after.hints.is_empty() {
+            let mut queue = self.pending.lock().await;
+            for hint in after.hints {
+                queue.push_back(PendingMessage::system_hint(hint));
+            }
+        }
     }
 
     /// Sets how this session continues a turn that stopped on its turn limit.
@@ -912,10 +1045,10 @@ impl AgentSessionHandle {
     /// announce the continuation, wait (a Stop cancels it), and queue the
     /// "continue" hint the queue then plays — the Claude Code engine's
     /// `PostStreamHandler::handle_auto_continue`, with the same decision and message.
-    async fn auto_continue_after(&self, hit_turn_limit: bool) {
+    async fn auto_continue_after(&self, hit_turn_limit: bool) -> bool {
         use super::post_stream::{auto_continue_allowed, AUTO_CONTINUE_DELAY_MS};
         let Some(services) = &self.services else {
-            return;
+            return false;
         };
         if !auto_continue_allowed(
             &self.session_id,
@@ -925,7 +1058,7 @@ impl AgentSessionHandle {
             &self.auto_continue_count,
             self.max_auto_continues.load(Ordering::Relaxed),
         ) {
-            return;
+            return false;
         }
         self.emit(ChatEvent::AutoContinue {
             session_id: self.session_id.clone(),
@@ -935,13 +1068,14 @@ impl AgentSessionHandle {
         tokio::time::sleep(Duration::from_millis(AUTO_CONTINUE_DELAY_MS)).await;
         if self.interrupted.load(Ordering::SeqCst) {
             tracing::info!(session_id = %self.session_id, "Auto-continue cancelled by interrupt");
-            return;
+            return true;
         }
         let hint = services.continuation(&self.session_id).await;
         self.pending
             .lock()
             .await
             .push_back(PendingMessage::system_hint(hint));
+        true
     }
 
     /// Answers a permission request.
@@ -2359,5 +2493,213 @@ mod retry_config_tests {
             }
         }
         assert_eq!(retrying, [(1, 1, 7)]);
+    }
+}
+
+/// The end of a turn of the agent engine: what the Claude Code engine's
+/// post-stream does — the tool calls a Stop left are said cancelled, the host's
+/// `after_turn` sees what the turn did, its events go out and its hints are played.
+#[cfg(test)]
+mod after_turn_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    fn done() -> AgentEvent {
+        AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Completed,
+            subtype: None,
+            is_error: false,
+            result_text: None,
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        }
+    }
+
+    fn tool_call(id: &str, name: &str) -> AgentEvent {
+        AgentEvent::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            input: serde_json::json!({ "file_path": "src/lib.rs" }),
+            category: nexus_claude::agent::ToolCategory::Other,
+            canonical: None,
+            input_complete: true,
+            seq: None,
+            parent: None,
+        }
+    }
+
+    /// Records what `after_turn` was told and answers one hint, once.
+    #[derive(Default)]
+    struct Host {
+        seen: StdMutex<Vec<TurnOutcome>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TurnServices for Host {
+        async fn prepare(
+            &self,
+            _session_id: &str,
+            _shown: &str,
+            sent: &str,
+            _turn: &crate::refs::turn::TurnExpansion,
+        ) -> String {
+            sent.to_string()
+        }
+        async fn continuation(&self, _session_id: &str) -> String {
+            String::new()
+        }
+        async fn after_turn(&self, _session_id: &str, outcome: &TurnOutcome) -> AfterTurn {
+            let first = {
+                let mut seen = self.seen.lock().unwrap();
+                seen.push(outcome.clone());
+                seen.len() == 1
+            };
+            if !first {
+                return AfterTurn::default();
+            }
+            AfterTurn {
+                events: vec![ChatEvent::CompactionRecovery {
+                    hint_tokens: 1,
+                    build_latency_ms: 0,
+                    recovery_success: true,
+                }],
+                hints: vec!["THE-HINT".into()],
+            }
+        }
+    }
+
+    async fn rig(
+        services: Option<Arc<dyn TurnServices>>,
+    ) -> (FakeProvider, Arc<AgentSessionHandle>) {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = runtime
+            .adopt(
+                "not-a-uuid",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                services,
+            )
+            .await;
+        (provider, handle)
+    }
+
+    async fn until(what: &str, check: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !check() {
+            assert!(Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_host_sees_the_turn_and_its_hint_is_played_next() {
+        let host = Arc::new(Host::default());
+        let (provider, handle) = rig(Some(host.clone() as Arc<dyn TurnServices>)).await;
+        let mut rx = handle.events_tx.subscribe();
+        handle.send_message("go").await.unwrap();
+        until("the turn started", || {
+            !provider.state.turns_started.lock().unwrap().is_empty()
+        })
+        .await;
+        provider.state.push(AgentEvent::Text {
+            text: "all done".into(),
+            seq: None,
+            parent: None,
+        });
+        provider.state.push(tool_call("t1", "Edit"));
+        provider.state.push(AgentEvent::ToolResult {
+            id: "t1".into(),
+            output: None,
+            is_error: false,
+            seq: None,
+            parent: None,
+        });
+        provider.state.push(AgentEvent::Compaction {
+            phase: nexus_claude::agent::CompactionPhase::Completed,
+            trigger: None,
+            pre_tokens: Some(10),
+        });
+        provider.state.push(done());
+        until("the hint was played", || {
+            provider.state.turns_started.lock().unwrap().len() == 2
+        })
+        .await;
+        assert_eq!(provider.state.turns_started.lock().unwrap()[1], "THE-HINT");
+        provider.state.push(done());
+        until("the run ended", || {
+            !handle.is_streaming.load(Ordering::SeqCst)
+        })
+        .await;
+
+        let seen = host.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "after each turn played: {seen:?}");
+        assert_eq!(seen[0].assistant_text, "all done");
+        assert_eq!(seen[0].tools.len(), 1);
+        assert_eq!(seen[0].tools[0].0, "Edit");
+        assert!(seen[0].compacted, "{:?}", seen[0]);
+        assert!(!seen[0].interrupted);
+        assert!(!seen[1].compacted, "the hint's turn did not compact");
+        let mut recovered = false;
+        while let Ok(event) = rx.try_recv() {
+            recovered |= matches!(event, ChatEvent::CompactionRecovery { .. });
+        }
+        assert!(recovered, "the host's event went out");
+    }
+
+    #[tokio::test]
+    async fn a_stop_says_the_tools_left_without_result_cancelled() {
+        let (provider, handle) = rig(None).await;
+        let mut rx = handle.events_tx.subscribe();
+        handle.send_message("go").await.unwrap();
+        until("the turn started", || {
+            !provider.state.turns_started.lock().unwrap().is_empty()
+        })
+        .await;
+        provider.state.push(tool_call("t-done", "Read"));
+        provider.state.push(AgentEvent::ToolResult {
+            id: "t-done".into(),
+            output: None,
+            is_error: false,
+            seq: None,
+            parent: None,
+        });
+        provider.state.push(tool_call("t-left", "Bash"));
+        until("the tool call went out", || {
+            handle
+                .streaming_events
+                .try_lock()
+                .map(|e| {
+                    e.iter()
+                        .any(|e| matches!(e, ChatEvent::ToolUse { id, .. } if id == "t-left"))
+                })
+                .unwrap_or(false)
+        })
+        .await;
+        // The fake ends the turn stream on an interrupt, as a provider does.
+        handle.interrupt().await.unwrap();
+        until("the turn ended", || {
+            !handle.is_streaming.load(Ordering::SeqCst)
+        })
+        .await;
+        let mut cancelled = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ChatEvent::ToolCancelled { id, .. } = event {
+                cancelled.push(id);
+            }
+        }
+        assert_eq!(cancelled, ["t-left"], "only the tool left without a result");
     }
 }

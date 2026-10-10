@@ -7242,3 +7242,110 @@ mod agent_lifecycle {
         assert_eq!(manager.active_session_count().await, 0);
     }
 }
+
+/// P8 (c) — the post-stream steps of the Claude Code engine run at the end of each
+/// turn of the agent engine, with the same functions (`post_stream`): the context
+/// re-injected after a compaction, the objective reminder, and `cancel_task`
+/// refused, typed, instead of a silent success.
+mod post_turn {
+    use super::parity::{caps, rig};
+    use super::*;
+    use nexus_claude::agent::{AgentEvent, CompactionPhase, ProviderKind};
+    use nexus_claude::testkit::scripted::steps;
+    use nexus_claude::testkit::Step;
+
+    async fn seed_pending_tasks(graph: &MockGraphStore, project: Uuid) {
+        use crate::neo4j::models::{PlanNode, PlanStatus, TaskStatus};
+        let plan = PlanNode::new_for_project(
+            "Active Plan".into(),
+            "Plan with pending tasks".into(),
+            "test".into(),
+            50,
+            project,
+        );
+        graph.create_plan(&plan).await.unwrap();
+        graph
+            .update_plan_status(plan.id, PlanStatus::InProgress)
+            .await
+            .unwrap();
+        let mut task = crate::test_helpers::test_task_titled("Fix the parser bug");
+        task.status = TaskStatus::Pending;
+        graph.create_task(plan.id, &task).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn after_a_compaction_the_context_is_reinjected_and_the_objectives_recalled() {
+        let compacted = Step::Emit(AgentEvent::Compaction {
+            phase: CompactionPhase::Completed,
+            trigger: None,
+            pre_tokens: Some(1000),
+        });
+        let quiet = || vec![steps::done(&caps())];
+        let mut r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![compacted, steps::done(&caps())],
+                quiet(),
+                quiet(),
+                quiet(),
+                quiet(),
+            ],
+        )
+        .await;
+        seed_pending_tasks(&r.graph, r.project.id).await;
+        r.manager.send_message(&r.sid, "go on").await.unwrap();
+        let recovery = next_event(&mut r.rx, |e| {
+            matches!(e, ChatEvent::CompactionRecovery { .. })
+        })
+        .await;
+        assert!(
+            matches!(
+                recovery,
+                ChatEvent::CompactionRecovery {
+                    recovery_success: true,
+                    ..
+                }
+            ),
+            "{recovery:?}"
+        );
+        for _ in 0..400 {
+            if !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let sent = r.sent();
+        assert!(sent.len() >= 3, "the turn, then the hints: {sent:#?}");
+        assert!(
+            sent[1].contains("Post-Compaction Context") && sent[1].contains(&r.project.name),
+            "the context of the project, re-injected: {}",
+            sent[1]
+        );
+        assert!(
+            sent.iter().any(|s| {
+                s.contains(super::super::post_stream::OBJECTIVE_REMINDER_MARKER)
+                    && s.contains("Fix the parser bug")
+            }),
+            "the pending objective recalled: {sent:#?}"
+        );
+        assert!(
+            sent.len() <= 4,
+            "the reminders stop at their cap: {sent:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_task_on_the_agent_engine_is_refused_typed() {
+        let r = rig(ProviderKind::Native, vec![vec![steps::done(&caps())]]).await;
+        let err = r
+            .manager
+            .cancel_task(&r.sid, "task-1")
+            .await
+            .expect_err("no silent success");
+        assert!(
+            err.downcast_ref::<super::super::manager::CancelTaskUnsupported>()
+                .is_some(),
+            "{err:#}"
+        );
+    }
+}

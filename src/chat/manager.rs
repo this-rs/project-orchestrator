@@ -487,6 +487,26 @@ pub struct CancelTaskResult {
     pub capped: bool,
 }
 
+/// `cancel_task` asked of a session of the agent engine: it tracks no background
+/// task of its own yet (P4) and has nothing to stop (P12). Refused, typed, instead
+/// of the silent success it used to answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelTaskUnsupported {
+    pub session_id: String,
+}
+
+impl std::fmt::Display for CancelTaskUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cancel_task is not available on the agent engine yet: session {} tracks no background task",
+            self.session_id
+        )
+    }
+}
+
+impl std::error::Error for CancelTaskUnsupported {}
+
 /// Runtime-mutable environment config for Claude CLI subprocess.
 ///
 /// These fields can be changed at runtime via the REST API and are
@@ -1216,6 +1236,38 @@ pub(crate) struct ManagerTurnServices {
     nats: Option<Arc<crate::events::NatsEmitter>>,
     /// The anchor state of the manager when these services were built.
     anchor: super::anchor_resolver::AnchorSession,
+    /// The session's state for the end of its turns, as `ActiveSession` holds it on
+    /// the Claude Code engine.
+    session: AgentTurnState,
+    search: Arc<dyn SearchStore>,
+    event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
+    context_injector: Option<Arc<ContextInjector>>,
+}
+
+/// What a session of the agent engine keeps for the end of its turns: the fields of
+/// `ActiveSession` the Claude Code engine's post-stream reads.
+#[derive(Clone, Default)]
+pub(crate) struct AgentTurnState {
+    /// Records the conversation in memory (`None`: no memory configured).
+    memory: Option<Arc<Mutex<ConversationMemoryManager>>>,
+    rfc_accumulator: Arc<Mutex<super::observation_detector::RfcAccumulator>>,
+    /// The protocol run the session was spawned in (`spawned_by`), for the enrichment.
+    protocol_run_id: Option<Uuid>,
+    protocol_state: Option<String>,
+    reasoning_path_tracker: super::feedback::ReasoningPathTracker,
+    objectives: super::post_stream::ObjectiveCounters,
+    /// The tools the session used (files, steps), live from its events.
+    work_log: Arc<std::sync::Mutex<SessionWorkLog>>,
+}
+
+impl ManagerTurnServices {
+    fn work_summary(&self) -> String {
+        self.session
+            .work_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .to_summary_markdown()
+    }
 }
 
 #[async_trait::async_trait]
@@ -1242,12 +1294,20 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         };
         // The enrichment reads what the user typed (the attachments' text, without
         // references), and does not inject again the notes the user pointed at.
+        // What the user typed goes to memory, as `stream_response` records it.
+        if let Some(mm) = &self.session.memory {
+            mm.lock().await.record_user_message(&turn.memory_text);
+        }
         let prepared = match enrichment_for_turn(
             &self.graph,
             &self.enrichment_pipeline,
             session_id,
             &turn.enrichment_text,
-            TurnProtocol::default(),
+            TurnProtocol {
+                run_id: self.session.protocol_run_id,
+                state: self.session.protocol_state.clone(),
+                reasoning_path_tracker: Some(self.session.reasoning_path_tracker.clone()),
+            },
             turn.excluded_note_ids.clone(),
             &self.anchor,
         )
@@ -1272,8 +1332,13 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             Uuid::parse_str(session_id).ok(),
         )
         .await;
-        // No work log on this engine: the hint carries the task/step context alone.
-        super::post_stream::continuation_message(&self.graph, ctx.project_slug.as_deref(), "").await
+        let work_summary = self.work_summary();
+        super::post_stream::continuation_message(
+            &self.graph,
+            ctx.project_slug.as_deref(),
+            &work_summary,
+        )
+        .await
     }
 
     async fn images(
@@ -1287,6 +1352,92 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         if let Some(nats) = &self.nats {
             nats.publish_chat_event(session_id, event.clone());
         }
+    }
+
+    fn observe(&self, _session_id: &str, event: &ChatEvent) {
+        if let ChatEvent::ToolUse { tool, input, .. } = event {
+            self.session
+                .work_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_tool_use(tool, input);
+        }
+    }
+
+    /// The post-stream steps of the Claude Code engine, with the same functions:
+    /// post-compaction re-injection, objective tracking, memory / feedback /
+    /// observations. Interrupt cleanup and auto-continue are the runtime's.
+    async fn after_turn(
+        &self,
+        session_id: &str,
+        outcome: &super::agent_runtime::TurnOutcome,
+    ) -> super::agent_runtime::AfterTurn {
+        let mut after = super::agent_runtime::AfterTurn::default();
+        let uuid = Uuid::parse_str(session_id).ok();
+        let ctx = super::post_stream::PostStreamContext::build(&self.graph, uuid).await;
+        // 1. Post-compaction context re-injection.
+        if outcome.compacted && !outcome.interrupted {
+            let snapshot = self
+                .session
+                .work_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .snapshot();
+            let (hint, event) = super::post_stream::post_compaction_recovery(
+                &self.graph,
+                session_id,
+                ctx.project_slug.as_deref(),
+                Some(snapshot),
+            )
+            .await;
+            after.hints.extend(hint);
+            after.events.push(event);
+        }
+        // 2. Objective tracking.
+        let had_conclusive = outcome
+            .tools
+            .iter()
+            .any(|(tool, input)| is_conclusive_tool(tool, input));
+        let had_productive = outcome
+            .tools
+            .iter()
+            .any(|(tool, input)| !is_conclusive_tool(tool, input));
+        let turn = super::post_stream::ObjectiveTurn {
+            had_productive_tool_use: had_productive,
+            had_conclusive_tool_use: had_conclusive,
+            auto_continue_allowed: outcome.auto_continue_allowed,
+            hit_error_max_turns: outcome.hit_turn_limit,
+            interrupted: outcome.interrupted,
+        };
+        if let Some(reminder) = super::post_stream::objective_reminder(
+            &self.graph,
+            ctx.project_slug.as_deref(),
+            &self.session.objectives,
+            turn,
+            self.work_summary(),
+        )
+        .await
+        {
+            info!(session_id, "Objective tracker: injecting reminder");
+            after.hints.push(reminder);
+        }
+        // 3. Memory / feedback / observations (the store write runs on its own).
+        super::post_stream::record_turn_feedback(
+            super::post_stream::TurnFeedback {
+                graph: &self.graph,
+                search: &self.search,
+                event_emitter: &self.event_emitter,
+                session_id,
+                session_uuid: uuid,
+                project_id: ctx.project_id,
+                rfc_accumulator: Some(self.session.rfc_accumulator.clone()),
+            },
+            &outcome.assistant_text,
+            &self.session.memory,
+            &self.context_injector,
+        )
+        .await;
+        after
     }
 }
 
@@ -9947,6 +10098,11 @@ impl ChatManager {
     ///   task_id isn't in the map (idempotent — clicking Stop twice on
     ///   the same task is fine).
     pub async fn cancel_task(&self, session_id: &str, task_id: &str) -> Result<CancelTaskResult> {
+        if self.agent_runtime.owns(session_id).await {
+            return Err(anyhow::Error::new(CancelTaskUnsupported {
+                session_id: session_id.to_string(),
+            }));
+        }
         let session_state = {
             let sessions = self.active_sessions.read().await;
             sessions.get(session_id).map(|s| {
@@ -11643,8 +11799,12 @@ impl ChatManager {
     }
 
     /// What a session of the agent engine gets around its turns, built from the
-    /// manager as it is configured NOW (the pipeline is replaced after construction).
-    pub(crate) fn turn_services(&self) -> Arc<dyn super::agent_runtime::TurnServices> {
+    /// manager as it is configured NOW (the pipeline is replaced after construction)
+    /// and the session's own end-of-turn state ([`Self::agent_turn_state`]).
+    fn turn_services_with(
+        &self,
+        session: AgentTurnState,
+    ) -> Arc<dyn super::agent_runtime::TurnServices> {
         Arc::new(ManagerTurnServices {
             graph: self.graph.clone(),
             enrichment_pipeline: self.enrichment_pipeline.clone(),
@@ -11652,7 +11812,45 @@ impl ChatManager {
             documents: self.document_store.clone(),
             nats: self.nats.clone(),
             anchor: self.anchor_session(),
+            session,
+            search: self.search.clone(),
+            event_emitter: self.event_emitter.clone(),
+            context_injector: self.context_injector.clone(),
         })
+    }
+
+    /// The end-of-turn state of the agent session `session_id`, from its node: its
+    /// memory conversation, the protocol run it was spawned in. Objective tracking
+    /// is on, as for every Claude Code session.
+    async fn agent_turn_state(&self, session_id: &str) -> AgentTurnState {
+        let node = match Uuid::parse_str(session_id) {
+            Ok(uuid) => self.graph.get_chat_session(uuid).await.ok().flatten(),
+            Err(_) => None,
+        };
+        let memory = match (
+            &self.memory_config,
+            node.as_ref().and_then(|n| n.conversation_id.clone()),
+        ) {
+            (Some(config), Some(conversation_id)) => Some(Arc::new(Mutex::new(
+                ConversationMemoryManager::new(config.clone())
+                    .with_conversation_id(conversation_id),
+            ))),
+            _ => None,
+        };
+        let spawned = node
+            .as_ref()
+            .and_then(|n| n.spawned_by.as_deref())
+            .and_then(parse_spawned_by);
+        AgentTurnState {
+            memory,
+            protocol_run_id: spawned.as_ref().and_then(|s| s.protocol_run_id),
+            protocol_state: spawned.and_then(|s| s.protocol_state),
+            objectives: super::post_stream::ObjectiveCounters {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     /// Records what the provider reported (frozen capabilities, resume token)
@@ -11703,7 +11901,7 @@ impl ChatManager {
                 first_seq,
                 &kind_name,
                 tool_policy,
-                Some(self.turn_services()),
+                Some(self.turn_services_with(self.agent_turn_state(session_id).await)),
                 extra_degraded,
             )
             .await;
@@ -22802,6 +23000,10 @@ mod refs_turn_services_tests {
             nats: None,
             documents: crate::documents::store::DocumentStore::new(std::env::temp_dir()),
             anchor: Default::default(),
+            session: Default::default(),
+            search: crate::test_helpers::mock_app_state().meili,
+            event_emitter: None,
+            context_injector: None,
         };
 
         let note = Uuid::new_v4();

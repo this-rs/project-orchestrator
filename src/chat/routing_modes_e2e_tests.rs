@@ -552,9 +552,10 @@ async fn a_native_compaction_records_its_decision_in_shadow_and_runs_on_the_sess
         turn(&w, &p, text).await;
     }
     // The last turn runs on the compacted history: the summary the PRIMARY wrote, on pm.
+    // (The context re-injected after the compaction is a turn of its own, P8c.)
     let after: Vec<(String, String)> = turns(&w.primary)
         .into_iter()
-        .filter(|(_, body)| body.contains("turn five"))
+        .filter(|(_, body)| body.contains("turn five") && !body.contains("Post-Compaction Context"))
         .collect();
     assert_eq!(after.len(), 1, "{after:?}");
     assert_eq!(after[0].0, "pm");

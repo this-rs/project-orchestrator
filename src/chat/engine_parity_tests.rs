@@ -288,8 +288,8 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
         Expect::Gap {
             cause: Cause::Harness,
             task: "P12",
-            why: "cancel_task n'a pas de branche moteur agent (no-op idempotent) et le natif \
-                  n'a pas de tâche à annuler",
+            why: "cancel_task n'a pas de branche moteur agent : refus typé \
+                  (CancelTaskUnsupported, 501 sur la route) et le natif n'a pas de tâche à annuler",
         },
     ),
 ];
@@ -2460,12 +2460,15 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
         Cause::Harness,
         format!("active_tasks_update={tracked}"),
     );
-    let stopped = manager.cancel_task(&nid, "c7").await.unwrap();
+    let stopped = manager.cancel_task(&nid, "c7").await;
     na.check(
         "cancel_task",
-        !stopped.killed_pids.is_empty(),
+        stopped.as_ref().is_ok_and(|s| !s.killed_pids.is_empty()),
         Cause::Harness,
-        format!("killed_pids={:?}", stopped.killed_pids),
+        match &stopped {
+            Ok(s) => format!("killed_pids={:?}", s.killed_pids),
+            Err(e) => format!("refusé : {e}"),
+        },
     );
     wn.said(WAIT, "answered bg").await;
     wn.settle(ends, &manager).await;
