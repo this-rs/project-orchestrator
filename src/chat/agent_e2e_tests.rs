@@ -6095,3 +6095,130 @@ mod attached_images {
         }
     }
 }
+
+/// The session record of a conversation on the legacy Claude Code engine (P15): the
+/// counter of user messages survives every turn of the CLI.
+mod legacy_session_record {
+    use super::*;
+
+    fn turn(text: &str, cost: f64) -> [Value; 3] {
+        [
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            json!({"op": "emit_json", "json": {"type": "assistant", "message": {
+                "id": "msg_fake_1", "type": "message", "role": "assistant",
+                "model": "fake-claude", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": text}]}}}),
+            json!({"op": "emit_json", "json": {"type": "result", "subtype": "success",
+                "duration_ms": 1, "duration_api_ms": 1, "is_error": false, "num_turns": 1,
+                "session_id": "fake-cli-session", "total_cost_usd": cost, "result": text}}),
+        ]
+    }
+
+    /// `fake_claude` behind a wrapper that plays `transcript`, and a manager on the
+    /// legacy engine that starts it.
+    async fn legacy(transcript: &[Value]) -> (tempfile::TempDir, Arc<MockGraphStore>, ChatManager) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &script,
+            transcript
+                .iter()
+                .map(|l| format!("{l}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let wrapper = dir.path().join("claude");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nFAKE_CLAUDE_TRANSCRIPT='{}' FAKE_CLAUDE_MAX_RUNTIME_MS=120000 \
+                 exec '{}' \"$@\"\n",
+                script.display(),
+                fake_bin("fake_claude").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Legacy,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: None,
+            nexus_browser_path: None,
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config);
+        manager
+            .update_claude_cli_path(Some(wrapper.display().to_string()))
+            .await;
+        (dir, graph, manager)
+    }
+
+    /// The record of `sid` once `done` holds.
+    async fn record_until(
+        graph: &MockGraphStore,
+        sid: &str,
+        done: impl Fn(&crate::neo4j::models::ChatSessionNode) -> bool,
+    ) -> crate::neo4j::models::ChatSessionNode {
+        let id = Uuid::parse_str(sid).unwrap();
+        let mut last = None;
+        for _ in 0..400 {
+            let node = graph.get_chat_session(id).await.unwrap();
+            if let Some(node) = node {
+                if done(&node) {
+                    return node;
+                }
+                last = Some(node);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the record of {sid} never got there: {last:?}");
+    }
+
+    /// Three user messages, three turns of the CLI: the record counts three, each
+    /// `result` of the CLI still leaves its cost and its session id (it used to write
+    /// `message_count = 1` on every `result`: 1 measured for 13 messages).
+    #[tokio::test]
+    async fn the_message_count_of_a_legacy_session_counts_every_user_message() {
+        let mut transcript = turn("answer one", 0.01).to_vec();
+        transcript.insert(
+            1,
+            json!({"op": "emit_json", "json": {"type": "system", "subtype": "init",
+                "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                "permissionMode": "default", "apiKeySource": "none"}}),
+        );
+        transcript.extend(turn("answer two", 0.02));
+        transcript.extend(turn("answer three", 0.03));
+        transcript.push(json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}));
+        let (dir, graph, manager) = legacy(&transcript).await;
+
+        let mut req = request(None, None, "default");
+        req.message = "message one".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(
+            !manager.agent_runtime.owns(&sid).await,
+            "Claude Code runs on the legacy engine"
+        );
+        let node = record_until(&graph, &sid, |n| n.total_cost_usd == Some(0.01)).await;
+        assert_eq!(node.message_count, 1, "after the first turn: {node:?}");
+
+        manager.send_message(&sid, "message two").await.unwrap();
+        let node = record_until(&graph, &sid, |n| n.total_cost_usd == Some(0.02)).await;
+        assert_eq!(node.message_count, 2, "after the second turn: {node:?}");
+
+        manager.send_message(&sid, "message three").await.unwrap();
+        let node = record_until(&graph, &sid, |n| n.total_cost_usd == Some(0.03)).await;
+        assert_eq!(node.message_count, 3, "after the third turn: {node:?}");
+        assert_eq!(node.cli_session_id.as_deref(), Some("fake-cli-session"));
+        manager.close_session(&sid).await.unwrap();
+    }
+}
