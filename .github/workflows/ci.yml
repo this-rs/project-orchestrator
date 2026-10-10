@@ -2,9 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "integ/**"]
   pull_request:
-    branches: [main]
+    # integ/<lot>: integration branches. A lot's PRs merge there after review on the FAST tier
+    # (lint, security, unit, integration); the lot reaches main through ONE PR integ/<lot> -> main,
+    # which runs everything (build, API, coverage and the parity matrix). See the FULL-tier `if`.
+    # ready_for_review: marking a draft PR into main as ready is what starts its FULL tier.
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main, "integ/**"]
   # Cold run: nothing restored from any cache (see "Cache policy" below).
   schedule:
     - cron: "17 3 * * *"
@@ -55,6 +60,10 @@ jobs:
   # ==========================================================================
   build:
     name: Build
+    # FULL tier only: a READY (non-draft) PR into main, pushes to main, nightly and manual runs.
+    # A DRAFT PR into main (an integration branch accumulating its lot) runs the fast tier only;
+    # "Ready for review" starts the full tier once.
+    if: (github.base_ref == 'main' && !github.event.pull_request.draft) || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -216,6 +225,9 @@ jobs:
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
+    # A hung test used to hold a job for 1-2 hours; nextest kills it after 5 min (see
+    # .config/nextest.toml), this is the backstop.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
 
@@ -231,6 +243,9 @@ jobs:
           save-if: ${{ env.CACHE_SAVE == 'true' && env.CACHE_FRESH == '' }}
           cache-workspace-crates: true
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       # src/chat/agent_e2e_tests.rs needs the nexus fake servers (see the action).
       - name: Build the nexus fake servers used by the agent e2e tests
         uses: ./.github/actions/nexus-fakes
@@ -240,7 +255,9 @@ jobs:
         # neural-routing-* crates carry their own #[cfg(test)] suites that the
         # root-only `cargo test --lib` never executed). Desktop excluded — see
         # the clippy step.
-        run: cargo test --workspace --exclude project-orchestrator-desktop --lib
+        # nextest: one process per test (no shared globals between tests), all cores, and a
+        # per-test timeout that NAMES a hung test instead of letting it hold the job.
+        run: cargo nextest run --profile ci --workspace --exclude project-orchestrator-desktop --lib
 
       - name: Run parser tests
         run: cargo test --test parser_tests
@@ -262,6 +279,7 @@ jobs:
   integration-tests:
     name: Integration Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: read
@@ -275,8 +293,8 @@ jobs:
           NEO4J_AUTH: neo4j/testpassword
           NEO4J_PLUGINS: '["apoc"]'
         ports:
-          - 7687:7687
-          - 7474:7474
+          - 7687
+          - 7474
         options: >-
           --health-cmd "cypher-shell -u neo4j -p testpassword 'RETURN 1' || exit 1"
           --health-interval 10s
@@ -293,7 +311,7 @@ jobs:
           MEILI_MASTER_KEY: test-master-key
           MEILI_NO_ANALYTICS: true
         ports:
-          - 7700:7700
+          - 7700
         options: >-
           --health-cmd "curl -sf http://localhost:7700/health || exit 1"
           --health-interval 5s
@@ -318,17 +336,17 @@ jobs:
       - name: Wait for services to be ready
         run: |
           echo "Waiting for Neo4j..."
-          timeout 60 bash -c 'until curl -sf http://localhost:7474 > /dev/null 2>&1; do sleep 2; done'
+          timeout 60 bash -c 'until curl -sf http://localhost:${{ job.services.neo4j.ports['7474'] }} > /dev/null 2>&1; do sleep 2; done'
           echo "Waiting for Meilisearch..."
-          timeout 60 bash -c 'until curl -sf http://localhost:7700/health > /dev/null 2>&1; do sleep 2; done'
+          timeout 60 bash -c 'until curl -sf http://localhost:${{ job.services.meilisearch.ports['7700'] }}/health > /dev/null 2>&1; do sleep 2; done'
           echo "All services are ready!"
 
       - name: Run integration tests
         env:
-          NEO4J_URI: bolt://localhost:7687
+          NEO4J_URI: bolt://localhost:${{ job.services.neo4j.ports['7687'] }}
           NEO4J_USER: neo4j
           NEO4J_PASSWORD: testpassword
-          MEILISEARCH_URL: http://localhost:7700
+          MEILISEARCH_URL: http://localhost:${{ job.services.meilisearch.ports['7700'] }}
           MEILISEARCH_KEY: test-master-key
         run: |
           # harness_neo4j: the Cypher of the provider settings; REQUIRED here, so a
@@ -342,6 +360,10 @@ jobs:
   # ==========================================================================
   api-tests:
     name: API Tests
+    # FULL tier only: a READY (non-draft) PR into main, pushes to main, nightly and manual runs.
+    # A DRAFT PR into main (an integration branch accumulating its lot) runs the fast tier only;
+    # "Ready for review" starts the full tier once.
+    if: (github.base_ref == 'main' && !github.event.pull_request.draft) || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     needs: [build, lint]
     permissions:
@@ -447,7 +469,13 @@ jobs:
   # ==========================================================================
   coverage:
     name: Code Coverage
+    # FULL tier only: a READY (non-draft) PR into main, pushes to main, nightly and manual runs.
+    # A DRAFT PR into main (an integration branch accumulating its lot) runs the fast tier only;
+    # "Ready for review" starts the full tier once.
+    if: (github.base_ref == 'main' && !github.event.pull_request.draft) || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # Backstop: a hung test used to keep this job alive for 1-2 hours.
+    timeout-minutes: 50
     permissions:
       contents: read
       packages: read
@@ -461,8 +489,8 @@ jobs:
           NEO4J_AUTH: neo4j/testpassword
           NEO4J_PLUGINS: '["apoc"]'
         ports:
-          - 7687:7687
-          - 7474:7474
+          - 7687
+          - 7474
         options: >-
           --health-cmd "cypher-shell -u neo4j -p testpassword 'RETURN 1' || exit 1"
           --health-interval 10s
@@ -478,7 +506,7 @@ jobs:
           MEILI_MASTER_KEY: test-master-key
           MEILI_NO_ANALYTICS: true
         ports:
-          - 7700:7700
+          - 7700
         options: >-
           --health-cmd "curl -sf http://localhost:7700/health || exit 1"
           --health-interval 5s
@@ -506,8 +534,8 @@ jobs:
 
       - name: Wait for services to be ready
         run: |
-          timeout 90 bash -c 'until curl -sf http://localhost:7474 > /dev/null 2>&1; do sleep 2; done'
-          timeout 60 bash -c 'until curl -sf http://localhost:7700/health > /dev/null 2>&1; do sleep 2; done'
+          timeout 90 bash -c 'until curl -sf http://localhost:${{ job.services.neo4j.ports['7474'] }} > /dev/null 2>&1; do sleep 2; done'
+          timeout 60 bash -c 'until curl -sf http://localhost:${{ job.services.meilisearch.ports['7700'] }}/health > /dev/null 2>&1; do sleep 2; done'
           echo "Neo4j + Meilisearch ready"
 
       # Coverage is collected in SEVERAL runs whose profraw data is then MERGED
@@ -536,7 +564,7 @@ jobs:
       # The Unit Tests job has no Neo4j and no PARITY_NEO4J_URI: it skips.
       - name: Collect coverage — unit tests (workspace)
         env:
-          PARITY_NEO4J_URI: bolt://localhost:7687
+          PARITY_NEO4J_URI: bolt://localhost:${{ job.services.neo4j.ports['7687'] }}
           PARITY_NEO4J_USER: neo4j
           PARITY_NEO4J_PASSWORD: testpassword
           HARNESS_NEO4J_REQUIRED: "1"
@@ -554,10 +582,10 @@ jobs:
       # method here runs against Neo4j, so its lines count.
       - name: Collect coverage — Neo4j integration suites
         env:
-          NEO4J_URI: bolt://localhost:7687
+          NEO4J_URI: bolt://localhost:${{ job.services.neo4j.ports['7687'] }}
           NEO4J_USER: neo4j
           NEO4J_PASSWORD: testpassword
-          MEILISEARCH_URL: http://localhost:7700
+          MEILISEARCH_URL: http://localhost:${{ job.services.meilisearch.ports['7700'] }}
           MEILISEARCH_KEY: test-master-key
         run: |
           cargo llvm-cov --no-report --no-fail-fast \

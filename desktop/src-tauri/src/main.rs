@@ -24,6 +24,31 @@ static BACKEND_PORT: std::sync::atomic::AtomicU16 =
 /// The backend thread polls this flag before calling `show_main_window()`.
 static SPLASH_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// How long the desktop thread waits for the backend's HTTP listener before moving on.
+const BACKEND_LISTEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Where the wait for the backend's HTTP listener stands.
+#[derive(Debug, PartialEq, Eq)]
+enum BackendWait {
+    /// Keep polling.
+    Keep,
+    /// The splash signalled `proceed_to_main` ("Continue anyway" or a finished check): stop now.
+    SplashProceeded,
+    /// The backend did not answer within `BACKEND_LISTEN_TIMEOUT`.
+    TimedOut,
+}
+
+/// The splash wins over the clock: once it has faded out, waiting on would leave an empty window.
+fn backend_wait_state(splash_ready: bool, elapsed: std::time::Duration) -> BackendWait {
+    if splash_ready {
+        BackendWait::SplashProceeded
+    } else if elapsed > BACKEND_LISTEN_TIMEOUT {
+        BackendWait::TimedOut
+    } else {
+        BackendWait::Keep
+    }
+}
+
 /// Tauri command: get the server port for the frontend to connect to.
 /// Returns the real port from config.yaml (not necessarily 6600).
 #[tauri::command]
@@ -246,6 +271,16 @@ fn main() {
                 } else {
                     tracing::warn!("Bundled mcp_server not found at: {}", mcp_path.display());
                 }
+
+                // nexus-tools: the files, shell and web tools of a native session. The release
+                // bundles it as a resource; the server looks next to ITS executable, which here
+                // is the app's, so it is named explicitly. An operator's NEXUS_TOOLS_PATH wins.
+                let tools_name = format!("nexus-tools{}", std::env::consts::EXE_SUFFIX);
+                let tools_path = resource_dir.join(&tools_name);
+                if std::env::var_os("NEXUS_TOOLS_PATH").is_none() && tools_path.exists() {
+                    tracing::info!("nexus-tools path: {}", tools_path.display());
+                    std::env::set_var("NEXUS_TOOLS_PATH", &tools_path);
+                }
             }
 
             // Create the main window PROGRAMMATICALLY (not from tauri.conf.json)
@@ -401,9 +436,24 @@ fn main() {
                 let start = std::time::Instant::now();
 
                 loop {
-                    if start.elapsed() > std::time::Duration::from_secs(30) {
-                        tracing::error!("Backend HTTP listener did not start within 30 seconds");
-                        break;
+                    match backend_wait_state(
+                        SPLASH_READY.load(std::sync::atomic::Ordering::SeqCst),
+                        start.elapsed(),
+                    ) {
+                        BackendWait::SplashProceeded => {
+                            // "Continue anyway" was pressed: the splash already faded out, so do
+                            // not keep the user on an empty window for the rest of the wait.
+                            tracing::warn!(
+                                "Splash asked to proceed after {:?} — not waiting for the backend any longer",
+                                start.elapsed()
+                            );
+                            break;
+                        }
+                        BackendWait::TimedOut => {
+                            tracing::error!("Backend HTTP listener did not start within 30 seconds");
+                            break;
+                        }
+                        BackendWait::Keep => {}
                     }
                     // We only check that the HTTP listener is up (any response),
                     // NOT that services are connected. /health may return 503 when
@@ -674,5 +724,46 @@ fn show_main_window(handle: &tauri::AppHandle) {
         if let Err(e) = main_window.set_focus() {
             tracing::warn!("Failed to focus main window: {}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// The splash's "Continue anyway" button sets `SPLASH_READY` through `proceed_to_main`.
+    /// The wait for the backend reads that flag, otherwise the faded-out splash stays on an
+    /// empty window until the whole backend timeout has run out.
+    #[test]
+    fn proceed_to_main_sets_the_flag_the_backend_wait_reads() {
+        SPLASH_READY.store(false, Ordering::SeqCst);
+        proceed_to_main();
+        assert!(SPLASH_READY.load(Ordering::SeqCst));
+        SPLASH_READY.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn the_backend_wait_is_bounded_and_the_splash_wins_over_the_clock() {
+        use std::time::Duration;
+        assert_eq!(BACKEND_LISTEN_TIMEOUT.as_secs(), 30);
+        assert_eq!(
+            backend_wait_state(false, Duration::from_secs(5)),
+            BackendWait::Keep
+        );
+        assert_eq!(
+            backend_wait_state(false, Duration::from_secs(31)),
+            BackendWait::TimedOut
+        );
+        // "Continue anyway" at once: no waiting at all.
+        assert_eq!(
+            backend_wait_state(true, Duration::ZERO),
+            BackendWait::SplashProceeded
+        );
+        // Pressed after the timeout already ran out: still reported as the splash's decision.
+        assert_eq!(
+            backend_wait_state(true, Duration::from_secs(31)),
+            BackendWait::SplashProceeded
+        );
     }
 }
