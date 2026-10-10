@@ -1,0 +1,23 @@
+# cargo-nextest configuration (CI: `cargo nextest run --profile ci`).
+#
+# Why a per-test timeout: a test that waits on a condition that never comes held whole CI
+# jobs for one to two hours (October 2026: a Neo4j connection with nothing listening, and a
+# runner test whose global cancel flag was cleared by a sibling test). With nextest the hung
+# test is killed and NAMED after five minutes; the rest of the suite still runs.
+
+[profile.ci]
+# Report every failure, not just the first.
+fail-fast = false
+# "slow" after 60 s, killed after 5 periods (5 min). The slowest healthy tests (the engine
+# parity matrix, the agent e2e scenarios) finish well under that.
+slow-timeout = { period = "60s", terminate-after = 5 }
+# No retries: a flaky test must be seen and fixed, not hidden.
+retries = 0
+# Print the output of failing tests at the end of the run, where the log is read.
+failure-output = "immediate-final"
+
+# The engine parity matrix and the agent e2e scenarios start fake servers and play whole
+# turns on both engines: give them 10 minutes before they are killed.
+[[profile.ci.overrides]]
+filter = 'test(/engine_parity_tests|agent_e2e_tests/)'
+slow-timeout = { period = "60s", terminate-after = 10 }
