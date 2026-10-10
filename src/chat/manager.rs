@@ -53,11 +53,6 @@ const RESUME_GRACE: std::time::Duration = std::time::Duration::from_millis(1500)
 /// once, a dead one does not hold the session longer than this.
 const INTERRUPTED_TURN_RESULT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long a turn of the Claude CLI waits, at its end, for the OOB listener to
-/// reach the turn's `result` (see `oob_listener::ResultCursor`). A listener keeps
-/// up within milliseconds; a loaded machine may lag it by more.
-const OOB_CATCH_UP_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// OOB-triggered `stream_response` rate cap for interactive sessions.
 /// A misbehaving Monitor or background Bash that emits constantly could
 /// otherwise loop the session and inflate the LLM bill — this caps the
@@ -248,8 +243,9 @@ pub struct ActiveSession {
     /// `interrupt_token`. The interrupt watchdog compares it to know whether the
     /// turn it cancelled is still the one running (`abandon_turn_if_stuck`).
     pub turn_generation: Arc<AtomicU64>,
-    /// Where the turns and the OOB listener are in the CLI's output: a turn ends
-    /// only once the listener reached its `result` (`oob_listener::ResultCursor`).
+    /// Where the turns and the OOB listener are in the CLI's output: the listener
+    /// never takes a finished turn's message for background output
+    /// (`oob_listener::ResultCursor`).
     pub result_cursor: Arc<super::oob_listener::ResultCursor>,
     /// The task running the current turn (`stream_response`, then whatever it
     /// drains next). Registered by `track_stream_task` at every spawn; aborted by
@@ -6735,11 +6731,6 @@ impl ChatManager {
         if sdk_control_rx.is_some() {
             *shared_sdk_control_rx.lock().await = sdk_control_rx;
         }
-
-        // The OOB listener reads the same output on its own subscription: the turn
-        // ends only once it reached the turn's `result`, so none of the turn's
-        // messages is taken for background output (`oob_listener::ResultCursor`).
-        result_cursor.wait_for_listener(OOB_CATCH_UP_BOUND).await;
 
         // ===== POST-STREAM PROCESSING =====
         // All post-stream logic delegated to PostStreamHandler (see post_stream.rs).
@@ -17864,7 +17855,8 @@ mod tests {
             None,
             None,
             session_id.clone(),
-            Duration::from_millis(200),
+            // Long enough for the 20 ms bump to run on a loaded runner (200 ms was not).
+            Duration::from_secs(3),
         )
         .await;
 
@@ -19657,8 +19649,12 @@ mod tests {
         let event = parse_permission_control_msg(&msg, None).expect("permission request");
         assert!(matches!(event, ChatEvent::PermissionRequest { .. }));
         notify_attention_for_chat_event(&emitter, "sess-1", &event);
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let ev = rx.try_recv().expect("attention_changed on the bus");
+        // Wait for the event (bounded), not a fixed 400 ms: under a loaded runner the
+        // emitter task may not have run yet and a single try_recv saw an empty bus.
+        let ev = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("attention_changed on the bus within 10 s")
+            .expect("attention_changed on the bus");
         assert_eq!(ev.entity_type, crate::events::EntityType::AttentionChanged);
         assert_eq!(ev.payload["session_id"], "sess-1");
         assert_eq!(
@@ -19696,8 +19692,12 @@ mod tests {
             .send_permission_response("sess-d", "req-d", true)
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let ev = rx.try_recv().expect("attention_changed on the bus");
+        // Wait for the event (bounded), not a fixed 400 ms: under a loaded runner the
+        // emitter task may not have run yet and a single try_recv saw an empty bus.
+        let ev = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("attention_changed on the bus within 10 s")
+            .expect("attention_changed on the bus");
         assert_eq!(ev.payload["session_id"], "sess-d");
         assert_eq!(
             ev.payload["reasons"],

@@ -530,12 +530,23 @@ mod tests {
         let debouncer = AnalyticsDebouncer::new(engine, 50); // 50ms debounce
         let pid = Uuid::new_v4();
 
+        // Wait for each burst to be processed (bounded) instead of a fixed 150 ms: under a
+        // loaded runner the debounce task may not have run yet (seen failing in CI).
+        async fn wait_for(count: &AtomicU32, n: u32) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while count.load(Ordering::SeqCst) < n && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
         // First burst
         debouncer.trigger(pid);
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        wait_for(&count, 1).await;
 
         // Second burst (after first completed)
         debouncer.trigger(pid);
+        wait_for(&count, 2).await;
+        // Leave room for a wrong third call to show up.
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         assert_eq!(
