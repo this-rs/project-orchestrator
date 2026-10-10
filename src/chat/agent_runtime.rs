@@ -392,6 +392,9 @@ pub struct AgentSessionHandle {
     /// The call each permission request still waiting asks for (request id -> call):
     /// what a `session` grant is derived from.
     asked_calls: std::sync::Mutex<HashMap<String, super::session_grants::AskedCall>>,
+    /// Who asks this session's permission requests (its provider kind): whether a
+    /// request carries the whole call (`session_grants::Asker`).
+    asker: super::session_grants::Asker,
 }
 
 impl AgentSessionHandle {
@@ -465,6 +468,7 @@ impl AgentSessionHandle {
         } = &event
         {
             let call = super::session_grants::AskedCall {
+                asker: self.asker,
                 tool: tool.clone(),
                 canonical: canonical.clone(),
                 input: input.clone(),
@@ -959,9 +963,10 @@ impl AgentSessionHandle {
     /// rule, whose matching is looser than what the user approved):
     ///
     /// - `session`: the grant of this call (`session_grants::grant_for`: the identical
-    ///   call, or any call of a read-only tool) is kept in this session AFTER the provider
-    ///   took the answer; the backend answers the later requests it covers ([`Self::emit`]).
-    ///   A call that cannot be granted (a command running another command) is refused.
+    ///   call, or any call of a read-only tool of nexus) is kept in this session AFTER the
+    ///   provider took the answer; the backend answers the later requests it covers
+    ///   ([`Self::emit`]). A call that cannot be granted (a request that does not carry the
+    ///   whole call, a tool or a program off the allowlist) is refused.
     /// - `always`: refused on every engine in this lot.
     ///
     /// A refusal ([`PermissionDeliveryError::ScopeUnsupported`]) answers nothing: the
@@ -988,11 +993,13 @@ impl AgentSessionHandle {
                     .unwrap_or_else(|p| p.into_inner())
                     .get(request_id)
                     .cloned();
-                Some(
-                    call.as_ref()
-                        .and_then(super::session_grants::grant_for)
-                        .ok_or(PermissionDeliveryError::ScopeUnsupported(scope))?,
-                )
+                let grant = call.as_ref().and_then(|call| {
+                    self.session_grants
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .grant_for(call)
+                });
+                Some(grant.ok_or(PermissionDeliveryError::ScopeUnsupported(scope))?)
             }
             (true, PermissionAnswerScope::Always) => {
                 return Err(PermissionDeliveryError::ScopeUnsupported(scope));
@@ -1138,6 +1145,10 @@ impl AgentSessionHandle {
 pub struct AgentRuntime {
     sessions: RwLock<HashMap<String, Arc<AgentSessionHandle>>>,
     graph: Arc<dyn GraphStore>,
+    /// The third-party MCP tools the operator declared read-only
+    /// (`ChatConfig::read_only_mcp_tools`): what each session's grants may cover
+    /// (`session_grants::SessionGrants::declaring`).
+    read_only_mcp_tools: Vec<String>,
 }
 
 impl AgentRuntime {
@@ -1146,7 +1157,15 @@ impl AgentRuntime {
         Self {
             sessions: RwLock::new(HashMap::new()),
             graph,
+            read_only_mcp_tools: Vec::new(),
         }
+    }
+
+    /// This runtime, its sessions declaring these third-party MCP tools read-only (exact
+    /// `mcp__<server>__<tool>` names): the only ones a session grant may cover.
+    pub fn declaring_read_only_mcp_tools(mut self, tools: Vec<String>) -> Self {
+        self.read_only_mcp_tools = tools;
+        self
     }
 
     /// The live session, if this runtime owns it.
@@ -1246,8 +1265,11 @@ impl AgentRuntime {
             cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
-            session_grants: std::sync::Mutex::default(),
+            session_grants: std::sync::Mutex::new(super::session_grants::SessionGrants::declaring(
+                self.read_only_mcp_tools.clone(),
+            )),
             asked_calls: std::sync::Mutex::new(HashMap::new()),
+            asker: super::session_grants::Asker::from_provider_kind(provider_kind),
         });
         if let Some(oob) = session.out_of_band() {
             let pump = Arc::clone(&handle);
@@ -1964,6 +1986,112 @@ mod adopt_tests {
                 .count(),
             1,
             "listed once, whatever the caller passes"
+        );
+    }
+
+    /// The review of #681 (finding 1): Codex asks a patch with `{reason}` only (nexus
+    /// `codex/map.rs`), no path, no diff. A `session` answer to a first patch is refused,
+    /// typed; the second patch, to another file, is asked to the user, never answered by
+    /// the backend.
+    #[tokio::test]
+    async fn a_codex_patch_is_never_granted_for_the_session_and_the_next_one_is_asked() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        provider.caps.lock().unwrap().permission_scopes =
+            vec![PermissionScope::Once, PermissionScope::Session];
+        let handle = runtime
+            .adopt(
+                "codex-patches",
+                "codex",
+                provider.session(),
+                1,
+                "codex",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        let patch = |id: &str| ChatEvent::PermissionRequest {
+            id: id.to_string(),
+            tool: "apply_patch".into(),
+            input: serde_json::json!({ "reason": null }),
+            parent_tool_use_id: None,
+            category: Some("edit".into()),
+            canonical: Some("Edit".into()),
+        };
+        // The first patch (README.md): `session` refused, nothing answered; `once` goes.
+        handle.emit(patch("patch-readme")).await;
+        let refused = handle
+            .answer_permission_scoped("patch-readme", true, PermissionAnswerScope::Session)
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(PermissionDeliveryError::ScopeUnsupported(
+                    PermissionAnswerScope::Session
+                ))
+            ),
+            "{refused:?}"
+        );
+        assert!(provider.state.permission_answers.lock().unwrap().is_empty());
+        handle
+            .answer_permission_scoped("patch-readme", true, PermissionAnswerScope::Once)
+            .await
+            .unwrap();
+        // The second patch (~/.zshrc) reads the same: it waits for the user.
+        handle.emit(patch("patch-zshrc")).await;
+        let answered: Vec<String> = provider
+            .state
+            .permission_answers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert_eq!(answered, vec!["patch-readme".to_string()]);
+
+        // The same session kind on the native engine: a `nexus-tools` write IS granted
+        // for the identical call (its input is the whole call).
+        let native = runtime
+            .adopt(
+                "native-write",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        let write = |id: &str| ChatEvent::PermissionRequest {
+            id: id.to_string(),
+            tool: "mcp__nexus__Write".into(),
+            input: serde_json::json!({ "file_path": "a.txt", "content": "x" }),
+            parent_tool_use_id: None,
+            category: Some("edit".into()),
+            canonical: Some("Write".into()),
+        };
+        native.emit(write("write-1")).await;
+        native
+            .answer_permission_scoped("write-1", true, PermissionAnswerScope::Session)
+            .await
+            .unwrap();
+        native.emit(write("write-2")).await;
+        let answered: Vec<String> = provider
+            .state
+            .permission_answers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert_eq!(
+            answered,
+            vec![
+                "patch-readme".to_string(),
+                "write-1".into(),
+                "write-2".into()
+            ]
         );
     }
 }
