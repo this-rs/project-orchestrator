@@ -123,6 +123,49 @@ where
     })
 }
 
+/// Wait for a write started by [`spawn_write`], up to `budget`. Past it the
+/// caller goes on and gets the `error` event (`persistence_delayed`, `reason` =
+/// the step) its clients must see; the write itself keeps running and lands when
+/// the store answers ([`spawn_write`] logs it, late or failed).
+pub(crate) async fn await_write(
+    session_id: &str,
+    step: &'static str,
+    budget: Duration,
+    write: JoinHandle<()>,
+) -> Option<ChatEvent> {
+    match tokio::time::timeout(budget, write).await {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => {
+            warn!(
+                session_id = %session_id,
+                step,
+                "store write task ended abnormally: {e}"
+            );
+            None
+        }
+        Err(_) => {
+            warn!(
+                session_id = %session_id,
+                step,
+                budget_ms = budget.as_millis() as u64,
+                "store write still running past its budget: the turn goes on, the write too"
+            );
+            Some(ChatEvent::Error {
+                message: format!(
+                    "Saving this conversation ({step}) is taking longer than {}s. \
+                     It will be saved when the database answers; until then a reload \
+                     may not show the latest messages.",
+                    budget.as_secs()
+                ),
+                parent_tool_use_id: None,
+                code: Some(PERSISTENCE_DELAYED_CODE.to_string()),
+                reason: Some(step.to_string()),
+                index: None,
+            })
+        }
+    }
+}
+
 /// The budget of the post-stream steps of one turn, and where an overrun is
 /// reported: the server log (always, with the step) and the clients (an
 /// `error` event whose `code` says what happened and whose `reason` names
@@ -165,31 +208,10 @@ impl StepBudget {
     /// the turn goes on and the clients learn that the write is late; the
     /// write itself keeps running.
     pub async fn wait_for_write(&self, step: &'static str, write: JoinHandle<()>) {
-        match tokio::time::timeout(self.budget, write).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!(
-                session_id = %self.session_id,
-                step,
-                "store write task ended abnormally: {e}"
-            ),
-            Err(_) => {
-                warn!(
-                    session_id = %self.session_id,
-                    step,
-                    budget_ms = self.budget.as_millis() as u64,
-                    "store write still running past its budget: the turn goes on, the write too"
-                );
-                self.report(
-                    step,
-                    PERSISTENCE_DELAYED_CODE,
-                    format!(
-                        "Saving this conversation ({step}) is taking longer than {}s. \
-                         It will be saved when the database answers; until then a reload \
-                         may not show the latest messages.",
-                        self.budget.as_secs()
-                    ),
-                );
-            }
+        if let Some(ChatEvent::Error { message, .. }) =
+            await_write(&self.session_id, step, self.budget, write).await
+        {
+            self.report(step, PERSISTENCE_DELAYED_CODE, message);
         }
     }
 

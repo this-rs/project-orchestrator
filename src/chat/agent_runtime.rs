@@ -104,11 +104,33 @@ fn interrupted_done() -> AgentEvent {
     }
 }
 
-/// Longest the runtime waits for the host's whole end of turn: four steps (context,
-/// re-injection, objectives, feedback), each bounded by the host to the post-stream
-/// step budget, plus a margin. A backstop: the steps' own budgets come first.
+/// Longest the runtime waits for the host's whole end of turn: at most five waits,
+/// each bounded by the host to the post-stream step budget — context, re-injection
+/// (a turn that compacted), objectives, the ONE write of the held context (its store
+/// or its clear, never both), feedback — plus a margin. A backstop: the steps' own
+/// budgets come first.
 pub const AFTER_TURN_BACKSTOP: Duration =
-    Duration::from_secs(4 * super::post_stream::POST_STREAM_STEP_BUDGET.as_secs() + 5);
+    Duration::from_secs(5 * super::post_stream::POST_STREAM_STEP_BUDGET.as_secs() + 5);
+
+/// Whether a provider of `kind` keeps a turn it ended `interrupted` (no error) in its
+/// history, so what `prepare` put in front of it was delivered ([`TurnOutcome::answered`]).
+/// Verified per provider, at the pinned nexus rev (9b5f470b):
+/// - `native`: yes. nexus' `drive` (`native/loop.rs`) pushes the user message before
+///   the run and commits the history on `StopCause::Interrupted`, the only cause of a
+///   `done interrupted` without error.
+/// - `codex`: not verified. The `done` maps the app-server's `turn/completed` status
+///   `interrupted` (`codex/map.rs`); whether the thread keeps the user item is the
+///   app-server's, not seen from here.
+/// - `acp`: not verified. `done interrupted` is the agent's `cancelled` stop reason
+///   (`acp/map.rs`); the protocol does not say whether the agent keeps the prompt.
+/// - `claude_code`: not verified (the CLI owns its transcript).
+///
+/// Unverified: an interrupted turn is not answered, the context comes again with the
+/// next turn — a bounded duplicate (at most the held context's cap) rather than a
+/// loss.
+pub(crate) fn keeps_interrupted_turns(kind: &str) -> bool {
+    kind == "native"
+}
 
 /// Longest pause before a retry, whatever the provider or the configuration asks:
 /// the pause is cut short by a Stop, but a client waits that long for the next word.
@@ -373,10 +395,11 @@ pub struct TurnOutcome {
     pub auto_continue_allowed: bool,
     /// The model's context window as the session knows it (tokens), if known.
     pub context_window: Option<u64>,
-    /// The turn ended on a `done` of the provider without error, `interrupted`
-    /// included: the provider recorded it in its history (nexus' native loop keeps
-    /// an interrupted turn, the user message pushed before the run), so what
-    /// `prepare` put in front of it only for one turn may be dropped now. Not on
+    /// The turn ended on a `done` of the provider without error — `interrupted`
+    /// included only for a provider known to keep such a turn in its history
+    /// ([`keeps_interrupted_turns`]: nexus' native loop, the user message pushed
+    /// before the run) — so what `prepare` put in front of it only for one turn may
+    /// be dropped now. Not on
     /// `send_turn` accepting it: a provider may accept a turn before any request
     /// (the native harness spawns its run), then fail it (a 429 once the retries
     /// are spent). Not on the `done` the runtime makes itself for a Stop during the
@@ -500,6 +523,9 @@ pub struct AgentSessionHandle {
     cancel_tools_window: Duration,
     /// How the provider states the cost of a turn (`session_record::CostFigure`).
     cost_figure: super::session_record::CostFigure,
+    /// The provider is known to keep a turn it ended `interrupted` in its history
+    /// ([`keeps_interrupted_turns`]): such a turn counts as answered.
+    keeps_interrupted_turns: bool,
     /// Held across each read-then-write of the session record, so two writes of
     /// this session never lose one another's figure.
     record: Mutex<()>,
@@ -996,15 +1022,24 @@ impl AgentSessionHandle {
                         ..
                     }
                 );
-                if let AgentEvent::Done { cost, is_error, .. } = &event {
+                if let AgentEvent::Done {
+                    cost,
+                    is_error,
+                    stop_reason,
+                    ..
+                } = &event
+                {
                     turn_cost = cost.usd;
-                    // `interrupted` too: the provider kept the turn in its history.
-                    // Only the provider's `done` comes here; the one made for a Stop
-                    // during the pause below does not. A Claude Code CLI `done` with
-                    // an error may already have written the prompt to its transcript:
+                    // `interrupted` too where the provider is known to keep the turn
+                    // in its history ([`keeps_interrupted_turns`]). Only the
+                    // provider's `done` comes here; the one made for a Stop during
+                    // the pause below does not. A Claude Code CLI `done` with an
+                    // error may already have written the prompt to its transcript:
                     // the context then comes once more with the next turn (bounded
                     // duplicate, not a loss).
-                    outcome.answered = !is_error;
+                    outcome.answered = !is_error
+                        && (*stop_reason != nexus_claude::agent::StopReason::Interrupted
+                            || self.keeps_interrupted_turns);
                 }
                 let event = mask_agent_event(event);
                 let chat_events = self.mapper.lock().await.map(&event);
@@ -1410,6 +1445,7 @@ impl AgentRuntime {
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
             cost_figure: super::session_record::CostFigure::of_kind(provider_kind),
+            keeps_interrupted_turns: keeps_interrupted_turns(provider_kind),
             record: Mutex::new(()),
             opening_counted: AtomicBool::new(false),
             retry: std::sync::RwLock::new(RetryConfig::default()),
@@ -2948,6 +2984,13 @@ mod answered_tests {
     }
 
     async fn session(retries: u32) -> (FakeProvider, Arc<AgentSessionHandle>, Arc<Host>) {
+        session_of("native", retries).await
+    }
+
+    async fn session_of(
+        kind: &str,
+        retries: u32,
+    ) -> (FakeProvider, Arc<AgentSessionHandle>, Arc<Host>) {
         let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let runtime = AgentRuntime::new(graph);
         let provider = FakeProvider::new();
@@ -2958,7 +3001,7 @@ mod answered_tests {
                 "local",
                 provider.session(),
                 1,
-                "native",
+                kind,
                 serde_json::json!({}),
                 Some(host.clone() as Arc<dyn TurnServices>),
             )
@@ -3021,6 +3064,19 @@ mod answered_tests {
         let (provider, handle, host) = session(0).await;
         play(&provider, &handle, vec![interrupted_done()]).await;
         assert_eq!(host.seen(), [true]);
+    }
+
+    /// A provider not known to keep an interrupted turn (`keeps_interrupted_turns`):
+    /// its `done interrupted` leaves the context for the next turn — a bounded
+    /// duplicate if it did keep it, never a loss.
+    #[tokio::test]
+    async fn a_turn_an_unverified_provider_ended_interrupted_is_not_answered() {
+        for kind in ["codex", "acp", "claude_code"] {
+            let (provider, handle, host) = session_of(kind, 0).await;
+            play(&provider, &handle, vec![interrupted_done()]).await;
+            play(&provider, &handle, vec![done(false, None)]).await;
+            assert_eq!(host.seen(), [false, true], "{kind}");
+        }
     }
 
     #[tokio::test]

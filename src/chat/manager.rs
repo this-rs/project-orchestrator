@@ -709,6 +709,12 @@ pub struct ChatManager {
     pub(crate) anchor_mode: super::anchor_resolver::AnchorContextMode,
     /// What the turns of every session share in anchor mode (resolutions, shadow runs).
     pub(crate) anchor_cache: Arc<super::anchor_resolver::AnchorCache>,
+    /// The held context of each agent session this process opened ([`HeldSlot`]):
+    /// one per session id, shared by every state built for it, so a reopen orders
+    /// against the writes still running and keeps memory when the store is behind.
+    /// One small entry per session opened since the start (its held context is
+    /// empty once delivered).
+    pub(crate) held_slots: std::sync::Mutex<HashMap<String, Arc<HeldSlot>>>,
 }
 
 // ============================================================================
@@ -1273,9 +1279,64 @@ pub(crate) struct AgentTurnState {
     /// `routing_modes_e2e_tests` on integ/p8). Persisted with the session (it
     /// survives an idle close, a restart, a resume) and cleared only once a turn
     /// carrying it was answered ([`super::agent_runtime::TurnOutcome::answered`], in `after_turn`).
-    held: Arc<std::sync::Mutex<HeldContext>>,
+    held: Arc<HeldSlot>,
     /// Tool calls announced and not yet answered: id → (tool, input so far).
     open_tools: Arc<std::sync::Mutex<HashMap<String, (String, serde_json::Value)>>>,
+}
+
+/// A session's [`HeldContext`] in this process: what waits in memory (the truth
+/// while the process lives) and the one ordered way it reaches the store.
+#[derive(Default)]
+pub(crate) struct HeldSlot {
+    memory: std::sync::Mutex<HeldContext>,
+    /// Orders the store writes of the session: each write takes it INSIDE its task,
+    /// then stores what memory holds at that moment, so the last write to land is
+    /// the latest state (a clear can never land after a newer store).
+    write: tokio::sync::Mutex<()>,
+    /// The store may not hold what memory holds (a write failed, or still runs):
+    /// the next turn writes again, a reopen in this process keeps memory.
+    unsynced: std::sync::atomic::AtomicBool,
+}
+
+impl HeldSlot {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HeldContext> {
+        self.memory.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn unsynced(&self) -> bool {
+        self.unsynced.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Writes what memory holds to the store, in a task of its own
+    /// ([`super::post_stream::spawn_write`]: never dropped, a failure logged),
+    /// ordered after the writes already started. A failed write leaves the slot
+    /// [`Self::unsynced`]: the next turn writes again. Returns the step (for the
+    /// report) and the write to wait for.
+    fn spawn_write(
+        self: &Arc<Self>,
+        graph: &Arc<dyn GraphStore>,
+        session_id: &str,
+    ) -> (&'static str, tokio::task::JoinHandle<()>) {
+        let step = if self.lock().is_empty() {
+            "clear_held_context"
+        } else {
+            "hold_context"
+        };
+        self.unsynced
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let slot = Arc::clone(self);
+        let graph = graph.clone();
+        let sid = session_id.to_string();
+        let write = super::post_stream::spawn_write(session_id.to_string(), step, async move {
+            let _order = slot.write.lock().await;
+            let held = slot.lock().clone();
+            let out = held.store(&graph, &sid).await;
+            slot.unsynced
+                .store(out.is_err(), std::sync::atomic::Ordering::SeqCst);
+            out
+        });
+        (step, write)
+    }
 }
 
 /// What waits for a session's next turn after a compaction (`AgentTurnState::held`).
@@ -1475,12 +1536,7 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         // started it. Only read here: `after_turn` clears it once a turn carrying it
         // was answered (`TurnOutcome::answered`), so a turn refused before it was
         // sent, failed, or stopped before any attempt was answered keeps it.
-        let held = self
-            .session
-            .held
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .prefix();
+        let held = self.session.held.lock().prefix();
         let prepared = match held {
             Some(context) => prepend_enrichment(&context, &prepared),
             None => prepared,
@@ -1572,12 +1628,12 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         // dropped in memory before anything else (before the first await, so the
         // backstop cannot skip it), a compaction of this same turn holding its own
         // context again below. The store follows in ONE ordered write at the end.
-        let dropped = outcome.answered && {
-            let mut held = self.session.held.lock().unwrap_or_else(|e| e.into_inner());
-            let had = !held.is_empty();
-            *held = HeldContext::default();
-            had
+        let previous = if outcome.answered {
+            std::mem::take(&mut *self.session.held.lock())
+        } else {
+            HeldContext::default()
         };
+        let dropped = !previous.is_empty();
         // Each step under its own budget, as `PostStreamHandler`'s (`StepBudget`): a
         // step that never answers is dropped and said, the next ones still run.
         let ctx = self
@@ -1589,8 +1645,11 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             )
             .await
             .unwrap_or_default();
-        // 1. Post-compaction context re-injection.
-        if outcome.compacted && !outcome.interrupted {
+        // 1. Post-compaction context re-injection, a Stop included: unlike the Claude
+        // Code engine, nothing is queued as a turn (a Stop would drop it), the context
+        // waits in front of the next turn. Skipping it on a Stop lost the context the
+        // turn delivered AND the one of its own compaction.
+        if outcome.compacted {
             let snapshot = self
                 .session
                 .work_log
@@ -1614,13 +1673,17 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
                 // Kept for the next turn, never queued as a turn of its own, and
                 // no bigger than the window allows (`HeldContext::cap`).
                 if let Some(hint) = hint {
-                    self.session
-                        .held
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .context = Some(HeldContext::cap(&hint, outcome.context_window));
+                    self.session.held.lock().context =
+                        Some(HeldContext::cap(&hint, outcome.context_window));
                 }
                 after.events.push(event);
+            }
+            // The compaction summarized what this turn carried: when no fresh context
+            // came (the step ran out of time), the one it carried waits again rather
+            // than nothing.
+            let mut held = self.session.held.lock();
+            if held.context.is_none() {
+                held.context = previous.context.clone();
             }
         }
         // 2. Objective tracking, as on the Claude Code engine. After a turn that
@@ -1660,41 +1723,26 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             if let Some(reminder) = reminder {
                 info!(session_id, "Objective tracker: injecting reminder");
                 if outcome.compacted {
-                    self.session
-                        .held
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .reminder = Some(reminder);
+                    self.session.held.lock().reminder = Some(reminder);
                 } else {
                     after.hints.push(reminder);
                 }
             }
         }
-        // What waits for the next turn is stored with the session: one write, after
-        // the turn's own clear, so a clear can never land after the store of this
-        // turn's compaction (and lose it on a restart or an idle close).
-        if outcome.compacted {
-            let held = self
-                .session
-                .held
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            self.step(
-                &mut after,
-                session_id,
-                "hold_context",
-                held.store(&self.graph, session_id),
-            )
-            .await;
-        } else if dropped {
-            self.step(
-                &mut after,
-                session_id,
-                "clear_held_context",
-                HeldContext::clear(&self.graph, session_id),
-            )
-            .await;
+        // What waits for the next turn is stored with the session: ONE write of what
+        // memory holds, ordered after the session's earlier writes (`HeldSlot`), so a
+        // clear can never land after the store of this turn's compaction. Also when
+        // an earlier write failed (`unsynced`): retried until the store follows, so a
+        // restart, an idle close or a relay never reloads a context already delivered.
+        // Waited for within the step budget; past it the clients learn it is late
+        // (`persistence_delayed`) and the write goes on.
+        if outcome.compacted || dropped || self.session.held.unsynced() {
+            let (step, write) = self.session.held.spawn_write(&self.graph, session_id);
+            if let Some(late) =
+                super::post_stream::await_write(session_id, step, self.step_budget, write).await
+            {
+                after.events.push(late);
+            }
         }
         // Tools still open when the turn ended (an error, the turn limit) are
         // logged as they stand: the work log misses none.
@@ -2108,6 +2156,7 @@ impl ChatManager {
             native_transcripts: None,
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
+            held_slots: Default::default(),
         }
     }
 
@@ -2189,6 +2238,7 @@ impl ChatManager {
             native_transcripts: None,
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
+            held_slots: Default::default(),
         }
     }
 
@@ -12162,6 +12212,31 @@ impl ChatManager {
         })
     }
 
+    /// The held context of `session_id` ([`HeldSlot`]), as a new state of the session
+    /// starts from it: the store's (a first open in this process, a restart, another
+    /// instance that played turns since), once the writes of an earlier state of the
+    /// session in this process landed (waited for within the step budget). When this
+    /// process knows the store is behind (a write failed or still runs), memory.
+    async fn held_slot(&self, session_id: &str) -> Arc<HeldSlot> {
+        let slot = {
+            let mut slots = self.held_slots.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(slots.entry(session_id.to_string()).or_default())
+        };
+        {
+            let _order = tokio::time::timeout(
+                super::post_stream::POST_STREAM_STEP_BUDGET,
+                slot.write.lock(),
+            )
+            .await
+            .ok();
+            if !slot.unsynced() {
+                let stored = HeldContext::load(&self.graph, session_id).await;
+                *slot.lock() = stored;
+            }
+        }
+        slot
+    }
+
     /// The end-of-turn state of the agent session `session_id`, from its node: its
     /// memory conversation, the protocol run it was spawned in. Objective tracking
     /// is on, as for every Claude Code session.
@@ -12186,11 +12261,11 @@ impl ChatManager {
             .and_then(parse_spawned_by);
         // What waited for this session's next turn before it closed or the server
         // restarted.
-        let held = HeldContext::load(&self.graph, session_id).await;
+        let held = self.held_slot(session_id).await;
         AgentTurnState {
             memory,
             protocol_run_id: spawned.as_ref().and_then(|s| s.protocol_run_id),
-            held: Arc::new(std::sync::Mutex::new(held)),
+            held,
             protocol_state: spawned.and_then(|s| s.protocol_state),
             objectives: super::post_stream::ObjectiveCounters {
                 enabled: true,
@@ -23526,9 +23601,17 @@ mod held_context_tests {
     }
 
     async fn world() -> (ChatManager, String) {
-        let state = crate::test_helpers::mock_app_state();
-        let graph = state.neo4j.clone();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        world_on(Arc::new(crate::neo4j::mock::MockGraphStore::new())).await
+    }
+
+    /// [`world`] on a store the test drives (slow, failing writes).
+    async fn world_on(mock: Arc<crate::neo4j::mock::MockGraphStore>) -> (ChatManager, String) {
+        let graph: Arc<dyn GraphStore> = mock;
+        let manager = ChatManager::new_without_memory(
+            graph.clone(),
+            crate::test_helpers::mock_app_state().meili,
+            test_config(),
+        );
         let mut project = crate::test_helpers::test_project();
         project.slug = "held".into();
         graph.create_project(&project).await.unwrap();
@@ -23547,6 +23630,98 @@ mod held_context_tests {
             compacted: true,
             ..Default::default()
         }
+    }
+
+    fn answered() -> TurnOutcome {
+        TurnOutcome {
+            answered: true,
+            ..Default::default()
+        }
+    }
+
+    const HELD: &str = "Post-Compaction Context";
+
+    /// The clear of a delivered context fails (the store errs): the failure is not
+    /// lost — the slot knows the store is behind, a reopen in this process does not
+    /// reload the delivered context, and the next turn, whatever it is, writes again
+    /// until the store follows (else a restart, an idle close or a relay would
+    /// re-inject it, maybe days later).
+    #[tokio::test]
+    async fn a_failed_clear_is_retried_on_the_next_turn() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_on(mock.clone()).await;
+        let s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.after_turn(&sid, &compacted()).await;
+        assert!(!HeldContext::load(&s.graph, &sid).await.is_empty());
+        mock.fail_llm_setting_writes(HeldContext::KEY, true);
+        s.after_turn(&sid, &answered()).await;
+        assert!(!prepared(&s, &sid, "one").await.contains(HELD), "delivered");
+        assert!(
+            !HeldContext::load(&s.graph, &sid).await.is_empty(),
+            "the store refused the clear"
+        );
+        assert!(s.session.held.unsynced(), "and the slot knows it");
+        let reopened = services(&manager, manager.agent_turn_state(&sid).await);
+        assert!(
+            !prepared(&reopened, &sid, "two").await.contains(HELD),
+            "a reopen keeps memory over a store known to be behind"
+        );
+        // Still failing: a plain turn tries again, and keeps knowing.
+        s.after_turn(&sid, &TurnOutcome::default()).await;
+        assert!(s.session.held.unsynced());
+        // The store answers again: the next turn's write lands.
+        mock.fail_llm_setting_writes(HeldContext::KEY, false);
+        s.after_turn(&sid, &TurnOutcome::default()).await;
+        assert!(
+            HeldContext::load(&s.graph, &sid).await.is_empty(),
+            "retried"
+        );
+        assert!(!s.session.held.unsynced());
+    }
+
+    /// The clear of a delivered context is slow (the store does not answer): the
+    /// turn does not wait past the step budget and says the write is late
+    /// (`persistence_delayed`); the next turn compacts again meanwhile, and its
+    /// store is ORDERED after that clear — the newer context is what the store ends
+    /// with, not an empty one landed last.
+    #[tokio::test]
+    async fn a_slow_clear_is_said_late_and_a_newer_store_lands_after_it() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_on(mock.clone()).await;
+        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.step_budget = Duration::from_millis(200);
+        s.after_turn(&sid, &compacted()).await;
+        mock.stall_llm_setting_deletes(HeldContext::KEY);
+        let late = |after: &crate::chat::agent_runtime::AfterTurn, step: &str| {
+            after.events.iter().any(|e| {
+                matches!(
+                    e,
+                    ChatEvent::Error { code: Some(code), reason: Some(reason), .. }
+                        if code == crate::chat::post_stream::PERSISTENCE_DELAYED_CODE
+                            && reason == step
+                )
+            })
+        };
+        let started = std::time::Instant::now();
+        let after = s.after_turn(&sid, &answered()).await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(late(&after, "clear_held_context"), "{:?}", after.events);
+        // The next turn (not carrying a context) compacts again while the clear waits.
+        let after = s.after_turn(&sid, &compacted()).await;
+        assert!(late(&after, "hold_context"), "{:?}", after.events);
+        mock.release_llm_setting_deletes(HeldContext::KEY);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while s.session.held.unsynced() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writes never landed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            HeldContext::load(&s.graph, &sid).await.context.is_some(),
+            "the newer context is stored, the late clear landed before it"
+        );
     }
 
     /// The server goes down between the compaction and the next turn: the session
