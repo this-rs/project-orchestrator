@@ -2737,6 +2737,456 @@ mod provider_switch {
         );
         assert!(w.manager.is_session_active(&old).await);
     }
+
+    // ── Both directions, across engines: Claude Code → native → Claude Code ──
+    //
+    // Claude Code stays on its historical engine (the Claude CLI): here the
+    // `fake_claude` of nexus, behind a wrapper that hands it a transcript and records
+    // what it reads. The native target is `fake_openai`. Decision 896b7d7c: the two
+    // are interchangeable at any point of a conversation.
+
+    use crate::chat::provider::cognitive::decider::CognitiveRouting;
+    use crate::chat::provider::cognitive::decision::CognitiveDecision;
+    use crate::chat::provider::cognitive::store::{DecisionFilter, RoutingArmStore};
+    use crate::neo4j::models::ChatEventRecord;
+    use crate::neo4j::routing::Neo4jRoutingStore;
+
+    const CLAUDE_ANSWER: &str = "first answer, from claude";
+
+    /// A Claude CLI: `fake_claude` behind a shell wrapper. Every CLI it starts plays
+    /// one turn (waits for the user's message, answers [`CLAUDE_ANSWER`]) and appends
+    /// every line it reads to `stdin.jsonl`.
+    struct FakeClaude {
+        dir: tempfile::TempDir,
+    }
+
+    impl FakeClaude {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let transcript = dir.path().join("transcript.jsonl");
+            let lines = [
+                json!({"op": "capture_hooks", "optional": true, "timeout_ms": 3000}),
+                json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+                json!({"op": "emit_json", "json": {"type": "system", "subtype": "init",
+                    "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                    "permissionMode": "default", "apiKeySource": "none"}}),
+                json!({"op": "emit_json", "json": {"type": "assistant", "message": {
+                    "id": "msg_fake_1", "type": "message", "role": "assistant",
+                    "model": "fake-claude", "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": CLAUDE_ANSWER}]}}}),
+                json!({"op": "emit_json", "json": {"type": "result", "subtype": "success",
+                    "duration_ms": 1, "duration_api_ms": 1, "is_error": false, "num_turns": 1,
+                    "session_id": "fake-cli-session", "total_cost_usd": 0.0,
+                    "result": CLAUDE_ANSWER}}),
+                json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}),
+            ];
+            let text: Vec<String> = lines.iter().map(Value::to_string).collect();
+            std::fs::write(&transcript, text.join("\n")).unwrap();
+            let wrapper = dir.path().join("claude");
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nFAKE_CLAUDE_TRANSCRIPT='{}' FAKE_CLAUDE_STDIN_OUT='{}' \
+                     FAKE_CLAUDE_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                    transcript.display(),
+                    dir.path().join("stdin.jsonl").display(),
+                    fake_bin("fake_claude").display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self { dir }
+        }
+
+        fn path(&self) -> String {
+            self.dir.path().join("claude").display().to_string()
+        }
+
+        /// Every line the CLIs read, in order.
+        fn stdin(&self) -> String {
+            std::fs::read_to_string(self.dir.path().join("stdin.jsonl")).unwrap_or_default()
+        }
+    }
+
+    /// `world()` as deployed: Claude Code on the Claude CLI (the legacy engine), every
+    /// other provider on the agent engine, the cognitive router wired.
+    async fn hybrid_world(cli: &FakeClaude) -> World {
+        let mut w = world().await;
+        let dyn_graph: Arc<dyn GraphStore> = w.graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Legacy,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: None,
+            nexus_browser_path: None,
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let store = Arc::new(Neo4jRoutingStore::new(w.graph.clone()));
+        w.manager = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+            .with_cognitive_routing(CognitiveRouting::new(store));
+        w.manager.update_claude_cli_path(Some(cli.path())).await;
+        w
+    }
+
+    async fn stored_events(w: &World, session_id: &str) -> Vec<ChatEvent> {
+        w.graph
+            .get_chat_events(Uuid::parse_str(session_id).unwrap(), 0, 500)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|r| serde_json::from_str(&r.data).ok())
+            .collect()
+    }
+
+    fn relayed_of(events: &[ChatEvent]) -> Vec<&ChatEvent> {
+        events
+            .iter()
+            .filter(|e| matches!(e, ChatEvent::ConversationRelayed { .. }))
+            .collect()
+    }
+
+    async fn decision_of(w: &World, session_id: &str) -> Option<CognitiveDecision> {
+        let id = Uuid::parse_str(session_id).unwrap();
+        Neo4jRoutingStore::new(w.graph.clone())
+            .decisions(&DecisionFilter::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.session_id == Some(id))
+    }
+
+    /// The line the CLIs read that carries `needle`.
+    fn cli_line_with(cli: &FakeClaude, needle: &str) -> String {
+        cli.stdin()
+            .lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no line with {needle:?} reached the CLI: {}", cli.stdin()))
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn claude_code_to_native_and_back_the_target_knows_the_history_and_the_thread_says_so() {
+        let cli = FakeClaude::new();
+        let w = hybrid_world(&cli).await;
+
+        // 1. A conversation on Claude Code, served by the Claude CLI.
+        let cc1 = w
+            .manager
+            .create_session(&request(None, Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|err| panic!("open on claude-code failed: {err:#}"))
+            .session_id;
+        assert!(w.manager.is_session_active(&cc1).await);
+        assert!(
+            !w.manager.agent_runtime.owns(&cc1).await,
+            "Claude Code runs on the legacy engine"
+        );
+        stored_until(&w, &cc1, |events| {
+            events
+                .iter()
+                .any(|ev| ev.event_type == "assistant_text" && ev.data.contains(CLAUDE_ANSWER))
+        })
+        .await;
+        cli_line_with(&cli, "hi there");
+        // The memory conversation the move must keep.
+        w.graph
+            .update_chat_session(
+                Uuid::parse_str(&cc1).unwrap(),
+                None,
+                None,
+                None,
+                None,
+                Some("conv-kept".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        let first_decision = decision_of(&w, &cc1)
+            .await
+            .expect("the routed opening left a decision on the session");
+        assert!(
+            first_decision.outcome.is_none(),
+            "open while the session runs"
+        );
+        let mut old_rx = w.manager.subscribe(&cc1).await.unwrap();
+
+        // 2. Claude Code → native: the target answers knowing the history.
+        let moved = w
+            .manager
+            .switch_session_provider(&cc1, "local", None, "second question", None)
+            .await
+            .unwrap_or_else(|err| panic!("switch to local failed: {err:#}"));
+        let native = moved.session_id.clone();
+        assert_eq!((moved.relayed_entries, moved.omitted_entries), (2, 0));
+        assert_eq!(moved.conversation_id.as_deref(), Some("conv-kept"));
+        assert!(
+            w.manager.agent_runtime.owns(&native).await,
+            "native: agent engine"
+        );
+        stored_until(&w, &native, |events| {
+            events
+                .iter()
+                .any(|ev| ev.event_type == "assistant_text" && ev.data.contains("the answer"))
+        })
+        .await;
+        let body = w
+            .fake
+            .chat_requests()
+            .iter()
+            .map(|r| r["body"].to_string())
+            .find(|b| b.contains("second question"))
+            .expect("the relayed turn reached the native model");
+        assert!(
+            body.contains("<conversation_relay from=\\\"claude-code\\\" to=\\\"local\\\">"),
+            "{body}"
+        );
+        assert!(
+            body.contains("hi there") && body.contains(CLAUDE_ANSWER),
+            "{body}"
+        );
+
+        // The thread it left says where it went, then closes; the thread it reached
+        // says what was relayed, before the user's message.
+        let on_old = next_event(&mut old_rx, |ev| {
+            matches!(ev, ChatEvent::ConversationRelayed { .. })
+        })
+        .await;
+        let as_json = |ev: &ChatEvent| serde_json::to_value(ev).unwrap();
+        assert_eq!(
+            as_json(&on_old),
+            as_json(&ChatEvent::ConversationRelayed {
+                from_session_id: cc1.clone(),
+                to_session_id: native.clone(),
+                from_provider: "claude-code".into(),
+                to_provider: "local".into(),
+                relayed_entries: 2,
+                omitted_entries: 0,
+                moved_by: "user".into(),
+                conversation_id: Some("conv-kept".into()),
+            })
+        );
+        next_event(&mut old_rx, |ev| {
+            matches!(ev, ChatEvent::SessionClosed { .. })
+        })
+        .await;
+        assert!(
+            !w.manager.is_session_active(&cc1).await,
+            "the old session is closed"
+        );
+        assert_eq!(
+            relayed_of(&stored_events(&w, &cc1).await).len(),
+            1,
+            "stored on the old thread"
+        );
+        let new_thread = stored_events(&w, &native).await;
+        let relay_at = new_thread
+            .iter()
+            .position(|ev| matches!(ev, ChatEvent::ConversationRelayed { .. }))
+            .expect("stated on the new thread");
+        let message_at = new_thread
+            .iter()
+            .position(|ev| matches!(ev, ChatEvent::UserMessage { content } if content == "second question"))
+            .expect("the user's message");
+        assert!(
+            relay_at < message_at,
+            "the relay is stated before the message"
+        );
+        assert_eq!(
+            as_json(&new_thread[relay_at]),
+            as_json(&on_old),
+            "both threads carry the same statement"
+        );
+
+        // The routing decision of the session that closed is closed too.
+        assert!(w.manager.open_decisions.lock().unwrap().get(&cc1).is_none());
+        let closed = decision_of(&w, &cc1).await.unwrap();
+        assert!(
+            closed.outcome.is_some(),
+            "closed with what the session saw: {closed:?}"
+        );
+
+        // 3. Native → Claude Code: back, with everything so far.
+        let back = w
+            .manager
+            .switch_session_provider(&native, "claude-code", None, "third question", None)
+            .await
+            .unwrap_or_else(|err| panic!("switch back to claude-code failed: {err:#}"));
+        let cc2 = back.session_id.clone();
+        assert_eq!(back.previous_session_id, native);
+        assert_eq!(
+            (back.relayed_entries, back.omitted_entries),
+            (2, 0),
+            "the native session's own two entries (the relay it was given is not a message)"
+        );
+        assert_eq!(back.conversation_id.as_deref(), Some("conv-kept"));
+        stored_until(&w, &cc2, |events| {
+            events.iter().any(|ev| ev.event_type == "result")
+        })
+        .await;
+        let third = cli_line_with(&cli, "third question");
+        assert!(
+            third.contains(r#"<conversation_relay from=\"local\" to=\"claude-code\">"#),
+            "{third}"
+        );
+        assert!(
+            third.contains("second question") && third.contains("the answer"),
+            "the native turn is in the relay: {third}"
+        );
+        assert!(
+            !w.manager.agent_runtime.owns(&native).await,
+            "the native session is closed"
+        );
+        assert!(w.manager.is_session_active(&cc2).await);
+        let cc2_thread = stored_events(&w, &cc2).await;
+        assert!(
+            matches!(relayed_of(&cc2_thread).as_slice(),
+                [ChatEvent::ConversationRelayed { from_provider, to_provider, .. }]
+                    if from_provider == "local" && to_provider == "claude-code"),
+            "{cc2_thread:?}"
+        );
+        for id in [&native, &cc2] {
+            let node = w
+                .graph
+                .get_chat_session(Uuid::parse_str(id).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(node.conversation_id.as_deref(), Some("conv-kept"), "{id}");
+            assert_eq!(
+                node.routed_by.as_deref(),
+                Some("request"),
+                "the user chose: explicit"
+            );
+        }
+        w.manager.close_session(&cc2).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_switch_from_claude_code_refused_by_consent_states_nothing_and_closes_nothing() {
+        let cli = FakeClaude::new();
+        let w = hybrid_world(&cli).await;
+        let cc1 = w
+            .manager
+            .create_session(&request(None, Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        stored_until(&w, &cc1, |events| {
+            events.iter().any(|ev| ev.event_type == "result")
+        })
+        .await;
+        let sent_before = w.fake.chat_requests().len();
+
+        // No consent of the project for `local3`: a typed refusal.
+        let err = w
+            .manager
+            .switch_session_provider(&cc1, "local3", None, "second question", None)
+            .await
+            .expect_err("no consent");
+        assert_eq!(failure(&err), (403, "endpoint_not_allowed"));
+
+        assert!(
+            w.manager.is_session_active(&cc1).await,
+            "the conversation stays"
+        );
+        assert!(
+            relayed_of(&stored_events(&w, &cc1).await).is_empty(),
+            "nothing stated"
+        );
+        assert!(
+            decision_of(&w, &cc1).await.unwrap().outcome.is_none(),
+            "its decision stays open"
+        );
+        assert_eq!(
+            w.fake.chat_requests().len(),
+            sent_before,
+            "nothing was sent"
+        );
+        w.manager.close_session(&cc1).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_history_longer_than_the_targets_window_is_bounded_and_the_omission_is_stated() {
+        let w = world().await;
+        // A stored Claude Code conversation far larger than 40 % of a 32k window.
+        let mut node = crate::test_helpers::test_chat_session(Some("proj"));
+        node.provider_id = Some("claude-code".into());
+        node.cwd = std::env::temp_dir().display().to_string();
+        let old = node.id;
+        w.graph.create_chat_session(&node).await.unwrap();
+        let filler = "w".repeat(2_000);
+        let records: Vec<ChatEventRecord> = (0..80)
+            .map(|i| ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id: old,
+                seq: i + 1,
+                event_type: "user_message".into(),
+                data: serde_json::to_string(&ChatEvent::UserMessage {
+                    content: format!("turn-{i:02} {filler}"),
+                })
+                .unwrap(),
+                created_at: Utc::now(),
+            })
+            .collect();
+        w.graph.store_chat_events(old, records).await.unwrap();
+
+        let moved = w
+            .manager
+            .switch_session_provider(&old.to_string(), "local", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+        assert!(moved.omitted_entries > 0, "{moved:?}");
+        assert!(moved.relayed_entries > 0, "{moved:?}");
+        assert_eq!(moved.relayed_entries + moved.omitted_entries, 80);
+
+        stored_until(&w, &moved.session_id, |events| {
+            events.iter().any(|e| e.event_type == "assistant_text")
+        })
+        .await;
+        let body = w
+            .fake
+            .chat_requests()
+            .iter()
+            .map(|r| r["body"].to_string())
+            .find(|b| b.contains("second question"))
+            .expect("the relayed turn");
+        assert!(
+            body.contains("left out to fit your context window"),
+            "the omission is stated to the model"
+        );
+        assert!(body.contains("turn-79"), "the newest turn is kept");
+        assert!(!body.contains("turn-00"), "the oldest turn is dropped");
+        // The relay alone (the request also carries the system prompt and the tool
+        // schemas) stays within its budget: 40 % of a 32k window = 51 200 chars, or the
+        // 48 000 of an unknown window, whichever the target reported at the switch.
+        let start = body.find("<conversation_relay").unwrap();
+        let end = body.find("</conversation_relay>").unwrap();
+        let relay_chars = body[start..end].chars().count();
+        assert!(
+            relay_chars <= 51_200 + 1_000,
+            "the relay is bounded by the window: {relay_chars} chars"
+        );
+        // The thread says how much was left out: never a silent truncation.
+        let stated = stored_events(&w, &moved.session_id).await;
+        match relayed_of(&stated).as_slice() {
+            [ChatEvent::ConversationRelayed {
+                relayed_entries,
+                omitted_entries,
+                ..
+            }] => {
+                assert_eq!(*relayed_entries, moved.relayed_entries);
+                assert_eq!(*omitted_entries, moved.omitted_entries);
+            }
+            other => panic!("one statement expected: {other:?}"),
+        }
+        // Stated on the thread it left as well, even though it was not live.
+        assert_eq!(
+            relayed_of(&stored_events(&w, &old.to_string()).await).len(),
+            1
+        );
+    }
 }
 
 // ============================================================================

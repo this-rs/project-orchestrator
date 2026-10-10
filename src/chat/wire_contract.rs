@@ -46,7 +46,7 @@ const UPDATE_COMMAND: &str = "UPDATE_CHAT_CONTRACT=1 cargo test --lib chat::wire
 
 /// Every `ChatEvent` tag the examples must cover. Adding a variant means
 /// adding its tag here AND its examples in [`server_examples`].
-const EXPECTED_SERVER_TAGS: [&str; 34] = [
+const EXPECTED_SERVER_TAGS: [&str; 35] = [
     "active_tasks_update",
     "ask_user_question",
     "assistant_text",
@@ -56,6 +56,7 @@ const EXPECTED_SERVER_TAGS: [&str; 34] = [
     "compact_boundary",
     "compaction_recovery",
     "compaction_started",
+    "conversation_relayed",
     "error",
     "model_changed",
     "pending_queue",
@@ -141,6 +142,7 @@ fn variant_tag(e: &ChatEvent) -> &'static str {
         ChatEvent::SecretRequest { .. } => "secret_request",
         ChatEvent::SecretRequestResolved { .. } => "secret_request_resolved",
         ChatEvent::SessionClosed { .. } => "session_closed",
+        ChatEvent::ConversationRelayed { .. } => "conversation_relayed",
     }
 }
 
@@ -629,6 +631,28 @@ fn server_examples() -> Vec<ServerExample> {
             ChatEvent::SessionClosed {
                 session_id: s(SESSION_ID),
                 reason: None,
+            },
+        ),
+        ServerExample::new(
+            ChatEvent::ConversationRelayed {
+                from_session_id: s(SESSION_ID),
+                to_session_id: s("7f1c2a30-5b6d-4e8f-9a0b-1c2d3e4f5a6b"),
+                from_provider: s("claude-code"),
+                to_provider: s("local"),
+                relayed_entries: 12,
+                omitted_entries: 3,
+                moved_by: s("user"),
+                conversation_id: Some(s("conv-7f1c2a30")),
+            },
+            ChatEvent::ConversationRelayed {
+                from_session_id: s(SESSION_ID),
+                to_session_id: s("7f1c2a30-5b6d-4e8f-9a0b-1c2d3e4f5a6b"),
+                from_provider: s("claude-code"),
+                to_provider: s("local"),
+                relayed_entries: 0,
+                omitted_entries: 0,
+                moved_by: s("user"),
+                conversation_id: None,
             },
         ),
     ]

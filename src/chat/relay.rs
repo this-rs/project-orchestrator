@@ -208,6 +208,47 @@ pub fn render_relay(events: &[ChatEvent], from: &str, to: &str, budget_chars: us
     }
 }
 
+/// Who moved a conversation through the switch route. (`auto` is reserved for the
+/// cognitive router, which does not move conversations across providers yet.)
+pub const MOVED_BY_USER: &str = "user";
+
+/// A rendered relay with where it comes from: what a session being opened needs
+/// to send the relay in front of its first message AND to say so on its thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayedFrom {
+    /// The rendered relay.
+    pub relay: Relay,
+    /// The session the conversation leaves.
+    pub from_session_id: String,
+    /// The provider it leaves.
+    pub from_provider: String,
+    /// `user` or `auto`.
+    pub moved_by: String,
+    /// The memory conversation of the session it leaves, which the new session keeps.
+    pub conversation_id: Option<String>,
+}
+
+impl RelayedFrom {
+    /// The text to put in front of the first message, `None` when empty.
+    pub fn text(&self) -> Option<&str> {
+        (!self.relay.text.is_empty()).then_some(self.relay.text.as_str())
+    }
+
+    /// The event stating the relay, for the thread of either session.
+    pub fn event(&self, to_session_id: &str, to_provider: &str) -> ChatEvent {
+        ChatEvent::ConversationRelayed {
+            from_session_id: self.from_session_id.clone(),
+            to_session_id: to_session_id.to_string(),
+            from_provider: self.from_provider.clone(),
+            to_provider: to_provider.to_string(),
+            relayed_entries: self.relay.included,
+            omitted_entries: self.relay.omitted,
+            moved_by: self.moved_by.clone(),
+            conversation_id: self.conversation_id.clone(),
+        }
+    }
+}
+
 /// The first message of the new session: the relay, then the user's message.
 pub fn compose_first_message(relay: &Relay, message: &str) -> String {
     if relay.text.is_empty() {

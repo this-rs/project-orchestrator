@@ -331,6 +331,69 @@
         }
       }
     },
+    "conversation_relayed": {
+      "examples": {
+        "full": {
+          "conversation_id": "conv-7f1c2a30",
+          "from_provider": "claude-code",
+          "from_session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "moved_by": "user",
+          "omitted_entries": 3,
+          "relayed_entries": 12,
+          "to_provider": "local",
+          "to_session_id": "7f1c2a30-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+          "type": "conversation_relayed"
+        },
+        "minimal": {
+          "from_provider": "claude-code",
+          "from_session_id": "5b0c7c1e-2f4a-4d6b-9a3e-1c2d3e4f5a6b",
+          "moved_by": "user",
+          "omitted_entries": 0,
+          "relayed_entries": 0,
+          "to_provider": "local",
+          "to_session_id": "7f1c2a30-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+          "type": "conversation_relayed"
+        }
+      },
+      "fields": {
+        "conversation_id": {
+          "required": false,
+          "type": "string"
+        },
+        "from_provider": {
+          "required": true,
+          "type": "string"
+        },
+        "from_session_id": {
+          "required": true,
+          "type": "string"
+        },
+        "moved_by": {
+          "required": true,
+          "type": "string"
+        },
+        "omitted_entries": {
+          "required": true,
+          "type": "number"
+        },
+        "relayed_entries": {
+          "required": true,
+          "type": "number"
+        },
+        "to_provider": {
+          "required": true,
+          "type": "string"
+        },
+        "to_session_id": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
     "error": {
       "examples": {
         "full": {
