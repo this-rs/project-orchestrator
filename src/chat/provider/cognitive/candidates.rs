@@ -34,6 +34,9 @@ pub struct ModelFacts {
     pub supports_images: bool,
     /// Context window in tokens; `None` when unknown (never assumed).
     pub context_window: Option<u64>,
+    /// Why the window is unknown, when its source can say (Claude Code: the live
+    /// catalog). `None` with a known window, or when nothing names the cause.
+    pub window_unknown: Option<UnknownWindow>,
     /// Price per million tokens, from nexus; `None` when unknown.
     pub price: Option<ModelPrice>,
     /// How the cost is accounted.
@@ -62,6 +65,7 @@ impl ModelFacts {
             supports_tools: caps.tools,
             supports_images: caps.images,
             context_window: caps.context_window.map(|w| w.value),
+            window_unknown: None,
             price,
             cost_basis: caps.cost,
             healthy,
@@ -104,6 +108,14 @@ pub enum RejectReason {
         /// Tokens the model holds; `None` when unknown.
         have: Option<u64>,
     },
+    /// The window is unknown and its source says why (Claude Code: the live
+    /// catalog is offline, or lists no window for the model). Never assumed.
+    WindowUnknown {
+        /// Tokens the request needs.
+        need: u64,
+        /// Why the window is unknown.
+        why: UnknownWindow,
+    },
     /// The input carries images and the model cannot read them.
     NoImages,
     /// A median turn costs more than the marginal budget left.
@@ -124,11 +136,97 @@ impl RejectReason {
             Self::Unhealthy => "unhealthy",
             Self::NoTools => "no_tools",
             Self::ContextTooSmall { .. } => "context_too_small",
+            Self::WindowUnknown { .. } => "window_unknown",
             Self::NoImages => "no_images",
             Self::OverBudget => "over_budget",
             Self::TrustWithoutSandbox => "trust_without_sandbox",
         }
     }
+
+    /// Stable code of the cause, when the reason carries one (`window_unknown`:
+    /// `catalog_offline` or `not_in_catalog`), for the decision log.
+    pub fn why(&self) -> Option<&'static str> {
+        match self {
+            Self::WindowUnknown { why, .. } => Some(why.code()),
+            _ => None,
+        }
+    }
+}
+
+/// Why a model's window is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownWindow {
+    /// The live Models API was not reached (no credential, unreachable, nothing
+    /// fetched yet): the static fallback carries no window.
+    CatalogOffline,
+    /// The live catalog does not list this model, or lists it without
+    /// `max_input_tokens`.
+    NotInCatalog,
+}
+
+impl UnknownWindow {
+    /// Stable code, the same as its serialized form.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::CatalogOffline => "catalog_offline",
+            Self::NotInCatalog => "not_in_catalog",
+        }
+    }
+}
+
+impl std::fmt::Display for UnknownWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::CatalogOffline => "window unknown: catalog offline",
+            Self::NotInCatalog => "window unknown: not reported by the live catalog",
+        })
+    }
+}
+
+/// The Claude Code models the router may choose from: one per model of the
+/// live Anthropic catalog, with the window the Models API reports for it
+/// (`max_input_tokens`) and the other capabilities the Claude Code provider
+/// declares (`caps_of`: tools, images, cost basis, sandbox).
+///
+/// A window is never invented: offline, or for a model the listing gives none,
+/// the window is `None` and [`UnknownWindow`] says why, so the filter rejects the
+/// model with that reason. The price is nexus's when it has one (`price_of`),
+/// else unknown (A1: no price table here).
+pub fn claude_code_facts(
+    provider_id: &str,
+    catalog: &crate::chat::model_catalog::CatalogSnapshot,
+    caps_of: impl Fn(&str) -> Capabilities,
+    price_of: impl Fn(&str) -> Option<ModelPrice>,
+    healthy: Option<bool>,
+    allowed_for_project: bool,
+) -> Vec<ModelFacts> {
+    catalog
+        .models
+        .iter()
+        .map(|model| {
+            let caps = caps_of(&model.id);
+            let mut facts = ModelFacts::from_capabilities(
+                provider_id,
+                model.id.clone(),
+                &caps,
+                price_of(&model.id),
+                healthy,
+                allowed_for_project,
+            );
+            // The catalog's window first; the provider's own (configured) one
+            // only when the catalog has none.
+            facts.context_window = model.max_input_tokens.or(facts.context_window);
+            if facts.context_window.is_none() {
+                facts.window_unknown = Some(if catalog.live {
+                    UnknownWindow::NotInCatalog
+                } else {
+                    UnknownWindow::CatalogOffline
+                });
+            }
+            facts
+        })
+        .collect()
 }
 
 /// A pair that was not eligible, and why.
@@ -173,9 +271,15 @@ fn check(signature: &TaskSignature, facts: &ModelFacts) -> Option<RejectReason> 
     if signature.needs_tools && !facts.supports_tools {
         return Some(RejectReason::NoTools);
     }
-    match facts.context_window {
-        Some(window) if window >= signature.context_need_tokens => {}
-        have => {
+    match (facts.context_window, facts.window_unknown) {
+        (Some(window), _) if window >= signature.context_need_tokens => {}
+        (None, Some(why)) => {
+            return Some(RejectReason::WindowUnknown {
+                need: signature.context_need_tokens,
+                why,
+            })
+        }
+        (have, _) => {
             return Some(RejectReason::ContextTooSmall {
                 need: signature.context_need_tokens,
                 have,
@@ -284,6 +388,7 @@ mod tests {
             supports_tools: true,
             supports_images: true,
             context_window: Some(128_000),
+            window_unknown: None,
             price: Some(ModelPrice {
                 input_per_mtok: 1.0,
                 output_per_mtok: 2.0,
@@ -465,5 +570,186 @@ mod tests {
         let mut unpriced = good();
         unpriced.price = None;
         assert_eq!(unpriced.estimated_turn_cost_usd(&small), None);
+    }
+
+    /// Claude Code as the router sees it: windows from the live Anthropic catalog
+    /// (B-R3). The capabilities are the real Claude Code provider's (nexus).
+    mod claude_code_window {
+        use super::*;
+        use crate::chat::model_catalog::{live_snapshot_from_listing, ModelCatalogCache};
+        use nexus_claude::providers::claude_code::ClaudeCodeConfig;
+
+        fn caps(model: &str) -> Capabilities {
+            ClaudeCodeConfig::default().capabilities(Some(model))
+        }
+
+        /// A Models API page: Opus 5.5 with a 1M window, Haiku 4.5 (dated
+        /// snapshot) with 200k, one model listed without a window.
+        fn live() -> crate::chat::model_catalog::CatalogSnapshot {
+            live_snapshot_from_listing(serde_json::json!({
+                "data": [
+                    {"id": "claude-opus-5-5", "display_name": "Claude Opus 5.5",
+                     "max_input_tokens": 1_000_000, "max_tokens": 128_000},
+                    {"id": "claude-haiku-4-5-20251001", "display_name": "Claude Haiku 4.5",
+                     "max_input_tokens": 200_000, "max_tokens": 64_000},
+                    {"id": "claude-zeta-9-9", "display_name": "Claude Zeta 9.9"},
+                ],
+                "has_more": false,
+                "last_id": "claude-zeta-9-9",
+            }))
+        }
+
+        fn facts(
+            provider: &str,
+            catalog: &crate::chat::model_catalog::CatalogSnapshot,
+        ) -> Vec<ModelFacts> {
+            claude_code_facts(provider, catalog, caps, |_| None, Some(true), true)
+        }
+
+        /// A chat turn with tools and images that needs `need` tokens.
+        fn turn(need: u64) -> TaskSignature {
+            let mut signature = TaskSignature::from_chat_request(
+                "refactor this",
+                true,
+                None,
+                ContextHints::default(),
+            );
+            signature.context_need_tokens = need;
+            signature
+        }
+
+        fn rejection(out: &Filtered, model: &str) -> Option<RejectReason> {
+            out.rejected
+                .iter()
+                .find(|r| r.candidate.model == model)
+                .map(|r| r.reason.clone())
+        }
+
+        #[test]
+        fn a_live_window_makes_claude_code_eligible_for_a_task_that_fits() {
+            let pool = facts(CLAUDE_CODE, &live());
+            let opus = pool.iter().find(|f| f.model == "claude-opus-5-5").unwrap();
+            assert_eq!(opus.context_window, Some(1_000_000));
+            assert_eq!(opus.window_unknown, None);
+            assert!(opus.supports_tools && opus.supports_images);
+            assert_eq!(opus.price, None, "no nexus price: unknown, never zero");
+
+            let out = apply(Slot::Automatic, &turn(300_000), &pool).unwrap();
+            let eligible: Vec<_> = out.eligible.iter().map(|f| f.model.as_str()).collect();
+            assert_eq!(eligible, vec!["claude-opus-5-5"], "{:?}", out.rejected);
+            assert!(out.eligible.iter().all(|f| f.provider_id == CLAUDE_CODE));
+            // Haiku 4.5 holds 200k: too small for this task, and says so with numbers.
+            assert_eq!(
+                rejection(&out, "claude-haiku-4-5"),
+                Some(RejectReason::ContextTooSmall {
+                    need: 300_000,
+                    have: Some(200_000)
+                })
+            );
+            // A smaller task fits both.
+            let out = apply(Slot::Automatic, &turn(150_000), &pool).unwrap();
+            let eligible: Vec<_> = out.eligible.iter().map(|f| f.model.as_str()).collect();
+            assert!(
+                eligible.contains(&"claude-opus-5-5") && eligible.contains(&"claude-haiku-4-5")
+            );
+        }
+
+        #[test]
+        fn a_model_the_live_catalog_gives_no_window_is_rejected_by_name() {
+            let out = apply(Slot::Automatic, &turn(10_000), &facts(CLAUDE_CODE, &live())).unwrap();
+            for model in ["claude-zeta-9-9", "claude-sonnet-4-6"] {
+                assert_eq!(
+                    rejection(&out, model),
+                    Some(RejectReason::WindowUnknown {
+                        need: 10_000,
+                        why: UnknownWindow::NotInCatalog
+                    }),
+                    "{model}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn an_offline_catalog_leaves_every_claude_code_model_ineligible_by_name() {
+            let offline = ModelCatalogCache::new(None).snapshot().await;
+            assert!(!offline.live);
+            let pool = facts(CLAUDE_CODE, &offline);
+            assert!(
+                !pool.is_empty(),
+                "the models stay listed, with their reason"
+            );
+            let out = apply(Slot::Automatic, &turn(10_000), &pool).unwrap();
+            assert!(out.eligible.is_empty());
+            let reason = RejectReason::WindowUnknown {
+                need: 10_000,
+                why: UnknownWindow::CatalogOffline,
+            };
+            assert!(out.rejected.iter().all(|r| r.reason == reason));
+            assert_eq!(reason.code(), "window_unknown");
+            assert_eq!(
+                UnknownWindow::CatalogOffline.to_string(),
+                "window unknown: catalog offline"
+            );
+            assert_eq!(
+                serde_json::to_value(&reason).unwrap(),
+                serde_json::json!({"reason": "window_unknown", "need": 10_000, "why": "catalog_offline"})
+            );
+        }
+
+        #[test]
+        fn a_remote_claude_code_stays_out_and_consent_still_rules() {
+            let out = apply(
+                Slot::Automatic,
+                &turn(10_000),
+                &facts("claude-code@box", &live()),
+            )
+            .unwrap();
+            assert!(out.eligible.is_empty());
+            assert!(out
+                .rejected
+                .iter()
+                .all(|r| r.reason == RejectReason::Remote));
+
+            let refused =
+                claude_code_facts(CLAUDE_CODE, &live(), caps, |_| None, Some(true), false);
+            let out = apply(Slot::Automatic, &turn(10_000), &refused).unwrap();
+            assert!(out.eligible.is_empty());
+            assert!(out
+                .rejected
+                .iter()
+                .all(|r| r.reason == RejectReason::NotAllowed));
+
+            let down = claude_code_facts(CLAUDE_CODE, &live(), caps, |_| None, Some(false), true);
+            let out = apply(Slot::Automatic, &turn(10_000), &down).unwrap();
+            assert!(out
+                .rejected
+                .iter()
+                .all(|r| r.reason == RejectReason::Unhealthy));
+        }
+
+        #[test]
+        fn an_explicit_claude_code_choice_is_untouched_and_a_nexus_price_is_kept() {
+            let offline_like = facts(CLAUDE_CODE, &live());
+            assert_eq!(apply(Slot::Explicit, &turn(10_000), &offline_like), None);
+            let price = ModelPrice {
+                input_per_mtok: 4.0,
+                output_per_mtok: 20.0,
+                cache_read_per_mtok: None,
+                cache_write_per_mtok: None,
+            };
+            let priced = claude_code_facts(
+                CLAUDE_CODE,
+                &live(),
+                caps,
+                |m| (m == "claude-opus-5-5").then_some(price),
+                Some(true),
+                true,
+            );
+            let opus = priced
+                .iter()
+                .find(|f| f.model == "claude-opus-5-5")
+                .unwrap();
+            assert_eq!(opus.price, Some(price));
+        }
     }
 }

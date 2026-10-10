@@ -1522,8 +1522,17 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     let cognitive_store: Arc<dyn chat::provider::cognitive::store::RoutingArmStore> = Arc::new(
         neo4j::routing::Neo4jRoutingStore::new(orchestrator.neo4j_arc()),
     );
+    // The live Claude model catalog, shared: the model selector serves it, and the
+    // router reads the Claude Code candidates and their windows from it.
+    let model_catalog = chat::model_catalog::ModelCatalogCache::new_with_notifier(
+        config.anthropic_api_key.clone(),
+        Some(vault.clone()),
+        event_bus.clone() as Arc<dyn events::EventEmitter>,
+        orchestrator.neo4j_arc(),
+    );
     let cognitive_routing =
-        chat::provider::cognitive::decider::CognitiveRouting::new(cognitive_store.clone());
+        chat::provider::cognitive::decider::CognitiveRouting::new(cognitive_store.clone())
+            .with_claude_code_catalog(model_catalog.clone());
     api::routing_handlers::set_routing_store(Some(cognitive_store.clone()));
 
     // Create chat manager (optional — requires Claude CLI)
@@ -1938,12 +1947,6 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Subscribe to the event bus BEFORE creating ServerState (the bus lives independently)
     let reactor_receiver = event_bus.subscribe();
 
-    // Handles the model catalog needs to announce a newly released model.
-    // Captured here because the ServerState literal below moves `orchestrator`.
-    let catalog_graph: Arc<dyn neo4j::GraphStore> = orchestrator.neo4j_arc();
-    let catalog_emitter: Arc<dyn events::EventEmitter> =
-        event_bus.clone() as Arc<dyn events::EventEmitter>;
-
     // Create server state
     let server_state = Arc::new(ServerState {
         orchestrator,
@@ -1985,12 +1988,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         reactor_counters: std::sync::OnceLock::new(),
         confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         mcp_registry: mcp_registry.clone(),
-        model_catalog: chat::model_catalog::ModelCatalogCache::new_with_notifier(
-            config.anthropic_api_key.clone(),
-            Some(vault.clone()),
-            catalog_emitter,
-            catalog_graph,
-        ),
+        model_catalog,
         vault: vault.clone(),
     });
 

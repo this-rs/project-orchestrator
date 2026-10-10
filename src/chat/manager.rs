@@ -10695,6 +10695,27 @@ impl ChatManager {
                     }
                 }
             }
+            // Claude Code declares no catalog and no window of its own: its candidates
+            // are the live Anthropic catalog's models, each with the window the Models
+            // API reports. Offline, they stay in the pool with the reason they cannot
+            // be chosen ("window unknown: catalog offline"), never a guessed window.
+            if id == resolver::CLAUDE_CODE {
+                if let Some(catalog) = routing.claude_code_catalog.as_ref() {
+                    let snapshot = catalog.snapshot().await;
+                    let prices: std::collections::HashMap<_, _> = entries.iter().cloned().collect();
+                    for facts in super::provider::cognitive::candidates::claude_code_facts(
+                        &id,
+                        &snapshot,
+                        |model| provider.capabilities(Some(model)),
+                        |model| prices.get(model).copied().flatten(),
+                        Some(healthy),
+                        allowed,
+                    ) {
+                        seen.insert(facts.model.clone());
+                        pool.push(facts);
+                    }
+                }
+            }
             for (model, price) in entries {
                 if !seen.insert(model.clone()) {
                     continue;

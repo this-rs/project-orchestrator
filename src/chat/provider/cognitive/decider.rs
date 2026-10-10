@@ -272,6 +272,10 @@ pub struct CognitiveRouting {
     /// Where decisions and arms live, when the standard wiring built this; it is
     /// how a session's decision is linked and closed. `None` for a test decider.
     pub store: Option<Arc<dyn RoutingArmStore>>,
+    /// The live Anthropic model catalog: where the Claude Code candidates and
+    /// their windows come from (`max_input_tokens`). `None` (tests, or no
+    /// catalog wired): Claude Code adds only what its provider reports.
+    pub claude_code_catalog: Option<Arc<crate::chat::model_catalog::ModelCatalogCache>>,
 }
 
 impl CognitiveRouting {
@@ -287,6 +291,7 @@ impl CognitiveRouting {
             health: Arc::new(candidates::HealthCache::standard()),
             probed: Default::default(),
             store: Some(store),
+            claude_code_catalog: None,
         }
     }
 
@@ -298,7 +303,17 @@ impl CognitiveRouting {
             health: Arc::new(candidates::HealthCache::standard()),
             probed: Default::default(),
             store: None,
+            claude_code_catalog: None,
         }
+    }
+
+    /// Feeds the Claude Code candidates from the live model catalog.
+    pub fn with_claude_code_catalog(
+        mut self,
+        catalog: Arc<crate::chat::model_catalog::ModelCatalogCache>,
+    ) -> Self {
+        self.claude_code_catalog = Some(catalog);
+        self
     }
 
     /// Replaces the alias hints.
@@ -323,6 +338,7 @@ mod tests {
             supports_tools: true,
             supports_images: false,
             context_window: Some(128_000),
+            window_unknown: None,
             price: Some(ModelPrice {
                 input_per_mtok: price,
                 output_per_mtok: price,

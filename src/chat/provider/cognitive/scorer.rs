@@ -335,6 +335,7 @@ mod tests {
             supports_tools: true,
             supports_images: false,
             context_window: Some(200_000),
+            window_unknown: None,
             price: input_price.map(|p| ModelPrice {
                 input_per_mtok: p,
                 output_per_mtok: p,

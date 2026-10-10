@@ -24,6 +24,7 @@ use chrono::{DateTime, Utc};
 use nexus_claude::agent::CostBasis;
 use serde::Serialize;
 
+use super::candidates::RejectReason;
 use super::decision::{CognitiveDecision, Pick};
 use super::store::{DecisionFilter, RoutingArmStore};
 
@@ -286,6 +287,10 @@ pub struct AlternativeView {
     pub score: Option<f64>,
     /// Rejection code, `None` when merely outscored.
     pub rejected: Option<String>,
+    /// Cause of the rejection, when its code has one: for `window_unknown`,
+    /// `catalog_offline` or `not_in_catalog`. Omitted otherwise (additive).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
 }
 
 /// An outcome as the frontend types it (`RoutingOutcome`).
@@ -365,6 +370,11 @@ impl From<&CognitiveDecision> for RoutingDecisionView {
                     model: Some(a.pick.model.clone()),
                     score: a.score,
                     rejected: a.rejected.as_ref().map(|r| r.code().to_owned()),
+                    why: a
+                        .rejected
+                        .as_ref()
+                        .and_then(RejectReason::why)
+                        .map(str::to_owned),
                 })
                 .collect(),
             session_id: d.session_id.map(|u| u.to_string()),

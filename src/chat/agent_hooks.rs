@@ -1096,6 +1096,7 @@ mod provider_move_tests {
             supports_tools: true,
             supports_images: true,
             context_window: Some(200_000),
+            window_unknown: None,
             price: None,
             cost_basis: CostBasis::Unknown,
             healthy: Some(true),

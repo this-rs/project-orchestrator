@@ -384,6 +384,93 @@ mod tests {
         }
     }
 
+    /// B-R3: the manager's pool takes Claude Code's models from the live Anthropic
+    /// catalog, each with the window the Models API reports (`max_input_tokens`).
+    mod claude_code_window {
+        use super::*;
+        use crate::chat::model_catalog::{refreshed_cache_for_test, ModelCatalogCache};
+        use crate::chat::provider::cognitive::candidates::{
+            self, ModelFacts, RejectReason, Slot, UnknownWindow,
+        };
+        use crate::chat::provider::cognitive::decider::CognitiveRouting;
+        use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
+        use crate::chat::provider::cognitive::store::InMemoryRoutingStore;
+        use crate::chat::provider::resolver::CLAUDE_CODE;
+
+        /// The Claude Code part of the pool of a manager routed over `catalog`,
+        /// Claude Code measured healthy (no CLI is needed for the pool itself).
+        async fn claude_code_pool(catalog: Arc<ModelCatalogCache>) -> Vec<ModelFacts> {
+            let state = crate::test_helpers::mock_app_state();
+            let routing = CognitiveRouting::new(Arc::new(InMemoryRoutingStore::new()))
+                .with_claude_code_catalog(catalog);
+            routing
+                .health
+                .put(CLAUDE_CODE, true, std::time::Instant::now());
+            let manager = crate::chat::ChatManager::new_without_memory(
+                state.neo4j,
+                state.meili,
+                crate::chat::config::ChatConfig::default(),
+            )
+            .with_cognitive_routing(routing);
+            manager
+                .routing_pool_for(None)
+                .await
+                .into_iter()
+                .filter(|facts| facts.provider_id == CLAUDE_CODE)
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn claude_code_enters_the_pool_with_the_live_catalogs_window_and_is_eligible() {
+            use wiremock::matchers::{method, path};
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(method("GET"))
+                .and(path("/v1/models"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "data": [{"id": "claude-opus-5-5", "display_name": "Claude Opus 5.5",
+                                  "max_input_tokens": 1_000_000, "max_tokens": 128_000}],
+                        "has_more": false,
+                        "last_id": "claude-opus-5-5",
+                    }),
+                ))
+                .mount(&server)
+                .await;
+            let catalog =
+                refreshed_cache_for_test(format!("{}/v1/models", server.uri()), "k").await;
+
+            let pool = claude_code_pool(catalog).await;
+            let opus = pool
+                .iter()
+                .find(|f| f.model == "claude-opus-5-5")
+                .unwrap_or_else(|| panic!("no claude-code opus in the pool: {pool:?}"));
+            assert_eq!(opus.context_window, Some(1_000_000));
+            assert!(opus.supports_tools && opus.supports_images);
+
+            let signature = TaskSignature::utility(TaskClass::UtilityFeatureGraph, 300_000, None);
+            let out = candidates::apply(Slot::Automatic, &signature, &pool).unwrap();
+            assert!(
+                out.eligible.iter().any(|f| f.model == "claude-opus-5-5"),
+                "rejected: {:?}",
+                out.rejected
+            );
+        }
+
+        #[tokio::test]
+        async fn offline_every_claude_code_model_is_listed_and_rejected_by_name() {
+            let pool = claude_code_pool(ModelCatalogCache::new(None)).await;
+            assert!(!pool.is_empty());
+            let signature = TaskSignature::utility(TaskClass::UtilityFeatureGraph, 10_000, None);
+            let out = candidates::apply(Slot::Automatic, &signature, &pool).unwrap();
+            assert!(out.eligible.is_empty());
+            assert!(out.rejected.iter().all(|r| r.reason
+                == RejectReason::WindowUnknown {
+                    need: 10_000,
+                    why: UnknownWindow::CatalogOffline
+                }));
+        }
+    }
+
     #[test]
     fn verification_shapes() {
         assert_eq!(verification_passed(None), None);

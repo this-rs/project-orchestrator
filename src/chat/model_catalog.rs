@@ -103,6 +103,16 @@ pub struct ModelDefinition {
     pub full_label: String,
     /// One-line description for selection cards
     pub description: String,
+    /// Context window in tokens, as the Models API reports it (`max_input_tokens`,
+    /// present since March 2026). `None` when unknown: the catalog is the static
+    /// fallback, or the live listing gave none for this model. Never assumed — the
+    /// cognitive router keeps a model without a window out of the automatic slots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u64>,
+    /// Output cap in tokens, as the Models API reports it (`max_tokens`); `None`
+    /// when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
 }
 
 pub const TIER_CURRENT: &str = "current";
@@ -248,6 +258,8 @@ fn build_definition(
             .unwrap_or_else(|| format!("Claude {short_label}")),
         short_label,
         description: description.to_string(),
+        max_input_tokens: None,
+        max_tokens: None,
     }
 }
 
@@ -320,6 +332,10 @@ fn resolve_model(id: &str, api_display_name: Option<&str>) -> ModelDefinition {
 
 /// The static list used when no API key is configured, or the live fetch
 /// fails and nothing has ever been cached yet. Order matches `CURATED_ORDER`.
+///
+/// It carries no window: the curated table holds no context window from a
+/// cited source, and a window is never invented. Offline, every model's
+/// `max_input_tokens` is `None`, and the router says so ("catalog offline").
 fn static_fallback_models() -> Vec<ModelDefinition> {
     CURATED_ORDER
         .iter()
@@ -340,6 +356,19 @@ struct AnthropicModelEntry {
     id: String,
     #[serde(default)]
     display_name: Option<String>,
+    /// Context window (Models API `max_input_tokens`, since March 2026; the
+    /// API has no `context_window` field). Signed on purpose: a malformed
+    /// value is dropped (see [`positive`]) instead of failing the whole page.
+    #[serde(default)]
+    max_input_tokens: Option<i64>,
+    /// Output cap (Models API `max_tokens`).
+    #[serde(default)]
+    max_tokens: Option<i64>,
+}
+
+/// A token count the API reported, kept only when it is a real one (> 0).
+fn positive(value: Option<i64>) -> Option<u64> {
+    value.and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0)
 }
 
 /// Where the live fetch gets its credential from.
@@ -531,6 +560,10 @@ struct CacheState {
     /// credential.
     ttl: Duration,
     refreshing: bool,
+    /// `models` came from the live Models API at least once (a later failed
+    /// refresh keeps that list, still real data). `false` while the static
+    /// fallback is served.
+    live: bool,
 }
 
 /// Handles needed to announce a newly released model. Optional so the cache
@@ -538,6 +571,16 @@ struct CacheState {
 struct Notifier {
     emitter: Arc<dyn EventEmitter>,
     graph: Arc<dyn GraphStore>,
+}
+
+/// The catalog at one instant, and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogSnapshot {
+    /// The models, as [`ModelCatalogCache::get_models`] returns them.
+    pub models: Vec<ModelDefinition>,
+    /// The list came from the live Models API; `false` = static fallback
+    /// (no credential, API unreachable, nothing fetched yet).
+    pub live: bool,
 }
 
 /// Shared, lazily-refreshed cache of the Claude model catalog.
@@ -572,6 +615,7 @@ impl ModelCatalogCache {
                 fetched_at: Instant::now() - CACHE_TTL - Duration::from_secs(1),
                 ttl: CACHE_TTL,
                 refreshing: false,
+                live: false,
             }),
             http: reqwest::Client::builder()
                 .timeout(FETCH_TIMEOUT)
@@ -625,6 +669,13 @@ impl ModelCatalogCache {
     /// blocks on network I/O — always returns immediately with whatever is
     /// cached (which is at minimum the static fallback list).
     pub async fn get_models(self: &Arc<Self>) -> Vec<ModelDefinition> {
+        self.snapshot().await.models
+    }
+
+    /// Like [`Self::get_models`], and whether the list came from the live
+    /// Models API (`live`) or is the static fallback. The cognitive router
+    /// reads the windows from here, and names "catalog offline" when not live.
+    pub async fn snapshot(self: &Arc<Self>) -> CatalogSnapshot {
         let needs_refresh = {
             let state = self.inner.read().await;
             !state.refreshing && state.fetched_at.elapsed() >= state.ttl
@@ -643,7 +694,11 @@ impl ModelCatalogCache {
             }
         }
 
-        self.inner.read().await.models.clone()
+        let state = self.inner.read().await;
+        CatalogSnapshot {
+            models: state.models.clone(),
+            live: state.live,
+        }
     }
 
     /// Force an immediate synchronous refresh attempt (used by tests and by
@@ -664,6 +719,7 @@ impl ModelCatalogCache {
                 );
                 announce = Some(models.clone());
                 state.models = models;
+                state.live = true;
                 state.fetched_at = Instant::now();
                 state.ttl = CACHE_TTL;
             }
@@ -945,11 +1001,28 @@ fn merge_catalog(entries: &[AnthropicModelEntry]) -> Vec<ModelDefinition> {
     let mut seen = HashSet::new();
     let mut models: Vec<ModelDefinition> = Vec::new();
 
+    // The limits come from the listing only: a curated model the API does not
+    // list keeps `None` (unknown), never a guess.
+    let with_limits = |mut model: ModelDefinition, entry: Option<&AnthropicModelEntry>| {
+        if let Some(entry) = entry {
+            model.max_input_tokens = positive(entry.max_input_tokens);
+            model.max_tokens = positive(entry.max_tokens);
+        }
+        model
+    };
+
     for (id, ..) in CURATED_ORDER {
-        let api_entry = entries.iter().find(|e| canonical_id(&e.id) == *id);
-        models.push(resolve_model(
-            id,
-            api_entry.and_then(|e| e.display_name.as_deref()),
+        // An entry that reports a window wins over another snapshot of the
+        // same model that does not.
+        let same = |e: &&AnthropicModelEntry| canonical_id(&e.id) == *id;
+        let api_entry = entries
+            .iter()
+            .filter(same)
+            .find(|e| positive(e.max_input_tokens).is_some())
+            .or_else(|| entries.iter().find(same));
+        models.push(with_limits(
+            resolve_model(id, api_entry.and_then(|e| e.display_name.as_deref())),
+            api_entry,
         ));
         seen.insert(id.to_string());
     }
@@ -960,7 +1033,10 @@ fn merge_catalog(entries: &[AnthropicModelEntry]) -> Vec<ModelDefinition> {
         if !seen.insert(canonical.to_string()) {
             continue;
         }
-        models.push(resolve_model(&entry.id, entry.display_name.as_deref()));
+        models.push(with_limits(
+            resolve_model(&entry.id, entry.display_name.as_deref()),
+            Some(entry),
+        ));
     }
 
     let newest = |family: &str| {
@@ -982,6 +1058,33 @@ fn merge_catalog(entries: &[AnthropicModelEntry]) -> Vec<ModelDefinition> {
     }
 
     models
+}
+
+/// A cache keyed on `key` against the Models API at `models_url`, refreshed
+/// once. For tests elsewhere in the crate that need a live catalog.
+#[cfg(test)]
+pub(crate) async fn refreshed_cache_for_test(
+    models_url: String,
+    key: &str,
+) -> Arc<ModelCatalogCache> {
+    let cache = ModelCatalogCache::with_credentials(CredentialSource::ApiKey(key.into()));
+    let mut cache = Arc::try_unwrap(cache).unwrap_or_else(|_| unreachable!());
+    cache.models_url = models_url;
+    let cache = Arc::new(cache);
+    cache.refresh().await;
+    cache
+}
+
+/// The catalog a live Models API page would give, through the real parsing and
+/// merge. For the router tests, which start from the API's JSON.
+#[cfg(test)]
+pub(crate) fn live_snapshot_from_listing(page: serde_json::Value) -> CatalogSnapshot {
+    let page: AnthropicModelsResponse =
+        serde_json::from_value(page).expect("a Models API listing page");
+    CatalogSnapshot {
+        models: merge_catalog(&page.data),
+        live: true,
+    }
 }
 
 #[cfg(test)]
@@ -1119,6 +1222,8 @@ mod tests {
         AnthropicModelEntry {
             id: id.into(),
             display_name: Some(name.into()),
+            max_input_tokens: None,
+            max_tokens: None,
         }
     }
 
@@ -1644,5 +1749,85 @@ mod tests {
             .await
             .unwrap_or_default()
             .is_empty());
+    }
+
+    /// A Models API listing as the API answers since March 2026: each model
+    /// carries `max_input_tokens` (its context window) and `max_tokens`.
+    fn listing_with_windows() -> serde_json::Value {
+        serde_json::json!({
+            "data": [
+                {"id": "claude-opus-5-5", "display_name": "Claude Opus 5.5",
+                 "max_input_tokens": 1_000_000, "max_tokens": 128_000},
+                {"id": "claude-haiku-4-5-20251001", "display_name": "Claude Haiku 4.5",
+                 "max_input_tokens": 200_000, "max_tokens": 64_000},
+                {"id": LIVE_ONLY_MODEL, "display_name": "Claude Zeta 9.9"},
+                {"id": "claude-broken-1", "display_name": "Broken", "max_input_tokens": -5},
+            ],
+            "has_more": false,
+            "last_id": "claude-broken-1",
+        })
+    }
+
+    fn window_of(models: &[ModelDefinition], id: &str) -> Option<u64> {
+        models
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap_or_else(|| panic!("{id} missing from {:?}", ids(models)))
+            .max_input_tokens
+    }
+
+    #[tokio::test]
+    async fn test_live_listing_carries_each_models_window() {
+        use wiremock::matchers::{header, method, path};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("x-api-key", DUMMY_KEY))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(listing_with_windows()),
+            )
+            .mount(&server)
+            .await;
+        let cache = ModelCatalogCache::with_credentials(CredentialSource::ApiKey(DUMMY_KEY.into()));
+        let mut cache = Arc::try_unwrap(cache).unwrap_or_else(|_| unreachable!());
+        cache.models_url = format!("{}/v1/models", server.uri());
+        let cache = Arc::new(cache);
+
+        assert!(
+            !cache.snapshot().await.live,
+            "seeded with the static fallback"
+        );
+        cache.refresh().await;
+        let snapshot = cache.snapshot().await;
+
+        assert!(snapshot.live);
+        let models = &snapshot.models;
+        assert_eq!(window_of(models, "claude-opus-5-5"), Some(1_000_000));
+        let opus = models.iter().find(|m| m.id == "claude-opus-5-5").unwrap();
+        assert_eq!(opus.max_tokens, Some(128_000));
+        // A dated snapshot gives its window to the curated alias it matches.
+        assert_eq!(window_of(models, "claude-haiku-4-5"), Some(200_000));
+        // Listed without the field, malformed, or not listed at all: unknown.
+        assert_eq!(window_of(models, LIVE_ONLY_MODEL), None);
+        assert_eq!(window_of(models, "claude-broken-1"), None);
+        assert_eq!(window_of(models, "claude-sonnet-4-6"), None);
+    }
+
+    #[tokio::test]
+    async fn test_offline_catalog_is_not_live_and_knows_no_window() {
+        let snapshot = ModelCatalogCache::new(None).snapshot().await;
+        assert!(!snapshot.live);
+        assert!(!snapshot.models.is_empty());
+        assert!(snapshot.models.iter().all(|m| m.max_input_tokens.is_none()));
+    }
+
+    #[test]
+    fn test_window_is_additive_on_the_wire() {
+        // Unknown: absent from the JSON the frontend reads (no new null field).
+        let json = serde_json::to_value(static_fallback_models()[0].clone()).unwrap();
+        assert!(json.get("maxInputTokens").is_none());
+        let live = live_snapshot_from_listing(listing_with_windows());
+        let json = serde_json::to_value(&live.models[0]).unwrap();
+        assert_eq!(json["maxInputTokens"], 1_000_000);
     }
 }
