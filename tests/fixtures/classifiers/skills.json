@@ -1,0 +1,72 @@
+{
+  "classifier": "skills",
+  "version": 1,
+  "catalog": {
+    "skills": [
+      {
+        "name": "neo4j-cypher",
+        "triggers": [
+          { "type": "regex", "value": "neo4j|cypher|unwind", "threshold": 0.7, "quality": 0.8 }
+        ]
+      },
+      {
+        "name": "bug-triage",
+        "triggers": [
+          { "type": "regex", "value": "bug|erreur|error|crash|plante|échoue|fails", "threshold": 0.7, "quality": 0.75 }
+        ]
+      },
+      {
+        "name": "release-notes",
+        "triggers": [
+          { "type": "regex", "value": "changelog|release notes|notes de version", "threshold": 0.7, "quality": 0.9 }
+        ]
+      },
+      {
+        "name": "rust-tests",
+        "triggers": [
+          { "type": "file_glob", "value": "tests/**/*.rs", "threshold": 0.7, "quality": 0.85 }
+        ]
+      },
+      {
+        "name": "frontend-ui",
+        "triggers": [
+          { "type": "file_glob", "value": "frontend/src/**", "threshold": 0.7, "quality": 0.6 }
+        ]
+      }
+    ]
+  },
+  "cases": [
+    { "id": "skills-01-fr", "lang": "fr", "pair": "01", "input": { "message": "pourquoi la requête cypher renvoie-t-elle rien ?" }, "label": "neo4j-cypher" },
+    { "id": "skills-01-en", "lang": "en", "pair": "01", "input": { "message": "why does the cypher query return nothing?" }, "label": "neo4j-cypher" },
+    { "id": "skills-02-fr", "lang": "fr", "pair": "02", "input": { "message": "écris un UNWIND pour insérer ces notes" }, "label": "neo4j-cypher" },
+    { "id": "skills-02-en", "lang": "en", "pair": "02", "input": { "message": "write an UNWIND to insert these notes" }, "label": "neo4j-cypher" },
+    { "id": "skills-03-fr", "lang": "fr", "pair": "03", "input": { "message": "il y a une erreur dans le parseur" }, "label": "bug-triage" },
+    { "id": "skills-03-en", "lang": "en", "pair": "03", "input": { "message": "there is an error in the parser" }, "label": "bug-triage" },
+    { "id": "skills-04-fr", "lang": "fr", "pair": "04", "input": { "message": "le serveur plante au démarrage" }, "label": "bug-triage" },
+    { "id": "skills-04-en", "lang": "en", "pair": "04", "input": { "message": "the server crashes at startup" }, "label": "bug-triage" },
+    { "id": "skills-05-fr", "lang": "fr", "pair": "05", "input": { "message": "prépare les notes de version de 1.2" }, "label": "release-notes" },
+    { "id": "skills-05-en", "lang": "en", "pair": "05", "input": { "message": "prepare the release notes for 1.2" }, "label": "release-notes" },
+    { "id": "skills-06-fr", "lang": "fr", "pair": "06", "input": { "message": "mets à jour le changelog" }, "label": "release-notes" },
+    { "id": "skills-06-en", "lang": "en", "pair": "06", "input": { "message": "update the changelog" }, "label": "release-notes" },
+    { "id": "skills-07-fr", "lang": "fr", "pair": "07", "input": { "message": "ajoute un test pour cette fonction", "file": "tests/api.rs" }, "label": "rust-tests" },
+    { "id": "skills-07-en", "lang": "en", "pair": "07", "input": { "message": "add a test for this function", "file": "tests/api.rs" }, "label": "rust-tests" },
+    { "id": "skills-08-fr", "lang": "fr", "pair": "08", "input": { "message": "ajoute un test pour cette fonction" }, "label": "none" },
+    { "id": "skills-08-en", "lang": "en", "pair": "08", "input": { "message": "add a test for this function" }, "label": "none" },
+    { "id": "skills-09-fr", "lang": "fr", "pair": "09", "input": { "message": "corrige le bouton du tableau de bord", "file": "frontend/src/App.tsx" }, "label": "frontend-ui" },
+    { "id": "skills-09-en", "lang": "en", "pair": "09", "input": { "message": "fix the dashboard button", "file": "frontend/src/App.tsx" }, "label": "frontend-ui" },
+    { "id": "skills-10-fr", "lang": "fr", "pair": "10", "input": { "message": "réorganise les composants de la page", "file": "frontend/src/pages/Home.tsx" }, "label": "frontend-ui" },
+    { "id": "skills-10-en", "lang": "en", "pair": "10", "input": { "message": "reorganize the page components", "file": "frontend/src/pages/Home.tsx" }, "label": "frontend-ui" },
+    { "id": "skills-11-fr", "lang": "fr", "pair": "11", "input": { "message": "bonjour, comment ça va ?" }, "label": "none" },
+    { "id": "skills-11-en", "lang": "en", "pair": "11", "input": { "message": "hello, how are you?" }, "label": "none" },
+    { "id": "skills-12-fr", "lang": "fr", "pair": "12", "input": { "message": "merci, c'est parfait" }, "label": "none" },
+    { "id": "skills-12-en", "lang": "en", "pair": "12", "input": { "message": "thanks, that's perfect" }, "label": "none" },
+    { "id": "skills-13-fr", "lang": "fr", "pair": "13", "input": { "message": "quelle est la météo demain ?" }, "label": "none" },
+    { "id": "skills-13-en", "lang": "en", "pair": "13", "input": { "message": "what is the weather tomorrow?" }, "label": "none" },
+    { "id": "skills-14-fr", "lang": "fr", "pair": "14", "input": { "message": "pourquoi la requête neo4j est lente" }, "label": "neo4j-cypher" },
+    { "id": "skills-14-en", "lang": "en", "pair": "14", "input": { "message": "why is the neo4j query slow" }, "label": "neo4j-cypher" },
+    { "id": "skills-15-fr", "lang": "fr", "pair": "15", "input": { "message": "une erreur de compilation sur le module graph" }, "label": "bug-triage" },
+    { "id": "skills-15-en", "lang": "en", "pair": "15", "input": { "message": "a compilation error in the graph module" }, "label": "bug-triage" },
+    { "id": "skills-16-fr", "lang": "fr", "pair": "16", "input": { "message": "rédige les release notes et le changelog" }, "label": "release-notes" },
+    { "id": "skills-16-en", "lang": "en", "pair": "16", "input": { "message": "write the release notes and the changelog" }, "label": "release-notes" }
+  ]
+}
