@@ -18125,7 +18125,8 @@ mod tests {
             None,
             None,
             session_id.clone(),
-            Duration::from_millis(200),
+            // Long enough for the 20 ms bump to run on a loaded runner (200 ms was not).
+            Duration::from_secs(3),
         )
         .await;
 
@@ -19918,8 +19919,12 @@ mod tests {
         let event = parse_permission_control_msg(&msg, None).expect("permission request");
         assert!(matches!(event, ChatEvent::PermissionRequest { .. }));
         notify_attention_for_chat_event(&emitter, "sess-1", &event);
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let ev = rx.try_recv().expect("attention_changed on the bus");
+        // Wait for the event (bounded), not a fixed 400 ms: under a loaded runner the
+        // emitter task may not have run yet and a single try_recv saw an empty bus.
+        let ev = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("attention_changed on the bus within 10 s")
+            .expect("attention_changed on the bus");
         assert_eq!(ev.entity_type, crate::events::EntityType::AttentionChanged);
         assert_eq!(ev.payload["session_id"], "sess-1");
         assert_eq!(
@@ -19957,8 +19962,12 @@ mod tests {
             .send_permission_response("sess-d", "req-d", true)
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let ev = rx.try_recv().expect("attention_changed on the bus");
+        // Wait for the event (bounded), not a fixed 400 ms: under a loaded runner the
+        // emitter task may not have run yet and a single try_recv saw an empty bus.
+        let ev = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("attention_changed on the bus within 10 s")
+            .expect("attention_changed on the bus");
         assert_eq!(ev.payload["session_id"], "sess-d");
         assert_eq!(
             ev.payload["reasons"],
