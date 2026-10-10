@@ -7509,9 +7509,9 @@ impl ChatManager {
 
         // On the tool clock BEFORE the CLI has it: a fast tool's result cannot overtake it.
         let tool_clock = super::tool_clock::ToolClock::for_session(session_id);
-        tool_clock.decided(request_id, allow, chrono::Utc::now());
+        let mark = tool_clock.decided(request_id, allow, chrono::Utc::now());
         if let Err(e) = stdin_tx.send(json).await {
-            tool_clock.undecided(request_id);
+            tool_clock.undecided(request_id, mark);
             restore_claim(original_input).await;
             return Err(PermissionDeliveryError::Failed(anyhow!(
                 "Failed to send permission control response: {}",

@@ -25,7 +25,10 @@
 //!   `tool_cancelled` (the call is over);
 //! - the user's **answer to a permission**, noted by [`ToolClock::decided`] BEFORE
 //!   it is handed to the CLI or the provider (a fast tool's result cannot overtake
-//!   it), and taken back by [`ToolClock::undecided`] when the hand-over fails.
+//!   it), and taken back by [`ToolClock::undecided`] when the hand-over fails —
+//!   only the mark that answer placed ([`DecisionMark`]): a second answer to the
+//!   same request (a double click, two tabs) that the engine refuses does not
+//!   erase the first.
 //!
 //! When the call is over, the clock answers one [`ChatEvent::ToolTiming`], which
 //! the engine stores and relays right after the result, in the same order.
@@ -37,7 +40,13 @@
 //! ran), a permission never answered (a cancellation, a question answered by the
 //! result itself), an engine that runs no host hook (remote cwd, Codex, ACP
 //! sessions of the agent engine). `incomplete` says the clock may have missed a
-//! wait (a permission request that named no call).
+//! wait (a permission request that named no call): such a call has no
+//! `run_started_at` either, its take-up may hold the user's wait.
+//!
+//! The turn's `result` forgets the calls left open, except the calls of a
+//! sub-agent (`parent_tool_use_id`): a background `Task` outlives the turn that
+//! launched it, its calls are timed when they end. A sub-agent call that never
+//! ends is kept until the session's clock goes.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -59,6 +68,8 @@ struct Call {
     permission_requested_at: Option<DateTime<Utc>>,
     /// The answer: when, and whether the tool may run.
     permission_resolved: Option<(DateTime<Utc>, bool)>,
+    /// The [`ToolClock::decided`] that placed `permission_resolved`, if one did.
+    resolved_by: Option<DecisionMark>,
     /// A question to the user: its answer is the result, the call never "runs".
     question: bool,
     incomplete: bool,
@@ -69,7 +80,14 @@ struct State {
     calls: HashMap<String, Call>,
     /// Permission (or question) request id → tool call id, while the call lasts.
     requests: HashMap<String, String>,
+    /// The last [`DecisionMark`] handed out.
+    marks: u64,
 }
+
+/// What one [`ToolClock::decided`] placed on the clock, so that
+/// [`ToolClock::undecided`] takes back that answer and no other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DecisionMark(u64);
 
 /// The times of the tool calls of one session, until they are over.
 #[derive(Default)]
@@ -111,25 +129,50 @@ impl ToolClock {
     }
 
     /// The user answered `request_id`, at `at`; call it BEFORE the answer is handed
-    /// to the engine. The first answer counts.
-    pub(crate) fn decided(&self, request_id: &str, allow: bool, at: DateTime<Utc>) {
+    /// to the engine. The first answer counts: the mark is returned only when this
+    /// answer is the one the clock keeps, for [`ToolClock::undecided`].
+    pub(crate) fn decided(
+        &self,
+        request_id: &str,
+        allow: bool,
+        at: DateTime<Utc>,
+    ) -> Option<DecisionMark> {
         let mut state = self.state();
         let Some(call_id) = state.requests.get(request_id).cloned() else {
-            return;
+            tracing::debug!(
+                request_id,
+                "tool clock: an answer to a request it does not know"
+            );
+            return None;
         };
-        if let Some(call) = state.calls.get_mut(&call_id) {
-            call.permission_resolved.get_or_insert((at, allow));
+        state.marks += 1;
+        let mark = DecisionMark(state.marks);
+        let call = state.calls.get_mut(&call_id)?;
+        if call.permission_resolved.is_some() {
+            return None;
         }
+        call.permission_resolved = Some((at, allow));
+        call.resolved_by = Some(mark);
+        Some(mark)
     }
 
-    /// The answer to `request_id` could not be handed over: it is pending again.
-    pub(crate) fn undecided(&self, request_id: &str) {
+    /// The answer `mark` placed on `request_id` could not be handed over: it is
+    /// pending again. Any other answer (an earlier one, one the engine took) stays.
+    pub(crate) fn undecided(&self, request_id: &str, mark: Option<DecisionMark>) {
+        let Some(mark) = mark else { return };
         let mut state = self.state();
         let Some(call_id) = state.requests.get(request_id).cloned() else {
+            tracing::debug!(
+                request_id,
+                "tool clock: a failed answer to a request it does not know"
+            );
             return;
         };
         if let Some(call) = state.calls.get_mut(&call_id) {
-            call.permission_resolved = None;
+            if call.resolved_by == Some(mark) {
+                call.permission_resolved = None;
+                call.resolved_by = None;
+            }
         }
     }
 
@@ -189,10 +232,14 @@ impl ToolClock {
                 id,
                 parent_tool_use_id,
             } => end(&mut state, id, parent_tool_use_id, true, at),
-            // The turn is over: a call without a result will not get one.
+            // The turn is over: a call without a result will not get one, except
+            // the calls of a sub-agent, which may outlive the turn (background Task).
             ChatEvent::Result { .. } => {
-                state.calls.clear();
-                state.requests.clear();
+                let State {
+                    calls, requests, ..
+                } = &mut *state;
+                calls.retain(|_, call| call.parent.is_some());
+                requests.retain(|_, call_id| calls.contains_key(call_id));
                 None
             }
             _ => None,
@@ -212,6 +259,8 @@ fn end(
     state.requests.retain(|_, call_id| call_id != id);
     let asked = call.permission_requested_at.is_some();
     let run_started_at = match (asked, call.question, call.permission_resolved) {
+        // A wait the clock may have missed: no time it can vouch for.
+        _ if call.incomplete => None,
         (_, true, _) => None,
         (true, false, Some((resolved, true))) => Some(resolved),
         (true, false, _) => None,
@@ -432,9 +481,13 @@ mod tests {
     fn a_request_naming_no_call_marks_the_open_calls_incomplete() {
         let clock = ToolClock::default();
         clock.observe(&tool_use("a"), at(1_000));
+        clock.taken_up("a", at(1_050));
         clock.observe(&asks("r", None), at(1_100));
         let a = fields(clock.observe(&result("a"), at(2_000)).unwrap());
         assert_eq!(a["incomplete"], true);
+        assert_eq!(a["started_at"], 1.05);
+        // The take-up may hold the user's wait: absent rather than estimated.
+        assert!(a.get("run_started_at").is_none(), "{a}");
     }
 
     #[test]
@@ -456,11 +509,76 @@ mod tests {
         let clock = ToolClock::default();
         clock.observe(&tool_use("t1"), at(1_000));
         clock.observe(&asks("req-1", Some("t1")), at(1_100));
-        clock.decided("req-1", true, at(2_000));
-        clock.undecided("req-1");
+        let mark = clock.decided("req-1", true, at(2_000));
+        assert!(mark.is_some());
+        clock.undecided("req-1", mark);
         clock.decided("req-1", true, at(3_000));
         let t = fields(clock.observe(&result("t1"), at(3_500)).unwrap());
         assert_eq!(t["permission_resolved_at"], 3.0);
+    }
+
+    #[test]
+    fn a_second_answer_the_engine_refuses_does_not_erase_the_first() {
+        let clock = ToolClock::default();
+        clock.observe(&tool_use("t1"), at(1_000));
+        clock.taken_up("t1", at(1_050));
+        clock.observe(&asks("req-1", Some("t1")), at(1_100));
+        let first = clock.decided("req-1", true, at(2_000));
+        // A double click / a second tab: the engine refuses the second answer.
+        let second = clock.decided("req-1", false, at(2_300));
+        assert!(second.is_none(), "the first answer counts");
+        clock.undecided("req-1", second);
+        let t = fields(clock.observe(&result("t1"), at(2_500)).unwrap());
+        assert!(first.is_some());
+        assert_eq!(t["permission_resolved_at"], 2.0, "{t}");
+        assert_eq!(t["permission_outcome"], "allowed", "{t}");
+        assert_eq!(t["run_started_at"], 2.0, "{t}");
+    }
+
+    #[test]
+    fn an_answer_to_an_unknown_request_marks_nothing() {
+        let clock = ToolClock::default();
+        assert!(clock.decided("nope", true, at(1)).is_none());
+        clock.undecided("nope", None);
+    }
+
+    #[test]
+    fn a_sub_agent_call_outlives_the_turn_that_launched_it() {
+        let clock = ToolClock::default();
+        clock.observe(
+            &ChatEvent::ToolUse {
+                id: "sub".into(),
+                tool: "Bash".into(),
+                input: json!({}),
+                parent_tool_use_id: Some("task".into()),
+                category: None,
+                canonical: None,
+            },
+            at(1_000),
+        );
+        clock.taken_up("sub", at(1_010));
+        clock.observe(&asks("req-s", Some("sub")), at(1_020));
+        clock.observe(&tool_use("top"), at(1_100));
+        clock.observe(
+            &serde_json::from_value::<ChatEvent>(json!({
+                "type": "result", "session_id": "s", "duration_ms": 0,
+                "subtype": "success", "is_error": false
+            }))
+            .unwrap(),
+            at(2_000),
+        );
+        assert!(
+            clock.observe(&result("top"), at(2_100)).is_none(),
+            "cleared"
+        );
+        assert!(
+            clock.decided("req-s", true, at(3_000)).is_some(),
+            "its request kept"
+        );
+        let t = fields(clock.observe(&result("sub"), at(4_000)).unwrap());
+        assert_eq!(t["parent_tool_use_id"], "task", "{t}");
+        assert_eq!(t["called_at"], 1.0, "{t}");
+        assert_eq!(t["run_started_at"], 3.0, "{t}");
     }
 
     #[test]

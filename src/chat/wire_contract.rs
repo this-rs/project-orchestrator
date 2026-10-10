@@ -297,6 +297,11 @@ fn server_examples() -> Vec<ServerExample> {
                 parent_tool_use_id: None,
             },
         ),
+        // `full` sets every optional field: the fields of the contract are derived
+        // from it, and the two booleans are absent when false. Hence `cancelled`
+        // (coherent here: an allowed call interrupted while it ran) and `incomplete`
+        // together with `run_started_at`, which the clock never sends together (an
+        // incomplete timing has no run start). Field coverage, not a real frame.
         ServerExample::new(
             ChatEvent::ToolTiming {
                 id: s(TOOL_USE_ID),

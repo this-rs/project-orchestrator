@@ -607,8 +607,9 @@ pub enum ChatEvent {
         permission_outcome: Option<String>,
         /// The tool itself started running, only as the engine saw it: the answer to
         /// an allowed permission, else the take-up. Absent when the tool never ran
-        /// (denied, never answered, a question answered by its result) or when the
-        /// engine runs no host hook: never estimated.
+        /// (denied, never answered, a question answered by its result), when the
+        /// engine runs no host hook, or when the timing is `incomplete`: never
+        /// estimated.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_started_at: Option<f64>,
         /// The engine had the result, or the call was cancelled.
