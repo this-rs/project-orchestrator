@@ -32,7 +32,7 @@ use crate::test_helpers::mock_app_state;
 use crate::vault::grants::{GrantScope, SecretSelector};
 use crate::vault::VaultService;
 
-fn fakes_dir() -> PathBuf {
+pub(super) fn fakes_dir() -> PathBuf {
     std::env::var_os("NEXUS_FAKES_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -40,7 +40,7 @@ fn fakes_dir() -> PathBuf {
         })
 }
 
-fn fake_bin(name: &str) -> PathBuf {
+pub(super) fn fake_bin(name: &str) -> PathBuf {
     let path = fakes_dir().join(name);
     assert!(
         path.exists(),
@@ -51,14 +51,19 @@ fn fake_bin(name: &str) -> PathBuf {
 }
 
 /// A running `fake_openai`, killed on drop.
-struct FakeOpenAi {
+pub(super) struct FakeOpenAi {
     child: Child,
     port: u16,
     dir: tempfile::TempDir,
 }
 
 impl FakeOpenAi {
-    fn start(routes: Value) -> Self {
+    pub(super) fn start(routes: Value) -> Self {
+        Self::start_for(routes, 120_000)
+    }
+
+    /// [`Self::start`] with the watchdog of the fake set to `max_runtime_ms`.
+    pub(super) fn start_for(routes: Value, max_runtime_ms: u64) -> Self {
         let dir = tempfile::TempDir::new().unwrap();
         let script = dir.path().join("script.json");
         std::fs::write(&script, routes.to_string()).unwrap();
@@ -68,7 +73,7 @@ impl FakeOpenAi {
                 "FAKE_OPENAI_REQUESTS_OUT",
                 dir.path().join("requests.jsonl"),
             )
-            .env("FAKE_OPENAI_MAX_RUNTIME_MS", "120000")
+            .env("FAKE_OPENAI_MAX_RUNTIME_MS", max_runtime_ms.to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -85,15 +90,15 @@ impl FakeOpenAi {
         Self { child, port, dir }
     }
 
-    fn base_url(&self) -> String {
+    pub(super) fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}/v1", self.port)
     }
 
-    fn origin(&self) -> String {
+    pub(super) fn origin(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    fn requests(&self) -> Vec<Value> {
+    pub(super) fn requests(&self) -> Vec<Value> {
         std::fs::read_to_string(self.dir.path().join("requests.jsonl"))
             .unwrap_or_default()
             .lines()
@@ -101,7 +106,7 @@ impl FakeOpenAi {
             .collect()
     }
 
-    fn chat_requests(&self) -> Vec<Value> {
+    pub(super) fn chat_requests(&self) -> Vec<Value> {
         self.requests()
             .into_iter()
             .filter(|r| r["path"] == "/v1/chat/completions")
@@ -116,11 +121,11 @@ impl Drop for FakeOpenAi {
     }
 }
 
-fn delta(d: Value) -> Value {
+pub(super) fn delta(d: Value) -> Value {
     json!({"choices": [{"index": 0, "delta": d}]})
 }
 
-fn sse_route(body_contains: &str, events: Vec<Value>) -> Value {
+pub(super) fn sse_route(body_contains: &str, events: Vec<Value>) -> Value {
     json!({"method": "POST", "path": "/v1/chat/completions", "status": 200,
            "body_contains": body_contains, "sse": events})
 }
@@ -146,7 +151,7 @@ fn script() -> Value {
     ])
 }
 
-fn instance(fake: &FakeOpenAi, credential_ref: &str) -> InstanceRecord {
+pub(super) fn instance(fake: &FakeOpenAi, credential_ref: &str) -> InstanceRecord {
     InstanceRecord {
         id: "local".into(),
         kind: "openai_compatible".into(),
@@ -161,7 +166,7 @@ fn instance(fake: &FakeOpenAi, credential_ref: &str) -> InstanceRecord {
     }
 }
 
-async fn store_instance(graph: &MockGraphStore, record: &InstanceRecord) {
+pub(super) async fn store_instance(graph: &MockGraphStore, record: &InstanceRecord) {
     graph
         .put_llm_setting(
             GLOBAL,
@@ -172,7 +177,7 @@ async fn store_instance(graph: &MockGraphStore, record: &InstanceRecord) {
         .unwrap();
 }
 
-async fn consent(graph: &MockGraphStore, slug: &str, id: &str, origin: &str) {
+pub(super) async fn consent(graph: &MockGraphStore, slug: &str, id: &str, origin: &str) {
     // The consent names the credential reference the instance has NOW.
     let credential_ref = graph
         .get_llm_setting(GLOBAL, &format!("{INSTANCE_PREFIX}{id}"))
@@ -214,7 +219,7 @@ fn manager(graph: Arc<MockGraphStore>, secure: bool) -> ChatManager {
     ChatManager::new_without_memory(dyn_graph, state.meili, config)
 }
 
-fn request(provider: Option<&str>, project: Option<&str>, mode: &str) -> ChatRequest {
+pub(super) fn request(provider: Option<&str>, project: Option<&str>, mode: &str) -> ChatRequest {
     ChatRequest {
         access: None,
         routing_pool: None,
