@@ -4105,15 +4105,26 @@ impl GraphStore for Neo4jClient {
         self.list_all_triggers_impl(trigger_type).await
     }
 
-    async fn update_trigger(
+    async fn disable_trigger(
         &self,
         trigger_id: Uuid,
-        enabled: Option<bool>,
-        config: Option<serde_json::Value>,
-        cooldown_secs: Option<u64>,
+        reason: Option<&str>,
     ) -> anyhow::Result<Option<crate::runner::Trigger>> {
-        self.update_trigger_impl(trigger_id, enabled, config, cooldown_secs)
-            .await
+        self.disable_trigger_impl(trigger_id, reason).await
+    }
+
+    async fn mark_third_party_write(
+        &self,
+        content: crate::runner::PlanContent,
+    ) -> anyhow::Result<Option<Uuid>> {
+        self.mark_third_party_write_impl(content).await
+    }
+
+    async fn plan_third_party_written_at(
+        &self,
+        plan_id: Uuid,
+    ) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
+        self.plan_third_party_written_at_impl(plan_id).await
     }
 
     async fn delete_trigger(&self, trigger_id: Uuid) -> anyhow::Result<()> {

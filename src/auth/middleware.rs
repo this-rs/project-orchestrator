@@ -121,10 +121,62 @@ pub async fn require_auth(
         }
     }
 
+    // 4e. A third-party session writing what a plan run executes (the plan,
+    //     its tasks, steps, constraints, decisions) marks the plan, BEFORE the
+    //     write: a trigger approved earlier then starts its run restricted
+    //     (`TriggerDispatcher::run_claims_now`). Before, so a deletion can
+    //     still be traced to its plan; a mark that cannot be written refuses
+    //     the write.
+    if crate::auth::jwt::agent_session_binding(&claims).is_some_and(|b| b.third_party) {
+        if let Some(content) = plan_content_written(req.method(), req.uri().path()) {
+            state
+                .orchestrator
+                .neo4j()
+                .mark_third_party_write(content)
+                .await
+                .map_err(AppError::Internal)?;
+        }
+    }
+
     // 5. Inject claims into request extensions
     req.extensions_mut().insert(claims);
 
     Ok(next.run(req).await)
+}
+
+/// The plan content a write on `method path` changes: the plan of
+/// `/api/plans/{id}/…` (except starting or listing its runs and its
+/// triggers), the task of `/api/tasks/{id}/…` (its steps, decisions and
+/// dependencies included), `/api/steps/{id}`, `/api/constraints/{id}`,
+/// `/api/decisions/{id}/…`. `None` for a read, another route, or a segment
+/// that is not an id. Creating a plan (`POST /api/plans`) names none: whoever
+/// later puts a trigger on it approves it as it is.
+pub fn plan_content_written(
+    method: &axum::http::Method,
+    path: &str,
+) -> Option<crate::runner::PlanContent> {
+    use crate::runner::PlanContent;
+    if matches!(
+        *method,
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    ) {
+        return None;
+    }
+    let mut segments = path.strip_prefix("/api/")?.split('/');
+    let kind = segments.next()?;
+    let id = segments.next()?.parse::<uuid::Uuid>().ok()?;
+    let rest = segments.next();
+    match kind {
+        "plans" => match rest {
+            Some("run" | "runs" | "triggers") => None,
+            _ => Some(PlanContent::Plan(id)),
+        },
+        "tasks" => Some(PlanContent::Task(id)),
+        "steps" => Some(PlanContent::Step(id)),
+        "constraints" => Some(PlanContent::Constraint(id)),
+        "decisions" => Some(PlanContent::Decision(id)),
+        _ => None,
+    }
 }
 
 /// Where a Bearer token is exchanged for a WebSocket ticket.

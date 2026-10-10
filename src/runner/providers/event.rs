@@ -233,8 +233,10 @@ const CHAIN_ORIGIN_WINDOW_SECS: i64 = 600;
 ///
 /// The run is the one the event names (a runner event), else its plan's
 /// latest run if it is still running or ended within
-/// [`CHAIN_ORIGIN_WINDOW_SECS`]. A graph error counts as no run: the chain is
-/// then bounded by the cooldown alone for that hop.
+/// [`CHAIN_ORIGIN_WINDOW_SECS`] — and, whatever the event's entity, any run
+/// of any plan in that window: the depth is the deepest of them. A graph
+/// error counts as no run: the chain is then bounded by the cooldown alone
+/// for that hop.
 async fn chain_depth_of_event(
     graph: &dyn GraphStore,
     event: &CrudEvent,
@@ -254,15 +256,40 @@ async fn chain_depth_of_event(
             .await
             .ok()
             .and_then(|runs| runs.into_iter().next())
-            .filter(|run| {
-                run.completed_at.is_none_or(|end| {
-                    (chrono::Utc::now() - end).num_seconds() <= CHAIN_ORIGIN_WINDOW_SECS
-                })
-            }),
+            .filter(is_recent),
         (None, None) => None,
     };
-    match run.map(|r| r.triggered_by) {
-        Some(crate::runner::TriggerSource::Event { chain_depth, .. }) => chain_depth,
+    let own = run.as_ref().map_or(0, depth_of_run);
+    // Whatever the entity (a note, a decision, a commit, a task of another
+    // plan...), an event observed while an event-triggered run is running,
+    // or just after it, may be that run's doing: the runner drives one run at
+    // a time, so the event inherits that run's depth. Over-counting only ends
+    // a chain sooner; under-counting let it loop.
+    let around = graph
+        .list_all_plan_runs(CHAIN_RECENT_RUNS, 0, None, None)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| is_recent(r))
+        .map(depth_of_run)
+        .max()
+        .unwrap_or(0);
+    own.max(around)
+}
+
+/// How many of the latest runs (all plans) an event is compared with.
+const CHAIN_RECENT_RUNS: i64 = 10;
+
+/// The run is still running, or ended within [`CHAIN_ORIGIN_WINDOW_SECS`].
+fn is_recent(run: &crate::runner::RunnerState) -> bool {
+    run.completed_at
+        .is_none_or(|end| (chrono::Utc::now() - end).num_seconds() <= CHAIN_ORIGIN_WINDOW_SECS)
+}
+
+/// The chain depth of `run`: its own when an event started it, else 0.
+fn depth_of_run(run: &crate::runner::RunnerState) -> u32 {
+    match run.triggered_by {
+        crate::runner::TriggerSource::Event { chain_depth, .. } => chain_depth,
         _ => 0,
     }
 }
@@ -571,5 +598,78 @@ mod tests {
             .start_error
             .as_deref()
             .is_some_and(|e| e.contains("event chain too deep")));
+    }
+
+    /// (D, round 2) An event of an entity that belongs to no plan (a note) is
+    /// observed while an event-triggered run at the chain limit is running:
+    /// it inherits that run's depth, and the next hop is refused. Without a
+    /// run around it, the same note starts a chain at depth 1.
+    #[tokio::test]
+    async fn a_note_created_by_an_event_triggered_run_extends_the_chain() {
+        use crate::runner::dispatch::MAX_EVENT_CHAIN_DEPTH;
+        use crate::runner::{RunnerState, TriggerSource};
+        let mock = Arc::new(MockGraphStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plan_b = runnable_plan(&mock, dir.path()).await;
+        let (dispatcher, starter) = dispatcher_on(&mock);
+        let note_created = || CrudEvent {
+            entity_type: EntityType::Note,
+            action: CrudAction::Created,
+            entity_id: Uuid::new_v4().to_string(),
+            related: None,
+            payload: serde_json::json!({}),
+            timestamp: Utc::now().to_rfc3339(),
+            project_id: None,
+        };
+
+        // No run around: depth 1, B starts.
+        let first = event_trigger(plan_b, serde_json::json!({"event_type": "note_created"}));
+        mock.create_trigger(&first).await.unwrap();
+        handle_event(
+            &(mock.clone() as Arc<dyn GraphStore>),
+            &dispatcher,
+            &note_created(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            starter.calls.lock().await[0].1,
+            TriggerSource::Event { chain_depth: 1, .. }
+        ));
+        crate::runner::dispatch::tests::finish_all_runs(&mock).await;
+        mock.plan_runs.write().await.clear();
+
+        // A run of another plan, started by an event at the limit, is running.
+        let plan_a = crate::test_helpers::test_plan();
+        mock.create_plan(&plan_a).await.unwrap();
+        let run = RunnerState::new(
+            Uuid::new_v4(),
+            plan_a.id,
+            1,
+            TriggerSource::Event {
+                trigger_id: Uuid::new_v4(),
+                source_event: "plan_completed".into(),
+                chain_depth: MAX_EVENT_CHAIN_DEPTH,
+            },
+        );
+        mock.create_plan_run(&run).await.unwrap();
+        let second = event_trigger(plan_b, serde_json::json!({"event_type": "note_created"}));
+        mock.create_trigger(&second).await.unwrap();
+        handle_event(
+            &(mock.clone() as Arc<dyn GraphStore>),
+            &dispatcher,
+            &note_created(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(starter.calls.lock().await.len(), 1, "no second run");
+        let firings = mock.list_trigger_firings(second.id, 10).await.unwrap();
+        assert!(
+            firings[0]
+                .start_error
+                .as_deref()
+                .is_some_and(|e| e.contains("event chain too deep")),
+            "{firings:?}"
+        );
     }
 }

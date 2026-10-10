@@ -1001,6 +1001,7 @@ async fn test_trigger_type_filter_is_bound_not_spliced() {
         fire_count: 0,
         created_at: chrono::Utc::now(),
         author: None,
+        disabled_reason: None,
     };
     let schedule = Trigger {
         id: Uuid::new_v4(),
@@ -1112,6 +1113,7 @@ async fn test_trigger_firing_binds_plan_run_id() {
         fire_count: 0,
         created_at: chrono::Utc::now(),
         author: None,
+        disabled_reason: None,
     };
     client.create_trigger_impl(&trigger).await.unwrap();
 
@@ -1255,6 +1257,7 @@ async fn trigger_on_new_plan(
         fire_count: 0,
         created_at: chrono::Utc::now(),
         author: None,
+        disabled_reason: None,
     };
     client.create_trigger_impl(&trigger).await.unwrap();
     trigger
@@ -1510,6 +1513,9 @@ async fn test_trigger_without_author_is_disabled_at_startup() {
     );
     assert!(enabled(webhook.id).await);
     assert!(enabled(authored.id).await);
+    // The reason is read back, for whoever lists the trigger.
+    let disabled = client.get_trigger_impl(legacy.id).await.unwrap().unwrap();
+    assert_eq!(disabled.disabled_reason.as_deref(), Some("no_author"));
 
     let reenabled = client
         .enable_trigger_as_impl(legacy.id, &author)
@@ -1518,10 +1524,111 @@ async fn test_trigger_without_author_is_disabled_at_startup() {
         .unwrap();
     assert!(reenabled.enabled);
     assert_eq!(reenabled.author.as_ref(), Some(&author));
+    assert_eq!(reenabled.disabled_reason, None);
+
+    // Disabled by the system with a reason, or by someone without one.
+    let revoked = client
+        .disable_trigger_impl(authored.id, Some("author_revoked"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!revoked.enabled);
+    assert_eq!(revoked.disabled_reason.as_deref(), Some("author_revoked"));
+    let by_someone = client
+        .disable_trigger_impl(webhook.id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(by_someone.disabled_reason, None);
 
     for t in [&legacy, &webhook, &authored] {
         drop_trigger_and_plan(&client, &raw, t).await;
     }
+}
+
+/// (Round 2, finding 1) A write by a third-party session on a plan, a task,
+/// a step, a constraint or a decision marks the plan they belong to, on the
+/// real relationships; content of no plan marks nothing.
+#[tokio::test]
+async fn test_trigger_third_party_write_marks_the_plan() {
+    use project_orchestrator::runner::PlanContent;
+    let Some((client, raw)) = trigger_test_graph().await else {
+        return;
+    };
+    let (plan, task, step, constraint, decision, orphan) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    raw.run(
+        neo4rs::query(
+            "CREATE (p:Plan {id: $plan, title: 'mark-test'})
+             CREATE (p)-[:HAS_TASK]->(t:Task {id: $task})
+             CREATE (t)-[:HAS_STEP]->(:Step {id: $step})
+             CREATE (t)-[:INFORMED_BY]->(:Decision {id: $decision})
+             CREATE (p)-[:CONSTRAINED_BY]->(:Constraint {id: $constraint})
+             CREATE (:Task {id: $orphan})",
+        )
+        .param("plan", plan.to_string())
+        .param("task", task.to_string())
+        .param("step", step.to_string())
+        .param("decision", decision.to_string())
+        .param("constraint", constraint.to_string())
+        .param("orphan", orphan.to_string()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        client.plan_third_party_written_at_impl(plan).await.unwrap(),
+        None
+    );
+    let mut last = None;
+    for content in [
+        PlanContent::Plan(plan),
+        PlanContent::Task(task),
+        PlanContent::Step(step),
+        PlanContent::Constraint(constraint),
+        PlanContent::Decision(decision),
+    ] {
+        assert_eq!(
+            client.mark_third_party_write_impl(content).await.unwrap(),
+            Some(plan),
+            "{content:?}"
+        );
+        let at = client
+            .plan_third_party_written_at_impl(plan)
+            .await
+            .unwrap()
+            .expect("marked");
+        assert!(last.is_none_or(|l| at >= l), "{content:?}");
+        last = Some(at);
+    }
+    assert_eq!(
+        client
+            .mark_third_party_write_impl(PlanContent::Task(orphan))
+            .await
+            .unwrap(),
+        None
+    );
+
+    raw.run(
+        neo4rs::query(
+            "MATCH (n) WHERE n.id IN [$plan, $task, $step, $decision, $constraint, $orphan]
+             DETACH DELETE n",
+        )
+        .param("plan", plan.to_string())
+        .param("task", task.to_string())
+        .param("step", step.to_string())
+        .param("decision", decision.to_string())
+        .param("constraint", constraint.to_string())
+        .param("orphan", orphan.to_string()),
+    )
+    .await
+    .unwrap();
 }
 
 /// Create a bare Project node and return its id.

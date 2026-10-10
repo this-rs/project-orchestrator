@@ -689,6 +689,12 @@ pub struct Trigger {
     /// `runner::dispatch::TriggerDispatcher::dispatch`).
     #[serde(default)]
     pub author: Option<TriggerAuthor>,
+    /// Why the system disabled the trigger (`no_author`: written before
+    /// authors were recorded; `author_revoked`: its author is no longer a
+    /// user). `None` when enabled, or disabled by someone. Cleared when the
+    /// trigger is enabled again.
+    #[serde(default)]
+    pub disabled_reason: Option<String>,
 }
 
 /// The caller that created or enabled a [`Trigger`], recorded so a run the
@@ -761,6 +767,17 @@ impl TriggerAuthor {
             jti: None,
         }
     }
+}
+
+/// Something a plan run executes or reads as its instructions: the plan, or
+/// one of its tasks, steps, constraints or decisions (by id).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanContent {
+    Plan(Uuid),
+    Task(Uuid),
+    Step(Uuid),
+    Constraint(Uuid),
+    Decision(Uuid),
 }
 
 /// What the reservation of a trigger signal decided (see

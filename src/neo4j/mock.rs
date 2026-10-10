@@ -150,6 +150,8 @@ pub struct MockGraphStore {
     pub trigger_firings: RwLock<HashMap<Uuid, Vec<crate::runner::TriggerFiring>>>,
     /// Reserved signal keys per trigger, with when (`reserve_trigger_signal`).
     pub trigger_reservations: RwLock<HashMap<(Uuid, String), chrono::DateTime<chrono::Utc>>>,
+    /// `third_party_written_at` per plan (`mark_third_party_write`).
+    pub plan_third_party_writes: RwLock<HashMap<Uuid, chrono::DateTime<chrono::Utc>>>,
 
     // Relationships (adjacency lists)
     pub plan_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
@@ -364,6 +366,7 @@ impl MockGraphStore {
             triggers: RwLock::new(HashMap::new()),
             trigger_firings: RwLock::new(HashMap::new()),
             trigger_reservations: RwLock::new(HashMap::new()),
+            plan_third_party_writes: RwLock::new(HashMap::new()),
             plan_tasks: RwLock::new(HashMap::new()),
             task_steps: RwLock::new(HashMap::new()),
             task_decisions: RwLock::new(HashMap::new()),
@@ -12061,28 +12064,75 @@ impl GraphStore for MockGraphStore {
             .collect())
     }
 
-    async fn update_trigger(
+    async fn disable_trigger(
         &self,
         trigger_id: Uuid,
-        enabled: Option<bool>,
-        config: Option<serde_json::Value>,
-        cooldown_secs: Option<u64>,
+        reason: Option<&str>,
     ) -> anyhow::Result<Option<crate::runner::Trigger>> {
         let mut triggers = self.triggers.write().await;
-        if let Some(t) = triggers.get_mut(&trigger_id) {
-            if let Some(e) = enabled {
-                t.enabled = e;
+        Ok(triggers.get_mut(&trigger_id).map(|t| {
+            t.enabled = false;
+            t.disabled_reason = reason.map(str::to_string);
+            t.clone()
+        }))
+    }
+
+    async fn mark_third_party_write(
+        &self,
+        content: crate::runner::PlanContent,
+    ) -> anyhow::Result<Option<Uuid>> {
+        use crate::runner::PlanContent;
+        let plan_of_task = |task_id: Uuid| async move {
+            self.plan_tasks
+                .read()
+                .await
+                .iter()
+                .find(|(_, tasks)| tasks.contains(&task_id))
+                .map(|(plan, _)| *plan)
+        };
+        let task_of = |map: &HashMap<Uuid, Vec<Uuid>>, id: Uuid| {
+            map.iter()
+                .find(|(_, children)| children.contains(&id))
+                .map(|(task, _)| *task)
+        };
+        let plan_id = match content {
+            PlanContent::Plan(id) => self.plans.read().await.contains_key(&id).then_some(id),
+            PlanContent::Task(id) => plan_of_task(id).await,
+            PlanContent::Step(id) => {
+                let task = task_of(&*self.task_steps.read().await, id);
+                match task {
+                    Some(task) => plan_of_task(task).await,
+                    None => None,
+                }
             }
-            if let Some(c) = config {
-                t.config = c;
+            PlanContent::Decision(id) => {
+                let task = task_of(&*self.task_decisions.read().await, id);
+                match task {
+                    Some(task) => plan_of_task(task).await,
+                    None => None,
+                }
             }
-            if let Some(cd) = cooldown_secs {
-                t.cooldown_secs = cd;
-            }
-            Ok(Some(t.clone()))
-        } else {
-            Ok(None)
+            PlanContent::Constraint(id) => task_of(&*self.plan_constraints.read().await, id),
+        };
+        if let Some(plan_id) = plan_id {
+            self.plan_third_party_writes
+                .write()
+                .await
+                .insert(plan_id, chrono::Utc::now());
         }
+        Ok(plan_id)
+    }
+
+    async fn plan_third_party_written_at(
+        &self,
+        plan_id: Uuid,
+    ) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
+        Ok(self
+            .plan_third_party_writes
+            .read()
+            .await
+            .get(&plan_id)
+            .copied())
     }
 
     async fn delete_trigger(&self, trigger_id: Uuid) -> anyhow::Result<()> {
@@ -12105,8 +12155,9 @@ impl GraphStore for MockGraphStore {
         // Update trigger fire_count and last_fired
         let mut triggers = self.triggers.write().await;
         if let Some(t) = triggers.get_mut(&firing.trigger_id) {
+            // `last_fired` belongs to the reservation (`reserve_trigger_signal`):
+            // a firing refused before it consumes no cooldown.
             t.fire_count += 1;
-            t.last_fired = t.last_fired.max(Some(firing.fired_at));
         }
         Ok(())
     }
@@ -12120,6 +12171,7 @@ impl GraphStore for MockGraphStore {
         Ok(triggers.get_mut(&trigger_id).map(|t| {
             t.enabled = true;
             t.author = Some(author.clone());
+            t.disabled_reason = None;
             t.clone()
         }))
     }

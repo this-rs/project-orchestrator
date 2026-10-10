@@ -55,8 +55,8 @@ pub use git::{WorktreeCollector, WorktreeInfo, WorktreeResolution};
 pub use guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict, HintSender};
 pub use lifecycle::{route_lifecycle_protocol, LifecycleRouteResult};
 pub use models::{
-    ActiveAgent, ActiveAgentSnapshot, CwdValidation, PlanRunStatus, RunSnapshot, RunnerConfig,
-    RunnerEvent, SignalReservation, TaskExecutionReport, TaskResult, TaskRunStatus,
+    ActiveAgent, ActiveAgentSnapshot, CwdValidation, PlanContent, PlanRunStatus, RunSnapshot,
+    RunnerConfig, RunnerEvent, SignalReservation, TaskExecutionReport, TaskResult, TaskRunStatus,
     TaskStateMachine, Trigger, TriggerAuthor, TriggerFiring, TriggerSource, TriggerType,
 };
 pub use persona::{

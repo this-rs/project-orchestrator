@@ -560,14 +560,27 @@ function gitRepoWithCommit(dir) {
   return git('rev-parse', 'HEAD');
 }
 
-test('verified_sha: present, absent, ou non verifiable hors depot', () => {
+// Un commit sur une branche laterale, puis retour sur la branche de depart : il existe, mais
+// HEAD n'en descend pas (une branche non fusionnee, ou ecrasee par un squash).
+function sideCommit(dir) {
+  const git = (...args) => execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...args], { encoding: 'utf8' }).trim();
+  const start = git('rev-parse', '--abbrev-ref', 'HEAD');
+  git('switch', '-q', '-c', 'side');
+  git('commit', '-q', '--allow-empty', '-m', 'side');
+  const side = git('rev-parse', 'HEAD');
+  git('switch', '-q', start);
+  return side;
+}
+
+test('verified_sha: ancetre de HEAD, hors historique, absent, ou non verifiable hors depot', () => {
   const root = mkdtempSync(join(tmpdir(), 'diagram-sha-'));
   try {
     const repo = join(root, 'repo');
     mkdirSync(repo);
     writeFileSync(join(repo, 'f'), 'x\n');
     const head = gitRepoWithCommit(repo);
-    assert.equal(commitStatus(repo, head.slice(0, 8)), 'present');
+    assert.equal(commitStatus(repo, head.slice(0, 8)), 'ancestor');
+    assert.equal(commitStatus(repo, sideCommit(repo).slice(0, 8)), 'not-ancestor');
     assert.equal(commitStatus(repo, 'deadbeef'), 'absent');
     const plain = join(root, 'plain');
     mkdirSync(plain);
@@ -588,6 +601,24 @@ test('gate: un verified_sha qui ne designe aucun commit du depot echoue', () => 
     writeIndex(be, EXT_OK.replace('6c79054e', head.slice(0, 8)));
     const present = run(be, nx);
     assert.doesNotMatch(present.out, /ne designe aucun commit/, present.out);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('gate: un verified_sha hors de l\'historique de HEAD echoue', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    writeIndex(be, EXT_OK);
+    const head = gitRepoWithCommit(be);
+    const side = sideCommit(be);
+    writeIndex(be, EXT_OK.replace('6c79054e', side.slice(0, 8)));
+    const off = run(be, nx);
+    assert.equal(off.code, 1, off.out);
+    assert.match(off.out, /po-x : 'verified_sha: [0-9a-f]{8}' est hors de l'historique de HEAD/);
+    writeIndex(be, EXT_OK.replace('6c79054e', head.slice(0, 8)));
+    const on = run(be, nx);
+    assert.doesNotMatch(on.out, /hors de l'historique|ne designe aucun commit/, on.out);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
