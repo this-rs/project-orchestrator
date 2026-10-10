@@ -58,6 +58,115 @@ const INTERRUPTED_TURN_RESULT_GRACE: std::time::Duration = std::time::Duration::
 /// otherwise loop the session and inflate the LLM bill — this caps the
 /// number of OOB-driven LLM turns to 50 over a rolling 5-min window
 /// (T7 of plan 9a1684b2).
+/// Longest wait for one instance's health while building the Auto pool. A
+/// health check can start a process (ACP) or wait on a slow endpoint (a local
+/// server loading a model); past this the instance counts as unavailable for
+/// this decision instead of holding the opening of the conversation.
+pub(crate) const ROUTING_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest wait for the health check that precedes opening a non-Claude-Code
+/// session (A30).
+pub(crate) const OPEN_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest wait for `provider.open`. Below the 60 s HTTP request timeout so the
+/// person reads why the conversation did not open, not a bare HTTP 408.
+pub(crate) const PROVIDER_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `provider.health()` bounded by `limit`; a timeout reads as unavailable,
+/// with a typed `Timeout` error.
+pub(crate) async fn bounded_health(
+    provider: &dyn nexus_claude::agent::AgentProvider,
+    limit: Duration,
+) -> nexus_claude::agent::ProviderHealth {
+    match tokio::time::timeout(limit, provider.health()).await {
+        Ok(health) => health,
+        Err(_) => nexus_claude::agent::ProviderHealth {
+            status: nexus_claude::agent::HealthStatus::Unavailable,
+            version: None,
+            detail: Some(format!("no health answer within {} s", limit.as_secs())),
+            error: Some(nexus_claude::agent::ProviderError::Timeout {
+                after_ms: limit.as_millis() as u64,
+            }),
+            login_hint: None,
+            checked_at_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+        },
+    }
+}
+
+/// The local instances Auto may route to whose key lives in the vault: every
+/// one, or only those among the ticked models when the menu restricts the pool.
+/// Remote instances never enter the Auto pool.
+pub(crate) fn vault_backed_candidates(
+    instances: &[super::provider::settings::InstanceRecord],
+    ticked: Option<&[super::types::RoutingPoolEntry]>,
+) -> Vec<String> {
+    instances
+        .iter()
+        .filter(|i| !super::provider::resolver::is_remote_instance(&i.id))
+        .filter(|i| i.credential_ref.trim_start().starts_with("vault:"))
+        .filter(|i| ticked.is_none_or(|pool| pool.iter().any(|e| e.provider == i.id)))
+        .map(|i| i.id.clone())
+        .collect()
+}
+
+/// Whether opening in Auto must be refused because the vault is locked: the
+/// router chooses (`full`, nothing named) and some candidate's key is in the
+/// locked vault. Routing around it would be a silent fallback (A30).
+pub(crate) fn auto_refused_by_locked_vault(
+    mode: super::provider::cognitive::ProviderRoutingMode,
+    named: bool,
+    vault_locked: bool,
+    vault_backed: &[String],
+) -> bool {
+    mode == super::provider::cognitive::ProviderRoutingMode::Full
+        && !named
+        && vault_locked
+        && !vault_backed.is_empty()
+}
+
+/// Most models offered instead of unlocking the vault.
+pub(crate) const MAX_LOCKED_VAULT_FALLBACKS: usize = 3;
+
+/// The models Auto could still open on without the vault, best first: its own
+/// pick, then the eligible alternatives by score. None of them is keyed in the
+/// vault (those came back unhealthy, but the filter says it outright). Empty
+/// when every usable model needs the vault: unlocking is then the only way.
+pub(crate) fn locked_vault_fallbacks(
+    decision: &super::provider::cognitive::decision::CognitiveDecision,
+    vault_backed: &[String],
+) -> Vec<super::provider::errors::FallbackModel> {
+    let mut eligible: Vec<_> = decision
+        .alternatives
+        .iter()
+        .filter(|a| a.rejected.is_none())
+        .collect();
+    eligible.sort_by(|a, b| {
+        b.score
+            .unwrap_or(f64::MIN)
+            .total_cmp(&a.score.unwrap_or(f64::MIN))
+    });
+    let mut out: Vec<super::provider::errors::FallbackModel> = Vec::new();
+    for pick in decision
+        .chosen
+        .iter()
+        .chain(eligible.into_iter().map(|a| &a.pick))
+    {
+        if vault_backed.contains(&pick.provider_id)
+            || out
+                .iter()
+                .any(|f| f.provider_id == pick.provider_id && f.model == pick.model)
+        {
+            continue;
+        }
+        out.push(super::provider::errors::FallbackModel {
+            provider_id: pick.provider_id.clone(),
+            model: pick.model.clone(),
+        });
+        if out.len() == MAX_LOCKED_VAULT_FALLBACKS {
+            break;
+        }
+    }
+    out
+}
+
 pub(crate) const OOB_TRIGGER_CAP_INTERACTIVE: u32 = 50;
 /// Same cap for runner sessions, more conservative since they run
 /// autonomously without a human watching.
@@ -11446,6 +11555,15 @@ impl ChatManager {
             .await
     }
 
+    /// A provider, model, alias or run the caller named: never substituted.
+    fn names_a_choice(request: &ChatRequest) -> bool {
+        request.provider.is_some()
+            || request.model.as_deref().is_some_and(|m| !m.is_empty())
+            || request.task_alias.is_some()
+            || request.persona_alias.is_some()
+            || request.run_provider.is_some()
+    }
+
     /// The models ticked for the conversation being opened, `None` when nothing restricts it.
     fn routing_pool_of(request: &ChatRequest) -> Option<&[super::types::RoutingPoolEntry]> {
         request.routing_pool.as_deref().filter(|p| !p.is_empty())
@@ -11476,6 +11594,7 @@ impl ChatManager {
             resolver::Role::Pilot
         };
         let routing_instances = self.cognitive_routing.as_ref().map(|_| instances.clone());
+        let vault_backed = vault_backed_candidates(&instances, Self::routing_pool_of(request));
         let store_catalog =
             catalog::StoreCatalog::new(instances, &consents, project_slug.is_some());
         let policy: settings::ModelPolicy = self
@@ -11527,6 +11646,33 @@ impl ChatManager {
             }
             _ => None,
         };
+        // Auto with the vault locked: the instances whose key is in the vault came
+        // back unavailable, so the router would pick among what is left — a silent
+        // fallback, and in practice a slow local agent whose opening ran past the
+        // HTTP timeout (408). Refuse as for a named instance: the person unlocks
+        // the vault, then opens again.
+        if let Some(decision) = &cognitive {
+            let vault_locked = self
+                .vault
+                .as_ref()
+                .is_some_and(|v| !v.is_unlocked(chrono::Utc::now()));
+            if auto_refused_by_locked_vault(
+                decision.mode,
+                Self::names_a_choice(request),
+                vault_locked,
+                &vault_backed,
+            ) {
+                info!(
+                    instances = ?vault_backed,
+                    "Auto routing refused: the vault is locked and holds candidates' keys"
+                );
+                return Err(anyhow::Error::new(
+                    super::provider::errors::AutoVaultLocked {
+                        fallbacks: locked_vault_fallbacks(decision, &vault_backed),
+                    },
+                ));
+            }
+        }
         let auto_pick = cognitive
             .as_ref()
             .filter(|d| d.applied)
@@ -11789,7 +11935,7 @@ impl ChatManager {
                 .filter(|i| !resolver::is_remote_instance(&i.id))
                 .map(|i| i.id.clone()),
         );
-        let mut pool = Vec::new();
+        let mut providers = Vec::new();
         for id in ids {
             // The legacy engine can only drive Claude Code.
             if !self.engine_is_agent(&id) && id != resolver::CLAUDE_CODE {
@@ -11798,15 +11944,35 @@ impl ChatManager {
             let Ok(provider) = self.provider_for(&id).await else {
                 continue;
             };
+            providers.push((id, provider));
+        }
+        // Health of every instance the cache does not know, all at once and each
+        // bounded: one slow endpoint or agent process must not hold the opening
+        // of the conversation (an unbounded, sequential check here returned HTTP
+        // 408 on an Auto opening). Stored with the time it ENDED, so a slow
+        // answer is not already stale when cached.
+        let unknown: Vec<_> = providers
+            .iter()
+            .filter(|(id, _)| routing.health.get(id, Instant::now()).is_none())
+            .map(|(id, provider)| async move {
+                let ok = bounded_health(provider.as_ref(), ROUTING_HEALTH_TIMEOUT)
+                    .await
+                    .status
+                    != nexus_claude::agent::HealthStatus::Unavailable;
+                routing.health.put(id, ok, Instant::now());
+                (id.clone(), ok)
+            })
+            .collect();
+        let measured: HashMap<String, bool> = futures::future::join_all(unknown)
+            .await
+            .into_iter()
+            .collect();
+        let mut pool = Vec::new();
+        for (id, provider) in providers {
             let now = Instant::now();
-            let healthy = match routing.health.get(&id, now) {
-                Some(known) => known,
-                None => {
-                    let ok = provider.health().await.status
-                        != nexus_claude::agent::HealthStatus::Unavailable;
-                    routing.health.put(&id, ok, now);
-                    ok
-                }
+            let healthy = match measured.get(&id) {
+                Some(ok) => *ok,
+                None => routing.health.get(&id, now).unwrap_or(false),
             };
             let default_model = instances
                 .iter()
@@ -11947,12 +12113,7 @@ impl ChatManager {
         };
         routing.set_hints(PriorHints::from_aliases(aliases));
         let mut pool = self.routing_pool(routing, instances, store_catalog).await;
-        // A provider, model, alias or run the caller named is never substituted.
-        let named = request.provider.is_some()
-            || request.model.as_deref().is_some_and(|m| !m.is_empty())
-            || request.task_alias.is_some()
-            || request.persona_alias.is_some()
-            || request.run_provider.is_some();
+        let named = Self::names_a_choice(request);
         // The conversation's own mode replaces the settings' (the chat menu: Auto = full).
         let mut settings = settings;
         if let Some(mode) = request.routing_mode {
@@ -12543,7 +12704,7 @@ impl ChatManager {
         // Preflight at EVERY opening (A30), not only when the instance was saved:
         // is the provider reachable and logged in now?
         if provider_id != super::provider::resolver::CLAUDE_CODE {
-            let health = provider.health().await;
+            let health = bounded_health(provider.as_ref(), OPEN_PREFLIGHT_TIMEOUT).await;
             if health.status == nexus_claude::agent::HealthStatus::Unavailable {
                 return Err(anyhow::Error::new(health.error.unwrap_or(
                     nexus_claude::agent::ProviderError::EndpointUnreachable {
@@ -12558,10 +12719,23 @@ impl ChatManager {
             &spec,
             self.config.nexus_tools_path.as_deref(),
         );
-        let (session, dropped) =
-            open_dropping_refused_mcp(provider.kind(), spec, |spec| provider.open(spec))
-                .await
-                .map_err(anyhow::Error::new)?;
+        // Bounded below the HTTP request timeout: a provider that does not open in
+        // time is a typed `timeout` the person can read, not a bare 408.
+        let (session, dropped) = match tokio::time::timeout(
+            PROVIDER_OPEN_TIMEOUT,
+            open_dropping_refused_mcp(provider.kind(), spec, |spec| provider.open(spec)),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(anyhow::Error::new)?,
+            Err(_) => {
+                return Err(anyhow::Error::new(
+                    nexus_claude::agent::ProviderError::Timeout {
+                        after_ms: PROVIDER_OPEN_TIMEOUT.as_millis() as u64,
+                    },
+                ));
+            }
+        };
         let without_mcp = opened_without_mcp(per_session_mcp, dropped, session.capabilities());
         if without_mcp {
             // The token minted for the refused spec's PO server: nothing holds it.
@@ -24351,6 +24525,175 @@ mod refs_turn_services_tests {
             "{out}"
         );
         assert!(!out.contains("<po-refs>"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod auto_open_bounds_tests {
+    use super::*;
+    use crate::chat::provider::cognitive::ProviderRoutingMode;
+    use crate::chat::provider::resolver::REMOTE_PREFIX;
+    use crate::chat::provider::settings::InstanceRecord;
+    use crate::chat::types::RoutingPoolEntry;
+
+    fn instance(id: &str, credential_ref: &str) -> InstanceRecord {
+        InstanceRecord {
+            id: id.to_string(),
+            credential_ref: credential_ref.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn only_local_instances_keyed_in_the_vault_are_vault_backed() {
+        let remote = format!("{REMOTE_PREFIX}box");
+        let instances = vec![
+            instance("openai", "vault:openai-key"),
+            instance("ollama", "none"),
+            instance("groq", "env:GROQ_API_KEY"),
+            instance(&remote, "vault:ssh-key"),
+        ];
+        assert_eq!(vault_backed_candidates(&instances, None), ids(&["openai"]));
+    }
+
+    #[test]
+    fn ticked_models_restrict_the_vault_backed_candidates() {
+        let instances = vec![
+            instance("openai", "vault:openai-key"),
+            instance("mistral", "vault:mistral-key"),
+        ];
+        let ticked = vec![
+            RoutingPoolEntry {
+                provider: "mistral".into(),
+                model: "large".into(),
+            },
+            RoutingPoolEntry {
+                provider: "claude-code".into(),
+                model: "opus".into(),
+            },
+        ];
+        assert_eq!(
+            vault_backed_candidates(&instances, Some(&ticked)),
+            ids(&["mistral"])
+        );
+        let none_keyed = vec![RoutingPoolEntry {
+            provider: "claude-code".into(),
+            model: "opus".into(),
+        }];
+        assert!(vault_backed_candidates(&instances, Some(&none_keyed)).is_empty());
+    }
+
+    #[test]
+    fn auto_is_refused_only_when_it_would_route_around_a_locked_vault() {
+        let keyed = ids(&["openai"]);
+        let full = ProviderRoutingMode::Full;
+        assert!(auto_refused_by_locked_vault(full, false, true, &keyed));
+        // Unlocked vault, named choice, no keyed candidate, or not Auto: open as before.
+        assert!(!auto_refused_by_locked_vault(full, false, false, &keyed));
+        assert!(!auto_refused_by_locked_vault(full, true, true, &keyed));
+        assert!(!auto_refused_by_locked_vault(full, false, true, &[]));
+        assert!(!auto_refused_by_locked_vault(
+            ProviderRoutingMode::Primary,
+            false,
+            true,
+            &keyed
+        ));
+        assert!(!auto_refused_by_locked_vault(
+            ProviderRoutingMode::Mixed,
+            false,
+            true,
+            &keyed
+        ));
+    }
+
+    fn decision_with(
+        chosen: Option<(&str, &str)>,
+        alternatives: &[(&str, &str, Option<f64>, bool)],
+    ) -> crate::chat::provider::cognitive::decision::CognitiveDecision {
+        use crate::chat::provider::cognitive::candidates::RejectReason;
+        use crate::chat::provider::cognitive::decision::{
+            CognitiveDecision, DecisionAlternative, Pick,
+        };
+        use crate::chat::provider::cognitive::mode::LearningStage;
+        use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
+        CognitiveDecision {
+            id: Uuid::new_v4(),
+            at: chrono::Utc::now(),
+            signature: TaskSignature::utility(TaskClass::UtilityCompaction, 9_000, None),
+            chosen: chosen.map(|(p, m)| Pick::new(p, m)),
+            score: None,
+            explored: false,
+            reason: "test".into(),
+            alternatives: alternatives
+                .iter()
+                .map(|(p, m, score, rejected)| DecisionAlternative {
+                    pick: Pick::new(*p, *m),
+                    score: *score,
+                    rejected: rejected.then_some(RejectReason::Unhealthy),
+                })
+                .collect(),
+            applied: true,
+            mode: ProviderRoutingMode::Full,
+            stage: LearningStage::Auto,
+            session_id: None,
+            task_id: None,
+            run_id: None,
+            turn_index: None,
+            outcome: None,
+            used: None,
+        }
+    }
+
+    fn picks(f: &[crate::chat::provider::errors::FallbackModel]) -> Vec<(String, String)> {
+        f.iter()
+            .map(|f| (f.provider_id.clone(), f.model.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn fallbacks_are_the_pick_then_eligible_alternatives_without_the_vault() {
+        let d = decision_with(
+            Some(("codex", "gpt-5")),
+            &[
+                ("codex", "gpt-5", Some(0.9), false),
+                ("ollama", "qwen3", Some(0.4), false),
+                ("openclaw", "default", Some(0.7), false),
+                ("openai", "gpt-5", Some(0.95), false),
+                ("claude-code", "opus", None, true),
+                ("lmstudio", "llama", Some(0.1), false),
+            ],
+        );
+        let out = locked_vault_fallbacks(&d, &ids(&["openai"]));
+        assert_eq!(
+            picks(&out),
+            vec![
+                ("codex".into(), "gpt-5".into()),
+                ("openclaw".into(), "default".into()),
+                ("ollama".into(), "qwen3".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_model_in_the_vault_leaves_only_unlocking() {
+        let d = decision_with(
+            None,
+            &[
+                ("openai", "gpt-5", None, true),
+                ("claude-code", "opus", None, true),
+            ],
+        );
+        assert!(locked_vault_fallbacks(&d, &ids(&["openai"])).is_empty());
+    }
+
+    #[test]
+    fn the_open_budget_stays_under_the_http_request_timeout() {
+        let budget = ROUTING_HEALTH_TIMEOUT + OPEN_PREFLIGHT_TIMEOUT + PROVIDER_OPEN_TIMEOUT;
+        assert!(budget < Duration::from_secs(60), "{budget:?}");
     }
 }
 

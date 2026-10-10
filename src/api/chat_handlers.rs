@@ -1241,6 +1241,7 @@ pub async fn set_session_routing(
                     action: None,
                     retryable: false,
                     retry_after_ms: None,
+                    fallbacks: None,
                 }))
             }
             None => AppError::Internal(error),
@@ -4829,6 +4830,7 @@ fn switch_error(error: anyhow::Error, session_id: &str) -> AppError {
                     action: None,
                     retryable: false,
                     retry_after_ms: None,
+                    fallbacks: None,
                 }))
             }
             None => AppError::BadRequest(refusal.to_string()),
