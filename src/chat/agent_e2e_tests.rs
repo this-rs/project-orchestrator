@@ -7639,7 +7639,9 @@ mod post_turn {
     /// What the session keeps in the store for its next turn.
     async fn stored(r: &super::parity::Rig) -> super::super::manager::HeldContext {
         let graph: Arc<dyn GraphStore> = r.graph.clone();
-        super::super::manager::HeldContext::load(&graph, &r.sid).await
+        super::super::manager::HeldContext::load(&graph, &r.sid)
+            .await
+            .unwrap()
     }
 
     /// Through the real `ManagerTurnServices`: a compaction, then the next turn hit

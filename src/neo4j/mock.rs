@@ -146,6 +146,8 @@ pub struct MockGraphStore {
     chat_events_released: tokio::sync::Notify,
     /// Failure injection: writes (put / delete) of these setting keys error.
     pub fail_llm_setting_writes_of: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Failure injection: reads of these setting keys error.
+    pub fail_llm_setting_reads_of: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Stall injection: deletes of these setting keys do not return until
     /// [`Self::release_llm_setting_deletes`] — a slow store.
     pub stall_llm_setting_deletes_of: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -366,6 +368,7 @@ impl MockGraphStore {
             stall_chat_events_of: std::sync::Mutex::new(std::collections::HashSet::new()),
             chat_events_released: tokio::sync::Notify::new(),
             fail_llm_setting_writes_of: std::sync::Mutex::new(std::collections::HashSet::new()),
+            fail_llm_setting_reads_of: std::sync::Mutex::new(std::collections::HashSet::new()),
             stall_llm_setting_deletes_of: std::sync::Mutex::new(std::collections::HashSet::new()),
             llm_setting_writes_released: tokio::sync::Notify::new(),
             triggers: RwLock::new(HashMap::new()),
@@ -675,6 +678,17 @@ impl MockGraphStore {
     /// Make every write (put / delete) of the setting `key` fail (`on`) or not.
     pub fn fail_llm_setting_writes(&self, key: &str, on: bool) {
         if let Ok(mut s) = self.fail_llm_setting_writes_of.lock() {
+            if on {
+                s.insert(key.to_string());
+            } else {
+                s.remove(key);
+            }
+        }
+    }
+
+    /// Make every read of the setting `key` fail (`on`) or not.
+    pub fn fail_llm_setting_reads(&self, key: &str, on: bool) {
+        if let Ok(mut s) = self.fail_llm_setting_reads_of.lock() {
             if on {
                 s.insert(key.to_string());
             } else {
@@ -7979,6 +7993,13 @@ impl GraphStore for MockGraphStore {
     }
 
     async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>> {
+        if self
+            .fail_llm_setting_reads_of
+            .lock()
+            .is_ok_and(|s| s.contains(key))
+        {
+            anyhow::bail!("mock: injected failure of the read of setting {key}");
+        }
         Ok(self
             .llm_settings
             .read()
