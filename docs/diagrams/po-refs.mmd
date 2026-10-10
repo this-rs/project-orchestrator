@@ -1,26 +1,26 @@
 %% name: po-refs
 %% covers: backend:src/refs/** backend:src/api/refs_handlers.rs
-%% verified: ccaf357d
+%% verified: 8ed0e4f6
 %% ---
-%% PROUVE : ce que le module src/refs/ fait aujourd'hui (PR 1 et PR 2 du plan « Chat : références #/@ ») :
-%%   valider une référence envoyée par un client, décider si l'appelant peut la lire, la replier dans
-%%   le texte du message, la résoudre par kind sur le GraphStore et la proposer via GET /api/refs/search.
-%%   Rien n'est branché au chat : le branchement est PR 3, derrière le drapeau refs_v1.
+%% PROUVE : ce que le module src/refs/ fait aujourd'hui (plan « Chat : références #/@ », R2) :
+%%   valider une référence envoyée par un client (sigil # data / @ actor porté par le jeton), décider si
+%%   la session peut la lire, la replier dans le texte du message, la résoudre par genre sur le GraphStore,
+%%   la proposer via GET /api/refs/search classée par pertinence, et l'expanser dans le tour envoyé à
+%%   l'agent (chat/manager.rs et chat/agent_runtime.rs appellent turn::expand_user_turn_in ;
+%%   la trame refs_resolved est émise). Drapeau refs_v1 actif par défaut (flag.rs).
 %% ---
 %% SOURCES LUES :
-%%   src/refs/{mod,types,registry,validate,access,block,wire,label,resolvers,search}.rs
-%%   src/api/refs_handlers.rs (route dans api/routes.rs)
+%%   src/refs/{mod,kinds,types,registry,validate,access,block,wire,label,link,rank,resolvers,
+%%             resolvers_ext,resolvers_ext_contract,search,search_contract,turn,flag}.rs
+%%   src/api/refs_handlers.rs (routes dans api/routes.rs), src/chat/refs_wiring_tests.rs
 %%   tests/refs_contract.rs, tests/fixtures/refs/*.json
 %% ---
-%% MISE A JOUR R2 : 16 genres derives de kinds::TABLE ; le sigil du jeton (# data, @ actor) est porte par le jeton ;
-%%   OpenInstanceRule borne une session a son projet/workspace (file et commit : sensibles) ;
-%%   les resolveurs des nouveaux genres suivent dans des commits separes.
 %% NON ETABLI :
-%%   aucun appelant WS : la trame refs_resolved n'existe que comme forme (wire.rs) figée par la fixture ;
-%%   aucune ACL de lecture par entité n'existe dans le dépôt : OpenInstanceRule admet tout
-%%   appelant authentifié, ScopeRule est la couture où une règle projet/workspace se branchera ;
-%%   la recherche texte des tâches et des décisions est un filtre mémoire borné (SCAN_CAP = 300) ;
-%%   le push-down du workspace au store n'est pas prouvé pour plans et tâches (le mock l'ignore).
+%%   la recherche texte des tâches et des décisions est un filtre mémoire borné (SCAN_CAP = 300) :
+%%   une tâche plus ancienne que les 300 plus récentes de sa portée n'est pas proposée par texte ;
+%%   la pertinence n'est prouvée que sur le mock : pas encore mesurée sur le serveur réel ;
+%%   le push-down du workspace au store n'est pas prouvé pour plans et tâches (le mock l'ignore) ;
+%%   un identifiant cité par l'agent dans sa réponse n'est pas vérifié côté serveur (R2-9).
 %% ---
 %% LEGENDE
 %%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans appelant  ⚪ autre domaine
@@ -36,18 +36,22 @@ flowchart TD
     TABLE["✅ kinds::TABLE<br/>UNE entrée par genre : nom, classe data (#) ou actor (@), format d id, source du libellé, accès, recherche, route, icône, backing, résolveur ;<br/>test: every_variant_has_one_entry_and_every_entry_a_variant"]
     CLIENT["⚪ client: refs[] = {kind, id} en chaînes"]
     VALIDATE["✅ validate::validate_refs<br/>plafond 20 avant dédoublonnage ;<br/>kind inconnu / réservé / id nul ;<br/>test: the_limit_is_inclusive_and_counts_before_dedup"]
-    REGISTRY["✅ registry::lookup<br/>16 kinds actifs (5 historiques + conversation, project, milestone, release, workspace, commit, protocol, persona, skill, file, link), plus aucun réservé ;<br/>test: events_entity_type_is_fully_classified"]
+    REGISTRY["✅ registry::lookup<br/>16 kinds actifs (5 historiques + conversation, project, milestone, release, workspace, commit, protocol, persona, skill, file, link), plus aucun réservé ;<br/>test: events_entity_type_is_fully_classified, a_reserved_name_is_told_apart_from_an_unknown_one"]
+    SIGIL["✅ validate : le sigil suit la classe<br/># pour data, @ pour actor (persona, skill) ; mauvais sigil = bad_token ;<br/>test: the_sigil_follows_the_class_of_the_kind_in_both_directions"]
+    LINK["✅ link::normalize<br/>http/https seulement, pas d identifiants, pas d IP privée ni loopback, aucun accès réseau, ≤ 1024 octets, libellé = hôte ;<br/>test: private_loopback_and_link_local_addresses_are_refused"]
     KINDS["✅ wire::KindsResponse + refs_handlers::ref_kinds<br/>GET /api/refs/kinds : les kinds que CE serveur résout ; un serveur ancien répond 404 et le client se replie sur les 5 historiques ;<br/>test: kinds_response_fixture_is_what_the_server_builds"]
     IDS["✅ types::canonical_id<br/>id par kind : UUID, projet:hash, projet:chemin relatif, URL normalisée ;<br/>test: kind_ids_fixture"]
     ERR["✅ wire::RefsErrorBody<br/>400 {error, code: refs_invalid, reason, index?} ;<br/>test: error_fixture"]
     ENTITYREF["✅ types::EntityRef {kind, id}<br/>sans label, champs inconnus refusés ;<br/>test: an_entity_ref_refuses_a_client_label"]
     BLOCK["✅ block::encode<br/>bloc po-refs en fin de texte, avant po-attachments ;<br/>marqueur tapé par l'utilisateur neutralisé ;<br/>test: a_typed_marker_cannot_forge_a_block"]
-    SOURCE["✅ resolvers::GraphRefSource::load_unchecked<br/>un KindResolver par kind, délégué aux get_* ;<br/>test: the_verdict_on_each_kind_comes_from_the_policy"]
+    SOURCE["✅ resolvers + resolvers_ext : un KindResolver par genre<br/>load, candidates, finish ; fichiers cachés ou d allure secrète jamais nommés ;<br/>test: the_verdict_on_each_kind_comes_from_the_policy, each_kind_of_another_project_reads_not_found_for_a_project_session, hidden_and_secret_looking_files_are_never_named"]
     POLICY{"✅ access::AccessPolicy::resolve_checked<br/>non authentifié refusé avant lecture ;<br/>erreur de store = Failed ;<br/>réponse pour une autre entité = NotFound ;<br/>test: a_source_answering_for_another_entity_is_not_found"}
-    RULE["✅ access::ScopeRule::allows<br/>OpenInstanceRule aujourd'hui ;<br/>test: denied_by_the_rule_is_forbidden_and_the_rule_spoke"]
+    RULE["✅ access::OpenInstanceRule::allows<br/>une session lit son projet et son workspace, pas les autres ; ce qui n appartient à rien est partagé (persona globale) ; file et commit exigent un projet prouvé ; refus lu not_found ;<br/>test: a_project_session_reads_its_own_project_and_no_other, a_sensitive_kind_needs_a_project_and_a_session_that_can_prove_its_own, a_scoped_denial_reads_not_found_never_forbidden"]
     DISCLOSE["✅ Resolution::to_wire(Disclosure::Uniform)<br/>refus, absence et erreur = not_found ;<br/>test: uniform_disclosure_makes_denied_and_missing_indistinguishable"]
     EVENT["✅ wire::RefsEvent refs_resolved<br/>test: refs_resolved_fixture"]
     SEARCH["✅ search::search_with + refs_handlers::search_refs<br/>GET /api/refs/search : portée, politique, un kind lent ou en panne est omis ;<br/>test: plan_and_rfc_items_are_the_fixture_items"]
+    RANK["✅ rank::score puis tri avant coupe<br/>exact 100, préfixe 80, début de mot 60, sous-chaîne du titre 40, mots du titre 30, corps 20, mots dispersés 10 ; casse et accents repliés ; égalité = le plus récent ; sans texte = le plus récent ;<br/>test: the_tiers_are_ordered_exact_prefix_word_substring_body, fond_ranks_fondations_before_a_text_with_fond_in_the_middle, without_text_each_kind_is_listed_newest_first"]
+    TURN["✅ turn::expand_user_turn_in<br/>appelé par chat/manager.rs et chat/agent_runtime.rs ; texte stocké propre, pointeur et non contenu, store lent borné, libellé du bloc jamais cru ;<br/>test: send_message_expands_the_references_for_the_cli_and_keeps_the_stored_text_clean, a_hung_store_ends_the_whole_turn_within_the_budget"]
     GATE["✅ scripts/lcov_gate.rs<br/>énumère src/refs/ depuis le disque ;<br/>CI: étape Blocking coverage gate"]
 
     CLIENT --> VALIDATE
@@ -63,6 +67,12 @@ flowchart TD
     POLICY --> RULE
     POLICY --> DISCLOSE
     DISCLOSE --> EVENT
+    VALIDATE --> SIGIL
+    IDS --> LINK
+    BLOCK --> TURN
+    TURN --> POLICY
+    TURN --> EVENT
+    SEARCH --> RANK
     SEARCH -. filtré par .-> POLICY
     GATE -. mesure .-> VALIDATE
     GATE -. mesure .-> POLICY
