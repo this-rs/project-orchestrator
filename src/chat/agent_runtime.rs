@@ -25,6 +25,7 @@ use nexus_claude::agent::{
 use tokio::sync::{broadcast, Mutex, RwLock};
 use uuid::Uuid;
 
+use super::config::RetryConfig;
 use super::manager::{CancelToolsResult, ChatManager, CANCEL_TOOLS_CAP, CANCEL_TOOLS_WINDOW_SECS};
 use super::provider::event_map::{out_of_band_to_chat_events, EventMapper};
 use super::types::{ChatEvent, PendingMessage, PendingMessageKind};
@@ -65,9 +66,6 @@ pub(crate) fn mask_agent_event_with(
     }
 }
 
-/// Retries of a turn that failed before showing anything (`done.error` retryable).
-const MAX_RETRIES: u32 = 3;
-
 /// The failure that ends a turn and is worth trying again: a retryable
 /// `done.error` of an error turn, or a retryable terminal `error`.
 fn retryable_failure(event: &AgentEvent) -> Option<ProviderError> {
@@ -86,6 +84,33 @@ fn retryable_failure(event: &AgentEvent) -> Option<ProviderError> {
     }
 }
 
+/// What one emitted event tells of the turn ([`TurnOutcome`]), and the tool calls
+/// still waiting for their result.
+fn track_turn(
+    outcome: &mut TurnOutcome,
+    pending_tools: &mut Vec<(String, Option<String>)>,
+    event: &ChatEvent,
+) {
+    match event {
+        ChatEvent::AssistantText { content, .. } => outcome.assistant_text.push_str(content),
+        ChatEvent::ToolUse {
+            id,
+            tool,
+            input,
+            parent_tool_use_id,
+            ..
+        } => {
+            outcome.tools.push((tool.clone(), input.clone()));
+            pending_tools.push((id.clone(), parent_tool_use_id.clone()));
+        }
+        ChatEvent::ToolResult { id, .. } | ChatEvent::ToolCancelled { id, .. } => {
+            pending_tools.retain(|(pending, _)| pending != id);
+        }
+        ChatEvent::CompactBoundary { .. } => outcome.compacted = true,
+        _ => {}
+    }
+}
+
 /// Whether an event is something the user has already seen of this turn.
 fn shows_content(event: &AgentEvent) -> bool {
     matches!(
@@ -100,16 +125,17 @@ fn shows_content(event: &AgentEvent) -> bool {
     )
 }
 
-/// Delay before attempt `n`: what the provider asked (`retry_after`), else an
-/// exponential backoff from one second, never beyond thirty.
-fn retry_delay_ms(error: &ProviderError, attempt: u32) -> u64 {
+/// Delay before attempt `n`: what the provider asked (`retry_after`, never beyond
+/// thirty seconds), else the backoff of the chat's `RetryConfig` — the one the Claude
+/// Code engine applies (`stream_response`).
+fn retry_delay_ms(error: &ProviderError, attempt: u32, retry: &RetryConfig) -> u64 {
     if let ProviderError::RateLimited {
         retry_after_ms: Some(ms),
     } = error
     {
         return (*ms).min(30_000);
     }
-    (1000u64 << attempt.saturating_sub(1).min(5)).min(30_000)
+    retry.delay_for_attempt(attempt)
 }
 
 /// The input of a turn: its text, then the images the user attached, in order
@@ -289,6 +315,33 @@ pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
     missing.into_iter().map(str::to_string).collect()
 }
 
+/// What a turn of the agent engine did, for what the host does after it
+/// ([`TurnServices::after_turn`]) — what `stream_response` gathers for its
+/// post-stream steps.
+#[derive(Debug, Clone, Default)]
+pub struct TurnOutcome {
+    /// The assistant's text of the turn.
+    pub assistant_text: String,
+    /// The tools the turn called: name and input.
+    pub tools: Vec<(String, serde_json::Value)>,
+    /// The provider compacted the conversation during the turn (`compact_boundary`).
+    pub compacted: bool,
+    /// The turn was stopped (a Stop, or a message sent now).
+    pub interrupted: bool,
+    /// The turn stopped on its turn limit.
+    pub hit_turn_limit: bool,
+    /// Auto-continue was allowed after it (a continuation is on its way).
+    pub auto_continue_allowed: bool,
+}
+
+/// What the host asks of the session after a turn: events to emit, then system
+/// hints to queue (played as the next turns, as the Claude Code engine's queue).
+#[derive(Debug, Default)]
+pub struct AfterTurn {
+    pub events: Vec<ChatEvent>,
+    pub hints: Vec<String>,
+}
+
 /// What the host does around a turn of the agent engine, that the Claude Code
 /// engine does around its own (`ChatManager::stream_response`). The manager
 /// implements it; the runtime stays free of graph and transport concerns.
@@ -320,6 +373,17 @@ pub trait TurnServices: Send + Sync {
     /// Hands an event of the session to the other instances (NATS), as the Claude
     /// Code engine publishes each of its events. Default: nowhere.
     fn publish(&self, _session_id: &str, _event: &ChatEvent) {}
+    /// Sees each event of the session as it is emitted (the work log of the turn).
+    /// Default: nothing.
+    fn observe(&self, _session_id: &str, _event: &ChatEvent) {}
+    /// After each turn played (not one refused before it was sent): the
+    /// Claude Code engine's post-stream steps — post-compaction re-injection,
+    /// objective tracking, memory, feedback, observations. Run under the step
+    /// budget of the post-stream (`post_stream::POST_STREAM_STEP_BUDGET`): past it,
+    /// it is dropped, the turn goes on. Default: nothing.
+    async fn after_turn(&self, _session_id: &str, _outcome: &TurnOutcome) -> AfterTurn {
+        AfterTurn::default()
+    }
 }
 
 /// Where the runtime finds a provider instance by identifier. The nexus
@@ -384,11 +448,26 @@ pub struct AgentSessionHandle {
     cancel_tools_cap: u32,
     /// The window of the cap (`CANCEL_TOOLS_WINDOW_SECS`).
     cancel_tools_window: Duration,
+    /// How the provider states the cost of a turn (`session_record::CostFigure`).
+    cost_figure: super::session_record::CostFigure,
+    /// Held across each read-then-write of the session record, so two writes of
+    /// this session never lose one another's figure.
+    record: Mutex<()>,
+    /// The next user message was already counted when the session was created
+    /// (the opening message: `message_count` starts at 1).
+    opening_counted: AtomicBool,
+    /// How a turn that failed before showing anything is retried: the chat's
+    /// `RetryConfig` (`configure_retry`), as on the Claude Code engine.
+    retry: std::sync::RwLock<RetryConfig>,
+    /// When the session last did something (an event, a message): what the idle
+    /// cleanup reads (`ChatManager::start_cleanup_task`).
+    last_activity: std::sync::Mutex<Instant>,
 }
 
 impl AgentSessionHandle {
     /// Persists (except transient events) and broadcasts one event.
     pub async fn emit(&self, mut event: ChatEvent) {
+        self.touch();
         // What only the session owner knows rides on `system_init`.
         if let ChatEvent::SystemInit {
             provider,
@@ -434,6 +513,7 @@ impl AgentSessionHandle {
         }
         if let Some(services) = &self.services {
             services.publish(&self.session_id, &event);
+            services.observe(&self.session_id, &event);
         }
         let _ = self.events_tx.send(event);
     }
@@ -466,6 +546,73 @@ impl AgentSessionHandle {
                 error = %e,
                 "Failed to persist the resume token (retried at the next turn)"
             ),
+        }
+    }
+
+    /// Retries this session's failed turns as `retry` says (the chat's configuration).
+    pub fn configure_retry(&self, retry: RetryConfig) {
+        *self.retry.write().unwrap_or_else(|e| e.into_inner()) = retry;
+    }
+
+    pub(crate) fn retry_config(&self) -> RetryConfig {
+        self.retry.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The session did something now.
+    pub fn touch(&self) {
+        *self.last_activity.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    /// How long the session has done nothing.
+    pub fn idle_for(&self) -> Duration {
+        self.last_activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .elapsed()
+    }
+
+    /// The opening message of the session was counted when the session was created:
+    /// its turn does not count it again (`session_record`).
+    pub fn opening_message_counted(&self) {
+        self.opening_counted.store(true, Ordering::SeqCst);
+    }
+
+    /// Counts a user message on the session record — the opening one excepted, already
+    /// counted — under [`super::session_record::RECORD_WRITE_BUDGET`].
+    async fn count_user_message(&self) {
+        if self.opening_counted.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let Some(uuid) = self.uuid else { return };
+        let _held = self.record.lock().await;
+        let write = super::session_record::count_user_message(&self.graph, uuid);
+        match tokio::time::timeout(super::session_record::RECORD_WRITE_BUDGET, write).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(session_id = %self.session_id, error = %e, "Failed to count the user message")
+            }
+            Err(_) => {
+                tracing::warn!(session_id = %self.session_id, "Counting the user message took too long: abandoned")
+            }
+        }
+    }
+
+    /// Adds what a turn cost to the session record (nothing for an unknown price),
+    /// under [`super::session_record::RECORD_WRITE_BUDGET`].
+    async fn add_turn_cost(&self, usd: Option<f64>) {
+        let (Some(uuid), Some(_)) = (self.uuid, usd) else {
+            return;
+        };
+        let _held = self.record.lock().await;
+        let write = super::session_record::add_turn_cost(&self.graph, uuid, usd, self.cost_figure);
+        match tokio::time::timeout(super::session_record::RECORD_WRITE_BUDGET, write).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(session_id = %self.session_id, error = %e, "Failed to record the cost of the turn")
+            }
+            Err(_) => {
+                tracing::warn!(session_id = %self.session_id, "Recording the cost of the turn took too long: abandoned")
+            }
         }
     }
 
@@ -617,7 +764,8 @@ impl AgentSessionHandle {
                 self.emit(ChatEvent::UserMessage {
                     content: shown.to_string(),
                 })
-                .await
+                .await;
+                self.count_user_message().await;
             }
         }
         // The same expansion as `stream_response` (`refs::turn`), for every turn
@@ -685,8 +833,13 @@ impl AgentSessionHandle {
         let mut turn = first;
         loop {
             if let Some((stream, input)) = turn.take() {
-                let hit_turn_limit = self.play(stream, input).await;
-                self.auto_continue_after(hit_turn_limit).await;
+                let (mut outcome, pending_tools) = self.play(stream, input).await;
+                outcome.interrupted = self.interrupted.load(Ordering::SeqCst);
+                self.cancel_pending_tools(outcome.interrupted, pending_tools)
+                    .await;
+                outcome.auto_continue_allowed =
+                    self.auto_continue_after(outcome.hit_turn_limit).await;
+                self.after_turn(&outcome).await;
             }
             let Some(next) = self.next_queued().await else {
                 return;
@@ -741,10 +894,20 @@ impl AgentSessionHandle {
     }
 
     /// Plays one turn to its terminal event, retrying a failure that showed nothing.
-    /// Answers whether the turn stopped on its turn limit (`max_turns`).
-    async fn play(&self, mut stream: nexus_claude::agent::EventStream, input: TurnInput) -> bool {
+    /// Answers what the turn did, and the tool calls it left without a result
+    /// (id, parent).
+    async fn play(
+        &self,
+        mut stream: nexus_claude::agent::EventStream,
+        input: TurnInput,
+    ) -> (TurnOutcome, Vec<(String, Option<String>)>) {
         let mut attempt = 0u32;
-        let mut hit_turn_limit = false;
+        let mut outcome = TurnOutcome::default();
+        let mut pending_tools: Vec<(String, Option<String>)> = Vec::new();
+        // What the turn cost, read on its `done` (`None`: no price, or no `done`).
+        let mut turn_cost: Option<f64> = None;
+        let retry_config = self.retry_config();
+        let max_attempts = retry_config.max_attempts;
         loop {
             // Did the turn already show the user anything? A turn that did is
             // never replayed: it would repeat text or tool calls.
@@ -761,22 +924,26 @@ impl AgentSessionHandle {
                     self.sync_resume_token().await;
                 }
                 if !shown {
-                    retry = retryable_failure(&event).filter(|_| attempt < MAX_RETRIES);
+                    retry = retryable_failure(&event).filter(|_| attempt < max_attempts);
                     if retry.is_some() {
                         break;
                     }
                 }
                 shown |= shows_content(&event);
-                hit_turn_limit |= matches!(
+                outcome.hit_turn_limit |= matches!(
                     event,
                     AgentEvent::Done {
                         stop_reason: nexus_claude::agent::StopReason::MaxTurns,
                         ..
                     }
                 );
+                if let AgentEvent::Done { cost, .. } = &event {
+                    turn_cost = cost.usd;
+                }
                 let event = mask_agent_event(event);
                 let chat_events = self.mapper.lock().await.map(&event);
                 for chat_event in chat_events {
+                    track_turn(&mut outcome, &mut pending_tools, &chat_event);
                     self.emit(chat_event).await;
                 }
                 if terminal {
@@ -785,10 +952,10 @@ impl AgentSessionHandle {
             }
             let Some(error) = retry else { break };
             attempt += 1;
-            let delay = retry_delay_ms(&error, attempt);
+            let delay = retry_delay_ms(&error, attempt, &retry_config);
             self.emit(ChatEvent::Retrying {
                 attempt,
-                max_attempts: MAX_RETRIES,
+                max_attempts,
                 delay_ms: delay,
                 error_message: format!(
                     "Error: {}",
@@ -808,7 +975,64 @@ impl AgentSessionHandle {
                 }
             }
         }
-        hit_turn_limit
+        // The record carries the turn's cost before the session is seen idle.
+        self.add_turn_cost(turn_cost).await;
+        (outcome, pending_tools)
+    }
+
+    /// A stopped turn's tool calls left without a result are said cancelled
+    /// (`tool_cancelled`, persisted) — the Claude Code engine's
+    /// `PostStreamHandler::handle_interrupt_cleanup`.
+    async fn cancel_pending_tools(
+        &self,
+        interrupted: bool,
+        pending: Vec<(String, Option<String>)>,
+    ) {
+        if !interrupted {
+            return;
+        }
+        for (id, parent_tool_use_id) in pending {
+            self.emit(ChatEvent::ToolCancelled {
+                id,
+                parent_tool_use_id,
+            })
+            .await;
+        }
+    }
+
+    /// The host's end of turn ([`TurnServices::after_turn`]), bounded: its events
+    /// are emitted, its hints queued.
+    async fn after_turn(&self, outcome: &TurnOutcome) {
+        let Some(services) = &self.services else {
+            return;
+        };
+        let Some(after) = super::post_stream::bounded(
+            &self.session_id,
+            "after_turn",
+            super::post_stream::POST_STREAM_STEP_BUDGET,
+            services.after_turn(&self.session_id, outcome),
+        )
+        .await
+        else {
+            self.emit(ChatEvent::Error {
+                message: "Error: the end-of-turn processing took too long: skipped".into(),
+                parent_tool_use_id: None,
+                code: Some(super::post_stream::STEP_ABANDONED_CODE.to_string()),
+                reason: Some("after_turn".to_string()),
+                index: None,
+            })
+            .await;
+            return;
+        };
+        for event in after.events {
+            self.emit(event).await;
+        }
+        if !after.hints.is_empty() {
+            let mut queue = self.pending.lock().await;
+            for hint in after.hints {
+                queue.push_back(PendingMessage::system_hint(hint));
+            }
+        }
     }
 
     /// Sets how this session continues a turn that stopped on its turn limit.
@@ -821,10 +1045,10 @@ impl AgentSessionHandle {
     /// announce the continuation, wait (a Stop cancels it), and queue the
     /// "continue" hint the queue then plays — the Claude Code engine's
     /// `PostStreamHandler::handle_auto_continue`, with the same decision and message.
-    async fn auto_continue_after(&self, hit_turn_limit: bool) {
+    async fn auto_continue_after(&self, hit_turn_limit: bool) -> bool {
         use super::post_stream::{auto_continue_allowed, AUTO_CONTINUE_DELAY_MS};
         let Some(services) = &self.services else {
-            return;
+            return false;
         };
         if !auto_continue_allowed(
             &self.session_id,
@@ -834,7 +1058,7 @@ impl AgentSessionHandle {
             &self.auto_continue_count,
             self.max_auto_continues.load(Ordering::Relaxed),
         ) {
-            return;
+            return false;
         }
         self.emit(ChatEvent::AutoContinue {
             session_id: self.session_id.clone(),
@@ -844,13 +1068,14 @@ impl AgentSessionHandle {
         tokio::time::sleep(Duration::from_millis(AUTO_CONTINUE_DELAY_MS)).await;
         if self.interrupted.load(Ordering::SeqCst) {
             tracing::info!(session_id = %self.session_id, "Auto-continue cancelled by interrupt");
-            return;
+            return true;
         }
         let hint = services.continuation(&self.session_id).await;
         self.pending
             .lock()
             .await
             .push_back(PendingMessage::system_hint(hint));
+        true
     }
 
     /// Answers a permission request.
@@ -1012,6 +1237,11 @@ impl AgentRuntime {
         self.sessions.read().await.is_empty()
     }
 
+    /// Every live session.
+    pub async fn handles(&self) -> Vec<Arc<AgentSessionHandle>> {
+        self.sessions.read().await.values().cloned().collect()
+    }
+
     /// Registers a session just opened by a provider and starts its
     /// out-of-turn pump. `first_seq` is the next event number to persist.
     #[allow(clippy::too_many_arguments)]
@@ -1089,6 +1319,11 @@ impl AgentRuntime {
             cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
+            cost_figure: super::session_record::CostFigure::of_kind(provider_kind),
+            record: Mutex::new(()),
+            opening_counted: AtomicBool::new(false),
+            retry: std::sync::RwLock::new(RetryConfig::default()),
+            last_activity: std::sync::Mutex::new(Instant::now()),
         });
         if let Some(oob) = session.out_of_band() {
             let pump = Arc::clone(&handle);
@@ -1499,28 +1734,28 @@ mod mask_tests {
     }
 
     #[test]
-    fn the_retry_delay_follows_the_provider_then_backs_off() {
+    fn the_retry_delay_follows_the_provider_then_the_chat_retry_config() {
+        let config = RetryConfig::default();
+        let limited = |ms| ProviderError::RateLimited {
+            retry_after_ms: Some(ms),
+        };
+        assert_eq!(retry_delay_ms(&limited(40), 1, &config), 40);
+        assert_eq!(retry_delay_ms(&limited(900_000), 1, &config), 30_000);
+        // The backoff of the Claude Code engine: initial × multiplier^(n-1).
+        assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 1, &config), 1000);
+        assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 3, &config), 4000);
+        let operator = RetryConfig {
+            max_attempts: 5,
+            initial_delay_ms: 10,
+            backoff_multiplier: 3.0,
+        };
+        assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 1, &operator), 10);
+        assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 3, &operator), 90);
         assert_eq!(
-            retry_delay_ms(
-                &ProviderError::RateLimited {
-                    retry_after_ms: Some(40)
-                },
-                1
-            ),
-            40
+            retry_delay_ms(&ProviderError::Overloaded, 3, &operator),
+            operator.delay_for_attempt(3),
+            "the same figure as stream_response"
         );
-        assert_eq!(
-            retry_delay_ms(
-                &ProviderError::RateLimited {
-                    retry_after_ms: Some(900_000)
-                },
-                1
-            ),
-            30_000
-        );
-        assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 1), 1000);
-        assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 3), 4000);
-        assert_eq!(retry_delay_ms(&ProviderError::Overloaded, 20), 30_000);
     }
 
     #[test]
@@ -2013,5 +2248,458 @@ mod image_tests {
                 other => panic!("{other:?}"),
             }
         }
+    }
+}
+
+/// The session record the agent engine keeps at the end of its turns, by the rules
+/// of the Claude Code engine (`chat::session_record`).
+#[cfg(test)]
+mod session_record_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+    use crate::neo4j::mock::MockGraphStore;
+    use nexus_claude::agent::{Cost, CostBasis};
+
+    fn done(usd: Option<f64>) -> AgentEvent {
+        AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Completed,
+            subtype: None,
+            is_error: false,
+            result_text: Some("ok".into()),
+            usage: Default::default(),
+            cost: Cost {
+                usd,
+                basis: if usd.is_some() {
+                    CostBasis::Priced
+                } else {
+                    CostBasis::Unknown
+                },
+            },
+            duration_ms: 1,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        }
+    }
+
+    /// A session of `kind` whose node was created as the manager creates it
+    /// (`message_count: 1` for the opening message).
+    async fn rig(kind: &str) -> (Arc<MockGraphStore>, FakeProvider, Arc<AgentSessionHandle>) {
+        let graph = Arc::new(MockGraphStore::new());
+        let mut node = crate::test_helpers::test_chat_session(None);
+        node.message_count = 1;
+        graph.create_chat_session(&node).await.unwrap();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let runtime = AgentRuntime::new(dyn_graph);
+        let provider = FakeProvider::new();
+        let handle = runtime
+            .adopt(
+                &node.id.to_string(),
+                "local",
+                provider.session(),
+                1,
+                kind,
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        (graph, provider, handle)
+    }
+
+    async fn node(
+        graph: &MockGraphStore,
+        handle: &AgentSessionHandle,
+    ) -> crate::neo4j::models::ChatSessionNode {
+        graph
+            .get_chat_session(Uuid::parse_str(&handle.session_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Plays one turn that ends on `done(usd)` and waits for the session to be idle.
+    async fn turn(
+        provider: &FakeProvider,
+        handle: &Arc<AgentSessionHandle>,
+        text: &str,
+        usd: Option<f64>,
+    ) {
+        let before = provider.state.turns_started.lock().unwrap().len();
+        handle.send_message(text).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while provider.state.turns_started.lock().unwrap().len() == before {
+            assert!(Instant::now() < deadline, "the turn never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        provider.state.push(done(usd));
+        while handle.is_streaming.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the turn never ended");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Before P8 the record stayed at `message_count: 1` and `total_cost_usd: None`
+    /// whatever the conversation did.
+    #[tokio::test]
+    async fn each_user_message_counts_and_the_turn_costs_add_up() {
+        let (graph, provider, handle) = rig("native").await;
+        handle.opening_message_counted();
+        turn(&provider, &handle, "opening", Some(0.01)).await;
+        let n = node(&graph, &handle).await;
+        assert_eq!(
+            n.message_count, 1,
+            "the opening message counted once: {n:?}"
+        );
+        assert_eq!(n.total_cost_usd, Some(0.01));
+
+        turn(&provider, &handle, "second", Some(0.02)).await;
+        let n = node(&graph, &handle).await;
+        assert_eq!(n.message_count, 2, "{n:?}");
+        assert!((n.total_cost_usd.unwrap() - 0.03).abs() < 1e-9, "{n:?}");
+
+        // An unknown price changes nothing: never an invented zero.
+        turn(&provider, &handle, "third", None).await;
+        let n = node(&graph, &handle).await;
+        assert_eq!(n.message_count, 3, "{n:?}");
+        assert!((n.total_cost_usd.unwrap() - 0.03).abs() < 1e-9, "{n:?}");
+    }
+
+    /// Claude Code (forced onto the agent engine) reports the session's total on
+    /// each `result`: it is kept as is, as the legacy engine keeps it.
+    #[tokio::test]
+    async fn the_claude_code_figure_is_the_session_total() {
+        let (graph, provider, handle) = rig("claude_code").await;
+        turn(&provider, &handle, "one", Some(0.01)).await;
+        turn(&provider, &handle, "two", Some(0.03)).await;
+        let n = node(&graph, &handle).await;
+        assert_eq!(n.total_cost_usd, Some(0.03), "{n:?}");
+        assert_eq!(
+            n.message_count, 3,
+            "1 at creation + two messages not flagged as opening"
+        );
+    }
+
+    /// A system hint queued behind a turn is played as its own turn, and is not a
+    /// user message: it does not count.
+    #[tokio::test]
+    async fn a_system_hint_is_not_counted() {
+        let (graph, provider, handle) = rig("native").await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        handle.send_message("one").await.unwrap();
+        while provider.state.turns_started.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the turn never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        handle.inject_hint("a hint").await.unwrap();
+        provider.state.push(done(Some(0.0)));
+        while provider.state.turns_started.lock().unwrap().len() < 2 {
+            assert!(Instant::now() < deadline, "the hint never played");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        provider.state.push(done(Some(0.0)));
+        while handle.is_streaming.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the run never ended");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let n = node(&graph, &handle).await;
+        assert_eq!(
+            n.message_count, 2,
+            "1 at creation + one user message: {n:?}"
+        );
+        assert_eq!(n.total_cost_usd, Some(0.0), "a free turn is a real 0");
+    }
+}
+
+/// A turn of the agent engine that fails before showing anything is retried as the
+/// chat's `RetryConfig` says — the figures the Claude Code engine uses — not by a
+/// constant of its own.
+#[cfg(test)]
+mod retry_config_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+
+    fn overloaded() -> AgentEvent {
+        AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Error,
+            subtype: None,
+            is_error: true,
+            result_text: None,
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 0,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: Some(ProviderError::Overloaded),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_retries_follow_the_chat_retry_config() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = runtime
+            .adopt(
+                "not-a-uuid",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        handle.configure_retry(RetryConfig {
+            max_attempts: 1,
+            initial_delay_ms: 7,
+            backoff_multiplier: 2.0,
+        });
+        let mut rx = handle.events_tx.subscribe();
+        handle.send_message("hello").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut attempts_seen = 0;
+        loop {
+            let turns = provider.state.turns_started.lock().unwrap().len();
+            if turns > attempts_seen {
+                attempts_seen = turns;
+                provider.state.push(overloaded());
+            }
+            if !handle.is_streaming.load(Ordering::SeqCst) && attempts_seen > 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the turn never ended");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            attempts_seen, 2,
+            "the turn, then ONE retry (max_attempts = 1)"
+        );
+        let mut retrying = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ChatEvent::Retrying {
+                attempt,
+                max_attempts,
+                delay_ms,
+                ..
+            } = event
+            {
+                retrying.push((attempt, max_attempts, delay_ms));
+            }
+        }
+        assert_eq!(retrying, [(1, 1, 7)]);
+    }
+}
+
+/// The end of a turn of the agent engine: what the Claude Code engine's
+/// post-stream does — the tool calls a Stop left are said cancelled, the host's
+/// `after_turn` sees what the turn did, its events go out and its hints are played.
+#[cfg(test)]
+mod after_turn_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    fn done() -> AgentEvent {
+        AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Completed,
+            subtype: None,
+            is_error: false,
+            result_text: None,
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        }
+    }
+
+    fn tool_call(id: &str, name: &str) -> AgentEvent {
+        AgentEvent::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            input: serde_json::json!({ "file_path": "src/lib.rs" }),
+            category: nexus_claude::agent::ToolCategory::Other,
+            canonical: None,
+            input_complete: true,
+            seq: None,
+            parent: None,
+        }
+    }
+
+    /// Records what `after_turn` was told and answers one hint, once.
+    #[derive(Default)]
+    struct Host {
+        seen: StdMutex<Vec<TurnOutcome>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TurnServices for Host {
+        async fn prepare(
+            &self,
+            _session_id: &str,
+            _shown: &str,
+            sent: &str,
+            _turn: &crate::refs::turn::TurnExpansion,
+        ) -> String {
+            sent.to_string()
+        }
+        async fn continuation(&self, _session_id: &str) -> String {
+            String::new()
+        }
+        async fn after_turn(&self, _session_id: &str, outcome: &TurnOutcome) -> AfterTurn {
+            let first = {
+                let mut seen = self.seen.lock().unwrap();
+                seen.push(outcome.clone());
+                seen.len() == 1
+            };
+            if !first {
+                return AfterTurn::default();
+            }
+            AfterTurn {
+                events: vec![ChatEvent::CompactionRecovery {
+                    hint_tokens: 1,
+                    build_latency_ms: 0,
+                    recovery_success: true,
+                }],
+                hints: vec!["THE-HINT".into()],
+            }
+        }
+    }
+
+    async fn rig(
+        services: Option<Arc<dyn TurnServices>>,
+    ) -> (FakeProvider, Arc<AgentSessionHandle>) {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = runtime
+            .adopt(
+                "not-a-uuid",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                services,
+            )
+            .await;
+        (provider, handle)
+    }
+
+    async fn until(what: &str, check: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !check() {
+            assert!(Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_host_sees_the_turn_and_its_hint_is_played_next() {
+        let host = Arc::new(Host::default());
+        let (provider, handle) = rig(Some(host.clone() as Arc<dyn TurnServices>)).await;
+        let mut rx = handle.events_tx.subscribe();
+        handle.send_message("go").await.unwrap();
+        until("the turn started", || {
+            !provider.state.turns_started.lock().unwrap().is_empty()
+        })
+        .await;
+        provider.state.push(AgentEvent::Text {
+            text: "all done".into(),
+            seq: None,
+            parent: None,
+        });
+        provider.state.push(tool_call("t1", "Edit"));
+        provider.state.push(AgentEvent::ToolResult {
+            id: "t1".into(),
+            output: None,
+            is_error: false,
+            seq: None,
+            parent: None,
+        });
+        provider.state.push(AgentEvent::Compaction {
+            phase: nexus_claude::agent::CompactionPhase::Completed,
+            trigger: None,
+            pre_tokens: Some(10),
+        });
+        provider.state.push(done());
+        until("the hint was played", || {
+            provider.state.turns_started.lock().unwrap().len() == 2
+        })
+        .await;
+        assert_eq!(provider.state.turns_started.lock().unwrap()[1], "THE-HINT");
+        provider.state.push(done());
+        until("the run ended", || {
+            !handle.is_streaming.load(Ordering::SeqCst)
+        })
+        .await;
+
+        let seen = host.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "after each turn played: {seen:?}");
+        assert_eq!(seen[0].assistant_text, "all done");
+        assert_eq!(seen[0].tools.len(), 1);
+        assert_eq!(seen[0].tools[0].0, "Edit");
+        assert!(seen[0].compacted, "{:?}", seen[0]);
+        assert!(!seen[0].interrupted);
+        assert!(!seen[1].compacted, "the hint's turn did not compact");
+        let mut recovered = false;
+        while let Ok(event) = rx.try_recv() {
+            recovered |= matches!(event, ChatEvent::CompactionRecovery { .. });
+        }
+        assert!(recovered, "the host's event went out");
+    }
+
+    #[tokio::test]
+    async fn a_stop_says_the_tools_left_without_result_cancelled() {
+        let (provider, handle) = rig(None).await;
+        let mut rx = handle.events_tx.subscribe();
+        handle.send_message("go").await.unwrap();
+        until("the turn started", || {
+            !provider.state.turns_started.lock().unwrap().is_empty()
+        })
+        .await;
+        provider.state.push(tool_call("t-done", "Read"));
+        provider.state.push(AgentEvent::ToolResult {
+            id: "t-done".into(),
+            output: None,
+            is_error: false,
+            seq: None,
+            parent: None,
+        });
+        provider.state.push(tool_call("t-left", "Bash"));
+        until("the tool call went out", || {
+            handle
+                .streaming_events
+                .try_lock()
+                .map(|e| {
+                    e.iter()
+                        .any(|e| matches!(e, ChatEvent::ToolUse { id, .. } if id == "t-left"))
+                })
+                .unwrap_or(false)
+        })
+        .await;
+        // The fake ends the turn stream on an interrupt, as a provider does.
+        handle.interrupt().await.unwrap();
+        until("the turn ended", || {
+            !handle.is_streaming.load(Ordering::SeqCst)
+        })
+        .await;
+        let mut cancelled = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ChatEvent::ToolCancelled { id, .. } = event {
+                cancelled.push(id);
+            }
+        }
+        assert_eq!(cancelled, ["t-left"], "only the tool left without a result");
     }
 }

@@ -338,7 +338,11 @@ curl -H "Authorization: Bearer <JWT>" \
 
 ### POST /api/chat/sessions/backfill-previews -- Protected
 
-Backfill preview data for existing sessions.
+Backfill preview data for existing sessions: the title and preview of a session that has none
+(from its first `user_message`, then from Meilisearch), and the record of the sessions the agent
+engine served before it kept one (`message_count` from their `user_message` events, raised never
+lowered; `total_cost_usd` from their `result` events when it has none). Idempotent. The response
+counts each phase: `from_neo4j`, `from_meilisearch`, `agent_records`.
 
 ```bash
 curl -X POST -H "Authorization: Bearer <JWT>" \

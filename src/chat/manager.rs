@@ -495,6 +495,26 @@ pub struct CancelTaskResult {
     pub capped: bool,
 }
 
+/// `cancel_task` asked of a session of the agent engine: it tracks no background
+/// task of its own yet (P4) and has nothing to stop (P12). Refused, typed, instead
+/// of the silent success it used to answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelTaskUnsupported {
+    pub session_id: String,
+}
+
+impl std::fmt::Display for CancelTaskUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cancel_task is not available on the agent engine yet: session {} tracks no background task",
+            self.session_id
+        )
+    }
+}
+
+impl std::error::Error for CancelTaskUnsupported {}
+
 /// Runtime-mutable environment config for Claude CLI subprocess.
 ///
 /// These fields can be changed at runtime via the REST API and are
@@ -1224,6 +1244,38 @@ pub(crate) struct ManagerTurnServices {
     nats: Option<Arc<crate::events::NatsEmitter>>,
     /// The anchor state of the manager when these services were built.
     anchor: super::anchor_resolver::AnchorSession,
+    /// The session's state for the end of its turns, as `ActiveSession` holds it on
+    /// the Claude Code engine.
+    session: AgentTurnState,
+    search: Arc<dyn SearchStore>,
+    event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
+    context_injector: Option<Arc<ContextInjector>>,
+}
+
+/// What a session of the agent engine keeps for the end of its turns: the fields of
+/// `ActiveSession` the Claude Code engine's post-stream reads.
+#[derive(Clone, Default)]
+pub(crate) struct AgentTurnState {
+    /// Records the conversation in memory (`None`: no memory configured).
+    memory: Option<Arc<Mutex<ConversationMemoryManager>>>,
+    rfc_accumulator: Arc<Mutex<super::observation_detector::RfcAccumulator>>,
+    /// The protocol run the session was spawned in (`spawned_by`), for the enrichment.
+    protocol_run_id: Option<Uuid>,
+    protocol_state: Option<String>,
+    reasoning_path_tracker: super::feedback::ReasoningPathTracker,
+    objectives: super::post_stream::ObjectiveCounters,
+    /// The tools the session used (files, steps), live from its events.
+    work_log: Arc<std::sync::Mutex<SessionWorkLog>>,
+}
+
+impl ManagerTurnServices {
+    fn work_summary(&self) -> String {
+        self.session
+            .work_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .to_summary_markdown()
+    }
 }
 
 #[async_trait::async_trait]
@@ -1250,12 +1302,20 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         };
         // The enrichment reads what the user typed (the attachments' text, without
         // references), and does not inject again the notes the user pointed at.
+        // What the user typed goes to memory, as `stream_response` records it.
+        if let Some(mm) = &self.session.memory {
+            mm.lock().await.record_user_message(&turn.memory_text);
+        }
         let prepared = match enrichment_for_turn(
             &self.graph,
             &self.enrichment_pipeline,
             session_id,
             &turn.enrichment_text,
-            TurnProtocol::default(),
+            TurnProtocol {
+                run_id: self.session.protocol_run_id,
+                state: self.session.protocol_state.clone(),
+                reasoning_path_tracker: Some(self.session.reasoning_path_tracker.clone()),
+            },
             turn.excluded_note_ids.clone(),
             &self.anchor,
         )
@@ -1280,8 +1340,13 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             Uuid::parse_str(session_id).ok(),
         )
         .await;
-        // No work log on this engine: the hint carries the task/step context alone.
-        super::post_stream::continuation_message(&self.graph, ctx.project_slug.as_deref(), "").await
+        let work_summary = self.work_summary();
+        super::post_stream::continuation_message(
+            &self.graph,
+            ctx.project_slug.as_deref(),
+            &work_summary,
+        )
+        .await
     }
 
     async fn images(
@@ -1295,6 +1360,92 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         if let Some(nats) = &self.nats {
             nats.publish_chat_event(session_id, event.clone());
         }
+    }
+
+    fn observe(&self, _session_id: &str, event: &ChatEvent) {
+        if let ChatEvent::ToolUse { tool, input, .. } = event {
+            self.session
+                .work_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_tool_use(tool, input);
+        }
+    }
+
+    /// The post-stream steps of the Claude Code engine, with the same functions:
+    /// post-compaction re-injection, objective tracking, memory / feedback /
+    /// observations. Interrupt cleanup and auto-continue are the runtime's.
+    async fn after_turn(
+        &self,
+        session_id: &str,
+        outcome: &super::agent_runtime::TurnOutcome,
+    ) -> super::agent_runtime::AfterTurn {
+        let mut after = super::agent_runtime::AfterTurn::default();
+        let uuid = Uuid::parse_str(session_id).ok();
+        let ctx = super::post_stream::PostStreamContext::build(&self.graph, uuid).await;
+        // 1. Post-compaction context re-injection.
+        if outcome.compacted && !outcome.interrupted {
+            let snapshot = self
+                .session
+                .work_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .snapshot();
+            let (hint, event) = super::post_stream::post_compaction_recovery(
+                &self.graph,
+                session_id,
+                ctx.project_slug.as_deref(),
+                Some(snapshot),
+            )
+            .await;
+            after.hints.extend(hint);
+            after.events.push(event);
+        }
+        // 2. Objective tracking.
+        let had_conclusive = outcome
+            .tools
+            .iter()
+            .any(|(tool, input)| is_conclusive_tool(tool, input));
+        let had_productive = outcome
+            .tools
+            .iter()
+            .any(|(tool, input)| !is_conclusive_tool(tool, input));
+        let turn = super::post_stream::ObjectiveTurn {
+            had_productive_tool_use: had_productive,
+            had_conclusive_tool_use: had_conclusive,
+            auto_continue_allowed: outcome.auto_continue_allowed,
+            hit_error_max_turns: outcome.hit_turn_limit,
+            interrupted: outcome.interrupted,
+        };
+        if let Some(reminder) = super::post_stream::objective_reminder(
+            &self.graph,
+            ctx.project_slug.as_deref(),
+            &self.session.objectives,
+            turn,
+            self.work_summary(),
+        )
+        .await
+        {
+            info!(session_id, "Objective tracker: injecting reminder");
+            after.hints.push(reminder);
+        }
+        // 3. Memory / feedback / observations (the store write runs on its own).
+        super::post_stream::record_turn_feedback(
+            super::post_stream::TurnFeedback {
+                graph: &self.graph,
+                search: &self.search,
+                event_emitter: &self.event_emitter,
+                session_id,
+                session_uuid: uuid,
+                project_id: ctx.project_id,
+                rfc_accumulator: Some(self.session.rfc_accumulator.clone()),
+            },
+            &outcome.assistant_text,
+            &self.session.memory,
+            &self.context_injector,
+        )
+        .await;
+        after
     }
 }
 
@@ -3537,6 +3688,16 @@ impl ChatManager {
                 }
             }
         }
+        // The agent engine's sessions are live too (their permissions and background
+        // tasks are not tracked here: P11 / P4).
+        for handle in self.agent_runtime.handles().await {
+            if let Ok(id) = handle.session_id.parse::<Uuid>() {
+                snap.live.insert(id);
+                if handle.is_streaming.load(Ordering::SeqCst) {
+                    snap.streaming.insert(id);
+                }
+            }
+        }
         for (id, pending) in inputs {
             let ids: std::collections::HashSet<String> =
                 pending.lock().await.keys().cloned().collect();
@@ -4353,10 +4514,9 @@ impl ChatManager {
         relay: Option<&super::relay::RelayedFrom>,
         session_id: Uuid,
     ) -> Result<CreateSessionResponse> {
-        // Check max sessions
+        // Check max sessions: both engines' live sessions count.
         {
-            let sessions = self.active_sessions.read().await;
-            if sessions.len() >= self.config.max_sessions {
+            if self.active_session_count().await >= self.config.max_sessions {
                 return Err(anyhow!(
                     "Maximum number of active sessions reached ({})",
                     self.config.max_sessions
@@ -4484,13 +4644,24 @@ impl ChatManager {
             request.access,
             super::neutral_place::is_neutral_path(&request.cwd),
         );
+        // The record both engines keep (`session_record`): the title and preview come
+        // from the opening message as typed, and the memory conversation is named
+        // here (a relayed session keeps the one it continues).
+        let title_preview = super::session_record::title_and_preview(&request.message);
+        let conversation_id = relay.and_then(|r| r.conversation_id.clone()).or_else(|| {
+            self.memory_config.as_ref().map(|cfg| {
+                ConversationMemoryManager::new(cfg.clone())
+                    .conversation_id()
+                    .to_string()
+            })
+        });
         let session_node = ChatSessionNode {
             id: session_id,
             cli_session_id: None,
             project_slug: project_slug.clone(),
             workspace_slug: request.workspace_slug.clone(),
             cwd: request.cwd.clone(),
-            title: None,
+            title: title_preview.as_ref().map(|(t, _)| t.clone()),
             model: model.clone(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -4498,9 +4669,8 @@ impl ChatManager {
             // `user_message`); every later one bumps the count.
             message_count: 1,
             total_cost_usd: None,
-            // A relayed session keeps the memory conversation of the one it continues.
-            conversation_id: relay.and_then(|r| r.conversation_id.clone()),
-            preview: None,
+            conversation_id: conversation_id.clone(),
+            preview: title_preview.map(|(_, p)| p),
             permission_mode: request.permission_mode.clone(),
             add_dirs: if resolved_add_dirs.is_empty() {
                 None
@@ -4726,37 +4896,18 @@ impl ChatManager {
         }
 
         // Create ConversationMemoryManager for message recording
-        let memory_manager = if let Some(ref mem_config) = self.memory_config {
-            // A relayed session records into the conversation it continues.
-            let mm = match relay.and_then(|r| r.conversation_id.clone()) {
-                Some(kept) => {
-                    ConversationMemoryManager::new(mem_config.clone()).with_conversation_id(kept)
-                }
-                None => ConversationMemoryManager::new(mem_config.clone()),
-            };
-            let conversation_id = mm.conversation_id().to_string();
-            debug!(
-                "Created ConversationMemoryManager for session {} with conversation_id {}",
-                session_id, conversation_id
-            );
-
-            // Persist conversation_id in Neo4j
-            let _ = self
-                .graph
-                .update_chat_session(
-                    session_id,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(conversation_id),
-                    None,
-                )
-                .await;
-
-            Some(Arc::new(Mutex::new(mm)))
-        } else {
-            None
+        // It records into the conversation named on the node at creation.
+        let memory_manager = match (&self.memory_config, &conversation_id) {
+            (Some(mem_config), Some(conversation_id)) => {
+                let mm = ConversationMemoryManager::new(mem_config.clone())
+                    .with_conversation_id(conversation_id.clone());
+                debug!(
+                    "Created ConversationMemoryManager for session {} with conversation_id {}",
+                    session_id, conversation_id
+                );
+                Some(Arc::new(Mutex::new(mm)))
+            }
+            _ => None,
         };
 
         // Clone the stdin sender BEFORE wrapping client in Arc<Mutex<>>.
@@ -5031,36 +5182,7 @@ impl ChatManager {
             );
         }
 
-        // Auto-generate title and preview from the first user message — what the
-        // user typed, never the `<po-refs>`/`<po-attachments>` blocks around it.
-        {
-            let typed = crate::refs::turn::visible_text(&request.message);
-            let msg = &typed;
-            let title = if msg.chars().count() > 80 {
-                let truncated: String = msg.chars().take(77).collect();
-                format!("{}...", truncated.trim_end())
-            } else {
-                msg.to_string()
-            };
-            let preview = if msg.chars().count() > 200 {
-                let truncated: String = msg.chars().take(197).collect();
-                format!("{}...", truncated.trim_end())
-            } else {
-                msg.to_string()
-            };
-            let _ = self
-                .graph
-                .update_chat_session(
-                    session_id,
-                    None,
-                    Some(title),
-                    None,
-                    None,
-                    None,
-                    Some(preview),
-                )
-                .await;
-        }
+        // The title and preview were set on the node at creation (`session_record`).
 
         // Send the initial message and start streaming in a background task
         let session_id_str = session_id.to_string();
@@ -8918,6 +9040,11 @@ impl ChatManager {
             created_at: chrono::Utc::now(),
         };
         let _ = self.graph.store_chat_events(uuid, vec![user_event]).await;
+        // The message that resumes the session is a user message: it counts
+        // (`session_record`), as on the agent engine.
+        if let Err(e) = super::session_record::count_user_message(&self.graph, uuid).await {
+            warn!(session_id, error = %e, "Failed to count the resuming message (non-fatal)");
+        }
 
         // Emit user_message on local broadcast + NATS
         let user_msg_event = ChatEvent::UserMessage {
@@ -9145,18 +9272,11 @@ impl ChatManager {
                 .find(|m| m.role == "user")
                 .map(|m| m.content.clone());
 
-            if let Some(content) = first_user_msg {
-                let chars: Vec<char> = content.chars().collect();
-                let title = if chars.len() > 80 {
-                    format!("{}...", chars[..77].iter().collect::<String>().trim_end())
-                } else {
-                    content.clone()
-                };
-                let preview = if chars.len() > 200 {
-                    format!("{}...", chars[..197].iter().collect::<String>().trim_end())
-                } else {
-                    content
-                };
+            // The title rule of every session (`session_record`).
+            if let Some((title, preview)) = first_user_msg
+                .as_deref()
+                .and_then(super::session_record::title_and_preview)
+            {
                 let _ = self
                     .graph
                     .update_chat_session(
@@ -9174,6 +9294,111 @@ impl ChatManager {
         }
 
         Ok(count)
+    }
+
+    /// Brings the record of the sessions the agent engine served before it kept one
+    /// (P8) to what it would hold today (`session_record`), from their persisted
+    /// events: `message_count` = their `user_message` events (raised, never lowered),
+    /// `total_cost_usd` from their `result` events when the record has none, and the
+    /// title and preview of their first user message when they have none.
+    /// Idempotent: a second run changes nothing. A Claude Code session (provider
+    /// `claude_code`) is left alone: the legacy engine kept its record.
+    /// Returns the number of sessions updated.
+    pub async fn backfill_agent_session_records(&self) -> Result<usize> {
+        use super::session_record::{next_total_cost, title_and_preview, CostFigure};
+        const PAGE: usize = 200;
+        // Listed in full first: the list is ordered by `updated_at`, which each
+        // write below changes (paging while writing would skip sessions).
+        let mut sessions = Vec::new();
+        let mut offset = 0;
+        loop {
+            let (page, _) = self
+                .graph
+                .list_chat_sessions(None, None, PAGE, offset, true)
+                .await
+                .context("Failed to list sessions")?;
+            let fetched = page.len();
+            offset += fetched;
+            sessions.extend(page.into_iter().filter(|s| s.provider_id.is_some()));
+            if fetched < PAGE {
+                break;
+            }
+        }
+        let mut updated = 0;
+        for session in sessions {
+            let Some(provider_id) = session.provider_id.as_deref() else {
+                continue;
+            };
+            if provider_id == super::provider::resolver::CLAUDE_CODE {
+                continue;
+            }
+            let events = self.graph.get_chat_events(session.id, -1, 100_000).await?;
+            let parsed: Vec<ChatEvent> = events
+                .iter()
+                .filter(|e| e.event_type == "user_message" || e.event_type == "result")
+                .filter_map(|e| serde_json::from_str(&e.data).ok())
+                .collect();
+            let users: Vec<&str> = parsed
+                .iter()
+                .filter_map(|e| match e {
+                    ChatEvent::UserMessage { content } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let message_count = i64::try_from(users.len())
+                .ok()
+                .filter(|n| *n > session.message_count);
+            let total_cost_usd = if session.total_cost_usd.is_none() {
+                // A Claude Code on another machine reports the session's total.
+                let figure = match super::provider::store::instance(
+                    self.graph.as_ref(),
+                    provider_id,
+                )
+                .await
+                {
+                    Ok(Some(record))
+                        if record.kind == super::provider::settings::KIND_CLAUDE_CODE_REMOTE =>
+                    {
+                        CostFigure::SessionTotal
+                    }
+                    _ => CostFigure::Turn,
+                };
+                parsed
+                    .iter()
+                    .filter_map(|e| match e {
+                        ChatEvent::Result { cost_usd, .. } => Some(*cost_usd),
+                        _ => None,
+                    })
+                    .fold(None, |total, usd| {
+                        next_total_cost(total, usd, figure).or(total)
+                    })
+            } else {
+                None
+            };
+            let (title, preview) = match (&session.title, users.first()) {
+                (None, Some(first)) => match title_and_preview(first) {
+                    Some((t, p)) => (Some(t), Some(p)),
+                    None => (None, None),
+                },
+                _ => (None, None),
+            };
+            if message_count.is_none() && total_cost_usd.is_none() && title.is_none() {
+                continue;
+            }
+            self.graph
+                .update_chat_session(
+                    session.id,
+                    None,
+                    title,
+                    message_count,
+                    total_cost_usd,
+                    None,
+                    preview,
+                )
+                .await?;
+            updated += 1;
+        }
+        Ok(updated)
     }
 
     /// Search messages across all sessions via Meilisearch full-text search.
@@ -9892,6 +10117,11 @@ impl ChatManager {
     ///   task_id isn't in the map (idempotent — clicking Stop twice on
     ///   the same task is fine).
     pub async fn cancel_task(&self, session_id: &str, task_id: &str) -> Result<CancelTaskResult> {
+        if self.agent_runtime.owns(session_id).await {
+            return Err(anyhow::Error::new(CancelTaskUnsupported {
+                session_id: session_id.to_string(),
+            }));
+        }
         let session_state = {
             let sessions = self.active_sessions.read().await;
             sessions.get(session_id).map(|s| {
@@ -11568,6 +11798,8 @@ impl ChatManager {
                 handle.emit(relay.event(&sid, provider_id)).await;
             }
             if !request.message.is_empty() {
+                // Counted on the node at creation (`message_count: 1`).
+                handle.opening_message_counted();
                 handle
                     .send_message_relayed(
                         &request.message,
@@ -11586,8 +11818,12 @@ impl ChatManager {
     }
 
     /// What a session of the agent engine gets around its turns, built from the
-    /// manager as it is configured NOW (the pipeline is replaced after construction).
-    pub(crate) fn turn_services(&self) -> Arc<dyn super::agent_runtime::TurnServices> {
+    /// manager as it is configured NOW (the pipeline is replaced after construction)
+    /// and the session's own end-of-turn state ([`Self::agent_turn_state`]).
+    fn turn_services_with(
+        &self,
+        session: AgentTurnState,
+    ) -> Arc<dyn super::agent_runtime::TurnServices> {
         Arc::new(ManagerTurnServices {
             graph: self.graph.clone(),
             enrichment_pipeline: self.enrichment_pipeline.clone(),
@@ -11595,7 +11831,45 @@ impl ChatManager {
             documents: self.document_store.clone(),
             nats: self.nats.clone(),
             anchor: self.anchor_session(),
+            session,
+            search: self.search.clone(),
+            event_emitter: self.event_emitter.clone(),
+            context_injector: self.context_injector.clone(),
         })
+    }
+
+    /// The end-of-turn state of the agent session `session_id`, from its node: its
+    /// memory conversation, the protocol run it was spawned in. Objective tracking
+    /// is on, as for every Claude Code session.
+    async fn agent_turn_state(&self, session_id: &str) -> AgentTurnState {
+        let node = match Uuid::parse_str(session_id) {
+            Ok(uuid) => self.graph.get_chat_session(uuid).await.ok().flatten(),
+            Err(_) => None,
+        };
+        let memory = match (
+            &self.memory_config,
+            node.as_ref().and_then(|n| n.conversation_id.clone()),
+        ) {
+            (Some(config), Some(conversation_id)) => Some(Arc::new(Mutex::new(
+                ConversationMemoryManager::new(config.clone())
+                    .with_conversation_id(conversation_id),
+            ))),
+            _ => None,
+        };
+        let spawned = node
+            .as_ref()
+            .and_then(|n| n.spawned_by.as_deref())
+            .and_then(parse_spawned_by);
+        AgentTurnState {
+            memory,
+            protocol_run_id: spawned.as_ref().and_then(|s| s.protocol_run_id),
+            protocol_state: spawned.and_then(|s| s.protocol_state),
+            objectives: super::post_stream::ObjectiveCounters {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     /// Records what the provider reported (frozen capabilities, resume token)
@@ -11646,10 +11920,12 @@ impl ChatManager {
                 first_seq,
                 &kind_name,
                 tool_policy,
-                Some(self.turn_services()),
+                Some(self.turn_services_with(self.agent_turn_state(session_id).await)),
                 extra_degraded,
             )
             .await;
+        // A failed turn is retried as the chat's configuration says, on both engines.
+        handle.configure_retry(self.config.retry.clone());
         self.spawn_agent_nats_listeners(handle);
     }
 
@@ -12085,6 +12361,22 @@ impl ChatManager {
                         );
                     }
                 }
+                // The agent engine's sessions, by the same rule. It tracks no
+                // background task of its own (P4): a running turn keeps it.
+                for handle in manager.agent_runtime.handles().await {
+                    let idle = handle.idle_for();
+                    let is_streaming = handle.is_streaming.load(Ordering::SeqCst);
+                    if session_is_expired(idle, timeout, is_streaming, 0) {
+                        expired.push(handle.session_id.clone());
+                    } else if idle > timeout {
+                        debug!(
+                            session_id = %handle.session_id,
+                            idle_secs = idle.as_secs(),
+                            is_streaming,
+                            "Idle agent session kept alive: a turn is running"
+                        );
+                    }
+                }
 
                 for id in expired {
                     info!("Cleaning up timed-out session {}", id);
@@ -12096,9 +12388,10 @@ impl ChatManager {
         });
     }
 
-    /// Get the number of currently active sessions
+    /// Get the number of currently active sessions, on both engines.
     pub async fn active_session_count(&self) -> usize {
-        self.active_sessions.read().await.len()
+        let legacy = self.active_sessions.read().await.len();
+        legacy + self.agent_runtime.len().await
     }
 }
 
@@ -18361,6 +18654,127 @@ mod tests {
     }
 
     // ====================================================================
+    // backfill_agent_session_records — the record of the sessions the agent
+    // engine served before it kept one (P8)
+    // ====================================================================
+
+    fn record_event(session: Uuid, seq: i64, event: &ChatEvent) -> ChatEventRecord {
+        ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: session,
+            seq,
+            event_type: event.event_type().to_string(),
+            data: serde_json::to_string(event).unwrap(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn result_costing(usd: Option<f64>) -> ChatEvent {
+        ChatEvent::Result {
+            session_id: String::new(),
+            duration_ms: 1,
+            cost_usd: usd,
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: None,
+            result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_backfill_rebuilds_the_record_of_an_agent_session_once_and_leaves_claude_code_alone(
+    ) {
+        let state = mock_app_state();
+        let graph = state.neo4j.clone();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // A native session of before P8: three messages, three priced turns (one
+        // unknown), a record stuck at its creation.
+        let mut native = crate::test_helpers::test_chat_session(None);
+        native.provider_id = Some("local".into());
+        native.message_count = 1;
+        graph.create_chat_session(&native).await.unwrap();
+        let typed = crate::refs::block::encode(&"x".repeat(100), &[]);
+        let events = [
+            ChatEvent::UserMessage { content: typed },
+            result_costing(Some(0.01)),
+            ChatEvent::UserMessage {
+                content: "two".into(),
+            },
+            result_costing(None),
+            ChatEvent::UserMessage {
+                content: "three".into(),
+            },
+            result_costing(Some(0.02)),
+        ];
+        graph
+            .store_chat_events(
+                native.id,
+                events
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| record_event(native.id, i as i64 + 1, e))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        // A Claude Code session: the legacy engine kept its record.
+        let mut legacy = crate::test_helpers::test_chat_session(None);
+        legacy.provider_id = Some(crate::chat::provider::resolver::CLAUDE_CODE.into());
+        legacy.message_count = 1;
+        graph.create_chat_session(&legacy).await.unwrap();
+        graph
+            .store_chat_events(
+                legacy.id,
+                vec![
+                    record_event(
+                        legacy.id,
+                        1,
+                        &ChatEvent::UserMessage {
+                            content: "a".into(),
+                        },
+                    ),
+                    record_event(
+                        legacy.id,
+                        2,
+                        &ChatEvent::UserMessage {
+                            content: "b".into(),
+                        },
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(manager.backfill_agent_session_records().await.unwrap(), 1);
+        let node = graph.get_chat_session(native.id).await.unwrap().unwrap();
+        assert_eq!(node.message_count, 3, "{node:?}");
+        assert!(
+            (node.total_cost_usd.unwrap() - 0.03).abs() < 1e-9,
+            "{node:?}"
+        );
+        let title = node.title.clone().unwrap();
+        assert_eq!(title.chars().count(), 80, "the one title rule: {title}");
+        assert!(title.ends_with("..."));
+        assert_eq!(node.preview.as_deref(), Some("x".repeat(100).as_str()));
+
+        let untouched = graph.get_chat_session(legacy.id).await.unwrap().unwrap();
+        assert_eq!(untouched.message_count, 1);
+        assert_eq!(untouched.title, None);
+
+        // Idempotent.
+        assert_eq!(manager.backfill_agent_session_records().await.unwrap(), 0);
+        let again = graph.get_chat_session(native.id).await.unwrap().unwrap();
+        assert_eq!(again.message_count, 3);
+        assert_eq!(again.total_cost_usd, node.total_cost_usd);
+    }
+
+    // ====================================================================
     // update_chat_session via mock — title, preview, conversation_id
     // ====================================================================
 
@@ -22608,6 +23022,10 @@ mod refs_turn_services_tests {
             nats: None,
             documents: crate::documents::store::DocumentStore::new(std::env::temp_dir()),
             anchor: Default::default(),
+            session: Default::default(),
+            search: crate::test_helpers::mock_app_state().meili,
+            event_emitter: None,
+            context_injector: None,
         };
 
         let note = Uuid::new_v4();

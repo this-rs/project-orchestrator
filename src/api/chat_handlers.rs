@@ -1109,6 +1109,9 @@ pub async fn get_live_activity(
 /// - `capped: true` → rate cap hit (30/5min/session); display a
 ///   "slow down" toast and disable the button briefly.
 ///
+/// **501** — the session runs on the agent engine, which tracks no background
+/// task yet (`CancelTaskUnsupported`, P12).
+///
 /// **404** — `chat_manager` not configured.
 pub async fn cancel_task(
     State(state): State<OrchestratorState>,
@@ -1121,7 +1124,13 @@ pub async fn cancel_task(
     let result = chat_manager
         .cancel_task(&session_id.to_string(), &task_id)
         .await
-        .map_err(AppError::Internal)?;
+        .map_err(|e| {
+            match e.downcast_ref::<crate::chat::manager::CancelTaskUnsupported>() {
+                // A session of the agent engine: refused, said so (501).
+                Some(unsupported) => AppError::NotImplemented(unsupported.to_string()),
+                None => AppError::Internal(e),
+            }
+        })?;
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
@@ -1296,7 +1305,8 @@ pub async fn search_messages(
 // Backfill
 // ============================================================================
 
-/// POST /api/chat/sessions/backfill-previews — Backfill title/preview for existing sessions
+/// POST /api/chat/sessions/backfill-previews — Backfill title/preview for existing
+/// sessions, and the record of the sessions of the agent engine (`agent_records`).
 pub async fn backfill_previews(
     State(state): State<OrchestratorState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1318,11 +1328,23 @@ pub async fn backfill_previews(
         0
     };
 
+    // Phase 3: the record (message count, cost, title) of the sessions the agent
+    // engine served before it kept one, from their persisted events.
+    let agent_count = if let Some(chat_manager) = &state.chat_manager {
+        chat_manager
+            .backfill_agent_session_records()
+            .await
+            .map_err(AppError::Internal)?
+    } else {
+        0
+    };
+
     let total = neo4j_count + meili_count;
     Ok(Json(serde_json::json!({
         "updated": total,
         "from_neo4j": neo4j_count,
         "from_meilisearch": meili_count,
+        "agent_records": agent_count,
         "message": format!("Backfilled title/preview for {} sessions", total)
     })))
 }

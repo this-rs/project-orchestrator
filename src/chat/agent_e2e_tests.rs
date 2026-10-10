@@ -7177,3 +7177,332 @@ mod legacy_oob_lag {
         manager.close_session(&sid).await.unwrap();
     }
 }
+
+/// P8 — the record of a native session (the agent engine) is kept as the legacy
+/// engine keeps its own (`chat::session_record`): before, it stayed at what the
+/// creation wrote (`message_count: 1`, no cost, no title) whatever the conversation did.
+mod native_session_record {
+    use super::*;
+
+    fn answer(key: &str) -> Value {
+        sse_route(
+            key,
+            vec![
+                delta(json!({"content": format!("answer to {key}")})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}),
+                json!("[DONE]"),
+            ],
+        )
+    }
+
+    async fn record_until(
+        graph: &MockGraphStore,
+        sid: &str,
+        done: impl Fn(&crate::neo4j::models::ChatSessionNode) -> bool,
+    ) -> crate::neo4j::models::ChatSessionNode {
+        let id = Uuid::parse_str(sid).unwrap();
+        let mut last = None;
+        for _ in 0..400 {
+            if let Some(node) = graph.get_chat_session(id).await.unwrap() {
+                if done(&node) {
+                    return node;
+                }
+                last = Some(node);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the record of {sid} never got there: {last:?}");
+    }
+
+    async fn results(graph: &MockGraphStore, sid: &str) -> usize {
+        graph
+            .get_chat_events(Uuid::parse_str(sid).unwrap(), 0, 500)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| e.event_type == "result")
+            .count()
+    }
+
+    async fn wait_results(graph: &MockGraphStore, sid: &str, count: usize) {
+        for _ in 0..400 {
+            if results(graph, sid).await >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{count} result event(s) never persisted");
+    }
+
+    #[tokio::test]
+    async fn a_native_session_keeps_its_title_its_message_count_and_its_cost_across_a_resume() {
+        let mut routes = vec![answer("AFTER-RESTART"), answer("SECOND-TURN")];
+        routes.extend(script().as_array().cloned().unwrap());
+        let fake = FakeOpenAi::start(Value::Array(routes));
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("native-transcripts");
+
+        let before = manager(graph.clone(), true).with_native_transcripts(&root);
+        let sid = before
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        assert!(before.agent_runtime.owns(&sid).await, "the agent engine");
+        wait_results(&graph, &sid, 1).await;
+        // A free endpoint: its turns cost a real 0, recorded.
+        let node = record_until(&graph, &sid, |n| n.total_cost_usd.is_some()).await;
+        assert_eq!(node.message_count, 1, "the opening message, once: {node:?}");
+        assert_eq!(node.total_cost_usd, Some(0.0), "{node:?}");
+        assert_eq!(node.title.as_deref(), Some("hi there"), "{node:?}");
+        assert_eq!(node.preview.as_deref(), Some("hi there"), "{node:?}");
+
+        before.send_message(&sid, "SECOND-TURN").await.unwrap();
+        wait_results(&graph, &sid, 2).await;
+        let node = record_until(&graph, &sid, |n| n.message_count >= 2).await;
+        assert_eq!(node.message_count, 2, "{node:?}");
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+
+        // The message that resumes the session after a restart counts too.
+        let after = manager(graph.clone(), true).with_native_transcripts(&root);
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        after
+            .resume_session(&sid, "AFTER-RESTART", Some(&claims))
+            .await
+            .unwrap_or_else(|e| panic!("resume failed: {e:#}"));
+        wait_results(&graph, &sid, 3).await;
+        let node = record_until(&graph, &sid, |n| n.message_count >= 3).await;
+        assert_eq!(node.message_count, 3, "{node:?}");
+        assert_eq!(node.title.as_deref(), Some("hi there"), "the title stays");
+        assert_eq!(node.total_cost_usd, Some(0.0));
+        after.close_session(&sid).await.unwrap();
+    }
+}
+
+/// P8 — the lifecycle of the agent engine's sessions follows the chat's
+/// configuration as the legacy engine's do: the idle cleanup closes them, they
+/// count in `max_sessions` / `active_session_count`, and their retries follow
+/// `RetryConfig`. Before, they were invisible to all three.
+mod agent_lifecycle {
+    use super::*;
+
+    fn configured(
+        graph: Arc<MockGraphStore>,
+        edit: impl FnOnce(&mut super::super::config::ChatConfig),
+    ) -> Arc<ChatManager> {
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph;
+        let mut config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: None,
+            nexus_browser_path: None,
+            jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        edit(&mut config);
+        Arc::new(ChatManager::new_without_memory(
+            dyn_graph,
+            state.meili,
+            config,
+        ))
+    }
+
+    async fn native_world() -> (FakeOpenAi, Arc<MockGraphStore>) {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        (fake, graph)
+    }
+
+    async fn idle(manager: &ChatManager, sid: &str) {
+        for _ in 0..400 {
+            if !manager.is_session_streaming(sid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the opening turn never ended");
+    }
+
+    #[tokio::test]
+    async fn an_idle_native_session_is_closed_by_the_cleanup() {
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |c| c.session_timeout = Duration::from_millis(300));
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        idle(&manager, &sid).await;
+        manager.start_cleanup_task();
+        for _ in 0..200 {
+            if !manager.agent_runtime.owns(&sid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("an idle native session outlived the session timeout");
+    }
+
+    #[tokio::test]
+    async fn native_sessions_count_toward_max_sessions_and_get_the_chat_retry_config() {
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |c| {
+            c.max_sessions = 1;
+            c.retry = super::super::config::RetryConfig {
+                max_attempts: 7,
+                initial_delay_ms: 5,
+                backoff_multiplier: 1.5,
+            };
+        });
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        assert_eq!(manager.active_session_count().await, 1);
+        let live = manager.live_session_snapshot().await;
+        assert!(
+            live.live.contains(&Uuid::parse_str(&sid).unwrap()),
+            "the cockpit sees the native session live"
+        );
+        let second = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await;
+        let err = second.expect_err("the limit refuses a second session");
+        assert!(
+            err.to_string()
+                .contains("Maximum number of active sessions"),
+            "{err:#}"
+        );
+        let retry = manager
+            .agent_runtime
+            .get(&sid)
+            .await
+            .unwrap()
+            .retry_config();
+        assert_eq!(
+            (retry.max_attempts, retry.initial_delay_ms),
+            (7, 5),
+            "the chat's RetryConfig, not a constant"
+        );
+        manager.close_session(&sid).await.unwrap();
+        assert_eq!(manager.active_session_count().await, 0);
+    }
+}
+
+/// P8 (c) — the post-stream steps of the Claude Code engine run at the end of each
+/// turn of the agent engine, with the same functions (`post_stream`): the context
+/// re-injected after a compaction, the objective reminder, and `cancel_task`
+/// refused, typed, instead of a silent success.
+mod post_turn {
+    use super::parity::{caps, rig};
+    use super::*;
+    use nexus_claude::agent::{AgentEvent, CompactionPhase, ProviderKind};
+    use nexus_claude::testkit::scripted::steps;
+    use nexus_claude::testkit::Step;
+
+    async fn seed_pending_tasks(graph: &MockGraphStore, project: Uuid) {
+        use crate::neo4j::models::{PlanNode, PlanStatus, TaskStatus};
+        let plan = PlanNode::new_for_project(
+            "Active Plan".into(),
+            "Plan with pending tasks".into(),
+            "test".into(),
+            50,
+            project,
+        );
+        graph.create_plan(&plan).await.unwrap();
+        graph
+            .update_plan_status(plan.id, PlanStatus::InProgress)
+            .await
+            .unwrap();
+        let mut task = crate::test_helpers::test_task_titled("Fix the parser bug");
+        task.status = TaskStatus::Pending;
+        graph.create_task(plan.id, &task).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn after_a_compaction_the_context_is_reinjected_and_the_objectives_recalled() {
+        let compacted = Step::Emit(AgentEvent::Compaction {
+            phase: CompactionPhase::Completed,
+            trigger: None,
+            pre_tokens: Some(1000),
+        });
+        let quiet = || vec![steps::done(&caps())];
+        let mut r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![compacted, steps::done(&caps())],
+                quiet(),
+                quiet(),
+                quiet(),
+                quiet(),
+            ],
+        )
+        .await;
+        seed_pending_tasks(&r.graph, r.project.id).await;
+        r.manager.send_message(&r.sid, "go on").await.unwrap();
+        let recovery = next_event(&mut r.rx, |e| {
+            matches!(e, ChatEvent::CompactionRecovery { .. })
+        })
+        .await;
+        assert!(
+            matches!(
+                recovery,
+                ChatEvent::CompactionRecovery {
+                    recovery_success: true,
+                    ..
+                }
+            ),
+            "{recovery:?}"
+        );
+        for _ in 0..400 {
+            if !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let sent = r.sent();
+        assert!(sent.len() >= 3, "the turn, then the hints: {sent:#?}");
+        assert!(
+            sent[1].contains("Post-Compaction Context") && sent[1].contains(&r.project.name),
+            "the context of the project, re-injected: {}",
+            sent[1]
+        );
+        assert!(
+            sent.iter().any(|s| {
+                s.contains(super::super::post_stream::OBJECTIVE_REMINDER_MARKER)
+                    && s.contains("Fix the parser bug")
+            }),
+            "the pending objective recalled: {sent:#?}"
+        );
+        assert!(
+            sent.len() <= 4,
+            "the reminders stop at their cap: {sent:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_task_on_the_agent_engine_is_refused_typed() {
+        let r = rig(ProviderKind::Native, vec![vec![steps::done(&caps())]]).await;
+        let err = r
+            .manager
+            .cancel_task(&r.sid, "task-1")
+            .await
+            .expect_err("no silent success");
+        assert!(
+            err.downcast_ref::<super::super::manager::CancelTaskUnsupported>()
+                .is_some(),
+            "{err:#}"
+        );
+    }
+}
