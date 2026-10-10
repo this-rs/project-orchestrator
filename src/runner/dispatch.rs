@@ -269,6 +269,13 @@ pub struct FireRequest {
 /// their cooldown.
 pub const MAX_EVENT_CHAIN_DEPTH: u32 = 5;
 
+/// `Trigger::disabled_reason` of a trigger whose author is no longer a user.
+pub const AUTHOR_REVOKED: &str = "author_revoked";
+
+/// `Trigger::disabled_reason` the startup migration sets on a schedule or
+/// event trigger written before authors were recorded.
+pub const NO_AUTHOR: &str = "no_author";
+
 /// What became of a trigger signal.
 #[derive(Debug, Clone)]
 pub enum DispatchOutcome {
@@ -320,11 +327,14 @@ impl TriggerDispatcher {
     /// and record the firing (with the run id, or with the start error).
     ///
     /// In order: the guards (enabled, cooldown, no run of this plan) → the
-    /// reservation of the signal (one dispatch per `dedupe_key`, across
-    /// instances, and the cooldown read and `last_fired` written in the same
-    /// graph write) → who the run starts as ([`Self::run_claims`]) and how
-    /// deep its event chain is → no other run active (the runner has a single
-    /// global run state) → where the run executes → the start → the firing.
+    /// refusals no race decides ([`Self::standing_refusal`]: an author that is
+    /// missing or no longer a user, an event chain too deep) → the reservation
+    /// of the signal (one dispatch per `dedupe_key`, across instances, and the
+    /// cooldown read and `last_fired` written in the same graph write) → no
+    /// other run active (the runner has a single global run state) → where the
+    /// run executes → who it starts as ([`Self::run_claims_now`]: restricted
+    /// when a third party wrote the plan since the trigger was approved) → the
+    /// start → the firing.
     ///
     /// `Err` only when the guards or the reservation cannot be read/written;
     /// a run that does not start is an `Ok(StartFailed)` with its firing.
@@ -336,6 +346,20 @@ impl TriggerDispatcher {
         let Some(mut source) = self.engine.evaluate_and_prepare(trigger).await? else {
             return Ok(DispatchOutcome::Skipped);
         };
+        if let TriggerSource::Event { chain_depth, .. } = &mut source {
+            *chain_depth = request.chain_depth.unwrap_or(1);
+        }
+
+        // Refusals that no race decides (who the run would start as, how deep
+        // its event chain is) come BEFORE the reservation: they neither burn
+        // the signal's key nor advance `last_fired`. With several instances,
+        // each may record the refusal of one signal once.
+        if let Some(error) = self
+            .standing_refusal(trigger, &source, request.claims.is_some())
+            .await?
+        {
+            return self.refused(trigger, request.payload, error).await;
+        }
 
         match self
             .graph
@@ -363,21 +387,21 @@ impl TriggerDispatcher {
             }
         }
 
-        if let TriggerSource::Event { chain_depth, .. } = &mut source {
-            *chain_depth = request.chain_depth.unwrap_or(1);
-        }
-
-        let started = match self
-            .refusal(trigger, &source, request.claims.is_some())
-            .await
-        {
+        // Decided after the reservation (it depends on what else runs now): a
+        // signal that falls during another plan's run is lost, and its firing
+        // records why.
+        let started = match self.another_run_active(trigger.plan_id).await {
             Some(error) => Err(anyhow!(error)),
             None => match resolve_run_location(self.graph.as_ref(), trigger.plan_id).await {
                 Ok((cwd, project_slug)) => {
-                    let claims = Self::run_claims(trigger, request.claims);
-                    self.starter
-                        .start_run(trigger.plan_id, source, cwd, project_slug, claims)
-                        .await
+                    match self.run_claims_now(trigger, request.claims).await {
+                        Ok(claims) => {
+                            self.starter
+                                .start_run(trigger.plan_id, source, cwd, project_slug, claims)
+                                .await
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
                 Err(e) => Err(e),
             },
@@ -406,18 +430,28 @@ impl TriggerDispatcher {
                 Ok(DispatchOutcome::Started { firing, start })
             }
             Err(e) => {
-                let error = format!("{e:#}");
-                warn!(
-                    "Trigger {} fired but plan {} did not start: {}",
-                    trigger.id, trigger.plan_id, error
-                );
-                let firing = self
-                    .engine
-                    .record_fire(trigger, None, request.payload, Some(error.clone()))
-                    .await?;
-                Ok(DispatchOutcome::StartFailed { firing, error })
+                self.refused(trigger, request.payload, format!("{e:#}"))
+                    .await
             }
         }
+    }
+
+    /// The trigger fired but no run starts: the firing records `error`.
+    async fn refused(
+        &self,
+        trigger: &Trigger,
+        payload: Option<serde_json::Value>,
+        error: String,
+    ) -> Result<DispatchOutcome> {
+        warn!(
+            "Trigger {} fired but plan {} did not start: {}",
+            trigger.id, trigger.plan_id, error
+        );
+        let firing = self
+            .engine
+            .record_fire(trigger, None, payload, Some(error.clone()))
+            .await?;
+        Ok(DispatchOutcome::StartFailed { firing, error })
     }
 
     /// Who the run of `trigger` starts as: the caller behind the signal when
@@ -430,32 +464,96 @@ impl TriggerDispatcher {
         caller.or_else(|| trigger.author.as_ref().map(|a| a.claims()))
     }
 
-    /// Why this firing starts no run, decided before anything is resolved:
-    /// a schedule or event trigger without a recorded author (written before
-    /// authors were recorded: enabling it again records one), an event chain
-    /// too deep, or a run of another plan active.
-    async fn refusal(
+    /// [`Self::run_claims`], restricted when a third-party session wrote the
+    /// plan (or its tasks, steps, constraints, decisions) after the trigger
+    /// was last approved — created or enabled, `author.recorded_at`. Nobody
+    /// approved what the run would execute: it starts with a third-party
+    /// lineage, so its agents get the restricted profile, as if that session
+    /// had started it. Enabling the trigger again approves the plan as it is.
+    pub async fn run_claims_now(
+        &self,
+        trigger: &Trigger,
+        caller: Option<Claims>,
+    ) -> Result<Option<Claims>> {
+        let claims = Self::run_claims(trigger, caller);
+        let written = self
+            .graph
+            .plan_third_party_written_at(trigger.plan_id)
+            .await?;
+        let approved = trigger.author.as_ref().map(|a| a.recorded_at);
+        let unapproved = match (written, approved) {
+            (Some(written), Some(approved)) => written > approved,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if !unapproved {
+            return Ok(claims);
+        }
+        warn!(
+            "Trigger {}: plan {} was written by a third-party session after the trigger was \
+             approved; the run starts restricted (enable the trigger again to approve)",
+            trigger.id, trigger.plan_id
+        );
+        let session = format!("trigger-{}", trigger.id);
+        let base = claims.unwrap_or_else(|| Claims::service_account(&session));
+        Ok(Some(crate::auth::jwt::with_third_party_lineage(
+            base, &session,
+        )))
+    }
+
+    /// Why this firing starts no run whatever else happens now: a schedule or
+    /// event trigger without a recorded author (written before authors were
+    /// recorded: enabling it again records one), or whose author is no longer
+    /// a user (the trigger is then disabled, `author_revoked`), or an event
+    /// chain too deep. `Err` only when the author cannot be checked.
+    async fn standing_refusal(
         &self,
         trigger: &Trigger,
         source: &TriggerSource,
         has_caller: bool,
-    ) -> Option<String> {
-        if !has_caller && trigger.author.is_none() {
-            return Some(format!(
-                "trigger {} has no recorded author: a {} trigger starts its run as whoever \
-                 created or enabled it; enable it again to record one",
-                trigger.id, trigger.trigger_type
-            ));
+    ) -> Result<Option<String>> {
+        if !has_caller {
+            let Some(author) = &trigger.author else {
+                return Ok(Some(format!(
+                    "trigger {} has no recorded author: a {} trigger starts its run as whoever \
+                     created or enabled it; enable it again to record one",
+                    trigger.id, trigger.trigger_type
+                )));
+            };
+            if self.author_revoked(author).await? {
+                self.graph
+                    .disable_trigger(trigger.id, Some(AUTHOR_REVOKED))
+                    .await?;
+                return Ok(Some(format!(
+                    "the author of trigger {} is no longer a user: the trigger is disabled \
+                     ({AUTHOR_REVOKED}); someone must enable it again to run it as themselves",
+                    trigger.id
+                )));
+            }
         }
         if let TriggerSource::Event { chain_depth, .. } = source {
             if *chain_depth > MAX_EVENT_CHAIN_DEPTH {
-                return Some(format!(
+                return Ok(Some(format!(
                     "event chain too deep: this run would be the {chain_depth}th event-triggered \
                      run in a row (at most {MAX_EVENT_CHAIN_DEPTH})"
-                ));
+                )));
             }
         }
-        self.another_run_active(trigger.plan_id).await
+        Ok(None)
+    }
+
+    /// Whether the person behind `author` is gone: a user id (the `sub` of a
+    /// person's token, and of an `agent_session` minted for that person) that
+    /// no longer names a user. The anonymous user (no-auth mode, the local MCP
+    /// server) and internal identities (not a user id) have no account to
+    /// lose and are never revoked.
+    async fn author_revoked(&self, author: &crate::runner::TriggerAuthor) -> Result<bool> {
+        match author.sub.parse::<Uuid>() {
+            Ok(id) if id != crate::auth::jwt::ANONYMOUS_USER_ID => {
+                Ok(self.graph.get_user_by_id(id).await?.is_none())
+            }
+            _ => Ok(false),
+        }
     }
 
     /// Why no run can start now: a run of another plan is active (the runner
@@ -520,6 +618,17 @@ pub(crate) mod tests {
             scope: None,
             jti: None,
         }
+    }
+
+    /// Make the person behind `claims` a user of the server (a trigger author
+    /// who is not a user any more is revoked at fire time).
+    pub(crate) async fn register_user(graph: &dyn GraphStore, claims: &Claims) {
+        let mut user = crate::test_helpers::test_user();
+        user.id = claims.sub.parse().expect("a user id");
+        user.email = claims.email.clone();
+        // One account per person (OIDC accounts are matched on external_id).
+        user.external_id = Some(claims.sub.clone());
+        graph.upsert_user(&user).await.unwrap();
     }
 
     /// The claims of an `agent_session` token bound to session `sid`, with
@@ -595,6 +704,7 @@ pub(crate) mod tests {
             author: Some(TriggerAuthor::from_claims(&Claims::service_account(
                 TEST_AUTHOR,
             ))),
+            disabled_reason: None,
         }
     }
 
@@ -1091,6 +1201,7 @@ pub(crate) mod tests {
             let dir = tempfile::tempdir().unwrap();
             let plan_id = runnable_plan(&mock, dir.path()).await;
             let author = agent_session_claims("third-s1", true, None, "bypassPermissions");
+            register_user(mock.as_ref(), &author).await;
             let mut trigger = trigger_of(plan_id, trigger_type.clone());
             trigger.author = Some(TriggerAuthor::from_claims(&author));
             mock.create_trigger(&trigger).await.unwrap();
@@ -1249,5 +1360,107 @@ pub(crate) mod tests {
         assert!(error.contains("belongs to 2 projects"), "{error}");
         assert_eq!(firing.start_error.as_deref(), Some(error.as_str()));
         assert!(starter.calls.lock().await.is_empty());
+    }
+
+    /// (Round 2, finding 3) The author is checked when the trigger fires: a
+    /// person who is no longer a user starts no run; the firing says why and
+    /// the trigger is disabled (`author_revoked`), until someone enables it
+    /// again (which records them as the author and clears the reason).
+    #[tokio::test]
+    async fn a_trigger_whose_author_was_removed_does_not_start() {
+        let mock = Arc::new(MockGraphStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = runnable_plan(&mock, dir.path()).await;
+        let person = person_claims();
+        register_user(mock.as_ref(), &person).await;
+        let mut trigger = trigger_of(plan_id, TriggerType::Schedule);
+        trigger.author = Some(TriggerAuthor::from_claims(&person));
+        mock.create_trigger(&trigger).await.unwrap();
+        let (dispatcher, starter) = dispatcher_with(&mock);
+
+        // A user: the run starts.
+        let outcome = dispatcher.dispatch(&trigger, signal("m1")).await.unwrap();
+        assert!(
+            matches!(outcome, DispatchOutcome::Started { .. }),
+            "{outcome:?}"
+        );
+        finish_all_runs(&mock).await;
+
+        // Removed: no run, the firing says why, the trigger is disabled.
+        let user_id: Uuid = person.sub.parse().unwrap();
+        mock.users.write().await.remove(&user_id);
+        let outcome = dispatcher.dispatch(&trigger, signal("m2")).await.unwrap();
+        let DispatchOutcome::StartFailed { firing, error } = outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert!(error.contains("no longer a user"), "{error}");
+        assert_eq!(firing.start_error.as_deref(), Some(error.as_str()));
+        assert_eq!(starter.calls.lock().await.len(), 1);
+        let disabled = mock.get_trigger(trigger.id).await.unwrap().unwrap();
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.disabled_reason.as_deref(), Some(AUTHOR_REVOKED));
+
+        // Someone enables it again: they are the author, the reason is gone.
+        let other = person_claims();
+        register_user(mock.as_ref(), &other).await;
+        let enabled = mock
+            .enable_trigger_as(trigger.id, &TriggerAuthor::from_claims(&other))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(enabled.enabled && enabled.disabled_reason.is_none());
+        let outcome = dispatcher.dispatch(&enabled, signal("m3")).await.unwrap();
+        assert!(
+            matches!(outcome, DispatchOutcome::Started { .. }),
+            "{outcome:?}"
+        );
+
+        // The anonymous user (no-auth mode) and internal identities have no
+        // account to lose: never revoked.
+        for sub in [
+            crate::auth::jwt::ANONYMOUS_USER_ID.to_string(),
+            TEST_AUTHOR.to_string(),
+        ] {
+            finish_all_runs(&mock).await;
+            let mut t = trigger_of(plan_id, TriggerType::Schedule);
+            t.author.as_mut().unwrap().sub = sub.clone();
+            mock.create_trigger(&t).await.unwrap();
+            let outcome = dispatcher.dispatch(&t, signal("m4")).await.unwrap();
+            assert!(
+                matches!(outcome, DispatchOutcome::Started { .. }),
+                "{sub}: {outcome:?}"
+            );
+        }
+    }
+
+    /// (Round 2, nit) A refusal that no race decides comes before the
+    /// reservation: it burns neither the signal's key nor the cooldown, so
+    /// once the cause is gone the same signal still starts its run.
+    #[tokio::test]
+    async fn a_refusal_before_the_reservation_burns_neither_the_key_nor_the_cooldown() {
+        let mock = Arc::new(MockGraphStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = runnable_plan(&mock, dir.path()).await;
+        let mut trigger = trigger_of(plan_id, TriggerType::Event);
+        mock.create_trigger(&trigger).await.unwrap();
+        let (dispatcher, starter) = dispatcher_with(&mock);
+
+        let too_deep = FireRequest {
+            dedupe_key: "e1".into(),
+            chain_depth: Some(MAX_EVENT_CHAIN_DEPTH + 1),
+            ..FireRequest::default()
+        };
+        let outcome = dispatcher.dispatch(&trigger, too_deep).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::StartFailed { .. }));
+        // Read back as the provider would: the refusal moved no last_fired.
+        trigger = mock.get_trigger(trigger.id).await.unwrap().unwrap();
+        assert!(trigger.last_fired.is_none());
+
+        let outcome = dispatcher.dispatch(&trigger, signal("e1")).await.unwrap();
+        assert!(
+            matches!(outcome, DispatchOutcome::Started { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(starter.calls.lock().await.len(), 1);
     }
 }

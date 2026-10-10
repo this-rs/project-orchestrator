@@ -1,7 +1,9 @@
 //! Neo4j Trigger operations — trigger persistence and firing history
 
 use super::client::Neo4jClient;
-use crate::runner::{SignalReservation, Trigger, TriggerAuthor, TriggerFiring, TriggerType};
+use crate::runner::{
+    PlanContent, SignalReservation, Trigger, TriggerAuthor, TriggerFiring, TriggerType,
+};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use neo4rs::query;
@@ -115,45 +117,22 @@ impl Neo4jClient {
         Ok(triggers)
     }
 
-    /// Update a trigger's enabled status, config, or cooldown.
-    pub async fn update_trigger_impl(
+    /// Disable a trigger; `reason` when the system does it (`""` stored for
+    /// none, read back as `None`).
+    pub async fn disable_trigger_impl(
         &self,
         trigger_id: Uuid,
-        enabled: Option<bool>,
-        config: Option<serde_json::Value>,
-        cooldown_secs: Option<u64>,
+        reason: Option<&str>,
     ) -> Result<Option<Trigger>> {
-        let mut set_clauses = Vec::new();
-        if enabled.is_some() {
-            set_clauses.push("t.enabled = $enabled".to_string());
-        }
-        if config.is_some() {
-            set_clauses.push("t.config = $config".to_string());
-        }
-        if cooldown_secs.is_some() {
-            set_clauses.push("t.cooldown_secs = $cooldown_secs".to_string());
-        }
-
-        if set_clauses.is_empty() {
-            return self.get_trigger_impl(trigger_id).await;
-        }
-
-        let cypher = format!(
-            "MATCH (t:Trigger {{id: $id}}) SET {} RETURN t",
-            set_clauses.join(", ")
-        );
-
-        let mut q = query(&cypher).param("id", trigger_id.to_string());
-
-        if let Some(e) = enabled {
-            q = q.param("enabled", e);
-        }
-        if let Some(c) = config {
-            q = q.param("config", serde_json::to_string(&c).unwrap_or_default());
-        }
-        if let Some(cd) = cooldown_secs {
-            q = q.param("cooldown_secs", cd as i64);
-        }
+        let q = query(
+            r#"
+            MATCH (t:Trigger {id: $id})
+            SET t.enabled = false, t.disabled_reason = $reason
+            RETURN t
+            "#,
+        )
+        .param("id", trigger_id.to_string())
+        .param("reason", reason.unwrap_or_default().to_string());
 
         let mut result = self.graph.execute(q).await?;
         if let Some(row) = result.next().await? {
@@ -196,12 +175,7 @@ impl Neo4jClient {
                 start_error: $start_error
             })
             CREATE (f)-[:FIRED_BY]->(t)
-            SET t.fire_count = t.fire_count + 1,
-                t.last_fired = CASE
-                    WHEN t.last_fired IS NULL OR t.last_fired < datetime($fired_at)
-                    THEN datetime($fired_at)
-                    ELSE t.last_fired
-                END
+            SET t.fire_count = t.fire_count + 1
             "#,
         );
 
@@ -370,6 +344,7 @@ impl Neo4jClient {
         let created_at: String = node.get("created_at")?;
         let last_fired: Option<String> = node.get("last_fired").ok();
         let author: Option<String> = node.get("author").ok();
+        let disabled_reason: Option<String> = node.get("disabled_reason").ok();
 
         let tt = match trigger_type.as_str() {
             "schedule" => TriggerType::Schedule,
@@ -392,7 +367,61 @@ impl Neo4jClient {
             author: author
                 .filter(|a| !a.is_empty())
                 .and_then(|a| serde_json::from_str(&a).ok()),
+            // A disabled_reason only means something on a disabled trigger.
+            disabled_reason: disabled_reason.filter(|r| !r.is_empty() && !enabled),
         })
+    }
+
+    /// Mark the plan `content` belongs to as written by a third-party session
+    /// (`third_party_written_at = datetime()`), in one statement.
+    pub async fn mark_third_party_write_impl(&self, content: PlanContent) -> Result<Option<Uuid>> {
+        let (pattern, id) = match content {
+            PlanContent::Plan(id) => ("MATCH (p:Plan {id: $id})", id),
+            PlanContent::Task(id) => ("MATCH (p:Plan)-[:HAS_TASK]->(:Task {id: $id})", id),
+            PlanContent::Step(id) => (
+                "MATCH (p:Plan)-[:HAS_TASK]->(:Task)-[:HAS_STEP]->(:Step {id: $id})",
+                id,
+            ),
+            PlanContent::Constraint(id) => (
+                "MATCH (p:Plan)-[:CONSTRAINED_BY]->(:Constraint {id: $id})",
+                id,
+            ),
+            PlanContent::Decision(id) => (
+                "MATCH (p:Plan)-[:HAS_TASK]->(:Task)-[:INFORMED_BY]->(:Decision {id: $id})",
+                id,
+            ),
+        };
+        // `pattern` is one of the fixed strings above; the id is a parameter.
+        let cypher = format!(
+            "{pattern} WITH DISTINCT p SET p.third_party_written_at = datetime() RETURN p.id AS plan_id"
+        );
+        let mut result = self
+            .graph
+            .execute(query(&cypher).param("id", id.to_string()))
+            .await?;
+        match result.next().await? {
+            Some(row) => Ok(row.get::<String>("plan_id")?.parse().ok()),
+            None => Ok(None),
+        }
+    }
+
+    /// When a third-party session last wrote the plan (see
+    /// [`Self::mark_third_party_write_impl`]).
+    pub async fn plan_third_party_written_at_impl(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let q = query("MATCH (p:Plan {id: $id}) RETURN toString(p.third_party_written_at) AS at")
+            .param("id", plan_id.to_string());
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => Ok(row
+                .get::<Option<String>>("at")
+                .ok()
+                .flatten()
+                .and_then(|s| s.parse::<DateTime<Utc>>().ok())),
+            None => Ok(None),
+        }
     }
 
     /// Convert a Neo4j node to a TriggerFiring.

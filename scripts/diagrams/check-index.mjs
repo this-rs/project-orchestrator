@@ -7,7 +7,7 @@
 //      status planned => pas de fichier ; tout .mmd du dossier est dans l'index ;
 //      ou bien le diagramme est EXTERNE (service Mermaid de l'equipe, regle par defaut) : l'entree
 //      porte `mermaid_id` et/ou `external` (emplacement sans hote), plus `verified_at` et `verified_sha`, et aucun .mmd local ;
-//      `verified_sha` doit designer un commit qui existe dans ce depot (`git cat-file -e`, hors reseau) ;
+//      `verified_sha` doit etre un ancetre de HEAD (`git merge-base --is-ancestor`, hors reseau) ;
 //      une entree externe verified possede ses `covers` comme une entree locale (hors reseau) ;
 //   4. l'index porte la carte d'index `po-carte` (role: index) et toute carte provisoire
 //      reprise est declaree par `supersedes:` sur l'entree qui la remplace ;
@@ -123,17 +123,28 @@ export function looksLikeHost(segment) {
   return LOCAL_HOSTNAMES.has(s) || /^\d{1,3}(\.\d{1,3}){3}$/.test(s) || /\.[a-z]{2,}$/.test(s);
 }
 
-// `verified_sha` doit DESIGNER un commit de ce depot : un sha bien forme mais absent (une
-// branche ecrasee par un squash, une faute de frappe) passerait le controle de forme et ne
-// prouverait rien. Verifie HORS RESEAU (`git cat-file -e <sha>^{commit}`) :
-//   'present' : le commit existe ; 'absent' : il n'existe pas ;
-//   'unknown' : pas un depot git, ou un clone superficiel (le commit peut exister en amont).
+// `verified_sha` doit etre un ANCETRE de HEAD : le code releve est celui dont descend la branche
+// verifiee. Exister ne suffit pas : un commit d'une branche non fusionnee, ou d'une branche
+// ecrasee par un squash mais encore presente localement, existe sans que HEAD en contienne le
+// code. Verifie HORS RESEAU (`git rev-parse --verify` puis `git merge-base --is-ancestor`) :
+//   'ancestor' : le commit est dans l'historique de HEAD ;
+//   'not-ancestor' : il existe mais HEAD n'en descend pas ;
+//   'absent' : il n'existe pas ; 'ambiguous' : le sha abrege designe plusieurs objets ;
+//   'unknown' : pas un depot git, ou un clone superficiel (l'historique est incomplet).
 export function commitStatus(root, sha) {
   const git = (args) => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' });
   const inside = git(['rev-parse', '--is-inside-work-tree']);
   if (inside.status !== 0 || inside.stdout.trim() !== 'true') return 'unknown';
-  if (git(['cat-file', '-e', `${sha}^{commit}`]).status === 0) return 'present';
-  return git(['rev-parse', '--is-shallow-repository']).stdout.trim() === 'true' ? 'unknown' : 'absent';
+  const shallow = git(['rev-parse', '--is-shallow-repository']).stdout.trim() === 'true';
+  const resolved = git(['rev-parse', '--verify', '--end-of-options', `${sha}^{commit}`]);
+  if (resolved.status !== 0) {
+    if (/ambiguous/i.test(resolved.stderr)) return 'ambiguous';
+    return shallow ? 'unknown' : 'absent';
+  }
+  const ancestor = git(['merge-base', '--is-ancestor', resolved.stdout.trim(), 'HEAD']);
+  if (ancestor.status === 0) return 'ancestor';
+  if (ancestor.status === 1) return shallow ? 'unknown' : 'not-ancestor';
+  return 'unknown';
 }
 
 export function isExternal(entry) {
@@ -389,6 +400,8 @@ function main() {
       if (e.status === 'verified' && /^[0-9a-f]{7,40}$/.test(e.verified_sha ?? '')) {
         const status = commitStatus(backendRoot, e.verified_sha);
         if (status === 'absent') problems.push(`${e.name} : 'verified_sha: ${e.verified_sha}' ne designe aucun commit de ce depot (squash ? relever contre le sha fusionne)`);
+        else if (status === 'not-ancestor') problems.push(`${e.name} : 'verified_sha: ${e.verified_sha}' est hors de l'historique de HEAD (branche non fusionnee, ou ecrasee par un squash) ; relever contre un sha dont HEAD descend`);
+        else if (status === 'ambiguous') problems.push(`${e.name} : 'verified_sha: ${e.verified_sha}' est ambigu (plusieurs objets) ; l'allonger`);
         else if (status === 'unknown') console.warn(`AVERTISSEMENT ${e.name} : 'verified_sha: ${e.verified_sha}' non verifiable ici (pas un depot git, ou clone superficiel)`);
       }
       if (existsSync(file)) problems.push(`${e.name} : diagramme externe ET docs/diagrams/${e.name}.mmd present ; une seule source`);

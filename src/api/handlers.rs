@@ -6164,6 +6164,7 @@ pub async fn create_trigger(
         fire_count: 0,
         created_at: chrono::Utc::now(),
         author: Some(TriggerAuthor::from_claims(&caller)),
+        disabled_reason: None,
     };
 
     let graph = state.orchestrator.neo4j_arc();
@@ -6255,7 +6256,7 @@ pub async fn disable_trigger(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let graph = state.orchestrator.neo4j_arc();
     let trigger = graph
-        .update_trigger(trigger_id, Some(false), None, None)
+        .disable_trigger(trigger_id, None)
         .await
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Trigger {} not found", trigger_id)))?;
@@ -9297,18 +9298,10 @@ mod tests {
     async fn test_a_third_party_sessions_schedule_trigger_runs_restricted() {
         use crate::auth::tool_profile::ToolProfile;
         use crate::runner::dispatch::tests::{
-            agent_session_claims, completed_plan_in_git_repo, person_claims, RecordingStarter,
+            agent_session_claims, completed_plan_in_git_repo, person_claims, register_user,
         };
         let app_state = crate::test_helpers::mock_app_state();
-        let chat_config = crate::chat::config::ChatConfig {
-            jwt_secret: Some("test-secret-key-minimum-32-chars!!".into()),
-            ..Default::default()
-        };
-        let manager = crate::chat::manager::ChatManager::new_without_memory(
-            app_state.neo4j.clone(),
-            app_state.meili.clone(),
-            chat_config,
-        );
+        let manager = signed_chat_manager(&app_state);
         let state = mock_server_state_from(app_state).await;
         let graph = state.orchestrator.neo4j_arc();
         let dir = tempfile::tempdir().unwrap();
@@ -9324,51 +9317,12 @@ mod tests {
             &format!("/api/plans/{plan_id}/triggers")
         ));
 
-        // The profile the agents of the run started by `trigger_id` get: the
-        // dispatch the schedule provider makes (no caller), then the claims
-        // the runner gives a task agent and the MCP token minted from them for
-        // a Claude Code agent in bypass, as `PlanRunner` does.
         let profile_of_run = |trigger_id: Uuid, minute: &'static str| {
-            let (graph, manager) = (graph.clone(), &manager);
-            async move {
-                let trigger = graph.get_trigger(trigger_id).await.unwrap().unwrap();
-                let starter = Arc::new(RecordingStarter::on(graph.clone()));
-                let dispatcher = crate::runner::TriggerDispatcher::new(
-                    graph.clone(),
-                    Arc::new(crate::runner::TriggerEngine::new(graph.clone())),
-                    starter.clone(),
-                );
-                let outcome = dispatcher
-                    .dispatch(
-                        &trigger,
-                        crate::runner::FireRequest {
-                            dedupe_key: minute.to_string(),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .unwrap();
-                let crate::runner::DispatchOutcome::Started { start, .. } = outcome else {
-                    panic!("expected a started run, got {outcome:?}");
-                };
-                let run_claims = starter.claims.lock().await[0].clone();
-                let agent = crate::runner::runner::agent_claims(run_claims.as_ref(), start.run_id);
-                let env = manager
-                    .po_mcp_env(
-                        Some("bypassPermissions"),
-                        Some(&agent),
-                        Some(&format!("agent-of-{}", start.run_id)),
-                        None,
-                        false,
-                    )
-                    .await;
-                for mut run in graph.list_active_plan_runs().await.unwrap() {
-                    run.finalize(crate::runner::PlanRunStatus::Completed);
-                    graph.update_plan_run(&run).await.unwrap();
-                }
-                ToolProfile::from_unverified_token(&env["PO_AUTH_TOKEN"])
-            }
+            profile_of_trigger_run(&graph, &manager, trigger_id, minute)
         };
+        let person = person_claims();
+        register_user(graph.as_ref(), &person).await;
+        register_user(graph.as_ref(), &third).await;
 
         // 1. Created by the third-party session: restricted.
         let schedule =
@@ -9397,7 +9351,7 @@ mod tests {
         let Json(created) = create_trigger(
             State(state.clone()),
             Path(plan_id),
-            axum::Extension(person_claims()),
+            axum::Extension(person),
             Json(schedule),
         )
         .await
@@ -9427,6 +9381,231 @@ mod tests {
             profile_of_run(person_trigger, "schedule:m3").await,
             ToolProfile::Restricted
         );
+    }
+
+    /// A chat manager that signs session tokens (the test secret).
+    fn signed_chat_manager(app_state: &crate::AppState) -> crate::chat::manager::ChatManager {
+        crate::chat::manager::ChatManager::new_without_memory(
+            app_state.neo4j.clone(),
+            app_state.meili.clone(),
+            crate::chat::config::ChatConfig {
+                jwt_secret: Some("test-secret-key-minimum-32-chars!!".into()),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The profile the agents of the run started by `trigger_id` get: the
+    /// dispatch the schedule provider makes (no caller), then the claims the
+    /// runner gives a task agent and the MCP token minted from them for a
+    /// Claude Code agent in bypass, as `PlanRunner` does. The run is then
+    /// marked over, so the next firing is not held back by it.
+    async fn profile_of_trigger_run(
+        graph: &Arc<dyn crate::neo4j::traits::GraphStore>,
+        manager: &crate::chat::manager::ChatManager,
+        trigger_id: Uuid,
+        key: &str,
+    ) -> crate::auth::tool_profile::ToolProfile {
+        use crate::runner::dispatch::tests::RecordingStarter;
+        let trigger = graph.get_trigger(trigger_id).await.unwrap().unwrap();
+        let starter = Arc::new(RecordingStarter::on(graph.clone()));
+        let dispatcher = crate::runner::TriggerDispatcher::new(
+            graph.clone(),
+            Arc::new(crate::runner::TriggerEngine::new(graph.clone())),
+            starter.clone(),
+        );
+        let outcome = dispatcher
+            .dispatch(
+                &trigger,
+                crate::runner::FireRequest {
+                    dedupe_key: key.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let crate::runner::DispatchOutcome::Started { start, .. } = outcome else {
+            panic!("expected a started run, got {outcome:?}");
+        };
+        let run_claims = starter.claims.lock().await[0].clone();
+        let agent = crate::runner::runner::agent_claims(run_claims.as_ref(), start.run_id);
+        let env = manager
+            .po_mcp_env(
+                Some("bypassPermissions"),
+                Some(&agent),
+                Some(&format!("agent-of-{}", start.run_id)),
+                None,
+                false,
+            )
+            .await;
+        for mut run in graph.list_active_plan_runs().await.unwrap() {
+            run.finalize(crate::runner::PlanRunStatus::Completed);
+            graph.update_plan_run(&run).await.unwrap();
+        }
+        crate::auth::tool_profile::ToolProfile::from_unverified_token(&env["PO_AUTH_TOKEN"])
+    }
+
+    /// (Round 2, finding 1) A person schedules their plan; a third-party
+    /// session in trust (full profile) then rewrites one of its tasks through
+    /// the REST API (where its MCP tools land). The next run must not execute
+    /// that unapproved content at full privilege: it starts restricted. A
+    /// person's own edit leaves no mark, and the person enabling the trigger
+    /// again approves the plan as it now is.
+    #[tokio::test]
+    async fn a_persons_schedule_on_a_plan_edited_by_a_third_party_does_not_run_full() {
+        use crate::auth::tool_profile::ToolProfile;
+        use crate::runner::dispatch::tests::{
+            completed_plan_in_git_repo, person_claims, register_user, trigger_of,
+        };
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (app, _) = test_app_parts(mock.clone()).await;
+        let manager = signed_chat_manager(&crate::test_helpers::mock_app_state_with_graph(
+            mock.clone(),
+        ));
+        let graph: Arc<dyn crate::neo4j::traits::GraphStore> = mock.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let (_, plan_id) = completed_plan_in_git_repo(graph.as_ref(), dir.path()).await;
+        let task_id = graph.get_plan_tasks(plan_id).await.unwrap()[0].id;
+
+        let person = person_claims();
+        register_user(graph.as_ref(), &person).await;
+        let mut trigger = trigger_of(plan_id, crate::runner::TriggerType::Schedule);
+        trigger.config = serde_json::json!({"cron": "* * * * *"});
+        trigger.author = Some(crate::runner::TriggerAuthor::from_claims(&person));
+        graph.create_trigger(&trigger).await.unwrap();
+        assert_eq!(
+            profile_of_trigger_run(&graph, &manager, trigger.id, "schedule:m1").await,
+            ToolProfile::Full
+        );
+
+        let edit = |token: String| {
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/tasks/{task_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"description":"edited"}"#))
+                .unwrap()
+        };
+
+        // A person's edit: no mark.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/tasks/{task_id}"))
+                    .header("authorization", test_bearer_token())
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"description":"edited"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "{}", resp.status());
+        assert!(graph
+            .plan_third_party_written_at(plan_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // A third-party session in trust edits the task.
+        let binding = crate::auth::jwt::AgentSessionBinding {
+            session_id: "third-edit-s1".into(),
+            ceiling: Some("bypassPermissions".into()),
+            tool_profile: None,
+            third_party: true,
+        };
+        let (token, jti) = crate::auth::jwt::generate_session_token(
+            &person_claims(),
+            Some(&binding),
+            "test-secret-key-minimum-32-chars!!",
+            3600,
+        )
+        .unwrap();
+        crate::auth::agent_tokens::register(&jti, Some("third-edit-s1"));
+        let resp = app.clone().oneshot(edit(token)).await.unwrap();
+        assert!(resp.status().is_success(), "{}", resp.status());
+        assert!(graph
+            .plan_third_party_written_at(plan_id)
+            .await
+            .unwrap()
+            .is_some());
+
+        assert_eq!(
+            profile_of_trigger_run(&graph, &manager, trigger.id, "schedule:m2").await,
+            ToolProfile::Restricted,
+            "unapproved third-party content never runs full"
+        );
+
+        // The person enables the trigger again: the plan is approved as it is.
+        graph
+            .enable_trigger_as(
+                trigger.id,
+                &crate::runner::TriggerAuthor::from_claims(&person),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            profile_of_trigger_run(&graph, &manager, trigger.id, "schedule:m3").await,
+            ToolProfile::Full
+        );
+    }
+
+    /// Writes of plan content are traced to the plan they change; reads,
+    /// run control and other routes are not.
+    #[test]
+    fn plan_content_written_names_the_content_of_a_write() {
+        use crate::auth::middleware::plan_content_written;
+        use crate::runner::PlanContent;
+        use axum::http::Method;
+        let id = Uuid::new_v4();
+        assert_eq!(
+            plan_content_written(&Method::PATCH, &format!("/api/plans/{id}")),
+            Some(PlanContent::Plan(id))
+        );
+        assert_eq!(
+            plan_content_written(&Method::POST, &format!("/api/plans/{id}/tasks")),
+            Some(PlanContent::Plan(id))
+        );
+        assert_eq!(
+            plan_content_written(&Method::POST, &format!("/api/plans/{id}/constraints")),
+            Some(PlanContent::Plan(id))
+        );
+        assert_eq!(
+            plan_content_written(&Method::DELETE, &format!("/api/tasks/{id}")),
+            Some(PlanContent::Task(id))
+        );
+        assert_eq!(
+            plan_content_written(&Method::POST, &format!("/api/tasks/{id}/steps")),
+            Some(PlanContent::Task(id))
+        );
+        assert_eq!(
+            plan_content_written(&Method::PATCH, &format!("/api/steps/{id}")),
+            Some(PlanContent::Step(id))
+        );
+        assert_eq!(
+            plan_content_written(&Method::PATCH, &format!("/api/constraints/{id}")),
+            Some(PlanContent::Constraint(id))
+        );
+        assert_eq!(
+            plan_content_written(&Method::PATCH, &format!("/api/decisions/{id}")),
+            Some(PlanContent::Decision(id))
+        );
+        for (method, path) in [
+            (Method::GET, format!("/api/tasks/{id}")),
+            (Method::POST, format!("/api/plans/{id}/run")),
+            (Method::POST, format!("/api/plans/{id}/triggers")),
+            (Method::POST, "/api/decisions/search".to_string()),
+            (Method::POST, "/api/plans".to_string()),
+            (Method::POST, format!("/api/notes/{id}")),
+        ] {
+            assert_eq!(
+                plan_content_written(&method, &path),
+                None,
+                "{method} {path}"
+            );
+        }
     }
 
     /// A webhook that passes the guards starts a real run of the trigger's

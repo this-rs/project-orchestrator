@@ -168,6 +168,42 @@ const AGENT_SCOPE_CEILING: &str = "ceiling:";
 const AGENT_SCOPE_TOOLS: &str = "tools:";
 const AGENT_SCOPE_THIRD_PARTY: &str = "lineage:third_party";
 
+/// The `scope` of an `agent_session` token bound as `binding`
+/// (`session:<id> ceiling:<mode> tools:<profile> lineage:third_party`), the
+/// inverse of [`agent_session_binding`].
+pub fn agent_session_scope(binding: &AgentSessionBinding) -> String {
+    let mut parts = vec![format!("{AGENT_SCOPE_SESSION}{}", binding.session_id)];
+    if let Some(c) = binding.ceiling.as_deref().filter(|c| !c.is_empty()) {
+        parts.push(format!("{AGENT_SCOPE_CEILING}{c}"));
+    }
+    if let Some(t) = binding.tool_profile.as_deref().filter(|t| !t.is_empty()) {
+        parts.push(format!("{AGENT_SCOPE_TOOLS}{t}"));
+    }
+    if binding.third_party {
+        parts.push(AGENT_SCOPE_THIRD_PARTY.to_string());
+    }
+    parts.join(" ")
+}
+
+/// `claims` with a third-party lineage signed into them: whatever a session
+/// opened with the result is restricted (`ChatManager::po_mcp_env`), as if a
+/// third-party session were its caller. An `agent_session` keeps its binding
+/// (session, ceiling, profile) and gains the lineage; any other token becomes
+/// an `agent_session` bound to `session_id`. Internal only: such claims are
+/// handed to the runner, never presented over HTTP.
+pub fn with_third_party_lineage(mut claims: Claims, session_id: &str) -> Claims {
+    let mut binding = agent_session_binding(&claims).unwrap_or(AgentSessionBinding {
+        session_id: session_id.to_string(),
+        ceiling: None,
+        tool_profile: None,
+        third_party: true,
+    });
+    binding.third_party = true;
+    claims.token_type = Some(TOKEN_TYPE_AGENT_SESSION.to_string());
+    claims.scope = Some(agent_session_scope(&binding));
+    claims
+}
+
 /// Generate the session token handed to a chat session's MCP subprocess
 /// (`PO_AUTH_TOKEN`).
 ///
@@ -188,19 +224,7 @@ pub fn generate_session_token(
 ) -> Result<(String, String)> {
     let now = chrono::Utc::now().timestamp();
     let jti = Uuid::new_v4().to_string();
-    let scope = binding.map(|b| {
-        let mut parts = vec![format!("{AGENT_SCOPE_SESSION}{}", b.session_id)];
-        if let Some(c) = b.ceiling.as_deref().filter(|c| !c.is_empty()) {
-            parts.push(format!("{AGENT_SCOPE_CEILING}{c}"));
-        }
-        if let Some(t) = b.tool_profile.as_deref().filter(|t| !t.is_empty()) {
-            parts.push(format!("{AGENT_SCOPE_TOOLS}{t}"));
-        }
-        if b.third_party {
-            parts.push(AGENT_SCOPE_THIRD_PARTY.to_string());
-        }
-        parts.join(" ")
-    });
+    let scope = binding.map(agent_session_scope);
     let session_claims = Claims {
         sub: claims.sub.clone(),
         email: claims.email.clone(),

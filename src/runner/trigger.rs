@@ -199,6 +199,7 @@ mod tests {
             fire_count: 0,
             created_at: Utc::now(),
             author: None,
+            disabled_reason: None,
         }
     }
 
