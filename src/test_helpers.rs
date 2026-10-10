@@ -614,6 +614,33 @@ pub async fn seed_plan_with_task(
     plan
 }
 
+/// A global persona called `name`, naming `model_preference` (free text) or none.
+pub fn test_persona(name: &str, model_preference: Option<&str>) -> PersonaNode {
+    PersonaNode {
+        id: Uuid::new_v4(),
+        project_id: None,
+        name: name.to_string(),
+        description: format!("Expert in {name}"),
+        status: PersonaStatus::Emerging,
+        complexity_default: None,
+        timeout_secs: None,
+        max_cost_usd: None,
+        model_preference: model_preference.map(str::to_string),
+        system_prompt_override: None,
+        energy: 0.5,
+        cohesion: 0.0,
+        activation_count: 0,
+        success_rate: 0.0,
+        avg_duration_secs: 0.0,
+        last_activated: None,
+        energy_boost_accumulated: 0.0,
+        energy_history: vec![],
+        origin: PersonaOrigin::Manual,
+        created_at: chrono::Utc::now(),
+        updated_at: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

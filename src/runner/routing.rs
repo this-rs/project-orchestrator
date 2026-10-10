@@ -163,6 +163,51 @@ pub fn slot_for(explicit: bool) -> Slot {
     }
 }
 
+/// The model preference of the persona a task names, resolved in the task's
+/// project scope (then among the global personas). `task_persona` is what
+/// `TaskNode.persona` holds: a persona id (possibly JSON-quoted), a name, or the
+/// `name:complexity` form the runner writes back. An unknown persona, an
+/// unreadable graph or an empty preference is `None`.
+///
+/// The returned text is free text: it is only ever matched against the alias
+/// table, never stored, logged or sent anywhere.
+pub async fn persona_preference(
+    graph: &dyn GraphStore,
+    project_id: Option<Uuid>,
+    task_persona: &str,
+) -> Option<String> {
+    let key = task_persona.trim().trim_matches('"').trim();
+    if key.is_empty() {
+        return None;
+    }
+    let mut pool = Vec::new();
+    if let Some(pid) = project_id {
+        if let Ok((found, _)) = graph.list_personas(pid, None, 1000, 0).await {
+            pool.extend(found);
+        }
+    }
+    if let Ok(global) = graph.list_global_personas().await {
+        pool.extend(global);
+    }
+    let by_id = key.parse::<Uuid>().ok();
+    let persona = pool
+        .iter()
+        .find(|p| match by_id {
+            Some(id) => p.id == id,
+            None => p.name == key,
+        })
+        .or_else(|| {
+            let (name, _) = key.rsplit_once(':')?;
+            pool.iter().find(|p| p.name == name)
+        })?;
+    persona
+        .model_preference
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+}
+
 /// Whether the task's own verification passed, read from the node's
 /// `verification_json`. `None` when nothing ran or the shape is not known.
 ///
@@ -380,5 +425,53 @@ mod tests {
         assert_eq!(outcome.duration_ms, Some(1500));
         assert_eq!(outcome.attempts, 2);
         assert_eq!(outcome.success, Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_persona_preference_is_read_by_id_name_or_the_runners_name_form() {
+        let graph = crate::neo4j::mock::MockGraphStore::new();
+        let named = crate::test_helpers::test_persona("rust-expert", Some("  opus "));
+        let silent = crate::test_helpers::test_persona("generalist", None);
+        let blank = crate::test_helpers::test_persona("blank", Some("   "));
+        for p in [&named, &silent, &blank] {
+            graph.create_persona(p).await.unwrap();
+        }
+        let pref = |key: String| {
+            let graph = &graph;
+            async move { persona_preference(graph, None, &key).await }
+        };
+        assert_eq!(pref("rust-expert".into()).await.as_deref(), Some("opus"));
+        assert_eq!(pref(named.id.to_string()).await.as_deref(), Some("opus"));
+        assert_eq!(
+            pref(format!("\"{}\"", named.id)).await.as_deref(),
+            Some("opus")
+        );
+        assert_eq!(
+            pref("rust-expert:complex".into()).await.as_deref(),
+            Some("opus")
+        );
+        // No preference, a blank one, an unknown persona, an empty key: nothing.
+        assert_eq!(pref("generalist".into()).await, None);
+        assert_eq!(pref("blank".into()).await, None);
+        assert_eq!(pref("ghost".into()).await, None);
+        assert_eq!(pref("  ".into()).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_persona_of_another_project_is_not_read() {
+        let graph = crate::neo4j::mock::MockGraphStore::new();
+        let mut other = crate::test_helpers::test_persona("rust-expert", Some("opus"));
+        other.project_id = Some(Uuid::new_v4());
+        graph.create_persona(&other).await.unwrap();
+        assert_eq!(
+            persona_preference(&graph, Some(Uuid::new_v4()), "rust-expert").await,
+            None
+        );
+        assert_eq!(
+            persona_preference(&graph, other.project_id, "rust-expert")
+                .await
+                .as_deref(),
+            Some("opus")
+        );
     }
 }

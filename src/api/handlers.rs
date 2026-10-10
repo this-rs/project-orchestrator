@@ -1294,7 +1294,7 @@ struct DelegationClose {
 /// Decides the model of a delegated task before its session opens and puts the
 /// decision id on the request (nothing else on it changes). The task's own
 /// alias is part of the signature's slot: an alias, a provider or a model named
-/// by the delegating agent, or a task persona, makes the slot explicit.
+/// by the delegating agent, or a task persona that names a model, makes the slot explicit.
 /// `None` without a routing handle, or when the decider fails.
 async fn route_delegation(
     routing: Option<&crate::runner::routing::RoutingHandle>,
@@ -1305,6 +1305,22 @@ async fn route_delegation(
     stated_class: Option<&str>,
 ) -> Option<Uuid> {
     use crate::chat::provider::cognitive::signature::{ContextHints, TaskSignature};
+    // The persona level (A16): the preference of the persona the task names.
+    // Fed whether or not a router is wired; a persona that names no model
+    // leaves the slot automatic.
+    if let Some(persona) = task.persona.as_deref() {
+        let project_id = match request.project_slug.as_deref() {
+            Some(slug) => graph
+                .get_project_by_slug(slug)
+                .await
+                .ok()
+                .flatten()
+                .map(|p| p.id),
+            None => None,
+        };
+        request.persona_alias =
+            crate::runner::routing::persona_preference(graph, project_id, persona).await;
+    }
     let routing = routing?;
     let signature = TaskSignature::from_delegation(
         stated_class,
@@ -1316,7 +1332,7 @@ async fn route_delegation(
     let explicit = request.provider.is_some()
         || request.model.is_some()
         || request.task_alias.is_some()
-        || task.persona.is_some();
+        || request.persona_alias.is_some();
     let decision = routing
         .decide(
             graph,
@@ -1356,6 +1372,7 @@ fn delegation_chat_request(
         model: None,
         provider: None,
         task_alias: None,
+        persona_alias: None,
         run_provider: None,
         run_model: None,
         max_tokens: None,
@@ -10024,5 +10041,49 @@ mod retry_plan_task_tests {
             .await
             .expect("decided");
         assert_eq!(decider.requests()[1].slot, Slot::Explicit);
+    }
+
+    #[tokio::test]
+    async fn a_task_persona_makes_the_slot_explicit_only_when_it_names_a_model() {
+        use crate::chat::provider::cognitive::candidates::Slot;
+        use crate::runner::routing::test_support::FakeDecider;
+        let graph = crate::neo4j::mock::MockGraphStore::new();
+        graph
+            .create_persona(&crate::test_helpers::test_persona("generalist", None))
+            .await
+            .unwrap();
+        graph
+            .create_persona(&crate::test_helpers::test_persona("deep", Some("opus")))
+            .await
+            .unwrap();
+        let (decider, handle) = FakeDecider::handle(true);
+        let mut task = crate::test_helpers::test_task();
+        let base =
+            delegation_chat_request("/a".into(), None, task.id, "t", None, "default").unwrap();
+
+        task.persona = Some("generalist".into());
+        let mut silent = base.clone();
+        route_delegation(Some(&handle), &graph, &mut silent, &task, 2, None)
+            .await
+            .expect("decided");
+        assert_eq!(decider.requests()[0].slot, Slot::Automatic);
+        assert_eq!(silent.persona_alias, None);
+
+        task.persona = Some("deep".into());
+        let mut named = base.clone();
+        route_delegation(Some(&handle), &graph, &mut named, &task, 2, None)
+            .await
+            .expect("decided");
+        assert_eq!(decider.requests()[1].slot, Slot::Explicit);
+        assert_eq!(named.persona_alias.as_deref(), Some("opus"));
+
+        // The persona level is fed even when no router is wired.
+        let mut unrouted = base.clone();
+        assert!(
+            route_delegation(None, &graph, &mut unrouted, &task, 2, None)
+                .await
+                .is_none()
+        );
+        assert_eq!(unrouted.persona_alias.as_deref(), Some("opus"));
     }
 }

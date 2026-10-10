@@ -2542,6 +2542,7 @@ mod tests {
             model: None,
             provider: Some("claude-code@build-box-1".into()),
             task_alias: None,
+            persona_alias: None,
             run_provider: None,
             run_model: None,
             max_tokens: None,

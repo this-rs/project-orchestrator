@@ -232,6 +232,10 @@ pub struct ChatRequest {
     /// Model alias set on the task (A16 level "task"). Internal.
     #[serde(skip)]
     pub task_alias: Option<String>,
+    /// Model preference of the persona the task names (A16 level "persona"):
+    /// free text, only ever matched against the alias table. Internal.
+    #[serde(skip)]
+    pub persona_alias: Option<String>,
     /// Provider named by the run (A16 level "run"). Internal.
     #[serde(skip)]
     pub run_provider: Option<String>,
