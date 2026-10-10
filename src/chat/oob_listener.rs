@@ -85,6 +85,8 @@ pub(crate) struct OobListenerDeps {
     pub retry_config: super::config::RetryConfig,
     pub enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
     pub search: Arc<dyn SearchStore>,
+    /// The blobs of the attached documents (the images a turn sends inline).
+    pub documents: crate::documents::store::DocumentStore,
     pub nats: Option<Arc<crate::events::NatsEmitter>>,
 }
 
@@ -507,6 +509,7 @@ async fn maybe_trigger_stream(
     let retry_config = deps.retry_config.clone();
     let enrichment_pipeline = deps.enrichment_pipeline.clone();
     let search = deps.search.clone();
+    let documents = deps.documents.clone();
     let nats = deps.nats.clone();
     // `client` was cloned earlier from ActiveSession but only the spawned
     // stream_response below consumes it; touch it here to make ownership
@@ -544,6 +547,7 @@ async fn maybe_trigger_stream(
             retry_config,
             enrichment_pipeline,
             search,
+            documents,
         )
         .await;
     });
@@ -1163,6 +1167,7 @@ mod tests {
             retry_config: crate::chat::config::RetryConfig::default(),
             enrichment_pipeline,
             search,
+            documents: crate::documents::store::DocumentStore::new(std::env::temp_dir()),
             nats: None,
         };
 

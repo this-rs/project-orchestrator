@@ -5410,13 +5410,24 @@ mod attached_images {
         store: &DocumentStore,
         text: &str,
     ) -> String {
+        attach_image(graph, store, text, "pixel.png", "image/png").await
+    }
+
+    /// [`attach_pixel`] under another name and recorded media type.
+    async fn attach_image(
+        graph: &Arc<MockGraphStore>,
+        store: &DocumentStore,
+        text: &str,
+        filename: &str,
+        media_type: &str,
+    ) -> String {
         let id = Uuid::new_v4();
         let sha256 = store.put(PIXEL).unwrap();
         graph.documents.write().await.insert(
             id,
             Document {
                 id,
-                filename: "pixel.png".to_string(),
+                filename: filename.to_string(),
                 format: DocumentFormat::Binary,
                 sha256,
                 size_bytes: PIXEL.len() as u64,
@@ -5427,7 +5438,7 @@ mod attached_images {
                 project_id: None,
                 session_id: None,
                 extracted: false,
-                mime_type: Some("image/png".to_string()),
+                mime_type: Some(media_type.to_string()),
             },
         );
         let dyn_graph: Arc<dyn GraphStore> = graph.clone();
@@ -5741,5 +5752,341 @@ mod attached_images {
         assert_eq!(image["source"]["media_type"], "image/png");
         assert_eq!(image["source"]["data"], pixel_base64());
         manager.close_session(&sid).await.unwrap();
+    }
+
+    /// Claude Code on its historical engine (the Claude CLI driven by the manager,
+    /// `ProviderPath::Legacy`, the default for a local Claude Code): the CLI is
+    /// nexus' `fake_claude` behind a wrapper that plays `transcript` and records
+    /// every line it reads on stdin.
+    mod legacy_engine {
+        use super::*;
+
+        struct LegacyCli {
+            dir: tempfile::TempDir,
+            graph: Arc<MockGraphStore>,
+            store: DocumentStore,
+            manager: ChatManager,
+        }
+
+        impl LegacyCli {
+            async fn start(transcript: &[Value]) -> Self {
+                use std::os::unix::fs::PermissionsExt;
+                let dir = tempfile::tempdir().unwrap();
+                let script = dir.path().join("transcript.jsonl");
+                std::fs::write(
+                    &script,
+                    transcript
+                        .iter()
+                        .map(|l| format!("{l}\n"))
+                        .collect::<String>(),
+                )
+                .unwrap();
+                let wrapper = dir.path().join("claude");
+                std::fs::write(
+                    &wrapper,
+                    format!(
+                        "#!/bin/sh\nFAKE_CLAUDE_TRANSCRIPT='{}' FAKE_CLAUDE_STDIN_OUT='{}' \
+                         FAKE_CLAUDE_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                        script.display(),
+                        dir.path().join("stdin.jsonl").display(),
+                        fake_bin("fake_claude").display()
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let graph = Arc::new(MockGraphStore::new());
+                let store = DocumentStore::new(dir.path().join("blobs"));
+                let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+                let config = super::super::super::config::ChatConfig {
+                    provider_path: ProviderPath::Legacy,
+                    mcp_server_path: fake_bin("fake_mcp"),
+                    nexus_tools_path: None,
+                    nexus_browser_path: None,
+                    jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+                    max_sessions: 10,
+                    retry: super::super::super::config::RetryConfig {
+                        max_attempts: 3,
+                        initial_delay_ms: 10,
+                        backoff_multiplier: 1.0,
+                    },
+                    ..Default::default()
+                };
+                let manager =
+                    ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+                        .with_document_store(store.clone());
+                manager
+                    .update_claude_cli_path(Some(wrapper.display().to_string()))
+                    .await;
+                Self {
+                    dir,
+                    graph,
+                    store,
+                    manager,
+                }
+            }
+
+            /// Opens a conversation whose first message is `message`, on the
+            /// legacy engine.
+            async fn open(&self, message: String) -> String {
+                let mut req = request(None, None, "default");
+                req.message = message;
+                req.cwd = self.dir.path().display().to_string();
+                let sid = self
+                    .manager
+                    .create_session(&req)
+                    .await
+                    .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+                    .session_id;
+                assert!(
+                    !self.manager.agent_runtime.owns(&sid).await,
+                    "Claude Code runs on the legacy engine"
+                );
+                sid
+            }
+
+            /// The stored events of `sid` once `done` holds.
+            async fn stored_until(
+                &self,
+                sid: &str,
+                done: impl Fn(&[crate::neo4j::models::ChatEventRecord]) -> bool,
+            ) -> Vec<crate::neo4j::models::ChatEventRecord> {
+                let id = Uuid::parse_str(sid).unwrap();
+                for _ in 0..400 {
+                    let events = self.graph.get_chat_events(id, 0, 500).await.unwrap();
+                    if done(&events) {
+                        return events;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                panic!("the expected events were never stored for {sid}");
+            }
+
+            /// The `user` lines the CLI read on stdin, as written.
+            fn user_lines(&self) -> Vec<String> {
+                std::fs::read_to_string(self.dir.path().join("stdin.jsonl"))
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|l| {
+                        serde_json::from_str::<Value>(l)
+                            .map(|v| v["type"] == "user")
+                            .unwrap_or(false)
+                    })
+                    .map(str::to_string)
+                    .collect()
+            }
+        }
+
+        fn init() -> Value {
+            json!({"op": "emit_json", "json": {"type": "system", "subtype": "init",
+                "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                "permissionMode": "default", "apiKeySource": "none"}})
+        }
+
+        fn await_user() -> Value {
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000})
+        }
+
+        /// One answered turn: `text`, then a successful result.
+        fn answer(text: &str) -> [Value; 2] {
+            [
+                json!({"op": "emit_json", "json": {"type": "assistant", "message": {
+                    "id": "msg_fake_1", "type": "message", "role": "assistant",
+                    "model": "fake-claude", "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": text}]}}}),
+                json!({"op": "emit_json", "json": {"type": "result", "subtype": "success",
+                    "duration_ms": 1, "duration_api_ms": 1, "is_error": false, "num_turns": 1,
+                    "session_id": "fake-cli-session", "total_cost_usd": 0.0, "result": text}}),
+            ]
+        }
+
+        fn eof() -> Value {
+            json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000})
+        }
+
+        fn answered(events: &[crate::neo4j::models::ChatEventRecord], text: &str) -> bool {
+            events
+                .iter()
+                .any(|e| e.event_type == "assistant_text" && e.data.contains(text))
+        }
+
+        /// The blocks of a user line written as content blocks, else a panic.
+        fn blocks_of(line: &str) -> Vec<Value> {
+            let user: Value = serde_json::from_str(line).unwrap();
+            user["message"]["content"]
+                .as_array()
+                .unwrap_or_else(|| panic!("a list of blocks: {user}"))
+                .clone()
+        }
+
+        fn assert_text_then_pixel(line: &str) {
+            assert!(
+                !line.contains("no text could be extracted"),
+                "the image is sent, its /raw line is not: {line}"
+            );
+            assert!(
+                line.contains("pixel.png"),
+                "the document heading stays: {line}"
+            );
+            let blocks = blocks_of(line);
+            assert_eq!(blocks.len(), 2, "text, then the image: {line}");
+            assert_eq!(blocks[0]["type"], "text", "{line}");
+            assert!(
+                blocks[0]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("look at this"),
+                "{line}"
+            );
+            assert_eq!(blocks[1]["type"], "image", "{line}");
+            assert_eq!(blocks[1]["source"]["type"], "base64");
+            assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+            assert_eq!(blocks[1]["source"]["data"], pixel_base64());
+        }
+
+        /// An image attached to the message reaches the CLI: the user line on
+        /// stdin is a list of blocks, the text then the image (base64 inline),
+        /// and the text no longer carries the image's "/raw" line.
+        #[tokio::test]
+        async fn the_legacy_engine_writes_the_attached_image_on_the_cli_stdin() {
+            let mut transcript = vec![await_user(), init()];
+            transcript.extend(answer("a pixel"));
+            transcript.push(eof());
+            let cli = LegacyCli::start(&transcript).await;
+            let message = attach_pixel(&cli.graph, &cli.store, "look at this").await;
+            let sid = cli.open(message).await;
+            cli.stored_until(&sid, |e| answered(e, "a pixel")).await;
+
+            let lines = cli.user_lines();
+            assert_eq!(lines.len(), 1, "one user line: {lines:?}");
+            assert_text_then_pixel(&lines[0]);
+            cli.manager.close_session(&sid).await.unwrap();
+        }
+
+        /// A text-only turn is written as it always was: `content` is one
+        /// string, the line is byte for byte `InputMessage::user` of it.
+        #[tokio::test]
+        async fn a_text_only_turn_on_the_legacy_engine_writes_the_same_stdin_line_as_before() {
+            let mut transcript = vec![await_user(), init()];
+            transcript.extend(answer("hello"));
+            transcript.push(eof());
+            let cli = LegacyCli::start(&transcript).await;
+            let sid = cli.open("hi there".to_string()).await;
+            cli.stored_until(&sid, |e| answered(e, "hello")).await;
+
+            let lines = cli.user_lines();
+            assert_eq!(lines.len(), 1, "one user line: {lines:?}");
+            let user: Value = serde_json::from_str(&lines[0]).unwrap();
+            let content = user["message"]["content"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a string content: {user}"))
+                .to_string();
+            assert!(content.contains("hi there"), "{content}");
+            let historical = serde_json::to_string(&nexus_claude::transport::InputMessage::user(
+                content,
+                "default".to_string(),
+            ))
+            .unwrap();
+            assert_eq!(lines[0], historical);
+            cli.manager.close_session(&sid).await.unwrap();
+        }
+
+        /// An image nexus will not hand the CLI (a media type outside png, jpeg,
+        /// gif, webp): `images_refused` / `invalid` on the wire and stored,
+        /// nothing written on stdin, no retry; the next message is served.
+        #[tokio::test]
+        async fn an_invalid_image_on_the_legacy_engine_is_refused_and_nothing_reaches_the_cli() {
+            let mut transcript = vec![await_user(), init()];
+            transcript.extend(answer("hello again"));
+            transcript.push(eof());
+            let cli = LegacyCli::start(&transcript).await;
+            let message = attach_image(
+                &cli.graph,
+                &cli.store,
+                "look at this",
+                "pixel.svg",
+                "image/svg+xml",
+            )
+            .await;
+            let sid = cli.open(message).await;
+            let stored = cli
+                .stored_until(&sid, |e| {
+                    e.iter()
+                        .any(|e| e.event_type == "error" && e.data.contains("images_refused"))
+                })
+                .await;
+            let refusal: ChatEvent = stored
+                .iter()
+                .find(|e| e.event_type == "error")
+                .map(|e| serde_json::from_str(&e.data).unwrap())
+                .unwrap();
+            match &refusal {
+                ChatEvent::Error {
+                    message,
+                    code,
+                    reason,
+                    ..
+                } => {
+                    assert_eq!(code.as_deref(), Some("images_refused"), "{refusal:?}");
+                    assert_eq!(reason.as_deref(), Some("invalid"), "{refusal:?}");
+                    assert!(message.contains("image/svg+xml"), "{message}");
+                    assert!(message.contains("not sent"), "{message}");
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(
+                !stored.iter().any(|e| e.event_type == "retrying"),
+                "a refusal is not retried"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                cli.user_lines().is_empty(),
+                "nothing was written on stdin: {:?}",
+                cli.user_lines()
+            );
+
+            // The session is usable: the next message is sent (as a string).
+            cli.manager.send_message(&sid, "hi again").await.unwrap();
+            cli.stored_until(&sid, |e| answered(e, "hello again")).await;
+            let lines = cli.user_lines();
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].contains("hi again"), "{}", lines[0]);
+            assert!(!lines[0].contains("\"type\":\"image\""), "{}", lines[0]);
+            cli.manager.close_session(&sid).await.unwrap();
+        }
+
+        /// A retryable failure (529 overloaded, nothing streamed) makes the
+        /// engine send the turn again: the second user line carries the image
+        /// too, never the text alone.
+        #[tokio::test]
+        async fn a_retried_turn_on_the_legacy_engine_sends_the_image_again() {
+            let mut transcript = vec![
+                await_user(),
+                init(),
+                json!({"op": "emit_json", "json": {"type": "result",
+                    "subtype": "error_during_execution", "duration_ms": 1,
+                    "duration_api_ms": 1, "is_error": true, "num_turns": 1,
+                    "session_id": "fake-cli-session", "total_cost_usd": 0.0,
+                    "result": "API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}"}}),
+                await_user(),
+            ];
+            transcript.extend(answer("a pixel"));
+            transcript.push(eof());
+            let cli = LegacyCli::start(&transcript).await;
+            let message = attach_pixel(&cli.graph, &cli.store, "look at this").await;
+            let sid = cli.open(message).await;
+            let stored = cli.stored_until(&sid, |e| answered(e, "a pixel")).await;
+            assert!(
+                stored.iter().any(|e| e.event_type == "retrying"),
+                "the turn was retried: {:?}",
+                stored.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+            );
+
+            let lines = cli.user_lines();
+            assert_eq!(lines.len(), 2, "the turn, then its retry: {lines:?}");
+            assert_text_then_pixel(&lines[0]);
+            assert_text_then_pixel(&lines[1]);
+            assert_eq!(lines[0], lines[1], "the retry sends the same blocks");
+            cli.manager.close_session(&sid).await.unwrap();
+        }
     }
 }
