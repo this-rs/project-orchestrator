@@ -223,6 +223,33 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Compare-and-set of the trigger's last reserved signal key.
+    ///
+    /// The first `SET` takes the write lock on the Trigger node before anything
+    /// is read, so two transactions with the same key are serialized and the
+    /// second reads the key the first committed: only one gets `true`.
+    pub async fn reserve_trigger_signal_impl(&self, trigger_id: Uuid, key: &str) -> Result<bool> {
+        let q = query(
+            r#"
+            MATCH (t:Trigger {id: $trigger_id})
+            SET t.reservation_lock = true
+            WITH t, coalesce(t.last_signal_key, '') <> $key AS won
+            FOREACH (_ IN CASE WHEN won THEN [1] ELSE [] END |
+                SET t.last_signal_key = $key)
+            REMOVE t.reservation_lock
+            RETURN won
+            "#,
+        )
+        .param("trigger_id", trigger_id.to_string())
+        .param("key", key.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => Ok(row.get::<bool>("won")?),
+            None => Ok(false),
+        }
+    }
+
     /// List trigger firings for a given trigger, ordered by fired_at desc.
     pub async fn list_trigger_firings_impl(
         &self,

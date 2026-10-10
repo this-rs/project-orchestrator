@@ -1,18 +1,19 @@
 //! ScheduleProvider — cron-based trigger activation.
 //!
 //! Uses a simple tokio interval loop to evaluate schedule triggers.
-//! Each trigger's `config.cron` contains a cron expression (5 fields, local
-//! time) that is checked against the current minute at each tick; a trigger
-//! whose expression matches, and that has not fired in this minute yet, goes
-//! to the `TriggerDispatcher`, which starts the plan run.
+//! Each trigger's `config.cron` contains a cron expression (5 fields, **UTC**)
+//! checked, at each tick, against every minute elapsed since the previous tick
+//! (so a tick that drifts or lands late misses no minute). A trigger due in one
+//! of those minutes goes to the `TriggerDispatcher` with that minute as its
+//! signal key: every instance reserves the same key, one run starts.
 
 use super::TriggerProvider;
 use crate::neo4j::traits::GraphStore;
-use crate::runner::dispatch::{DispatchOutcome, TriggerDispatcher};
+use crate::runner::dispatch::{DispatchOutcome, FireRequest, TriggerDispatcher};
 use crate::runner::models::{Trigger, TriggerType};
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Datelike, Local, Timelike};
+use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
@@ -66,12 +67,16 @@ impl TriggerProvider for ScheduleProvider {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(tick));
             info!("ScheduleProvider started (tick interval: {}s)", tick);
 
+            // End of the window evaluated by the previous tick.
+            let mut since: Option<DateTime<Utc>> = None;
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        if let Err(e) = evaluate_schedule_triggers(&graph, &dispatcher, Local::now()).await {
+                        let now = Utc::now();
+                        if let Err(e) = evaluate_schedule_triggers(&graph, &dispatcher, since, now).await {
                             error!("ScheduleProvider tick error: {}", e);
                         }
+                        since = Some(now);
                     }
                     _ = shutdown_rx.changed() => {
                         info!("ScheduleProvider shutting down");
@@ -95,24 +100,35 @@ impl TriggerProvider for ScheduleProvider {
     }
 }
 
-/// Evaluate all Schedule triggers at `now`.
+/// Longest catch-up of a tick, in minutes (after a sleep or a stall, the
+/// latest due minute in this window fires once; older ones are not replayed).
+const MAX_CATCH_UP_MINUTES: i64 = 10;
+
+/// Evaluate all Schedule triggers over the minutes in `(since, now]`.
 ///
-/// A trigger whose `config.cron` matches the minute of `now` and that has not
-/// fired in that minute yet goes to the dispatcher, which checks the guards,
-/// starts the plan run and records the firing.
+/// A trigger due in one of these minutes goes to the dispatcher with the
+/// minute as its signal key; the dispatcher checks the guards, reserves the
+/// key (one start per minute, across instances), starts the plan run and
+/// records the firing.
 async fn evaluate_schedule_triggers(
     graph: &Arc<dyn GraphStore>,
     dispatcher: &TriggerDispatcher,
-    now: DateTime<Local>,
+    since: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
 ) -> Result<()> {
     let triggers = graph.list_all_triggers(Some("schedule")).await?;
 
     let mut fired_count = 0;
     for trigger in &triggers {
-        if !is_due(trigger, now) {
+        let Some(minute) = due_minute(trigger, since, now) else {
             continue;
-        }
-        match dispatcher.dispatch(trigger, None).await {
+        };
+        let request = FireRequest {
+            dedupe_key: format!("schedule:{}", minute.to_rfc3339()),
+            payload: None,
+            claims: None,
+        };
+        match dispatcher.dispatch(trigger, request).await {
             Ok(DispatchOutcome::Started { start, .. }) => {
                 fired_count += 1;
                 info!(
@@ -125,6 +141,12 @@ async fn evaluate_schedule_triggers(
                 warn!(
                     "Schedule trigger {} fired, plan {} not started: {}",
                     trigger.id, trigger.plan_id, error
+                );
+            }
+            Ok(DispatchOutcome::Duplicate) => {
+                debug!(
+                    "Schedule trigger {}: minute {} already dispatched",
+                    trigger.id, minute
                 );
             }
             Ok(DispatchOutcome::Skipped) => {
@@ -145,32 +167,61 @@ async fn evaluate_schedule_triggers(
     Ok(())
 }
 
-/// Whether `trigger` is due at `now`: its cron matches the minute of `now` and
-/// it has not fired in that minute (a tick may land twice in one minute).
-/// A missing or invalid cron is never due.
-fn is_due(trigger: &Trigger, now: DateTime<Local>) -> bool {
+/// The minute (UTC, seconds zeroed) in which `trigger` is due within the
+/// window `(since, now]`: the latest one its cron matches. The first tick
+/// (`since` = `None`) looks at the minute of `now` only; a tick in the same
+/// minute as the previous one finds no new minute. A missing or invalid cron
+/// is never due.
+fn due_minute(
+    trigger: &Trigger,
+    since: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
     let Some(expr) = trigger.config.get("cron").and_then(|v| v.as_str()) else {
         warn!(
             "Schedule trigger {} has no config.cron, never due",
             trigger.id
         );
-        return false;
+        return None;
     };
-    match cron_matches(expr, now) {
-        Some(true) => {}
-        Some(false) => return false,
-        None => {
-            warn!(
-                "Schedule trigger {}: invalid cron '{}', never due",
-                trigger.id, expr
-            );
-            return false;
-        }
+    if validate_cron(expr).is_err() {
+        warn!(
+            "Schedule trigger {}: invalid cron '{}', never due",
+            trigger.id, expr
+        );
+        return None;
     }
-    let minute = |t: DateTime<Local>| t.with_second(0).and_then(|t| t.with_nanosecond(0));
-    match trigger.last_fired {
-        Some(last) => minute(last.with_timezone(&Local)) != minute(now),
-        None => true,
+    let end = floor_minute(now);
+    let start = since
+        .map(|s| floor_minute(s) + Duration::minutes(1))
+        .unwrap_or(end)
+        .max(end - Duration::minutes(MAX_CATCH_UP_MINUTES - 1));
+    let mut minute = end;
+    while minute >= start {
+        if cron_matches(expr, minute) == Some(true) {
+            return Some(minute);
+        }
+        minute -= Duration::minutes(1);
+    }
+    None
+}
+
+fn floor_minute(t: DateTime<Utc>) -> DateTime<Utc> {
+    t.with_second(0)
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(t)
+}
+
+/// `Ok` when `expr` is a cron expression this provider understands (see
+/// [`cron_matches`]); the error says what is expected. Checked when a schedule
+/// trigger is created.
+pub fn validate_cron(expr: &str) -> std::result::Result<(), String> {
+    match cron_matches(expr, DateTime::<Utc>::UNIX_EPOCH) {
+        Some(_) => Ok(()),
+        None => Err(format!(
+            "invalid cron '{expr}': expected 5 fields (minute hour day-of-month month \
+             day-of-week, UTC), each '*', 'N', 'A-B', '*/S', 'A-B/S' or a comma list"
+        )),
     }
 }
 
@@ -180,7 +231,7 @@ fn is_due(trigger: &Trigger, now: DateTime<Local>) -> bool {
 /// Each field takes `*`, `N`, `A-B`, `*/S`, `A-B/S` and comma lists of these;
 /// day-of-week is 0-7 (0 and 7 are Sunday). As in cron, when both
 /// day-of-month and day-of-week are restricted, either one matching suffices.
-fn cron_matches(expr: &str, now: DateTime<Local>) -> Option<bool> {
+fn cron_matches(expr: &str, now: DateTime<Utc>) -> Option<bool> {
     let fields: Vec<&str> = expr.split_whitespace().collect();
     let [minute, hour, dom, month, dow] = fields.as_slice() else {
         return None;
@@ -236,7 +287,7 @@ mod tests {
     use crate::neo4j::mock::MockGraphStore;
     use crate::runner::dispatch::tests::{runnable_plan, trigger_of, RecordingStarter};
     use crate::runner::trigger::TriggerEngine;
-    use chrono::{TimeZone, Utc};
+    use chrono::TimeZone;
     use uuid::Uuid;
 
     fn dispatcher_on(
@@ -255,6 +306,26 @@ mod tests {
         let mut trigger = trigger_of(plan_id, TriggerType::Schedule);
         trigger.config = serde_json::json!({ "cron": cron });
         trigger
+    }
+
+    fn utc(h: u32, m: u32, s: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 10, h, m, s).unwrap()
+    }
+
+    async fn tick(
+        mock: &Arc<MockGraphStore>,
+        dispatcher: &TriggerDispatcher,
+        since: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) {
+        evaluate_schedule_triggers(
+            &(mock.clone() as Arc<dyn GraphStore>),
+            dispatcher,
+            since,
+            now,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -279,13 +350,7 @@ mod tests {
         mock.create_trigger(&trigger).await.unwrap();
         let (dispatcher, starter) = dispatcher_on(&mock);
 
-        evaluate_schedule_triggers(
-            &(mock.clone() as Arc<dyn GraphStore>),
-            &dispatcher,
-            Local::now(),
-        )
-        .await
-        .unwrap();
+        tick(&mock, &dispatcher, None, Utc::now()).await;
 
         let calls = starter.calls.lock().await;
         assert_eq!(calls.len(), 1, "the run was started");
@@ -302,6 +367,34 @@ mod tests {
         );
     }
 
+    /// Two instances (or two ticks) evaluating the same minute: one run.
+    #[tokio::test]
+    async fn the_same_minute_dispatched_twice_starts_one_run() {
+        let mock = Arc::new(MockGraphStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = runnable_plan(&mock, dir.path()).await;
+        let trigger = schedule_trigger(plan_id, "30 3 * * *");
+        mock.create_trigger(&trigger).await.unwrap();
+        let (dispatcher, starter) = dispatcher_on(&mock);
+        let (other_instance, other_starter) = dispatcher_on(&mock);
+
+        tick(&mock, &dispatcher, None, utc(3, 30, 1)).await;
+        assert_eq!(starter.calls.lock().await.len(), 1);
+        // The run is over: only the reservation of 03:30 stands in the way now.
+        crate::runner::dispatch::tests::finish_all_runs(&mock).await;
+        tick(&mock, &other_instance, None, utc(3, 30, 2)).await;
+
+        let started = starter.calls.lock().await.len() + other_starter.calls.lock().await.len();
+        assert_eq!(started, 1, "one run for one minute");
+        assert_eq!(
+            mock.list_trigger_firings(trigger.id, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn a_schedule_start_failure_is_recorded_in_the_firing() {
         let mock = Arc::new(MockGraphStore::new());
@@ -312,13 +405,7 @@ mod tests {
         mock.create_trigger(&trigger).await.unwrap();
         let (dispatcher, starter) = dispatcher_on(&mock);
 
-        evaluate_schedule_triggers(
-            &(mock.clone() as Arc<dyn GraphStore>),
-            &dispatcher,
-            Local::now(),
-        )
-        .await
-        .unwrap();
+        tick(&mock, &dispatcher, None, Utc::now()).await;
 
         assert!(starter.calls.lock().await.is_empty());
         let firings = mock.list_trigger_firings(trigger.id, 10).await.unwrap();
@@ -340,13 +427,7 @@ mod tests {
         mock.create_trigger(&trigger).await.unwrap();
         let (dispatcher, starter) = dispatcher_on(&mock);
 
-        evaluate_schedule_triggers(
-            &(mock.clone() as Arc<dyn GraphStore>),
-            &dispatcher,
-            Local::now(),
-        )
-        .await
-        .unwrap();
+        tick(&mock, &dispatcher, None, Utc::now()).await;
 
         // No firing, no run for disabled trigger
         assert!(starter.calls.lock().await.is_empty());
@@ -363,10 +444,7 @@ mod tests {
         mock.create_trigger(&trigger).await.unwrap();
         let (dispatcher, starter) = dispatcher_on(&mock);
 
-        let at = Local.with_ymd_and_hms(2026, 10, 10, 3, 31, 5).unwrap();
-        evaluate_schedule_triggers(&(mock.clone() as Arc<dyn GraphStore>), &dispatcher, at)
-            .await
-            .unwrap();
+        tick(&mock, &dispatcher, Some(utc(3, 30, 5)), utc(3, 31, 5)).await;
         assert!(starter.calls.lock().await.is_empty());
         assert!(mock
             .list_trigger_firings(trigger.id, 10)
@@ -376,31 +454,49 @@ mod tests {
     }
 
     #[test]
-    fn is_due_once_per_matching_minute() {
-        let at = Local.with_ymd_and_hms(2026, 10, 10, 3, 30, 40).unwrap();
-        let mut trigger = schedule_trigger(Uuid::new_v4(), "30 3 * * *");
-        assert!(is_due(&trigger, at));
-        trigger.last_fired = Some(
-            Local
-                .with_ymd_and_hms(2026, 10, 10, 3, 30, 1)
-                .unwrap()
-                .with_timezone(&Utc),
+    fn due_minute_covers_every_minute_since_the_last_tick_once() {
+        let trigger = schedule_trigger(Uuid::new_v4(), "30 3 * * *");
+        // First tick: the current minute only.
+        assert_eq!(
+            due_minute(&trigger, None, utc(3, 30, 40)),
+            Some(utc(3, 30, 0))
         );
-        assert!(!is_due(&trigger, at), "already fired in this minute");
-        trigger.last_fired = Some(Utc::now() - chrono::Duration::days(1));
-        assert!(is_due(&trigger, at));
+        assert_eq!(due_minute(&trigger, None, utc(3, 31, 0)), None);
+        // A late tick (03:29:59.9 → 03:31:00.1) does not skip 03:30.
+        assert_eq!(
+            due_minute(&trigger, Some(utc(3, 29, 59)), utc(3, 31, 0)),
+            Some(utc(3, 30, 0))
+        );
+        // A second tick in the same minute finds no new minute.
+        assert_eq!(
+            due_minute(&trigger, Some(utc(3, 30, 1)), utc(3, 30, 59)),
+            None
+        );
+        // The next tick does not see 03:30 again.
+        assert_eq!(
+            due_minute(&trigger, Some(utc(3, 30, 40)), utc(3, 31, 40)),
+            None
+        );
+        // After a long stall, only the last MAX_CATCH_UP_MINUTES minutes count.
+        assert_eq!(
+            due_minute(&trigger, Some(utc(3, 0, 0)), utc(3, 45, 0)),
+            None
+        );
+        assert_eq!(
+            due_minute(&trigger, Some(utc(3, 0, 0)), utc(3, 39, 0)),
+            Some(utc(3, 30, 0))
+        );
 
-        trigger.config = serde_json::json!({ "cron": "not a cron" });
-        trigger.last_fired = None;
-        assert!(!is_due(&trigger, at));
-        trigger.config = serde_json::json!({});
-        assert!(!is_due(&trigger, at));
+        let mut invalid = schedule_trigger(Uuid::new_v4(), "not a cron");
+        assert_eq!(due_minute(&invalid, None, utc(3, 30, 0)), None);
+        invalid.config = serde_json::json!({});
+        assert_eq!(due_minute(&invalid, None, utc(3, 30, 0)), None);
     }
 
     #[test]
     fn cron_expressions() {
-        // Saturday 10 October 2026, 03:30.
-        let at = Local.with_ymd_and_hms(2026, 10, 10, 3, 30, 0).unwrap();
+        // Saturday 10 October 2026, 03:30 UTC.
+        let at = utc(3, 30, 0);
         assert_eq!(cron_matches("* * * * *", at), Some(true));
         assert_eq!(cron_matches("30 3 * * *", at), Some(true));
         assert_eq!(cron_matches("0 3 * * *", at), Some(false));
@@ -414,14 +510,20 @@ mod tests {
         assert_eq!(cron_matches("30 3 10 * 1", at), Some(true));
         assert_eq!(cron_matches("30 3 1 * 1", at), Some(false));
         // Sunday is 0 or 7.
-        let sunday = Local.with_ymd_and_hms(2026, 10, 11, 3, 30, 0).unwrap();
+        let sunday = Utc.with_ymd_and_hms(2026, 10, 11, 3, 30, 0).unwrap();
         assert_eq!(cron_matches("30 3 * * 7", sunday), Some(true));
         assert_eq!(cron_matches("30 3 * * 0", sunday), Some(true));
         // Invalid.
-        assert_eq!(cron_matches("* * * *", at), None);
-        assert_eq!(cron_matches("60 * * * *", at), None);
-        assert_eq!(cron_matches("*/0 * * * *", at), None);
-        assert_eq!(cron_matches("5-1 * * * *", at), None);
-        assert_eq!(cron_matches("@daily", at), None);
+        for invalid in [
+            "* * * *",
+            "60 * * * *",
+            "*/0 * * * *",
+            "5-1 * * * *",
+            "@daily",
+        ] {
+            assert_eq!(cron_matches(invalid, at), None, "{invalid}");
+            assert!(validate_cron(invalid).is_err(), "{invalid}");
+        }
+        assert!(validate_cron("*/5 1-3 * * 1-5").is_ok());
     }
 }

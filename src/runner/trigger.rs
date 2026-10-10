@@ -24,6 +24,22 @@ pub enum EvalResult {
     ActiveRunExists { run_id: Uuid },
 }
 
+/// Floor of the cooldown of event and webhook triggers, whatever their
+/// `cooldown_secs` (0 by default): two event triggers that answer each other's
+/// plans, or a burst of deliveries, start at most one run a minute each.
+/// A schedule trigger is already held to one firing per matching minute.
+pub const MIN_AUTOMATIC_COOLDOWN_SECS: u64 = 60;
+
+/// The cooldown `evaluate` applies to `trigger`.
+pub fn effective_cooldown_secs(trigger: &Trigger) -> u64 {
+    match trigger.trigger_type {
+        TriggerType::Event | TriggerType::Webhook => {
+            trigger.cooldown_secs.max(MIN_AUTOMATIC_COOLDOWN_SECS)
+        }
+        TriggerType::Schedule | TriggerType::Chat => trigger.cooldown_secs,
+    }
+}
+
 /// Trigger evaluation engine.
 ///
 /// Stateless — all state is in Neo4j. Each `evaluate()` call checks
@@ -56,10 +72,11 @@ impl TriggerEngine {
         }
 
         // 2. Check cooldown
-        if trigger.cooldown_secs > 0 {
+        let cooldown_secs = effective_cooldown_secs(trigger);
+        if cooldown_secs > 0 {
             if let Some(last_fired) = trigger.last_fired {
                 let elapsed = (Utc::now() - last_fired).num_seconds();
-                let cooldown = trigger.cooldown_secs as i64;
+                let cooldown = cooldown_secs as i64;
                 if elapsed < cooldown {
                     return Ok(EvalResult::CooldownActive {
                         remaining_secs: cooldown - elapsed,
@@ -239,6 +256,29 @@ mod tests {
 
         let result = engine.evaluate(&trigger).await.unwrap();
         assert!(matches!(result, EvalResult::ActiveRunExists { .. }));
+    }
+
+    #[tokio::test]
+    async fn event_and_webhook_triggers_have_a_minimum_cooldown() {
+        let mock = Arc::new(MockGraphStore::new());
+        let engine = TriggerEngine::new(mock);
+        for trigger_type in [TriggerType::Event, TriggerType::Webhook] {
+            let mut trigger = make_trigger(Uuid::new_v4(), true, 0);
+            trigger.trigger_type = trigger_type.clone();
+            trigger.last_fired = Some(Utc::now() - chrono::Duration::seconds(10));
+            assert!(
+                matches!(
+                    engine.evaluate(&trigger).await.unwrap(),
+                    EvalResult::CooldownActive { .. }
+                ),
+                "{trigger_type:?} with cooldown_secs 0 still waits {MIN_AUTOMATIC_COOLDOWN_SECS}s"
+            );
+            trigger.last_fired = Some(Utc::now() - chrono::Duration::seconds(61));
+            assert!(matches!(
+                engine.evaluate(&trigger).await.unwrap(),
+                EvalResult::Fire
+            ));
+        }
     }
 
     #[tokio::test]

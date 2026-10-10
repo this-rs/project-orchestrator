@@ -742,6 +742,7 @@ mod tests {
         let app = Router::new()
             .route("/api/chat/sessions", get(ok_handler).post(ok_handler))
             .route("/api/plans/{id}/run", post(ok_handler))
+            .route("/api/webhooks/{trigger_id}", post(ok_handler))
             .route("/api/plans/{id}/tasks/{tid}/delegate", post(ok_handler))
             .route("/api/admin/backfill-synapses", post(ok_handler))
             .route("/api/notes", post(ok_handler))
@@ -774,6 +775,8 @@ mod tests {
         for (method, uri) in [
             ("POST", "/api/chat/sessions"),
             ("POST", "/api/plans/p1/run"),
+            // A webhook starts a run like `run` does: the same boundary.
+            ("POST", "/api/webhooks/t1"),
             ("POST", "/api/plans/p1/tasks/t1/delegate"),
             ("POST", "/api/admin/backfill-synapses"),
         ] {

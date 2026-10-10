@@ -4,9 +4,9 @@
 //! triggers when matching events are received (e.g., plan_completed → start plan B).
 
 use super::TriggerProvider;
-use crate::events::CrudEvent;
+use crate::events::{CrudEvent, EntityType};
 use crate::neo4j::traits::GraphStore;
-use crate::runner::dispatch::{DispatchOutcome, TriggerDispatcher};
+use crate::runner::dispatch::{DispatchOutcome, FireRequest, TriggerDispatcher};
 use crate::runner::models::TriggerType;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -124,6 +124,16 @@ async fn handle_event(
 
     // Get all Event-type triggers
     let triggers = graph.list_all_triggers(Some("event")).await?;
+    if triggers.is_empty() {
+        return Ok(());
+    }
+    // The plan the event belongs to (resolved once, only when a trigger may use it).
+    let mut event_plan: Option<Option<uuid::Uuid>> = None;
+    // Same signal on every instance (NATS bridge): one dispatch wins it.
+    let dedupe_key = format!(
+        "event:{:?}:{:?}:{}:{}",
+        event.entity_type, event.action, event.entity_id, event.timestamp
+    );
 
     for trigger in &triggers {
         // Match config.event_type against both raw event type and status-aware type
@@ -149,9 +159,26 @@ async fn handle_event(
             }
         }
 
+        // An event of the trigger's own plan (its tasks, its runs) never
+        // relaunches that plan: a run would trigger itself.
+        if event_plan.is_none() {
+            event_plan = Some(plan_of_event(graph.as_ref(), event).await);
+        }
+        if event_plan.flatten() == Some(trigger.plan_id) {
+            debug!(
+                "EventProvider: trigger {} ignores event {} of its own plan {}",
+                trigger.id, event_type, trigger.plan_id
+            );
+            continue;
+        }
+
         // Evaluate the guards, start the run, record the firing
-        let payload = serde_json::to_value(event).ok();
-        match dispatcher.dispatch(trigger, payload).await {
+        let request = FireRequest {
+            dedupe_key: dedupe_key.clone(),
+            payload: serde_json::to_value(event).ok(),
+            claims: None,
+        };
+        match dispatcher.dispatch(trigger, request).await {
             Ok(DispatchOutcome::Started { start, .. }) => {
                 info!(
                     "Event trigger {} started run {} of plan {} on event {}",
@@ -162,6 +189,12 @@ async fn handle_event(
                 warn!(
                     "Event trigger {} fired on event {}, plan {} not started: {}",
                     trigger.id, event_type, trigger.plan_id, error
+                );
+            }
+            Ok(DispatchOutcome::Duplicate) => {
+                debug!(
+                    "Event trigger {}: event {} already dispatched",
+                    trigger.id, event_type
                 );
             }
             Ok(DispatchOutcome::Skipped) => {
@@ -176,6 +209,31 @@ async fn handle_event(
     }
 
     Ok(())
+}
+
+/// The plan `event` belongs to: the plan itself, a task's plan, a run's plan.
+/// `None` when it belongs to none (or it cannot be read).
+async fn plan_of_event(graph: &dyn GraphStore, event: &CrudEvent) -> Option<uuid::Uuid> {
+    let id = event.entity_id.parse::<uuid::Uuid>().ok();
+    match event.entity_type {
+        EntityType::Plan => id,
+        EntityType::Task => graph.get_task_plan_id(id?).await.ok().flatten(),
+        EntityType::Runner => match event
+            .payload
+            .get("plan_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+        {
+            Some(plan_id) => Some(plan_id),
+            None => graph
+                .get_plan_run(id?)
+                .await
+                .ok()
+                .flatten()
+                .map(|r| r.plan_id),
+        },
+        _ => None,
+    }
 }
 
 // ============================================================================
@@ -303,6 +361,59 @@ mod tests {
         assert_eq!(firings.len(), 1);
         assert!(firings[0].plan_run_id.is_none());
         assert!(firings[0].start_error.is_some());
+    }
+
+    /// The tasks and the runs of the trigger's own plan never relaunch it.
+    #[tokio::test]
+    async fn events_of_the_target_plan_do_not_relaunch_it() {
+        let mock = Arc::new(MockGraphStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = runnable_plan(&mock, dir.path()).await;
+        let task_id = mock.get_plan_tasks(plan_id).await.unwrap()[0].id;
+        let trigger = event_trigger(plan_id, serde_json::json!({"event_type": "task_updated"}));
+        mock.create_trigger(&trigger).await.unwrap();
+        let (dispatcher, starter) = dispatcher_on(&mock);
+
+        let own_task = CrudEvent {
+            entity_type: EntityType::Task,
+            action: CrudAction::Updated,
+            entity_id: task_id.to_string(),
+            related: None,
+            payload: serde_json::json!({"status": "completed"}),
+            timestamp: Utc::now().to_rfc3339(),
+            project_id: None,
+        };
+        handle_event(
+            &(mock.clone() as Arc<dyn GraphStore>),
+            &dispatcher,
+            &own_task,
+        )
+        .await
+        .unwrap();
+        assert!(starter.calls.lock().await.is_empty());
+        assert!(mock
+            .list_trigger_firings(trigger.id, 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // The same event on a task of another plan does start it.
+        let other_plan = crate::test_helpers::test_plan();
+        mock.create_plan(&other_plan).await.unwrap();
+        let other_task = crate::test_helpers::test_task();
+        mock.create_task(other_plan.id, &other_task).await.unwrap();
+        let foreign = CrudEvent {
+            entity_id: other_task.id.to_string(),
+            ..own_task
+        };
+        handle_event(
+            &(mock.clone() as Arc<dyn GraphStore>),
+            &dispatcher,
+            &foreign,
+        )
+        .await
+        .unwrap();
+        assert_eq!(starter.calls.lock().await.len(), 1);
     }
 
     #[tokio::test]

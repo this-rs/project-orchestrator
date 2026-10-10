@@ -23,7 +23,7 @@ use crate::runner::trigger::TriggerEngine;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 // ============================================================================
@@ -109,12 +109,15 @@ impl PlanRunnerFactory {
 /// Starts a plan run. Implemented by [`PlanRunnerFactory`]; a seam for tests.
 #[async_trait]
 pub trait PlanRunStarter: Send + Sync {
+    /// `claims`: the caller behind the signal, whose identity (and lineage) the
+    /// run's agents inherit; `None` for the system (schedule, event).
     async fn start_run(
         &self,
         plan_id: Uuid,
         source: TriggerSource,
         cwd: String,
         project_slug: Option<String>,
+        claims: Option<Claims>,
     ) -> Result<StartResult>;
 }
 
@@ -126,12 +129,18 @@ impl PlanRunStarter for PlanRunnerFactory {
         source: TriggerSource,
         cwd: String,
         project_slug: Option<String>,
+        claims: Option<Claims>,
     ) -> Result<StartResult> {
-        // No caller: the run's agents use a service account each, the budget
-        // and the routing are the defaults.
-        self.build(RunOptions::default())
-            .start(plan_id, source, cwd, project_slug)
-            .await
+        // The caller's claims when there is one (a webhook): a third-party
+        // lineage stays restricted in the run, as with `plan(action: "run")`.
+        // Without (schedule, event), each agent uses a service account. Budget
+        // and routing are the defaults.
+        self.build(RunOptions {
+            claims,
+            ..RunOptions::default()
+        })
+        .start(plan_id, source, cwd, project_slug)
+        .await
     }
 }
 
@@ -147,6 +156,7 @@ impl PlanRunStarter for NoPlanRunner {
         _source: TriggerSource,
         _cwd: String,
         _project_slug: Option<String>,
+        _claims: Option<Claims>,
     ) -> Result<StartResult> {
         Err(anyhow!(
             "Plan {} not started: the chat manager is not initialized, no run can start",
@@ -159,13 +169,14 @@ impl PlanRunStarter for NoPlanRunner {
 // Where a triggered run executes
 // ============================================================================
 
-/// Where the run of `plan_id` executes: `(cwd, project_slug)` as a
-/// `plan(action: "run")` call passes them — cwd `.` and the slug of the plan's
-/// project, which the runner resolves to the project's `root_path`.
+/// Where the run of `plan_id` executes: `(cwd, project_slug)` — the absolute
+/// `root_path` of the plan's project (`~` expanded) and its slug.
 ///
-/// A trigger has no caller to name a directory, so a plan without a project,
-/// or whose project has no existing `root_path`, cannot run: an error, never
-/// the server's own working directory.
+/// Resolved here, once, and passed as an absolute cwd: the runner never
+/// re-resolves a `.` in the background, where a transient graph error would
+/// leave it without a project. A trigger has no caller to name a directory,
+/// so a plan without a project, or whose project has no existing `root_path`,
+/// cannot run: an error, never the server's own working directory.
 pub async fn resolve_run_location(
     graph: &dyn GraphStore,
     plan_id: Uuid,
@@ -205,7 +216,7 @@ pub async fn resolve_run_location(
         ));
     }
 
-    Ok((".".to_string(), Some(project.slug)))
+    Ok((root, Some(project.slug)))
 }
 
 /// `~` at the start of a path → `$HOME` (as the runner's cwd resolution does).
@@ -221,14 +232,32 @@ fn expand_home(path: &str) -> String {
 // Dispatcher
 // ============================================================================
 
+/// One activation signal of a trigger.
+#[derive(Debug, Clone, Default)]
+pub struct FireRequest {
+    /// Identity of the signal (the minute of a schedule, the event, the
+    /// webhook delivery). Every instance that sees the same signal dispatches
+    /// it with the same key; an atomic reservation in the graph lets one of
+    /// them through.
+    pub dedupe_key: String,
+    /// What the source sent, recorded in the firing (never passed to the run).
+    pub payload: Option<serde_json::Value>,
+    /// The caller behind the signal (a webhook); `None` for the system.
+    pub claims: Option<Claims>,
+}
+
 /// What became of a trigger signal.
 #[derive(Debug, Clone)]
 pub enum DispatchOutcome {
-    /// The guards held it back (disabled, cooldown, active run): no firing.
+    /// The guards held it back (disabled, cooldown, run of this plan): no firing.
     Skipped,
-    /// A run started; the firing carries its id.
+    /// Another dispatch (here or on another instance) already took this
+    /// signal: no firing, no run.
+    Duplicate,
+    /// A run started. `firing` is `None` when the run started but its firing
+    /// could not be recorded (logged): the run is not undone for that.
     Started {
-        firing: TriggerFiring,
+        firing: Option<TriggerFiring>,
         start: StartResult,
     },
     /// The trigger fired but no run started; the firing carries the reason.
@@ -267,36 +296,66 @@ impl TriggerDispatcher {
     /// Evaluate the guards of `trigger` and, when it fires, start the plan run
     /// and record the firing (with the run id, or with the start error).
     ///
-    /// `Err` only when the guards or the firing record cannot be read/written;
+    /// In order: the guards (enabled, cooldown, no run of this plan) → the
+    /// reservation of the signal (one dispatch per `dedupe_key`, across
+    /// instances) → no other run active (the runner has a single global run
+    /// state) → where the run executes → the start → the firing.
+    ///
+    /// `Err` only when the guards or the reservation cannot be read/written;
     /// a run that does not start is an `Ok(StartFailed)` with its firing.
     pub async fn dispatch(
         &self,
         trigger: &Trigger,
-        source_payload: Option<serde_json::Value>,
+        request: FireRequest,
     ) -> Result<DispatchOutcome> {
         let Some(source) = self.engine.evaluate_and_prepare(trigger).await? else {
             return Ok(DispatchOutcome::Skipped);
         };
 
-        let started = match resolve_run_location(self.graph.as_ref(), trigger.plan_id).await {
-            Ok((cwd, project_slug)) => {
-                self.starter
-                    .start_run(trigger.plan_id, source, cwd, project_slug)
-                    .await
-            }
-            Err(e) => Err(e),
+        if !self
+            .graph
+            .reserve_trigger_signal(trigger.id, &request.dedupe_key)
+            .await?
+        {
+            info!(
+                "Trigger {}: signal '{}' already dispatched, skipping",
+                trigger.id, request.dedupe_key
+            );
+            return Ok(DispatchOutcome::Duplicate);
+        }
+
+        let started = match self.another_run_active(trigger.plan_id).await {
+            Some(error) => Err(anyhow!(error)),
+            None => match resolve_run_location(self.graph.as_ref(), trigger.plan_id).await {
+                Ok((cwd, project_slug)) => {
+                    self.starter
+                        .start_run(trigger.plan_id, source, cwd, project_slug, request.claims)
+                        .await
+                }
+                Err(e) => Err(e),
+            },
         };
 
         match started {
             Ok(start) => {
-                let firing = self
-                    .engine
-                    .record_fire(trigger, Some(start.run_id), source_payload, None)
-                    .await?;
                 info!(
                     "Trigger {} started run {} of plan {}",
                     trigger.id, start.run_id, trigger.plan_id
                 );
+                let firing = match self
+                    .engine
+                    .record_fire(trigger, Some(start.run_id), request.payload, None)
+                    .await
+                {
+                    Ok(firing) => Some(firing),
+                    Err(e) => {
+                        error!(
+                            "Trigger {} started run {} but its firing was not recorded: {:#}",
+                            trigger.id, start.run_id, e
+                        );
+                        None
+                    }
+                };
                 Ok(DispatchOutcome::Started { firing, start })
             }
             Err(e) => {
@@ -307,10 +366,24 @@ impl TriggerDispatcher {
                 );
                 let firing = self
                     .engine
-                    .record_fire(trigger, None, source_payload, Some(error.clone()))
+                    .record_fire(trigger, None, request.payload, Some(error.clone()))
                     .await?;
                 Ok(DispatchOutcome::StartFailed { firing, error })
             }
+        }
+    }
+
+    /// Why no run can start now: a run of another plan is active (the runner
+    /// keeps a single global run state; starting would overwrite it).
+    async fn another_run_active(&self, plan_id: Uuid) -> Option<String> {
+        match self.graph.list_active_plan_runs().await {
+            Ok(runs) => runs.iter().find(|r| r.plan_id != plan_id).map(|r| {
+                format!(
+                    "another plan run is active (run {} of plan {}): one run at a time",
+                    r.run_id, r.plan_id
+                )
+            }),
+            Err(e) => Some(format!("active runs could not be read: {e:#}")),
         }
     }
 }
@@ -329,8 +402,8 @@ pub(crate) mod tests {
     use chrono::Utc;
     use tokio::sync::Mutex;
 
-    /// One `start_run` call: plan, source, cwd, project slug.
-    pub(crate) type StartCall = (Uuid, TriggerSource, String, Option<String>);
+    /// One `start_run` call: plan, source, cwd, project slug, caller (`sub`).
+    pub(crate) type StartCall = (Uuid, TriggerSource, String, Option<String>, Option<String>);
 
     /// Records each start and persists a PlanRun, as `PlanRunner::start` does.
     #[derive(Default)]
@@ -356,11 +429,15 @@ pub(crate) mod tests {
             source: TriggerSource,
             cwd: String,
             project_slug: Option<String>,
+            claims: Option<Claims>,
         ) -> Result<StartResult> {
-            self.calls
-                .lock()
-                .await
-                .push((plan_id, source.clone(), cwd, project_slug));
+            self.calls.lock().await.push((
+                plan_id,
+                source.clone(),
+                cwd,
+                project_slug,
+                claims.map(|c| c.sub),
+            ));
             let run_id = Uuid::new_v4();
             if let Some(graph) = &self.graph {
                 graph
@@ -442,6 +519,23 @@ pub(crate) mod tests {
         panic!("run {run_id} still running after 10s");
     }
 
+    /// A system signal (no caller, no payload) with key `key`.
+    pub(crate) fn signal(key: &str) -> FireRequest {
+        FireRequest {
+            dedupe_key: key.to_string(),
+            ..FireRequest::default()
+        }
+    }
+
+    /// Mark every running PlanRun of `mock` completed (the run is over).
+    pub(crate) async fn finish_all_runs(mock: &MockGraphStore) {
+        for mut run in mock.list_active_plan_runs().await.unwrap() {
+            run.finalize(crate::runner::models::PlanRunStatus::Completed);
+            mock.update_plan_run(&run).await.unwrap();
+        }
+        assert!(mock.list_active_plan_runs().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn dispatch_starts_the_run_and_records_its_id() {
         let mock = Arc::new(MockGraphStore::new());
@@ -457,14 +551,16 @@ pub(crate) mod tests {
             starter.clone(),
         );
 
-        let outcome = dispatcher.dispatch(&trigger, None).await.unwrap();
+        let outcome = dispatcher.dispatch(&trigger, signal("s1")).await.unwrap();
         let DispatchOutcome::Started { firing, start } = outcome else {
             panic!("expected a started run, got {outcome:?}");
         };
+        let firing = firing.expect("firing recorded");
         assert_eq!(firing.plan_run_id, Some(start.run_id));
         assert!(firing.start_error.is_none());
 
-        // Started with the plan's project, cwd resolved by the runner.
+        // Started in the project's root_path, absolute (no `.` left for the
+        // runner to resolve), as the system (no caller).
         let calls = starter.calls.lock().await;
         assert_eq!(calls.len(), 1);
         let project_slug = test_project().slug;
@@ -475,14 +571,147 @@ pub(crate) mod tests {
                 TriggerSource::Schedule {
                     trigger_id: trigger.id
                 },
-                ".".to_string(),
-                Some(project_slug)
+                dir.path().to_string_lossy().into_owned(),
+                Some(project_slug),
+                None
             )
         );
 
         let firings = mock.list_trigger_firings(trigger.id, 10).await.unwrap();
         assert_eq!(firings.len(), 1);
         assert_eq!(firings[0].plan_run_id, Some(start.run_id));
+    }
+
+    /// The caller behind the signal (a webhook) is the one the run's agents
+    /// inherit: its lineage (third party) goes with it.
+    #[tokio::test]
+    async fn the_callers_claims_reach_the_run() {
+        let mock = Arc::new(MockGraphStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = runnable_plan(&mock, dir.path()).await;
+        let trigger = trigger_of(plan_id, TriggerType::Webhook);
+        mock.create_trigger(&trigger).await.unwrap();
+        let starter = Arc::new(RecordingStarter::on(mock.clone()));
+        let dispatcher = TriggerDispatcher::new(
+            mock.clone(),
+            Arc::new(TriggerEngine::new(mock.clone())),
+            starter.clone(),
+        );
+
+        let request = FireRequest {
+            dedupe_key: "delivery-1".to_string(),
+            payload: None,
+            claims: Some(Claims::service_account("agent-session:third-party")),
+        };
+        let outcome = dispatcher.dispatch(&trigger, request).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Started { .. }));
+        assert_eq!(
+            starter.calls.lock().await[0].4.as_deref(),
+            Some("agent-session:third-party")
+        );
+    }
+
+    /// The same signal dispatched twice (two instances, a redelivery) starts
+    /// one run, even once the first run is over.
+    #[tokio::test]
+    async fn the_same_signal_starts_one_run() {
+        let mock = Arc::new(MockGraphStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = runnable_plan(&mock, dir.path()).await;
+        let trigger = trigger_of(plan_id, TriggerType::Schedule);
+        mock.create_trigger(&trigger).await.unwrap();
+        let starter = Arc::new(RecordingStarter::on(mock.clone()));
+        let dispatcher = TriggerDispatcher::new(
+            mock.clone(),
+            Arc::new(TriggerEngine::new(mock.clone())),
+            starter.clone(),
+        );
+
+        let first = dispatcher
+            .dispatch(&trigger, signal("minute-1"))
+            .await
+            .unwrap();
+        assert!(matches!(first, DispatchOutcome::Started { .. }));
+        finish_all_runs(&mock).await;
+        let again = dispatcher
+            .dispatch(&trigger, signal("minute-1"))
+            .await
+            .unwrap();
+        assert!(matches!(again, DispatchOutcome::Duplicate), "{again:?}");
+        assert_eq!(starter.calls.lock().await.len(), 1);
+        assert_eq!(
+            mock.list_trigger_firings(trigger.id, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // A new signal goes through.
+        let next = dispatcher
+            .dispatch(&trigger, signal("minute-2"))
+            .await
+            .unwrap();
+        assert!(matches!(next, DispatchOutcome::Started { .. }));
+    }
+
+    /// Two dispatches racing for the same signal: one run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_dispatches_of_one_signal_start_one_run() {
+        let mock = Arc::new(MockGraphStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = runnable_plan(&mock, dir.path()).await;
+        let trigger = trigger_of(plan_id, TriggerType::Schedule);
+        mock.create_trigger(&trigger).await.unwrap();
+        let starter = Arc::new(RecordingStarter::on(mock.clone()));
+        let dispatcher = Arc::new(TriggerDispatcher::new(
+            mock.clone(),
+            Arc::new(TriggerEngine::new(mock.clone())),
+            starter.clone(),
+        ));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let dispatcher = dispatcher.clone();
+                let trigger = trigger.clone();
+                tokio::spawn(async move { dispatcher.dispatch(&trigger, signal("minute-1")).await })
+            })
+            .collect();
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+        assert_eq!(starter.calls.lock().await.len(), 1);
+    }
+
+    /// A run of plan A is active: a trigger of plan B does not start (the
+    /// runner has one global run state), the firing says why, A is untouched.
+    #[tokio::test]
+    async fn a_run_of_another_plan_blocks_the_start_and_is_recorded() {
+        let mock = Arc::new(MockGraphStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plan_b = runnable_plan(&mock, dir.path()).await;
+        let plan_a = Uuid::new_v4();
+        let run_a = RunnerState::new(Uuid::new_v4(), plan_a, 1, TriggerSource::Manual);
+        mock.create_plan_run(&run_a).await.unwrap();
+        let trigger = trigger_of(plan_b, TriggerType::Event);
+        mock.create_trigger(&trigger).await.unwrap();
+        let starter = Arc::new(RecordingStarter::on(mock.clone()));
+        let dispatcher = TriggerDispatcher::new(
+            mock.clone(),
+            Arc::new(TriggerEngine::new(mock.clone())),
+            starter.clone(),
+        );
+
+        let outcome = dispatcher.dispatch(&trigger, signal("e1")).await.unwrap();
+        let DispatchOutcome::StartFailed { firing, error } = outcome else {
+            panic!("expected a start failure, got {outcome:?}");
+        };
+        assert!(error.contains("another plan run is active"), "{error}");
+        assert_eq!(firing.start_error.as_deref(), Some(error.as_str()));
+        assert!(starter.calls.lock().await.is_empty());
+        let active = mock.list_active_plan_runs().await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].run_id, run_a.run_id);
     }
 
     #[tokio::test]
@@ -501,7 +730,7 @@ pub(crate) mod tests {
             starter.clone(),
         );
 
-        let outcome = dispatcher.dispatch(&trigger, None).await.unwrap();
+        let outcome = dispatcher.dispatch(&trigger, signal("s1")).await.unwrap();
         assert!(matches!(outcome, DispatchOutcome::Skipped));
         assert!(starter.calls.lock().await.is_empty());
         assert!(mock
@@ -527,7 +756,7 @@ pub(crate) mod tests {
             starter.clone(),
         );
 
-        let outcome = dispatcher.dispatch(&trigger, None).await.unwrap();
+        let outcome = dispatcher.dispatch(&trigger, signal("s1")).await.unwrap();
         let DispatchOutcome::StartFailed { firing, error } = outcome else {
             panic!("expected a start failure, got {outcome:?}");
         };
@@ -559,7 +788,7 @@ pub(crate) mod tests {
             Arc::new(RecordingStarter::on(mock.clone())),
         );
 
-        let outcome = dispatcher.dispatch(&trigger, None).await.unwrap();
+        let outcome = dispatcher.dispatch(&trigger, signal("s1")).await.unwrap();
         let DispatchOutcome::StartFailed { error, .. } = outcome else {
             panic!("expected a start failure, got {outcome:?}");
         };
@@ -581,7 +810,7 @@ pub(crate) mod tests {
             Arc::new(TriggerEngine::new(mock.clone())),
             Arc::new(NoPlanRunner),
         );
-        let outcome = dispatcher.dispatch(&trigger, None).await.unwrap();
+        let outcome = dispatcher.dispatch(&trigger, signal("s1")).await.unwrap();
         assert!(matches!(outcome, DispatchOutcome::StartFailed { .. }));
         let firings = mock.list_trigger_firings(trigger.id, 10).await.unwrap();
         assert!(firings[0]
@@ -640,7 +869,7 @@ pub(crate) mod tests {
             factory.clone(),
         );
 
-        let outcome = dispatcher.dispatch(&trigger, None).await.unwrap();
+        let outcome = dispatcher.dispatch(&trigger, signal("s1")).await.unwrap();
         let DispatchOutcome::Started { firing, start } = outcome else {
             panic!("expected a started run, got {outcome:?}");
         };
@@ -656,7 +885,7 @@ pub(crate) mod tests {
                 trigger_id: trigger.id
             }
         );
-        assert_eq!(firing.plan_run_id, Some(start.run_id));
+        assert_eq!(firing.and_then(|f| f.plan_run_id), Some(start.run_id));
 
         wait_until_finished(graph.as_ref(), start.run_id).await;
 
@@ -666,7 +895,10 @@ pub(crate) mod tests {
         mock.create_plan(&empty).await.unwrap();
         let empty_trigger = trigger_of(empty.id, TriggerType::Event);
         mock.create_trigger(&empty_trigger).await.unwrap();
-        let outcome = dispatcher.dispatch(&empty_trigger, None).await.unwrap();
+        let outcome = dispatcher
+            .dispatch(&empty_trigger, signal("s2"))
+            .await
+            .unwrap();
         let DispatchOutcome::StartFailed { firing, error } = outcome else {
             panic!("expected a start failure, got {outcome:?}");
         };

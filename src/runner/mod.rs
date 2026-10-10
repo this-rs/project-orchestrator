@@ -39,7 +39,8 @@ pub mod verifier;
 
 // Re-export key types for convenience
 pub use dispatch::{
-    DispatchOutcome, NoPlanRunner, PlanRunStarter, PlanRunnerFactory, RunOptions, TriggerDispatcher,
+    DispatchOutcome, FireRequest, NoPlanRunner, PlanRunStarter, PlanRunnerFactory, RunOptions,
+    TriggerDispatcher,
 };
 pub use enricher::{EnrichResult, TaskEnricher};
 pub use feedback::{
