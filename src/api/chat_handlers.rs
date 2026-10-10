@@ -1296,7 +1296,8 @@ pub async fn search_messages(
 // Backfill
 // ============================================================================
 
-/// POST /api/chat/sessions/backfill-previews — Backfill title/preview for existing sessions
+/// POST /api/chat/sessions/backfill-previews — Backfill title/preview for existing
+/// sessions, and the record of the sessions of the agent engine (`agent_records`).
 pub async fn backfill_previews(
     State(state): State<OrchestratorState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1318,11 +1319,23 @@ pub async fn backfill_previews(
         0
     };
 
+    // Phase 3: the record (message count, cost, title) of the sessions the agent
+    // engine served before it kept one, from their persisted events.
+    let agent_count = if let Some(chat_manager) = &state.chat_manager {
+        chat_manager
+            .backfill_agent_session_records()
+            .await
+            .map_err(AppError::Internal)?
+    } else {
+        0
+    };
+
     let total = neo4j_count + meili_count;
     Ok(Json(serde_json::json!({
         "updated": total,
         "from_neo4j": neo4j_count,
         "from_meilisearch": meili_count,
+        "agent_records": agent_count,
         "message": format!("Backfilled title/preview for {} sessions", total)
     })))
 }

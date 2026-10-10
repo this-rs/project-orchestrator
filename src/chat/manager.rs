@@ -4476,13 +4476,24 @@ impl ChatManager {
             request.access,
             super::neutral_place::is_neutral_path(&request.cwd),
         );
+        // The record both engines keep (`session_record`): the title and preview come
+        // from the opening message as typed, and the memory conversation is named
+        // here (a relayed session keeps the one it continues).
+        let title_preview = super::session_record::title_and_preview(&request.message);
+        let conversation_id = relay.and_then(|r| r.conversation_id.clone()).or_else(|| {
+            self.memory_config.as_ref().map(|cfg| {
+                ConversationMemoryManager::new(cfg.clone())
+                    .conversation_id()
+                    .to_string()
+            })
+        });
         let session_node = ChatSessionNode {
             id: session_id,
             cli_session_id: None,
             project_slug: project_slug.clone(),
             workspace_slug: request.workspace_slug.clone(),
             cwd: request.cwd.clone(),
-            title: None,
+            title: title_preview.as_ref().map(|(t, _)| t.clone()),
             model: model.clone(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -4490,9 +4501,8 @@ impl ChatManager {
             // `user_message`); every later one bumps the count.
             message_count: 1,
             total_cost_usd: None,
-            // A relayed session keeps the memory conversation of the one it continues.
-            conversation_id: relay.and_then(|r| r.conversation_id.clone()),
-            preview: None,
+            conversation_id: conversation_id.clone(),
+            preview: title_preview.map(|(_, p)| p),
             permission_mode: request.permission_mode.clone(),
             add_dirs: if resolved_add_dirs.is_empty() {
                 None
@@ -4718,37 +4728,18 @@ impl ChatManager {
         }
 
         // Create ConversationMemoryManager for message recording
-        let memory_manager = if let Some(ref mem_config) = self.memory_config {
-            // A relayed session records into the conversation it continues.
-            let mm = match relay.and_then(|r| r.conversation_id.clone()) {
-                Some(kept) => {
-                    ConversationMemoryManager::new(mem_config.clone()).with_conversation_id(kept)
-                }
-                None => ConversationMemoryManager::new(mem_config.clone()),
-            };
-            let conversation_id = mm.conversation_id().to_string();
-            debug!(
-                "Created ConversationMemoryManager for session {} with conversation_id {}",
-                session_id, conversation_id
-            );
-
-            // Persist conversation_id in Neo4j
-            let _ = self
-                .graph
-                .update_chat_session(
-                    session_id,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(conversation_id),
-                    None,
-                )
-                .await;
-
-            Some(Arc::new(Mutex::new(mm)))
-        } else {
-            None
+        // It records into the conversation named on the node at creation.
+        let memory_manager = match (&self.memory_config, &conversation_id) {
+            (Some(mem_config), Some(conversation_id)) => {
+                let mm = ConversationMemoryManager::new(mem_config.clone())
+                    .with_conversation_id(conversation_id.clone());
+                debug!(
+                    "Created ConversationMemoryManager for session {} with conversation_id {}",
+                    session_id, conversation_id
+                );
+                Some(Arc::new(Mutex::new(mm)))
+            }
+            _ => None,
         };
 
         // Clone the stdin sender BEFORE wrapping client in Arc<Mutex<>>.
@@ -5022,36 +5013,7 @@ impl ChatManager {
             );
         }
 
-        // Auto-generate title and preview from the first user message — what the
-        // user typed, never the `<po-refs>`/`<po-attachments>` blocks around it.
-        {
-            let typed = crate::refs::turn::visible_text(&request.message);
-            let msg = &typed;
-            let title = if msg.chars().count() > 80 {
-                let truncated: String = msg.chars().take(77).collect();
-                format!("{}...", truncated.trim_end())
-            } else {
-                msg.to_string()
-            };
-            let preview = if msg.chars().count() > 200 {
-                let truncated: String = msg.chars().take(197).collect();
-                format!("{}...", truncated.trim_end())
-            } else {
-                msg.to_string()
-            };
-            let _ = self
-                .graph
-                .update_chat_session(
-                    session_id,
-                    None,
-                    Some(title),
-                    None,
-                    None,
-                    None,
-                    Some(preview),
-                )
-                .await;
-        }
+        // The title and preview were set on the node at creation (`session_record`).
 
         // Send the initial message and start streaming in a background task
         let session_id_str = session_id.to_string();
@@ -8899,6 +8861,11 @@ impl ChatManager {
             created_at: chrono::Utc::now(),
         };
         let _ = self.graph.store_chat_events(uuid, vec![user_event]).await;
+        // The message that resumes the session is a user message: it counts
+        // (`session_record`), as on the agent engine.
+        if let Err(e) = super::session_record::count_user_message(&self.graph, uuid).await {
+            warn!(session_id, error = %e, "Failed to count the resuming message (non-fatal)");
+        }
 
         // Emit user_message on local broadcast + NATS
         let user_msg_event = ChatEvent::UserMessage {
@@ -9126,18 +9093,11 @@ impl ChatManager {
                 .find(|m| m.role == "user")
                 .map(|m| m.content.clone());
 
-            if let Some(content) = first_user_msg {
-                let chars: Vec<char> = content.chars().collect();
-                let title = if chars.len() > 80 {
-                    format!("{}...", chars[..77].iter().collect::<String>().trim_end())
-                } else {
-                    content.clone()
-                };
-                let preview = if chars.len() > 200 {
-                    format!("{}...", chars[..197].iter().collect::<String>().trim_end())
-                } else {
-                    content
-                };
+            // The title rule of every session (`session_record`).
+            if let Some((title, preview)) = first_user_msg
+                .as_deref()
+                .and_then(super::session_record::title_and_preview)
+            {
                 let _ = self
                     .graph
                     .update_chat_session(
@@ -9155,6 +9115,111 @@ impl ChatManager {
         }
 
         Ok(count)
+    }
+
+    /// Brings the record of the sessions the agent engine served before it kept one
+    /// (P8) to what it would hold today (`session_record`), from their persisted
+    /// events: `message_count` = their `user_message` events (raised, never lowered),
+    /// `total_cost_usd` from their `result` events when the record has none, and the
+    /// title and preview of their first user message when they have none.
+    /// Idempotent: a second run changes nothing. A Claude Code session (provider
+    /// `claude_code`) is left alone: the legacy engine kept its record.
+    /// Returns the number of sessions updated.
+    pub async fn backfill_agent_session_records(&self) -> Result<usize> {
+        use super::session_record::{next_total_cost, title_and_preview, CostFigure};
+        const PAGE: usize = 200;
+        // Listed in full first: the list is ordered by `updated_at`, which each
+        // write below changes (paging while writing would skip sessions).
+        let mut sessions = Vec::new();
+        let mut offset = 0;
+        loop {
+            let (page, _) = self
+                .graph
+                .list_chat_sessions(None, None, PAGE, offset, true)
+                .await
+                .context("Failed to list sessions")?;
+            let fetched = page.len();
+            offset += fetched;
+            sessions.extend(page.into_iter().filter(|s| s.provider_id.is_some()));
+            if fetched < PAGE {
+                break;
+            }
+        }
+        let mut updated = 0;
+        for session in sessions {
+            let Some(provider_id) = session.provider_id.as_deref() else {
+                continue;
+            };
+            if provider_id == super::provider::resolver::CLAUDE_CODE {
+                continue;
+            }
+            let events = self.graph.get_chat_events(session.id, -1, 100_000).await?;
+            let parsed: Vec<ChatEvent> = events
+                .iter()
+                .filter(|e| e.event_type == "user_message" || e.event_type == "result")
+                .filter_map(|e| serde_json::from_str(&e.data).ok())
+                .collect();
+            let users: Vec<&str> = parsed
+                .iter()
+                .filter_map(|e| match e {
+                    ChatEvent::UserMessage { content } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let message_count = i64::try_from(users.len())
+                .ok()
+                .filter(|n| *n > session.message_count);
+            let total_cost_usd = if session.total_cost_usd.is_none() {
+                // A Claude Code on another machine reports the session's total.
+                let figure = match super::provider::store::instance(
+                    self.graph.as_ref(),
+                    provider_id,
+                )
+                .await
+                {
+                    Ok(Some(record))
+                        if record.kind == super::provider::settings::KIND_CLAUDE_CODE_REMOTE =>
+                    {
+                        CostFigure::SessionTotal
+                    }
+                    _ => CostFigure::Turn,
+                };
+                parsed
+                    .iter()
+                    .filter_map(|e| match e {
+                        ChatEvent::Result { cost_usd, .. } => Some(*cost_usd),
+                        _ => None,
+                    })
+                    .fold(None, |total, usd| {
+                        next_total_cost(total, usd, figure).or(total)
+                    })
+            } else {
+                None
+            };
+            let (title, preview) = match (&session.title, users.first()) {
+                (None, Some(first)) => match title_and_preview(first) {
+                    Some((t, p)) => (Some(t), Some(p)),
+                    None => (None, None),
+                },
+                _ => (None, None),
+            };
+            if message_count.is_none() && total_cost_usd.is_none() && title.is_none() {
+                continue;
+            }
+            self.graph
+                .update_chat_session(
+                    session.id,
+                    None,
+                    title,
+                    message_count,
+                    total_cost_usd,
+                    None,
+                    preview,
+                )
+                .await?;
+            updated += 1;
+        }
+        Ok(updated)
     }
 
     /// Search messages across all sessions via Meilisearch full-text search.
@@ -11549,6 +11614,8 @@ impl ChatManager {
                 handle.emit(relay.event(&sid, provider_id)).await;
             }
             if !request.message.is_empty() {
+                // Counted on the node at creation (`message_count: 1`).
+                handle.opening_message_counted();
                 handle
                     .send_message_relayed(
                         &request.message,
@@ -18338,6 +18405,127 @@ mod tests {
         let result = manager.backfill_previews_from_meilisearch().await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
+    }
+
+    // ====================================================================
+    // backfill_agent_session_records — the record of the sessions the agent
+    // engine served before it kept one (P8)
+    // ====================================================================
+
+    fn record_event(session: Uuid, seq: i64, event: &ChatEvent) -> ChatEventRecord {
+        ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: session,
+            seq,
+            event_type: event.event_type().to_string(),
+            data: serde_json::to_string(event).unwrap(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn result_costing(usd: Option<f64>) -> ChatEvent {
+        ChatEvent::Result {
+            session_id: String::new(),
+            duration_ms: 1,
+            cost_usd: usd,
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: None,
+            result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_backfill_rebuilds_the_record_of_an_agent_session_once_and_leaves_claude_code_alone(
+    ) {
+        let state = mock_app_state();
+        let graph = state.neo4j.clone();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // A native session of before P8: three messages, three priced turns (one
+        // unknown), a record stuck at its creation.
+        let mut native = crate::test_helpers::test_chat_session(None);
+        native.provider_id = Some("local".into());
+        native.message_count = 1;
+        graph.create_chat_session(&native).await.unwrap();
+        let typed = crate::refs::block::encode(&"x".repeat(100), &[]);
+        let events = [
+            ChatEvent::UserMessage { content: typed },
+            result_costing(Some(0.01)),
+            ChatEvent::UserMessage {
+                content: "two".into(),
+            },
+            result_costing(None),
+            ChatEvent::UserMessage {
+                content: "three".into(),
+            },
+            result_costing(Some(0.02)),
+        ];
+        graph
+            .store_chat_events(
+                native.id,
+                events
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| record_event(native.id, i as i64 + 1, e))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        // A Claude Code session: the legacy engine kept its record.
+        let mut legacy = crate::test_helpers::test_chat_session(None);
+        legacy.provider_id = Some(crate::chat::provider::resolver::CLAUDE_CODE.into());
+        legacy.message_count = 1;
+        graph.create_chat_session(&legacy).await.unwrap();
+        graph
+            .store_chat_events(
+                legacy.id,
+                vec![
+                    record_event(
+                        legacy.id,
+                        1,
+                        &ChatEvent::UserMessage {
+                            content: "a".into(),
+                        },
+                    ),
+                    record_event(
+                        legacy.id,
+                        2,
+                        &ChatEvent::UserMessage {
+                            content: "b".into(),
+                        },
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(manager.backfill_agent_session_records().await.unwrap(), 1);
+        let node = graph.get_chat_session(native.id).await.unwrap().unwrap();
+        assert_eq!(node.message_count, 3, "{node:?}");
+        assert!(
+            (node.total_cost_usd.unwrap() - 0.03).abs() < 1e-9,
+            "{node:?}"
+        );
+        let title = node.title.clone().unwrap();
+        assert_eq!(title.chars().count(), 80, "the one title rule: {title}");
+        assert!(title.ends_with("..."));
+        assert_eq!(node.preview.as_deref(), Some("x".repeat(100).as_str()));
+
+        let untouched = graph.get_chat_session(legacy.id).await.unwrap().unwrap();
+        assert_eq!(untouched.message_count, 1);
+        assert_eq!(untouched.title, None);
+
+        // Idempotent.
+        assert_eq!(manager.backfill_agent_session_records().await.unwrap(), 0);
+        let again = graph.get_chat_session(native.id).await.unwrap().unwrap();
+        assert_eq!(again.message_count, 3);
+        assert_eq!(again.total_cost_usd, node.total_cost_usd);
     }
 
     // ====================================================================

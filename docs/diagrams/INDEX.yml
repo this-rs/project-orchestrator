@@ -38,7 +38,7 @@ diagrams:
     status: verified
     file: docs/diagrams/po-chat-manager.mmd
     covers:
-      - "backend:src/chat/{mod,manager,cost,anchor,anchor_resolver,agent_e2e_tests,tree,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments,pending_queue,relay,refs_wiring_tests,untrusted,neutral_place}.rs"
+      - "backend:src/chat/{mod,manager,cost,anchor,anchor_resolver,agent_e2e_tests,tree,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments,pending_queue,relay,refs_wiring_tests,untrusted,neutral_place,session_record}.rs"
       - "backend:src/notes/coactivation.rs"
   - name: po-spawn-envelope
     owner: theotime

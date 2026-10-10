@@ -7020,3 +7020,109 @@ mod legacy_interrupt_stale_result {
         queued_message_after(1500).await;
     }
 }
+
+/// P8 — the record of a native session (the agent engine) is kept as the legacy
+/// engine keeps its own (`chat::session_record`): before, it stayed at what the
+/// creation wrote (`message_count: 1`, no cost, no title) whatever the conversation did.
+mod native_session_record {
+    use super::*;
+
+    fn answer(key: &str) -> Value {
+        sse_route(
+            key,
+            vec![
+                delta(json!({"content": format!("answer to {key}")})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}),
+                json!("[DONE]"),
+            ],
+        )
+    }
+
+    async fn record_until(
+        graph: &MockGraphStore,
+        sid: &str,
+        done: impl Fn(&crate::neo4j::models::ChatSessionNode) -> bool,
+    ) -> crate::neo4j::models::ChatSessionNode {
+        let id = Uuid::parse_str(sid).unwrap();
+        let mut last = None;
+        for _ in 0..400 {
+            if let Some(node) = graph.get_chat_session(id).await.unwrap() {
+                if done(&node) {
+                    return node;
+                }
+                last = Some(node);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the record of {sid} never got there: {last:?}");
+    }
+
+    async fn results(graph: &MockGraphStore, sid: &str) -> usize {
+        graph
+            .get_chat_events(Uuid::parse_str(sid).unwrap(), 0, 500)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| e.event_type == "result")
+            .count()
+    }
+
+    async fn wait_results(graph: &MockGraphStore, sid: &str, count: usize) {
+        for _ in 0..400 {
+            if results(graph, sid).await >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{count} result event(s) never persisted");
+    }
+
+    #[tokio::test]
+    async fn a_native_session_keeps_its_title_its_message_count_and_its_cost_across_a_resume() {
+        let mut routes = vec![answer("AFTER-RESTART"), answer("SECOND-TURN")];
+        routes.extend(script().as_array().cloned().unwrap());
+        let fake = FakeOpenAi::start(Value::Array(routes));
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("native-transcripts");
+
+        let before = manager(graph.clone(), true).with_native_transcripts(&root);
+        let sid = before
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        assert!(before.agent_runtime.owns(&sid).await, "the agent engine");
+        wait_results(&graph, &sid, 1).await;
+        // A free endpoint: its turns cost a real 0, recorded.
+        let node = record_until(&graph, &sid, |n| n.total_cost_usd.is_some()).await;
+        assert_eq!(node.message_count, 1, "the opening message, once: {node:?}");
+        assert_eq!(node.total_cost_usd, Some(0.0), "{node:?}");
+        assert_eq!(node.title.as_deref(), Some("hi there"), "{node:?}");
+        assert_eq!(node.preview.as_deref(), Some("hi there"), "{node:?}");
+
+        before.send_message(&sid, "SECOND-TURN").await.unwrap();
+        wait_results(&graph, &sid, 2).await;
+        let node = record_until(&graph, &sid, |n| n.message_count >= 2).await;
+        assert_eq!(node.message_count, 2, "{node:?}");
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+
+        // The message that resumes the session after a restart counts too.
+        let after = manager(graph.clone(), true).with_native_transcripts(&root);
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        after
+            .resume_session(&sid, "AFTER-RESTART", Some(&claims))
+            .await
+            .unwrap_or_else(|e| panic!("resume failed: {e:#}"));
+        wait_results(&graph, &sid, 3).await;
+        let node = record_until(&graph, &sid, |n| n.message_count >= 3).await;
+        assert_eq!(node.message_count, 3, "{node:?}");
+        assert_eq!(node.title.as_deref(), Some("hi there"), "the title stays");
+        assert_eq!(node.total_cost_usd, Some(0.0));
+        after.close_session(&sid).await.unwrap();
+    }
+}

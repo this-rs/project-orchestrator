@@ -384,6 +384,14 @@ pub struct AgentSessionHandle {
     cancel_tools_cap: u32,
     /// The window of the cap (`CANCEL_TOOLS_WINDOW_SECS`).
     cancel_tools_window: Duration,
+    /// How the provider states the cost of a turn (`session_record::CostFigure`).
+    cost_figure: super::session_record::CostFigure,
+    /// Held across each read-then-write of the session record, so two writes of
+    /// this session never lose one another's figure.
+    record: Mutex<()>,
+    /// The next user message was already counted when the session was created
+    /// (the opening message: `message_count` starts at 1).
+    opening_counted: AtomicBool,
 }
 
 impl AgentSessionHandle {
@@ -466,6 +474,51 @@ impl AgentSessionHandle {
                 error = %e,
                 "Failed to persist the resume token (retried at the next turn)"
             ),
+        }
+    }
+
+    /// The opening message of the session was counted when the session was created:
+    /// its turn does not count it again (`session_record`).
+    pub fn opening_message_counted(&self) {
+        self.opening_counted.store(true, Ordering::SeqCst);
+    }
+
+    /// Counts a user message on the session record — the opening one excepted, already
+    /// counted — under [`super::session_record::RECORD_WRITE_BUDGET`].
+    async fn count_user_message(&self) {
+        if self.opening_counted.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let Some(uuid) = self.uuid else { return };
+        let _held = self.record.lock().await;
+        let write = super::session_record::count_user_message(&self.graph, uuid);
+        match tokio::time::timeout(super::session_record::RECORD_WRITE_BUDGET, write).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(session_id = %self.session_id, error = %e, "Failed to count the user message")
+            }
+            Err(_) => {
+                tracing::warn!(session_id = %self.session_id, "Counting the user message took too long: abandoned")
+            }
+        }
+    }
+
+    /// Adds what a turn cost to the session record (nothing for an unknown price),
+    /// under [`super::session_record::RECORD_WRITE_BUDGET`].
+    async fn add_turn_cost(&self, usd: Option<f64>) {
+        let (Some(uuid), Some(_)) = (self.uuid, usd) else {
+            return;
+        };
+        let _held = self.record.lock().await;
+        let write = super::session_record::add_turn_cost(&self.graph, uuid, usd, self.cost_figure);
+        match tokio::time::timeout(super::session_record::RECORD_WRITE_BUDGET, write).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(session_id = %self.session_id, error = %e, "Failed to record the cost of the turn")
+            }
+            Err(_) => {
+                tracing::warn!(session_id = %self.session_id, "Recording the cost of the turn took too long: abandoned")
+            }
         }
     }
 
@@ -617,7 +670,8 @@ impl AgentSessionHandle {
                 self.emit(ChatEvent::UserMessage {
                     content: shown.to_string(),
                 })
-                .await
+                .await;
+                self.count_user_message().await;
             }
         }
         // The same expansion as `stream_response` (`refs::turn`), for every turn
@@ -745,6 +799,8 @@ impl AgentSessionHandle {
     async fn play(&self, mut stream: nexus_claude::agent::EventStream, input: TurnInput) -> bool {
         let mut attempt = 0u32;
         let mut hit_turn_limit = false;
+        // What the turn cost, read on its `done` (`None`: no price, or no `done`).
+        let mut turn_cost: Option<f64> = None;
         loop {
             // Did the turn already show the user anything? A turn that did is
             // never replayed: it would repeat text or tool calls.
@@ -774,6 +830,9 @@ impl AgentSessionHandle {
                         ..
                     }
                 );
+                if let AgentEvent::Done { cost, .. } = &event {
+                    turn_cost = cost.usd;
+                }
                 let event = mask_agent_event(event);
                 let chat_events = self.mapper.lock().await.map(&event);
                 for chat_event in chat_events {
@@ -808,6 +867,8 @@ impl AgentSessionHandle {
                 }
             }
         }
+        // The record carries the turn's cost before the session is seen idle.
+        self.add_turn_cost(turn_cost).await;
         hit_turn_limit
     }
 
@@ -1089,6 +1150,9 @@ impl AgentRuntime {
             cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
+            cost_figure: super::session_record::CostFigure::of_kind(provider_kind),
+            record: Mutex::new(()),
+            opening_counted: AtomicBool::new(false),
         });
         if let Some(oob) = session.out_of_band() {
             let pump = Arc::clone(&handle);
@@ -2013,5 +2077,167 @@ mod image_tests {
                 other => panic!("{other:?}"),
             }
         }
+    }
+}
+
+/// The session record the agent engine keeps at the end of its turns, by the rules
+/// of the Claude Code engine (`chat::session_record`).
+#[cfg(test)]
+mod session_record_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+    use crate::neo4j::mock::MockGraphStore;
+    use nexus_claude::agent::{Cost, CostBasis};
+
+    fn done(usd: Option<f64>) -> AgentEvent {
+        AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Completed,
+            subtype: None,
+            is_error: false,
+            result_text: Some("ok".into()),
+            usage: Default::default(),
+            cost: Cost {
+                usd,
+                basis: if usd.is_some() {
+                    CostBasis::Priced
+                } else {
+                    CostBasis::Unknown
+                },
+            },
+            duration_ms: 1,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        }
+    }
+
+    /// A session of `kind` whose node was created as the manager creates it
+    /// (`message_count: 1` for the opening message).
+    async fn rig(kind: &str) -> (Arc<MockGraphStore>, FakeProvider, Arc<AgentSessionHandle>) {
+        let graph = Arc::new(MockGraphStore::new());
+        let mut node = crate::test_helpers::test_chat_session(None);
+        node.message_count = 1;
+        graph.create_chat_session(&node).await.unwrap();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let runtime = AgentRuntime::new(dyn_graph);
+        let provider = FakeProvider::new();
+        let handle = runtime
+            .adopt(
+                &node.id.to_string(),
+                "local",
+                provider.session(),
+                1,
+                kind,
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        (graph, provider, handle)
+    }
+
+    async fn node(
+        graph: &MockGraphStore,
+        handle: &AgentSessionHandle,
+    ) -> crate::neo4j::models::ChatSessionNode {
+        graph
+            .get_chat_session(Uuid::parse_str(&handle.session_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Plays one turn that ends on `done(usd)` and waits for the session to be idle.
+    async fn turn(
+        provider: &FakeProvider,
+        handle: &Arc<AgentSessionHandle>,
+        text: &str,
+        usd: Option<f64>,
+    ) {
+        let before = provider.state.turns_started.lock().unwrap().len();
+        handle.send_message(text).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while provider.state.turns_started.lock().unwrap().len() == before {
+            assert!(Instant::now() < deadline, "the turn never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        provider.state.push(done(usd));
+        while handle.is_streaming.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the turn never ended");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Before P8 the record stayed at `message_count: 1` and `total_cost_usd: None`
+    /// whatever the conversation did.
+    #[tokio::test]
+    async fn each_user_message_counts_and_the_turn_costs_add_up() {
+        let (graph, provider, handle) = rig("native").await;
+        handle.opening_message_counted();
+        turn(&provider, &handle, "opening", Some(0.01)).await;
+        let n = node(&graph, &handle).await;
+        assert_eq!(
+            n.message_count, 1,
+            "the opening message counted once: {n:?}"
+        );
+        assert_eq!(n.total_cost_usd, Some(0.01));
+
+        turn(&provider, &handle, "second", Some(0.02)).await;
+        let n = node(&graph, &handle).await;
+        assert_eq!(n.message_count, 2, "{n:?}");
+        assert!((n.total_cost_usd.unwrap() - 0.03).abs() < 1e-9, "{n:?}");
+
+        // An unknown price changes nothing: never an invented zero.
+        turn(&provider, &handle, "third", None).await;
+        let n = node(&graph, &handle).await;
+        assert_eq!(n.message_count, 3, "{n:?}");
+        assert!((n.total_cost_usd.unwrap() - 0.03).abs() < 1e-9, "{n:?}");
+    }
+
+    /// Claude Code (forced onto the agent engine) reports the session's total on
+    /// each `result`: it is kept as is, as the legacy engine keeps it.
+    #[tokio::test]
+    async fn the_claude_code_figure_is_the_session_total() {
+        let (graph, provider, handle) = rig("claude_code").await;
+        turn(&provider, &handle, "one", Some(0.01)).await;
+        turn(&provider, &handle, "two", Some(0.03)).await;
+        let n = node(&graph, &handle).await;
+        assert_eq!(n.total_cost_usd, Some(0.03), "{n:?}");
+        assert_eq!(
+            n.message_count, 3,
+            "1 at creation + two messages not flagged as opening"
+        );
+    }
+
+    /// A system hint queued behind a turn is played as its own turn, and is not a
+    /// user message: it does not count.
+    #[tokio::test]
+    async fn a_system_hint_is_not_counted() {
+        let (graph, provider, handle) = rig("native").await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        handle.send_message("one").await.unwrap();
+        while provider.state.turns_started.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the turn never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        handle.inject_hint("a hint").await.unwrap();
+        provider.state.push(done(Some(0.0)));
+        while provider.state.turns_started.lock().unwrap().len() < 2 {
+            assert!(Instant::now() < deadline, "the hint never played");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        provider.state.push(done(Some(0.0)));
+        while handle.is_streaming.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the run never ended");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let n = node(&graph, &handle).await;
+        assert_eq!(
+            n.message_count, 2,
+            "1 at creation + one user message: {n:?}"
+        );
+        assert_eq!(n.total_cost_usd, Some(0.0), "a free turn is a real 0");
     }
 }

@@ -274,16 +274,6 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
     ),
     (
         Engine::Native,
-        "session_record",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "P8",
-            why: "le moteur agent ne met pas à jour le dossier de session à la fin d'un tour \
-                  (message_count / total_cost_usd)",
-        },
-    ),
-    (
-        Engine::Native,
         "background_tasks",
         Expect::Gap {
             cause: Cause::Harness,
@@ -765,11 +755,13 @@ impl Stage {
     }
 }
 
-/// `ok` when the record of a session carries what its conversation produced.
+/// `ok` when the record of a session carries what its conversation produced:
+/// the record of a session after `sent` user messages: each counted, a cost (the
+/// total the provider reported: 0 for a free endpoint, a real figure; an unknown
+/// price leaves none, never an invented 0) and a title.
 fn record_verdict(node: &crate::neo4j::models::ChatSessionNode, sent: i64) -> (bool, String) {
-    let cost = node.total_cost_usd.unwrap_or(0.0);
     let ok = node.message_count >= sent
-        && cost > 0.0
+        && node.total_cost_usd.is_some_and(|c| c >= 0.0)
         && node.title.as_deref().is_some_and(|t| !t.is_empty());
     (
         ok,
@@ -2840,7 +2832,7 @@ fn a_declared_gap_fixed_silently_turns_the_matrix_red() {
     let mut na = as_declared(Engine::Native);
     na.rows
         .iter_mut()
-        .find(|(f, _, _)| *f == "session_record")
+        .find(|(f, _, _)| *f == "background_tasks")
         .unwrap()
         .1 = Verdict::Ok;
     let problems = audit(&cc, &na, &expected);
