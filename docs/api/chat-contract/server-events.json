@@ -510,6 +510,7 @@
         "full": {
           "allow": true,
           "id": "perm_0001",
+          "scope": "session",
           "type": "permission_decision"
         },
         "minimal": {
@@ -525,6 +526,10 @@
         },
         "id": {
           "required": true,
+          "type": "string"
+        },
+        "scope": {
+          "required": false,
           "type": "string"
         },
         "type": {

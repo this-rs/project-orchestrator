@@ -1,6 +1,6 @@
 %% name: po-chat-agent-runtime
-%% covers: backend:src/chat/{agent_runtime,agent_hooks}.rs backend:src/chat/provider/transcripts.rs
-%% verified: 1f5fb14e
+%% covers: backend:src/chat/{agent_runtime,agent_hooks,lasting_rules}.rs backend:src/chat/provider/transcripts.rs
+%% verified: 403a93de
 %% ---
 %% PROUVE : le moteur « agent » du chat (tâche B13) : comment un AgentSession nexus est piloté, ce qu'il
 %%   diffuse et persiste, ce qu'il ne fait PAS encore. Le routage entre moteurs est dans po-chat-manager.
@@ -14,6 +14,7 @@
 %%   src/chat/provider/event_map.rs — EventMapper (AgentEvent vers ChatEvent)
 %%   src/chat/message_attachments.rs (load_images, AttachedImage) — les images jointes lues dans le DocumentStore ; turn_input / image_refusal (agent_runtime.rs)
 %%   src/chat/provider/transcripts.rs — default_root, store_for, transcript_id_of, remove_for_token ; native_factory::build_provider_with_handle (transcripts) ; manager.rs (provider_for, delete_session) ; api/chat_handlers.rs (delete_session) ; lib.rs (with_native_transcripts)
+%%   src/chat/lasting_rules.rs — LastingRules (allow, allowed_for), project_key, valid_tool_rule ; agent_runtime.rs (answer_permission_scoped, grant_lasting_rules, offered_capabilities) ; manager.rs (lasting_project, build_agent_spec_with_access, finish_agent_open, with_lasting_rules) ; lib.rs (with_lasting_rules)
 %% ---
 %% NON ETABLI :
 %%   jamais exercé contre le VRAI CLI Claude (seulement la façade Claude Code de nexus contre son fake_claude, pour le jeton de reprise), un vrai endpoint ni un vrai Codex/ACP (faux provider, fake_openai,
@@ -50,7 +51,7 @@ flowchart TD
     end
 
     subgraph ctl["Commandes de session"]
-        CTL["✅ answer_permission (PermissionDecision émis), interrupt (TurnAndTools), cancel_tools (CancelScope::All, sous le plafond CANCEL_TOOLS_CAP du chemin Claude, partagé par check_and_record_cancel_cap ; tools_cancelled émis sans cli_pid ; le tour continue : tool_result annulé, le modèle reprend), set_model (ModelChanged), set_policy_mode (PermissionModeChanged avec policy_mode neutre)<br/>test : agent_path_interrupt_model_mode_and_close_reach_the_provider, a_cancel_tools_from_this_instance_stops_the_tool_and_the_turn_goes_on, the_cancel_tools_cap_applies_on_the_agent_engine_as_on_claude_code, a_ws_cancel_tools_on_a_native_session_stops_the_running_mcp_tool_and_the_turn_goes_on (vraie WS, harnais natif)<br/>🟠 cancel_task (une tâche de fond) : toujours un no-op silencieux sur ce moteur (manager::cancel_task ne regarde que active_sessions)"]
+        CTL["✅ answer_permission_scoped (P11 : once / session / always ; une portée que la session n’offre pas → ScopeUnsupported typé, jamais rétrogradée ; always sans portée du provider (natif) → règle BORNÉE dérivée de l’appel (lasting_rules::rules_for_call : programme + sous-commande en préfixe Bash(ls) / Bash(ls *), chemin normalisé comme nexus, WebFetch(domain:hôte), argument exact sinon ; commande composée, substitution, enveloppe sudo/sh -c, glob → refus typé, jamais l’outil entier) écrite d’abord dans <app dir>/permission-rules.json (0600) puis réponse once ; emit répond lui-même once aux appels suivants de la session que les règles couvrent (décision scope always) ; les sessions natives ouvertes ou reprises dans ce projet ont les règles dans allow ; system_init.capabilities.permission_scopes y ajoute always ; PermissionDecision émis avec scope)<br/><i>test : permission_scopes::native_session_scope_is_not_asked_again_and_always_without_lasting_rules_is_refused, permission_scopes::native_always_on_ls_is_kept_for_the_project_scoped_to_ls_and_never_allows_rm (vrai nexus-tools), lasting_rules::tests (7 : an_always_on_bash_ls_does_not_allow_rm…), matrice permissions.session / permissions.always (natif, après redémarrage)</i><br/> interrupt (TurnAndTools), cancel_tools (CancelScope::All, sous le plafond CANCEL_TOOLS_CAP du chemin Claude, partagé par check_and_record_cancel_cap ; tools_cancelled émis sans cli_pid ; le tour continue : tool_result annulé, le modèle reprend), set_model (ModelChanged), set_policy_mode (PermissionModeChanged avec policy_mode neutre)<br/>test : agent_path_interrupt_model_mode_and_close_reach_the_provider, a_cancel_tools_from_this_instance_stops_the_tool_and_the_turn_goes_on, the_cancel_tools_cap_applies_on_the_agent_engine_as_on_claude_code, a_ws_cancel_tools_on_a_native_session_stops_the_running_mcp_tool_and_the_turn_goes_on (vraie WS, harnais natif)<br/>🟠 cancel_task (une tâche de fond) : toujours un no-op silencieux sur ce moteur (manager::cancel_task ne regarde que active_sessions)"]
         CLOSE["✅ close : sync_resume_token, ferme le provider (5 s max), émet session_closed, oublie la session<br/>test : agent_path_interrupt_model_mode_and_close_reach_the_provider"]
     end
 

@@ -395,6 +395,7 @@ mod tests {
             ChatEvent::PermissionDecision {
                 id: "a".into(),
                 allow: true,
+                scope: None,
             },
         );
         assert_eq!(
@@ -431,6 +432,7 @@ mod tests {
             ChatEvent::PermissionDecision {
                 id: id.into(),
                 allow: true,
+                scope: None,
             },
         )
     }
