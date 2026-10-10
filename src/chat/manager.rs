@@ -4337,7 +4337,9 @@ impl ChatManager {
             model: model.clone(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
-            message_count: 0,
+            // The opening message is the first user message (persisted below as
+            // `user_message`); every later one bumps the count.
+            message_count: 1,
             total_cost_usd: None,
             // A relayed session keeps the memory conversation of the one it continues.
             conversation_id: relay.and_then(|r| r.conversation_id.clone()),
@@ -6105,14 +6107,16 @@ impl ChatManager {
                                     ..
                                 } = msg
                                 {
-                                    // Update Neo4j with cli_session_id and cost
+                                    // Update Neo4j with cli_session_id and cost. Never the
+                                    // message count: each user message bumps it (send_message,
+                                    // drain, the NATS listener), a `result` is not a message.
                                     if let Some(uuid) = session_uuid {
                                         let _ = graph
                                             .update_chat_session(
                                                 uuid,
                                                 Some(cli_sid.clone()),
                                                 None,
-                                                Some(1),
+                                                None,
                                                 *cost,
                                                 None,
                                                 None,

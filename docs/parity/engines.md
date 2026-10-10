@@ -34,12 +34,12 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `refs` | une référence #kind:id atteint le modèle en pointeur po-context | ok | ok |
 | `provider_switch.relay` | la bascule vers ce moteur relaie la conversation sur le fil (conversation_relayed) | ok | ok |
 | `images` | une image jointe atteint le provider en bloc image | ok | ok |
-| `session_record` | le dossier de session porte message_count, total_cost_usd et un titre | gap (harnais, P15) | gap (harnais, P8) |
+| `session_record` | le dossier de session porte message_count, total_cost_usd et un titre | ok | gap (harnais, P8) |
 | `background_tasks` | une tâche d'arrière-plan est suivie (active_tasks_update) | ok | gap (harnais, P4) |
 | `cancel_task` | cancel_task arrête une tâche d'arrière-plan | ok | gap (harnais, P12) |
 | `system_init.degraded` | system_init n'annonce comme manquant qu'une limite du modèle (liste fermée) | ok | ok |
 
-`ok` : Claude Code 21/26, natif 20/26.
+`ok` : Claude Code 22/26, natif 20/26.
 
 ## Écarts déclarés
 
@@ -48,7 +48,6 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | Claude Code | `nats.permission_response` | harnais | P13 | l'écouteur RPC NATS du moteur historique écrit au CLI une control_response sans request_id ni behavior (et sous le verrou du client) : l'outil reste bloqué alors que la RPC répond success |
 | Claude Code | `permissions.session` | harnais | P11 | la réponse de permission ne porte aucune portée : le backend n'écrit au CLI qu'un allow/deny ponctuel (pas d'updatedPermissions de session) |
 | Claude Code | `permissions.always` | harnais | P11 | aucune portée persistante (updatedPermissions vers les réglages) n'est écrite au CLI |
-| Claude Code | `session_record` | harnais | P15 | chaque Result du CLI réécrit message_count à 1 dans le dossier de session (1 mesuré pour 13 messages envoyés) |
 | natif | `resume` | harnais | P14 | les transcripts natifs sont en mémoire (MemoryTranscriptStore) : après un redémarrage du backend le jeton relu du graphe ne désigne plus rien (« unknown transcript: nothing to resume ») |
 | natif | `permissions.session` | harnais | P11 | le harnais natif sait retenir une portée session, mais le backend répond toujours allow_once : la permission est redemandée |
 | natif | `permissions.always` | harnais | P11 | le harnais natif ne déclare pas la portée always (permission_scopes = once, session) et le backend ne la transmet pas |

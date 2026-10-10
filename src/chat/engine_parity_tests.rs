@@ -225,16 +225,6 @@ const FUNCTIONS: &[(&str, &str)] = &[
 /// measures fails it too (update this list and regenerate the table).
 const EXPECTED: &[(Engine, &str, Expect)] = &[
     (
-        Engine::ClaudeCode,
-        "session_record",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "P15",
-            why: "chaque Result du CLI réécrit message_count à 1 dans le dossier de session \
-                  (1 mesuré pour 13 messages envoyés)",
-        },
-    ),
-    (
         Engine::Native,
         "resume",
         Expect::Gap {
