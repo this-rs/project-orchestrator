@@ -7727,8 +7727,7 @@ mod post_turn {
         idle(&r).await;
         r.manager.send_message(&r.sid, "two").await.unwrap();
         idle(&r).await;
-        // Whatever the store does after the turn, give it the time to land.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The write is waited for in `after_turn`, before the session goes idle.
         assert!(
             stored(&r).await.context.is_some(),
             "the context of the second compaction is stored"
@@ -7739,6 +7738,45 @@ mod post_turn {
         let sent = r.sent();
         assert!(sent[1].contains("Post-Compaction Context"), "{}", sent[1]);
         assert!(sent[2].contains("Post-Compaction Context"), "{}", sent[2]);
+    }
+
+    /// A turn carrying the held context compacts again, then the user stops it (the
+    /// provider ends it `done interrupted`: answered, the context delivered). The
+    /// compaction's own context is still built and held — the next turn carries a
+    /// context, and the store keeps one — instead of nothing at all.
+    #[tokio::test]
+    async fn a_stop_on_a_turn_that_compacts_again_keeps_a_context_for_the_next() {
+        let r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![compaction(), steps::done(&caps())],
+                vec![compaction(), Step::AwaitInterrupt],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        r.manager.send_message(&r.sid, "one").await.unwrap();
+        idle(&r).await;
+        r.manager.send_message(&r.sid, "two").await.unwrap();
+        sent_count(&r, 2).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        r.manager.interrupt(&r.sid).await.unwrap();
+        idle(&r).await;
+        assert!(
+            stored(&r).await.context.is_some(),
+            "the stopped turn's compaction holds its context in the store"
+        );
+        r.manager.send_message(&r.sid, "three").await.unwrap();
+        sent_count(&r, 3).await;
+        idle(&r).await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 3, "{sent:#?}");
+        assert!(sent[1].contains("Post-Compaction Context"), "{}", sent[1]);
+        assert!(
+            sent[2].contains("Post-Compaction Context") && sent[2].contains("three"),
+            "the turn after the Stop carries a context: {}",
+            sent[2]
+        );
     }
 
     #[tokio::test]
