@@ -548,18 +548,12 @@ impl Neo4jClient {
 
             // Parse the event data JSON to extract content
             if let Ok(data) = serde_json::from_str::<serde_json::Value>(&event_data) {
-                if let Some(content) = data.get("content").and_then(|v| v.as_str()) {
-                    let chars: Vec<char> = content.chars().collect();
-                    let title = if chars.len() > 80 {
-                        format!("{}...", chars[..77].iter().collect::<String>().trim_end())
-                    } else {
-                        content.to_string()
-                    };
-                    let preview = if chars.len() > 200 {
-                        format!("{}...", chars[..197].iter().collect::<String>().trim_end())
-                    } else {
-                        content.to_string()
-                    };
+                // The title rule of every session (`chat::session_record`).
+                if let Some((title, preview)) = data
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .and_then(crate::chat::session_record::title_and_preview)
+                {
                     updates.push((session_id, title, preview));
                 }
             }
