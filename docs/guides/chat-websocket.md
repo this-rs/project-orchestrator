@@ -177,9 +177,15 @@ These events are not `ChatEvent` variants but are sent by the WebSocket handler 
   "id": "tu_abc123",
   "tool": "search_code",
   "input": {"query": "authenticate", "project_slug": "my-api"},
-  "seq": 15
+  "seq": 15,
+  "created_at": 1760099999.123
 }
 ```
+
+`created_at` is a server time in seconds since the epoch, with the milliseconds as the fraction (the
+unit of `created_at` in `GET /api/chat/sessions/{id}/messages`). A replayed event carries the time it
+was stored; a live event (local or relayed over NATS) the time the server forwards it. Events of the
+mid-stream snapshot sent on join carry none.
 
 #### Replay Events
 
@@ -190,7 +196,8 @@ During the replay phase, events include `"replaying": true` so the client can di
   "type": "assistant_text",
   "content": "I found the authentication module.",
   "seq": 3,
-  "replaying": true
+  "replaying": true,
+  "created_at": 1760099990.457
 }
 ```
 

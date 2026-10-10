@@ -829,12 +829,18 @@ fn control_frames() -> Vec<ControlFrame> {
 ///
 /// api::ws_chat_handler::handle_ws_chat_loop: live events get `seq: 0`
 /// (`send_chat_event!`), replayed events get their stored `seq` and
-/// `replaying: true`. The frames the handler builds itself with a `ChatEvent`
-/// tag (`error`, `streaming_status`, `pending_queue`,
-/// `permission_mode_changed`, `model_changed`) carry neither, hence both
-/// fields are optional.
+/// `replaying: true`. Both carry `created_at` (`live_frame` / `replayed_frame`):
+/// seconds since the epoch, milliseconds as the fraction — the time stored for a
+/// replayed event, the forwarding time for a live one. The events of the
+/// mid-stream snapshot carry no `created_at` (their time is not kept), and the
+/// frames the handler builds itself with a `ChatEvent` tag (`error`,
+/// `streaming_status`, `pending_queue`, `permission_mode_changed`,
+/// `model_changed`) carry none of these fields, hence all are optional.
 fn event_envelope() -> (Value, Value) {
-    (json!({ "seq": 42, "replaying": true }), json!({}))
+    (
+        json!({ "seq": 42, "replaying": true, "created_at": 1760099999.123 }),
+        json!({}),
+    )
 }
 
 // ============================================================================
