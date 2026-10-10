@@ -171,6 +171,60 @@ pub async fn render_documents(graph: &Arc<dyn GraphStore>, refs: &[MessageAttach
     out
 }
 
+/// An image attached to a message, as a provider takes it inline: its type and
+/// its bytes in standard base64 (no `data:` prefix).
+///
+/// A backend type on purpose: the agent engine turns it into the nexus input
+/// block in ONE place (`agent_runtime`), the manager never sees the SDK type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedImage {
+    pub media_type: String,
+    pub data_base64: String,
+}
+
+/// Whether an attachment is a picture (the media type recorded at upload,
+/// derived from the bytes: `image/png`, `image/jpeg`, `image/gif`, `image/webp`).
+pub fn is_image(attachment: &MessageAttachment) -> bool {
+    attachment.mime_type.starts_with("image/")
+}
+
+/// The images attached to `content` (the stored form of a message), read from
+/// the blob store, in the order they were attached. A message without image →
+/// empty.
+///
+/// # Errors
+///
+/// A line naming the image that cannot be read (document gone, blob missing or
+/// corrupted): the caller says so on the wire, it never sends the turn without
+/// the picture the user attached.
+pub async fn load_images(
+    graph: &Arc<dyn GraphStore>,
+    store: &crate::documents::store::DocumentStore,
+    content: &str,
+) -> Result<Vec<AttachedImage>, String> {
+    use base64::Engine as _;
+    let (_, refs) = split(content);
+    let mut images = Vec::new();
+    for r in refs.iter().filter(|r| is_image(r)) {
+        let doc = graph
+            .get_document(r.id)
+            .await
+            .map_err(|e| format!("the image {} could not be read: {e}", r.filename))?
+            .ok_or_else(|| format!("the image {} no longer exists", r.filename))?;
+        let store = store.clone();
+        let sha = doc.sha256.clone();
+        let bytes = tokio::task::spawn_blocking(move || store.get(&sha))
+            .await
+            .map_err(|e| format!("the image {} could not be read: {e}", r.filename))?
+            .map_err(|e| format!("the image {} could not be read: {e}", r.filename))?;
+        images.push(AttachedImage {
+            media_type: r.mime_type.clone(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        });
+    }
+    Ok(images)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,5 +361,79 @@ mod tests {
     async fn a_message_without_attachments_reaches_the_agent_unchanged() {
         let (graph, _) = store_with(None).await;
         assert_eq!(expand_for_agent(&graph, "plain").await, "plain");
+    }
+
+    /// A stored image document: its blob in `store`, its node in the mock graph.
+    async fn store_image(
+        mock: &MockGraphStore,
+        store: &crate::documents::store::DocumentStore,
+        bytes: &[u8],
+        mime: &str,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        let sha256 = store.put(bytes).unwrap();
+        mock.documents.write().await.insert(
+            id,
+            Document {
+                id,
+                filename: "shot.png".to_string(),
+                format: DocumentFormat::Binary,
+                sha256,
+                size_bytes: bytes.len() as u64,
+                page_count: 0,
+                chunk_count: 0,
+                warnings: vec![],
+                created_at: chrono::Utc::now(),
+                project_id: None,
+                session_id: None,
+                extracted: false,
+                mime_type: Some(mime.to_string()),
+            },
+        );
+        id
+    }
+
+    #[tokio::test]
+    async fn the_images_of_a_message_are_read_from_the_blob_store_in_order() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::documents::store::DocumentStore::new(dir.path());
+        let mock = MockGraphStore::new();
+        let png = store_image(&mock, &store, b"\x89PNG\r\n\x1a\nfirst", "image/png").await;
+        let jpeg = store_image(&mock, &store, b"\xff\xd8\xffsecond", "image/jpeg").await;
+        let (text_graph, text) = store_with(Some("plain text")).await;
+        // The text document lives in another mock: copy its node over.
+        let node = text_graph.get_document(text).await.unwrap().unwrap();
+        mock.documents.write().await.insert(text, node);
+        let graph: Arc<dyn GraphStore> = Arc::new(mock);
+
+        let stored = compose(&graph, "look", &[png, text, jpeg]).await.unwrap();
+        let images = load_images(&graph, &store, &stored).await.unwrap();
+        assert_eq!(images.len(), 2, "the text document is not an image");
+        assert_eq!(images[0].media_type, "image/png");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&images[0].data_base64)
+                .unwrap(),
+            b"\x89PNG\r\n\x1a\nfirst"
+        );
+        assert_eq!(images[1].media_type, "image/jpeg");
+        assert!(load_images(&graph, &store, "no attachment")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_image_whose_blob_is_gone_is_an_error_not_a_silent_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::documents::store::DocumentStore::new(dir.path());
+        let mock = MockGraphStore::new();
+        let id = store_image(&mock, &store, b"\x89PNG\r\n\x1a\ngone", "image/png").await;
+        let graph: Arc<dyn GraphStore> = Arc::new(mock);
+        let stored = compose(&graph, "look", &[id]).await.unwrap();
+        let elsewhere = crate::documents::store::DocumentStore::new(dir.path().join("empty"));
+        let err = load_images(&graph, &elsewhere, &stored).await.unwrap_err();
+        assert!(err.contains("shot.png"), "{err}");
     }
 }
