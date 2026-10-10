@@ -5541,6 +5541,15 @@ mod attached_images {
             .rev()
             .find(|m| m["role"] == "user")
             .unwrap();
+        let text = user["content"].to_string();
+        assert!(
+            !text.contains("no text could be extracted"),
+            "the image is sent, its /raw line is not: {text}"
+        );
+        assert!(
+            text.contains("pixel.png"),
+            "the document heading stays: {text}"
+        );
         let parts = user["content"]
             .as_array()
             .unwrap_or_else(|| panic!("a list of parts: {user}"));
@@ -5703,6 +5712,14 @@ mod attached_images {
         assert!(answered, "the CLI answered the turn");
 
         let written = std::fs::read_to_string(&stdin_out).expect("stdin recorded");
+        assert!(
+            !written.contains("no text could be extracted"),
+            "the image is sent, its /raw line is not: {written}"
+        );
+        assert!(
+            written.contains("pixel.png"),
+            "the document heading stays: {written}"
+        );
         let user: Value = written
             .lines()
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())

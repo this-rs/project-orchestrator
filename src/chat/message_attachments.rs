@@ -129,6 +129,31 @@ pub async fn expand_for_agent(graph: &Arc<dyn GraphStore>, content: &str) -> Str
     out
 }
 
+/// The line a document without extracted text gets in the prompt: it points at
+/// the original. Shared with [`without_notes_of_sent_images`], which takes it
+/// out again for an image the turn carries inline.
+fn no_text_line(r: &MessageAttachment) -> String {
+    format!(
+        "[no text could be extracted from this {} file ({} bytes); the original is at GET /api/documents/{}/raw]\n",
+        if r.mime_type.is_empty() { "binary" } else { &r.mime_type },
+        r.size_bytes,
+        r.id
+    )
+}
+
+/// `prompt` without the "no text could be extracted… /raw" line of each image
+/// in `images`: the agent engine sends those inline, the line would only
+/// repeat them. The document's heading stays. Every other line — and the whole
+/// prompt of a turn whose images are not sent, or of the legacy engine — is
+/// left as is.
+pub fn without_notes_of_sent_images(prompt: &str, images: &[AttachedImage]) -> String {
+    let mut out = prompt.to_string();
+    for image in images {
+        out = out.replacen(&no_text_line(&image.source), "", 1);
+    }
+    out
+}
+
 /// The documents' text as the block that follows the message in the prompt;
 /// empty when there is no attachment. Never fails (see [`expand_for_agent`]).
 pub async fn render_documents(graph: &Arc<dyn GraphStore>, refs: &[MessageAttachment]) -> String {
@@ -159,12 +184,7 @@ pub async fn render_documents(graph: &Arc<dyn GraphStore>, refs: &[MessageAttach
                     ));
                 }
             }
-            Ok(_) => out.push_str(&format!(
-                "[no text could be extracted from this {} file ({} bytes); the original is at GET /api/documents/{}/raw]\n",
-                if r.mime_type.is_empty() { "binary" } else { &r.mime_type },
-                r.size_bytes,
-                r.id
-            )),
+            Ok(_) => out.push_str(&no_text_line(r)),
             Err(e) => out.push_str(&format!("[this document could not be read: {e}]\n")),
         }
     }
@@ -180,6 +200,8 @@ pub async fn render_documents(graph: &Arc<dyn GraphStore>, refs: &[MessageAttach
 pub struct AttachedImage {
     pub media_type: String,
     pub data_base64: String,
+    /// The attachment it was read from (its id names it in the prompt).
+    pub source: MessageAttachment,
 }
 
 /// Whether an attachment is a picture (the media type recorded at upload,
@@ -220,6 +242,7 @@ pub async fn load_images(
         images.push(AttachedImage {
             media_type: r.mime_type.clone(),
             data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            source: r.clone(),
         });
     }
     Ok(images)
@@ -435,5 +458,28 @@ mod tests {
         let elsewhere = crate::documents::store::DocumentStore::new(dir.path().join("empty"));
         let err = load_images(&graph, &elsewhere, &stored).await.unwrap_err();
         assert!(err.contains("shot.png"), "{err}");
+    }
+
+    /// The prompt keeps the "no text could be extracted… /raw" line of an image
+    /// (the legacy engine, a turn whose images are not sent); only a turn that
+    /// carries the image inline takes it out, and nothing else.
+    #[tokio::test]
+    async fn only_an_image_sent_inline_loses_its_no_text_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::documents::store::DocumentStore::new(dir.path());
+        let mock = MockGraphStore::new();
+        let id = store_image(&mock, &store, b"\x89PNG\r\n\x1a\nnote", "image/png").await;
+        let graph: Arc<dyn GraphStore> = Arc::new(mock);
+        let stored = compose(&graph, "look", &[id]).await.unwrap();
+
+        let prompt = expand_for_agent(&graph, &stored).await;
+        assert!(prompt.contains("no text could be extracted"), "{prompt}");
+        assert_eq!(without_notes_of_sent_images(&prompt, &[]), prompt);
+
+        let images = load_images(&graph, &store, &stored).await.unwrap();
+        let sent = without_notes_of_sent_images(&prompt, &images);
+        assert!(!sent.contains("no text could be extracted"), "{sent}");
+        assert!(sent.contains(&format!("### shot.png (id {id})")), "{sent}");
+        assert!(sent.starts_with("look"));
     }
 }
