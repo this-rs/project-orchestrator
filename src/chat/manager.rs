@@ -1710,7 +1710,10 @@ impl ChatManager {
         }));
         let enrichment_pipeline =
             Self::build_enrichment_pipeline(&graph, &search, None, None, None);
-        let agent_runtime = Arc::new(super::agent_runtime::AgentRuntime::new(graph.clone()));
+        let agent_runtime = Arc::new(
+            super::agent_runtime::AgentRuntime::new(graph.clone())
+                .declaring_read_only_mcp_tools(config.read_only_mcp_tools.clone()),
+        );
         let provider_source: Arc<dyn super::agent_runtime::ProviderSource> = Arc::new(
             super::agent_runtime::BuiltinProviders::new(config.claude_cli_path.clone()),
         );
@@ -1791,7 +1794,10 @@ impl ChatManager {
         });
         let enrichment_pipeline =
             Self::build_enrichment_pipeline(&graph, &search, None, None, None);
-        let agent_runtime = Arc::new(super::agent_runtime::AgentRuntime::new(graph.clone()));
+        let agent_runtime = Arc::new(
+            super::agent_runtime::AgentRuntime::new(graph.clone())
+                .declaring_read_only_mcp_tools(config.read_only_mcp_tools.clone()),
+        );
         let provider_source: Arc<dyn super::agent_runtime::ProviderSource> = Arc::new(
             super::agent_runtime::BuiltinProviders::new(config.claude_cli_path.clone()),
         );
@@ -4992,7 +4998,11 @@ impl ChatManager {
                     objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
                     work_log: work_log.clone(),
                     oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
-                    session_grants: Arc::default(),
+                    session_grants: Arc::new(std::sync::Mutex::new(
+                        super::session_grants::SessionGrants::declaring(
+                            self.config.read_only_mcp_tools.clone(),
+                        ),
+                    )),
                     oob_trigger_cap,
                     oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
                     oob_capped_warned: Arc::new(AtomicBool::new(false)),
@@ -7626,13 +7636,17 @@ impl ChatManager {
         let grant = match (allow, scope) {
             (false, _) | (true, super::types::PermissionAnswerScope::Once) => None,
             (true, super::types::PermissionAnswerScope::Session) => {
+                // With this session's declared read-only MCP tools.
                 let grant = claimed.as_ref().and_then(|c| {
-                    super::session_grants::grant_for(&super::session_grants::AskedCall {
-                        asker: super::session_grants::Asker::ClaudeCode,
-                        tool: c.tool.clone(),
-                        canonical: None,
-                        input: c.input.clone(),
-                    })
+                    session_grants
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .grant_for(&super::session_grants::AskedCall {
+                            asker: super::session_grants::Asker::ClaudeCode,
+                            tool: c.tool.clone(),
+                            canonical: None,
+                            input: c.input.clone(),
+                        })
                 });
                 match grant {
                     Some(grant) => Some(grant),
@@ -9051,7 +9065,11 @@ impl ChatManager {
                     // Resumed sessions = interactive: use the generous cap (50/5min).
                     // T7 of plan 9a1684b2.
                     oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
-                    session_grants: Arc::default(),
+                    session_grants: Arc::new(std::sync::Mutex::new(
+                        super::session_grants::SessionGrants::declaring(
+                            self.config.read_only_mcp_tools.clone(),
+                        ),
+                    )),
                     oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
                     oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
                     oob_capped_warned: Arc::new(AtomicBool::new(false)),
@@ -11867,7 +11885,9 @@ impl ChatManager {
         let kind_name = serde_json::to_value(kind)
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_else(|| "claude_code".to_string());
+            // Never a guess: an unnamed kind is `unknown`, whose requests are never granted
+            // for the session (`session_grants::Asker::Other`, the most restrictive).
+            .unwrap_or_else(|| "unknown".to_string());
         let extra_degraded = if nexus_missing {
             vec![super::agent_runtime::NEXUS_TOOLS_FEATURE.to_string()]
         } else {
@@ -12850,6 +12870,7 @@ mod tests {
             jwt_secret: None,
             server_port: 8080,
             session_token_expiry_secs: 86400,
+            read_only_mcp_tools: Vec::new(),
         }
     }
 

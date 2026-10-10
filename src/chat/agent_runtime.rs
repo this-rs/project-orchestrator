@@ -993,11 +993,13 @@ impl AgentSessionHandle {
                     .unwrap_or_else(|p| p.into_inner())
                     .get(request_id)
                     .cloned();
-                Some(
-                    call.as_ref()
-                        .and_then(super::session_grants::grant_for)
-                        .ok_or(PermissionDeliveryError::ScopeUnsupported(scope))?,
-                )
+                let grant = call.as_ref().and_then(|call| {
+                    self.session_grants
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .grant_for(call)
+                });
+                Some(grant.ok_or(PermissionDeliveryError::ScopeUnsupported(scope))?)
             }
             (true, PermissionAnswerScope::Always) => {
                 return Err(PermissionDeliveryError::ScopeUnsupported(scope));
@@ -1143,6 +1145,10 @@ impl AgentSessionHandle {
 pub struct AgentRuntime {
     sessions: RwLock<HashMap<String, Arc<AgentSessionHandle>>>,
     graph: Arc<dyn GraphStore>,
+    /// The third-party MCP tools the operator declared read-only
+    /// (`ChatConfig::read_only_mcp_tools`): what each session's grants may cover
+    /// (`session_grants::SessionGrants::declaring`).
+    read_only_mcp_tools: Vec<String>,
 }
 
 impl AgentRuntime {
@@ -1151,7 +1157,15 @@ impl AgentRuntime {
         Self {
             sessions: RwLock::new(HashMap::new()),
             graph,
+            read_only_mcp_tools: Vec::new(),
         }
+    }
+
+    /// This runtime, its sessions declaring these third-party MCP tools read-only (exact
+    /// `mcp__<server>__<tool>` names): the only ones a session grant may cover.
+    pub fn declaring_read_only_mcp_tools(mut self, tools: Vec<String>) -> Self {
+        self.read_only_mcp_tools = tools;
+        self
     }
 
     /// The live session, if this runtime owns it.
@@ -1251,7 +1265,9 @@ impl AgentRuntime {
             cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
-            session_grants: std::sync::Mutex::default(),
+            session_grants: std::sync::Mutex::new(super::session_grants::SessionGrants::declaring(
+                self.read_only_mcp_tools.clone(),
+            )),
             asked_calls: std::sync::Mutex::new(HashMap::new()),
             asker: super::session_grants::Asker::from_provider_kind(provider_kind),
         });

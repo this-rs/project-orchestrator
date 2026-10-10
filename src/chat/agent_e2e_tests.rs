@@ -7573,6 +7573,9 @@ mod permission_scopes {
             nexus_browser_path: None,
             jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
             max_sessions: 10,
+            // A third-party MCP tool is granted for the session only when the operator
+            // declared it read-only: the fake server's tool is, for the grant mechanics.
+            read_only_mcp_tools: vec![PO_WRITE.to_string()],
             ..Default::default()
         };
         let m = ChatManager::new_without_memory(dyn_graph, state.meili, config);

@@ -22,12 +22,20 @@
 //!      `NotebookRead`), identified FOR SURE (the adapter's `canonical` name AND the
 //!      `mcp__nexus__` name it belongs to), is covered whole: any later call of it;
 //!    - the file tools (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`), the reads of the
-//!      CLI (it only asks a read OUTSIDE the working directory, so never whole), the web
-//!      tools (`WebFetch`, `WebSearch`) and a third party's MCP tool: the identical call;
+//!      CLI (it only asks a read OUTSIDE the working directory, so never whole) and the
+//!      web tools (`WebFetch`, `WebSearch`): the identical call;
+//!    - a third party's MCP tool: the identical call, and ONLY when the operator declared
+//!      it read-only by its exact name (`mcp__<server>__<tool>`,
+//!      `ChatConfig::read_only_mcp_tools`, kept by [`SessionGrants::declaring`]). Its name
+//!      says nothing of what it does (a tool that runs a command or a script can be called
+//!      anything), and the MCP `readOnlyHint` annotation does not reach the backend (no
+//!      engine relays it in a permission request): an undeclared one is allowed once,
+//!      never for the session. A declared one named like a command tool still goes
+//!      through the command checks;
 //!    - a command (`Bash`, `Monitor`): the identical line, and only when EVERY simple
 //!      command of it is a program of [`SAFE_PROGRAMS`] (programs that execute nothing
-//!      from the project), none of its options able to run something, the line readable
-//!      for sure ([`simple_commands`]);
+//!      from the project), none of its options able to run something or to write a file,
+//!      the line readable for sure ([`simple_commands`]);
 //!    - anything else (`SlashCommand`, `Skill`, `Task`, `Agent`, `TaskStop`, a tool the
 //!      backend does not know) is refused.
 //!
@@ -35,8 +43,9 @@
 //! its surrounding blanks trimmed and every field but the cosmetic `description`). The
 //! working directory is NOT part of it: both engines keep the `cd` of one call for the
 //! next, so a grant of `ls` lists whatever directory the shell is in, and a grant of
-//! `echo x > out` writes `out` there. The programs of the allowlist only read, list or
-//! print; what a redirection writes is in the line the user approved.
+//! `echo x > out` writes `out` there. The programs of the allowlist read, list or print;
+//! their options that write a file are refused (`find -delete`, `sort -o`...), so what the
+//! line writes is what its redirections, in the line the user approved, write.
 //!
 //! The programs are found through the server's `PATH`, never the model's: neither engine
 //! keeps an environment change from one call to the next, and a line that changes it
@@ -82,7 +91,9 @@ const EXACT_TOOLS: &[&str] = &[
 const COMMAND_BUILTINS: &[&str] = &["Bash", "Monitor"];
 
 /// Tool names (alias, exact name, or the last segment of an MCP name) that run a command
-/// line: a third party's tool of that name goes through the command checks too. Matching
+/// line: a third party's tool of that name, once declared read-only, goes through the
+/// command checks too. NOT how a tool that runs something is recognised (a name proves
+/// nothing): an undeclared third-party tool is never granted, whatever its name. Matching
 /// more names here only ever refuses more.
 const COMMAND_TOOLS: &[&str] = &["Bash", "Monitor", "shell", "exec_command"];
 
@@ -114,17 +125,22 @@ impl Asker {
 
 /// A program a session grant may cover in a command line: it executes nothing from the
 /// project (no script, no plugin, no configuration file of the working tree), whatever the
-/// files it reads say. Its options that can run something are refused.
+/// files it reads say. Its options that can run something or write a file are refused.
 struct SafeProgram {
     name: &'static str,
-    /// Long options that run a program (`--pre`): refused, also abbreviated (GNU
-    /// `getopt_long` takes any unambiguous prefix: `--compress` for `--compress-program`)
-    /// and in their `--opt=value` form.
+    /// Long options that run a program (`--pre`) or write a file (`--output`): refused,
+    /// also abbreviated (GNU `getopt_long` takes any unambiguous prefix: `--compress` for
+    /// `--compress-program`) and in their `--opt=value` form.
     long: &'static [&'static str],
-    /// Single-dash words that run a program (`find -exec`).
+    /// Single-dash words that run a program (`find -exec`) or write a file
+    /// (`find -delete`).
     single: &'static [&'static str],
-    /// Short options that run a program, also inside a cluster (`fd -Hx`).
+    /// Short options that run a program or write a file, also inside a cluster
+    /// (`fd -Hx`, `sort -no`), and with their value attached (`sort -oout`).
     short: &'static [char],
+    /// Its second operand is a file it WRITES (`uniq IN OUT` truncates `OUT`): at most
+    /// one operand.
+    one_operand: bool,
 }
 
 impl SafeProgram {
@@ -134,13 +150,16 @@ impl SafeProgram {
             long: &[],
             single: &[],
             short: &[],
+            one_operand: false,
         }
     }
 
-    /// Whether some option of it can run a program: a glob in its arguments could then
-    /// expand to that option (a file named `--pre=./x.sh`), so none is allowed.
+    /// Whether some option or operand of it can run a program or write a file: a glob in
+    /// its arguments could then expand to that option (a file named `--pre=./x.sh`) or
+    /// to a second operand, so none is allowed.
     fn has_dangerous_options(&self) -> bool {
-        !(self.long.is_empty() && self.single.is_empty() && self.short.is_empty())
+        self.one_operand
+            || !(self.long.is_empty() && self.single.is_empty() && self.short.is_empty())
     }
 
     fn forbids(&self, word: &str) -> bool {
@@ -160,11 +179,13 @@ impl SafeProgram {
     }
 }
 
-/// The programs a `session` grant of a command line may run (P11c): they only read, list,
-/// compare or print. Everything else is refused: interpreters, shells, task runners, build
+/// The programs a `session` grant of a command line may run (P11c): they read, list,
+/// compare or print, and their options that would run a program or write a file are
+/// refused (`find -delete`/`-fprint`, `sort -o`, `tree -o`/`-R`, `file -C`, `uniq`'s output
+/// operand). Everything else is refused: interpreters, shells, task runners, build
 /// tools, linters and servers that load project files (`eslint`, `vite`, `mypy`...),
 /// `git` (hooks, `core.fsmonitor`, diff drivers from the repository's configuration),
-/// `sed` (`-f`, the `e` command), `awk`, `jq`, `tar`, `sqlite3`, `xargs`, `env`, any
+/// `sed` (`-f`, the `e` command), `awk`, `jq`, `tar`, `sqlite3`, `xargs`, `env`, `tee`, any
 /// builtin that changes how a name resolves (`export`, `hash`, `enable`, `alias`, `cd`...).
 const SAFE_PROGRAMS: &[SafeProgram] = &[
     SafeProgram::plain("ls"),
@@ -180,42 +201,73 @@ const SAFE_PROGRAMS: &[SafeProgram] = &[
         long: &["--pre", "--pre-glob", "--hostname-bin"],
         single: &[],
         short: &[],
+        one_operand: false,
     },
+    // `-delete` removes, `-fprint*` / `-fls` write (truncate) a file.
     SafeProgram {
         name: "find",
         long: &[],
-        single: &["-exec", "-execdir", "-ok", "-okdir"],
+        single: &[
+            "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf",
+            "-fls",
+        ],
         short: &[],
+        one_operand: false,
     },
     SafeProgram {
         name: "fd",
         long: &["--exec", "--exec-batch"],
         single: &[],
         short: &['x', 'X'],
+        one_operand: false,
     },
     SafeProgram {
         name: "fdfind",
         long: &["--exec", "--exec-batch"],
         single: &[],
         short: &['x', 'X'],
+        one_operand: false,
     },
+    // `-o` / `--output` write the result to a file.
     SafeProgram {
         name: "sort",
-        long: &["--compress-program"],
+        long: &["--compress-program", "--output"],
+        single: &[],
+        short: &['o'],
+        one_operand: false,
+    },
+    // `uniq IN OUT` truncates `OUT`.
+    SafeProgram {
+        name: "uniq",
+        long: &[],
         single: &[],
         short: &[],
+        one_operand: true,
     },
-    SafeProgram::plain("uniq"),
     SafeProgram::plain("cut"),
     SafeProgram::plain("tr"),
     SafeProgram::plain("nl"),
     SafeProgram::plain("diff"),
     SafeProgram::plain("cmp"),
     SafeProgram::plain("stat"),
-    SafeProgram::plain("file"),
+    // `-C` / `--compile` writes a compiled magic file (`*.mgc`).
+    SafeProgram {
+        name: "file",
+        long: &["--compile"],
+        single: &[],
+        short: &['C'],
+        one_operand: false,
+    },
     SafeProgram::plain("du"),
     SafeProgram::plain("df"),
-    SafeProgram::plain("tree"),
+    // `-o` writes the listing to a file; `-R` (with `-H`) writes one in every directory.
+    SafeProgram {
+        name: "tree",
+        long: &[],
+        single: &[],
+        short: &['o', 'R'],
+        one_operand: false,
+    },
     SafeProgram::plain("pwd"),
     SafeProgram::plain("echo"),
     // `printf -v VAR` assigns a variable of the shell (`printf -v PATH ./bin; ls`).
@@ -224,6 +276,7 @@ const SAFE_PROGRAMS: &[SafeProgram] = &[
         long: &[],
         single: &[],
         short: &['v'],
+        one_operand: false,
     },
     SafeProgram::plain("which"),
     SafeProgram::plain("basename"),
@@ -292,19 +345,37 @@ impl AskedCall {
         .any(|name| COMMAND_TOOLS.contains(&name))
     }
 
-    /// A third party's MCP tool: the identical call (the command checks when it is named
-    /// like a command tool).
-    fn third_party(&self) -> Kind {
-        if self.is_command() {
+    /// A third party's MCP tool: the identical call, and only when the operator declared
+    /// it read-only by its exact name (`read_only_mcp`); the command checks too when it is
+    /// named like a command tool. `None` for an undeclared one, whatever its name: a tool
+    /// that runs a command or a script may be called anything.
+    fn third_party(&self, read_only_mcp: &[String]) -> Option<Kind> {
+        if !read_only_mcp.contains(&self.tool) {
+            return None;
+        }
+        Some(if self.is_command() {
             Kind::Command
         } else {
             Kind::Exact
-        }
+        })
+    }
+
+    /// Whether the input of a Codex MCP elicitation has the shape of the call's arguments
+    /// (`tool_params`): a non-empty object with no `message` field. nexus
+    /// (`codex/map.rs`, `ask_elicitation`) falls back to `{"message": <the elicitation's
+    /// text>}` when the arguments are missing, and the backend cannot see which of the two
+    /// it got: anything that could be that fallback, whatever other fields it might grow,
+    /// is refused (a tool whose own arguments hold a `message` is then allowed once only).
+    fn codex_input_is_the_arguments(&self) -> bool {
+        self.input
+            .as_object()
+            .is_some_and(|fields| !fields.is_empty() && !fields.contains_key("message"))
     }
 
     /// Rules 1 and 2 of the module: what a grant of this call may be, `None` when it
-    /// cannot be granted for the session at all.
-    fn kind(&self) -> Option<Kind> {
+    /// cannot be granted for the session at all. `read_only_mcp`: the third-party MCP
+    /// tools the operator declared read-only.
+    fn kind(&self, read_only_mcp: &[String]) -> Option<Kind> {
         match self.asker {
             Asker::Native => {
                 if let Some(name) = self.nexus_builtin() {
@@ -321,7 +392,7 @@ impl AskedCall {
                 match self.mcp_server() {
                     // A `nexus` tool the adapter did not name for sure: unknown.
                     Some(NEXUS_TOOLS_SERVER) | None => None,
-                    Some(_) => Some(self.third_party()),
+                    Some(_) => self.third_party(read_only_mcp),
                 }
             }
             Asker::ClaudeCode => {
@@ -330,21 +401,23 @@ impl AskedCall {
                 } else if self.tool == "Bash" {
                     Some(Kind::Command)
                 } else if self.mcp_server().is_some() {
-                    Some(self.third_party())
+                    self.third_party(read_only_mcp)
                 } else {
                     None
                 }
             }
             // Only an MCP tool call whose elicitation carries the call's arguments
             // (`tool_params`): nexus names it `mcp__<server>__<tool>` with that same name
-            // as `canonical`, and gives `{"message": ...}` when the arguments are missing.
+            // as `canonical` ([`Self::codex_input_is_the_arguments`] for the input).
             Asker::Codex => {
                 let whole = self.mcp_server().is_some()
                     && self.canonical.as_deref() == Some(self.tool.as_str())
-                    && self.input.as_object().is_some_and(|fields| {
-                        !(fields.len() == 1 && fields.contains_key("message"))
-                    });
-                whole.then(|| self.third_party())
+                    && self.codex_input_is_the_arguments();
+                if whole {
+                    self.third_party(read_only_mcp)
+                } else {
+                    None
+                }
             }
             Asker::Other => None,
         }
@@ -437,6 +510,8 @@ struct Word {
 /// - a brace outside quotes: `{bash,x.sh}` runs `bash x.sh`, `{ cmd; }` is a group;
 /// - a backslash outside single quotes: `ba\⏎sh x.sh` (a line continuation) runs
 ///   `bash x.sh`;
+/// - a `^`, `~` or `#` outside quotes: zsh's extended glob operators (`EXTENDED_GLOB`),
+///   which this reader does not expand (a `~` home and a `#` comment go with them);
 /// - an unterminated quote, a control character (only blanks, tabs and new lines are
 ///   read: a non-breaking space is not a separator for the shell).
 fn simple_commands(line: &str) -> Option<Vec<Vec<Word>>> {
@@ -475,6 +550,10 @@ fn simple_commands(line: &str) -> Option<Vec<Vec<Word>>> {
         let tail = std::mem::replace(&mut redirect_tail, false);
         match c {
             '\\' | '$' | '`' | '{' | '}' => return None,
+            // zsh with `EXTENDED_GLOB` (the user's shell runs Claude Code's commands):
+            // `^x`, `a~b`, `x#`, `x##` are patterns, expanded to file names the model
+            // chose. Refused wherever they stand, a `~` home too (conservative).
+            '^' | '~' | '#' => return None,
             '\'' | '"' => {
                 quote = Some(c);
                 in_word = true;
@@ -527,7 +606,38 @@ fn runs_only_what_it_shows(words: &[Word]) -> bool {
     if safe.has_dangerous_options() && args.iter().any(|w| w.glob) {
         return false;
     }
+    if safe.one_operand && operands(args) > 1 {
+        return false;
+    }
     !args.iter().any(|w| safe.forbids(&w.text))
+}
+
+/// How many operands (arguments that are neither an option nor a redirection) these
+/// words hold, counted the conservative way: after `--` everything is one, and a word
+/// that follows an option (it may be that option's value) counts too.
+fn operands(args: &[Word]) -> usize {
+    let mut count = 0;
+    let mut options_end = false;
+    let mut redirect_target = false;
+    for word in args {
+        let text = word.text.as_str();
+        if std::mem::replace(&mut redirect_target, false) {
+            continue;
+        }
+        // `>out`, `2>>log`, `<in`, `&>f`, `>&2`: a redirection, its target attached or the
+        // next word.
+        let operator = text.trim_start_matches(|c: char| c.is_ascii_digit());
+        if operator.starts_with(['<', '>']) || operator.starts_with("&>") {
+            redirect_target = operator.trim_end_matches(['<', '>', '&', '|']).is_empty();
+            continue;
+        }
+        if !options_end && text == "--" {
+            options_end = true;
+        } else if options_end || !text.starts_with('-') || text == "-" {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Whether this command call only runs what its line shows ([`runs_only_what_it_shows`]
@@ -544,12 +654,18 @@ fn command_is_grantable(call: &AskedCall) -> bool {
 /// The grant an approval "for the session" of this call gives, or `None` when the call
 /// cannot be granted for the session (see the module: an input that is not the whole
 /// call, a tool not on the allowlist, a command running a program not on the allowlist):
-/// the answer `session` is then refused, typed.
+/// the answer `session` is then refused, typed. No third-party MCP tool is declared
+/// read-only here: a session's own declarations go through [`SessionGrants::grant_for`].
 pub fn grant_for(call: &AskedCall) -> Option<SessionGrant> {
+    grant_with(call, &[])
+}
+
+/// [`grant_for`], `read_only_mcp` being the third-party MCP tools declared read-only.
+fn grant_with(call: &AskedCall, read_only_mcp: &[String]) -> Option<SessionGrant> {
     if call.tool.is_empty() || call.tool == "unknown" {
         return None;
     }
-    match call.kind()? {
+    match call.kind(read_only_mcp)? {
         Kind::WholeTool => Some(SessionGrant::WholeTool {
             tool: call.tool.clone(),
         }),
@@ -565,9 +681,27 @@ pub fn grant_for(call: &AskedCall) -> Option<SessionGrant> {
 #[derive(Debug, Default)]
 pub struct SessionGrants {
     grants: Vec<SessionGrant>,
+    /// The third-party MCP tools (exact `mcp__<server>__<tool>` names) the operator
+    /// declared read-only (`ChatConfig::read_only_mcp_tools`): the only ones a session
+    /// grant may cover.
+    read_only_mcp: Vec<String>,
 }
 
 impl SessionGrants {
+    /// The grants of a session where these third-party MCP tools (exact
+    /// `mcp__<server>__<tool>` names) are declared read-only.
+    pub fn declaring(read_only_mcp: Vec<String>) -> Self {
+        Self {
+            grants: Vec::new(),
+            read_only_mcp,
+        }
+    }
+
+    /// [`grant_for`], with this session's declared read-only MCP tools.
+    pub fn grant_for(&self, call: &AskedCall) -> Option<SessionGrant> {
+        grant_with(call, &self.read_only_mcp)
+    }
+
     /// Keeps a grant for the rest of the session.
     pub fn add(&mut self, grant: SessionGrant) {
         if !self.grants.contains(&grant) {
@@ -576,10 +710,10 @@ impl SessionGrants {
     }
 
     /// The grant that covers this call, if any: a grant covers a call when that call,
-    /// approved for the session, would give this very grant (every rule of [`grant_for`]
-    /// applies again to the later call).
+    /// approved for the session, would give this very grant (every rule of
+    /// [`Self::grant_for`] applies again to the later call).
     pub fn covering(&self, call: &AskedCall) -> Option<&SessionGrant> {
-        let grant = grant_for(call)?;
+        let grant = self.grant_for(call)?;
         self.grants.iter().find(|g| **g == grant)
     }
 }
@@ -633,26 +767,51 @@ mod tests {
         );
     }
 
+    /// The review of #688 (nit 4): what the parser decides, not only the exact comparison.
     #[test]
-    fn cat_readme_granted_for_the_session_does_not_allow_appending_to_zshrc() {
+    fn cat_readme_granted_for_the_session_covers_neither_a_redirection_nor_a_chained_command() {
         let grants = granted(&bash("cat README.md"));
         assert!(grants.covering(&bash("cat README.md")).is_some());
         assert!(grants.covering(&bash("  cat README.md ")).is_some());
-        assert!(grants.covering(&bash("cat x >> ~/.zshrc")).is_none());
-        assert!(grants
-            .covering(&bash("cat README.md >> ~/.zshrc"))
-            .is_none());
-        assert!(grants.covering(&bash("cat README.md; rm -rf ~")).is_none());
+        // An appending redirection is shown in its line: grantable on its own (what it
+        // writes is what the user approves), never covered by the grant of the plain read.
+        let appending = bash("cat README.md >> ../.zshrc");
+        assert!(grant_for(&appending).is_some());
+        assert!(grants.covering(&appending).is_none());
+        // A chained command off the allowlist: no grant at all (the parser reads the second
+        // simple command), so nothing could ever cover it.
+        for chained in [
+            "cat README.md; rm -rf ..",
+            "cat README.md && ./x.sh",
+            "cat README.md | sh",
+        ] {
+            assert!(grant_for(&bash(chained)).is_none(), "{chained:?}");
+            assert!(grants.covering(&bash(chained)).is_none(), "{chained:?}");
+        }
+        // A `~` home: refused (a zsh extended glob operator, review of #688 finding 2).
+        assert!(grant_for(&bash("cat x >> ~/.zshrc")).is_none());
     }
 
+    /// The review of #688 (nit 4): a redirection is allowed by design (the user sees it in
+    /// the line), so a line that holds one is its own grant; the grant of `ls` covers only
+    /// `ls`.
     #[test]
-    fn ls_granted_for_the_session_does_not_allow_a_redirection() {
+    fn ls_granted_for_the_session_covers_only_the_identical_line_a_seen_redirection_is_its_own_grant(
+    ) {
         let grants = granted(&bash("ls"));
-        assert!(grants
-            .covering(&bash("ls > ~/.ssh/authorized_keys"))
-            .is_none());
+        let redirected = bash("ls > ../.ssh/authorized_keys");
+        assert!(
+            matches!(grant_for(&redirected), Some(SessionGrant::Exact { .. })),
+            "a redirection in the approved line is granted for that line"
+        );
+        assert!(grants.covering(&redirected).is_none());
         assert!(grants.covering(&bash("ls -la")).is_none());
         assert!(grants.covering(&bash("lsof")).is_none());
+        // `ls` followed by a program off the allowlist: not grantable, not covered.
+        for line in ["ls; ./x.sh", "ls\nmake", "ls &>/dev/null & ./x.sh"] {
+            assert!(grant_for(&bash(line)).is_none(), "{line:?}");
+            assert!(grants.covering(&bash(line)).is_none(), "{line:?}");
+        }
     }
 
     #[test]
@@ -824,6 +983,97 @@ mod tests {
             "find . -name '*.rs'",
             "ls *.rs",
             "wc -l src/*.rs",
+        ] {
+            assert!(grant_for(&bash(command)).is_some(), "{command:?}");
+        }
+    }
+
+    /// The review of #688 (finding 2): zsh with `EXTENDED_GLOB` reads an unquoted `^`, `~`
+    /// or `#` as a glob operator, which could expand to a file the model named like a
+    /// forbidden option. Refused wherever it stands (conservative); quoted, a character.
+    #[test]
+    fn a_zsh_extended_glob_is_refused_where_it_could_become_an_option_that_runs_something() {
+        for command in [
+            "rg ^foo src",
+            "rg foo ^x",
+            "sort ^a",
+            "ls ^*.rs",
+            "find . -name x~y",
+            "cat src/*.rs~*.md",
+            "fd x#",
+            "rg foo x##",
+            "cat ~/notes.txt",
+            "ls ~",
+            "ls # a comment",
+            "wc -l a^b",
+        ] {
+            refused_everywhere(command);
+        }
+        for command in [
+            "rg '^foo' src",
+            "rg \"^fn main\" src",
+            "grep -n 'a~b#c' src",
+            "echo \"~/x #1\"",
+        ] {
+            assert!(grant_for(&bash(command)).is_some(), "{command:?}");
+        }
+    }
+
+    /// The review of #688 (finding 3): the options of the allowlist's programs that WRITE
+    /// a file are refused like those that run one (also abbreviated, with an attached or
+    /// `=` value, inside a cluster); `uniq`'s second operand is the file it truncates. A
+    /// glob next to such a program could become one of them: refused too.
+    #[test]
+    fn an_option_that_writes_a_file_is_refused() {
+        for command in [
+            // find
+            "find . -delete",
+            "find . -name '*.tmp' -delete",
+            "find . -fprint out.txt",
+            "find . -fprint0 out.txt",
+            "find . -fprintf out.txt %p",
+            "find . -fls out.txt",
+            // sort
+            "sort -o out.txt a.txt",
+            "sort -oout.txt a.txt",
+            "sort -no out.txt a.txt",
+            "sort --output=out.txt a.txt",
+            "sort --output out.txt a.txt",
+            "sort --out=out.txt a.txt",
+            "sort --o out.txt a.txt",
+            // tree
+            "tree -o out.txt",
+            "tree -aoout.txt",
+            "tree -R -H . src",
+            "tree -RH . src",
+            "tree src *",
+            // file
+            "file -C -m magic",
+            "file -zC -m magic",
+            "file --compile -m magic",
+            "file --comp -m magic",
+            "file *",
+            // uniq: a second operand is its output
+            "uniq a.txt b.txt",
+            "uniq -c a.txt b.txt",
+            "uniq -- a.txt b.txt",
+            "uniq - b.txt",
+            "uniq *.txt",
+            "cat a | uniq - out.txt",
+        ] {
+            refused_everywhere(command);
+        }
+        // What only reads or prints stays grantable.
+        for command in [
+            "find . -name '*.rs' -print",
+            "sort -n a.txt",
+            "sort -k2 -t, a.txt",
+            "tree -L 2 src",
+            "file Cargo.toml",
+            "uniq -c a.txt",
+            "uniq a.txt > out.txt",
+            "uniq a.txt 2>/dev/null",
+            "cat a.txt | sort | uniq -c",
         ] {
             assert!(grant_for(&bash(command)).is_some(), "{command:?}");
         }
@@ -1048,27 +1298,83 @@ mod tests {
         assert!(grants.covering(&other).is_none());
     }
 
+    /// The grants of a session where these third-party MCP tools are declared read-only.
+    fn declared(tools: &[&str]) -> SessionGrants {
+        SessionGrants::declaring(tools.iter().map(|t| t.to_string()).collect())
+    }
+
+    /// The review of #688 (finding 1): a third party's MCP tool that runs a command or a
+    /// script can be called anything; its name proves nothing. Undeclared, it is never
+    /// granted for the session (allowed once only), on any engine, whatever its name.
+    #[test]
+    fn a_third_party_mcp_tool_that_runs_a_command_under_another_name_is_not_granted() {
+        for tool in [
+            "mcp__acme__execute_command",
+            "mcp__acme__run_command",
+            "mcp__acme__run_tests",
+            "mcp__acme__deploy",
+            "mcp__acme__shell",
+            "mcp__acme__Read",
+        ] {
+            let input = json!({ "command": "./x.sh", "script": "x.sh" });
+            for asker in [Asker::Native, Asker::ClaudeCode, Asker::Codex] {
+                let asked = call(asker, tool, Some(tool), input.clone());
+                assert!(grant_for(&asked).is_none(), "{tool} ({asker:?})");
+                assert!(
+                    SessionGrants::default().grant_for(&asked).is_none(),
+                    "{tool} ({asker:?})"
+                );
+                // Another tool declared read-only does not declare this one.
+                assert!(
+                    declared(&["mcp__acme__list", "mcp__other__run_tests", "acme"])
+                        .grant_for(&asked)
+                        .is_none(),
+                    "{tool} ({asker:?})"
+                );
+                // Even a grant made up for it does not cover its next call.
+                let mut grants = SessionGrants::default();
+                grants.add(SessionGrant::Exact {
+                    tool: tool.into(),
+                    input: canonical_json(&input),
+                });
+                assert!(grants.covering(&asked).is_none(), "{tool} ({asker:?})");
+            }
+        }
+        // Declared read-only by the operator: the identical call.
+        let session = declared(&["mcp__acme__list"]);
+        let list = |dir: &str| {
+            call(
+                Asker::Native,
+                "mcp__acme__list",
+                None,
+                json!({ "dir": dir }),
+            )
+        };
+        let mut grants = declared(&["mcp__acme__list"]);
+        grants.add(session.grant_for(&list("a")).expect("declared read-only"));
+        assert!(grants.covering(&list("a")).is_some());
+        assert!(grants.covering(&list("b")).is_none());
+    }
+
     /// A third party's MCP tool named like a built-in is not that built-in: it can do
-    /// anything. Only the identical call is granted.
+    /// anything. Declared read-only, only the identical call is granted.
     #[test]
     fn a_third_party_tool_named_like_a_read_only_built_in_gets_only_an_exact_grant() {
         for name in ["Read", "Glob", "Grep", "LS", "NotebookRead"] {
+            let tool = format!("mcp__other__{name}");
+            let session = declared(&[tool.as_str()]);
             for canonical in [None, Some(name)] {
                 for asker in [Asker::Native, Asker::ClaudeCode] {
-                    let at = |path: &str| {
-                        call(
-                            asker,
-                            &format!("mcp__other__{name}"),
-                            canonical,
-                            json!({ "file_path": path }),
-                        )
-                    };
-                    let grant = grant_for(&at("a.rs")).unwrap();
+                    let at =
+                        |path: &str| call(asker, &tool, canonical, json!({ "file_path": path }));
+                    // Undeclared: never.
+                    assert!(grant_for(&at("a.rs")).is_none(), "{tool}");
+                    let grant = session.grant_for(&at("a.rs")).unwrap();
                     assert!(
                         matches!(grant, SessionGrant::Exact { .. }),
-                        "mcp__other__{name} ({canonical:?}, {asker:?}): {grant:?}"
+                        "{tool} ({canonical:?}, {asker:?}): {grant:?}"
                     );
-                    let mut grants = SessionGrants::default();
+                    let mut grants = declared(&[tool.as_str()]);
                     grants.add(grant);
                     assert!(grants.covering(&at("a.rs")).is_some());
                     assert!(grants.covering(&at("/etc/passwd")).is_none());
@@ -1076,7 +1382,7 @@ mod tests {
             }
         }
         // A whole-tool grant never covers a third party's tool of that name.
-        let mut grants = SessionGrants::default();
+        let mut grants = declared(&["mcp__other__Read"]);
         grants.add(SessionGrant::WholeTool {
             tool: "mcp__other__Read".into(),
         });
@@ -1088,19 +1394,22 @@ mod tests {
                 json!({ "file_path": "x" }),
             ))
             .is_none());
-        // Nor a `nexus` tool the adapter did not name.
-        assert!(grant_for(&call(
-            Asker::Native,
-            "mcp__nexus__Read",
-            None,
-            json!({ "file_path": "x" }),
-        ))
-        .is_none());
+        // Nor a `nexus` tool the adapter did not name, even "declared".
+        assert!(declared(&["mcp__nexus__Read"])
+            .grant_for(&call(
+                Asker::Native,
+                "mcp__nexus__Read",
+                None,
+                json!({ "file_path": "x" }),
+            ))
+            .is_none());
     }
 
-    /// A third party's MCP tool named like a command tool goes through the command checks.
+    /// A declared third party's MCP tool named like a command tool goes through the
+    /// command checks.
     #[test]
     fn a_third_party_tool_named_like_a_command_tool_is_checked_like_a_command() {
+        let session = declared(&["mcp__acme__shell"]);
         for asker in [Asker::Native, Asker::ClaudeCode] {
             let shell = |command: &str| {
                 call(
@@ -1110,8 +1419,12 @@ mod tests {
                     json!({ "command": command }),
                 )
             };
-            assert!(grant_for(&shell("./x.sh")).is_none(), "{asker:?}");
-            assert!(grant_for(&shell("ls -la")).is_some(), "{asker:?}");
+            assert!(session.grant_for(&shell("./x.sh")).is_none(), "{asker:?}");
+            assert!(session.grant_for(&shell("ls -la")).is_some(), "{asker:?}");
+            assert!(
+                grant_for(&shell("ls -la")).is_none(),
+                "undeclared ({asker:?})"
+            );
         }
     }
 
@@ -1268,12 +1581,14 @@ mod tests {
 
     #[test]
     fn a_codex_mcp_call_is_granted_only_when_its_elicitation_carries_the_arguments() {
+        let session = declared(&["mcp__acme__deploy", "mcp__acme__shell"]);
         let mcp = |canonical: Option<&str>, input: Value| {
             call(Asker::Codex, "mcp__acme__deploy", canonical, input)
         };
         // With `tool_params`: the identical call only.
         let with = |target: &str| mcp(Some("mcp__acme__deploy"), json!({ "target": target }));
-        let grants = granted(&with("staging"));
+        let mut grants = declared(&["mcp__acme__deploy"]);
+        grants.add(grants.grant_for(&with("staging")).expect("grantable"));
         assert!(grants.covering(&with("staging")).is_some());
         assert!(grants.covering(&with("production")).is_none());
         // Without them nexus gives the elicitation's message: never granted, and two
@@ -1282,25 +1597,31 @@ mod tests {
             Some("mcp__acme__deploy"),
             json!({ "message": "Allow acme to run deploy?" }),
         );
-        assert!(grant_for(&without).is_none());
-        let mut grants = SessionGrants::default();
+        assert!(session.grant_for(&without).is_none());
+        let mut grants = declared(&["mcp__acme__deploy"]);
         grants.add(SessionGrant::Exact {
             tool: "mcp__acme__deploy".into(),
             input: canonical_json(&without.input),
         });
         assert!(grants.covering(&without).is_none());
         // No tool name (`mcp__<server>` only, no canonical): never granted.
-        assert!(grant_for(&call(
-            Asker::Codex,
-            "mcp__acme",
-            None,
-            json!({ "target": "staging" }),
-        ))
-        .is_none());
-        assert!(grant_for(&mcp(None, json!({ "target": "staging" }))).is_none());
+        assert!(session
+            .grant_for(&call(
+                Asker::Codex,
+                "mcp__acme",
+                None,
+                json!({ "target": "staging" }),
+            ))
+            .is_none());
+        assert!(session
+            .grant_for(&mcp(None, json!({ "target": "staging" })))
+            .is_none());
         // A non-object input is not a call's arguments.
-        assert!(grant_for(&mcp(Some("mcp__acme__deploy"), json!("staging"))).is_none());
-        // A Codex MCP tool named like a command tool goes through the command checks.
+        assert!(session
+            .grant_for(&mcp(Some("mcp__acme__deploy"), json!("staging")))
+            .is_none());
+        // A declared Codex MCP tool named like a command tool goes through the command
+        // checks.
         let shell = |command: &str| {
             call(
                 Asker::Codex,
@@ -1309,8 +1630,41 @@ mod tests {
                 json!({ "command": command }),
             )
         };
-        assert!(grant_for(&shell("./x.sh")).is_none());
-        assert!(grant_for(&shell("ls")).is_some());
+        assert!(session.grant_for(&shell("./x.sh")).is_none());
+        assert!(session.grant_for(&shell("ls")).is_some());
+    }
+
+    /// The review of #688 (nit 5): the backend cannot see whether nexus found the
+    /// elicitation's `tool_params` or fell back to `{"message": ...}`. Whatever that
+    /// fallback grows into (another field next to the message), an input that could be it
+    /// is refused; only a non-empty object of arguments without a `message` is the call.
+    #[test]
+    fn a_codex_elicitation_without_tool_params_is_refused_whatever_the_fallback_shape() {
+        let session = declared(&["mcp__acme__deploy"]);
+        let codex = |input: Value| {
+            call(
+                Asker::Codex,
+                "mcp__acme__deploy",
+                Some("mcp__acme__deploy"),
+                input,
+            )
+        };
+        for input in [
+            json!({ "message": "Allow acme to run deploy?" }),
+            json!({ "message": "Allow?", "server": "acme" }),
+            json!({ "message": null, "tool": "deploy", "reason": "x" }),
+            json!({}),
+            json!(null),
+            json!(["staging"]),
+        ] {
+            assert!(
+                session.grant_for(&codex(input.clone())).is_none(),
+                "{input}"
+            );
+        }
+        assert!(session
+            .grant_for(&codex(json!({ "target": "staging" })))
+            .is_some());
     }
 
     #[test]
@@ -1352,6 +1706,8 @@ mod tests {
         assert_eq!(Asker::from_provider_kind("acp"), Asker::Other);
         assert_eq!(Asker::from_provider_kind("scripted"), Asker::Other);
         assert_eq!(Asker::from_provider_kind(""), Asker::Other);
+        // The manager's fallback for a kind it cannot name (review of #688, nit 6).
+        assert_eq!(Asker::from_provider_kind("unknown"), Asker::Other);
     }
 
     #[test]
