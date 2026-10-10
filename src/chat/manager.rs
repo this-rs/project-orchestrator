@@ -1276,7 +1276,7 @@ pub(crate) struct AgentTurnState {
     /// the window right after the compaction and compacted again (measured in
     /// `routing_modes_e2e_tests` on integ/p8). Persisted with the session (it
     /// survives an idle close, a restart, a resume) and cleared only once a turn
-    /// carrying it was actually sent ([`TurnServices::turn_sent`]).
+    /// carrying it was answered ([`TurnServices::turn_completed`]).
     held: Arc<std::sync::Mutex<HeldContext>>,
     /// Tool calls announced and not yet answered: id → (tool, input so far).
     open_tools: Arc<std::sync::Mutex<HashMap<String, (String, serde_json::Value)>>>,
@@ -1477,7 +1477,7 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         };
         // What waits since the last compaction goes in front of this turn, whatever
         // started it. Only read here: it is cleared once the turn is sent
-        // (`turn_sent`), so a turn stopped or refused before that keeps it.
+        // (`turn_completed`), so a turn stopped, refused or failed keeps it.
         let held = self
             .session
             .held
@@ -1530,7 +1530,7 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
     /// its input was complete (Claude Code, ACP: `tool_use` with `{}`, then
     /// `tool_use_input_resolved`) is logged when its result (or its cancel) arrives,
     /// with the resolved input.
-    async fn turn_sent(&self, session_id: &str) {
+    async fn turn_completed(&self, session_id: &str) {
         let had = {
             let mut held = self.session.held.lock().unwrap_or_else(|e| e.into_inner());
             let had = !held.is_empty();
@@ -9606,6 +9606,11 @@ impl ChatManager {
     /// Idempotent: a second run changes nothing. A session of the legacy engine (no
     /// provider snapshot) is left alone, that engine kept its record; a live one too.
     /// Returns the number of sessions updated.
+    ///
+    /// Run it AT REST, or on the instance that holds the live sessions: it skips the
+    /// sessions live on THIS instance only. A session live on another instance
+    /// (NATS) can still be counted twice until the cluster-wide follow-up (plan
+    /// 5ad54c48-6317-4dc0-ad99-096242cc038d) lands.
     pub async fn backfill_agent_session_records(&self) -> Result<usize> {
         use super::session_record::{next_total_cost, title_and_preview, CostFigure};
         const PAGE: usize = 200;
@@ -23563,10 +23568,10 @@ mod held_context_tests {
         s.after_turn(&sid, &compacted()).await;
         let first = prepared(&s, &sid, "one").await;
         assert!(first.contains("Post-Compaction Context"));
-        // `send_turn` failed: no `turn_sent`.
+        // The turn failed: no `turn_completed`.
         let again = prepared(&s, &sid, "two").await;
         assert!(again.contains("Post-Compaction Context"), "kept: {again}");
-        s.turn_sent(&sid).await;
+        s.turn_completed(&sid).await;
         let then = prepared(&s, &sid, "three").await;
         assert!(!then.contains("Post-Compaction Context"), "dropped: {then}");
         // And from the store too, once the write landed.
