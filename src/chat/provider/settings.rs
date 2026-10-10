@@ -430,10 +430,16 @@ pub fn parse_acp_commands(raw: &str) -> std::collections::BTreeMap<String, AcpCo
     serde_json::from_str::<std::collections::BTreeMap<String, serde_json::Value>>(raw)
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|(name, value)| {
-            serde_json::from_value::<AcpCommandDecl>(value)
-                .ok()
-                .map(|decl| (name, decl))
+        .filter_map(|(name, value)| match serde_json::from_value::<AcpCommandDecl>(value) {
+            Ok(decl) => Some((name, decl)),
+            Err(error) => {
+                tracing::warn!(
+                    agent = %name,
+                    %error,
+                    "{ACP_COMMANDS_VAR}: malformed entry left out (its instances answer that the agent is not declared)"
+                );
+                None
+            }
         })
         .map(|(name, decl)| {
             let command = match decl {
@@ -464,19 +470,105 @@ pub fn parse_acp_commands(raw: &str) -> std::collections::BTreeMap<String, AcpCo
 /// gateway (`openclaw mcp set`).
 const ACP_AGENTS_WITHOUT_PER_SESSION_MCP: &[&str] = &["openclaw"];
 
+/// Launchers that run the program named after them (their options skipped): `npx`,
+/// `bunx`, `pnpm dlx` / `pnpm exec`, `env`, `node` (its script).
+const ACP_LAUNCHERS: &[&str] = &["npx", "bunx", "pnpm", "env", "node"];
+
+/// Options of those launchers that take the NEXT argument as their value
+/// (`npx -p <pkg>`, `env -u <var>`, `node -r <module>`): that value is not a program.
+const LAUNCHER_OPTIONS_WITH_VALUE: &[&str] = &[
+    "-p",
+    "--package",
+    "-c",
+    "--call",
+    "-u",
+    "--unset",
+    "-C",
+    "--chdir",
+    "-S",
+    "--split-string",
+    "-r",
+    "--require",
+    "--import",
+    "--loader",
+    "--experimental-loader",
+    "--env-file",
+    "--filter",
+    "--dir",
+];
+
+/// The name a program position designates: its file name (both separators: a
+/// declaration may name a Windows path on any host), a package version removed
+/// (`openclaw@2026.9.9`), at most one extension removed (`openclaw.mjs`,
+/// `OpenClaw.cmd`), lowercased. `None` for a URL.
+fn program_name(arg: &str) -> Option<String> {
+    if arg.contains("://") {
+        return None;
+    }
+    let file = arg.rsplit(['/', '\\']).next().unwrap_or(arg);
+    let file = match file.char_indices().skip(1).find(|&(_, c)| c == '@') {
+        Some((at, _)) => &file[..at],
+        None => file,
+    };
+    let name = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
+    Some(name.to_ascii_lowercase())
+}
+
+/// The programs a command runs, as far as its arguments tell: `argv[0]`, and, while
+/// that program is a known launcher ([`ACP_LAUNCHERS`]), the first argument after it
+/// that is neither an option, an option's value, nor an `env` assignment
+/// (`npx --yes openclaw`, `env FOO=1 openclaw`, `pnpm dlx openclaw`, `node
+/// …/openclaw.mjs`, `env npx openclaw`). Nothing else: an option's value, a path or
+/// a URL among the arguments is never taken for the program.
+fn acp_programs(argv: &[String]) -> Vec<String> {
+    let mut programs = Vec::new();
+    let mut at = 0;
+    while let Some(arg) = argv.get(at) {
+        let Some(name) = program_name(arg) else {
+            break;
+        };
+        let launcher = ACP_LAUNCHERS.contains(&name.as_str());
+        programs.push(name.clone());
+        if !launcher {
+            break;
+        }
+        at += 1;
+        if name == "pnpm" {
+            // `pnpm dlx <pkg>` / `pnpm exec <bin>`; any other `pnpm` command runs no
+            // program named after it.
+            while argv.get(at).is_some_and(|a| a.starts_with('-')) {
+                at += 1;
+            }
+            match argv.get(at).map(String::as_str) {
+                Some("dlx" | "exec") => at += 1,
+                _ => break,
+            }
+        }
+        while let Some(next) = argv.get(at) {
+            if LAUNCHER_OPTIONS_WITH_VALUE.contains(&next.as_str()) {
+                at += 2;
+            } else if next.starts_with('-') || (name == "env" && next.contains('=')) {
+                at += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    programs
+}
+
 /// Whether the ACP agent this command starts takes MCP servers per session, as far
-/// as its arguments tell: `false` when ANY argument's file name, with at most one
-/// extension removed, is a known agent that refuses them
+/// as its arguments tell: `false` when a PROGRAM it runs ([`acp_programs`]: `argv[0]`,
+/// or what a known launcher runs) is a known agent that refuses them
 /// ([`ACP_AGENTS_WITHOUT_PER_SESSION_MCP`]) — `openclaw`, `/usr/bin/openclaw`,
-/// `npx openclaw acp`, `node …/openclaw.mjs`, `env openclaw`, `OpenClaw.cmd`. A
-/// convenience: the declaration's `per_session_mcp` wins over it.
+/// `npx openclaw acp`, `node …/openclaw.mjs`, `env openclaw`, `OpenClaw.cmd`. An
+/// option value (`--config ~/.openclaw/openclaw.json`, `--profile openclaw`) or a URL
+/// (`wss://gw/openclaw`) is not a program. A convenience: the declaration's
+/// `per_session_mcp` wins over it.
 pub fn acp_command_carries_mcp(argv: &[String]) -> bool {
-    !argv.iter().any(|arg| {
-        // Both separators: a declaration may name a Windows path on any host.
-        let file = arg.rsplit(['/', '\\']).next().unwrap_or(arg);
-        let name = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
-        ACP_AGENTS_WITHOUT_PER_SESSION_MCP.contains(&name.to_ascii_lowercase().as_str())
-    })
+    !acp_programs(argv)
+        .iter()
+        .any(|name| ACP_AGENTS_WITHOUT_PER_SESSION_MCP.contains(&name.as_str()))
 }
 
 /// Kinds that run a local process instead of calling an endpoint: they have no
@@ -1332,29 +1424,7 @@ mod tests {
         );
         assert_eq!(declared.keys().collect::<Vec<_>>(), vec!["opencode"]);
         assert!(parse_acp_commands("not json").is_empty());
-        // OpenClaw's ACP bridge takes no MCP server per session: found by name among
-        // ALL the arguments (wrappers included), one extension removed at most.
         let argv = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
-        for carries in [
-            &["opencode", "acp"][..],
-            &["node", "/opt/oc/openclaw.config.mjs", "acp"],
-            &["agent", "--url", "wss://openclaw.example/ws"],
-        ] {
-            assert!(acp_command_carries_mcp(&argv(carries)), "{carries:?}");
-        }
-        for refuses in [
-            &["openclaw", "acp", "--token-file", "/run/oc"][..],
-            &["/usr/local/bin/openclaw", "acp"],
-            &[r"C:\tools\OpenClaw.cmd", "acp"],
-            &["npx", "openclaw", "acp"],
-            &["pnpm", "dlx", "openclaw", "acp"],
-            &["bunx", "openclaw", "acp"],
-            &["node", "/opt/oc/dist/openclaw.mjs", "acp"],
-            &["env", "openclaw", "acp"],
-        ] {
-            assert!(!acp_command_carries_mcp(&argv(refuses)), "{refuses:?}");
-        }
-        assert!(acp_command_carries_mcp(&[]));
         // The declaration wins over the name, both ways.
         let declared = parse_acp_commands(
             r#"{"old": {"argv": ["my-bridge", "acp"], "per_session_mcp": false},
@@ -1394,6 +1464,64 @@ mod tests {
                 && is_process_kind("codex")
                 && !is_process_kind("openai_compatible")
         );
+    }
+
+    /// OpenClaw's ACP bridge takes no MCP server per session: found by name at the
+    /// PROGRAM positions only (`argv[0]`, what a known launcher runs), never in an
+    /// option's value, a path given as an argument, or a URL.
+    #[test]
+    fn the_openclaw_name_is_read_at_program_positions_only() {
+        let argv = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        for carries in [
+            &["opencode", "acp"][..],
+            &["node", "/opt/oc/openclaw.config.mjs", "acp"],
+            &["agent", "--url", "wss://openclaw.example/ws"],
+            // A non-OpenClaw agent whose arguments merely name OpenClaw keeps its tools.
+            &["my-agent", "--config", "~/.openclaw/openclaw.json"],
+            &["my-agent", "--token-file", "/etc/po/openclaw.token"],
+            &["my-agent", "--url", "wss://gw/openclaw"],
+            &["my-agent", "--profile", "openclaw"],
+            &["my-agent", "acp", "openclaw"],
+            &["npx", "my-agent", "--profile", "openclaw"],
+            &["env", "PROFILE=openclaw", "my-agent", "openclaw"],
+            &["npx", "-p", "openclaw", "my-agent"],
+            &["pnpm", "install", "openclaw"],
+            &["wss://gw/openclaw"],
+        ] {
+            assert!(acp_command_carries_mcp(&argv(carries)), "{carries:?}");
+        }
+        for refuses in [
+            &["openclaw", "acp", "--token-file", "/run/oc"][..],
+            &["/usr/local/bin/openclaw", "acp"],
+            &[r"C:\tools\OpenClaw.cmd", "acp"],
+            &["npx", "openclaw", "acp"],
+            &["npx", "--yes", "openclaw@2026.9.9", "acp"],
+            &["npx", "-p", "openclaw", "openclaw", "acp"],
+            &["pnpm", "dlx", "openclaw", "acp"],
+            &["pnpm", "--silent", "exec", "openclaw", "acp"],
+            &["bunx", "openclaw", "acp"],
+            &["node", "/opt/oc/dist/openclaw.mjs", "acp"],
+            &[
+                "node",
+                "--require",
+                "/opt/trace.js",
+                "/opt/oc/openclaw.mjs",
+                "acp",
+            ],
+            &["env", "openclaw", "acp"],
+            &[
+                "/usr/bin/env",
+                "-u",
+                "HOME",
+                "OC_DEBUG=1",
+                "openclaw",
+                "acp",
+            ],
+            &["env", "npx", "openclaw", "acp"],
+        ] {
+            assert!(!acp_command_carries_mcp(&argv(refuses)), "{refuses:?}");
+        }
+        assert!(acp_command_carries_mcp(&[]));
     }
 
     // ── claude_code_remote ────────────────────────────────────────────────

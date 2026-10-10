@@ -80,17 +80,21 @@ CHAT_PROVIDER_ACP_COMMANDS='{"openclaw":["openclaw","acp","--url","wss://gateway
     `{"openclaw": {"argv": ["npx", "openclaw", "acp", "--token-file", "/etc/po/openclaw.token"], "per_session_mcp": false}}`.
     Declare it for an older OpenClaw (nothing to learn: it says nothing) and for any agent
     that takes no MCP server. `"per_session_mcp": true` forces the other way. An entry with
-    an unknown or misspelt field is left out, never half-read (its instance then answers that the
-    agent is not declared);
-  - **the name**, as a convenience: any argument whose file name is `openclaw` (one
-    extension removed: `openclaw`, `/usr/bin/openclaw`, `npx openclaw`, `pnpm dlx openclaw`,
-    `bunx openclaw`, `node …/openclaw.mjs`, `env openclaw`, `OpenClaw.cmd`). An argument such
-    as a path `/run/openclaw` counts too: declare `"per_session_mcp": true` if that is wrong;
+    an unknown or misspelt field is left out, never half-read, with a warning naming it in the
+    server log (its instance then answers that the agent is not declared);
+  - **the name**, as a convenience: the PROGRAM the command runs is `openclaw` (file name, a
+    package version and one extension removed): `argv[0]` (`openclaw`, `/usr/bin/openclaw`,
+    `OpenClaw.cmd`), or what a known launcher runs, its options skipped (`npx [--yes]
+    openclaw[@version]`, `pnpm dlx|exec openclaw`, `bunx openclaw`, `node …/openclaw.mjs`,
+    `env [VAR=…] openclaw`). An option value, another argument or a URL is never read
+    (`--config ~/.openclaw/openclaw.json`, `--profile openclaw`, `wss://gw/openclaw` leave the
+    agent its servers): a wrapper script of another name needs `"per_session_mcp": false`;
   - **the refusal, learned**: an agent that refuses the servers is asked again once without
     them (the session says so on the thread, `system:mcp_servers_refused`), and the next
     sessions of that instance are opened without them. Learned **in memory**: a restart of the
     server, or any change to the instance, forgets it (one more refused round-trip); a
-    resumed session keeps what its first opening found (its frozen capabilities).
+    resumed session keeps what its first opening found (its frozen capabilities, which a resume
+    never turns back to "takes servers", however many restarts later).
   To give OpenClaw the PO tools, configure them on the OpenClaw side
   (`openclaw mcp set project-orchestrator '<json>'`: a stdio `command`, or the server's `/mcp`
   over Streamable HTTP when `remote_mcp.enabled`, with its authentication).
