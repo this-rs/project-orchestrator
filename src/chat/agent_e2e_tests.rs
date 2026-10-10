@@ -7471,15 +7471,35 @@ mod post_turn {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        // No turn of its own for the context, nor any automated turn on the history
+        // just compacted: the run is the user's turn alone.
+        assert_eq!(r.sent().len(), 1, "{:#?}", r.sent());
+        // The next turn carries the context in front, once; it did no work, so the
+        // pending objective is recalled after it.
+        r.manager.send_message(&r.sid, "next").await.unwrap();
+        r.turn_end().await;
+        for _ in 0..400 {
+            if !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         let sent = r.sent();
-        assert!(sent.len() >= 3, "the turn, then the hints: {sent:#?}");
         assert!(
-            sent[1].contains("Post-Compaction Context") && sent[1].contains(&r.project.name),
-            "the context of the project, re-injected: {}",
+            sent[1].contains("Post-Compaction Context")
+                && sent[1].contains(&r.project.name)
+                && sent[1].contains("next"),
+            "the context of the project, in front of the next turn: {}",
             sent[1]
         );
         assert!(
-            sent.iter().any(|s| {
+            sent[2..]
+                .iter()
+                .all(|s| !s.contains("Post-Compaction Context")),
+            "re-injected once: {sent:#?}"
+        );
+        assert!(
+            sent[2..].iter().any(|s| {
                 s.contains(super::super::post_stream::OBJECTIVE_REMINDER_MARKER)
                     && s.contains("Fix the parser bug")
             }),
@@ -7488,6 +7508,87 @@ mod post_turn {
         assert!(
             sent.len() <= 4,
             "the reminders stop at their cap: {sent:#?}"
+        );
+    }
+
+    /// After a compaction, the context comes back BEFORE the model continues: the
+    /// continuation turn carries it in front of "Continue…" (the legacy engine queues
+    /// the re-injection before the auto-continue hint).
+    #[tokio::test]
+    async fn after_a_compaction_the_continuation_carries_the_context_first() {
+        let compacted = Step::Emit(AgentEvent::Compaction {
+            phase: CompactionPhase::Completed,
+            trigger: None,
+            pre_tokens: Some(1000),
+        });
+        let r = rig(
+            ProviderKind::Native,
+            vec![
+                vec![
+                    compacted,
+                    Step::Emit(nexus_claude::testkit::done_event(
+                        &caps(),
+                        nexus_claude::agent::StopReason::MaxTurns,
+                        None,
+                    )),
+                ],
+                vec![steps::done(&caps())],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        r.manager.set_auto_continue(&r.sid, true).await.unwrap();
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        for _ in 0..400 {
+            if r.sent().len() >= 2 && !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let sent = r.sent();
+        assert_eq!(sent.len(), 2, "the turn, then its continuation: {sent:#?}");
+        let context = sent[1].find("Post-Compaction Context");
+        let cont = sent[1].find("Continue where you left off");
+        assert!(
+            matches!((context, cont), (Some(a), Some(b)) if a < b),
+            "the context first, then the continuation: {}",
+            sent[1]
+        );
+    }
+
+    /// A tool call announced before its input was complete (Claude Code, ACP) is
+    /// judged on its RESOLVED input: a `git commit` is conclusive, so a turn that
+    /// only committed still gets the objective reminder.
+    #[tokio::test]
+    async fn a_tool_is_judged_on_its_resolved_input() {
+        let r = rig(
+            ProviderKind::ClaudeCode,
+            vec![
+                vec![
+                    steps::tool_call_start("c1", "Bash"),
+                    steps::tool_call("c1", "Bash", json!({ "command": "git commit -m done" })),
+                    steps::tool_result("c1", "committed"),
+                    steps::done(&caps()),
+                ],
+                vec![steps::done(&caps())],
+                vec![steps::done(&caps())],
+            ],
+        )
+        .await;
+        seed_pending_tasks(&r.graph, r.project.id).await;
+        r.manager.send_message(&r.sid, "commit it").await.unwrap();
+        for _ in 0..400 {
+            if r.sent().len() >= 2 && !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let sent = r.sent();
+        assert!(
+            sent.iter()
+                .skip(1)
+                .any(|s| s.contains(super::super::post_stream::OBJECTIVE_REMINDER_MARKER)),
+            "a commit alone is wrapping up, not working: the objectives are recalled: {sent:#?}"
         );
     }
 
@@ -7504,5 +7605,129 @@ mod post_turn {
                 .is_some(),
             "{err:#}"
         );
+    }
+}
+
+/// P8c — the context re-injected after a compaction never starts a turn of its
+/// own: such a turn is measured against the window right after the compaction and
+/// compacted again (measured on integ/p8: a second summarisation call whose history
+/// held the re-injected context). The context rides in front of the session's next
+/// turn instead, and a user turn costs at most one compaction.
+mod compaction_loop {
+    use super::*;
+
+    const SUMMARY_PROMPT: &str = "You are compacting the history";
+    const TURNS: [&str; 5] = [
+        "turn two",
+        "turn three",
+        "turn four",
+        "turn five",
+        "turn six",
+    ];
+
+    fn answer(text: &str, prompt_tokens: u64) -> Vec<Value> {
+        vec![
+            delta(json!({ "content": text })),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 4, "total_tokens": prompt_tokens + 4}}),
+            json!("[DONE]"),
+        ]
+    }
+
+    /// A 32k window; every long turn reports a prompt near it (31k), so each turn
+    /// after enough history calls for a compaction before it.
+    fn script() -> Value {
+        let mut routes = vec![
+            sse_route(
+                "Call the ping tool now",
+                vec![
+                    delta(
+                        json!({"tool_calls": [{"index": 0, "id": "p1", "function": {"name": "ping", "arguments": "{}"}}]}),
+                    ),
+                    json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                    json!("[DONE]"),
+                ],
+            ),
+            json!({"method": "GET", "path": "/v1/models", "status": 200,
+                   "body": {"object": "list", "data": [{"id": "m", "context_length": 32000}]}}),
+            sse_route(SUMMARY_PROMPT, answer("a dense summary", 50)),
+        ];
+        for text in TURNS.iter().rev() {
+            routes.push(sse_route(text, answer("noted", 31_000)));
+        }
+        routes.push(sse_route("hi there", answer("hello", 10)));
+        Value::Array(routes)
+    }
+
+    fn bodies(fake: &FakeOpenAi) -> Vec<String> {
+        fake.chat_requests()
+            .iter()
+            .map(|r| r["body"].to_string())
+            .filter(|b| !b.contains("Call the ping tool now"))
+            .collect()
+    }
+
+    async fn idle(manager: &ChatManager, sid: &str) {
+        for _ in 0..600 {
+            if !manager.is_session_streaming(sid).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the session never went idle");
+    }
+
+    #[tokio::test]
+    async fn a_reinjected_context_never_triggers_a_compaction_and_a_user_turn_compacts_at_most_once(
+    ) {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let manager = manager(graph.clone(), true);
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        idle(&manager, &sid).await;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+
+        let mut recovered = 0;
+        for text in TURNS {
+            let before = bodies(&fake).len();
+            manager.send_message(&sid, text).await.unwrap();
+            // Its result, then the end of its run (hints included).
+            next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+            idle(&manager, &sid).await;
+            let run: Vec<String> = bodies(&fake)[before..].to_vec();
+            let compactions = run.iter().filter(|b| b.contains(SUMMARY_PROMPT)).count();
+            assert!(
+                compactions <= 1,
+                "{text}: {compactions} compactions in one user turn: {run:#?}"
+            );
+            for body in run.iter().filter(|b| b.contains(SUMMARY_PROMPT)) {
+                assert!(
+                    !body.contains("Post-Compaction Context"),
+                    "{text}: a compaction summarised the re-injected context: {body}"
+                );
+            }
+            let turns = run.iter().filter(|b| !b.contains(SUMMARY_PROMPT)).count();
+            assert_eq!(turns, 1, "{text}: one model turn per user turn: {run:#?}");
+            while let Ok(event) = rx.try_recv() {
+                recovered += usize::from(matches!(event, ChatEvent::CompactionRecovery { .. }));
+            }
+        }
+        assert!(recovered >= 1, "the scenario compacted at least once");
+        // The context of the last compaction reaches the model, in front of a turn.
+        let last = bodies(&fake)
+            .into_iter()
+            .filter(|b| !b.contains(SUMMARY_PROMPT))
+            .rfind(|b| b.contains("Post-Compaction Context"));
+        assert!(
+            last.is_some(),
+            "the re-injected context rode on a user turn"
+        );
+        manager.close_session(&sid).await.unwrap();
     }
 }

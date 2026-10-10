@@ -84,10 +84,21 @@ fn retryable_failure(event: &AgentEvent) -> Option<ProviderError> {
     }
 }
 
+/// Longest the runtime waits for the host's whole end of turn: four steps (context,
+/// re-injection, objectives, feedback), each bounded by the host to the post-stream
+/// step budget, plus a margin. A backstop: the steps' own budgets come first.
+pub const AFTER_TURN_BACKSTOP: Duration =
+    Duration::from_secs(4 * super::post_stream::POST_STREAM_STEP_BUDGET.as_secs() + 5);
+
+/// Longest pause before a retry, whatever the provider or the configuration asks:
+/// the pause is cut short by a Stop, but a client waits that long for the next word.
+pub const MAX_RETRY_DELAY_MS: u64 = 30_000;
+
 /// What one emitted event tells of the turn ([`TurnOutcome`]), and the tool calls
 /// still waiting for their result.
 fn track_turn(
     outcome: &mut TurnOutcome,
+    tool_ids: &mut Vec<String>,
     pending_tools: &mut Vec<(String, Option<String>)>,
     event: &ChatEvent,
 ) {
@@ -101,7 +112,15 @@ fn track_turn(
             ..
         } => {
             outcome.tools.push((tool.clone(), input.clone()));
+            tool_ids.push(id.clone());
             pending_tools.push((id.clone(), parent_tool_use_id.clone()));
+        }
+        // A tool call announced before its input was complete (Claude Code, ACP): its
+        // input is the resolved one, so a `git commit` is told from an edit.
+        ChatEvent::ToolUseInputResolved { id, input, .. } => {
+            if let Some(i) = tool_ids.iter().position(|t| t == id) {
+                outcome.tools[i].1 = input.clone();
+            }
         }
         ChatEvent::ToolResult { id, .. } | ChatEvent::ToolCancelled { id, .. } => {
             pending_tools.retain(|(pending, _)| pending != id);
@@ -125,17 +144,17 @@ fn shows_content(event: &AgentEvent) -> bool {
     )
 }
 
-/// Delay before attempt `n`: what the provider asked (`retry_after`, never beyond
-/// thirty seconds), else the backoff of the chat's `RetryConfig` — the one the Claude
-/// Code engine applies (`stream_response`).
+/// Delay before attempt `n`: what the provider asked (`retry_after`), else the
+/// backoff of the chat's `RetryConfig` (the figures of `stream_response`); never
+/// beyond [`MAX_RETRY_DELAY_MS`].
 fn retry_delay_ms(error: &ProviderError, attempt: u32, retry: &RetryConfig) -> u64 {
     if let ProviderError::RateLimited {
         retry_after_ms: Some(ms),
     } = error
     {
-        return (*ms).min(30_000);
+        return (*ms).min(MAX_RETRY_DELAY_MS);
     }
-    retry.delay_for_attempt(attempt)
+    retry.delay_for_attempt(attempt).min(MAX_RETRY_DELAY_MS)
 }
 
 /// The input of a turn: its text, then the images the user attached, in order
@@ -378,9 +397,9 @@ pub trait TurnServices: Send + Sync {
     fn observe(&self, _session_id: &str, _event: &ChatEvent) {}
     /// After each turn played (not one refused before it was sent): the
     /// Claude Code engine's post-stream steps — post-compaction re-injection,
-    /// objective tracking, memory, feedback, observations. Run under the step
-    /// budget of the post-stream (`post_stream::POST_STREAM_STEP_BUDGET`): past it,
-    /// it is dropped, the turn goes on. Default: nothing.
+    /// objective tracking, memory, feedback, observations. The host bounds each of
+    /// its steps (`post_stream::POST_STREAM_STEP_BUDGET`); the runtime holds the whole
+    /// to [`AFTER_TURN_BACKSTOP`] at most, the turn goes on. Default: nothing.
     async fn after_turn(&self, _session_id: &str, _outcome: &TurnOutcome) -> AfterTurn {
         AfterTurn::default()
     }
@@ -575,6 +594,11 @@ impl AgentSessionHandle {
     /// its turn does not count it again (`session_record`).
     pub fn opening_message_counted(&self) {
         self.opening_counted.store(true, Ordering::SeqCst);
+    }
+
+    /// The opening message was not played after all: the next one counts.
+    pub fn forget_opening_count(&self) {
+        self.opening_counted.store(false, Ordering::SeqCst);
     }
 
     /// Counts a user message on the session record — the opening one excepted, already
@@ -904,6 +928,7 @@ impl AgentSessionHandle {
         let mut attempt = 0u32;
         let mut outcome = TurnOutcome::default();
         let mut pending_tools: Vec<(String, Option<String>)> = Vec::new();
+        let mut tool_ids: Vec<String> = Vec::new();
         // What the turn cost, read on its `done` (`None`: no price, or no `done`).
         let mut turn_cost: Option<f64> = None;
         let retry_config = self.retry_config();
@@ -943,7 +968,7 @@ impl AgentSessionHandle {
                 let event = mask_agent_event(event);
                 let chat_events = self.mapper.lock().await.map(&event);
                 for chat_event in chat_events {
-                    track_turn(&mut outcome, &mut pending_tools, &chat_event);
+                    track_turn(&mut outcome, &mut tool_ids, &mut pending_tools, &chat_event);
                     self.emit(chat_event).await;
                 }
                 if terminal {
@@ -963,7 +988,13 @@ impl AgentSessionHandle {
                 ),
             })
             .await;
-            tokio::time::sleep(Duration::from_millis(delay)).await;
+            // A Stop cuts the pause short, and ends the turn: no retry after it.
+            if self
+                .pause_unless_stopped(Duration::from_millis(delay))
+                .await
+            {
+                break;
+            }
             match self.session.send_turn(input.clone()).await {
                 Ok(next) => stream = next,
                 Err(e) => {
@@ -978,6 +1009,19 @@ impl AgentSessionHandle {
         // The record carries the turn's cost before the session is seen idle.
         self.add_turn_cost(turn_cost).await;
         (outcome, pending_tools)
+    }
+
+    /// Waits `delay`, or less when the turn is stopped meanwhile: `true` when it was.
+    async fn pause_unless_stopped(&self, delay: Duration) -> bool {
+        let deadline = Instant::now() + delay;
+        while Instant::now() < deadline {
+            if self.interrupted.load(Ordering::SeqCst) {
+                return true;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            tokio::time::sleep(left.min(Duration::from_millis(50))).await;
+        }
+        self.interrupted.load(Ordering::SeqCst)
     }
 
     /// A stopped turn's tool calls left without a result are said cancelled
@@ -1009,7 +1053,7 @@ impl AgentSessionHandle {
         let Some(after) = super::post_stream::bounded(
             &self.session_id,
             "after_turn",
-            super::post_stream::POST_STREAM_STEP_BUDGET,
+            AFTER_TURN_BACKSTOP,
             services.after_turn(&self.session_id, outcome),
         )
         .await
@@ -1755,6 +1799,11 @@ mod mask_tests {
             retry_delay_ms(&ProviderError::Overloaded, 3, &operator),
             operator.delay_for_attempt(3),
             "the same figure as stream_response"
+        );
+        // Never beyond thirty seconds, whatever the configuration (attempt 10: 512 s).
+        assert_eq!(
+            retry_delay_ms(&ProviderError::Overloaded, 10, &config),
+            30_000
         );
     }
 
@@ -2701,5 +2750,70 @@ mod after_turn_tests {
             }
         }
         assert_eq!(cancelled, ["t-left"], "only the tool left without a result");
+    }
+}
+
+#[cfg(test)]
+mod retry_stop_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+
+    /// A Stop during the pause before a retry ends the turn at once: no ten-second
+    /// wait, no retry sent after the Stop.
+    #[tokio::test]
+    async fn a_stop_cuts_the_pause_before_a_retry() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = runtime
+            .adopt(
+                "not-a-uuid",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        handle.configure_retry(RetryConfig {
+            max_attempts: 3,
+            initial_delay_ms: 10_000,
+            backoff_multiplier: 1.0,
+        });
+        let mut rx = handle.events_tx.subscribe();
+        handle.send_message("hello").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while provider.state.turns_started.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        provider.state.push(AgentEvent::Error {
+            error: ProviderError::Overloaded,
+        });
+        // The pause has begun once `retrying` is out.
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("retrying")
+                .unwrap();
+            if matches!(event, ChatEvent::Retrying { .. }) {
+                break;
+            }
+        }
+        let stopped = Instant::now();
+        handle.interrupt().await.unwrap();
+        while handle.is_streaming.load(Ordering::SeqCst) {
+            assert!(
+                stopped.elapsed() < Duration::from_secs(2),
+                "the Stop waited out the pause"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap().len(),
+            1,
+            "no retry after the Stop"
+        );
     }
 }

@@ -1250,6 +1250,8 @@ pub(crate) struct ManagerTurnServices {
     search: Arc<dyn SearchStore>,
     event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
     context_injector: Option<Arc<ContextInjector>>,
+    /// The budget of each end-of-turn step (`post_stream::POST_STREAM_STEP_BUDGET`).
+    step_budget: Duration,
 }
 
 /// What a session of the agent engine keeps for the end of its turns: the fields of
@@ -1266,6 +1268,15 @@ pub(crate) struct AgentTurnState {
     objectives: super::post_stream::ObjectiveCounters,
     /// The tools the session used (files, steps), live from its events.
     work_log: Arc<std::sync::Mutex<SessionWorkLog>>,
+    /// The context to re-inject after a compaction, waiting for the session's next
+    /// turn (`after_turn` sets it, `prepare` puts it in front of that turn). Never a
+    /// turn of its own: a turn started only to carry it would be measured against
+    /// the window right after the compaction, and could compact again (P8c, measured
+    /// in `routing_modes_e2e_tests` on integ/p8). One slot: several compactions
+    /// before the next turn re-inject once, the latest.
+    reinjection: Arc<std::sync::Mutex<Option<String>>>,
+    /// Tool calls announced and not yet answered: id → (tool, input so far).
+    open_tools: Arc<std::sync::Mutex<HashMap<String, (String, serde_json::Value)>>>,
 }
 
 impl ManagerTurnServices {
@@ -1324,6 +1335,18 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             Some(md) => prepend_enrichment(&md, &body),
             None => body,
         };
+        // The context re-injected after the last compaction goes in front of this
+        // turn (the next one after it, whatever started it), once.
+        let prepared = match self
+            .session
+            .reinjection
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            Some(context) => prepend_enrichment(&context, &prepared),
+            None => prepared,
+        };
         // The hook of the turn only sees the length of the text: hand it the text of
         // THIS turn, whatever started it (a message, the queue, a hint, another
         // instance), right before it is sent — what the user typed, not the
@@ -1362,13 +1385,38 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         }
     }
 
+    /// The work log records a tool once its input is final: a call announced before
+    /// its input was complete (Claude Code, ACP: `tool_use` with `{}`, then
+    /// `tool_use_input_resolved`) is logged when its result (or its cancel) arrives,
+    /// with the resolved input.
     fn observe(&self, _session_id: &str, event: &ChatEvent) {
-        if let ChatEvent::ToolUse { tool, input, .. } = event {
-            self.session
-                .work_log
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .record_tool_use(tool, input);
+        let mut open = self
+            .session
+            .open_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match event {
+            ChatEvent::ToolUse {
+                id, tool, input, ..
+            } => {
+                open.insert(id.clone(), (tool.clone(), input.clone()));
+            }
+            ChatEvent::ToolUseInputResolved { id, input, .. } => {
+                if let Some(call) = open.get_mut(id) {
+                    call.1 = input.clone();
+                }
+            }
+            ChatEvent::ToolResult { id, .. } | ChatEvent::ToolCancelled { id, .. } => {
+                if let Some((tool, input)) = open.remove(id) {
+                    drop(open);
+                    self.session
+                        .work_log
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_tool_use(&tool, &input);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1382,7 +1430,18 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
     ) -> super::agent_runtime::AfterTurn {
         let mut after = super::agent_runtime::AfterTurn::default();
         let uuid = Uuid::parse_str(session_id).ok();
-        let ctx = super::post_stream::PostStreamContext::build(&self.graph, uuid).await;
+        // Each step under its own budget, as `PostStreamHandler`'s (`StepBudget`): a
+        // step that never answers is dropped and said, the next ones still run.
+        let budget = self.step_budget;
+        let ctx = run_step(
+            &mut after,
+            session_id,
+            "context",
+            budget,
+            super::post_stream::PostStreamContext::build(&self.graph, uuid),
+        )
+        .await
+        .unwrap_or_default();
         // 1. Post-compaction context re-injection.
         if outcome.compacted && !outcome.interrupted {
             let snapshot = self
@@ -1391,62 +1450,121 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .snapshot();
-            let (hint, event) = super::post_stream::post_compaction_recovery(
-                &self.graph,
+            if let Some((hint, event)) = run_step(
+                &mut after,
                 session_id,
-                ctx.project_slug.as_deref(),
-                Some(snapshot),
+                "post_compaction",
+                budget,
+                super::post_stream::post_compaction_recovery(
+                    &self.graph,
+                    session_id,
+                    ctx.project_slug.as_deref(),
+                    Some(snapshot),
+                ),
             )
-            .await;
-            after.hints.extend(hint);
-            after.events.push(event);
+            .await
+            {
+                // Kept for the next turn, never queued as a turn of its own.
+                if let Some(hint) = hint {
+                    *self
+                        .session
+                        .reinjection
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(hint);
+                }
+                after.events.push(event);
+            }
         }
-        // 2. Objective tracking.
-        let had_conclusive = outcome
-            .tools
-            .iter()
-            .any(|(tool, input)| is_conclusive_tool(tool, input));
-        let had_productive = outcome
-            .tools
-            .iter()
-            .any(|(tool, input)| !is_conclusive_tool(tool, input));
-        let turn = super::post_stream::ObjectiveTurn {
-            had_productive_tool_use: had_productive,
-            had_conclusive_tool_use: had_conclusive,
-            auto_continue_allowed: outcome.auto_continue_allowed,
-            hit_error_max_turns: outcome.hit_turn_limit,
-            interrupted: outcome.interrupted,
-        };
-        if let Some(reminder) = super::post_stream::objective_reminder(
-            &self.graph,
-            ctx.project_slug.as_deref(),
-            &self.session.objectives,
-            turn,
-            self.work_summary(),
-        )
-        .await
-        {
-            info!(session_id, "Objective tracker: injecting reminder");
-            after.hints.push(reminder);
+        // 2. Objective tracking. Not right after a compaction: no automated turn is
+        // started on a history just compacted (one compaction per user turn); the
+        // reminder comes at the next stall.
+        if !outcome.compacted {
+            let had_conclusive = outcome
+                .tools
+                .iter()
+                .any(|(tool, input)| is_conclusive_tool(tool, input));
+            let had_productive = outcome
+                .tools
+                .iter()
+                .any(|(tool, input)| !is_conclusive_tool(tool, input));
+            let turn = super::post_stream::ObjectiveTurn {
+                had_productive_tool_use: had_productive,
+                had_conclusive_tool_use: had_conclusive,
+                auto_continue_allowed: outcome.auto_continue_allowed,
+                hit_error_max_turns: outcome.hit_turn_limit,
+                interrupted: outcome.interrupted,
+            };
+            let reminder = run_step(
+                &mut after,
+                session_id,
+                "objective_tracking",
+                budget,
+                super::post_stream::objective_reminder(
+                    &self.graph,
+                    ctx.project_slug.as_deref(),
+                    &self.session.objectives,
+                    turn,
+                    self.work_summary(),
+                ),
+            )
+            .await
+            .flatten();
+            if let Some(reminder) = reminder {
+                info!(session_id, "Objective tracker: injecting reminder");
+                after.hints.push(reminder);
+            }
         }
         // 3. Memory / feedback / observations (the store write runs on its own).
-        super::post_stream::record_turn_feedback(
-            super::post_stream::TurnFeedback {
-                graph: &self.graph,
-                search: &self.search,
-                event_emitter: &self.event_emitter,
-                session_id,
-                session_uuid: uuid,
-                project_id: ctx.project_id,
-                rfc_accumulator: Some(self.session.rfc_accumulator.clone()),
-            },
-            &outcome.assistant_text,
-            &self.session.memory,
-            &self.context_injector,
+        run_step(
+            &mut after,
+            session_id,
+            "feedback",
+            budget,
+            super::post_stream::record_turn_feedback(
+                super::post_stream::TurnFeedback {
+                    graph: &self.graph,
+                    search: &self.search,
+                    event_emitter: &self.event_emitter,
+                    session_id,
+                    session_uuid: uuid,
+                    project_id: ctx.project_id,
+                    rfc_accumulator: Some(self.session.rfc_accumulator.clone()),
+                },
+                &outcome.assistant_text,
+                &self.session.memory,
+                &self.context_injector,
+            ),
         )
         .await;
         after
     }
+}
+
+/// One end-of-turn step of the agent engine under its own `budget`: past it the step
+/// is dropped (`post_stream::bounded`) and an `error` event says which one
+/// (`post_stream_step_abandoned`, `reason` = the step), as the Claude Code engine's
+/// `StepBudget::run` reports it.
+pub(crate) async fn run_step<F: std::future::Future>(
+    after: &mut super::agent_runtime::AfterTurn,
+    session_id: &str,
+    step: &'static str,
+    budget: Duration,
+    fut: F,
+) -> Option<F::Output> {
+    let out = super::post_stream::bounded(session_id, step, budget, fut).await;
+    if out.is_none() {
+        after.events.push(ChatEvent::Error {
+            message: format!(
+                "Error: the end-of-turn step '{step}' took longer than {} s: skipped",
+                budget.as_secs()
+            ),
+            parent_tool_use_id: None,
+            code: Some(super::post_stream::STEP_ABANDONED_CODE.to_string()),
+            reason: Some(step.to_string()),
+            index: None,
+        });
+    }
+    out
 }
 
 /// What another instance asks of a session of the agent engine this instance
@@ -9301,8 +9419,8 @@ impl ChatManager {
     /// events: `message_count` = their `user_message` events (raised, never lowered),
     /// `total_cost_usd` from their `result` events when the record has none, and the
     /// title and preview of their first user message when they have none.
-    /// Idempotent: a second run changes nothing. A Claude Code session (provider
-    /// `claude_code`) is left alone: the legacy engine kept its record.
+    /// Idempotent: a second run changes nothing. A session of the legacy engine (no
+    /// provider snapshot) is left alone, that engine kept its record; a live one too.
     /// Returns the number of sessions updated.
     pub async fn backfill_agent_session_records(&self) -> Result<usize> {
         use super::session_record::{next_total_cost, title_and_preview, CostFigure};
@@ -9319,19 +9437,22 @@ impl ChatManager {
                 .context("Failed to list sessions")?;
             let fetched = page.len();
             offset += fetched;
-            sessions.extend(page.into_iter().filter(|s| s.provider_id.is_some()));
+            // The sessions the agent engine served: it alone stores their provider
+            // snapshot (`finish_agent_open`), Claude Code forced onto it included.
+            sessions.extend(page.into_iter().filter(|s| s.capabilities.is_some()));
             if fetched < PAGE {
                 break;
             }
         }
         let mut updated = 0;
         for session in sessions {
-            let Some(provider_id) = session.provider_id.as_deref() else {
-                continue;
-            };
-            if provider_id == super::provider::resolver::CLAUDE_CODE {
+            // A live session keeps its own record: its handle may be between the
+            // event and the write (`user_message` stored, count not yet bumped; a
+            // `result` stored, cost not yet added), the backfill would count it twice.
+            if self.agent_runtime.owns(&session.id.to_string()).await {
                 continue;
             }
+            let provider_id = session.provider_id.as_deref().unwrap_or_default();
             let events = self.graph.get_chat_events(session.id, -1, 100_000).await?;
             let parsed: Vec<ChatEvent> = events
                 .iter()
@@ -9359,6 +9480,10 @@ impl ChatManager {
                     Ok(Some(record))
                         if record.kind == super::provider::settings::KIND_CLAUDE_CODE_REMOTE =>
                     {
+                        CostFigure::SessionTotal
+                    }
+                    // Claude Code forced onto the agent engine: the CLI's total too.
+                    _ if provider_id == super::provider::resolver::CLAUDE_CODE => {
                         CostFigure::SessionTotal
                     }
                     _ => CostFigure::Turn,
@@ -11800,12 +11925,18 @@ impl ChatManager {
             if !request.message.is_empty() {
                 // Counted on the node at creation (`message_count: 1`).
                 handle.opening_message_counted();
-                handle
+                let sent = handle
                     .send_message_relayed(
                         &request.message,
                         &super::relay::prefixed(relay.and_then(|r| r.text()), &request.message),
                     )
-                    .await?;
+                    .await;
+                // A send that failed before its turn took the flag: the next message
+                // the user sends is counted.
+                if sent.is_err() {
+                    handle.forget_opening_count();
+                }
+                sent?;
             }
         }
         Ok(CreateSessionResponse {
@@ -11835,6 +11966,7 @@ impl ChatManager {
             search: self.search.clone(),
             event_emitter: self.event_emitter.clone(),
             context_injector: self.context_injector.clone(),
+            step_budget: super::post_stream::POST_STREAM_STEP_BUDGET,
         })
     }
 
@@ -18697,6 +18829,7 @@ mod tests {
         let mut native = crate::test_helpers::test_chat_session(None);
         native.provider_id = Some("local".into());
         native.message_count = 1;
+        native.capabilities = Some("{}".into());
         graph.create_chat_session(&native).await.unwrap();
         let typed = crate::refs::block::encode(&"x".repeat(100), &[]);
         let events = [
@@ -18772,6 +18905,71 @@ mod tests {
         let again = graph.get_chat_session(native.id).await.unwrap().unwrap();
         assert_eq!(again.message_count, 3);
         assert_eq!(again.total_cost_usd, node.total_cost_usd);
+    }
+
+    /// Claude Code forced onto the agent engine has a provider snapshot: it is
+    /// backfilled, its cost being the CLI's session total (the last one). A session
+    /// live on this instance is left to its handle (it could be counted twice).
+    #[tokio::test]
+    async fn the_backfill_takes_claude_code_on_the_agent_engine_and_skips_a_live_session() {
+        let state = mock_app_state();
+        let graph = state.neo4j.clone();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let mut forced = crate::test_helpers::test_chat_session(None);
+        forced.provider_id = Some(crate::chat::provider::resolver::CLAUDE_CODE.into());
+        forced.capabilities = Some("{}".into());
+        forced.message_count = 1;
+        graph.create_chat_session(&forced).await.unwrap();
+        let mut live = crate::test_helpers::test_chat_session(None);
+        live.provider_id = Some("local".into());
+        live.capabilities = Some("{}".into());
+        live.message_count = 1;
+        graph.create_chat_session(&live).await.unwrap();
+        for id in [forced.id, live.id] {
+            let events = [
+                ChatEvent::UserMessage {
+                    content: "a".into(),
+                },
+                result_costing(Some(0.01)),
+                ChatEvent::UserMessage {
+                    content: "b".into(),
+                },
+                result_costing(Some(0.03)),
+            ];
+            graph
+                .store_chat_events(
+                    id,
+                    events
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| record_event(id, i as i64 + 1, e))
+                        .collect(),
+                )
+                .await
+                .unwrap();
+        }
+        let provider = crate::chat::agent_runtime::fake::FakeProvider::new();
+        manager
+            .agent_runtime
+            .adopt(
+                &live.id.to_string(),
+                "local",
+                provider.session(),
+                10,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+
+        assert_eq!(manager.backfill_agent_session_records().await.unwrap(), 1);
+        let node = graph.get_chat_session(forced.id).await.unwrap().unwrap();
+        assert_eq!(node.message_count, 2, "{node:?}");
+        assert_eq!(node.total_cost_usd, Some(0.03), "the CLI's total, not 0.04");
+        let untouched = graph.get_chat_session(live.id).await.unwrap().unwrap();
+        assert_eq!(untouched.message_count, 1, "a live session is its handle's");
+        assert_eq!(untouched.total_cost_usd, None);
     }
 
     // ====================================================================
@@ -23026,6 +23224,7 @@ mod refs_turn_services_tests {
             search: crate::test_helpers::mock_app_state().meili,
             event_emitter: None,
             context_injector: None,
+            step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
         };
 
         let note = Uuid::new_v4();
@@ -23049,5 +23248,41 @@ mod refs_turn_services_tests {
             "{out}"
         );
         assert!(!out.contains("<po-refs>"), "{out}");
+    }
+}
+
+/// The end-of-turn steps of the agent engine are bounded one by one, as the Claude
+/// Code engine's (`StepBudget::run`): a step that never answers is dropped and
+/// said, the next one still runs (before, one budget held the three together, so a
+/// slow re-injection lost the memory and the feedback too).
+#[cfg(test)]
+mod agent_step_budget_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_step_past_its_budget_is_said_and_the_next_one_still_runs() {
+        let mut after = super::super::agent_runtime::AfterTurn::default();
+        let budget = Duration::from_millis(20);
+        let stuck = run_step(
+            &mut after,
+            "s",
+            "post_compaction",
+            budget,
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(stuck.is_none());
+        let next = run_step(&mut after, "s", "feedback", budget, async { 7 }).await;
+        assert_eq!(next, Some(7), "the next step ran");
+        assert!(
+            matches!(
+                after.events.as_slice(),
+                [ChatEvent::Error { code: Some(code), reason: Some(step), .. }]
+                    if code == super::super::post_stream::STEP_ABANDONED_CODE
+                        && step == "post_compaction"
+            ),
+            "{:?}",
+            after.events
+        );
     }
 }
