@@ -22,12 +22,11 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use nexus_claude::agent::CostBasis;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use super::candidates::RejectReason;
 use super::decision::{CognitiveDecision, Pick};
 use super::store::{DecisionFilter, RoutingArmStore};
-use crate::evaluation::{self, ClassifierScore};
 
 /// Decisions read per page, and in total, to build a report.
 const PAGE: usize = 500;
@@ -60,7 +59,7 @@ impl PriceLookup for NoPrices {
 }
 
 /// One class of the report.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ReportByClass {
     /// Class key.
     pub task_class: String,
@@ -75,7 +74,7 @@ pub struct ReportByClass {
 }
 
 /// One arm of the report.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ReportByArm {
     /// Class key.
     pub task_class: String,
@@ -92,7 +91,7 @@ pub struct ReportByArm {
 }
 
 /// The shadow report.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RoutingReport {
     /// Decisions in the window.
     pub decisions: usize,
@@ -109,10 +108,6 @@ pub struct RoutingReport {
     pub by_class: Vec<ReportByClass>,
     /// Per arm.
     pub by_arm: Vec<ReportByArm>,
-    /// The offline classifier bench (`crate::evaluation`), one row per classifier.
-    /// Additive: a report serialised before this field existed reads back as empty.
-    #[serde(default)]
-    pub classifiers: Vec<ClassifierScore>,
 }
 
 #[derive(Default)]
@@ -278,18 +273,7 @@ pub fn summarise(decisions: &[CognitiveDecision], prices: &dyn PriceLookup) -> R
                 mean_cost_usd: (a.cost_n > 0).then(|| a.cost_sum / a.cost_n as f64),
             })
             .collect(),
-        classifiers: classifier_bench(),
     }
-}
-
-/// The classifier bench rows. The bench is embedded and offline, so it does not
-/// fail in practice; if it ever does, the report is served without the rows and
-/// the failure is logged rather than turned into an error for the whole report.
-fn classifier_bench() -> Vec<ClassifierScore> {
-    evaluation::run_embedded().unwrap_or_else(|error| {
-        tracing::warn!(%error, "classifier bench unavailable for the routing report");
-        Vec::new()
-    })
 }
 
 /// An alternative as the frontend types it (`RoutingAlternative`).
@@ -659,26 +643,6 @@ mod tests {
         assert!(json["estimated_cost_delta_usd"].is_null());
         assert_eq!(json["by_class"][0]["task_class"], "simple");
         assert_eq!(json["by_arm"][0]["provider_id"], "p");
-    }
-
-    #[test]
-    fn the_report_carries_the_five_classifier_rows_and_reads_back_without_them() {
-        let report = summarise(&[], &NoPrices);
-        let names: Vec<&str> = report
-            .classifiers
-            .iter()
-            .map(|c| c.classifier.as_str())
-            .collect();
-        assert_eq!(
-            names,
-            ["tool_groups", "intent", "task_class", "skills", "triggers"]
-        );
-
-        let mut json = serde_json::to_value(&report).unwrap();
-        assert!(json["classifiers"][0]["accuracy"].is_number());
-        json.as_object_mut().unwrap().remove("classifiers");
-        let older: RoutingReport = serde_json::from_value(json).unwrap();
-        assert!(older.classifiers.is_empty());
     }
 
     #[test]
