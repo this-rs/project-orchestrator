@@ -20,7 +20,7 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `auto_continue` | un tour arrêté sur sa limite est continué (auto_continue) | ok | ok |
 | `nats.send` | un message d'une autre instance (NATS) est joué ici | ok | ok |
 | `nats.interrupt` | un Stop d'une autre instance (NATS) arrête le tour | ok | ok |
-| `nats.permission_response` | une réponse de permission d'une autre instance (NATS) débloque l'outil | gap (harnais, P13) | ok |
+| `nats.permission_response` | une réponse de permission d'une autre instance (NATS) débloque l'outil | ok | ok |
 | `nats.cancel_tools` | un cancel_tools d'une autre instance (NATS) arrête l'outil, le tour continue | ok | ok |
 | `resume` | après redémarrage du backend, la session reprend sur le jeton relu du graphe | ok | ok |
 | `set_model` | set_model en cours de conversation atteint le provider | ok | ok |
@@ -39,13 +39,12 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `cancel_task` | cancel_task arrête une tâche d'arrière-plan | ok | gap (harnais, P12) |
 | `system_init.degraded` | system_init n'annonce comme manquant qu'une limite du modèle (liste fermée) | ok | ok |
 
-`ok` : Claude Code 22/26, natif 21/26.
+`ok` : Claude Code 23/26, natif 21/26.
 
 ## Écarts déclarés
 
 | Moteur | Fonction | Cause | Tâche | Ce qui manque |
 |---|---|---|---|---|
-| Claude Code | `nats.permission_response` | harnais | P13 | l'écouteur RPC NATS du moteur historique écrit au CLI une control_response sans request_id ni behavior (et sous le verrou du client) : l'outil reste bloqué alors que la RPC répond success |
 | Claude Code | `permissions.session` | harnais | P11 | la réponse de permission ne porte aucune portée : le backend n'écrit au CLI qu'un allow/deny ponctuel (pas d'updatedPermissions de session) |
 | Claude Code | `permissions.always` | harnais | P11 | aucune portée persistante (updatedPermissions vers les réglages) n'est écrite au CLI |
 | natif | `permissions.session` | harnais | P11 | le harnais natif sait retenir une portée session, mais le backend répond toujours allow_once : la permission est redemandée |

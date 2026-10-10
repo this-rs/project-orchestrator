@@ -5047,6 +5047,208 @@ mod claude_code_resume_token {
     }
 }
 
+/// P13: a permission of a legacy Claude Code session granted from ANOTHER instance
+/// (NATS RPC) reaches the CLI as the same `control_response` as a local answer —
+/// subtype, request_id, behavior —, exactly once, while the turn waits for it.
+mod legacy_nats_permission {
+    use super::*;
+    use crate::chat::manager::{DeliveryRoute, PermissionDeliveryError};
+    use crate::events::nats_broker_test::TestBroker;
+    use crate::events::NatsEmitter;
+
+    fn emit(v: Value) -> Value {
+        json!({"op": "emit_json", "json": v})
+    }
+
+    /// One turn that asks `req-nats` for `Bash pwd` and waits, up to 15 s, for an
+    /// answer naming it before it goes on.
+    fn transcript() -> Vec<Value> {
+        vec![
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            emit(json!({"type": "system", "subtype": "init",
+                "session_id": "fake-cli-session", "model": "fake-claude", "tools": [],
+                "permissionMode": "default", "apiKeySource": "none"})),
+            emit(json!({"type": "assistant", "message": {
+                "id": "msg_fake_1", "type": "message", "role": "assistant",
+                "model": "fake-claude", "stop_reason": "tool_use",
+                "content": [{"type": "tool_use", "id": "t8", "name": "Bash",
+                             "input": {"command": "pwd"}}]}})),
+            emit(json!({"type": "control_request", "request_id": "req-nats",
+                "request": {"subtype": "can_use_tool", "tool_name": "Bash",
+                            "input": {"command": "pwd"}, "tool_use_id": "t8"}})),
+            json!({"op": "await_stdin", "contains": "req-nats", "timeout_ms": 15000}),
+            emit(json!({"type": "assistant", "message": {
+                "id": "msg_fake_2", "type": "message", "role": "assistant",
+                "model": "fake-claude", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "allowed and done"}]}})),
+            emit(json!({"type": "result", "subtype": "success",
+                "duration_ms": 1, "duration_api_ms": 1, "is_error": false, "num_turns": 1,
+                "session_id": "fake-cli-session", "total_cost_usd": 0.0,
+                "result": "allowed and done"})),
+            json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}),
+        ]
+    }
+
+    /// `fake_claude` behind a wrapper that plays the transcript and records stdin.
+    fn wrapper(dir: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("transcript.jsonl");
+        let lines: String = transcript().iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&script, lines).unwrap();
+        let wrapper = dir.join("claude");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nFAKE_CLAUDE_TRANSCRIPT='{}' FAKE_CLAUDE_STDIN_OUT='{}' \
+                 FAKE_CLAUDE_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                script.display(),
+                dir.join("stdin.jsonl").display(),
+                fake_bin("fake_claude").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wrapper.display().to_string()
+    }
+
+    /// The `control_response` lines the CLI read.
+    fn control_responses(dir: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(dir.join("stdin.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["type"] == "control_response")
+            .collect()
+    }
+
+    async fn stored_until(graph: &MockGraphStore, sid: &str, needle: &str) {
+        let id = Uuid::parse_str(sid).unwrap();
+        for _ in 0..400 {
+            let events = graph.get_chat_events(id, 0, 500).await.unwrap();
+            if events.iter().any(|e| e.data.contains(needle)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{needle:?} was never stored for {sid}");
+    }
+
+    #[tokio::test]
+    async fn a_permission_granted_from_another_instance_reaches_the_cli_once_with_its_request_id() {
+        let broker = TestBroker::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cli = wrapper(dir.path());
+
+        // The owner: Claude Code on the legacy engine, on NATS.
+        let graph = Arc::new(MockGraphStore::new());
+        let owner = {
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Legacy,
+                mcp_server_path: fake_bin("fake_mcp"),
+                nexus_tools_path: None,
+                nexus_browser_path: None,
+                jwt_secret: Some("test-secret-test-secret-test-secret".to_string()),
+                max_sessions: 10,
+                ..Default::default()
+            };
+            let nats = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+            ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+                .with_nats(nats)
+        };
+        owner.update_claude_cli_path(Some(cli)).await;
+        // The other instance: no session of its own.
+        let other = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let far = {
+            let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Legacy,
+                mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+                max_sessions: 10,
+                ..Default::default()
+            };
+            ChatManager::new_without_memory(graph, mock_app_state().meili, config)
+                .with_nats(Arc::clone(&other))
+        };
+
+        let mut req = request(None, None, "default");
+        req.message = "run pwd".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = owner
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(!owner.agent_runtime.owns(&sid).await, "legacy engine");
+        // The CLI asked: the request waits on the owner.
+        let id = Uuid::parse_str(&sid).unwrap();
+        let mut asked = false;
+        for _ in 0..400 {
+            let snap = owner.live_session_snapshot().await;
+            if snap
+                .pending_permissions
+                .get(&id)
+                .is_some_and(|ids| ids.contains("req-nats"))
+            {
+                asked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(asked, "the CLI's can_use_tool never waited on the owner");
+
+        // The owner's RPC listener is up (a harmless RPC answers) before the ONE
+        // permission answer: a resend would write it twice.
+        let mut listening = false;
+        for _ in 0..20 {
+            if other
+                .request_send_message(&sid, r#"{"enabled":false}"#, "set_auto_continue")
+                .await
+                .is_some()
+            {
+                listening = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(listening, "the owner's RPC listener never answered");
+
+        let routed = far
+            .route_permission_response(&sid, "req-nats", true, true)
+            .await;
+        assert!(
+            matches!(routed, Ok(DeliveryRoute::Remote)),
+            "delivered by the owner: {routed:?}"
+        );
+        // The CLI matched it to its can_use_tool: the tool ran, the turn ended.
+        stored_until(&graph, &sid, "allowed and done").await;
+
+        let answers = control_responses(dir.path());
+        assert_eq!(answers.len(), 1, "one RPC, one write: {answers:?}");
+        let answer = &answers[0]["response"];
+        assert_eq!(answer["subtype"], "success", "{answer}");
+        assert_eq!(answer["request_id"], "req-nats", "{answer}");
+        assert_eq!(answer["response"]["behavior"], "allow", "{answer}");
+        assert_eq!(
+            answer["response"]["updatedInput"],
+            json!({"command": "pwd"}),
+            "the original input goes back: {answer}"
+        );
+
+        // The same request answered again: no longer waiting, a typed refusal, and
+        // nothing more reaches the CLI.
+        let again = far
+            .route_permission_response(&sid, "req-nats", true, true)
+            .await;
+        assert!(
+            matches!(again, Err(PermissionDeliveryError::NotPending)),
+            "{again:?}"
+        );
+        assert_eq!(control_responses(dir.path()).len(), 1);
+        owner.close_session(&sid).await.unwrap();
+    }
+}
+
 /// P5 (parity): `cancel_tools` on the agent engine stops the running tools and
 /// keeps the turn — from this instance (the WS handler calls
 /// `cancel_running_tools`), from another instance over NATS, and under the cap

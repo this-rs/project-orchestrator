@@ -380,6 +380,20 @@ impl std::fmt::Display for PermissionDeliveryError {
 
 impl std::error::Error for PermissionDeliveryError {}
 
+/// The `error` of a NATS `control_response` RPC whose request is no longer waiting
+/// on the owning instance: the asking instance turns it back into
+/// [`PermissionDeliveryError::NotPending`].
+pub(crate) const PERMISSION_NOT_PENDING_RPC: &str = "permission_not_pending";
+
+/// What delivering a permission answer to a legacy session reads, borrowed from the
+/// manager or from the NATS RPC listener of the session.
+struct PermissionAnswer<'a> {
+    active_sessions: &'a RwLock<HashMap<String, ActiveSession>>,
+    graph: &'a Arc<dyn GraphStore>,
+    nats: Option<&'a Arc<crate::events::NatsEmitter>>,
+    event_emitter: &'a Option<Arc<dyn crate::events::EventEmitter>>,
+}
+
 /// Why a user message was not delivered.
 #[derive(Debug)]
 pub enum MessageDeliveryError {
@@ -2747,30 +2761,68 @@ impl ChatManager {
 
                         // Route based on message_type
                         if request.message_type == "control_response" {
-                            // Permission control response — send directly to CLI subprocess
-                            // via SDK control protocol. Do NOT persist or broadcast.
-                            let allow: bool = serde_json::from_str::<serde_json::Value>(message)
-                                .ok()
+                            // A permission granted on another instance: the same path as
+                            // a local answer (deliver_permission_answer) — the control_response
+                            // carries subtype, request_id and behavior, goes over stdin_tx
+                            // (never the client lock, held by the turn that waits for it),
+                            // and the request must still be waiting: one RPC, one write.
+                            let answer = serde_json::from_str::<serde_json::Value>(message).ok();
+                            let allow = answer
+                                .as_ref()
                                 .and_then(|v| v.get("allow").and_then(|a| a.as_bool()))
                                 .unwrap_or(false);
+                            let request_id = answer.as_ref().and_then(|v| {
+                                v.get("request_id")
+                                    .and_then(|r| r.as_str())
+                                    .map(str::to_string)
+                            });
 
                             info!(
                                 session_id = %session_id,
+                                request_id = ?request_id,
                                 allow,
-                                "NATS RPC: Sending permission control response to CLI"
+                                "NATS RPC: answering a permission request of the CLI"
                             );
 
-                            let response_json = serde_json::json!({ "allow": allow });
-                            let mut cli = client.lock().await;
-                            match cli.send_control_response(response_json).await {
-                                Ok(()) => crate::events::ChatRpcResponse {
-                                    success: true,
-                                    error: None,
-                                },
-                                Err(e) => crate::events::ChatRpcResponse {
+                            match request_id {
+                                None => crate::events::ChatRpcResponse {
                                     success: false,
-                                    error: Some(format!("Failed to send control response: {}", e)),
+                                    error: Some(
+                                        "a permission answer needs its request_id".to_string(),
+                                    ),
                                 },
+                                Some(request_id) => {
+                                    let ctx = PermissionAnswer {
+                                        active_sessions: &active_sessions,
+                                        graph: &graph,
+                                        nats: Some(&nats),
+                                        event_emitter: &event_emitter,
+                                    };
+                                    match Self::deliver_permission_answer(
+                                        ctx,
+                                        &session_id,
+                                        &request_id,
+                                        allow,
+                                        true,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => crate::events::ChatRpcResponse {
+                                            success: true,
+                                            error: None,
+                                        },
+                                        Err(PermissionDeliveryError::NotPending) => {
+                                            crate::events::ChatRpcResponse {
+                                                success: false,
+                                                error: Some(PERMISSION_NOT_PENDING_RPC.to_string()),
+                                            }
+                                        }
+                                        Err(e) => crate::events::ChatRpcResponse {
+                                            success: false,
+                                            error: Some(e.to_string()),
+                                        },
+                                    }
+                                }
                             }
                         } else if request.message_type == "set_auto_continue" {
                             // Toggle auto-continue for this session (no CLI interaction needed)
@@ -7244,8 +7296,29 @@ impl ChatManager {
         allow: bool,
         require_pending: bool,
     ) -> std::result::Result<(), PermissionDeliveryError> {
+        let answer = PermissionAnswer {
+            active_sessions: &self.active_sessions,
+            graph: &self.graph,
+            nats: self.nats.as_ref(),
+            event_emitter: &self.event_emitter,
+        };
+        Self::deliver_permission_answer(answer, session_id, request_id, allow, require_pending)
+            .await
+    }
+
+    /// The body of [`Self::send_permission_response_inner`], without `self`: the
+    /// NATS RPC listener of a legacy session answers through it too, so a permission
+    /// granted on another instance is the same `control_response` (subtype, request_id,
+    /// behavior) written on `stdin_tx`, never under the client lock that a turn holds.
+    async fn deliver_permission_answer(
+        ctx: PermissionAnswer<'_>,
+        session_id: &str,
+        request_id: &str,
+        allow: bool,
+        require_pending: bool,
+    ) -> std::result::Result<(), PermissionDeliveryError> {
         let (stdin_tx, pending_perm_inputs, events_tx, session_uuid, next_seq) = {
-            let mut sessions = self.active_sessions.write().await;
+            let mut sessions = ctx.active_sessions.write().await;
             let session = sessions
                 .get_mut(session_id)
                 .ok_or_else(|| PermissionDeliveryError::SessionDead(session_id.to_string()))?;
@@ -7345,10 +7418,14 @@ impl ChatManager {
 
         // Broadcast to all connected WebSocket clients
         let _ = events_tx.send(decision_event.clone());
-        if let Some(ref nats) = self.nats {
+        if let Some(nats) = ctx.nats {
             nats.publish_chat_event(session_id, decision_event.clone());
         }
-        self.notify_attention(session_id, AttentionReason::PermissionDecision);
+        notify_attention(
+            ctx.event_emitter,
+            AttentionSubject::Session(session_id.to_string()),
+            AttentionReason::PermissionDecision,
+        );
 
         // Persist to Neo4j
         if let Some(uuid) = session_uuid {
@@ -7361,7 +7438,7 @@ impl ChatManager {
                 data: serde_json::to_string(&decision_event).unwrap_or_default(),
                 created_at: chrono::Utc::now(),
             };
-            if let Err(e) = self.graph.store_chat_events(uuid, vec![record]).await {
+            if let Err(e) = ctx.graph.store_chat_events(uuid, vec![record]).await {
                 warn!(
                     session_id = %session_id,
                     request_id = %request_id,
@@ -7402,17 +7479,31 @@ impl ChatManager {
                 .map(|()| DeliveryRoute::Local);
         }
         // The message_type "control_response" tells the receiving instance to
-        // use send_permission_response instead of send_message.
-        // `request_id`: what an agent-engine owner answers with (the CLI does not need it).
+        // answer the permission, not to send a message. Both engines answer with
+        // `request_id`: the CLI matches the control_response to its can_use_tool by it.
+        // The owner answers strictly (a request no longer waiting is refused), so the
+        // refusal comes back typed. Asked ONCE: a resend would write the answer twice.
         let payload = serde_json::json!({ "allow": allow, "request_id": request_id }).to_string();
-        if self
-            .try_remote_send(session_id, &payload, "control_response")
+        let Some(ref nats) = self.nats else {
+            return Err(PermissionDeliveryError::SessionDead(session_id.to_string()));
+        };
+        match nats
+            .request_send_message(session_id, &payload, "control_response")
             .await
-            .unwrap_or(false)
         {
-            Ok(DeliveryRoute::Remote)
-        } else {
-            Err(PermissionDeliveryError::SessionDead(session_id.to_string()))
+            Some(answer) if answer.success => Ok(DeliveryRoute::Remote),
+            Some(answer) if answer.error.as_deref() == Some(PERMISSION_NOT_PENDING_RPC) => {
+                Err(PermissionDeliveryError::NotPending)
+            }
+            Some(answer) => {
+                debug!(
+                    session_id = %session_id,
+                    error = ?answer.error,
+                    "the remote instance did not deliver the permission answer"
+                );
+                Err(PermissionDeliveryError::SessionDead(session_id.to_string()))
+            }
+            None => Err(PermissionDeliveryError::SessionDead(session_id.to_string())),
         }
     }
 
