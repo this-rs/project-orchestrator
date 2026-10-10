@@ -7762,6 +7762,7 @@ mod permission_scopes {
         let handle = manager.agent_runtime.get(&sid).await.unwrap();
         handle.seed_session_grant(
             crate::chat::session_grants::grant_for(&crate::chat::session_grants::AskedCall {
+                asker: crate::chat::session_grants::Asker::Native,
                 tool: "mcp__nexus__Bash".into(),
                 canonical: Some("Bash".into()),
                 input: json!({"command": "ls"}),

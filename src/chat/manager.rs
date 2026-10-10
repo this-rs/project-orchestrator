@@ -379,10 +379,28 @@ pub const LEGACY_PERMISSION_SCOPES: &[super::types::PermissionAnswerScope] = &[
     super::types::PermissionAnswerScope::Session,
 ];
 
-/// `system_init.capabilities` of the Claude Code engine: only what this engine declares
-/// itself (`permission_scopes`); a client keeps its Claude Code profile for the rest.
+/// `system_init.capabilities` of the Claude Code engine: the WHOLE capabilities object, as
+/// the agent engine stamps it on a Claude Code session (`AgentSessionHandle::emit_one`:
+/// the provider's capabilities without `always`), its `permission_scopes` being exactly
+/// [`LEGACY_PERMISSION_SCOPES`] (what [`ChatManager::deliver_permission_answer`] accepts).
 pub fn legacy_capabilities() -> serde_json::Value {
-    serde_json::json!({ "permission_scopes": LEGACY_PERMISSION_SCOPES })
+    static CAPABILITIES: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    CAPABILITIES
+        .get_or_init(|| {
+            let mut caps = serde_json::to_value(
+                nexus_claude::providers::claude_code::ClaudeCodeConfig::default()
+                    .capabilities(None),
+            )
+            .unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(fields) = caps.as_object_mut() {
+                fields.insert(
+                    "permission_scopes".to_string(),
+                    serde_json::json!(LEGACY_PERMISSION_SCOPES),
+                );
+            }
+            caps
+        })
+        .clone()
 }
 
 /// Why a permission answer was not delivered.
@@ -7610,6 +7628,7 @@ impl ChatManager {
             (true, super::types::PermissionAnswerScope::Session) => {
                 let grant = claimed.as_ref().and_then(|c| {
                     super::session_grants::grant_for(&super::session_grants::AskedCall {
+                        asker: super::session_grants::Asker::ClaudeCode,
                         tool: c.tool.clone(),
                         canonical: None,
                         input: c.input.clone(),
@@ -12591,6 +12610,7 @@ async fn answer_granted_request(
     input: &serde_json::Value,
 ) -> Option<ChatEvent> {
     let call = super::session_grants::AskedCall {
+        asker: super::session_grants::Asker::ClaudeCode,
         tool: tool.to_string(),
         canonical: None,
         input: input.clone(),

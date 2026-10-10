@@ -133,23 +133,53 @@ messages yet. Both are also logged by the server with the step name.
 
 `scope` (optional, default `once`) says how long an approval lasts: `once` (this call) or
 `session`. Both engines declare what they accept in `system_init.capabilities.permission_scopes`
-(the Claude Code engine: `["once", "session"]`); a scope not declared is refused. A `session`
+(the Claude Code engine: `["once", "session"]`, in the whole Claude Code capability object, as
+the agent engine stamps it); a scope not declared is refused. A `session`
 approval is decided by the BACKEND (`chat::session_grants`), never handed to the provider as a
 rule (no nexus `allow` entry, no `updatedPermissions` to the CLI): the provider is answered
 `once`, and the backend answers itself the later requests of the SAME session that the grant
-covers. A grant never covers more than what the user approved:
+covers. A grant only ever covers exactly what the user saw and approved, and only for an action
+that cannot run code the model can change. Everything is an allowlist; anything else is refused
+(`permission_scope_unsupported`, the user answers `once`):
 
-- the identical call: same tool, same input (a command's surrounding blanks trimmed, its
-  `description` ignored, every other field compared);
-- any call of a read-only built-in tool of the native engine (`mcp__nexus__Read`, `Glob`, `Grep`,
-  `LS`), identified by the adapter, never by the name's suffix: a third party's `mcp__acme__Read`
-  only gets the identical call. On the Claude Code engine a read is only granted for the identical
-  call too (the CLI asks a read only outside the working directory);
-- no session grant at all (refused) for a command that may run code the user did not see in the
-  line: one that runs another command (`env`, `sudo`, `bash -c`, `xargs`, `ssh`, `docker
-  exec`..., by basename), a program given by path (`./x.sh`), an interpreter (`python3`, `node`...),
-  a task runner or build tool (`make`, `npm`, `cargo`...), `git` (hooks, repository
-  configuration), `find -exec`, a command or process substitution, anywhere in the line.
+- **the request must carry the whole call.** The Claude Code engine and the native engine hand
+  the model's own tool input. On Codex, only an MCP tool call whose elicitation carries its
+  arguments (`tool_params`) qualifies. Never Codex's `apply_patch` (its input is `{reason}`: no
+  path, no diff, so one grant would cover every later patch), its `shell` (nexus joins the argv
+  with spaces: `["rm","a b"]` and `["rm","a","b"]` read the same) or `request_permissions`;
+  never an ACP agent;
+- **any call of a read-only built-in tool of the native engine** (`mcp__nexus__Read`, `Glob`,
+  `Grep`, `LS`, `NotebookRead`), identified by the adapter, never by the name's suffix;
+- **the identical call** (same tool, same input; a command's surrounding blanks trimmed, its
+  `description` ignored, every other field compared) for: the file tools (`Write`, `Edit`,
+  `MultiEdit`, `NotebookEdit`), a read of the Claude Code CLI (it asks a read only outside the
+  working directory, so never the whole tool), `WebFetch`, `WebSearch`, a third party's MCP tool
+  (`mcp__acme__Read` included);
+- **the identical command line** (`Bash`, `Monitor`, or a tool named like one) only when every
+  simple command of it (split on `; & | ( )` and new lines) runs one of these programs, plainly
+  named: `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `egrep`, `fgrep`, `rg` (without `--pre`,
+  `--pre-glob`, `--hostname-bin`), `find` (without `-exec`, `-execdir`, `-ok`, `-okdir`), `fd` /
+  `fdfind` (without `-x`, `-X`, `--exec`, `--exec-batch`), `sort` (without
+  `--compress-program`), `uniq`, `cut`, `tr`, `nl`, `diff`, `cmp`, `stat`, `file`, `du`, `df`,
+  `tree`, `pwd`, `echo`, `printf` (without `-v`), `which`, `basename`, `dirname`, `realpath`,
+  `readlink`, `whoami`, `uname`, `id`, `true`, `false`. A forbidden long option is refused
+  abbreviated too (`--compress`), and an unquoted glob is refused next to a program that has one
+  (a file named `--pre=./x.sh`). Everything else is refused: interpreters, shells, scripts given
+  by path, task runners and build tools, tools that load project files (`eslint`, `vite`,
+  `mypy`...), `git` (hooks, `core.fsmonitor`, diff drivers), `sed`, `awk`, `jq`, `tar`,
+  `sqlite3`, `xargs`, `env`, `sudo`, any builtin that changes how a name resolves (`export`,
+  `hash`, `enable`, `alias`, `cd`...), an assignment in front (`PATH=./bin ls`);
+- **a line that cannot be read for sure** gets no grant: an expansion (`$` outside single quotes,
+  a backquote, `<(...)`), a brace outside quotes (`{bash,x.sh}` runs `bash x.sh`), a backslash
+  outside single quotes (`ba\⏎sh x.sh` is a line continuation), an unterminated quote, a control
+  character;
+- **never** `SlashCommand`, `Skill` (they run a file the model can edit), `Task` / `Agent`,
+  `TaskStop`, or a tool the backend does not know.
+
+The working directory is **not** part of the match: both engines keep the `cd` of one call for
+the next, so a grant of `ls` lists whatever directory the shell is in, and a grant of
+`echo x > out` writes `out` there. The programs are found through the server's `PATH` (neither
+engine keeps an environment change from one call to the next).
 
 Only requests the provider asked reach the backend, after its own policy (read-only access,
 denies, trust) and the project's consent. Another session, or the same one after a restart, asks
