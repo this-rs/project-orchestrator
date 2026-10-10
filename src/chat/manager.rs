@@ -543,6 +543,11 @@ pub(crate) struct AgentSpecInput<'a> {
     /// directories (the provider refuses both, and the local paths mean nothing
     /// there).
     pub remote_cwd: Option<&'a str>,
+    /// The provider can be given MCP servers for this session
+    /// ([`ChatManager::carries_per_session_mcp`]). `false` (OpenClaw's ACP bridge,
+    /// whatever its capabilities say): no project-orchestrator MCP server, and the
+    /// session reports `project_orchestrator_tools` among what it does not do.
+    pub per_session_mcp: bool,
     /// The knowledge-graph hooks to give the session (`None`: none).
     pub hooks: Option<AgentHookScope>,
 }
@@ -1488,6 +1493,28 @@ pub(crate) fn lacks_nexus_tools(
         && configured
             .and_then(super::provider::native_factory::runnable_nexus_tools)
             .is_none()
+}
+
+/// Name of the project-orchestrator MCP server in a session's spec.
+pub(crate) const PO_MCP_SERVER: &str = "project-orchestrator";
+
+/// What a session about to open lacks that the HOST knows and its provider's
+/// capabilities may not say, as `degraded_features` entries: `nexus_tools`
+/// ([`lacks_nexus_tools`]) and `project_orchestrator_tools` when the spec carries no
+/// project-orchestrator MCP server (a remote Claude Code, OpenClaw's ACP bridge).
+pub(crate) fn host_degraded(
+    kind: nexus_claude::agent::ProviderKind,
+    spec: &nexus_claude::agent::SessionSpec,
+    configured: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    if lacks_nexus_tools(kind, spec, configured) {
+        missing.push(super::agent_runtime::NEXUS_TOOLS_FEATURE.to_string());
+    }
+    if !spec.mcp_servers.contains_key(PO_MCP_SERVER) {
+        missing.push(super::agent_runtime::PO_TOOLS_FEATURE.to_string());
+    }
+    missing
 }
 
 /// Refuses a model whose context window cannot hold the tool schemas of the
@@ -11051,6 +11078,30 @@ impl ChatManager {
         })
     }
 
+    /// Whether a session of `provider_id` can be given MCP servers (the
+    /// project-orchestrator server among them): its provider says it can
+    /// (`capabilities(model).per_session_mcp`), AND its record does not name an agent
+    /// known to refuse them ([`super::provider::settings::instance_carries_mcp`]:
+    /// OpenClaw's ACP bridge answers `session/new` with an error when it is given one).
+    pub(crate) async fn carries_per_session_mcp(
+        &self,
+        provider_id: &str,
+        provider: &dyn nexus_claude::agent::AgentProvider,
+        model: &str,
+    ) -> Result<bool> {
+        if !provider.capabilities(Some(model)).per_session_mcp {
+            return Ok(false);
+        }
+        if provider.kind() != nexus_claude::agent::ProviderKind::Acp {
+            return Ok(true);
+        }
+        Ok(
+            super::provider::store::instance(self.graph.as_ref(), provider_id)
+                .await?
+                .is_none_or(|record| super::provider::settings::instance_carries_mcp(&record)),
+        )
+    }
+
     /// Everything that must hold before a session's content is sent to a
     /// provider other than Claude Code. Claude Code (the historical path) is
     /// not subject to it.
@@ -11206,6 +11257,7 @@ impl ChatManager {
             max_tokens,
             kind,
             remote_cwd,
+            per_session_mcp,
             hooks,
         } = i;
         // A neutral directory of the host is made on demand (new session or resume).
@@ -11277,12 +11329,14 @@ impl ChatManager {
         }
         spec.policy = policy;
         // A remote Claude Code cannot carry an MCP server (its configuration holds
-        // the session token, which must not reach another machine's command line):
-        // the PO tools are NOT given to it, and `system_init.degraded_features`
-        // says so (`project_orchestrator_tools`).
-        if remote_cwd.is_none() {
+        // the session token, which must not reach another machine's command line),
+        // nor can an agent that refuses per-session MCP servers (OpenClaw's ACP
+        // bridge, `per_session_mcp`): the PO tools are NOT given to it, and
+        // `system_init.degraded_features` says so (`project_orchestrator_tools`,
+        // [`host_degraded`]).
+        if remote_cwd.is_none() && per_session_mcp {
             spec.mcp_servers.insert(
-                "project-orchestrator".to_string(),
+                PO_MCP_SERVER.to_string(),
                 McpServerSpec::Stdio {
                     command: self.config.mcp_server_path.to_string_lossy().to_string(),
                     args: Vec::new(),
@@ -11429,6 +11483,9 @@ impl ChatManager {
         } = o;
         let provider = self.provider_for(provider_id).await?;
         let remote_cwd = self.remote_cwd_of(provider_id).await?;
+        let per_session_mcp = self
+            .carries_per_session_mcp(provider_id, provider.as_ref(), model)
+            .await?;
         let sid = session_id.to_string();
         // A run (an executor) on a remote machine that does not allow `Trust` runs under `ask`
         // instead (a pilot asking for it is refused in authorize_provider_use). Every other
@@ -11481,6 +11538,7 @@ impl ChatManager {
                     max_tokens: request.max_tokens,
                     kind: provider.kind(),
                     remote_cwd: remote_cwd.as_deref(),
+                    per_session_mcp,
                     hooks: Some(AgentHookScope {
                         project_slug: project_slug.map(str::to_string),
                         task_id: request
@@ -11523,7 +11581,7 @@ impl ChatManager {
             }
         }
         let tool_profile = spec_tool_profile(&spec);
-        let nexus_missing = lacks_nexus_tools(
+        let host_missing = host_degraded(
             provider.kind(),
             &spec,
             self.config.nexus_tools_path.as_deref(),
@@ -11550,7 +11608,7 @@ impl ChatManager {
             session,
             1,
             tool_policy,
-            nexus_missing,
+            host_missing,
         )
         .await;
         if let Some(handle) = self.agent_runtime.get(&sid).await {
@@ -11599,9 +11657,10 @@ impl ChatManager {
     }
 
     /// Records what the provider reported (frozen capabilities, resume token)
-    /// and registers the live session. `nexus_missing`: the session was opened without
-    /// its `nexus-tools` server ([`lacks_nexus_tools`]), which it reports as a feature it
-    /// does not have rather than leaving only a line in the server's log.
+    /// and registers the live session. `host_missing`: what the host knows the session
+    /// lacks ([`host_degraded`]: its `nexus-tools` server, the project-orchestrator
+    /// server), which it reports as features it does not have rather than leaving only
+    /// a line in the server's log.
     #[allow(clippy::too_many_arguments)]
     async fn finish_agent_open(
         &self,
@@ -11611,7 +11670,7 @@ impl ChatManager {
         session: Arc<dyn nexus_claude::agent::AgentSession>,
         first_seq: i64,
         tool_policy: serde_json::Value,
-        nexus_missing: bool,
+        host_missing: Vec<String>,
     ) {
         self.warn_if_forced(provider_id, session.as_ref());
         if let Some(router) = self.turn_routing.get(session_id) {
@@ -11632,11 +11691,6 @@ impl ChatManager {
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_else(|| "claude_code".to_string());
-        let extra_degraded = if nexus_missing {
-            vec![super::agent_runtime::NEXUS_TOOLS_FEATURE.to_string()]
-        } else {
-            Vec::new()
-        };
         let handle = self
             .agent_runtime
             .adopt_with(
@@ -11647,7 +11701,7 @@ impl ChatManager {
                 &kind_name,
                 tool_policy,
                 Some(self.turn_services()),
-                extra_degraded,
+                host_missing,
             )
             .await;
         self.spawn_agent_nats_listeners(handle);
@@ -11774,6 +11828,9 @@ impl ChatManager {
             .unwrap_or_else(|| super::provider::resolver::CLAUDE_CODE.to_string());
         let provider = self.provider_for(&provider_id).await?;
         let remote_cwd = self.remote_cwd_of(&provider_id).await?;
+        let per_session_mcp = self
+            .carries_per_session_mcp(&provider_id, provider.as_ref(), &node.model)
+            .await?;
         let sid = node.id.to_string();
         let (system_prompt, _) = self
             .build_system_prompt_anchored(
@@ -11830,6 +11887,7 @@ impl ChatManager {
                     max_tokens: None,
                     kind: provider.kind(),
                     remote_cwd: remote_cwd.as_deref(),
+                    per_session_mcp,
                     hooks: Some(AgentHookScope {
                         project_slug: node.project_slug.clone(),
                         task_id: node
@@ -11864,7 +11922,7 @@ impl ChatManager {
             .resume_token
             .as_deref()
             .and_then(|raw| nexus_claude::agent::ResumeToken::from_wire(raw).ok());
-        let nexus_missing = lacks_nexus_tools(
+        let host_missing = host_degraded(
             provider.kind(),
             &spec,
             self.config.nexus_tools_path.as_deref(),
@@ -11886,7 +11944,7 @@ impl ChatManager {
             session,
             latest + 1,
             tool_policy,
-            nexus_missing,
+            host_missing,
         )
         .await;
         let handle = self
@@ -12693,6 +12751,7 @@ mod tests {
                             max_tokens: None,
                             kind: ProviderKind::ClaudeCode,
                             remote_cwd: None,
+                            per_session_mcp: true,
                             hooks: None,
                         },
                         access,
@@ -13470,6 +13529,7 @@ mod tests {
                         max_tokens: None,
                         kind,
                         remote_cwd: remote,
+                        per_session_mcp: true,
                         hooks,
                     })
                     .await
@@ -13593,6 +13653,7 @@ mod tests {
                         max_tokens: None,
                         kind: ProviderKind::ClaudeCode,
                         remote_cwd,
+                        per_session_mcp: true,
                         hooks: None,
                     })
                     .await
@@ -13611,6 +13672,51 @@ mod tests {
         let local = spec_for(None).await;
         assert!(local.mcp_servers.contains_key("project-orchestrator"));
         assert_eq!(local.extra_dirs.len(), 1);
+    }
+
+    /// An agent that takes no MCP server per session (OpenClaw's ACP bridge) is not
+    /// given the PO server, and the host reports what the session lacks.
+    #[tokio::test]
+    async fn a_provider_without_per_session_mcp_gets_no_po_server_and_it_is_reported() {
+        use nexus_claude::agent::ProviderKind;
+        let state = mock_app_state();
+        let mut config = test_config();
+        config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let claims = crate::auth::jwt::Claims::service_account("acp");
+        let spec_for = |per_session_mcp: bool| {
+            let manager = &manager;
+            let claims = &claims;
+            async move {
+                manager
+                    .build_agent_spec(AgentSpecInput {
+                        cwd: "/tmp",
+                        model: "openclaw",
+                        system_prompt: "p",
+                        permission_mode: None,
+                        add_dirs: &[],
+                        user_claims: Some(claims),
+                        session_id: "acp-s1",
+                        third_party: true,
+                        max_tokens: None,
+                        kind: ProviderKind::Acp,
+                        remote_cwd: None,
+                        per_session_mcp,
+                        hooks: None,
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        let without = spec_for(false).await;
+        assert!(without.mcp_servers.is_empty(), "{:?}", without.mcp_servers);
+        assert_eq!(
+            host_degraded(ProviderKind::Acp, &without, None),
+            vec![super::super::agent_runtime::PO_TOOLS_FEATURE.to_string()]
+        );
+        let with = spec_for(true).await;
+        assert!(with.mcp_servers.contains_key(PO_MCP_SERVER));
+        assert!(host_degraded(ProviderKind::Acp, &with, None).is_empty());
     }
 
     // ── nexus-tools on a native session (B40) ───────────────────────────────
@@ -13648,6 +13754,7 @@ mod tests {
                         max_tokens: None,
                         kind,
                         remote_cwd: None,
+                        per_session_mcp: true,
                         hooks: None,
                     })
                     .await
@@ -13728,6 +13835,7 @@ mod tests {
                 max_tokens: None,
                 kind: ProviderKind::Native,
                 remote_cwd: None,
+                per_session_mcp: true,
                 hooks: None,
             })
             .await
@@ -13764,6 +13872,7 @@ mod tests {
                 max_tokens: None,
                 kind: ProviderKind::Native,
                 remote_cwd: None,
+                per_session_mcp: true,
                 hooks: None,
             })
             .await
@@ -13807,6 +13916,7 @@ mod tests {
                 max_tokens: None,
                 kind: ProviderKind::Native,
                 remote_cwd: None,
+                per_session_mcp: true,
                 hooks: None,
             })
             .await
@@ -14143,6 +14253,7 @@ mod tests {
                 max_tokens: None,
                 kind,
                 remote_cwd,
+                per_session_mcp: true,
                 hooks: Some(AgentHookScope {
                     project_slug: Some("proj".into()),
                     task_id: None,
@@ -16196,6 +16307,7 @@ mod tests {
                         max_tokens: None,
                         kind: ProviderKind::Native,
                         remote_cwd: None,
+                        per_session_mcp: true,
                         hooks: None,
                     },
                     SessionAccess::ReadOnly,

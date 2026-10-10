@@ -7177,3 +7177,206 @@ mod legacy_oob_lag {
         manager.close_session(&sid).await.unwrap();
     }
 }
+
+/// OpenClaw delegated through its ACP bridge (`openclaw acp`), played by nexus'
+/// `fake_acp` (its `refuse_mcp_servers` mode answers as the bridge does). The bridge
+/// refuses MCP servers per session (`session/new` answered with an error, 2026.9.x;
+/// older versions ignored them): the session is opened WITHOUT the project-orchestrator
+/// server, and says so (`project_orchestrator_tools` among its `degraded_features`), as
+/// a remote Claude Code.
+mod openclaw_delegation {
+    use super::*;
+
+    /// The agent's side: `openclaw acp` as read in its published code (initialize
+    /// without HTTP / SSE MCP, `session/new` refused when it carries `mcpServers`),
+    /// then one turn.
+    fn transcript() -> String {
+        [
+            json!({"op": "expect", "method": "initialize", "reply": {
+                "protocolVersion": 1,
+                "agentCapabilities": {"loadSession": true,
+                    "promptCapabilities": {"image": true, "audio": false, "embeddedContext": true},
+                    "mcpCapabilities": {"http": false, "sse": false}},
+                "agentInfo": {"name": "openclaw-acp", "version": "2026.9.9"},
+                "authMethods": []}}),
+            json!({"op": "expect", "method": "session/new", "refuse_mcp_servers": true,
+                   "reply": {"sessionId": "oc-1"}}),
+            json!({"op": "expect", "method": "session/prompt", "defer": "p"}),
+            json!({"op": "notify", "method": "session/update", "params": {"sessionId": "oc-1",
+                   "update": {"sessionUpdate": "agent_message_chunk",
+                              "content": {"type": "text", "text": "hello from openclaw"}}}}),
+            json!({"op": "reply", "to": "p", "result": {"stopReason": "end_turn"}}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
+
+    /// Two ACP agents declared on this server, both playing the refusing transcript:
+    /// `openclaw` (a program named so: declared without per-session MCP) and `bridge`
+    /// (a program of another name: the refusal is learned at its first session). The
+    /// declaration is process-wide: made once. Returns the directory of the records.
+    fn declare() -> &'static std::path::Path {
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let transcript_path = dir.path().join("transcript.jsonl");
+            std::fs::write(&transcript_path, transcript()).unwrap();
+            let mut declared = serde_json::Map::new();
+            for (preset, program) in [("openclaw", "openclaw"), ("bridge", "acp-bridge")] {
+                let path = dir.path().join(program);
+                std::fs::write(
+                    &path,
+                    format!(
+                        "#!/bin/sh\nFAKE_ACP_TRANSCRIPT='{}' FAKE_ACP_RECORD='{}' \
+                         FAKE_ACP_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                        transcript_path.display(),
+                        dir.path().join(format!("{preset}.jsonl")).display(),
+                        fake_bin("fake_acp").display()
+                    ),
+                )
+                .unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                }
+                declared.insert(
+                    preset.to_string(),
+                    json!([
+                        path.display().to_string(),
+                        "acp",
+                        "--token-file",
+                        "/dev/null"
+                    ]),
+                );
+            }
+            std::env::set_var(
+                super::super::provider::settings::ACP_COMMANDS_VAR,
+                Value::Object(declared).to_string(),
+            );
+            dir
+        })
+        .path()
+    }
+
+    /// The `mcpServers` of every `session/new` the agent `preset` received (the health
+    /// probe sends none).
+    fn session_news(preset: &str) -> Vec<Value> {
+        std::fs::read_to_string(declare().join(format!("{preset}.jsonl")))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|entry| entry["kind"] == "in" && entry["method"] == "session/new")
+            .map(|entry| entry["params"]["mcpServers"].clone())
+            .collect()
+    }
+
+    /// A stored, consented ACP instance `id` of the declared agent `preset`.
+    async fn store(graph: &MockGraphStore, id: &str, preset: &str) {
+        let origin = super::super::provider::settings::process_origin("acp", Some(preset));
+        store_instance(
+            graph,
+            &InstanceRecord {
+                id: id.into(),
+                kind: "acp".into(),
+                preset: Some(preset.into()),
+                label: id.into(),
+                base_url: String::new(),
+                origin: origin.clone(),
+                default_model: Some("openclaw".into()),
+                cost_source: "unknown".into(),
+                credential_ref: "none".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        consent(graph, "proj", id, &origin).await;
+    }
+
+    /// Opens a session on `id`, plays its turn, and returns its `degraded_features`.
+    async fn open_and_play(manager: &ChatManager, graph: &MockGraphStore, id: &str) -> Vec<String> {
+        let created = manager
+            .create_session(&request(Some(id), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("the session on {id} must open: {e:#}"));
+        let sid = created.session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        next_event(
+            &mut rx,
+            |e| matches!(e, ChatEvent::AssistantText { content, .. } if content.contains("hello from openclaw")),
+        )
+        .await;
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        // The system_init the interface reads (persisted by the out-of-turn pump,
+        // maybe after the Result).
+        let uuid = Uuid::parse_str(&sid).unwrap();
+        let mut init = None;
+        for _ in 0..100 {
+            init = graph
+                .get_chat_events(uuid, 0, 100)
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|r| serde_json::from_str::<ChatEvent>(&r.data).ok())
+                .find(|e| matches!(e, ChatEvent::SystemInit { .. }));
+            if init.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let Some(ChatEvent::SystemInit {
+            degraded_features, ..
+        }) = init
+        else {
+            panic!("no system_init persisted");
+        };
+        manager.close_session(&sid).await.ok();
+        degraded_features.unwrap_or_default()
+    }
+
+    fn lacks_po_tools(degraded: &[String]) -> bool {
+        degraded
+            .iter()
+            .any(|f| f == super::super::agent_runtime::PO_TOOLS_FEATURE)
+    }
+
+    #[tokio::test]
+    async fn an_openclaw_session_opens_without_the_po_server_and_says_so() {
+        declare();
+        let graph = Arc::new(MockGraphStore::new());
+        store(&graph, "openclaw-e2e", "openclaw").await;
+        let manager = manager(graph.clone(), true);
+        let degraded = open_and_play(&manager, &graph, "openclaw-e2e").await;
+        // The agent was never given an MCP server: no refusal, no second request.
+        assert_eq!(session_news("openclaw"), vec![json!([])]);
+        assert!(lacks_po_tools(&degraded), "{degraded:?}");
+    }
+
+    /// An agent of another name that refuses the servers the same way: the first
+    /// session is opened again without them by nexus (and says so); the provider has
+    /// learned it, so the SECOND session is built without the PO server and opens at
+    /// once, with no refusal and no retry.
+    #[tokio::test]
+    async fn a_learned_refusal_opens_the_next_session_without_the_po_server_and_without_retry() {
+        declare();
+        let graph = Arc::new(MockGraphStore::new());
+        store(&graph, "bridge-e2e", "bridge").await;
+        let manager = manager(graph.clone(), true);
+
+        let first = open_and_play(&manager, &graph, "bridge-e2e").await;
+        let asked = session_news("bridge");
+        assert_eq!(asked.len(), 2, "refused, then asked again: {asked:?}");
+        assert_eq!(asked[0][0]["name"], "project-orchestrator");
+        assert_eq!(asked[1], json!([]));
+        assert!(lacks_po_tools(&first), "{first:?}");
+
+        let second = open_and_play(&manager, &graph, "bridge-e2e").await;
+        let asked = session_news("bridge");
+        assert_eq!(asked.len(), 3, "one more session/new, no retry: {asked:?}");
+        assert_eq!(asked[2], json!([]));
+        assert!(lacks_po_tools(&second), "{second:?}");
+    }
+}

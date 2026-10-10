@@ -393,6 +393,41 @@ pub fn parse_acp_commands(raw: &str) -> std::collections::BTreeMap<String, Vec<S
         .collect()
 }
 
+/// ACP agents known to take no MCP server per session, by the name of their program.
+/// `openclaw acp` refuses `mcpServers` at `session/new` / `session/load` with an error
+/// (2026.9.x: "ACP bridge mode does not support per-session MCP servers"; older
+/// versions ignored them in silence). Its MCP servers are configured on the OpenClaw
+/// gateway (`openclaw mcp set`).
+const ACP_AGENTS_WITHOUT_PER_SESSION_MCP: &[&str] = &["openclaw"];
+
+/// Whether the ACP agent this declared command starts takes MCP servers per session:
+/// `false` when its program (file name, without a Windows extension) is a known agent
+/// that refuses them ([`ACP_AGENTS_WITHOUT_PER_SESSION_MCP`]).
+pub fn acp_command_carries_mcp(argv: &[String]) -> bool {
+    let Some(program) = argv.first() else {
+        return true;
+    };
+    // Both separators: a declaration may name a Windows path on any host.
+    let file = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let name = file.split('.').next().unwrap_or(file).to_ascii_lowercase();
+    !ACP_AGENTS_WITHOUT_PER_SESSION_MCP.contains(&name.as_str())
+}
+
+/// Whether a session of this instance can be given the project-orchestrator MCP
+/// server, as far as its RECORD says: an ACP instance whose declared agent refuses
+/// per-session MCP servers cannot ([`acp_command_carries_mcp`]); every other can (the
+/// provider's capabilities say the rest).
+pub fn instance_carries_mcp(record: &InstanceRecord) -> bool {
+    if record.kind != "acp" {
+        return true;
+    }
+    record
+        .preset
+        .as_deref()
+        .and_then(|name| acp_commands().remove(name))
+        .is_none_or(|argv| acp_command_carries_mcp(&argv))
+}
+
 /// Kinds that run a local process instead of calling an endpoint: they have no
 /// URL, their consent is tied to a process identity.
 pub fn is_process_kind(kind: &str) -> bool {
@@ -1246,6 +1281,24 @@ mod tests {
         );
         assert_eq!(declared.keys().collect::<Vec<_>>(), vec!["opencode"]);
         assert!(parse_acp_commands("not json").is_empty());
+        // OpenClaw's ACP bridge takes no MCP server per session, whatever the path.
+        let argv = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert!(acp_command_carries_mcp(&argv(&["opencode", "acp"])));
+        assert!(!acp_command_carries_mcp(&argv(&[
+            "openclaw",
+            "acp",
+            "--token-file",
+            "/run/oc"
+        ])));
+        assert!(!acp_command_carries_mcp(&argv(&[
+            "/usr/local/bin/openclaw",
+            "acp"
+        ])));
+        assert!(!acp_command_carries_mcp(&argv(&[
+            r"C:\tools\OpenClaw.cmd",
+            "acp"
+        ])));
+        assert!(acp_command_carries_mcp(&[]));
         assert!(serde_json::from_value::<InstanceDraft>(
             serde_json::json!({"id": "a", "kind": "acp", "command": ["sh", "-c", "evil"]})
         )

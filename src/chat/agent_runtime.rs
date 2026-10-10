@@ -252,6 +252,12 @@ fn image_refusal(error: &ProviderError) -> Option<ChatEvent> {
 /// knows it, not the provider's capabilities, so it is added at adoption.
 pub const NEXUS_TOOLS_FEATURE: &str = "nexus_tools";
 
+/// The identifier of a session that has none of the project-orchestrator tools: it
+/// cannot carry an MCP server (`per_session_mcp` false: a remote Claude Code), or the
+/// host did not give it one because its agent refuses them (OpenClaw's ACP bridge,
+/// `ChatManager::carries_per_session_mcp`).
+pub const PO_TOOLS_FEATURE: &str = "project_orchestrator_tools";
+
 /// What a session on the agent engine does NOT do, as the identifiers the
 /// frontend knows (`hooks`, `message_queue`, `auto_continue`, `compaction`,
 /// `nats`, `enrichment`, `images`, and [`NEXUS_TOOLS_FEATURE`] added by the host).
@@ -284,7 +290,7 @@ pub fn degraded_features(caps: &Capabilities) -> Vec<String> {
     // A session that cannot carry an MCP server (a remote Claude Code) has none
     // of the project-orchestrator tools.
     if !caps.per_session_mcp {
-        missing.push("project_orchestrator_tools");
+        missing.push(PO_TOOLS_FEATURE);
     }
     missing.into_iter().map(str::to_string).collect()
 }
@@ -1410,7 +1416,11 @@ pub(crate) mod fake {
             Ok(Vec::new())
         }
         fn capabilities(&self, _model: Option<&str>) -> Capabilities {
-            Capabilities::none()
+            // A local Claude Code takes MCP servers per session: the host gives it the
+            // PO server (`ChatManager::carries_per_session_mcp`).
+            let mut caps = Capabilities::none();
+            caps.per_session_mcp = true;
+            caps
         }
         async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
             if let Some(e) = self.fail_open.lock().unwrap().take() {

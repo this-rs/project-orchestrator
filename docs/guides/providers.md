@@ -54,6 +54,39 @@ secret value. It is for a signed-in person only (an agent token gets `403`, an u
 
 What was sent where is readable at `GET /api/chat/send-journal` (who, project, origin, model; never the content).
 
+## OpenClaw (delegating a conversation to an OpenClaw agent)
+
+OpenClaw speaks ACP through its bridge, `openclaw acp`, which connects to an OpenClaw Gateway.
+Declare it on the server, then register an ACP instance that names it:
+
+```sh
+CHAT_PROVIDER_ACP_COMMANDS='{"openclaw":["openclaw","acp","--url","wss://gateway.example:18789","--token-file","/etc/po/openclaw.token"]}'
+```
+
+```json
+{ "id": "openclaw", "kind": "acp", "preset": "openclaw", "label": "OpenClaw",
+  "default_model": "openclaw", "cost_source": "unknown", "credential_ref": "none" }
+```
+
+- **Use `--token-file`, never `--token`**: a token on the command line is visible to every user of
+  the machine in the process list (and an argument that looks like a secret is refused anyway).
+  The file belongs to the server's user, mode `0600`.
+- **No project-orchestrator tools in the session.** The bridge refuses MCP servers given per
+  session (`session/new` answers "ACP bridge mode does not support per-session MCP servers";
+  older versions ignored them without a word). The server knows it from the program's name
+  (`openclaw`, whatever its path): the session is opened **without** the project-orchestrator
+  MCP server and says so, `degraded_features` carries `project_orchestrator_tools` (the same
+  banner as a remote Claude Code). An ACP agent declared under another name that refuses
+  them the same way opens its first session again without them (and says so); the next
+  sessions of that instance are opened without them from the start. To give OpenClaw the PO tools, configure them on the
+  OpenClaw side (`openclaw mcp set project-orchestrator '<json>'`: a stdio `command`, or the
+  server's `/mcp` over Streamable HTTP when `remote_mcp.enabled`, with its authentication).
+- **Other limits of the bridge**: no `fs/*` or `terminal/*` requests (the agent uses its own
+  tools), no model choice (the model name is a label), no system prompt, no knowledge-graph
+  hooks, no compaction signal, images not sent; permissions are relayed only while a turn is
+  running. Each session is an isolated OpenClaw session (`acp-bridge:<uuid>`) unless the
+  command targets one (`--session agent:main:main`).
+
 ## Routing, roles, aliases, policy
 
 Resolution order: existing session (frozen) > explicit request > task alias > run > project role >
