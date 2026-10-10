@@ -7474,8 +7474,8 @@ mod post_turn {
         // No turn of its own for the context, nor any automated turn on the history
         // just compacted: the run is the user's turn alone.
         assert_eq!(r.sent().len(), 1, "{:#?}", r.sent());
-        // The next turn carries the context in front, once; it did no work, so the
-        // pending objective is recalled after it.
+        // The next turn carries in front, once, the context and the reminder of the
+        // turn that compacted (it did no work: the objective is pending).
         r.manager.send_message(&r.sid, "next").await.unwrap();
         r.turn_end().await;
         for _ in 0..400 {
@@ -7499,11 +7499,10 @@ mod post_turn {
             "re-injected once: {sent:#?}"
         );
         assert!(
-            sent[2..].iter().any(|s| {
-                s.contains(super::super::post_stream::OBJECTIVE_REMINDER_MARKER)
-                    && s.contains("Fix the parser bug")
-            }),
-            "the pending objective recalled: {sent:#?}"
+            sent[1].contains(super::super::post_stream::OBJECTIVE_REMINDER_MARKER)
+                && sent[1].contains("Fix the parser bug"),
+            "the pending objective recalled with the context: {}",
+            sent[1]
         );
         assert!(
             sent.len() <= 4,
@@ -7612,7 +7611,10 @@ mod post_turn {
 /// own: such a turn is measured against the window right after the compaction and
 /// compacted again (measured on integ/p8: a second summarisation call whose history
 /// held the re-injected context). The context rides in front of the session's next
-/// turn instead, and a user turn costs at most one compaction.
+/// turn instead. What is guaranteed: the re-injection itself never starts a turn,
+/// hence never a compaction; in this scenario (one model call per message) a user
+/// turn compacts at most once. Nexus may still compact between the tool steps of
+/// one turn: that is its own policy, not bounded here.
 mod compaction_loop {
     use super::*;
 
