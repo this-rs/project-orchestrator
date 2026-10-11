@@ -4516,13 +4516,17 @@ impl ChatManager {
                 }
             }
         }
-        // The agent engine's sessions are live too (their permissions and background
-        // tasks are not tracked here: P11 / P4).
+        // The agent engine's sessions are live too, with the background tasks their
+        // provider reports running (P4); their permissions are not tracked here (P11).
         for handle in self.agent_runtime.handles().await {
             if let Ok(id) = handle.session_id.parse::<Uuid>() {
                 snap.live.insert(id);
                 if handle.is_streaming.load(Ordering::SeqCst) {
                     snap.streaming.insert(id);
+                }
+                let counts = count_background_tasks(&handle.active_background_tasks().await);
+                if counts != (0, 0) {
+                    snap.background_tasks.insert(id, counts);
                 }
             }
         }
@@ -13775,24 +13779,7 @@ impl ChatManager {
                         );
                     }
                 }
-                // The agent engine's sessions, by the same rule: a running turn or a
-                // background task its provider still reports running (P4) keeps it.
-                for handle in manager.agent_runtime.handles().await {
-                    let idle = handle.idle_for();
-                    let is_streaming = handle.is_streaming.load(Ordering::SeqCst);
-                    let background_tasks = handle.active_background_tasks().await.len();
-                    if session_is_expired(idle, timeout, is_streaming, background_tasks) {
-                        expired.push(handle.session_id.clone());
-                    } else if idle > timeout {
-                        debug!(
-                            session_id = %handle.session_id,
-                            idle_secs = idle.as_secs(),
-                            is_streaming,
-                            background_tasks,
-                            "Idle agent session kept alive: work still in progress"
-                        );
-                    }
-                }
+                expired.extend(manager.expired_agent_sessions(timeout).await);
 
                 for id in expired {
                     info!("Cleaning up timed-out session {}", id);
@@ -13802,6 +13789,30 @@ impl ChatManager {
                 }
             }
         });
+    }
+
+    /// The agent engine's sessions the idle cleanup closes, by the rule of the
+    /// Claude Code engine ([`session_is_expired`]): a running turn or a background
+    /// task its provider still reports running (P4) keeps an idle session.
+    async fn expired_agent_sessions(&self, timeout: Duration) -> Vec<String> {
+        let mut expired = Vec::new();
+        for handle in self.agent_runtime.handles().await {
+            let idle = handle.idle_for();
+            let is_streaming = handle.is_streaming.load(Ordering::SeqCst);
+            let background_tasks = handle.active_background_tasks().await.len();
+            if session_is_expired(idle, timeout, is_streaming, background_tasks) {
+                expired.push(handle.session_id.clone());
+            } else if idle > timeout {
+                debug!(
+                    session_id = %handle.session_id,
+                    idle_secs = idle.as_secs(),
+                    is_streaming,
+                    background_tasks,
+                    "Idle agent session kept alive: work still in progress"
+                );
+            }
+        }
+        expired
     }
 
     /// Get the number of currently active sessions, on both engines.
@@ -21042,6 +21053,112 @@ mod tests {
         let untouched = graph.get_chat_session(live.id).await.unwrap().unwrap();
         assert_eq!(untouched.message_count, 1, "a live session is its handle's");
         assert_eq!(untouched.total_cost_usd, None);
+    }
+
+    fn native_bg_task(
+        id: &str,
+        kind: nexus_claude::agent::BackgroundTaskKind,
+        status: nexus_claude::agent::BackgroundTaskStatus,
+    ) -> nexus_claude::agent::BackgroundTask {
+        nexus_claude::agent::BackgroundTask {
+            id: id.into(),
+            kind,
+            description: "cargo build".into(),
+            status,
+            started_at_ms: Some(1_700_000_000_000),
+            tool_call_id: Some(format!("tool-{id}")),
+            parent: None,
+            pid: None,
+        }
+    }
+
+    /// Adopts a native agent session on a fake provider, idle for `idle`.
+    async fn idle_agent_session(
+        manager: &ChatManager,
+        idle: Duration,
+    ) -> Arc<crate::chat::agent_runtime::AgentSessionHandle> {
+        let provider = crate::chat::agent_runtime::fake::FakeProvider::new();
+        let handle = manager
+            .agent_runtime
+            .adopt(
+                &Uuid::new_v4().to_string(),
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        handle.backdate_activity(idle);
+        handle
+    }
+
+    /// The idle cleanup keeps an agent session whose provider still reports a
+    /// background task running (P4), as it keeps a Claude Code session with one;
+    /// the same idle session with no task left (or only ended ones) is closed,
+    /// and past the hard cap even a busy one is.
+    #[tokio::test]
+    async fn the_idle_cleanup_keeps_an_agent_session_with_a_background_task_running() {
+        use nexus_claude::agent::{BackgroundTaskKind as Kind, BackgroundTaskStatus as Status};
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let timeout = Duration::from_secs(60);
+
+        let busy = idle_agent_session(&manager, timeout * 2).await;
+        busy.set_background_tasks(vec![native_bg_task("nt-1", Kind::Shell, Status::Running)])
+            .await;
+        let done = idle_agent_session(&manager, timeout * 2).await;
+        done.set_background_tasks(vec![native_bg_task("nt-2", Kind::Shell, Status::Killed)])
+            .await;
+        let quiet = idle_agent_session(&manager, timeout * 2).await;
+        let fresh = idle_agent_session(&manager, Duration::ZERO).await;
+
+        let mut expired = manager.expired_agent_sessions(timeout).await;
+        expired.sort();
+        let mut want = vec![done.session_id.clone(), quiet.session_id.clone()];
+        want.sort();
+        assert_eq!(expired, want, "busy and fresh sessions are kept");
+        assert!(!expired.contains(&fresh.session_id));
+
+        busy.backdate_activity(timeout * (IDLE_HARD_CAP_FACTOR + 1));
+        assert!(
+            manager
+                .expired_agent_sessions(timeout)
+                .await
+                .contains(&busy.session_id),
+            "past the hard cap, a background task no longer keeps the session"
+        );
+    }
+
+    /// The cockpit's snapshot counts the background tasks an agent session's
+    /// provider reports running, by kind, as it does for a Claude Code session.
+    #[tokio::test]
+    async fn the_live_snapshot_lists_the_background_tasks_of_an_agent_session() {
+        use nexus_claude::agent::{BackgroundTaskKind as Kind, BackgroundTaskStatus as Status};
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let busy = idle_agent_session(&manager, Duration::ZERO).await;
+        busy.set_background_tasks(vec![
+            native_bg_task("nt-1", Kind::Shell, Status::Running),
+            native_bg_task("nt-2", Kind::Monitor, Status::Running),
+            native_bg_task("nt-3", Kind::Shell, Status::Running),
+            native_bg_task("nt-4", Kind::Shell, Status::Killed),
+        ])
+        .await;
+        let quiet = idle_agent_session(&manager, Duration::ZERO).await;
+
+        let snap = manager.live_session_snapshot().await;
+        let busy_id: Uuid = busy.session_id.parse().unwrap();
+        let quiet_id: Uuid = quiet.session_id.parse().unwrap();
+        assert!(snap.live.contains(&busy_id) && snap.live.contains(&quiet_id));
+        assert_eq!(
+            snap.background_tasks.get(&busy_id),
+            Some(&(1, 2)),
+            "one monitor, two running commands; the killed one is not counted"
+        );
+        assert_eq!(snap.background_tasks.get(&quiet_id), None);
     }
 
     // ====================================================================

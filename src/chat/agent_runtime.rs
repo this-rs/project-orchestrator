@@ -677,6 +677,28 @@ impl AgentSessionHandle {
             .elapsed()
     }
 
+    /// Tests: the session last did something `ago` before now.
+    #[cfg(test)]
+    pub(crate) fn backdate_activity(&self, ago: Duration) {
+        let then = Instant::now()
+            .checked_sub(ago)
+            .expect("a representable instant");
+        *self.last_activity.lock().unwrap_or_else(|e| e.into_inner()) = then;
+    }
+
+    /// Tests: the provider's background task snapshot, as its event would set it
+    /// (no event emitted, no activity recorded).
+    #[cfg(test)]
+    pub(crate) async fn set_background_tasks(
+        &self,
+        tasks: Vec<nexus_claude::agent::BackgroundTask>,
+    ) {
+        self.mapper
+            .lock()
+            .await
+            .map(&AgentEvent::BackgroundTasks { tasks });
+    }
+
     /// The opening message of the session was counted when the session was created:
     /// its turn does not count it again (`session_record`).
     pub fn opening_message_counted(&self) {
