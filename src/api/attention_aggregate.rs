@@ -1301,6 +1301,7 @@ mod tests {
                 parent_tool_use_id: None,
                 category: None,
                 canonical: None,
+                tool_use_id: None,
             };
             self.store(session, 1, ev, age).await;
         }

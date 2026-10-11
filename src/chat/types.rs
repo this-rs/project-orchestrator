@@ -583,6 +583,46 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_tool_use_id: Option<String>,
     },
+    /// When a tool call really ran, as the engine saw it (`tool_clock`), emitted once
+    /// its result (or its cancellation) is in. Times: seconds since the epoch, the
+    /// milliseconds as the fraction (the unit of `created_at`); a time the engine
+    /// did not see is absent.
+    ToolTiming {
+        /// The tool_use ID.
+        id: String,
+        /// The model announced the call (`tool_use`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        called_at: Option<f64>,
+        /// The engine took the call up (PreToolUse hook), before any permission.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<f64>,
+        /// The engine asked the user (permission or question).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_requested_at: Option<f64>,
+        /// The user answered the permission (noted before the answer reached the engine).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_resolved_at: Option<f64>,
+        /// `allowed` or `denied`; absent when no permission was answered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_outcome: Option<String>,
+        /// The tool itself started running, only as the engine saw it: the answer to
+        /// an allowed permission, else the take-up. Absent when the tool never ran
+        /// (denied, never answered, a question answered by its result), when the
+        /// engine runs no host hook, or when the timing is `incomplete`: never
+        /// estimated.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_started_at: Option<f64>,
+        /// The engine had the result, or the call was cancelled.
+        ended_at: f64,
+        /// The call ended by a cancellation (`tool_cancelled`), not a result.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cancelled: bool,
+        /// The clock may have missed a wait: a permission request named no call.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        incomplete: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
     /// Claude is asking for permission to use a tool
     PermissionRequest {
         id: String,
@@ -596,6 +636,10 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         /// Stable alias of the tool, from the adapter.
         canonical: Option<String>,
+        /// The tool_use the permission is about, when the engine gives it (the CLI's
+        /// `can_use_tool`, the agent engine's `permission_ask`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_use_id: Option<String>,
     },
     /// Claude Code called the AskUserQuestion tool — display the interactive
     /// question widget instead of a permission approval dialog.
@@ -966,6 +1010,7 @@ impl ChatEvent {
             ChatEvent::ToolResult { .. } => "tool_result",
             ChatEvent::ToolUseInputResolved { .. } => "tool_use_input_resolved",
             ChatEvent::ToolCancelled { .. } => "tool_cancelled",
+            ChatEvent::ToolTiming { .. } => "tool_timing",
             ChatEvent::PermissionRequest { .. } => "permission_request",
             ChatEvent::AskUserQuestion { .. } => "ask_user_question",
             ChatEvent::Result { .. } => "result",
@@ -1010,6 +1055,7 @@ impl ChatEvent {
                 Some(format!("tool_use_input_resolved:{}", id))
             }
             ChatEvent::ToolCancelled { id, .. } => Some(format!("tool_cancelled:{}", id)),
+            ChatEvent::ToolTiming { id, .. } => Some(format!("tool_timing:{}", id)),
             ChatEvent::PermissionRequest { id, .. } => Some(format!("permission_request:{}", id)),
             ChatEvent::AskUserQuestion { id, .. } => Some(format!("ask_user_question:{}", id)),
             ChatEvent::PermissionDecision { id, .. } => Some(format!("permission_decision:{}", id)),
@@ -2015,6 +2061,7 @@ mod tests {
                 parent_tool_use_id: None,
                 category: None,
                 canonical: None,
+                tool_use_id: None,
             }
             .event_type(),
             "permission_request"
@@ -2110,6 +2157,7 @@ mod tests {
                 parent_tool_use_id: None,
                 category: None,
                 canonical: None,
+                tool_use_id: None,
             },
             ChatEvent::Result {
                 session_id: "cli-123".into(),
@@ -2529,6 +2577,7 @@ mod tests {
                 parent_tool_use_id: Some("p5".into()),
                 category: None,
                 canonical: None,
+                tool_use_id: None,
             },
             ChatEvent::ToolUseInputResolved {
                 id: "tu1".into(),

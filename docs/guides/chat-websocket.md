@@ -148,6 +148,7 @@ Events sent from the server to the client. Each event includes a `type` field an
 | `thinking` | Claude's extended thinking content | `content` |
 | `tool_use` | Claude is invoking a tool | `id`, `tool`, `input` |
 | `tool_result` | Result of a tool invocation | `id`, `result`, `is_error` |
+| `tool_timing` | When a tool call really ran, as the engine saw it; stored and sent right after its `tool_result` (or `tool_cancelled`). Times in seconds, milliseconds as the fraction. The wait for the user is `permission_requested_at`..`permission_resolved_at` (`permission_outcome`: `allowed` / `denied`); the run is `run_started_at`..`ended_at`, and `run_started_at` is absent rather than estimated (denied, never answered, a question, an engine without host hooks). `cancelled`: ended by a cancellation; `incomplete`: a permission request named no call | `id`, `ended_at`, optional `called_at`, `started_at`, `permission_requested_at`, `permission_resolved_at`, `permission_outcome`, `run_started_at`, `cancelled`, `incomplete`, `parent_tool_use_id` |
 | `tool_use_input_resolved` | Full input resolved for a tool_use (emitted when the complete input arrives after an initial empty one) | `id`, `input` |
 | `permission_request` | Claude needs permission to use a tool | `id`, `tool`, `input` |
 | `ask_user_question` | Claude asks the user a question (AskUserQuestion tool) | `id`, `tool_call_id`, `questions`, `input` |
@@ -177,9 +178,15 @@ These events are not `ChatEvent` variants but are sent by the WebSocket handler 
   "id": "tu_abc123",
   "tool": "search_code",
   "input": {"query": "authenticate", "project_slug": "my-api"},
-  "seq": 15
+  "seq": 15,
+  "created_at": 1760099999.123
 }
 ```
+
+`created_at` is a server time in seconds since the epoch, with the milliseconds as the fraction (the
+unit of `created_at` in `GET /api/chat/sessions/{id}/messages`). A replayed event carries the time it
+was stored; a live event (local or relayed over NATS) the time the server forwards it. Events of the
+mid-stream snapshot sent on join carry none.
 
 #### Replay Events
 
@@ -190,7 +197,8 @@ During the replay phase, events include `"replaying": true` so the client can di
   "type": "assistant_text",
   "content": "I found the authentication module.",
   "seq": 3,
-  "replaying": true
+  "replaying": true,
+  "created_at": 1760099990.457
 }
 ```
 
