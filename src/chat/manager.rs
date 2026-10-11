@@ -708,6 +708,9 @@ pub struct ChatManager {
     /// One small entry per session opened since the start (its held context is
     /// empty once delivered).
     pub(crate) held_slots: std::sync::Mutex<HashMap<String, Arc<HeldSlot>>>,
+    /// The manager itself, once in its `Arc` ([`Self::enable_subagents`]): what the sub-agents
+    /// of native sessions open their child sessions through (P18, `subagents.rs`).
+    pub(crate) self_ref: std::sync::OnceLock<std::sync::Weak<ChatManager>>,
 }
 
 // ============================================================================
@@ -2582,6 +2585,7 @@ impl ChatManager {
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
             held_slots: Default::default(),
+            self_ref: Default::default(),
         }
     }
 
@@ -2666,6 +2670,7 @@ impl ChatManager {
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
             held_slots: Default::default(),
+            self_ref: Default::default(),
         }
     }
 
@@ -4674,6 +4679,19 @@ impl ChatManager {
             }
             _ => SpawnParent::ThirdParty,
         }
+    }
+
+    /// Whether the session `session_id` is recorded and was spawned by nothing (no
+    /// `spawned_by`): a conversation a person opened. Only such a session may run sub-agents
+    /// (P18, depth 1). An unknown or unreadable record answers `false`.
+    pub(crate) async fn spawned_by_nothing(&self, session_id: &str) -> bool {
+        let Ok(sid) = Uuid::parse_str(session_id) else {
+            return false;
+        };
+        matches!(
+            self.graph.get_chat_session(sid).await,
+            Ok(Some(node)) if node.spawned_by.as_deref().is_none_or(|s| s.trim().is_empty())
+        )
     }
 
     /// Where a session comes from, for its tool profile (H6).
@@ -12845,6 +12863,21 @@ impl ChatManager {
                 .with_turn_router(self.turn_routing.get(session_id)),
             ));
         }
+        // The `Agent` tool of the native harness (P18): its calls run as child sessions of this
+        // one (A18). Only for a local session nothing spawned (depth 1, A17), once the manager
+        // can hand itself over (`enable_subagents`).
+        if kind == nexus_claude::agent::ProviderKind::Native && remote_cwd.is_none() {
+            if let Some(manager) = self.weak_self() {
+                if self.spawned_by_nothing(session_id).await {
+                    spec.hooks = Some(Arc::new(super::subagents::SubagentHooks::new(
+                        spec.hooks.take(),
+                        manager,
+                        session_id,
+                        user_claims.cloned(),
+                    )));
+                }
+            }
+        }
         // The consent of the project and the revocation of the token are checked before ANY
         // other hook, and whether or not the session has the knowledge-graph hooks.
         if let Some(search_origins) = gate {
@@ -15920,6 +15953,85 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    /// P18: a native session a person opened runs sub-agents (the harness then offers
+    /// `Agent`); a session something spawned — the sub-agent's own child session included —
+    /// never does (depth 1, A17); nor does a manager that cannot hand itself over.
+    #[tokio::test]
+    async fn only_a_native_session_nothing_spawned_runs_subagents() {
+        use nexus_claude::agent::ProviderKind;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let state = mock_app_state_with_graph(graph.clone());
+        let mut config = test_config();
+        config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
+        let manager = Arc::new(ChatManager::new_without_memory(
+            state.neo4j,
+            state.meili,
+            config,
+        ));
+        let (top, child) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut node = crate::test_helpers::test_chat_session(Some("proj"));
+        node.id = top;
+        graph.create_chat_session(&node).await.unwrap();
+        node.id = child;
+        node.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: top,
+                tool_use_id: Some("ca1".into()),
+            }
+            .to_json_string(),
+        );
+        graph.create_chat_session(&node).await.unwrap();
+        let claims = crate::auth::jwt::Claims::service_account("p18");
+        let runs = |sid: String, kind: ProviderKind| {
+            let manager = manager.clone();
+            let claims = claims.clone();
+            async move {
+                let spec = manager
+                    .build_agent_spec(AgentSpecInput {
+                        cwd: "/work/app",
+                        model: "m",
+                        system_prompt: "p",
+                        permission_mode: None,
+                        add_dirs: &[],
+                        user_claims: Some(&claims),
+                        session_id: &sid,
+                        third_party: true,
+                        max_tokens: None,
+                        kind,
+                        remote_cwd: None,
+                        per_session_mcp: true,
+                        hooks: Some(AgentHookScope {
+                            project_slug: Some("proj".into()),
+                            task_id: None,
+                            runner: false,
+                        }),
+                    })
+                    .await
+                    .unwrap();
+                crate::auth::agent_tokens::revoke_session(&sid);
+                spec.hooks.is_some_and(|h| h.runs_subagents())
+            }
+        };
+        assert!(
+            !runs(top.to_string(), ProviderKind::Native).await,
+            "without enable_subagents the manager cannot open a child"
+        );
+        manager.enable_subagents();
+        assert!(runs(top.to_string(), ProviderKind::Native).await);
+        assert!(
+            !runs(child.to_string(), ProviderKind::Native).await,
+            "a spawned session cannot delegate again"
+        );
+        assert!(
+            !runs(Uuid::new_v4().to_string(), ProviderKind::Native).await,
+            "an unknown record is not trusted"
+        );
+        assert!(
+            !runs(top.to_string(), ProviderKind::ClaudeCode).await,
+            "Claude Code brings its own Task"
+        );
     }
 
     #[tokio::test]

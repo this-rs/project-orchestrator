@@ -1,5 +1,5 @@
 %% name: po-spawn-envelope
-%% covers: backend:src/chat/envelope.rs backend:src/auth/{agent_tokens,jwt,tool_profile}.rs
+%% covers: backend:src/chat/{envelope,subagents}.rs backend:src/auth/{agent_tokens,jwt,tool_profile}.rs
 %% verified: 878281ca
 %% ---
 %% PROUVE : ce qu'une session ouverte PAR UN AGENT a le droit d'être (décisions A17, A25, A34),
@@ -14,6 +14,7 @@
 %%   src/auth/tool_profile.rs — ToolProfile (from_name, from_unverified_token, filter_tools,
 %%                              allows_action, route_forbidden) ; src/mcp/server.rs — profile_refusal
 %%   src/auth/middleware.rs   — require_auth, enforce_token_policy, is_human_only_mutation (po-api)
+%%   src/chat/subagents.rs    — SubagentHooks (outil Agent du harnais natif, P18), ChatManager::run_subagent
 %%   src/chat/envelope.rs     — identify_caller, resolve_envelope, ParentEnvelope::apply,
 %%                              restrict_permission_mode, is_within, ensure_child_of
 %%   src/api/chat_handlers.rs — create_session ; src/api/handlers.rs — delegate_task,
@@ -122,3 +123,10 @@ flowchart TD
 
     LATER["🟠 B36 : budget = reste du parent, annulation en cascade,<br/>coût des descendants — non écrit"]
     SPAWN_DEL -.-> LATER
+
+    subgraph sub["Sous-agent d'une session native (P18, subagents.rs) — repli A18"]
+        SUBHOST["✅ build_agent_spec_with_access : SubagentHooks (runs_subagents) seulement pour une session native locale<br/>dont le nœud n'a pas de spawned_by, et si enable_subagents a été appelé ; le harnais nexus offre alors Agent<br/>test : only_a_native_session_nothing_spawned_runs_subagents (rouge sans la garde spawned_by)"]
+        SUBRUN["✅ run_subagent : resolve_envelope(parent) puis ParentEnvelope::apply, provider et modèle du parent,<br/>spawned_by = SpawnedBy::Conversation{parent, tool_use_id}, message inerte ;<br/>attend le premier result (vivant ou persisté) → tool_result ; enfant fermé ensuite (et si l'appel est abandonné)<br/>test : engine_parity_tests the_same_scenario… (subagents : l'enfant n'a pas Agent, il est dans l'arbre) ; subagents::tests"]
+        SUBHOST --> SUBRUN
+    end
+    SUBRUN --> DEPTH

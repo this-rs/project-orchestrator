@@ -47,7 +47,7 @@ diagrams:
     # Arbitrage : auth/middleware.rs reste a po-api ; ici le jeton de session lie
     # (jwt.rs, agent_tokens.rs) et l'enveloppe d'une session enfant (chat/envelope.rs).
     covers:
-      - "backend:src/chat/envelope.rs"
+      - "backend:src/chat/{envelope,subagents}.rs"
       - "backend:src/auth/{agent_tokens,jwt,tool_profile}.rs"
   - name: po-chat-agent-runtime
     owner: theotime
