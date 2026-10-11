@@ -30,6 +30,15 @@ static OUT_OF_TRUST: LazyLock<RwLock<HashSet<String>>> =
 /// agent process is (re)spawned, so the previous holder is gone. The new token
 /// is minted for the session's current mode: it is no longer out of trust.
 pub fn register(jti: &str, session_id: Option<&str>) {
+    #[cfg(test)]
+    if let Some(sid) = session_id {
+        MINTED
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(sid.to_string())
+            .or_default()
+            .push(jti.to_string());
+    }
     let mut live = LIVE.write().unwrap_or_else(|e| e.into_inner());
     if let Some(sid) = session_id {
         live.retain(|_, s| s.as_deref() != Some(sid));
@@ -100,6 +109,42 @@ pub fn revoke_session(session_id: &str) -> usize {
     let before = live.len();
     live.retain(|_, s| s.as_deref() != Some(session_id));
     before - live.len() + tools
+}
+
+/// Revoke the token `jti` minted for `session_id` — and only it: another token of the
+/// session (a concurrent resume that succeeded) is untouched — with the session's
+/// `nexus-tools` profile token, which is kept per session. Returns how many were revoked.
+pub fn revoke_minted(session_id: &str, jti: &str) -> usize {
+    let tools = usize::from(
+        TOOLS_LIVE
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id),
+    );
+    let mut live = LIVE.write().unwrap_or_else(|e| e.into_inner());
+    let own = live
+        .get(jti)
+        .is_some_and(|s| s.as_deref() == Some(session_id));
+    if own {
+        live.remove(jti);
+    }
+    usize::from(own) + tools
+}
+
+/// Every `jti` ever registered for a session, live or not: what a test reads to prove a
+/// token WAS minted before it checks that none is left.
+#[cfg(test)]
+static MINTED: LazyLock<RwLock<HashMap<String, Vec<String>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+#[cfg(test)]
+pub fn minted_for(session_id: &str) -> Vec<String> {
+    MINTED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(session_id)
+        .cloned()
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -1772,6 +1772,11 @@ pub(crate) mod fake {
         pub caps: Arc<StdMutex<Capabilities>>,
         /// The kind it says it is (Claude Code unless a test plays another).
         pub kind: Arc<StdMutex<ProviderKind>>,
+        /// What `health` answers (ok unless a test plays another).
+        pub health: Arc<StdMutex<Option<ProviderHealth>>>,
+        /// How long `open` and `resume` take (none unless a test needs the opening to
+        /// yield, or to be dropped while it waits).
+        pub open_delay: Arc<StdMutex<Option<std::time::Duration>>>,
     }
 
     impl FakeProvider {
@@ -1781,6 +1786,8 @@ pub(crate) mod fake {
                 fail_open: Arc::new(StdMutex::new(None)),
                 caps: Arc::new(StdMutex::new(Capabilities::none())),
                 kind: Arc::new(StdMutex::new(ProviderKind::ClaudeCode)),
+                health: Arc::new(StdMutex::new(None)),
+                open_delay: Arc::new(StdMutex::new(None)),
             }
         }
         pub(crate) fn session(&self) -> Arc<FakeSession> {
@@ -1803,7 +1810,11 @@ pub(crate) mod fake {
             *self.kind.lock().unwrap()
         }
         async fn health(&self) -> ProviderHealth {
-            ProviderHealth::ok(None)
+            self.health
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| ProviderHealth::ok(None))
         }
         async fn catalog(&self) -> Result<Vec<ModelInfo>, ProviderError> {
             Ok(Vec::new())
@@ -1816,6 +1827,10 @@ pub(crate) mod fake {
             caps
         }
         async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            let delay = *self.open_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             if let Some(e) = self.fail_open.lock().unwrap().take() {
                 return Err(e);
             }
@@ -1828,6 +1843,10 @@ pub(crate) mod fake {
             spec: SessionSpec,
             token: ResumeToken,
         ) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            let delay = *self.open_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             *self.state.provider_session_id.lock().unwrap() = token
                 .data()
                 .get("session_id")
