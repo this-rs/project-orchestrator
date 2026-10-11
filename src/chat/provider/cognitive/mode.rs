@@ -297,6 +297,26 @@ pub fn effective_routing(
     }
 }
 
+/// Whether the user handed THIS conversation's routing to PO (decision R-S1): Auto in the
+/// menu (`routing_mode: full`) or two models ticked or more (a pool). One model ticked is
+/// strict (a pin), and a conversation that asked nothing follows the settings.
+pub fn conversation_routes(mode: Option<ProviderRoutingMode>, pool_len: usize) -> bool {
+    mode == Some(ProviderRoutingMode::Full) || pool_len > 1
+}
+
+/// The stage a conversation's decisions are taken at (decision R-S1): a choice the user
+/// made on the conversation ([`conversation_routes`]) counts as `auto` for it, whatever the
+/// settings say. The settings' stage (`shadow` by default) is a LEARNING setting: it
+/// governs the sessions that asked nothing, the runner's executors and delegations, and
+/// the shadow report; it never vetoes an explicit choice of the user.
+pub fn conversation_stage(settings: LearningStage, conversation_routes: bool) -> LearningStage {
+    if conversation_routes {
+        LearningStage::Auto
+    } else {
+        settings
+    }
+}
+
 /// Body of `GET /api/chat/routing` and `GET /api/projects/{slug}/routing`:
 /// the settings, flattened, plus the scope they come from.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -325,6 +345,23 @@ impl From<(RoutingSettings, RoutingScope)> for EffectiveRouting {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_choice_on_the_conversation_is_the_auto_stage_for_it_only() {
+        use ProviderRoutingMode::*;
+        // Auto, or a pool of two models or more: the user handed the routing to PO.
+        assert!(conversation_routes(Some(Full), 0));
+        assert!(conversation_routes(Some(Mixed), 2));
+        assert!(conversation_routes(None, 3));
+        // Nothing asked, one model ticked (a pin), or a mode without a pool: the settings.
+        assert!(!conversation_routes(None, 0));
+        assert!(!conversation_routes(Some(Primary), 1));
+        assert!(!conversation_routes(Some(Mixed), 0));
+        for stage in LearningStage::ALL {
+            assert_eq!(conversation_stage(stage, true), LearningStage::Auto);
+            assert_eq!(conversation_stage(stage, false), stage);
+        }
+    }
 
     #[test]
     fn the_default_is_primary_and_shadow_with_the_documented_knobs() {
