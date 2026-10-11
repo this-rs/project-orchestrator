@@ -121,10 +121,12 @@ CHAT_PROVIDER_ACP_COMMANDS='{"openclaw":["openclaw","acp","--url","wss://gateway
   session's capabilities then say with `per_session_mcp: false`), that token was sent in the
   refused request: it is revoked at once. An opening or a resume that fails before the session
   is live revokes it too, and leaves no per-turn router behind. The resumes of one session run
-  one at a time: a message that arrives while another resume of that session is opening it, or
-  that was still asking the other instances of a cluster (up to the NATS RPC timeout) when that
-  resume succeeded, is delivered to the session it opened. It does not resume the session a
-  second time, so no second token supersedes the first one.
+  one at a time on a given server instance (the lock is local to the process; two instances of
+  a cluster resuming the same session at once are not covered). A message that arrives while
+  another resume of that session on the same instance is opening it, or that was still asking
+  the other instances (up to the NATS RPC timeout) when that resume succeeded, is delivered to
+  the session it opened. It does not resume the session a second time, so no second token
+  supersedes the first one. If that session has died in the meantime, the message resumes it.
 
   To give OpenClaw the PO tools, configure them on the OpenClaw side
   (`openclaw mcp set project-orchestrator '<json>'`: a stdio `command`, or the server's `/mcp`

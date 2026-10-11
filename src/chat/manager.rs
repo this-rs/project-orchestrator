@@ -13460,11 +13460,22 @@ impl ChatManager {
         // other set up. Once it holds the lock, a resume that finds a live handle OTHER than
         // the one it started from was overtaken by a resume that succeeded: its message goes
         // to that session, through `send_message` (routing applies in `full` mode). The same
-        // handle (dead, a resume after a failed send) or none: it resumes.
+        // handle (dead, a resume after a failed send) or none: it resumes. When the send to
+        // the handle that overtook it fails (its process died while this message waited, the
+        // NATS RPC included: a handle leaves the runtime only by `close`), it resumes over
+        // that handle, as after any failed send (review of #706, finding 1). Still under the
+        // lock: no new race.
         let _resuming = self.resume_locks.lock(&sid).await;
         if let Some(now) = self.agent_runtime.get(&sid).await {
             if seen.as_ref().is_none_or(|seen| !Arc::ptr_eq(seen, &now)) {
-                return self.send_message(&sid, message).await;
+                match self.send_message(&sid, message).await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => warn!(
+                        session_id = %sid,
+                        %error,
+                        "the session that overtook this resume refused the message: resuming over it"
+                    ),
+                }
             }
         }
         let provider_id = node
@@ -18237,6 +18248,60 @@ mod tests {
         delivered(&fake, &["one", "two"]).await;
         fake.state.end_turn();
         manager.close_session(&sid).await.unwrap();
+    }
+
+    /// Review of #706, finding 1: a message that waited (the NATS RPC) while another
+    /// resume installed a handle whose process then died is not lost: the send to that
+    /// handle fails, and the resume goes on over it (a handle leaves the runtime only by
+    /// `close`). Before, the failed send was the answer: the message never arrived.
+    #[tokio::test]
+    async fn a_message_overtaken_by_a_resume_whose_session_died_resumes_over_it() {
+        let (manager, _graph, fake) = signed_routed_agent_manager();
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        let mut req = agent_request("hello");
+        req.user_claims = Some(person_claims());
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+        fake.state.opened_specs.lock().unwrap().clear();
+        fake.state.turns_started.lock().unwrap().clear();
+        // "two" looked before the session was resumed: it saw no live handle.
+        let from = manager.resume_point(&sid).await;
+        manager
+            .resume_session(&sid, "one", req.user_claims.as_ref())
+            .await
+            .unwrap();
+        delivered(&fake, &["one"]).await;
+        fake.state.end_turn();
+        let overtaking = manager.agent_runtime.get(&sid).await.expect("live");
+        wait_idle(&overtaking).await;
+        // Its process dies: the next turn on it fails.
+        *fake.state.fail_next_turn.lock().unwrap() = Some(
+            nexus_claude::agent::ProviderError::unsupported("the agent is gone"),
+        );
+        manager
+            .resume_session_from(&sid, "two", req.user_claims.as_ref(), from)
+            .await
+            .unwrap();
+        let resumed = fake.state.opened_specs.lock().unwrap().clone();
+        assert_eq!(resumed.len(), 2, "resumed over the dead session");
+        let live = manager.agent_runtime.get(&sid).await.expect("live");
+        assert!(!Arc::ptr_eq(&live, &overtaking), "a new handle");
+        assert!(crate::auth::agent_tokens::is_live(&spec_token_jti(
+            &resumed[1]
+        )));
+        delivered(&fake, &["two"]).await;
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// Waits until `handle` has no turn running.
+    async fn wait_idle(handle: &super::super::agent_runtime::AgentSessionHandle) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while handle.is_streaming.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "the turn never ended");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
