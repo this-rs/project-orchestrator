@@ -1474,14 +1474,6 @@ impl ToolRefGroupId {
         }
     }
 
-    /// The group a tool belongs to, from its bare name (`code`, not `mcp__server__code`).
-    pub fn of_tool(tool: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|group| group.tool_names().contains(&tool))
-    }
-
     /// Display name for the group header.
     pub fn display_name(&self) -> &'static str {
         match self {

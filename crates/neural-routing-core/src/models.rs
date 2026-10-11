@@ -49,11 +49,6 @@ pub struct TrajectoryNode {
     pub delta_ms: u64,
     /// Order within the trajectory (0-based).
     pub order: usize,
-    /// Outcome of the decision, filled when its turn closes. `None` while the turn
-    /// is open or when the decision has no outcome channel. Never part of the
-    /// context embedding: the embedding is computed before the outcome exists.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outcome: Option<serde_json::Value>,
 }
 
 /// A candidate action that was considered at a decision point.

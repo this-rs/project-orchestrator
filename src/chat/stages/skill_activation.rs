@@ -29,7 +29,6 @@ use crate::neo4j::traits::GraphStore;
 use crate::neurons::intent::{IntentDetector, QueryIntentMode};
 use crate::skills::activation::evaluate_skill_match;
 use crate::skills::models::SkillNode;
-use neural_routing_core::confidence::{normalized_entropy_confidence, top_margin};
 
 // ============================================================================
 // Configuration
@@ -285,12 +284,14 @@ impl ParallelEnrichmentStage for SkillActivationStage {
                 })
                 .collect();
 
-            let scores: Vec<f64> = matches.iter().map(|(_, c)| *c).collect();
             collector.record_decision(neural_routing_runtime::DecisionRecord {
                 session_id: input.session_id.to_string(),
                 context_embedding: vec![],
                 action_type: "skill.activate".to_string(),
-                action_params: activation_action_params(&chosen_name, &scores),
+                action_params: serde_json::json!({
+                    "chosen_skill": chosen_name,
+                    "activated_count": alternatives_count,
+                }),
                 alternatives_count,
                 chosen_index: 0,
                 confidence: chosen_confidence,
@@ -307,7 +308,6 @@ impl ParallelEnrichmentStage for SkillActivationStage {
                 node_features: vec![],
                 protocol_run_id: input.protocol_run_id,
                 protocol_state: input.protocol_state.clone(),
-                outcome: None,
             });
         }
 
@@ -440,39 +440,9 @@ fn detect_intent_from_message(message: &str) -> &'static str {
 // Tests
 // ============================================================================
 
-/// `action_params` of a `skill.activate` record: the chosen skill, and the shape of
-/// the matched skills' scores. `entropy_confidence` and `margin` come from the shared
-/// implementation in `neural_routing_core::confidence`. With fewer than two matches
-/// the entropy confidence is 1 by that function's convention, so read `candidates`
-/// alongside it.
-fn activation_action_params(chosen_skill: &str, scores: &[f64]) -> serde_json::Value {
-    serde_json::json!({
-        "chosen_skill": chosen_skill,
-        "activated_count": scores.len(),
-        "candidates": scores.len(),
-        "entropy_confidence": normalized_entropy_confidence(scores),
-        "margin": top_margin(scores),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn activation_params_expose_entropy_and_margin() {
-        // Two matches with equal scores: no preference, so margin 0 and entropy 0.
-        let tied = activation_action_params("skill-a", &[0.6, 0.6]);
-        assert_eq!(tied["entropy_confidence"].as_f64(), Some(0.0));
-        assert_eq!(tied["margin"].as_f64(), Some(0.0));
-        assert_eq!(tied["candidates"], 2);
-        assert_eq!(tied["activated_count"], 2);
-        // One dominant match among three: margin 1 once normalised.
-        let dominant = activation_action_params("skill-b", &[0.9, 0.0, 0.0]);
-        assert_eq!(dominant["margin"].as_f64(), Some(1.0));
-        assert_eq!(dominant["entropy_confidence"].as_f64(), Some(1.0));
-        assert_eq!(dominant["chosen_skill"], "skill-b");
-    }
 
     #[tokio::test]
     async fn test_skill_context_is_live_never_the_raw_template() {

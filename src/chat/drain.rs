@@ -53,7 +53,6 @@ pub(crate) async fn drain_pending_messages(
     enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
     search: Arc<dyn SearchStore>,
     documents: crate::documents::store::DocumentStore,
-    turn_collector: Option<Arc<neural_routing_runtime::TrajectoryCollector>>,
 ) {
     // Pop the next message from the queue, prioritising User > SystemHint
     // > BackgroundOutput so a noisy Monitor cannot starve user messages
@@ -232,7 +231,6 @@ pub(crate) async fn drain_pending_messages(
             enrichment_pipeline,
             search,
             documents,
-            turn_collector.clone(),
         ))
         .await;
     } else if has_pending {

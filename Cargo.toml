@@ -195,10 +195,6 @@ dashmap = "6"
 
 # Neural routing — always compiled (build full), runtime-controlled via settings
 neural-routing-runtime = { path = "crates/neural-routing-runtime" }
-# Shared metrics (F1, AUC, ...) for the classifier evaluation bench (src/evaluation).
-neural-routing-gnn = { path = "crates/neural-routing-gnn" }
-# Pure confidence / margin functions shared by every classifier record (no dependencies).
-neural-routing-core = { path = "crates/neural-routing-core" }
 
 # Local embeddings via ONNX Runtime (default provider — zero external dependency)
 fastembed = { version = "5.17", optional = true }

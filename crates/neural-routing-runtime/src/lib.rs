@@ -19,7 +19,6 @@ pub mod dual_track;
 pub mod exploration;
 pub mod inference_engine;
 pub mod reward;
-pub mod routing_labels;
 
 pub use collector::{CollectorEvent, DecisionRecord, SessionHints, TrajectoryCollector};
 pub use confidence::{PlattCalibrator, RolloutConfig};
@@ -36,7 +35,6 @@ pub use inference_engine::{
     PlannedAction,
 };
 pub use reward::{SessionRewardComputer, SessionSignals};
-pub use routing_labels::{routing_label_rows, RoutingLabelRow};
 
 // Re-export core types so consumers only need neural-routing-runtime
 pub use neural_routing_core::{

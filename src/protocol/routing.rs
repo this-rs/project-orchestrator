@@ -422,14 +422,12 @@ pub fn rank_protocols(
         })
         .collect();
 
-    // Descending score (highest affinity first). Exact ties are ordered by
-    // protocol id, so the ranking does not depend on the input order.
+    // Sort by descending score (highest affinity first)
     results.sort_by(|a, b| {
         b.affinity
             .score
             .partial_cmp(&a.affinity.score)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.protocol_id.cmp(&b.protocol_id))
     });
 
     RouteResponse {

@@ -112,9 +112,6 @@ COPY querie[s] ./queries/
 # Copy the frontend dist/ from stage 1 (for embedded-frontend feature or ServeDir)
 COPY --from=frontend-builder /app/frontend/dist ./dist
 
-# Classifier fixtures are embedded at build time (src/evaluation/mod.rs include_str!)
-COPY tests/fixtures/classifiers ./tests/fixtures/classifiers
-
 # Touch source files to trigger rebuild
 RUN find src -name "*.rs" -exec touch {} \;
 

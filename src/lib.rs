@@ -19,7 +19,6 @@ pub mod chat;
 pub mod documents;
 pub mod embeddings;
 pub mod episodes;
-pub mod evaluation;
 pub mod events;
 pub mod feedback;
 pub mod graph;
@@ -1872,9 +1871,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Runs independently of chat sessions (like ScheduleProvider).
     {
         use heartbeat::checks::{
-            architecture_drift::ArchitectureDriftCheck, classifier_bench::ClassifierBenchCheck,
-            consolidation::ConsolidationCheck, convention_guard::ConventionGuardCheck,
-            git_drift::GitDriftCheck, homeostasis::HomeostasisCheck, maintenance::MaintenanceCheck,
+            architecture_drift::ArchitectureDriftCheck, consolidation::ConsolidationCheck,
+            convention_guard::ConventionGuardCheck, git_drift::GitDriftCheck,
+            homeostasis::HomeostasisCheck, maintenance::MaintenanceCheck,
             staleness::StalenessCheck, synapse_decay::SynapseDecayCheck,
             synapse_replenish::SynapseReplenishCheck,
         };
@@ -1893,8 +1892,6 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             Box::new(MaintenanceCheck::new()),
             Box::new(ConsolidationCheck),
             Box::new(HomeostasisCheck::new()),
-            // Pure in-memory re-scoring of the classifiers on their fixtures.
-            Box::new(ClassifierBenchCheck),
             // Derives the architecture of ONE workspace per tick, rotating. It
             // touches nothing the synapse checks care about, so its position here
             // is free — but its per-run bound is not: the engine awaits each

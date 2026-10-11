@@ -3,7 +3,6 @@
 //! When multiple EventTriggers match an event, the router evaluates
 //! context (phase, structure, domain) and selects the best protocol.
 
-use neural_routing_core::confidence::{normalized_entropy_confidence, top_margin};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -169,13 +168,11 @@ impl TriggerRouter {
             })
             .collect();
 
-        // Descending by score. Exact ties are ordered by trigger id, so the
-        // ranking does not depend on the order the candidates were passed in.
+        // Sort descending by score (stable sort keeps insertion order for ties)
         decisions.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.trigger_id.cmp(&b.trigger_id))
         });
         decisions
     }
@@ -186,19 +183,6 @@ impl TriggerRouter {
     /// [`rank_triggers`]).  Returns `None` if no decision meets the threshold.
     pub fn select_best(decisions: &[RoutingDecision], min_score: f64) -> Option<&RoutingDecision> {
         decisions.first().filter(|d| d.score >= min_score)
-    }
-
-    /// `action_params` of a ranked trigger distribution, for a trajectory record: the
-    /// first-ranked trigger, the number of candidates, and the entropy confidence and
-    /// margin of their affinity scores (shared implementation in `neural_routing_core`).
-    pub fn ranking_action_params(decisions: &[RoutingDecision]) -> serde_json::Value {
-        let scores: Vec<f64> = decisions.iter().map(|d| d.score).collect();
-        serde_json::json!({
-            "chosen_trigger": decisions.first().map(|d| d.trigger_id.to_string()),
-            "candidates": scores.len(),
-            "entropy_confidence": normalized_entropy_confidence(&scores),
-            "margin": top_margin(&scores),
-        })
     }
 
     // ── Private helpers ────────────────────────────────────────────
@@ -447,42 +431,6 @@ mod tests {
     }
 
     // ================================================================
-    #[test]
-    fn test_ranking_action_params_expose_entropy_and_margin() {
-        // Two identical triggers on the same event: no preference, so margin 0.
-        let trigger_a = make_trigger(Some("note"), Some("created"), None);
-        let trigger_b = make_trigger(Some("note"), Some("created"), None);
-        let event = make_event(EntityType::Note, CrudAction::Created, json!({}));
-        let ctx = TriggerRouter::build_context_from_event(&event);
-        let decisions = TriggerRouter::rank_triggers(&[&trigger_a, &trigger_b], &ctx);
-        let params = TriggerRouter::ranking_action_params(&decisions);
-        assert_eq!(params["candidates"], 2);
-        assert!(
-            params.get("entropy_confidence").is_some(),
-            "entropy missing"
-        );
-        assert!(params.get("margin").is_some(), "margin missing");
-        assert_eq!(params["margin"].as_f64(), Some(0.0));
-
-        // A dominant candidate: the first score holds all the mass, margin 1.
-        let dominant: Vec<RoutingDecision> = [0.8, 0.0]
-            .iter()
-            .map(|score| RoutingDecision {
-                trigger_id: Uuid::new_v4(),
-                protocol_id: Uuid::nil(),
-                score: *score,
-                context: RoutingContext::default(),
-                explanation: String::new(),
-            })
-            .collect();
-        let params = TriggerRouter::ranking_action_params(&dominant);
-        assert_eq!(params["margin"].as_f64(), Some(1.0));
-        assert_eq!(
-            params["chosen_trigger"],
-            serde_json::Value::String(dominant[0].trigger_id.to_string())
-        );
-    }
-
     // rank_triggers
     // ================================================================
 

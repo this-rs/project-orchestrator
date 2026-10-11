@@ -349,8 +349,7 @@ impl TrajectoryStore for Neo4jTrajectoryStore {
                          local_reward: $local_reward,
                          cumulative_reward: $cumulative_reward,
                          delta_ms: $delta_ms,
-                         order_idx: $order_idx,
-                         outcome: $outcome
+                         order_idx: $order_idx
                      })
                      CREATE (t)-[:CONTAINS {order_idx: $order_idx}]->(tn)",
                 )
@@ -365,13 +364,6 @@ impl TrajectoryStore for Neo4jTrajectoryStore {
                 .param("local_reward", node.local_reward)
                 .param("cumulative_reward", node.cumulative_reward)
                 .param("delta_ms", node.delta_ms as i64)
-                .param(
-                    "outcome",
-                    node.outcome
-                        .as_ref()
-                        .map(|o| o.to_string())
-                        .unwrap_or_default(),
-                )
                 .param("order_idx", node.order as i64);
 
                 txn.run(create_node)
@@ -729,7 +721,6 @@ impl TrajectoryStore for Neo4jTrajectoryStore {
         let mut all_cum_rewards: Vec<f64> = Vec::new();
         let mut all_deltas: Vec<i64> = Vec::new();
         let mut all_orders: Vec<i64> = Vec::new();
-        let mut all_outcomes: Vec<String> = Vec::new();
 
         for trajectory in trajectories {
             for node in &trajectory.nodes {
@@ -745,12 +736,6 @@ impl TrajectoryStore for Neo4jTrajectoryStore {
                 all_cum_rewards.push(node.cumulative_reward);
                 all_deltas.push(node.delta_ms as i64);
                 all_orders.push(node.order as i64);
-                all_outcomes.push(
-                    node.outcome
-                        .as_ref()
-                        .map(|o| o.to_string())
-                        .unwrap_or_default(),
-                );
             }
         }
 
@@ -769,8 +754,7 @@ impl TrajectoryStore for Neo4jTrajectoryStore {
                      local_reward: $local_rewards[i],
                      cumulative_reward: $cum_rewards[i],
                      delta_ms: $deltas[i],
-                     order_idx: $orders[i],
-                     outcome: $outcomes[i]
+                     order_idx: $orders[i]
                  })
                  CREATE (t)-[:CONTAINS {order_idx: $orders[i]}]->(tn)",
             )
@@ -779,7 +763,6 @@ impl TrajectoryStore for Neo4jTrajectoryStore {
             .param("ctx_embeddings", all_ctx_embeddings)
             .param("action_types", all_action_types)
             .param("action_params", all_action_params)
-            .param("outcomes", all_outcomes)
             .param("alt_counts", all_alt_counts)
             .param("chosen", all_chosen)
             .param("confidences", all_confidences)
@@ -939,10 +922,5 @@ fn parse_trajectory_node(node: &neo4rs::Node) -> Result<TrajectoryNode> {
         cumulative_reward: node.get("cumulative_reward").unwrap_or(0.0),
         delta_ms: node.get::<i64>("delta_ms").unwrap_or(0) as u64,
         order: node.get::<i64>("order_idx").unwrap_or(0) as usize,
-        outcome: node
-            .get::<String>("outcome")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .and_then(|s| serde_json::from_str(&s).ok()),
     })
 }
