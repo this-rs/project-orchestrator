@@ -420,7 +420,7 @@ impl ChatManager {
                     continue;
                 }
                 match self
-                    .resume_agent_session(&item.node, &item.message, None)
+                    .resume_agent_session(&item.node, &item.message, None, None)
                     .await
                 {
                     Ok(()) => {

@@ -26,9 +26,12 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use uuid::Uuid;
 
 use super::config::RetryConfig;
-use super::manager::{CancelToolsResult, ChatManager, CANCEL_TOOLS_CAP, CANCEL_TOOLS_WINDOW_SECS};
+use super::manager::{
+    CancelTaskResult, CancelToolsResult, ChatManager, CANCEL_TASK_CAP, CANCEL_TASK_WINDOW_SECS,
+    CANCEL_TOOLS_CAP, CANCEL_TOOLS_WINDOW_SECS,
+};
 use super::provider::event_map::{out_of_band_to_chat_events, EventMapper};
-use super::types::{ChatEvent, PendingMessage, PendingMessageKind};
+use super::types::{BackgroundTaskInfo, ChatEvent, PendingMessage, PendingMessageKind};
 use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::GraphStore;
 
@@ -527,6 +530,11 @@ pub struct AgentSessionHandle {
     cancel_tools_cap: u32,
     /// The window of the cap (`CANCEL_TOOLS_WINDOW_SECS`).
     cancel_tools_window: Duration,
+    /// When `cancel_task` was asked of this session: the sliding window of the
+    /// per-session cap the Claude Code engine applies to it
+    /// (`ActiveSession::cancel_task_history`, `CANCEL_TASK_CAP` per
+    /// `CANCEL_TASK_WINDOW_SECS`).
+    cancel_task_history: Arc<Mutex<VecDeque<Instant>>>,
     /// How the provider states the cost of a turn (`session_record::CostFigure`).
     cost_figure: super::session_record::CostFigure,
     /// The provider is known to keep a turn it ended `interrupted` in its history
@@ -583,7 +591,11 @@ impl AgentSessionHandle {
         }
         match &event {
             ChatEvent::StreamDelta { text, .. } => self.streaming_text.lock().await.push_str(text),
-            ChatEvent::StreamingStatus { .. } | ChatEvent::PendingQueue { .. } => {}
+            // `active_tasks_update` is a snapshot, never replayed (the client reads
+            // `GET .../background-tasks` when it joins), as on the Claude Code engine.
+            ChatEvent::StreamingStatus { .. }
+            | ChatEvent::PendingQueue { .. }
+            | ChatEvent::ActiveTasksUpdate { .. } => {}
             other => self.streaming_events.lock().await.push(other.clone()),
         }
         if !matches!(
@@ -591,6 +603,7 @@ impl AgentSessionHandle {
             ChatEvent::StreamDelta { .. }
                 | ChatEvent::StreamingStatus { .. }
                 | ChatEvent::PendingQueue { .. }
+                | ChatEvent::ActiveTasksUpdate { .. }
         ) {
             if let Some(uuid) = self.uuid {
                 let record = ChatEventRecord {
@@ -1297,11 +1310,18 @@ impl AgentSessionHandle {
                 capped: true,
             });
         }
-        let outcome = self
-            .session
-            .cancel_tools(CancelScope::All)
-            .await
-            .map_err(anyhow::Error::new)?;
+        // Bounded like a cancel relayed from another instance (review N6): a
+        // provider that hangs is `owner_timeout` (not retryable for cancel_tools).
+        let call = tokio::time::timeout(
+            super::cancel_relay::OWNER_CANCEL_BOUND,
+            self.session.cancel_tools(CancelScope::All),
+        )
+        .await
+        .map_err(|_| cancel_timeout(super::cancel_relay::CancelKind::Tools))?;
+        let outcome = match call {
+            Ok(outcome) => outcome,
+            Err(error) => return Err(self.cancel_refused(error).await),
+        };
         let diagnostic = outcome.diagnostic.unwrap_or_default();
         tracing::info!(
             session_id = %self.session_id,
@@ -1319,6 +1339,101 @@ impl AgentSessionHandle {
             killed_pids: diagnostic.killed_pids,
             capped: false,
         })
+    }
+
+    /// Stops ONE background task (a `Bash run_in_background`, a `Monitor`) by its
+    /// wire id — the `tool_use` that started it, what `active_tasks_update` and the
+    /// Claude Code engine call it — through the provider
+    /// (`AgentSession::cancel_tools(task { id })`, the provider's own id found in
+    /// the last snapshot). The turn, if one runs, goes on. The per-session cap of
+    /// the Claude Code engine applies (`CANCEL_TASK_CAP` per window): past it,
+    /// nothing reaches the provider and the result says `capped`.
+    ///
+    /// The provider follows with a `background_tasks` snapshot (the task `killed`),
+    /// which goes out as `active_tasks_update` without it. A task that already
+    /// ended, or that no snapshot ever named, is the idempotent no-op of the Claude
+    /// Code engine (`killed_pids` empty). A provider that cannot stop a task
+    /// (`Unsupported`: a Claude Code over SSH has no `tool_cancel`, a session
+    /// without background tasks) is refused: typed on the wire
+    /// (`error { code: cancel_refused }`) and in the `Err` (the `ProviderError` in
+    /// the chain), never a success.
+    pub async fn cancel_task(&self, task_id: &str) -> Result<CancelTaskResult> {
+        let allowed = ChatManager::check_and_record_cancel_cap(
+            &self.cancel_task_history,
+            CANCEL_TASK_CAP,
+            Duration::from_secs(CANCEL_TASK_WINDOW_SECS),
+        )
+        .await;
+        let result = |killed_pids: Vec<u32>, capped: bool| CancelTaskResult {
+            task_id: task_id.to_string(),
+            killed_pids,
+            capped,
+        };
+        if !allowed {
+            tracing::warn!(session_id = %self.session_id, task_id, "cancel_task: rate cap hit, refusing");
+            return Ok(result(Vec::new(), true));
+        }
+        let known = self.mapper.lock().await.provider_task(task_id);
+        let provider_id = match &known {
+            // Over already: nothing to stop, nothing changes (as on Claude Code).
+            Some((_, false)) => return Ok(result(Vec::new(), false)),
+            Some((id, true)) => id.clone(),
+            // No snapshot named it (yet): the provider decides.
+            None => task_id.to_string(),
+        };
+        let call = tokio::time::timeout(
+            super::cancel_relay::OWNER_CANCEL_BOUND,
+            self.session.cancel_tools(CancelScope::Task {
+                id: provider_id.clone(),
+            }),
+        )
+        .await
+        .map_err(|_| cancel_timeout(super::cancel_relay::CancelKind::Task))?;
+        match call {
+            Ok(outcome) => {
+                let diagnostic = outcome.diagnostic.unwrap_or_default();
+                tracing::info!(
+                    session_id = %self.session_id,
+                    task_id,
+                    provider_task_id = %provider_id,
+                    tasks_cancelled = outcome.tools_cancelled,
+                    killed = ?diagnostic.killed_pids,
+                    "cancel_task: background task stopped"
+                );
+                Ok(result(diagnostic.killed_pids, false))
+            }
+            // An id the provider does not know (or no longer runs): the idempotent
+            // no-op of the Claude Code engine.
+            Err(ProviderError::InvalidRequest { detail }) => {
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    task_id,
+                    %detail,
+                    known_in_snapshot = known.is_some(),
+                    "cancel_task: the provider does not know this task (unknown id, already over, or a Stop that came before the first background_tasks snapshot named it): idempotent no-op"
+                );
+                Ok(result(Vec::new(), false))
+            }
+            Err(error) => Err(self.cancel_refused(error).await),
+        }
+    }
+
+    /// The background tasks still running, as the last `active_tasks_update` said.
+    pub async fn active_background_tasks(&self) -> Vec<BackgroundTaskInfo> {
+        self.mapper.lock().await.active_tasks()
+    }
+
+    /// A cancel the provider refused: an `Unsupported` is announced to every
+    /// client of the session (`error { code: cancel_refused, reason: <capability> }`)
+    /// — the click had no effect and the user must know; the error is returned with
+    /// the `ProviderError` in its chain, which the HTTP layer answers typed
+    /// (`AppError::from_open_error`: 422 `unsupported`).
+    async fn cancel_refused(&self, error: ProviderError) -> anyhow::Error {
+        if let ProviderError::Unsupported { capability } = &error {
+            tracing::warn!(session_id = %self.session_id, %capability, "cancel refused: the provider cannot do it");
+            self.emit(cancel_refused_event(capability)).await;
+        }
+        anyhow::Error::new(error)
     }
 
     /// Changes the model live.
@@ -1348,6 +1463,27 @@ impl AgentSessionHandle {
         })
         .await;
         Ok(())
+    }
+}
+
+/// A cancel the provider did not answer within `OWNER_CANCEL_BOUND`.
+fn cancel_timeout(kind: super::cancel_relay::CancelKind) -> anyhow::Error {
+    anyhow::Error::new(super::cancel_relay::CancelRelayError::OwnerTimeout { kind })
+}
+
+/// The wire form of a cancel (`cancel_tools`, `cancel_task`) the provider refused
+/// for lack of `capability` (`tool_cancel`: a Claude Code over SSH or off Unix;
+/// `background_tasks`: a session that runs none).
+pub(crate) fn cancel_refused_event(capability: &str) -> ChatEvent {
+    ChatEvent::Error {
+        message: format!(
+            "Error: This session cannot stop running tools: its provider does not support \
+             `{capability}`. Nothing was stopped."
+        ),
+        parent_tool_use_id: None,
+        code: Some("cancel_refused".to_string()),
+        reason: Some(capability.to_string()),
+        index: None,
     }
 }
 
@@ -1469,6 +1605,7 @@ impl AgentRuntime {
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             tool_clock: super::tool_clock::ToolClock::for_session(session_id),
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
+            cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
             cost_figure: super::session_record::CostFigure::of_kind(provider_kind),
             keeps_interrupted_turns: keeps_interrupted_turns(provider_kind),
             record: Mutex::new(()),
@@ -1772,6 +1909,11 @@ pub(crate) mod fake {
         pub caps: Arc<StdMutex<Capabilities>>,
         /// The kind it says it is (Claude Code unless a test plays another).
         pub kind: Arc<StdMutex<ProviderKind>>,
+        /// What `health` answers (ok unless a test plays another).
+        pub health: Arc<StdMutex<Option<ProviderHealth>>>,
+        /// How long `open` and `resume` take (none unless a test needs the opening to
+        /// yield, or to be dropped while it waits).
+        pub open_delay: Arc<StdMutex<Option<std::time::Duration>>>,
     }
 
     impl FakeProvider {
@@ -1781,6 +1923,8 @@ pub(crate) mod fake {
                 fail_open: Arc::new(StdMutex::new(None)),
                 caps: Arc::new(StdMutex::new(Capabilities::none())),
                 kind: Arc::new(StdMutex::new(ProviderKind::ClaudeCode)),
+                health: Arc::new(StdMutex::new(None)),
+                open_delay: Arc::new(StdMutex::new(None)),
             }
         }
         pub(crate) fn session(&self) -> Arc<FakeSession> {
@@ -1803,7 +1947,11 @@ pub(crate) mod fake {
             *self.kind.lock().unwrap()
         }
         async fn health(&self) -> ProviderHealth {
-            ProviderHealth::ok(None)
+            self.health
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| ProviderHealth::ok(None))
         }
         async fn catalog(&self) -> Result<Vec<ModelInfo>, ProviderError> {
             Ok(Vec::new())
@@ -1816,6 +1964,10 @@ pub(crate) mod fake {
             caps
         }
         async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            let delay = *self.open_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             if let Some(e) = self.fail_open.lock().unwrap().take() {
                 return Err(e);
             }
@@ -1828,6 +1980,10 @@ pub(crate) mod fake {
             spec: SessionSpec,
             token: ResumeToken,
         ) -> Result<Arc<dyn AgentSession>, ProviderError> {
+            let delay = *self.open_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             *self.state.provider_session_id.lock().unwrap() = token
                 .data()
                 .get("session_id")
