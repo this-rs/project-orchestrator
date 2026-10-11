@@ -2845,6 +2845,12 @@ impl ChatManager {
                 provider_imposed: turn.provider_imposed && !turn.moved_in,
                 allowed_models,
                 routing_pool: turn.routing_pool.clone(),
+                // Auto, or two models ticked or more: the user's choice for THIS
+                // conversation, decided at the `auto` stage (decision R-S1).
+                conversation_routes: super::provider::cognitive::conversation_routes(
+                    turn.routing_mode,
+                    turn.routing_pool.as_ref().map_or(0, Vec::len),
+                ),
                 current_model: model.to_owned(),
                 next_turn: turn.next_turn,
                 moved_in: turn.moved_in,
@@ -2875,6 +2881,11 @@ impl ChatManager {
             {
                 warn!(session_id, error = %error, "turn routing could not change the model");
                 router.forget_change(&before);
+                // The stored decision says the change did not go out (as a refused move).
+                if let Some(decision) = router.decision_of_turn(ctx.turn_index) {
+                    self.record_refused_change(decision, "set_model_failed")
+                        .await;
+                }
             }
         }
     }
@@ -2970,6 +2981,26 @@ impl ChatManager {
         decision.reason = format!("{}; not_moved: {code}", decision.reason);
         if let Err(error) = store.put_decision(&decision).await {
             warn!(decision_id = %decision.id, %error, "the refused move was not recorded on its decision");
+        }
+    }
+
+    /// The decision of a model change that could not be sent says so: not applied, and why.
+    async fn record_refused_change(
+        &self,
+        mut decision: super::provider::cognitive::decision::CognitiveDecision,
+        code: &str,
+    ) {
+        let Some(store) = self
+            .cognitive_routing
+            .as_ref()
+            .and_then(|routing| routing.store.clone())
+        else {
+            return;
+        };
+        decision.applied = false;
+        decision.reason = format!("{}; not_changed: {code}", decision.reason);
+        if let Err(error) = store.put_decision(&decision).await {
+            warn!(decision_id = %decision.id, %error, "the refused change was not recorded on its decision");
         }
     }
 
@@ -5285,6 +5316,20 @@ impl ChatManager {
         // The menu's ticks, read once: one model ticked is strict, an empty pool is none.
         let settled = request.settled_routing();
         let request = settled.as_ref().unwrap_or(request);
+        // A delegation (an agent caller, a spawned session) follows the settings' stage: it
+        // cannot hand its own routing to PO (decision R-S1). Its Auto or pool is dropped, not
+        // refused: the delegation still opens, routed as a session that asked nothing.
+        let delegated = (request.spawned_by.is_some()
+            && (request.routing_mode.is_some() || request.routing_pool.is_some()))
+        .then(|| {
+            warn!("a delegated session cannot choose its routing: routing_mode and routing_pool dropped");
+            ChatRequest {
+                routing_mode: None,
+                routing_pool: None,
+                ..request.clone()
+            }
+        });
+        let request = delegated.as_ref().unwrap_or(request);
         let session_id = Uuid::new_v4();
         if !request.cwd.trim().is_empty() {
             return self
@@ -12337,6 +12382,15 @@ impl ChatManager {
             || request.run_provider.is_some();
         // The conversation's own mode replaces the settings' (the chat menu: Auto = full).
         let mut settings = settings;
+        // Auto, or two models ticked or more: the user's choice for THIS conversation is
+        // decided at the `auto` stage, whatever the settings' stage (decision R-S1).
+        settings.stage = super::provider::cognitive::conversation_stage(
+            settings.stage,
+            super::provider::cognitive::conversation_routes(
+                request.routing_mode,
+                Self::routing_pool_of(request).map_or(0, <[_]>::len),
+            ),
+        );
         if let Some(mode) = request.routing_mode {
             settings.mode = mode;
         }
