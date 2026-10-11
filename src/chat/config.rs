@@ -213,6 +213,14 @@ pub struct ChatConfig {
     /// approved "for the session" may cover (`chat::session_grants`, the identical call).
     /// Any other is allowed once at a time. From `CHAT_READ_ONLY_MCP_TOOLS` (comma
     /// separated); empty by default.
+    ///
+    /// A declaration binds a NAME, not a server: the Claude Code CLI also loads the
+    /// project's `.mcp.json`, where a server may take the name of one configured elsewhere.
+    /// A declaration whose server a project's `.mcp.json` defines is ignored for that
+    /// session (`session_grants::declarations_for_project`); declare only tools of servers
+    /// no project can redefine (the backend's own, or names no project uses). No strict MCP configuration is passed to the CLI: it would drop every
+    /// server configured outside the backend, the very ones a declaration is for
+    /// (`docs/guides/chat-websocket.md`).
     pub read_only_mcp_tools: Vec<String>,
 }
 
