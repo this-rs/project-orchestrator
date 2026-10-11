@@ -196,6 +196,43 @@ pub static RUNNER_STATE: LazyLock<Arc<RwLock<Option<RunnerState>>>> =
 pub static RUNNER_CANCEL: LazyLock<Arc<AtomicBool>> =
     LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 
+/// Serializes `PlanRunner::start`: the check that no run is active and the
+/// write of the new run into the globals happen as one step.
+static RUNNER_START_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// The claims a task agent of run `run_id` opens its session with: the run's
+/// caller (a `plan(run)` caller, a webhook caller, a trigger's author), whose
+/// lineage `ChatManager::po_mcp_env` signs into the agent's token; a service
+/// account only when the run has none.
+pub(crate) fn agent_claims(
+    user_claims: Option<&crate::auth::jwt::Claims>,
+    run_id: Uuid,
+) -> crate::auth::jwt::Claims {
+    user_claims.cloned().unwrap_or_else(|| {
+        crate::auth::jwt::Claims::service_account(&format!("runner-agent:{}", run_id))
+    })
+}
+
+/// Why a new run cannot start while `state` holds the process's run: the
+/// runner has a single global run state (state, cancel flag, budget, vector
+/// collector), so a second run would take over the first one's. `None` when
+/// there is no run or it has ended.
+pub(crate) fn active_run_refusal(state: Option<&RunnerState>, plan_id: Uuid) -> Option<String> {
+    let s = state.filter(|s| s.status == PlanRunStatus::Running)?;
+    Some(if s.plan_id == plan_id {
+        format!(
+            "Plan {} already has an active run: {} (status: {}). Cancel it first.",
+            plan_id, s.run_id, s.status
+        )
+    } else {
+        format!(
+            "Plan {} not started: another plan run is active (run {} of plan {}), one run at a time.",
+            plan_id, s.run_id, s.plan_id
+        )
+    })
+}
+
 /// Serializes the tests (runner and API handlers) that touch the runner globals.
 #[cfg(test)]
 pub(crate) static RUNNER_GLOBALS_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
@@ -480,6 +517,11 @@ pub struct PlanRunner {
     /// session opens and learns from how the attempt ends. `None` = nothing
     /// decided, nothing recorded.
     routing: Option<Arc<crate::runner::routing::RoutingHandle>>,
+    /// The plan's third-party mark (`third_party_written_at`) when this run
+    /// started: `Some(None)` when there was none. `None` when unknown (a run
+    /// resumed after a restart): agents then compare the mark with the run's
+    /// start time. See [`Self::claims_for_agent`].
+    plan_mark_at_start: Arc<std::sync::Mutex<Option<Option<chrono::DateTime<chrono::Utc>>>>>,
     /// Every session request this runner built (tests read what was asked).
     #[cfg(test)]
     request_spy: Arc<std::sync::Mutex<Vec<ChatRequest>>>,
@@ -706,6 +748,7 @@ impl PlanRunner {
             run_model: None,
             run_max_tokens: None,
             routing: None,
+            plan_mark_at_start: Default::default(),
             #[cfg(test)]
             request_spy: Default::default(),
         }
@@ -719,6 +762,61 @@ impl PlanRunner {
     ) -> Self {
         self.routing = routing;
         self
+    }
+
+    /// The claims the next agent of run `run_id` opens its session with, read
+    /// again before EACH launch: the run's caller ([`agent_claims`]), with a
+    /// third-party lineage when a third-party session wrote the plan's content
+    /// after the run started — what the agent is about to execute was then
+    /// approved by nobody, and it runs restricted like the rest of the run
+    /// from there on. Compared with the mark seen at start (no clock
+    /// involved); for a run resumed after a restart, with its start time. A
+    /// mark that cannot be read restricts.
+    pub(crate) async fn claims_for_agent(
+        &self,
+        run_id: Uuid,
+        plan_id: Uuid,
+    ) -> crate::auth::jwt::Claims {
+        let claims = agent_claims(self.user_claims.as_ref(), run_id);
+        if crate::auth::jwt::agent_session_binding(&claims).is_some_and(|b| b.third_party) {
+            return claims;
+        }
+        let restricted =
+            |claims| crate::auth::jwt::with_third_party_lineage(claims, &format!("run-{run_id}"));
+        let current = match self.graph.plan_third_party_written_at(plan_id).await {
+            Ok(Some(mark)) => mark,
+            Ok(None) => return claims,
+            Err(e) => {
+                warn!(%run_id, "Third-party mark of plan {plan_id} unreadable: agent restricted: {e:#}");
+                return restricted(claims);
+            }
+        };
+        let baseline = *self
+            .plan_mark_at_start
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let newer = match baseline {
+            Some(seen) => seen != Some(current),
+            None => {
+                let started = RUNNER_STATE
+                    .read()
+                    .await
+                    .as_ref()
+                    .filter(|s| s.run_id == run_id)
+                    .map(|s| s.started_at);
+                started.is_none_or(|start| current > start)
+            }
+        };
+        if newer {
+            warn!(
+                %run_id,
+                "Plan {plan_id} was written by a third-party session during the run: \
+                 the next agents run restricted"
+            );
+            restricted(claims)
+        } else {
+            claims
+        }
     }
 
     /// Set user claims inherited from the caller who started the run.
@@ -1017,16 +1115,28 @@ impl PlanRunner {
             return Ok(false);
         }
 
+        // Restore global state, under the start lock as `start` writes it: a
+        // run started meanwhile (a trigger firing during the boot) keeps the
+        // globals, and this one is interrupted rather than taking them over.
+        let start_guard = RUNNER_START_LOCK.lock().await;
+        if let Some(refusal) = active_run_refusal(RUNNER_STATE.read().await.as_ref(), plan_id) {
+            drop(start_guard);
+            self.interrupt_run(
+                saved_state,
+                &format!("another run holds the runner: {refusal}"),
+            )
+            .await?;
+            return Ok(false);
+        }
         // Proof of life BEFORE the run is spawned, so the reconciliation sweep that
         // follows the recovery sees this run as driven by this process.
         let live = LiveRunGuard::register(run_id);
-
-        // Restore global state
         {
             let mut global = RUNNER_STATE.write().await;
             *global = Some(saved_state.clone());
         }
         RUNNER_CANCEL.store(false, Ordering::SeqCst);
+        drop(start_guard);
 
         // Emit recovery event
         self.emit_event(RunnerEvent::PlanStarted {
@@ -1081,6 +1191,13 @@ impl PlanRunner {
         cwd: String,
         project_slug: Option<String>,
     ) -> Result<StartResult> {
+        // 0. One run at a time in this process: held until the new run is in
+        //    the globals, so two starts cannot both pass the check.
+        let start_guard = RUNNER_START_LOCK.lock().await;
+        if let Some(refusal) = active_run_refusal(RUNNER_STATE.read().await.as_ref(), plan_id) {
+            return Err(anyhow!(refusal));
+        }
+
         // 1. Check no active run exists for this plan
         let active_runs = self.graph.list_active_plan_runs().await?;
         if let Some(existing) = active_runs.iter().find(|r| r.plan_id == plan_id) {
@@ -1107,6 +1224,21 @@ impl PlanRunner {
 
         // Proof of life from before the PlanRun exists in the graph: the
         // reconciliation sweep must never see this run as abandoned.
+        // The plan's third-party mark as the run starts: content a third party
+        // writes from now on was not there when the run was approved
+        // (`claims_for_agent`). Unreadable: every later mark counts as new.
+        let mark = match self.graph.plan_third_party_written_at(plan_id).await {
+            Ok(mark) => mark,
+            Err(e) => {
+                warn!(%run_id, "Third-party mark of plan {plan_id} unreadable at start: {e:#}");
+                Some(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+            }
+        };
+        *self
+            .plan_mark_at_start
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(mark);
+
         let live = LiveRunGuard::register(run_id);
         self.graph.create_plan_run(&state).await?;
 
@@ -1126,6 +1258,7 @@ impl PlanRunner {
             let mut collector = VECTOR_COLLECTOR.write().await;
             *collector = VectorCollector::new();
         }
+        drop(start_guard);
 
         // Transition plan status to InProgress (idempotent — warn if already in_progress)
         if let Err(e) = self
@@ -1491,6 +1624,18 @@ impl PlanRunner {
                         resolved_cwd
                     );
                     resolved_cwd
+                }
+                // `.` with no project root to resolve it against would be the
+                // server's own working directory: never a place to run.
+                CwdResolution::NoRootPath { resolved_cwd }
+                    if resolved_cwd == "." || resolved_cwd.is_empty() =>
+                {
+                    return Err(anyhow!(
+                        "No directory to run in: cwd '{}' and no project root_path to resolve it \
+                         (project slug: {}). Pass an absolute cwd or a project with a root_path.",
+                        resolved_cwd,
+                        project_slug.as_deref().unwrap_or("none")
+                    ));
                 }
                 CwdResolution::Match { resolved_cwd }
                 | CwdResolution::NoRootPath { resolved_cwd } => resolved_cwd,
@@ -3160,9 +3305,7 @@ impl PlanRunner {
             permission_mode: Some("bypassPermissions".to_string()),
             add_dirs: None,
             workspace_slug: None,
-            user_claims: Some(self.user_claims.clone().unwrap_or_else(|| {
-                crate::auth::jwt::Claims::service_account(&format!("runner-agent:{}", run_id))
-            })),
+            user_claims: Some(self.claims_for_agent(run_id, plan_id).await),
             spawned_by: Some(
                 serde_json::json!({
                     "type": "runner",
@@ -5076,6 +5219,7 @@ impl Clone for PlanRunner {
             run_model: self.run_model.clone(),
             run_max_tokens: self.run_max_tokens,
             routing: self.routing.clone(),
+            plan_mark_at_start: self.plan_mark_at_start.clone(),
             #[cfg(test)]
             request_spy: self.request_spy.clone(),
         }
@@ -9094,6 +9238,83 @@ mod tests {
         (plan.id, run_id)
     }
 
+    /// (Round 3, finding 1) A person's run starts at full privilege; a
+    /// third-party session then rewrites the plan's content. Every agent the
+    /// run launches after that is restricted: the mark is read again before
+    /// each launch. A mark already there when the run started (approved by
+    /// whoever started it) restricts nothing.
+    #[tokio::test]
+    async fn a_third_party_edit_during_a_full_run_restricts_the_remaining_tasks() {
+        use crate::auth::jwt::agent_session_binding;
+        use nexus_claude::agent::CostBasis;
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (runner, graph, fake) = routed_runner(None).await;
+        let person = crate::runner::dispatch::tests::person_claims();
+        let runner = runner.with_user_claims(person.clone());
+        let (plan_id, run_id) = seed_run(&graph).await;
+        let tasks: Vec<_> = (0..3).map(|_| crate::test_helpers::test_task()).collect();
+        for task in &tasks {
+            graph.create_task(plan_id, task).await.unwrap();
+        }
+        let lineage = |i: usize| {
+            let request = runner.request_spy.lock().unwrap()[i].clone();
+            let claims = request.user_claims.expect("claims");
+            assert_eq!(claims.sub, person.sub, "still the person's run");
+            agent_session_binding(&claims).is_some_and(|b| b.third_party)
+        };
+
+        // A mark from before the run (the person started it on that plan).
+        graph
+            .mark_third_party_write(crate::runner::PlanContent::Plan(plan_id))
+            .await
+            .unwrap();
+        let at_start = graph.plan_third_party_written_at(plan_id).await.unwrap();
+        *runner.plan_mark_at_start.lock().unwrap() = Some(at_start);
+
+        run_attempt(
+            &runner,
+            &fake,
+            plan_id,
+            run_id,
+            &tasks[0],
+            1,
+            CostBasis::Reported,
+        )
+        .await;
+        assert!(!lineage(0), "the first task runs as the person, full");
+
+        // A third-party session rewrites a task that has not run yet.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        graph
+            .mark_third_party_write(crate::runner::PlanContent::Task(tasks[2].id))
+            .await
+            .unwrap();
+        run_attempt(
+            &runner,
+            &fake,
+            plan_id,
+            run_id,
+            &tasks[1],
+            1,
+            CostBasis::Reported,
+        )
+        .await;
+        run_attempt(
+            &runner,
+            &fake,
+            plan_id,
+            run_id,
+            &tasks[2],
+            1,
+            CostBasis::Reported,
+        )
+        .await;
+        assert!(lineage(1), "the next agent is restricted");
+        assert!(lineage(2), "and every one after it");
+        reset_globals().await;
+    }
+
     #[tokio::test]
     async fn mixed_two_tasks_of_different_classes_give_two_decisions_carried_on_request_and_record()
     {
@@ -9825,5 +10046,121 @@ mod tests {
         let first_after = g.get_plan_run(first.run_id).await.unwrap().unwrap();
         assert_ne!(first_after.status, PlanRunStatus::Interrupted);
         reset_globals().await;
+    }
+
+    /// (F) A run started while the recovery was examining the saved runs (a
+    /// trigger firing during the boot) keeps the globals: the recovered run is
+    /// interrupted, never written over it.
+    #[tokio::test]
+    async fn recovery_does_not_take_over_a_run_started_meanwhile() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (runner, g) = test_plan_runner_with_graph();
+        let here = std::env::temp_dir().to_string_lossy().into_owned();
+        let saved = resumable_candidate(&g, Some(here), 1).await;
+        let (run_b, plan_b) = (Uuid::new_v4(), Uuid::new_v4());
+        {
+            *RUNNER_STATE.write().await =
+                Some(RunnerState::new(run_b, plan_b, 1, TriggerSource::Manual));
+        }
+        RUNNER_CANCEL.store(true, Ordering::SeqCst);
+
+        let resumed = Arc::new(runner)
+            .recover_one(saved.clone(), false)
+            .await
+            .unwrap();
+
+        assert!(!resumed);
+        let global = RUNNER_STATE.read().await;
+        let state = global.as_ref().expect("B's state is still there");
+        assert_eq!((state.run_id, state.plan_id), (run_b, plan_b));
+        drop(global);
+        assert!(RUNNER_CANCEL.load(Ordering::SeqCst), "B's cancel flag kept");
+        let after = g.get_plan_run(saved.run_id).await.unwrap().unwrap();
+        assert_eq!(after.status, PlanRunStatus::Interrupted);
+        reset_globals().await;
+    }
+
+    /// A run of plan A holds the globals: starting plan B is refused and A's
+    /// state, cancel flag and budget are left as they were.
+    #[tokio::test]
+    async fn start_refuses_while_another_plans_run_is_active() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        use crate::test_helpers::{test_plan, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+        let runner = Arc::new(runner);
+        let plan_b = test_plan();
+        graph.create_plan(&plan_b).await.unwrap();
+        graph.create_task(plan_b.id, &test_task()).await.unwrap();
+
+        let (run_a, plan_a) = (Uuid::new_v4(), Uuid::new_v4());
+        {
+            *RUNNER_STATE.write().await =
+                Some(RunnerState::new(run_a, plan_a, 3, TriggerSource::Manual));
+        }
+        // A is being cancelled, with a budget override.
+        RUNNER_CANCEL.store(true, Ordering::SeqCst);
+        RUNNER_BUDGET.store(7.5f64.to_bits(), Ordering::Relaxed);
+
+        let err = runner
+            .clone()
+            .start(plan_b.id, TriggerSource::Manual, "/tmp".to_string(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("another plan run is active"),
+            "{err}"
+        );
+
+        let global = RUNNER_STATE.read().await;
+        let state = global.as_ref().expect("A's state is still there");
+        assert_eq!((state.run_id, state.plan_id), (run_a, plan_a));
+        drop(global);
+        assert!(RUNNER_CANCEL.load(Ordering::SeqCst), "A's cancel flag kept");
+        assert_eq!(f64::from_bits(RUNNER_BUDGET.load(Ordering::Relaxed)), 7.5);
+        assert!(graph
+            .list_plan_runs(plan_b.id, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        reset_globals().await;
+    }
+
+    #[test]
+    fn active_run_refusal_only_for_a_running_state() {
+        let plan = Uuid::new_v4();
+        assert!(active_run_refusal(None, plan).is_none());
+        let mut state = RunnerState::new(Uuid::new_v4(), Uuid::new_v4(), 1, TriggerSource::Manual);
+        assert!(active_run_refusal(Some(&state), plan)
+            .unwrap()
+            .contains("another plan run is active"));
+        state.finalize(PlanRunStatus::Completed);
+        assert!(active_run_refusal(Some(&state), plan).is_none());
+        let own = RunnerState::new(Uuid::new_v4(), plan, 1, TriggerSource::Manual);
+        assert!(active_run_refusal(Some(&own), plan)
+            .unwrap()
+            .contains("already has an active run"));
+    }
+
+    /// `.` with no project root to resolve it (no slug, an unknown slug, or a
+    /// slug that could not be read) is refused, never the server's directory.
+    #[tokio::test]
+    async fn execute_plan_refuses_dot_without_a_project_root() {
+        let (runner, _graph) = test_plan_runner_with_graph();
+        for slug in [None, Some("no-such-project".to_string())] {
+            let err = runner
+                .execute_plan(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    vec![],
+                    ".".to_string(),
+                    slug,
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("No directory to run in"), "{err}");
+        }
     }
 }

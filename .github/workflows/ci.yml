@@ -147,6 +147,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The diagram index gate checks that each `verified_sha` is an
+          # ancestor of HEAD (`git merge-base --is-ancestor`): a depth-1 clone
+          # has only HEAD, and the check would downgrade to a warning. The
+          # history comes without file contents (partial clone): commits and
+          # trees are all the check reads.
+          fetch-depth: 0
+          filter: blob:none
 
       - name: Embedded frontend carries the frames the backend uses
         run: scripts/check-dist-contract.sh dist

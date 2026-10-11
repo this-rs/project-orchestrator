@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { globToRegExp, parseIndex, parseHeader, checkDiagramFile, sharedOwnership, renderOrphans, localIndexOwners, orphanCeiling, orphanCeilingsByRepo, orphansByRepo } from './check-index.mjs';
+import { globToRegExp, parseIndex, parseHeader, checkDiagramFile, sharedOwnership, renderOrphans, localIndexOwners, orphanCeiling, orphanCeilingsByRepo, orphansByRepo, isExternal, checkExternalEntry, looksLikeHost, commitStatus } from './check-index.mjs';
 
 test('glob: **, *, braces', () => {
   assert.ok(globToRegExp('src/heartbeat/**').test('src/heartbeat/checks/git_drift.rs'));
@@ -122,7 +122,7 @@ test('renderOrphans: les index locaux sont expliques dans le registre publie', (
 // --- controle negatif de bout en bout : le gate doit REFUSER une collision entre index.
 // Un gate qui ne refuse rien est pire que pas de gate, parce qu'il se cite comme preuve.
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -510,6 +510,197 @@ test('cliquet par depot: --raise-ceiling avec raison releve aussi le plafond de 
     assert.equal(code, 0, out);
     assert.match(out, /plafond de backend releve 0 -> 1 : trois fichiers ajoutes en amont/);
     assert.equal(orphanCeilingsByRepo(readFileSync(p, 'utf8')).backend, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- diagrammes EXTERNES : ils vivent dans le service Mermaid de l'equipe, le depot ne garde que
+// l'entree. Depot public : aucun hote dans l'entree, seulement l'identifiant et l'emplacement.
+const ext = (extra) => parseIndex(`diagrams:\n  - name: po-x\n    owner: t\n${extra}    covers:\n      - "backend:src/own.rs"\n`)[0];
+const EXT_OK = '    status: verified\n    mermaid_id: abc123\n    external: po/doc/po-x@2\n    verified_at: 2026-10-10\n    verified_sha: 6c79054e\n';
+
+test('externe: une entree verified complete ne leve rien', () => {
+  const e = ext(EXT_OK);
+  assert.ok(isExternal(e));
+  assert.deepEqual(checkExternalEntry(e), []);
+  // mermaid_id seul suffit, external seul aussi
+  assert.deepEqual(checkExternalEntry(ext(EXT_OK.replace(/ {4}external:.*\n/, ''))), []);
+  assert.deepEqual(checkExternalEntry(ext(EXT_OK.replace(/ {4}mermaid_id:.*\n/, ''))), []);
+  assert.ok(!isExternal(ext('    status: verified\n')));
+});
+
+test('externe: identifiant absent, adresse hors site, releve incomplet ou planned sont des erreurs', () => {
+  assert.match(checkExternalEntry(ext(EXT_OK.replace('mermaid_id: abc123', 'mermaid_id:').replace(/ {4}external:.*\n/, ''))).join('\n'), /'mermaid_id' vide/);
+  assert.match(checkExternalEntry(ext(EXT_OK.replace('mermaid_id: abc123', 'mermaid_id:').replace(/ {4}external:.*\n/, ''))).join('\n'), /sans identifiant/);
+  // une adresse avec hote est refusee : le depot est public, l'hote ne s'y ecrit pas
+  assert.match(checkExternalEntry(ext(EXT_OK.replace('po/doc/po-x@2', 'https://example.com/po/doc/po-x@2'))).join('\n'), /sans hote/);
+  assert.match(checkExternalEntry(ext(EXT_OK.replace('po/doc/po-x@2', 'po/doc/po-x'))).join('\n'), /sans hote/);
+  // l'emplacement doit designer CE diagramme
+  assert.match(checkExternalEntry(ext(EXT_OK.replace('po/doc/po-x@2', 'po/doc/po-y@2'))).join('\n'), /designe le diagramme po-y/);
+  assert.match(checkExternalEntry(ext(EXT_OK.replace('6c79054e', 'HEAD'))).join('\n'), /verified_sha/);
+  assert.match(checkExternalEntry(ext(EXT_OK.replace(/ {4}verified_at:.*\n/, ''))).join('\n'), /verified_at/);
+  assert.match(checkExternalEntry(ext(EXT_OK.replace('status: verified', 'status: planned'))).join('\n'), /status devrait etre verified/);
+});
+
+test('externe: un nom d\'hote dans l\'emplacement est refuse, meme sans point', () => {
+  for (const loc of ['localhost/doc/po-x@2', 'po/127.0.0.1/po-x@2', 'po/diagrams.example.com/po-x@2']) {
+    assert.match(checkExternalEntry(ext(EXT_OK.replace('po/doc/po-x@2', loc))).join('\n'), /nom d'hote/, loc);
+  }
+  assert.ok(looksLikeHost('LocalHost'));
+  for (const segment of ['po', 'architecture-po', 'doc.v2', 'project-orchestrator']) assert.ok(!looksLikeHost(segment), segment);
+});
+
+// Un depot git jetable avec un commit : `verified_sha` est verifie contre lui.
+function gitRepoWithCommit(dir) {
+  const git = (...args) => execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...args], { encoding: 'utf8' }).trim();
+  git('init', '-q');
+  git('add', '-A');
+  git('commit', '-q', '-m', 'fixture');
+  return git('rev-parse', 'HEAD');
+}
+
+// Un commit sur une branche laterale, puis retour sur la branche de depart : il existe, mais
+// HEAD n'en descend pas (une branche non fusionnee, ou ecrasee par un squash).
+function sideCommit(dir) {
+  const git = (...args) => execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...args], { encoding: 'utf8' }).trim();
+  const start = git('rev-parse', '--abbrev-ref', 'HEAD');
+  git('switch', '-q', '-c', 'side');
+  git('commit', '-q', '--allow-empty', '-m', 'side');
+  const side = git('rev-parse', 'HEAD');
+  git('switch', '-q', start);
+  return side;
+}
+
+test('verified_sha: ancetre de HEAD, hors historique, absent, ou non verifiable hors depot', () => {
+  const root = mkdtempSync(join(tmpdir(), 'diagram-sha-'));
+  try {
+    const repo = join(root, 'repo');
+    mkdirSync(repo);
+    writeFileSync(join(repo, 'f'), 'x\n');
+    const head = gitRepoWithCommit(repo);
+    assert.equal(commitStatus(repo, head.slice(0, 8)), 'ancestor');
+    assert.equal(commitStatus(repo, sideCommit(repo).slice(0, 8)), 'not-ancestor');
+    assert.equal(commitStatus(repo, 'deadbeef'), 'absent');
+    const plain = join(root, 'plain');
+    mkdirSync(plain);
+    assert.equal(commitStatus(plain, head.slice(0, 8)), 'unknown');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('verified_sha: un sha abrege qui designe plusieurs commits est ambigu', () => {
+  const root = mkdtempSync(join(tmpdir(), 'diagram-sha-ambiguous-'));
+  try {
+    const repo = join(root, 'repo');
+    mkdirSync(repo);
+    execFileSync('git', ['-C', repo, 'init', '-q']);
+    // Assez de commits pour que deux d'entre eux partagent un prefixe de 4 caracteres.
+    let stream = '';
+    for (let i = 0; i < 1500; i++) {
+      const msg = `c${i}\n`;
+      stream += `commit refs/heads/many\ncommitter t <t@t> ${i} +0000\ndata ${Buffer.byteLength(msg)}\n${msg}\n`;
+    }
+    const imported = spawnSync('git', ['-C', repo, 'fast-import', '--quiet'], { input: stream, encoding: 'utf8' });
+    assert.equal(imported.status, 0, imported.stderr);
+    const shas = execFileSync('git', ['-C', repo, 'rev-list', 'refs/heads/many'], { encoding: 'utf8' }).trim().split('\n');
+    const seen = new Set();
+    const prefix = shas.map((s) => s.slice(0, 4)).find((p) => (seen.has(p) ? true : (seen.add(p), false)));
+    assert.ok(prefix, 'deux commits partagent un prefixe');
+    assert.equal(commitStatus(repo, prefix), 'ambiguous');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('gate: un verified_sha qui ne designe aucun commit du depot echoue', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    writeIndex(be, EXT_OK);
+    const head = gitRepoWithCommit(be);
+    const absent = run(be, nx);
+    assert.equal(absent.code, 1, absent.out);
+    assert.match(absent.out, /po-x : 'verified_sha: 6c79054e' ne designe aucun commit de ce depot/);
+    writeIndex(be, EXT_OK.replace('6c79054e', head.slice(0, 8)));
+    const present = run(be, nx);
+    assert.doesNotMatch(present.out, /ne designe aucun commit/, present.out);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('gate: un verified_sha hors de l\'historique de HEAD echoue', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    writeIndex(be, EXT_OK);
+    const head = gitRepoWithCommit(be);
+    const side = sideCommit(be);
+    writeIndex(be, EXT_OK.replace('6c79054e', side.slice(0, 8)));
+    const off = run(be, nx);
+    assert.equal(off.code, 1, off.out);
+    assert.match(off.out, /po-x : 'verified_sha: [0-9a-f]{8}' est hors de l'historique de HEAD/);
+    writeIndex(be, EXT_OK.replace('6c79054e', head.slice(0, 8)));
+    const on = run(be, nx);
+    assert.doesNotMatch(on.out, /hors de l'historique|ne designe aucun commit/, on.out);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function writeIndex(be, poX) {
+  writeFileSync(join(be, 'docs/diagrams/INDEX.yml'),
+    `diagrams:\n  - name: po-carte\n    owner: t\n    status: planned\n    role: index\n    covers:\n      - "backend:docs/diagrams/INDEX.yml"\n  - name: po-x\n    owner: t\n${poX}    covers:\n      - "backend:src/own.rs"\n`);
+}
+
+test('gate: une entree EXTERNE verified possede ses fichiers sans .mmd local', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    writeIndex(be, EXT_OK);
+    const { code, out } = run(be, nx, ['--write-orphans']);
+    assert.equal(code, 0, out);
+    // src/own.rs a un proprietaire : il ne reste que le fichier de nexus.
+    assert.match(out, /1 orphelins/);
+    assert.match(out, /1 verified/);
+    assert.doesNotMatch(readFileSync(join(be, 'docs/diagrams/ORPHANS.md'), 'utf8'), /own\.rs/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('gate: une entree externe sans identifiant echoue, et ne possede rien', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    writeIndex(be, EXT_OK.replace('mermaid_id: abc123', 'mermaid_id:').replace(/ {4}external:.*\n/, ''));
+    const { code, out } = run(be, nx);
+    assert.equal(code, 1, out);
+    assert.match(out, /po-x : diagramme externe sans identifiant/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('gate: une entree externe ET un .mmd local : deux sources, refuse', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    writeIndex(be, EXT_OK);
+    writeFileSync(join(be, 'docs/diagrams/po-x.mmd'), '%% name: po-x\n%% covers: backend:src/own.rs\n%% verified: 6c79054e\nflowchart TD\n');
+    const { code, out } = run(be, nx);
+    assert.equal(code, 1, out);
+    assert.match(out, /diagramme externe ET docs\/diagrams\/po-x\.mmd present/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('gate: le proprietaire unique vaut aussi pour une entree externe', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    writeFileSync(join(be, 'docs/diagrams/INDEX.yml'),
+      `diagrams:\n  - name: po-carte\n    owner: t\n    status: planned\n    role: index\n    covers:\n      - "backend:docs/diagrams/INDEX.yml"\n  - name: po-x\n    owner: t\n${EXT_OK}    covers:\n      - "backend:src/own.rs"\n  - name: po-y\n    owner: t\n    status: planned\n    covers:\n      - "backend:src/*.rs"\n`);
+    const { code, out } = run(be, nx);
+    assert.equal(code, 1, out);
+    assert.match(out, /backend:src\/own\.rs : couvert par 2 diagrammes \(po-x, po-y\)/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

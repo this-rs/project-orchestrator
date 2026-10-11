@@ -121,10 +121,205 @@ pub async fn require_auth(
         }
     }
 
+    // 4e. A third-party session writing what a plan run executes (the plan,
+    //     its tasks, steps, constraints, decisions) marks the plan, BEFORE the
+    //     write: a trigger approved earlier then starts its run restricted
+    //     (`TriggerDispatcher::run_claims_now`). Before, so a deletion can
+    //     still be traced to its plan; a mark that cannot be written refuses
+    //     the write.
+    //     An update that only records progress is read to tell (see
+    //     `PROGRESS_FIELDS`); an id segment the router would read differently
+    //     from this check is refused.
+    if crate::auth::jwt::agent_session_binding(&claims).is_some_and(|b| b.third_party) {
+        let method = req.method().clone();
+        let path = req.uri().path().to_string();
+        let body = if third_party_write_needs_body(&method, &path) {
+            let (parts, body) = req.into_parts();
+            // Beyond the router's own limit the handler would refuse it too.
+            let bytes = axum::body::to_bytes(body, PROGRESS_BODY_LIMIT)
+                .await
+                .map_err(|_| {
+                    AppError::BadRequest(format!(
+                        "update body larger than {PROGRESS_BODY_LIMIT} bytes"
+                    ))
+                })?;
+            req = Request::from_parts(parts, axum::body::Body::from(bytes.clone()));
+            Some(bytes)
+        } else {
+            None
+        };
+        match third_party_write(&method, &path, body.as_deref()) {
+            ThirdPartyWrite::Unmarked => {}
+            ThirdPartyWrite::Marks(contents) => {
+                for content in contents {
+                    state
+                        .orchestrator
+                        .neo4j()
+                        .mark_third_party_write(content)
+                        .await
+                        .map_err(AppError::Internal)?;
+                }
+            }
+            ThirdPartyWrite::Refused(reason) => return Err(AppError::Forbidden(reason)),
+        }
+    }
+
     // 5. Inject claims into request extensions
     req.extensions_mut().insert(claims);
 
     Ok(next.run(req).await)
+}
+
+/// What a write by a third-party session does to the plans it touches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThirdPartyWrite {
+    /// Not plan content (a read, another route, a collection route that names
+    /// no item), or only progress (see [`PROGRESS_FIELDS`]): no mark.
+    Unmarked,
+    /// Changes what a run of these plans executes: each is marked.
+    Marks(Vec<crate::runner::PlanContent>),
+    /// The item cannot be named the way the router will name it: refused, so
+    /// no write of plan content escapes the mark.
+    Refused(String),
+}
+
+/// The fields of an update that record progress, not instructions: a write
+/// that sets only these (task or step status, who works on a task, the
+/// session working on it, the complexity it turned out to have, a plan's
+/// status) leaves no mark. A run's own agents report progress all the time;
+/// marking it would restrict every next run of a person's schedule for
+/// nothing. Every other field (title, description, acceptance criteria,
+/// affected files, tags, priority, model alias, step or constraint text…)
+/// carries instructions and marks; so does an unknown field, or a body that
+/// cannot be read.
+pub const PROGRESS_FIELDS: &[(&str, &[&str])] = &[
+    ("plans", &["status"]),
+    (
+        "tasks",
+        &["status", "assigned_to", "session_id", "actual_complexity"],
+    ),
+    ("steps", &["status"]),
+];
+
+/// Second segments of the plan-content collections that name no item (reads
+/// and searches): no mark, and not refused.
+const STATIC_SEGMENTS: &[&str] = &["search", "search-semantic", "affecting", "timeline"];
+
+/// Largest update body read to decide whether it is progress only: the
+/// router's default body limit, so nothing a handler would accept is cut.
+pub const PROGRESS_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+/// Whether deciding on `method path` needs the request body: an update of a
+/// plan, task or step itself, which may be progress only.
+pub fn third_party_write_needs_body(method: &axum::http::Method, path: &str) -> bool {
+    if *method != axum::http::Method::PATCH {
+        return false;
+    }
+    let segments: Vec<&str> = path.trim_start_matches("/api/").split('/').collect();
+    path.starts_with("/api/")
+        && segments.len() == 2
+        && PROGRESS_FIELDS.iter().any(|(kind, _)| *kind == segments[0])
+}
+
+/// What a write on `method path` (with `body` when
+/// [`third_party_write_needs_body`]) by a third-party session does.
+///
+/// Each id segment is percent-decoded and read as the router reads it (the
+/// handlers take `Path<Uuid>`), so an id written in another form names the
+/// same item here. A segment that still does not read as an id, under a
+/// plan-content collection, is refused rather than let through unmarked.
+///
+/// Marks: the plan of `/api/plans/{id}/…` (except starting or listing its runs
+/// and its triggers), the task of `/api/tasks/{id}/…` (its steps, decisions,
+/// dependencies), `/api/steps/{id}`, `/api/constraints/{id}`, and every
+/// decision named by `/api/decisions/{id}/…` (both of a supersession).
+/// Creating a plan (`POST /api/plans`) names none: whoever later puts a
+/// trigger on it approves it as it is.
+///
+/// Not covered (documented limit): notes, skills and personas that the run's
+/// context builder also injects are not plan content and are never marked.
+pub fn third_party_write(
+    method: &axum::http::Method,
+    path: &str,
+    body: Option<&[u8]>,
+) -> ThirdPartyWrite {
+    use crate::runner::PlanContent;
+    if matches!(
+        *method,
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    ) {
+        return ThirdPartyWrite::Unmarked;
+    }
+    let Some(rest) = path.strip_prefix("/api/") else {
+        return ThirdPartyWrite::Unmarked;
+    };
+    let segments: Vec<&str> = rest.split('/').collect();
+    let kind = segments[0];
+    let content = |id: uuid::Uuid| match kind {
+        "plans" => Some(PlanContent::Plan(id)),
+        "tasks" => Some(PlanContent::Task(id)),
+        "steps" => Some(PlanContent::Step(id)),
+        "constraints" => Some(PlanContent::Constraint(id)),
+        "decisions" => Some(PlanContent::Decision(id)),
+        _ => None,
+    };
+    if content(uuid::Uuid::nil()).is_none() {
+        return ThirdPartyWrite::Unmarked;
+    }
+    let Some(raw) = segments.get(1) else {
+        // The collection itself (create a plan, a decision…): names no item.
+        return ThirdPartyWrite::Unmarked;
+    };
+    if STATIC_SEGMENTS.contains(raw) {
+        return ThirdPartyWrite::Unmarked;
+    }
+    let read_id = |segment: &str| -> Option<uuid::Uuid> {
+        let decoded = urlencoding::decode(segment).ok()?;
+        decoded.parse::<uuid::Uuid>().ok()
+    };
+    let Some(id) = read_id(raw) else {
+        return ThirdPartyWrite::Refused(format!(
+            "a third-party session writes plan content only by item id: '{kind}' segment \
+             is not one"
+        ));
+    };
+    let sub = segments.get(2).copied();
+    if kind == "plans" && matches!(sub, Some("run" | "runs" | "triggers")) {
+        return ThirdPartyWrite::Unmarked;
+    }
+    let mut marks = vec![content(id).expect("a plan-content kind")];
+    // `/api/decisions/{new}/supersedes/{old}` changes both decisions.
+    if kind == "decisions" && sub == Some("supersedes") {
+        match segments.get(3).and_then(|s| read_id(s)) {
+            Some(old) => marks.push(PlanContent::Decision(old)),
+            None => {
+                return ThirdPartyWrite::Refused(
+                    "a supersession names both decisions by id".to_string(),
+                )
+            }
+        }
+    }
+    if segments.len() == 2 && *method == axum::http::Method::PATCH && progress_only(kind, body) {
+        return ThirdPartyWrite::Unmarked;
+    }
+    ThirdPartyWrite::Marks(marks)
+}
+
+/// Whether `body` (a JSON object) sets only progress fields of `kind`.
+fn progress_only(kind: &str, body: Option<&[u8]>) -> bool {
+    let Some(fields) = PROGRESS_FIELDS
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map(|(_, f)| *f)
+    else {
+        return false;
+    };
+    let Some(serde_json::Value::Object(map)) =
+        body.and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+    else {
+        return false;
+    };
+    !map.is_empty() && map.keys().all(|k| fields.contains(&k.as_str()))
 }
 
 /// Where a Bearer token is exchanged for a WebSocket ticket.
@@ -742,6 +937,7 @@ mod tests {
         let app = Router::new()
             .route("/api/chat/sessions", get(ok_handler).post(ok_handler))
             .route("/api/plans/{id}/run", post(ok_handler))
+            .route("/api/webhooks/{trigger_id}", post(ok_handler))
             .route("/api/plans/{id}/tasks/{tid}/delegate", post(ok_handler))
             .route("/api/admin/backfill-synapses", post(ok_handler))
             .route("/api/notes", post(ok_handler))
@@ -773,8 +969,10 @@ mod tests {
 
         for (method, uri) in [
             ("POST", "/api/chat/sessions"),
-            ("POST", "/api/plans/p1/run"),
-            ("POST", "/api/plans/p1/tasks/t1/delegate"),
+            ("POST", "/api/plans/00000000-0000-4000-8000-000000000001/run"),
+            // A webhook starts a run like `run` does: the same boundary.
+            ("POST", "/api/webhooks/t1"),
+            ("POST", "/api/plans/00000000-0000-4000-8000-000000000001/tasks/00000000-0000-4000-8000-000000000002/delegate"),
             ("POST", "/api/admin/backfill-synapses"),
         ] {
             assert_eq!(
@@ -937,7 +1135,7 @@ mod tests {
         )
         .unwrap();
         crate::auth::agent_tokens::register(&jti, Some(&sid));
-        let delegate = "/api/plans/p1/tasks/t1/delegate";
+        let delegate = "/api/plans/00000000-0000-4000-8000-000000000001/tasks/00000000-0000-4000-8000-000000000002/delegate";
         assert_eq!(
             status_of(app.clone(), "POST", delegate, &token).await,
             StatusCode::OK

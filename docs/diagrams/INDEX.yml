@@ -1,7 +1,10 @@
 # Index des diagrammes du depot (voir docs/DOCUMENTATION.md). Verifie hors reseau par scripts/diagrams/check-index.mjs.
 # Sous-ensemble YAML strict : entrees "- name:", scalaires "cle: valeur", liste "covers:" de "- glob".
 # Globs prefixes par depot : backend: frontend: nexus: website:
-# status: planned = pas encore de fichier .mmd (contenu a verifier contre le code avant export) ; verified = docs/diagrams/<name>.mmd present et releve.
+# status: planned = pas encore de diagramme (contenu a verifier contre le code avant export) ; verified = diagramme present et releve :
+#   - EXTERNE (regle par defaut) : publie dans le service Mermaid de l'equipe (hote nomme hors depot, depot public), l'entree porte
+#     mermaid_id et/ou external (<workspace>/<session>/<name>@<version>, sans hote), verified_at, verified_sha ; pas de .mmd ici ;
+#   - locale (historique) : docs/diagrams/<name>.mmd present, en-tete %% verified.
 # REGLE DU PROPRIETAIRE UNIQUE : deux `covers` ne doivent jamais matcher le meme fichier.
 #   Un fichier couvert par deux diagrammes n'a pas de proprietaire : personne ne repond de lui.
 #   Le script echoue sur tout recouvrement ; les arbitrages faits sont notes en commentaire ci-dessous.
@@ -243,11 +246,27 @@ diagrams:
       - "backend:src/protocol/**"
   - name: po-runner-orchestrator
     owner: theotime
-    status: planned
+    status: verified
+    mermaid_id: dc22b7048fb964b
+    external: project-orchestrator/architecture-po/po-runner-orchestrator@3
+    verified_at: 2026-10-10
+    verified_sha: 501cb0b9
     # Arbitrage : src/orchestrator/{mod,runner}.rs scanne et synchronise le code
     # (scan_files, init_embedding_provider, should_ignore_path) : po-sync-parser en repond.
     covers:
       - "backend:src/runner/{mod,runner,state,models,guard}.rs"
+  - name: po-plan-triggers
+    owner: theotime
+    status: verified
+    mermaid_id: d34a0124803e64e
+    external: project-orchestrator/architecture-po/po-plan-triggers@1
+    verified_at: 2026-10-10
+    verified_sha: 501cb0b9
+    # Scinde de po-runner-orchestrator (une question par diagramme) : un declencheur qui tire
+    # (schedule, event, webhook) passe par TriggerDispatcher et demarre le run via PlanRunnerFactory.
+    covers:
+      - "backend:src/runner/{dispatch,trigger}.rs"
+      - "backend:src/runner/providers/**"
   - name: po-skills-reasoning
     owner: theotime
     status: planned

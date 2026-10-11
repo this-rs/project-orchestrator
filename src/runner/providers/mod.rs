@@ -24,7 +24,8 @@ use std::fmt::Debug;
 /// Each provider is responsible for:
 /// 1. Loading its triggers from Neo4j on `setup()`
 /// 2. Monitoring its source (cron, webhook, events) for activation signals
-/// 3. Calling `TriggerEngine::evaluate_and_prepare()` when conditions are met
+/// 3. Calling `TriggerDispatcher::dispatch()` when conditions are met (guards,
+///    run start, firing record)
 /// 4. Cleaning up on `teardown()`
 #[async_trait]
 pub trait TriggerProvider: Send + Sync + Debug {

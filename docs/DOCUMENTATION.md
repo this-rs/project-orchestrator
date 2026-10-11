@@ -1,6 +1,6 @@
 # Charte de documentation : les diagrammes du depot font foi
 
-Les diagrammes d'architecture et de conception de Project Orchestrator vivent dans le depot, en Mermaid standard, rendus nativement par GitHub : un fichier `docs/diagrams/<nom>.mmd` par diagramme. Ils sont relus et modifies comme du code, dans la meme PR que le code qu'ils decrivent. Aucun service externe n'est necessaire pour les lire, les verifier ou les mettre a jour.
+Les diagrammes d'architecture et de conception de Project Orchestrator sont en Mermaid standard. **Regle par defaut (2026-10) : un nouveau diagramme vit dans le service Mermaid de l'equipe** (workspace `project-orchestrator`). Ce depot est public : l'hote du service n'y est jamais ecrit (gate `scripts/forbidden/check-forbidden-tokens.mjs`), il est nomme hors depot, dans le skill `mermaid-design`, et le depot ne garde que son **entree d'index** (`INDEX.yml`, section 5) : identifiant, emplacement sans hote, date et sha du releve. Il n'y a pas de `.mmd` dans le depot pour un tel diagramme : une copie locale serait une deuxieme source qui derive. Les `docs/diagrams/<nom>.mmd` deja presents restent valides (format historique) jusqu'a leur migration. Dans les deux cas le diagramme est relu contre le code dans la meme PR que le code qu'il decrit, et la verification du depot reste hors reseau : elle controle l'index, jamais le service.
 
 - Index : `docs/diagrams/INDEX.yml`
 - Fichiers sans proprietaire : `docs/diagrams/ORPHANS.md` (genere)
@@ -54,9 +54,11 @@ On cite `create_router`, `require_auth`, `Config::from_yaml_and_env`, pas `route
 `role: index` sur la carte d'index et `supersedes` sur une entree qui reprend une carte provisoire.
 
 - `status: planned` : le diagramme est prevu, sans fichier. C'est le cas de toutes les cartes d'architecture existantes tant que leur contenu n'a pas ete releve contre le code : on n'exporte pas un contenu non verifie.
-- `status: verified` : `docs/diagrams/<name>.mmd` existe, son en-tete est valide et son contenu a ete relu contre le code au sha `verified`. Le champ `file` n'apparait que dans ce cas.
+- `status: verified` : le diagramme existe et a ete relu contre le code. Deux formes :
+  - **externe (regle par defaut)** : le diagramme est publie dans le service Mermaid ; l'entree porte `mermaid_id` (l'identifiant rendu a la creation) et/ou `external` (emplacement SANS hote : `<workspace>/<session>/<name>@<version>`, le nom devant etre celui de l'entree ; un segment qui est un nom d'hote, `localhost` compris, est refuse), plus `verified_at` (AAAA-MM-JJ) et `verified_sha` (sha du backend contre lequel le contenu a ete relu, qui doit etre un ancetre de HEAD : `git merge-base --is-ancestor`, hors reseau ; un sha de branche non fusionnee ou ecrasee par un squash est refuse, on releve contre un sha dont la branche verifiee descend. Les branches `integ/*` sont promues vers `main` par un commit de fusion, qui garde leurs commits dans l'historique ; une promotion par squash devra relever les sha). Aucun `.mmd` local : le script refuse une entree externe qui en a un. Une cle `mermaid_id:` ou `external:` vide est une erreur, de meme qu'une entree externe `planned`. Les en-tetes `%% name`, `%% covers`, ce que le diagramme PROUVE, les SOURCES LUES et le NON ETABLI (section 2) restent obligatoires, dans le diagramme publie.
+  - **locale (historique)** : `docs/diagrams/<name>.mmd` existe, son en-tete est valide et son contenu a ete relu contre le code au sha `verified`. Le champ `file` n'apparait que dans ce cas.
 
-Passer de `planned` a `verified` se fait dans une PR qui ajoute le `.mmd`, ajoute `file:` et passe le statut.
+Une entree `verified`, externe ou locale, possede ses `covers` (proprietaire unique, cliquet d'orphelins) ; le controle reste hors reseau. Passer de `planned` a `verified` se fait dans une PR qui publie le diagramme (externe) ou ajoute le `.mmd` et `file:` (locale), et passe le statut. Corriger un diagramme externe = une nouvelle version (`/update`), jamais une suppression ; la PR met a jour `verified_at` et `verified_sha`.
 
 ### Un fichier, un proprietaire
 
@@ -203,7 +205,7 @@ La note est liee aux TACHES qu'elle specifie, jamais au plan (lie au plan, le di
 
 ## 8. Cycle de vie
 
-1. **Creer** : ajouter `docs/diagrams/<name>.mmd` (en-tete complete) et passer l'entree de l'index a `verified` avec `file:`.
+1. **Creer** : publier le diagramme dans le service Mermaid (en-tete complete) et passer l'entree de l'index a `verified` avec `mermaid_id`/`external`, `verified_at`, `verified_sha` (forme historique : ajouter `docs/diagrams/<name>.mmd` et `file:`).
 2. **Citer** : creer la note `design-ref` (section 6) et la lier aux taches concernees.
 3. **Mettre a jour** : modifier le `.mmd` DANS LA MEME PR que le code, mettre a jour `verified` (et `covers` si le perimetre change, dans le fichier ET dans l'index).
 4. **Archiver** : quand le code couvert disparait, supprimer le `.mmd` et l'entree de l'index dans la PR qui supprime le code ; invalider la note `design-ref`.

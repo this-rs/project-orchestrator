@@ -13,9 +13,11 @@
 //! ├── verifier.rs  — post-task verification: build, steps, git
 //! ├── enricher.rs  — post-task knowledge capture (V1: git-based)
 //! ├── trigger.rs   — TriggerEngine: evaluation + firing
+//! ├── dispatch.rs  — TriggerDispatcher: a firing trigger starts a plan run
 //! └── providers/   — trigger providers (schedule, webhook, event)
 //! ```
 
+pub mod dispatch;
 pub mod eligibility;
 pub mod enricher;
 pub mod feedback;
@@ -36,6 +38,10 @@ pub mod vector;
 pub mod verifier;
 
 // Re-export key types for convenience
+pub use dispatch::{
+    DispatchOutcome, FireRequest, NoPlanRunner, PlanRunStarter, PlanRunnerFactory, RunOptions,
+    TriggerDispatcher,
+};
 pub use enricher::{EnrichResult, TaskEnricher};
 pub use feedback::{
     contains_dissatisfaction, ManualCommitInfo, OverrideType, PostRunMessage,
@@ -49,9 +55,9 @@ pub use git::{WorktreeCollector, WorktreeInfo, WorktreeResolution};
 pub use guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict, HintSender};
 pub use lifecycle::{route_lifecycle_protocol, LifecycleRouteResult};
 pub use models::{
-    ActiveAgent, ActiveAgentSnapshot, CwdValidation, PlanRunStatus, RunSnapshot, RunnerConfig,
-    RunnerEvent, TaskExecutionReport, TaskResult, TaskRunStatus, TaskStateMachine, Trigger,
-    TriggerFiring, TriggerSource, TriggerType,
+    ActiveAgent, ActiveAgentSnapshot, CwdValidation, PlanContent, PlanRunStatus, RunSnapshot,
+    RunnerConfig, RunnerEvent, SignalReservation, TaskExecutionReport, TaskResult, TaskRunStatus,
+    TaskStateMachine, Trigger, TriggerAuthor, TriggerFiring, TriggerSource, TriggerType,
 };
 pub use persona::{
     activate_skills_for_task, complexity_directive, load_persona_stack, profile_task,

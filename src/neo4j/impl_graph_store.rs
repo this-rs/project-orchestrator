@@ -4105,15 +4105,26 @@ impl GraphStore for Neo4jClient {
         self.list_all_triggers_impl(trigger_type).await
     }
 
-    async fn update_trigger(
+    async fn disable_trigger(
         &self,
         trigger_id: Uuid,
-        enabled: Option<bool>,
-        config: Option<serde_json::Value>,
-        cooldown_secs: Option<u64>,
+        reason: Option<&str>,
     ) -> anyhow::Result<Option<crate::runner::Trigger>> {
-        self.update_trigger_impl(trigger_id, enabled, config, cooldown_secs)
-            .await
+        self.disable_trigger_impl(trigger_id, reason).await
+    }
+
+    async fn mark_third_party_write(
+        &self,
+        content: crate::runner::PlanContent,
+    ) -> anyhow::Result<Option<Uuid>> {
+        self.mark_third_party_write_impl(content).await
+    }
+
+    async fn plan_third_party_written_at(
+        &self,
+        plan_id: Uuid,
+    ) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
+        self.plan_third_party_written_at_impl(plan_id).await
     }
 
     async fn delete_trigger(&self, trigger_id: Uuid) -> anyhow::Result<()> {
@@ -4125,6 +4136,24 @@ impl GraphStore for Neo4jClient {
         firing: &crate::runner::TriggerFiring,
     ) -> anyhow::Result<()> {
         self.record_trigger_firing_impl(firing).await
+    }
+
+    async fn enable_trigger_as(
+        &self,
+        trigger_id: Uuid,
+        author: &crate::runner::TriggerAuthor,
+    ) -> anyhow::Result<Option<crate::runner::Trigger>> {
+        self.enable_trigger_as_impl(trigger_id, author).await
+    }
+
+    async fn reserve_trigger_signal(
+        &self,
+        trigger_id: Uuid,
+        key: &str,
+        cooldown_secs: u64,
+    ) -> anyhow::Result<crate::runner::SignalReservation> {
+        self.reserve_trigger_signal_impl(trigger_id, key, cooldown_secs)
+            .await
     }
 
     async fn list_trigger_firings(

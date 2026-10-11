@@ -3688,20 +3688,59 @@ pub trait GraphStore: Send + Sync {
     /// List all triggers for a given plan.
     async fn list_triggers(&self, plan_id: Uuid) -> Result<Vec<crate::runner::Trigger>>;
 
-    /// Update a trigger (enabled, config, cooldown_secs).
-    async fn update_trigger(
+    /// Disable a trigger, with the reason when the system does it (`None`:
+    /// someone disabled it). The only way back is [`Self::enable_trigger_as`],
+    /// which records who enables it: there is no enable without an author.
+    async fn disable_trigger(
         &self,
         trigger_id: Uuid,
-        enabled: Option<bool>,
-        config: Option<serde_json::Value>,
-        cooldown_secs: Option<u64>,
+        reason: Option<&str>,
     ) -> Result<Option<crate::runner::Trigger>>;
+
+    /// Record that a third-party session wrote `content` (the plan itself, or
+    /// one of its tasks, steps, constraints or decisions): the plan it belongs
+    /// to gets `third_party_written_at = now`. Returns that plan, `None` when
+    /// the content belongs to no plan (or does not exist).
+    async fn mark_third_party_write(
+        &self,
+        content: crate::runner::PlanContent,
+    ) -> Result<Option<Uuid>>;
+
+    /// When a third-party session last wrote the plan or its content (see
+    /// [`Self::mark_third_party_write`]); `None` if never.
+    async fn plan_third_party_written_at(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>>;
 
     /// Delete a trigger by its UUID.
     async fn delete_trigger(&self, trigger_id: Uuid) -> Result<()>;
 
-    /// Record a trigger firing event.
+    /// Record a trigger firing event (`fire_count` + 1). `last_fired` is left
+    /// to [`Self::reserve_trigger_signal`]: a firing refused before the
+    /// reservation consumes no cooldown.
     async fn record_trigger_firing(&self, firing: &crate::runner::TriggerFiring) -> Result<()>;
+
+    /// Enable a trigger and record `author` as the identity its runs start as,
+    /// in one write. `None` when there is no such trigger.
+    async fn enable_trigger_as(
+        &self,
+        trigger_id: Uuid,
+        author: &crate::runner::TriggerAuthor,
+    ) -> Result<Option<crate::runner::Trigger>>;
+
+    /// Reserve the signal `key` of trigger `trigger_id`, atomically, across
+    /// instances: `Reserved` for the one caller that sees `key` for the first
+    /// time (one `TriggerSignal` per key, kept 24 h) AND finds the trigger out
+    /// of its `cooldown_secs` — `last_fired` then moves to now in the same
+    /// write; `Duplicate` when `key` was already reserved (or no such trigger);
+    /// `Cooldown` when the trigger fired less than `cooldown_secs` ago.
+    async fn reserve_trigger_signal(
+        &self,
+        trigger_id: Uuid,
+        key: &str,
+        cooldown_secs: u64,
+    ) -> Result<crate::runner::SignalReservation>;
 
     /// List all triggers across all plans, optionally filtered by type.
     async fn list_all_triggers(

@@ -5,6 +5,10 @@
 //   3. status verified => docs/diagrams/<name>.mmd existe, avec les en-tetes
 //      `%% name`, `%% covers` (identique a l'index) et `%% verified` (sha court) ;
 //      status planned => pas de fichier ; tout .mmd du dossier est dans l'index ;
+//      ou bien le diagramme est EXTERNE (service Mermaid de l'equipe, regle par defaut) : l'entree
+//      porte `mermaid_id` et/ou `external` (emplacement sans hote), plus `verified_at` et `verified_sha`, et aucun .mmd local ;
+//      `verified_sha` doit etre un ancetre de HEAD (`git merge-base --is-ancestor`, hors reseau) ;
+//      une entree externe verified possede ses `covers` comme une entree locale (hors reseau) ;
 //   4. l'index porte la carte d'index `po-carte` (role: index) et toute carte provisoire
 //      reprise est declaree par `supersedes:` sur l'entree qui la remplace ;
 //   5. la regle du proprietaire unique vaut ENTRE les index : un depot voisin peut tenir son
@@ -34,7 +38,7 @@
 //   DIAGRAM_ROOT_FRONTEND (defaut : ../frontend)   DIAGRAM_ROOT_NEXUS (../nexus)   DIAGRAM_ROOT_WEBSITE (../website)
 // Un depot absent est ignore avec un avertissement, sauf avec --strict (exit 1).
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { dirname, join, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -95,6 +99,79 @@ export function checkDiagramFile(entry, text) {
   const got = (h.covers ?? '').split(/\s+/).filter(Boolean).sort().join(' ');
   if (got !== want) errs.push(`${entry.name} : '%% covers' differe de l'index`);
   if (!/^[0-9a-f]{7,40}$/.test(h.verified ?? '')) errs.push(`${entry.name} : '%% verified' doit etre un sha git court`);
+  return errs;
+}
+
+// --- diagramme EXTERNE : il vit dans le service Mermaid prive de l'equipe, le depot ne garde
+// que son entree d'index. Ce depot est PUBLIC : l'hote du service ne doit y figurer nulle part
+// (scripts/forbidden/check-forbidden-tokens.mjs) ; il est nomme hors depot (skill mermaid-design).
+// L'entree porte donc l'identifiant du diagramme (`mermaid_id`) et, au choix, son emplacement
+// SANS hote (`external: <workspace>/<session>/<name>@<version>`). Une entree est externe des
+// qu'elle porte l'une de ces cles, meme vide : une cle vide est une erreur, pas une entree locale.
+// Le controle reste HORS RESEAU : on verifie la forme de l'entree, jamais le service.
+// `verified_sha` est le sha du backend contre lequel le diagramme a ete relu : c'est ce qui
+// remplace l'en-tete `%% verified` d'un .mmd local.
+// Un segment d'emplacement qui est un nom d'hote : la forme <workspace>/<session>/... admet
+// `localhost/doc/po-x@2` (le workspace n'a pas de point), et une session peut porter des
+// points. On refuse donc les noms d'hote locaux SANS point (localhost et ses alias), une
+// adresse IPv4, et un segment qui finit comme un domaine (`.xx` et plus, lettres seules).
+// Ce que ce controle ne peut pas voir : un nom d'hote d'intranet sans point qui ne serait pas
+// dans cette liste ressemble a un workspace ; le gate des jetons interdits reste la defense.
+const LOCAL_HOSTNAMES = new Set(['localhost', 'ip6-localhost', 'ip6-loopback', 'broadcasthost']);
+export function looksLikeHost(segment) {
+  const s = segment.toLowerCase();
+  return LOCAL_HOSTNAMES.has(s) || /^\d{1,3}(\.\d{1,3}){3}$/.test(s) || /\.[a-z]{2,}$/.test(s);
+}
+
+// `verified_sha` doit etre un ANCETRE de HEAD : le code releve est celui dont descend la branche
+// verifiee. Exister ne suffit pas : un commit d'une branche non fusionnee, ou d'une branche
+// ecrasee par un squash mais encore presente localement, existe sans que HEAD en contienne le
+// code. Verifie HORS RESEAU (`git rev-parse --verify` puis `git merge-base --is-ancestor`) :
+//   'ancestor' : le commit est dans l'historique de HEAD ;
+//   'not-ancestor' : il existe mais HEAD n'en descend pas ;
+//   'absent' : il n'existe pas ; 'ambiguous' : le sha abrege designe plusieurs objets ;
+//   'unknown' : pas un depot git, ou un clone superficiel (l'historique est incomplet).
+export function commitStatus(root, sha) {
+  // Messages de git en anglais quelle que soit la locale : l'ambiguite se lit dans stderr.
+  const git = (args) => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C', LANGUAGE: 'C' } });
+  const inside = git(['rev-parse', '--is-inside-work-tree']);
+  if (inside.status !== 0 || inside.stdout.trim() !== 'true') return 'unknown';
+  const shallow = git(['rev-parse', '--is-shallow-repository']).stdout.trim() === 'true';
+  const resolved = git(['rev-parse', '--verify', '--end-of-options', `${sha}^{commit}`]);
+  if (resolved.status !== 0) {
+    if (/ambiguous/i.test(resolved.stderr)) return 'ambiguous';
+    return shallow ? 'unknown' : 'absent';
+  }
+  const ancestor = git(['merge-base', '--is-ancestor', resolved.stdout.trim(), 'HEAD']);
+  if (ancestor.status === 0) return 'ancestor';
+  if (ancestor.status === 1) return shallow ? 'unknown' : 'not-ancestor';
+  return 'unknown';
+}
+
+export function isExternal(entry) {
+  return Object.hasOwn(entry, 'mermaid_id') || Object.hasOwn(entry, 'external');
+}
+
+export function checkExternalEntry(entry) {
+  const errs = [];
+  const id = entry.mermaid_id ?? '';
+  const loc = entry.external ?? '';
+  if (Object.hasOwn(entry, 'mermaid_id') && !/^[A-Za-z0-9_-]+$/.test(id)) {
+    errs.push(`${entry.name} : 'mermaid_id' vide ou invalide : un diagramme externe doit nommer son identifiant dans le service`);
+  }
+  if (Object.hasOwn(entry, 'external')) {
+    const m = /^([a-z0-9-]+)\/([A-Za-z0-9._-]+)\/([a-z0-9-]+)@(\d+)$/.exec(loc);
+    if (!m) errs.push(`${entry.name} : 'external' doit etre <workspace>/<session>/<name>@<version>, sans hote (trouve : ${loc || 'vide'})`);
+    else if (looksLikeHost(m[1]) || looksLikeHost(m[2])) errs.push(`${entry.name} : 'external' commence par un nom d'hote (${looksLikeHost(m[1]) ? m[1] : m[2]}) ; l'emplacement s'ecrit sans hote`);
+    else if (m[3] !== entry.name) errs.push(`${entry.name} : 'external' designe le diagramme ${m[3]}, pas ${entry.name}`);
+  }
+  if (!id && !loc) errs.push(`${entry.name} : diagramme externe sans identifiant ('mermaid_id' ou 'external')`);
+  if (entry.status === 'verified') {
+    if (!/^[0-9a-f]{7,40}$/.test(entry.verified_sha ?? '')) errs.push(`${entry.name} : 'verified_sha' doit etre le sha git (court) du code contre lequel le diagramme a ete relu`);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(entry.verified_at ?? '')) errs.push(`${entry.name} : 'verified_at' doit etre une date AAAA-MM-JJ`);
+  } else {
+    errs.push(`${entry.name} : diagramme externe publie, status devrait etre verified (une entree planned n'a pas de diagramme)`);
+  }
   return errs;
 }
 
@@ -318,7 +395,18 @@ function main() {
     if (!/^(po-[a-z0-9-]+|[a-z0-9]+(-[a-z0-9]+)+)$/.test(e.name)) problems.push(`${e.name} : nom hors nomenclature`);
     if (e.supersedes) for (const old of e.supersedes.split(/[,\s]+/).filter(Boolean)) superseded.push({ old, by: e.name });
     const file = join(backendRoot, 'docs/diagrams', `${e.name}.mmd`);
-    if (e.status === 'verified') {
+    if (isExternal(e)) {
+      // Le diagramme vit dans le service Mermaid : une copie locale serait une deuxieme source.
+      problems.push(...checkExternalEntry(e));
+      if (e.status === 'verified' && /^[0-9a-f]{7,40}$/.test(e.verified_sha ?? '')) {
+        const status = commitStatus(backendRoot, e.verified_sha);
+        if (status === 'absent') problems.push(`${e.name} : 'verified_sha: ${e.verified_sha}' ne designe aucun commit de ce depot (squash ? relever contre le sha fusionne)`);
+        else if (status === 'not-ancestor') problems.push(`${e.name} : 'verified_sha: ${e.verified_sha}' est hors de l'historique de HEAD (branche non fusionnee, ou ecrasee par un squash) ; relever contre un sha dont HEAD descend`);
+        else if (status === 'ambiguous') problems.push(`${e.name} : 'verified_sha: ${e.verified_sha}' est ambigu (plusieurs objets) ; l'allonger`);
+        else if (status === 'unknown') console.warn(`AVERTISSEMENT ${e.name} : 'verified_sha: ${e.verified_sha}' non verifiable ici (pas un depot git, ou clone superficiel)`);
+      }
+      if (existsSync(file)) problems.push(`${e.name} : diagramme externe ET docs/diagrams/${e.name}.mmd present ; une seule source`);
+    } else if (e.status === 'verified') {
       if (!existsSync(file)) problems.push(`${e.name} : status verified mais docs/diagrams/${e.name}.mmd est absent`);
       else problems.push(...checkDiagramFile(e, readFileSync(file, 'utf8')));
     } else if (existsSync(file)) problems.push(`${e.name} : fichier present, status devrait etre verified`);

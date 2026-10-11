@@ -61,6 +61,8 @@ const EXPECTED_CONSTRAINTS: &[&str] = &[
     "alert_dedup_key",
     "routing_arm_key",
     "routing_decision_id",
+    // Plan triggers
+    "trigger_signal_key",
 ];
 
 /// Client for Neo4j operations
@@ -617,6 +619,9 @@ impl Neo4jClient {
             "CREATE INDEX routing_decision_task IF NOT EXISTS FOR (d:RoutingDecision) ON (d.task_id)",
             "CREATE INDEX routing_decision_run IF NOT EXISTS FOR (d:RoutingDecision) ON (d.run_id)",
             "CREATE INDEX routing_decision_at IF NOT EXISTS FOR (d:RoutingDecision) ON (d.at)",
+            // Plan triggers: one reserved signal per (trigger, key), kept 24 h.
+            "CREATE CONSTRAINT trigger_signal_key IF NOT EXISTS FOR (s:TriggerSignal) REQUIRE (s.trigger_id, s.key) IS UNIQUE",
+            "CREATE INDEX trigger_signal_reserved_at IF NOT EXISTS FOR (s:TriggerSignal) ON (s.reserved_at)",
         ];
 
         // Vector indexes (require Neo4j 5.13+ — gracefully skip if not supported)
@@ -681,6 +686,14 @@ impl Neo4jClient {
 
         // Data migrations — idempotent, run on every startup
         let migrations = vec![
+            // A schedule or event trigger starts its run as its author (the
+            // caller that created or enabled it). One written before authors
+            // were recorded has none: it is disabled, and starts again only
+            // once someone enables it (which records them as its author).
+            r#"MATCH (t:Trigger)
+               WHERE t.trigger_type IN ['schedule', 'event']
+                 AND coalesce(t.author, '') = '' AND t.enabled = true
+               SET t.enabled = false, t.disabled_reason = 'no_author'"#,
             // T3.2: Set default status on existing Decision nodes without one
             r#"MATCH (d:Decision) WHERE d.status IS NULL SET d.status = 'accepted'"#,
             // Rename ATTACHED_TO → LINKED_TO (note.rs used ATTACHED_TO for writes,

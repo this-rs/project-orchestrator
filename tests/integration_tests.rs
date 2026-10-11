@@ -1000,6 +1000,9 @@ async fn test_trigger_type_filter_is_bound_not_spliced() {
         last_fired: None,
         fire_count: 0,
         created_at: chrono::Utc::now(),
+        author: None,
+        disabled_reason: None,
+        approved_mark: None,
     };
     let schedule = Trigger {
         id: Uuid::new_v4(),
@@ -1110,6 +1113,9 @@ async fn test_trigger_firing_binds_plan_run_id() {
         last_fired: None,
         fire_count: 0,
         created_at: chrono::Utc::now(),
+        author: None,
+        disabled_reason: None,
+        approved_mark: None,
     };
     client.create_trigger_impl(&trigger).await.unwrap();
 
@@ -1121,6 +1127,7 @@ async fn test_trigger_firing_binds_plan_run_id() {
         plan_run_id: Some(run_id),
         fired_at: chrono::Utc::now(),
         source_payload: Some(serde_json::json!({"body": EVIL})),
+        start_error: None,
     };
     client.record_trigger_firing_impl(&linked).await.unwrap();
 
@@ -1150,25 +1157,34 @@ async fn test_trigger_firing_binds_plan_run_id() {
         plan_run_id: None,
         fired_at: chrono::Utc::now(),
         source_payload: None,
+        start_error: Some("Plan has no tasks to execute".to_string()),
     };
     client.record_trigger_firing_impl(&unlinked).await.unwrap();
-    let (exists, edges): (i64, i64) = {
+    let (exists, edges, start_error): (i64, i64, String) = {
         let mut r = raw
             .execute(
                 neo4rs::query(
                     "MATCH (f:TriggerFiring {id: $fid}) \
                      OPTIONAL MATCH (f)-[s:STARTED]->() \
-                     RETURN count(DISTINCT f) AS f, count(s) AS s",
+                     RETURN count(DISTINCT f) AS f, count(s) AS s, f.start_error AS e",
                 )
                 .param("fid", unlinked.id.to_string()),
             )
             .await
             .unwrap();
         let row = r.next().await.unwrap().unwrap();
-        (row.get("f").unwrap(), row.get("s").unwrap())
+        (
+            row.get("f").unwrap(),
+            row.get("s").unwrap(),
+            row.get("e").unwrap(),
+        )
     };
     assert_eq!(exists, 1, "the firing must be recorded without a run");
     assert_eq!(edges, 0, "no STARTED edge without a plan_run_id");
+    assert_eq!(
+        start_error, "Plan has no tasks to execute",
+        "why no run started is stored on the firing"
+    );
 
     raw.run(
         neo4rs::query(
@@ -1183,6 +1199,491 @@ async fn test_trigger_firing_binds_plan_run_id() {
     raw.run(
         neo4rs::query("MATCH (r:PlanRun {run_id: $rid}) DETACH DELETE r")
             .param("rid", run_id.to_string()),
+    )
+    .await
+    .unwrap();
+}
+
+/// A Neo4j client and a raw graph on the test database, or `None` (skip).
+async fn trigger_test_graph() -> Option<(
+    std::sync::Arc<project_orchestrator::neo4j::client::Neo4jClient>,
+    neo4rs::Graph,
+)> {
+    use project_orchestrator::neo4j::client::Neo4jClient;
+    let config = test_config();
+    let client = match Neo4jClient::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(e) => {
+            eprintln!("Skipping test: Neo4j not available: {e}");
+            return None;
+        }
+    };
+    let raw = neo4rs::Graph::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    .unwrap();
+    Some((client, raw))
+}
+
+/// A Plan node and a trigger of `trigger_type` on it, `cooldown_secs` apart.
+async fn trigger_on_new_plan(
+    client: &project_orchestrator::neo4j::client::Neo4jClient,
+    raw: &neo4rs::Graph,
+    trigger_type: project_orchestrator::runner::TriggerType,
+    cooldown_secs: u64,
+) -> project_orchestrator::runner::Trigger {
+    let plan_id = Uuid::new_v4();
+    raw.run(
+        neo4rs::query("CREATE (:Plan {id: $pid, name: 'reservation-test'})")
+            .param("pid", plan_id.to_string()),
+    )
+    .await
+    .unwrap();
+    let trigger = project_orchestrator::runner::Trigger {
+        id: Uuid::new_v4(),
+        plan_id,
+        trigger_type,
+        config: serde_json::json!({"cron": "* * * * *"}),
+        enabled: true,
+        cooldown_secs,
+        last_fired: None,
+        fire_count: 0,
+        created_at: chrono::Utc::now(),
+        author: None,
+        disabled_reason: None,
+        approved_mark: None,
+    };
+    client.create_trigger_impl(&trigger).await.unwrap();
+    trigger
+}
+
+async fn drop_trigger_and_plan(
+    client: &project_orchestrator::neo4j::client::Neo4jClient,
+    raw: &neo4rs::Graph,
+    trigger: &project_orchestrator::runner::Trigger,
+) {
+    client.delete_trigger_impl(trigger.id).await.unwrap();
+    raw.run(
+        neo4rs::query("MATCH (p:Plan {id: $pid}) DETACH DELETE p")
+            .param("pid", trigger.plan_id.to_string()),
+    )
+    .await
+    .unwrap();
+}
+
+/// The reservation of a trigger signal is a compare-and-set: of many
+/// concurrent reservations of the same key, exactly one wins; a new key wins
+/// again; an unknown trigger never does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_trigger_signal_reservation_is_atomic() {
+    use project_orchestrator::runner::{SignalReservation, TriggerType};
+    let Some((client, raw)) = trigger_test_graph().await else {
+        return;
+    };
+    let trigger = trigger_on_new_plan(&client, &raw, TriggerType::Schedule, 0).await;
+
+    let handles: Vec<_> = (0..16)
+        .map(|_| {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .reserve_trigger_signal_impl(trigger.id, "schedule:minute-1", 0)
+                    .await
+                    .unwrap()
+            })
+        })
+        .collect();
+    let mut won = 0;
+    for handle in handles {
+        if handle.await.unwrap() == SignalReservation::Reserved {
+            won += 1;
+        }
+    }
+    assert_eq!(won, 1, "one reservation of one signal");
+    assert_eq!(
+        client
+            .reserve_trigger_signal_impl(trigger.id, "schedule:minute-2", 0)
+            .await
+            .unwrap(),
+        SignalReservation::Reserved
+    );
+    assert_eq!(
+        client
+            .reserve_trigger_signal_impl(Uuid::new_v4(), "schedule:minute-1", 0)
+            .await
+            .unwrap(),
+        SignalReservation::Duplicate
+    );
+    drop_trigger_and_plan(&client, &raw, &trigger).await;
+}
+
+/// (B) One TriggerSignal per key, not only the last one: A, B, then A again
+/// (a redelivery behind another signal) is a duplicate. Deleting the trigger
+/// deletes its signals.
+#[tokio::test]
+async fn test_trigger_signal_keeps_every_key_not_only_the_last() {
+    use project_orchestrator::runner::{SignalReservation, TriggerType};
+    let Some((client, raw)) = trigger_test_graph().await else {
+        return;
+    };
+    let trigger = trigger_on_new_plan(&client, &raw, TriggerType::Webhook, 0).await;
+
+    let mut outcomes = Vec::new();
+    for key in ["webhook:A", "webhook:B", "webhook:A"] {
+        outcomes.push(
+            client
+                .reserve_trigger_signal_impl(trigger.id, key, 0)
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        outcomes,
+        vec![
+            SignalReservation::Reserved,
+            SignalReservation::Reserved,
+            SignalReservation::Duplicate
+        ]
+    );
+
+    // Unique per (trigger, key): a second node with the same key is refused.
+    let duplicate_node = raw
+        .run(
+            neo4rs::query("CREATE (:TriggerSignal {trigger_id: $tid, key: 'webhook:A'})")
+                .param("tid", trigger.id.to_string()),
+        )
+        .await;
+    assert!(duplicate_node.is_err(), "the uniqueness constraint holds");
+
+    // A signal older than 24 h no longer counts: its key reserves again.
+    let age = |key: &'static str| {
+        let raw = raw.clone();
+        async move {
+            raw.run(
+                neo4rs::query(
+                    "MATCH (s:TriggerSignal {trigger_id: $tid, key: $key})
+                     SET s.reserved_at = datetime() - duration({hours: 25})",
+                )
+                .param("tid", trigger.id.to_string())
+                .param("key", key),
+            )
+            .await
+            .unwrap();
+        }
+    };
+    age("webhook:A").await;
+    assert_eq!(
+        client
+            .reserve_trigger_signal_impl(trigger.id, "webhook:A", 0)
+            .await
+            .unwrap(),
+        SignalReservation::Reserved
+    );
+    // And it is purged by the next reservation.
+    age("webhook:B").await;
+    assert_eq!(
+        client
+            .reserve_trigger_signal_impl(trigger.id, "webhook:C", 0)
+            .await
+            .unwrap(),
+        SignalReservation::Reserved
+    );
+    let mut aged = raw
+        .execute(
+            neo4rs::query(
+                "MATCH (s:TriggerSignal {trigger_id: $tid, key: 'webhook:B'}) RETURN count(s) AS n",
+            )
+            .param("tid", trigger.id.to_string()),
+        )
+        .await
+        .unwrap();
+    let n: i64 = aged.next().await.unwrap().unwrap().get("n").unwrap();
+    assert_eq!(n, 0, "a signal older than 24 h is purged");
+
+    drop_trigger_and_plan(&client, &raw, &trigger).await;
+    let mut left = raw
+        .execute(
+            neo4rs::query("MATCH (s:TriggerSignal {trigger_id: $tid}) RETURN count(s) AS n")
+                .param("tid", trigger.id.to_string()),
+        )
+        .await
+        .unwrap();
+    let n: i64 = left.next().await.unwrap().unwrap().get("n").unwrap();
+    assert_eq!(n, 0, "the trigger's signals go with it");
+}
+
+/// (C) Different signals racing (two instances, two events) on a trigger
+/// with a cooldown: the cooldown is read and `last_fired` written in the
+/// reservation itself, so exactly one wins; once the cooldown is over, a new
+/// signal wins again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_trigger_signal_cooldown_is_decided_in_the_reservation() {
+    use project_orchestrator::runner::{SignalReservation, TriggerType};
+    let Some((client, raw)) = trigger_test_graph().await else {
+        return;
+    };
+    let trigger = trigger_on_new_plan(&client, &raw, TriggerType::Event, 60).await;
+
+    let handles: Vec<_> = (0..16)
+        .map(|i| {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .reserve_trigger_signal_impl(trigger.id, &format!("event:{i}"), 60)
+                    .await
+                    .unwrap()
+            })
+        })
+        .collect();
+    let mut outcomes = Vec::new();
+    for handle in handles {
+        outcomes.push(handle.await.unwrap());
+    }
+    let won = outcomes
+        .iter()
+        .filter(|o| **o == SignalReservation::Reserved)
+        .count();
+    assert_eq!(won, 1, "one run within the cooldown: {outcomes:?}");
+    assert!(outcomes
+        .iter()
+        .all(|o| matches!(o, SignalReservation::Reserved | SignalReservation::Cooldown)));
+    let fired = client.get_trigger_impl(trigger.id).await.unwrap().unwrap();
+    assert!(
+        fired.last_fired.is_some(),
+        "last_fired written with the reservation"
+    );
+
+    // The cooldown is over: a new signal goes through.
+    raw.run(
+        neo4rs::query(
+            "MATCH (t:Trigger {id: $tid}) SET t.last_fired = datetime() - duration({seconds: 61})",
+        )
+        .param("tid", trigger.id.to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        client
+            .reserve_trigger_signal_impl(trigger.id, "event:late", 60)
+            .await
+            .unwrap(),
+        SignalReservation::Reserved
+    );
+    drop_trigger_and_plan(&client, &raw, &trigger).await;
+}
+
+/// (A) A schedule or event trigger written before authors were recorded is
+/// disabled at startup (it would otherwise run as nobody); one with an author,
+/// and a webhook (its runs start as their caller), stay enabled. Enabling it
+/// again records the author.
+#[tokio::test]
+async fn test_trigger_without_author_is_disabled_at_startup() {
+    use project_orchestrator::runner::{TriggerAuthor, TriggerType};
+    let Some((client, raw)) = trigger_test_graph().await else {
+        return;
+    };
+    let legacy = trigger_on_new_plan(&client, &raw, TriggerType::Schedule, 0).await;
+    let webhook = trigger_on_new_plan(&client, &raw, TriggerType::Webhook, 0).await;
+    let mut authored = trigger_on_new_plan(&client, &raw, TriggerType::Event, 0).await;
+    let author = TriggerAuthor::from_claims(
+        &project_orchestrator::auth::jwt::Claims::service_account("integration-author"),
+    );
+    authored = client
+        .enable_trigger_as_impl(authored.id, &author)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(authored.author.as_ref(), Some(&author));
+
+    // A restart: the schema and data migrations run again.
+    let (client, raw) = trigger_test_graph().await.unwrap();
+    let enabled = |id| {
+        let client = client.clone();
+        async move { client.get_trigger_impl(id).await.unwrap().unwrap().enabled }
+    };
+    assert!(
+        !enabled(legacy.id).await,
+        "an authorless schedule trigger is disabled"
+    );
+    assert!(enabled(webhook.id).await);
+    assert!(enabled(authored.id).await);
+    // The reason is read back, for whoever lists the trigger.
+    let disabled = client.get_trigger_impl(legacy.id).await.unwrap().unwrap();
+    assert_eq!(disabled.disabled_reason.as_deref(), Some("no_author"));
+
+    let reenabled = client
+        .enable_trigger_as_impl(legacy.id, &author)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reenabled.enabled);
+    assert_eq!(reenabled.author.as_ref(), Some(&author));
+    assert_eq!(reenabled.disabled_reason, None);
+
+    // Disabled by the system with a reason, or by someone without one.
+    let revoked = client
+        .disable_trigger_impl(authored.id, Some("author_revoked"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!revoked.enabled);
+    assert_eq!(revoked.disabled_reason.as_deref(), Some("author_revoked"));
+    let by_someone = client
+        .disable_trigger_impl(webhook.id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(by_someone.disabled_reason, None);
+
+    for t in [&legacy, &webhook, &authored] {
+        drop_trigger_and_plan(&client, &raw, t).await;
+    }
+}
+
+/// (Round 3, nit) The approval records the plan's mark in the approving write
+/// itself (create, enable), from the database: what the dispatcher compares
+/// is two values the database wrote, never two clocks.
+#[tokio::test]
+async fn test_trigger_approval_records_the_plans_mark() {
+    use project_orchestrator::runner::{PlanContent, TriggerAuthor, TriggerType};
+    let Some((client, raw)) = trigger_test_graph().await else {
+        return;
+    };
+    // No mark yet: the approval records none.
+    let trigger = trigger_on_new_plan(&client, &raw, TriggerType::Schedule, 0).await;
+    let stored = client.get_trigger_impl(trigger.id).await.unwrap().unwrap();
+    assert_eq!(stored.approved_mark, None);
+
+    // A third party writes the plan: the trigger's approval no longer matches.
+    client
+        .mark_third_party_write_impl(PlanContent::Plan(trigger.plan_id))
+        .await
+        .unwrap();
+    let mark = client
+        .plan_third_party_written_at_impl(trigger.plan_id)
+        .await
+        .unwrap()
+        .expect("marked");
+    assert_ne!(
+        client
+            .get_trigger_impl(trigger.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .approved_mark,
+        Some(mark)
+    );
+
+    // Enabling approves the plan as it is: the mark is recorded, exactly.
+    let author = TriggerAuthor::from_claims(
+        &project_orchestrator::auth::jwt::Claims::service_account("integration-author"),
+    );
+    let enabled = client
+        .enable_trigger_as_impl(trigger.id, &author)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(enabled.approved_mark, Some(mark));
+
+    // A trigger created on the marked plan records it at creation.
+    let mut second = trigger.clone();
+    second.id = Uuid::new_v4();
+    let created = client.create_trigger_impl(&second).await.unwrap();
+    assert_eq!(created.approved_mark, Some(mark));
+
+    client.delete_trigger_impl(second.id).await.unwrap();
+    drop_trigger_and_plan(&client, &raw, &trigger).await;
+}
+
+/// (Round 2, finding 1) A write by a third-party session on a plan, a task,
+/// a step, a constraint or a decision marks the plan they belong to, on the
+/// real relationships; content of no plan marks nothing.
+#[tokio::test]
+async fn test_trigger_third_party_write_marks_the_plan() {
+    use project_orchestrator::runner::PlanContent;
+    let Some((client, raw)) = trigger_test_graph().await else {
+        return;
+    };
+    let (plan, task, step, constraint, decision, orphan) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    raw.run(
+        neo4rs::query(
+            "CREATE (p:Plan {id: $plan, title: 'mark-test'})
+             CREATE (p)-[:HAS_TASK]->(t:Task {id: $task})
+             CREATE (t)-[:HAS_STEP]->(:Step {id: $step})
+             CREATE (t)-[:INFORMED_BY]->(:Decision {id: $decision})
+             CREATE (p)-[:CONSTRAINED_BY]->(:Constraint {id: $constraint})
+             CREATE (:Task {id: $orphan})",
+        )
+        .param("plan", plan.to_string())
+        .param("task", task.to_string())
+        .param("step", step.to_string())
+        .param("decision", decision.to_string())
+        .param("constraint", constraint.to_string())
+        .param("orphan", orphan.to_string()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        client.plan_third_party_written_at_impl(plan).await.unwrap(),
+        None
+    );
+    let mut last = None;
+    for content in [
+        PlanContent::Plan(plan),
+        PlanContent::Task(task),
+        PlanContent::Step(step),
+        PlanContent::Constraint(constraint),
+        PlanContent::Decision(decision),
+    ] {
+        assert_eq!(
+            client.mark_third_party_write_impl(content).await.unwrap(),
+            Some(plan),
+            "{content:?}"
+        );
+        let at = client
+            .plan_third_party_written_at_impl(plan)
+            .await
+            .unwrap()
+            .expect("marked");
+        assert!(last.is_none_or(|l| at >= l), "{content:?}");
+        last = Some(at);
+    }
+    assert_eq!(
+        client
+            .mark_third_party_write_impl(PlanContent::Task(orphan))
+            .await
+            .unwrap(),
+        None
+    );
+
+    raw.run(
+        neo4rs::query(
+            "MATCH (n) WHERE n.id IN [$plan, $task, $step, $decision, $constraint, $orphan]
+             DETACH DELETE n",
+        )
+        .param("plan", plan.to_string())
+        .param("task", task.to_string())
+        .param("step", step.to_string())
+        .param("decision", decision.to_string())
+        .param("constraint", constraint.to_string())
+        .param("orphan", orphan.to_string()),
     )
     .await
     .unwrap();
