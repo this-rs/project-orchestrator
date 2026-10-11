@@ -593,3 +593,149 @@ async fn a_native_compaction_records_its_decision_in_shadow_and_runs_on_the_sess
     assert_eq!(decision.used, Some(Pick::new("primary", "pm")));
     assert_eq!(decision.session_id.map(|id| id.to_string()), Some(p));
 }
+
+/// Sends one message and returns every event of its turn, up to its result.
+async fn turn_events(w: &World, session_id: &str, text: &str) -> Vec<ChatEvent> {
+    let mut rx = w.manager.subscribe(session_id).await.unwrap();
+    w.manager.send_message(session_id, text).await.unwrap();
+    let mut events = Vec::new();
+    loop {
+        let event = wait_for(&mut rx, |_| true).await;
+        let done = is_result(&event);
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+    idle(w, session_id).await;
+    events
+}
+
+/// The decisions stored for one session.
+async fn decisions_of(w: &World, session_id: &str) -> Vec<CognitiveDecision> {
+    decisions(w)
+        .await
+        .into_iter()
+        .filter(|d| d.session_id.map(|id| id.to_string()).as_deref() == Some(session_id))
+        .collect()
+}
+
+/// R-S1 (1) and (4): the settings say `primary` + `shadow` (the defaults), the user puts
+/// THIS conversation in Auto (`routing_mode: full`): its model changes between a simple
+/// and a debug turn, the change is told to the clients, and the stored decisions say what
+/// happened (`stage: auto`, the change `applied`, with its reason).
+#[tokio::test]
+async fn a_conversation_in_auto_routes_its_turns_whatever_the_global_shadow_stage() {
+    use super::provider::cognitive::{LearningStage, ProviderRoutingMode};
+    let w = world("primary", "shadow").await;
+    probe_wb(&w).await;
+    let mut auto = pilot();
+    auto.routing_mode = Some(ProviderRoutingMode::Full);
+    let p = open(&w, &auto).await;
+    turn(&w, &p, SIMPLE).await;
+    let events = turn_events(&w, &p, DEBUG).await;
+    assert_eq!(model_of_turn(&w.worker, SIMPLE, &[DEBUG]), ["wa"]);
+    assert_eq!(model_of_turn(&w.worker, DEBUG, &[]), ["wb"]);
+    assert!(turns(&w.primary).is_empty(), "the conversation left pm");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ChatEvent::ModelChanged { model } if model == "wb")),
+        "{events:#?}"
+    );
+    let mine = decisions_of(&w, &p).await;
+    assert!(!mine.is_empty());
+    assert!(
+        mine.iter().all(|d| d.stage == LearningStage::Auto),
+        "{mine:#?}"
+    );
+    let change = mine
+        .iter()
+        .find(|d| d.chosen.as_ref().is_some_and(|c| c.model == "wb"))
+        .expect("the debug turn is decided");
+    assert!(change.applied, "{change:#?}");
+    assert!(!change.reason.is_empty());
+}
+
+/// R-S1 (2) and (4): same settings, two models ticked on the conversation: the debug turn
+/// runs on `wb`, decided among the pool at `stage: auto`.
+#[tokio::test]
+async fn a_pool_ticked_on_the_conversation_routes_its_turns_whatever_the_global_shadow_stage() {
+    use super::provider::cognitive::{LearningStage, ProviderRoutingMode};
+    use super::types::RoutingPoolEntry;
+    let w = world("primary", "shadow").await;
+    probe_wb(&w).await;
+    let mut ticked = pilot();
+    ticked.routing_mode = Some(ProviderRoutingMode::Mixed);
+    ticked.routing_pool = Some(
+        ["wa", "wb"]
+            .iter()
+            .map(|m| RoutingPoolEntry {
+                provider: "worker".into(),
+                model: (*m).into(),
+            })
+            .collect(),
+    );
+    let p = open(&w, &ticked).await;
+    assert_eq!(node(&w, &p).await.model, "wa");
+    let events = turn_events(&w, &p, DEBUG).await;
+    assert_eq!(model_of_turn(&w.worker, DEBUG, &[]), ["wb"]);
+    assert!(turns(&w.primary).is_empty());
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, ChatEvent::ModelChanged { model } if model == "wb")));
+    let change = decisions_of(&w, &p)
+        .await
+        .into_iter()
+        .find(|d| d.turn_index.is_some() && d.chosen.as_ref().is_some_and(|c| c.model == "wb"))
+        .expect("the debug turn is decided");
+    assert_eq!(change.stage, LearningStage::Auto);
+    assert!(change.applied, "{change:#?}");
+}
+
+/// R-S1 (3) and (4): `primary` + `shadow` and NO choice on the conversation: strict
+/// identity, every turn on `pm`, nothing sent elsewhere, every decision `shadow`, none
+/// applied. The global stage still governs the sessions driven by the settings.
+#[tokio::test]
+async fn without_a_conversation_choice_the_global_shadow_stage_still_governs() {
+    use super::provider::cognitive::LearningStage;
+    let w = world("primary", "shadow").await;
+    let p = open(&w, &pilot()).await;
+    turn(&w, &p, SIMPLE).await;
+    turn(&w, &p, DEBUG).await;
+    assert_eq!(node(&w, &p).await.provider_id.as_deref(), Some("primary"));
+    assert!(turns(&w.worker).is_empty(), "no request elsewhere");
+    assert_eq!(turns(&w.primary).len(), 3);
+    assert!(turns(&w.primary).iter().all(|(model, _)| model == "pm"));
+    let all = decisions(&w).await;
+    assert!(!all.is_empty());
+    assert!(
+        all.iter()
+            .all(|d| !d.applied && d.stage == LearningStage::Shadow),
+        "{all:#?}"
+    );
+}
+
+/// R-S1 (5): a model the request pins is never substituted, even when the same request
+/// puts the conversation in Auto over a `shadow` setting.
+#[tokio::test]
+async fn a_pinned_model_is_never_substituted_even_in_a_conversation_in_auto() {
+    use super::provider::cognitive::ProviderRoutingMode;
+    let w = world("primary", "shadow").await;
+    probe_wb(&w).await;
+    let mut pinned = pilot();
+    pinned.provider = Some("worker".into());
+    pinned.model = Some("wa".into());
+    pinned.routing_mode = Some(ProviderRoutingMode::Full);
+    let p = open(&w, &pinned).await;
+    let events = turn_events(&w, &p, DEBUG).await;
+    assert_eq!(model_of_turn(&w.worker, DEBUG, &[]), ["wa"], "not wb");
+    assert!(turns(&w.primary).is_empty());
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, ChatEvent::ModelChanged { .. })));
+    assert!(decisions_of(&w, &p).await.iter().all(|d| !d.applied
+        || d.chosen
+            .as_ref()
+            .is_none_or(|c| (c.provider_id.as_str(), c.model.as_str()) == ("worker", "wa"))));
+}

@@ -2035,6 +2035,12 @@ impl ChatManager {
                 provider_imposed: turn.provider_imposed && !turn.moved_in,
                 allowed_models,
                 routing_pool: turn.routing_pool.clone(),
+                // Auto, or two models ticked or more: the user's choice for THIS
+                // conversation, decided at the `auto` stage (decision R-S1).
+                conversation_routes: super::provider::cognitive::conversation_routes(
+                    turn.routing_mode,
+                    turn.routing_pool.as_ref().map_or(0, Vec::len),
+                ),
                 current_model: model.to_owned(),
                 next_turn: turn.next_turn,
                 moved_in: turn.moved_in,
@@ -11128,6 +11134,15 @@ impl ChatManager {
             || request.run_provider.is_some();
         // The conversation's own mode replaces the settings' (the chat menu: Auto = full).
         let mut settings = settings;
+        // Auto, or two models ticked or more: the user's choice for THIS conversation is
+        // decided at the `auto` stage, whatever the settings' stage (decision R-S1).
+        settings.stage = super::provider::cognitive::conversation_stage(
+            settings.stage,
+            super::provider::cognitive::conversation_routes(
+                request.routing_mode,
+                Self::routing_pool_of(request).map_or(0, <[_]>::len),
+            ),
+        );
         if let Some(mode) = request.routing_mode {
             settings.mode = mode;
         }

@@ -67,7 +67,9 @@ use super::provider::cognitive::candidates::ModelFacts;
 use super::provider::cognitive::decider::HYSTERESIS_MARGIN;
 use super::provider::cognitive::decision::{CognitiveDecision, DecideRequest, Decider, Pick};
 use super::provider::cognitive::signature::{ContextHints, TaskSignature};
-use super::provider::cognitive::{LearningStage, ProviderRoutingMode, RoutingSettings};
+use super::provider::cognitive::{
+    conversation_stage, LearningStage, ProviderRoutingMode, RoutingSettings,
+};
 use super::types::RoutingPoolEntry;
 
 /// The table the Claude path hands to its CLI: event name → matchers.
@@ -375,6 +377,20 @@ struct RouterChoice {
     /// Every pair of the conversation's pool, whatever its provider: the candidates of a
     /// provider check in mode `full`. `None` = no pool.
     routing_pool: Option<Vec<RoutingPoolEntry>>,
+    /// The user handed this conversation's routing to PO (Auto, or a pool): its decisions
+    /// are taken at the `auto` stage whatever the settings' stage (decision R-S1).
+    conversation_routes: bool,
+}
+
+impl RouterChoice {
+    /// The settings the conversation's decisions are asked with: the stage is `auto` when
+    /// the user chose the conversation's routing ([`conversation_stage`]), the settings'
+    /// stage otherwise (sessions that asked nothing, executors, delegations).
+    fn settings(&self) -> RoutingSettings {
+        let mut settings = self.routing.clone();
+        settings.stage = conversation_stage(settings.stage, self.conversation_routes);
+        settings
+    }
 }
 
 /// What opens a [`TurnRouter`].
@@ -390,6 +406,8 @@ pub(crate) struct TurnRouterSpec {
     pub provider_imposed: bool,
     pub allowed_models: Option<Vec<String>>,
     pub routing_pool: Option<Vec<RoutingPoolEntry>>,
+    /// The conversation asked for Auto or a pool (decision R-S1).
+    pub conversation_routes: bool,
     pub current_model: String,
     /// Index the next turn counted by the router itself gets (legacy engine).
     pub next_turn: u32,
@@ -420,6 +438,7 @@ impl TurnRouter {
                 provider_imposed: spec.provider_imposed,
                 allowed_models: spec.allowed_models,
                 routing_pool: spec.routing_pool,
+                conversation_routes: spec.conversation_routes,
             }),
             provider_id: spec.provider_id,
             session_id: spec.session_id,
@@ -473,6 +492,10 @@ impl TurnRouter {
         choice.explicit_model = explicit_model;
         choice.provider_imposed = false;
         choice.routing_pool = None;
+        // Auto, or a pool (`allowed_models` is only given for two models or more): the
+        // user's choice, applied at the `auto` stage (decision R-S1).
+        choice.conversation_routes =
+            mode == ProviderRoutingMode::Full || choice.allowed_models.is_some();
         self.manual.store(false, Ordering::SeqCst);
     }
 
@@ -601,13 +624,10 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
     };
     // No two moves in a row: the turn right after a move (or a model change) is only recorded.
     let just_moved = router.moved_in.swap(false, Ordering::SeqCst);
-    let apply = choice.routing.stage == LearningStage::Auto && !just_moved && !just_changed;
+    let settings = choice.settings();
+    let apply = settings.stage == LearningStage::Auto && !just_moved && !just_changed;
     let current = Pick::new(&router.provider_id, &current_model);
-    let mut request = DecideRequest::new(
-        router.signature(),
-        settings_for(&choice.routing, apply),
-        pool,
-    );
+    let mut request = DecideRequest::new(router.signature(), settings_for(&settings, apply), pool);
     request.trust = router.trust;
     request.current = Some(current.clone());
     request.session_id = router.session_id;
@@ -692,8 +712,9 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
             let just_changed = locked(&router.state)
                 .last_change_turn
                 .is_some_and(|turn| turn.checked_add(1) == Some(ctx.turn_index));
-            let apply = choice.routing.stage == LearningStage::Auto && !just_changed;
-            let mut settings = settings_for(&choice.routing, apply);
+            let settings = choice.settings();
+            let apply = settings.stage == LearningStage::Auto && !just_changed;
+            let mut settings = settings_for(&settings, apply);
             // A pool is routed like `full` inside it, whatever the settings' mode.
             if choice.allowed_models.is_some() {
                 settings.mode = ProviderRoutingMode::Full;
@@ -1305,6 +1326,7 @@ mod provider_move_tests {
             provider_imposed: false,
             allowed_models: None,
             routing_pool: None,
+            conversation_routes: false,
             current_model: "m".into(),
             next_turn: 1,
             moved_in: false,
@@ -1511,5 +1533,76 @@ mod provider_move_tests {
         ));
         assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
         assert_eq!(decider.calls(), 0);
+    }
+
+    /// Decision R-S1: the settings' stage governs a session that asked nothing (`full` from
+    /// the settings, `shadow`: recorded, never applied); the user's Auto on the conversation
+    /// decides it at the `auto` stage; one model ticked afterwards pins it again.
+    #[tokio::test]
+    async fn the_conversations_auto_is_decided_at_the_auto_stage_whatever_the_settings() {
+        let decider = Fake::picking("local2", 0.9, 0.1);
+        let router = router(spec(
+            decider.clone(),
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Full,
+            LearningStage::Shadow,
+        ));
+        assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
+        assert_eq!(decider.last().settings.stage, LearningStage::Shadow);
+
+        let router = router_after_auto(decider.clone());
+        assert!(is_move_to(&plan_provider_move(&router).await, "local2"));
+        assert_eq!(decider.last().settings.stage, LearningStage::Auto);
+
+        // One model ticked: strict, nothing is asked any more.
+        router.reroute(ProviderRoutingMode::Primary, None, true);
+        let calls = decider.calls();
+        assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
+        let directive = directive_for_turn(&router, &TurnContext::new(2, "m")).await;
+        assert_eq!(directive.model, None);
+        assert_eq!(decider.calls(), calls);
+    }
+
+    /// A pool (two models ticked) chosen on a conversation of a `primary` + `shadow` setting
+    /// changes the model between turns: the decision is asked, and stored, at `auto`.
+    #[tokio::test]
+    async fn a_pool_chosen_on_the_conversation_is_decided_at_the_auto_stage() {
+        let decider = Arc::new(Fake {
+            pick: Pick::new("local", "big"),
+            score: 0.9,
+            current_score: 0.1,
+            explored: false,
+            requests: StdMutex::new(Vec::new()),
+        });
+        let router = router(spec(
+            decider.clone(),
+            Arc::new(OneProvider),
+            ProviderRoutingMode::Primary,
+            LearningStage::Shadow,
+        ));
+        router.reroute(
+            ProviderRoutingMode::Mixed,
+            Some(vec!["m".into(), "big".into()]),
+            false,
+        );
+        let directive = directive_for_turn(&router, &TurnContext::new(1, "m")).await;
+        assert_eq!(directive.model.as_deref(), Some("big"));
+        let asked = decider.last();
+        assert_eq!(
+            (asked.settings.mode, asked.settings.stage),
+            (ProviderRoutingMode::Full, LearningStage::Auto)
+        );
+    }
+
+    /// A router of a `full` + `shadow` setting whose conversation was handed to PO (Auto).
+    fn router_after_auto(decider: Arc<Fake>) -> TurnRouter {
+        let router = router(spec(
+            decider,
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Primary,
+            LearningStage::Shadow,
+        ));
+        router.reroute(ProviderRoutingMode::Full, None, false);
+        router
     }
 }

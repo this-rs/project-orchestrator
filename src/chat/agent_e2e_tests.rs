@@ -3593,17 +3593,58 @@ mod provider_switch {
             assert_eq!(checks[1].current, Some(Pick::new("local2", "m")));
         }
 
+        /// A session driven by the settings (`full` + `shadow`, nothing chosen on the
+        /// conversation): the provider decision is taken and recorded in shadow, nothing moves.
         #[tokio::test]
         async fn the_shadow_stage_records_the_provider_decision_and_moves_nothing() {
             let (w, mover) = auto_world("shadow", vec!["local2"], false).await;
-            let old = first_turn(&w).await;
-            hand_back_to_po(&w, &old).await;
+            // The settings' roles name the instance: the request names nothing.
+            w.graph
+                .put_llm_setting(
+                    GLOBAL,
+                    crate::chat::provider::settings::ROLES_KEY,
+                    &json!({"pilot": {"provider": "local"}}).to_string(),
+                )
+                .await
+                .unwrap();
+            let created = w
+                .manager
+                .create_session(&request(None, Some("proj"), "default"))
+                .await
+                .unwrap_or_else(|e| panic!("open failed: {e:#}"));
+            let old = created.session_id;
+            stored_until(&w, &old, |records| {
+                records.iter().any(|r| r.event_type == "assistant_text")
+            })
+            .await;
             idle(&w, &old).await;
             answered_in_place(&w, &old, "second question").await;
             let checks = mover.checks();
             assert_eq!(checks.len(), 1, "the decision is taken, so recorded");
             assert_eq!(checks[0].settings.stage, LearningStage::Shadow);
             assert_eq!(requests_with(&w, "conversation_relay").len(), 0);
+        }
+
+        /// Decision R-S1: Auto chosen on the conversation (handed back to PO) is the user's
+        /// choice, decided at the `auto` stage even when the settings say `shadow`.
+        #[tokio::test]
+        async fn a_conversation_handed_back_to_po_moves_even_under_a_shadow_setting() {
+            let (w, mover) = auto_world("shadow", vec!["local2"], false).await;
+            let old = first_turn(&w).await;
+            hand_back_to_po(&w, &old).await;
+            idle(&w, &old).await;
+            let mut old_rx = w.manager.subscribe(&old).await.unwrap();
+            w.manager
+                .send_message(&old, "second question")
+                .await
+                .unwrap();
+            next_event(&mut old_rx, |e| {
+                matches!(e, ChatEvent::ConversationRelayed { .. })
+            })
+            .await;
+            let checks = mover.checks();
+            assert_eq!(checks.len(), 1);
+            assert_eq!(checks[0].settings.stage, LearningStage::Auto);
         }
 
         #[tokio::test]
@@ -4617,6 +4658,7 @@ mod parity {
                 current_model: "m".into(),
                 next_turn: 0,
                 routing_pool: None,
+                conversation_routes: false,
                 moved_in: false,
             },
         ));
