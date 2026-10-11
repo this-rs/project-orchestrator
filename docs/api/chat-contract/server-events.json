@@ -402,6 +402,7 @@
           "message": "Tool execution failed: permission denied",
           "parent_tool_use_id": "toolu_01ParentTask0000000000",
           "reason": "unknown_kind",
+          "request_id": "pr_1",
           "type": "error"
         },
         "minimal": {
@@ -427,6 +428,10 @@
           "type": "string"
         },
         "reason": {
+          "required": false,
+          "type": "string"
+        },
+        "request_id": {
           "required": false,
           "type": "string"
         },
@@ -510,6 +515,8 @@
         "full": {
           "allow": true,
           "id": "perm_0001",
+          "rule": "Bash: git status",
+          "scope": "session",
           "type": "permission_decision"
         },
         "minimal": {
@@ -525,6 +532,14 @@
         },
         "id": {
           "required": true,
+          "type": "string"
+        },
+        "rule": {
+          "required": false,
+          "type": "string"
+        },
+        "scope": {
+          "required": false,
           "type": "string"
         },
         "type": {

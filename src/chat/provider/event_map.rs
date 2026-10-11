@@ -352,6 +352,7 @@ impl EventMapper {
                     code: None,
                     reason: None,
                     index: None,
+                    request_id: None,
                 }]
             }
             // A notice is a diagnostic: nothing in a turn.
@@ -440,6 +441,7 @@ fn error_event(error: &ProviderError) -> ChatEvent {
         code: None,
         reason: None,
         index: None,
+        request_id: None,
     }
 }
 
@@ -956,9 +958,23 @@ mod tests {
     fn replay_gives_the_same_chat_events_as_the_legacy_path() {
         let mut state = MapState::new();
         let mut mapper = EventMapper::new();
+        // What the agent runtime stamps on the `system_init` of a Claude Code session
+        // (`AgentSessionHandle::offered_capabilities`: the provider's, without `always`).
+        let mut caps =
+            nexus_claude::providers::claude_code::ClaudeCodeConfig::default().capabilities(None);
+        caps.permission_scopes
+            .retain(|s| *s != nexus_claude::agent::PermissionScope::Always);
+        let agent_stamp = serde_json::to_value(caps).unwrap();
+        assert!(
+            agent_stamp["images"].is_boolean(),
+            "the whole object: {agent_stamp}"
+        );
         for (name, msg) in corpus() {
-            // The legacy init says which engine it is; the mapper leaves that to the
-            // session owner (the runtime stamps `engine` and `degraded_features`).
+            // The legacy init says which engine it is and what it declares; the mapper
+            // leaves that to the session owner (the agent runtime stamps `engine`,
+            // `degraded_features` and `capabilities` on `system_init`, `emit_one`).
+            // `capabilities` is compared: the legacy engine declares the whole object the
+            // agent runtime stamps on a Claude Code session.
             let legacy: Vec<Value> = ChatManager::message_to_events(&msg)
                 .iter()
                 .map(|e| {
@@ -970,9 +986,38 @@ mod tests {
                     v
                 })
                 .collect();
-            let via_contract = mapped(&msg, &mut state, &mut mapper);
+            let via_contract: Vec<Value> = mapped(&msg, &mut state, &mut mapper)
+                .into_iter()
+                .map(|mut v| {
+                    if v["type"] == "system_init"
+                        && v.get("capabilities").is_none_or(Value::is_null)
+                    {
+                        v["capabilities"] = agent_stamp.clone();
+                    }
+                    v
+                })
+                .collect();
             assert_eq!(via_contract, legacy, "message `{name}` maps differently");
         }
+    }
+
+    /// The two engines that drive Claude Code declare the same approval scopes: the
+    /// legacy one (`LEGACY_PERMISSION_SCOPES`, in its `system_init`) and the agent one
+    /// (the Claude Code provider's own, without `always`, as `offered_capabilities`).
+    #[test]
+    fn both_claude_code_engines_declare_the_same_permission_scopes() {
+        let provider = nexus_claude::providers::claude_code::ClaudeCodeConfig::default()
+            .capabilities(None)
+            .permission_scopes
+            .into_iter()
+            .filter(|s| *s != nexus_claude::agent::PermissionScope::Always)
+            .map(|s| serde_json::to_value(s).unwrap())
+            .collect::<Vec<_>>();
+        let legacy = crate::chat::manager::LEGACY_PERMISSION_SCOPES
+            .iter()
+            .map(|s| serde_json::to_value(s).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(provider, legacy);
     }
 
     #[test]

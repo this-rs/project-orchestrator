@@ -128,8 +128,101 @@ messages yet. Both are also logged by the server with the step name.
 #### `permission_response` -- Respond to a permission request
 
 ```json
-{"type": "permission_response", "id": "pr_1", "allow": true}
+{"type": "permission_response", "id": "pr_1", "allow": true, "scope": "session"}
 ```
+
+`scope` (optional, default `once`) says how long an approval lasts: `once` (this call) or
+`session`. Both engines declare what they accept in `system_init.capabilities.permission_scopes`
+(the Claude Code engine: `["once", "session"]`, in the whole Claude Code capability object, as
+the agent engine stamps it); a scope not declared is refused. A `session`
+approval is decided by the BACKEND (`chat::session_grants`), never handed to the provider as a
+rule (no nexus `allow` entry, no `updatedPermissions` to the CLI): the provider is answered
+`once`, and the backend answers itself the later requests of the SAME session that the grant
+covers. A grant only ever covers exactly what the user saw and approved, and only for an action
+that cannot run code the model can change. Everything is an allowlist; anything else is refused
+(`permission_scope_unsupported`, the user answers `once`):
+
+- **the request must carry the whole call.** The Claude Code engine and the native engine hand
+  the model's own tool input. On Codex, only an MCP tool call whose elicitation carries its
+  arguments (`tool_params`) qualifies. Never Codex's `apply_patch` (its input is `{reason}`: no
+  path, no diff, so one grant would cover every later patch), its `shell` (nexus joins the argv
+  with spaces: `["rm","a b"]` and `["rm","a","b"]` read the same) or `request_permissions`;
+  never an ACP agent;
+- **the identical call** (same tool, same input; a command's surrounding blanks trimmed, its
+  `description` ignored, every other field compared) for: the read-only built-in tools of the
+  native engine (`mcp__nexus__Read`, `Glob`, `Grep`, `LS`, `NotebookRead`, identified by the
+  adapter, never by the name's suffix; never the whole tool, which would cover any later read
+  the session can reach), the file tools (`Write`, `Edit`,
+  `MultiEdit`, `NotebookEdit`), a read of the Claude Code CLI (it asks a read only outside the
+  working directory, so never the whole tool), `WebFetch`, `WebSearch`;
+- **a third party's MCP tool, only when the operator declared it read-only**, by its exact name,
+  in `CHAT_READ_ONLY_MCP_TOOLS` (comma separated `mcp__<server>__<tool>`; no pattern, no server
+  alone, never a `nexus` tool; empty by default): then the identical call. A tool's name says
+  nothing of what it does, and the MCP `readOnlyHint` annotation does not reach the backend, so
+  an undeclared one (`mcp__acme__Read` included) is allowed `once` only, on every engine. A
+  declared tool named like a command tool also goes through the command checks below. **Limit:
+  a declaration binds a NAME, not a server.** The Claude Code CLI also loads the project's
+  `.mcp.json`, and a project server may take the name of a server configured elsewhere; a
+  configuration the model can edit could then put another program behind a declared name (the
+  CLI still asks to approve a new project server, and a new session is needed). So at every
+  opening (new session, resume) the backend ignores, for that session, a declaration whose
+  server a `.mcp.json` of the project (its directory or one above) defines, and every
+  declaration when such a file cannot be read for sure or the session is remote. Declare only
+  tools of servers the projects cannot redefine: the backend's own servers, or servers whose
+  name no project's `.mcp.json` uses (projects whose MCP configuration is not reviewed should
+  not have their servers approved for all). The backend does not pass a strict MCP
+  configuration to the CLI: it would drop every server configured outside the backend (user and
+  project scopes), i.e. the very servers one would declare, and the users' own tools with them;
+- **the identical command line** (`Bash`, `Monitor`, or a declared tool named like one) only
+  when every simple command of it (split on `; & | ( )` and new lines) runs one of these
+  programs, plainly named: `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `egrep`, `fgrep`, `rg`
+  (without `--pre`, `--pre-glob`, `--hostname-bin`), `find` (without `-exec`, `-execdir`, `-ok`,
+  `-okdir`, `-delete`, `-fprint`, `-fprint0`, `-fprintf`, `-fls`), `fd` / `fdfind` (without
+  `-x`, `-X`, `--exec`, `--exec-batch`), `sort` (without `--compress-program`, `-o`,
+  `--output`), `uniq` (one operand at most: its second is a file it writes), `cut`, `tr`, `nl`,
+  `diff`, `cmp`, `stat`, `file` (without `-C`, `--compile`), `du`, `df`, `tree` (without `-o`,
+  `-R`), `pwd`, `echo`, `printf` (without `-v`), `which`, `basename`, `dirname`, `realpath`,
+  `readlink`, `whoami`, `uname`, `id`, `true`, `false`. A forbidden option is refused
+  abbreviated too (`--compress`), with its value attached or after `=`, and inside a cluster of
+  short options; an unquoted glob is refused next to a program that has one (a file named like
+  the option). What the line writes is therefore only what its own redirections write. Everything
+  else is refused: interpreters, shells, scripts given by path, task runners and build tools,
+  tools that load project files (`eslint`, `vite`, `mypy`...), `git` (hooks, `core.fsmonitor`,
+  diff drivers), `sed`, `awk`, `jq`, `tar`, `sqlite3`, `xargs`, `env`, `tee`, `sudo`, any builtin
+  that changes how a name resolves (`export`, `hash`, `enable`, `alias`, `cd`...), an assignment
+  in front (`PATH=./bin ls`);
+- **a line that cannot be read for sure** gets no grant: an expansion (`$` outside single quotes,
+  a backquote, `<(...)`), a brace outside quotes (`{bash,x.sh}` runs `bash x.sh`), a backslash
+  outside single quotes (`ba\⏎sh x.sh` is a line continuation), an unquoted `^`, `~` or `#`
+  (zsh's extended glob operators; a `~` home and a `#` comment go with them), an unterminated
+  quote, a control character;
+- **never** `SlashCommand`, `Skill` (they run a file the model can edit), `Task` / `Agent`,
+  `TaskStop`, or a tool the backend does not know.
+
+The working directory is **not** part of the match: both engines keep the `cd` of one call for
+the next, so a grant of `ls` lists whatever directory the shell is in, and a grant of
+`echo x > out` writes `out` there. The programs are found through the server's `PATH` (neither
+engine keeps an environment change from one call to the next).
+
+Only requests the provider asked reach the backend, after its own policy (read-only access,
+denies, trust) and the project's consent. Another session, or the same one after a restart, asks
+again. `always` is part of the contract but refused on every engine for now (P11b). A scope that
+cannot be kept is refused with an `error` frame `{"code": "permission_scope_unsupported",
+"reason": "<scope>", "request_id": "<id>"}` (`request_id`: the `id` of the refused answer, so a
+client with several requests waiting marks the right one); nothing is answered and the request
+stays waiting. An answer to a request
+that no longer waits (answered by the backend under a grant, or from another tab) is ignored,
+on the WebSocket as on REST and NATS. The resulting `permission_decision` carries `scope` and
+`rule` (what a session grant covers, e.g. `Bash: ls -la`). The REST twin
+`POST /api/chat/sessions/{id}/permissions/{request_id}` takes `{"allow", "scope"?}` (400
+`permission_scope_unsupported`); it is a human route (an agent session token gets 403). Only
+the person the conversation belongs to answers it (the one who opened it, or the person behind
+the agent session that opened it, or the person whose MCP token opened it; a session the server
+opened itself has no owner): another person gets 403 on REST and, on the WebSocket, an `error`
+frame `{"code": "permission_forbidden", "reason": "not_owner", "request_id": "<id>"}`; nothing
+is answered. The check fails closed: when the session cannot be read, the WebSocket refuses with
+`"reason": "owner_unreadable"` (REST: 500 / 404), and with the authentication off (no person
+behind the caller) a session that has an owner is refused on both.
 
 #### `input_response` -- Respond to an input request
 

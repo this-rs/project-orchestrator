@@ -26,8 +26,8 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `set_model` | set_model en cours de conversation atteint le provider | ok | ok |
 | `cancel_tools` | cancel_tools arrête l'outil en cours, le tour continue | ok | ok |
 | `permissions.once` | une permission accordée une fois débloque l'outil | ok | ok |
-| `permissions.session` | une permission accordée pour la session n'est pas redemandée | gap (harnais, P11) | gap (harnais, P11) |
-| `permissions.always` | une permission accordée pour toujours est retenue au-delà de la session | gap (harnais, P11) | gap (harnais, P11) |
+| `permissions.session` | une permission accordée pour la session n'est pas redemandée | ok | ok |
+| `permissions.always` | une permission accordée pour toujours est retenue au-delà de la session | gap (harnais, P11b) | gap (harnais, P11b) |
 | `tool_timing` | un outil qui a attendu une permission porte tool_timing persisté : prise en charge, attente, exécution, fin | ok | ok |
 | `po_tools` | les outils project-orchestrator (MCP) sont donnés et appelables | ok | ok |
 | `nexus_tools` | Read / Edit / Bash s'exécutent sur le projet | not_measured | ok |
@@ -40,16 +40,14 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `cancel_task` | cancel_task arrête une tâche d'arrière-plan | ok | ok |
 | `system_init.degraded` | system_init n'annonce comme manquant qu'une limite du modèle (liste fermée) | ok | ok |
 
-`ok` : Claude Code 24/27, natif 25/27.
+`ok` : Claude Code 25/27, natif 26/27.
 
 ## Écarts déclarés
 
 | Moteur | Fonction | Cause | Tâche | Ce qui manque |
 |---|---|---|---|---|
-| Claude Code | `permissions.session` | harnais | P11 | la réponse de permission ne porte aucune portée : le backend n'écrit au CLI qu'un allow/deny ponctuel (pas d'updatedPermissions de session) |
-| Claude Code | `permissions.always` | harnais | P11 | aucune portée persistante (updatedPermissions vers les réglages) n'est écrite au CLI |
-| natif | `permissions.session` | harnais | P11 | le harnais natif sait retenir une portée session, mais le backend répond toujours allow_once : la permission est redemandée |
-| natif | `permissions.always` | harnais | P11 | le harnais natif ne déclare pas la portée always (permission_scopes = once, session) et le backend ne la transmet pas |
+| Claude Code | `permissions.always` | harnais | P11b | volontaire (sécurité) : aucune approbation durable tant que les règles ne sont pas tenues par un comparateur strict du backend (revue P11 : une suggestion du CLI réécrite vers localSettings pouvait y porter setMode / addDirectories) ; always est refusé, typé |
+| natif | `permissions.always` | harnais | P11b | volontaire (sécurité) : aucune règle durable tant qu'elle n'est pas tenue par un comparateur strict du backend (revue P11 : un préfixe Bash(cat *) dans la liste allow de nexus autorisait cat x >> ~/.zshrc) ; always est refusé, typé |
 
 ## Non mesuré
 

@@ -5475,6 +5475,7 @@ mod tests {
             jwt_secret: None,
             server_port: 0,
             session_token_expiry_secs: 3600,
+            read_only_mcp_tools: Vec::new(),
         };
         let chat_manager = Arc::new(ChatManager::new_without_memory(
             graph.clone(),
@@ -6078,6 +6079,7 @@ mod tests {
             jwt_secret: None,
             server_port: 0,
             session_token_expiry_secs: 3600,
+            read_only_mcp_tools: Vec::new(),
         };
         let chat_manager = Arc::new(ChatManager::new_without_memory(
             graph.clone(),
@@ -8844,6 +8846,7 @@ mod tests {
             jwt_secret: None,
             server_port: 0,
             session_token_expiry_secs: 3600,
+            read_only_mcp_tools: Vec::new(),
         };
         let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
         let chat_manager = Arc::new(
@@ -8999,6 +9002,7 @@ mod tests {
             jwt_secret: None,
             server_port: 0,
             session_token_expiry_secs: 3600,
+            read_only_mcp_tools: Vec::new(),
         };
         let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
         let chat_manager = Arc::new(

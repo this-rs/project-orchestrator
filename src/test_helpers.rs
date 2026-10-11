@@ -549,6 +549,7 @@ pub fn test_chat_session(project_slug: Option<&str>) -> ChatSessionNode {
         resume_token: None,
         execution_place: Default::default(),
         access: Default::default(),
+        owner: None,
     }
 }
 

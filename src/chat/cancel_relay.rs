@@ -381,6 +381,7 @@ pub fn ws_error_event(error: &anyhow::Error) -> Option<crate::chat::types::ChatE
         code: Some("cancel_failed".to_string()),
         reason: Some(code),
         index: None,
+        request_id: None,
     })
 }
 

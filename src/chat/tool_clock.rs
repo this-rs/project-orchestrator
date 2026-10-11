@@ -215,7 +215,7 @@ impl ToolClock {
                 state.requests.insert(id.clone(), tool_call_id.clone());
                 None
             }
-            ChatEvent::PermissionDecision { id, allow } => {
+            ChatEvent::PermissionDecision { id, allow, .. } => {
                 if let Some(call_id) = state.requests.get(id).cloned() {
                     if let Some(call) = state.calls.get_mut(&call_id) {
                         call.permission_resolved.get_or_insert((at, *allow));
@@ -377,6 +377,8 @@ mod tests {
         ChatEvent::PermissionDecision {
             id: request.into(),
             allow,
+            scope: None,
+            rule: None,
         }
     }
 

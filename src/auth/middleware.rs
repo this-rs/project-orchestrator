@@ -732,6 +732,50 @@ mod tests {
         crate::auth::agent_tokens::revoke_session(&sid);
     }
 
+    /// Answering a permission prompt (and planting a `session` grant with it) is the
+    /// person's decision: an agent session token is refused on its own session, on a
+    /// session it spawned and on any other, before the handler runs.
+    #[tokio::test]
+    async fn an_agent_token_cannot_answer_a_permission_prompt_of_any_session() {
+        let state = make_server_state(Some(test_auth_config())).await;
+        async fn ok_handler() -> &'static str {
+            "ok"
+        }
+        use axum::routing::post;
+        let app = Router::new()
+            .route(
+                "/api/chat/sessions/{id}/permissions/{request_id}",
+                post(ok_handler),
+            )
+            .layer(from_fn_with_state(state.clone(), require_auth))
+            .with_state(state);
+
+        let sid = uuid::Uuid::new_v4().to_string();
+        let (agent, _) = agent_token(&sid);
+        let human = encode_jwt(
+            uuid::Uuid::new_v4(),
+            "alice@ffs.holdings",
+            "Alice",
+            TEST_SECRET,
+            3600,
+        )
+        .unwrap();
+        for target in [sid.clone(), uuid::Uuid::new_v4().to_string()] {
+            let uri = format!("/api/chat/sessions/{target}/permissions/req-1");
+            assert_eq!(
+                status_of(app.clone(), "POST", &uri, &agent).await,
+                StatusCode::FORBIDDEN,
+                "agent token must get 403 on POST {uri}"
+            );
+            assert_eq!(
+                status_of(app.clone(), "POST", &uri, &human).await,
+                StatusCode::OK,
+                "a person answers on POST {uri}"
+            );
+        }
+        crate::auth::agent_tokens::revoke_session(&sid);
+    }
+
     #[tokio::test]
     async fn a_restricted_profile_token_is_refused_the_routes_behind_withheld_tools() {
         let state = make_server_state(Some(test_auth_config())).await;

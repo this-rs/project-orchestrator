@@ -208,6 +208,20 @@ pub struct ChatConfig {
     pub server_port: u16,
     /// Expiration duration for MCP session tokens in seconds (default: 24h = 86400s).
     pub session_token_expiry_secs: u64,
+    /// The third-party MCP tools the operator declares READ-ONLY, by exact name
+    /// (`mcp__<server>__<tool>`, no pattern): the only third-party MCP tools a permission
+    /// approved "for the session" may cover (`chat::session_grants`, the identical call).
+    /// Any other is allowed once at a time. From `CHAT_READ_ONLY_MCP_TOOLS` (comma
+    /// separated); empty by default.
+    ///
+    /// A declaration binds a NAME, not a server: the Claude Code CLI also loads the
+    /// project's `.mcp.json`, where a server may take the name of one configured elsewhere.
+    /// A declaration whose server a project's `.mcp.json` defines is ignored for that
+    /// session (`session_grants::declarations_for_project`); declare only tools of servers
+    /// no project can redefine (the backend's own, or names no project uses). No strict MCP configuration is passed to the CLI: it would drop every
+    /// server configured outside the backend, the very ones a declaration is for
+    /// (`docs/guides/chat-websocket.md`).
+    pub read_only_mcp_tools: Vec<String>,
 }
 
 /// Environment variable selecting the [`ProviderPath`].
@@ -215,6 +229,10 @@ pub const PROVIDER_PATH_VAR: &str = "CHAT_PROVIDER_PATH";
 
 /// Variable naming the `nexus-tools` executable of the native sessions (B40).
 pub const NEXUS_TOOLS_PATH_VAR: &str = "NEXUS_TOOLS_PATH";
+
+/// Variable listing the third-party MCP tools declared read-only
+/// ([`ChatConfig::read_only_mcp_tools`]).
+pub const READ_ONLY_MCP_TOOLS_VAR: &str = "CHAT_READ_ONLY_MCP_TOOLS";
 
 /// Engine that drives Claude Code sessions (decision A18 / task B38).
 ///
@@ -334,7 +352,44 @@ impl ChatConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(86400), // 24 hours
+            read_only_mcp_tools: Self::parse_read_only_mcp_tools(
+                std::env::var(READ_ONLY_MCP_TOOLS_VAR).ok().as_deref(),
+            ),
         }
+    }
+
+    /// The declared read-only MCP tools of [`READ_ONLY_MCP_TOOLS_VAR`]: comma separated,
+    /// each an exact `mcp__<server>__<tool>` name. Anything else (a pattern, a server
+    /// alone, a tool of the `nexus` server, whose built-ins have their own rules) is
+    /// dropped with a warning: a declaration never widens beyond one named tool.
+    pub fn parse_read_only_mcp_tools(value: Option<&str>) -> Vec<String> {
+        let Some(value) = value else {
+            return Vec::new();
+        };
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .filter(|name| {
+                let exact = name
+                    .strip_prefix("mcp__")
+                    .and_then(|rest| rest.split_once("__"))
+                    .is_some_and(|(server, tool)| {
+                        !server.is_empty()
+                            && !tool.is_empty()
+                            && server != nexus_claude::providers::native::NEXUS_TOOLS_SERVER
+                            && name.chars().all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c))
+                    });
+                if !exact {
+                    tracing::warn!(
+                        tool = %name,
+                        "{READ_ONLY_MCP_TOOLS_VAR}: not an exact mcp__<server>__<tool> name, ignored"
+                    );
+                }
+                exact
+            })
+            .map(str::to_string)
+            .collect()
     }
 
     /// Public accessor for MCP server path detection.
@@ -399,6 +454,18 @@ mod tests {
     }
 
     #[test]
+    fn a_read_only_mcp_tool_is_declared_by_its_exact_name_only() {
+        assert!(ChatConfig::parse_read_only_mcp_tools(None).is_empty());
+        assert_eq!(
+            ChatConfig::parse_read_only_mcp_tools(Some(
+                " mcp__acme__list , ,mcp__docs-srv__search_docs,mcp__acme__*,mcp__acme,\
+                 mcp____x,mcp__nexus__Bash,Bash,acme__list,mcp__a__b c"
+            )),
+            vec!["mcp__acme__list", "mcp__docs-srv__search_docs"]
+        );
+    }
+
+    #[test]
     fn test_default_config() {
         let config = ChatConfig {
             provider_path: Default::default(),
@@ -425,6 +492,7 @@ mod tests {
             jwt_secret: None,
             server_port: 8080,
             session_token_expiry_secs: 86400,
+            read_only_mcp_tools: Vec::new(),
         };
 
         assert_eq!(config.default_model, "claude-sonnet-4-6");

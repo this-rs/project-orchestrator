@@ -238,32 +238,14 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
     ),
     (
         Engine::ClaudeCode,
-        "permissions.session",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "P11",
-            why: "la réponse de permission ne porte aucune portée : le backend n'écrit au CLI \
-                  qu'un allow/deny ponctuel (pas d'updatedPermissions de session)",
-        },
-    ),
-    (
-        Engine::ClaudeCode,
         "permissions.always",
         Expect::Gap {
             cause: Cause::Harness,
-            task: "P11",
-            why: "aucune portée persistante (updatedPermissions vers les réglages) n'est écrite \
-                  au CLI",
-        },
-    ),
-    (
-        Engine::Native,
-        "permissions.session",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "P11",
-            why: "le harnais natif sait retenir une portée session, mais le backend répond \
-                  toujours allow_once : la permission est redemandée",
+            task: "P11b",
+            why: "volontaire (sécurité) : aucune approbation durable tant que les règles ne sont \
+                  pas tenues par un comparateur strict du backend (revue P11 : une suggestion du \
+                  CLI réécrite vers localSettings pouvait y porter setMode / addDirectories) ; \
+                  always est refusé, typé",
         },
     ),
     (
@@ -271,9 +253,10 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
         "permissions.always",
         Expect::Gap {
             cause: Cause::Harness,
-            task: "P11",
-            why: "le harnais natif ne déclare pas la portée always (permission_scopes = once, \
-                  session) et le backend ne la transmet pas",
+            task: "P11b",
+            why: "volontaire (sécurité) : aucune règle durable tant qu'elle n'est pas tenue par \
+                  un comparateur strict du backend (revue P11 : un préfixe Bash(cat *) dans la \
+                  liste allow de nexus autorisait cat x >> ~/.zshrc) ; always est refusé, typé",
         },
     ),
 ];
@@ -1272,6 +1255,28 @@ fn transcript_main(k: Keys, cwd: &str) -> Vec<Value> {
         text("answered five"),
         result_ok("answered five"),
     ]);
+    // TURN-PERM-S: `ls -la` granted for the session, then the identical call again
+    // (the backend answers it). TURN-PERM-A: an `always` (refused), then once.
+    t.extend(vec![
+        await_in(&k.k("TURN-PERM-S")),
+        cc_tool_use("t5s", "Bash", json!({"command": "ls -la"})),
+        permission_request("req-perm-s", "Bash", json!({"command": "ls -la"}), "t5s"),
+        await_in("req-perm-s"),
+        cc_tool_result("t5s", "clean", false),
+        cc_tool_use("t5t", "Bash", json!({"command": "ls -la"})),
+        permission_request("req-perm-t", "Bash", json!({"command": "ls -la"}), "t5t"),
+        await_in("req-perm-t"),
+        cc_tool_result("t5t", "clean", false),
+        text("answered perm s"),
+        result_ok("answered perm s"),
+        await_in(&k.k("TURN-PERM-A")),
+        cc_tool_use("t5a", "Bash", json!({"command": "cargo fmt"})),
+        permission_request("req-perm-a", "Bash", json!({"command": "cargo fmt"}), "t5a"),
+        await_in("req-perm-a"),
+        cc_tool_result("t5a", "formatted", false),
+        text("answered perm a"),
+        result_ok("answered perm a"),
+    ]);
     // TURN-SIX: a tool whose process runs; the user cancels the tools, the tool
     // ends in error and the turn goes on.
     t.extend(vec![
@@ -1567,14 +1572,32 @@ fn native_script(k: Keys, cwd: &str) -> Value {
             json!({"command": "echo FIVE-$((1+1))"}),
         ),
         says(&k.k("TURN-FIVE"), "answered five"),
-        // TURN-PERM2: the same tool again (a session-scoped grant would not ask).
+        // TURN-PERM2: a tool asked for the first time (Write; Bash stays asked: NATS-PERM
+        // needs it), granted for the session.
         calls(
             &k.k("TURN-PERM2"),
             "c5b",
-            &nexus("Bash"),
-            json!({"command": "echo AGAIN-$((2+2))"}),
+            &nexus("Write"),
+            json!({"file_path": format!("{cwd}/session-1.txt"), "content": "AGAIN-SESSION"}),
         ),
         says(&k.k("TURN-PERM2"), "answered perm2"),
+        // TURN-PERM3: the identical call again: the session grant holds, not asked.
+        calls(
+            &k.k("TURN-PERM3"),
+            "c5c",
+            &nexus("Write"),
+            json!({"file_path": format!("{cwd}/session-1.txt"), "content": "AGAIN-SESSION"}),
+        ),
+        says(&k.k("TURN-PERM3"), "answered perm3"),
+        // TURN-ALWAYS: another tool, `always` asked (refused), then once.
+        calls(
+            &k.k("TURN-ALWAYS"),
+            "c5d",
+            &nexus("Edit"),
+            json!({"file_path": format!("{cwd}/always.txt"), "old_string": "ALWAYS-ONE",
+                   "new_string": "ALWAYS-EDITED"}),
+        ),
+        says(&k.k("TURN-ALWAYS"), "answered always"),
         // TURN-SIX: a tool that sleeps until cancelled; the model then answers.
         calls(&k.k("TURN-SIX"), "c6", &po("slow"), json!({})),
         says(&k.k("TURN-SIX"), "answered six"),
@@ -1680,6 +1703,85 @@ async fn wait_body(fake: &FakeOpenAi, key: &str) -> Option<String> {
     wait_body_nth(fake, key, 0, WAIT).await
 }
 
+/// A Claude Code turn whose permission `req` is answered with `scope`: whether the
+/// answer was routed, and the line the CLI read.
+async fn cc_scoped(
+    manager: &ChatManager,
+    w: &Watch,
+    cli: &FakeClaude,
+    key: String,
+    req: &'static str,
+    scope: crate::chat::types::PermissionAnswerScope,
+) -> (bool, String) {
+    let ends = w.turn_ends();
+    manager.send_message(&w.sid, &key).await.unwrap();
+    assert!(
+        w.wait(
+            WAIT,
+            |e| matches!(e, ChatEvent::PermissionRequest { id, .. } if id == req)
+        )
+        .await,
+        "the Claude Code engine did not show {req}"
+    );
+    let routed = manager
+        .route_permission_response(&w.sid, req, true, scope, false)
+        .await;
+    if routed.is_err() {
+        // Refused (the request still waits): unblock the turn.
+        let _ = manager
+            .route_permission_response(
+                &w.sid,
+                req,
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                false,
+            )
+            .await;
+    }
+    let line = cli.wait_line(0, req, WAIT).await.unwrap_or_default();
+    w.settle(ends, manager).await;
+    (routed.is_ok(), line)
+}
+
+/// A native turn whose tool (input holding `needle`) is asked and answered with `scope`:
+/// the request id, and whether the answer was accepted.
+async fn native_grant(
+    manager: &ChatManager,
+    w: &Watch,
+    fake: &FakeOpenAi,
+    key: String,
+    needle: &str,
+    said: &str,
+    scope: crate::chat::types::PermissionAnswerScope,
+) -> (Option<String>, bool) {
+    let ends = w.turn_ends();
+    manager.send_message(&w.sid, &key).await.unwrap();
+    let id = w.permission_id(WAIT, needle).await;
+    let granted = match &id {
+        Some(id) => manager
+            .route_permission_response(&w.sid, id, true, scope, false)
+            .await
+            .is_ok(),
+        None => false,
+    };
+    if let (Some(id), false) = (&id, granted) {
+        // Refused (the request still waits): unblock the turn.
+        let _ = manager
+            .route_permission_response(
+                &w.sid,
+                id,
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                false,
+            )
+            .await;
+    }
+    wait_body_nth(fake, &key, 1, WAIT).await;
+    w.said(WAIT, said).await;
+    w.settle(ends, manager).await;
+    (id, granted)
+}
+
 /// Allows the native tool whose input contains `needle` if the session asks; returns
 /// whether it asked. Stops waiting once the model received the `nth` request of `key`
 /// (the tool ran without asking).
@@ -1695,7 +1797,13 @@ async fn answer_if_asked(
     while tokio::time::Instant::now() < deadline {
         if let Some(id) = w.permission_ids(needle).await.into_iter().next() {
             let _ = manager
-                .route_permission_response(&w.sid, &id, true, false)
+                .route_permission_response(
+                    &w.sid,
+                    &id,
+                    true,
+                    crate::chat::types::PermissionAnswerScope::Once,
+                    false,
+                )
                 .await;
             return true;
         }
@@ -1943,7 +2051,13 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
         "the Claude Code engine did not show the permission request"
     );
     manager
-        .route_permission_response(&sid, "req-perm", true, false)
+        .route_permission_response(
+            &sid,
+            "req-perm",
+            true,
+            crate::chat::types::PermissionAnswerScope::Once,
+            false,
+        )
         .await
         .unwrap();
     let allowed = cli.wait_line(0, "req-perm", WAIT).await.unwrap_or_default();
@@ -1953,28 +2067,58 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
         Cause::Harness,
         format!("réponse écrite : {}", excerpt(&allowed)),
     );
-    // What the answer carries: no scope at all (the API has none).
-    let scoped = |dest: &[&str]| {
-        allowed.contains("updatedPermissions") && dest.iter().any(|d| allowed.contains(d))
+    w.settle(ends, &manager).await;
+    let (timed, seen) = timing_verdict(&w.persisted().await, "t5");
+    cc.check("tool_timing", timed, Cause::Harness, seen);
+    // `session`: a plain allow for the CLI (never a rule handed to it); the identical
+    // call again is answered by the backend. `always`: refused on every engine (P11b).
+    // Boxed: the scenario's future is already large (a stack overflow otherwise).
+    let (routed_s, line_s) = Box::pin(cc_scoped(
+        &manager,
+        &w,
+        &cli,
+        kc.k("TURN-PERM-S"),
+        "req-perm-s",
+        crate::chat::types::PermissionAnswerScope::Session,
+    ))
+    .await;
+    cc_sent += 1;
+    let (routed_a, line_a) = Box::pin(cc_scoped(
+        &manager,
+        &w,
+        &cli,
+        kc.k("TURN-PERM-A"),
+        "req-perm-a",
+        crate::chat::types::PermissionAnswerScope::Always,
+    ))
+    .await;
+    cc_sent += 1;
+    let second = cli
+        .wait_line(0, "req-perm-t", WAIT)
+        .await
+        .unwrap_or_default();
+    let plain = |line: &str| {
+        line.contains("\"behavior\":\"allow\"") && !line.contains("updatedPermissions")
     };
     cc.check(
         "permissions.session",
-        scoped(&["\"session\""]),
+        routed_s && plain(&line_s) && plain(&second),
         Cause::Harness,
         format!(
-            "portée session dans la réponse : {}",
-            scoped(&["\"session\""])
+            "accordée={routed_s}, réponse : {}, appel identique répondu par le backend : {}",
+            excerpt(&line_s),
+            excerpt(&second)
         ),
     );
     cc.check(
         "permissions.always",
-        scoped(&["localSettings", "userSettings", "projectSettings"]),
+        routed_a,
         Cause::Harness,
-        "portée persistante dans la réponse : aucune".to_string(),
+        format!(
+            "always accepté={routed_a}, réponse écrite : {}",
+            excerpt(&line_a)
+        ),
     );
-    w.settle(ends, &manager).await;
-    let (timed, seen) = timing_verdict(&w.persisted().await, "t5");
-    cc.check("tool_timing", timed, Cause::Harness, seen);
 
     // cancel_tools: the running tool's process is signalled, the turn goes on.
     let ends = w.turn_ends();
@@ -2104,7 +2248,13 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     if !answered.contains("\"behavior\"") {
         // Not delivered from there: answered here, so the scenario goes on.
         let _ = manager
-            .route_permission_response(&sid, "req-nats", true, false)
+            .route_permission_response(
+                &sid,
+                "req-nats",
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                false,
+            )
             .await;
     }
     w.settle(ends, &manager).await;
@@ -2395,7 +2545,13 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     let id = wn.permission_id(WAIT, "FIVE-$").await;
     if let Some(id) = &id {
         manager
-            .route_permission_response(&nid, id, true, false)
+            .route_permission_response(
+                &nid,
+                id,
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                false,
+            )
             .await
             .unwrap();
     }
@@ -2414,42 +2570,88 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     wn.settle(ends, &manager).await;
     let (timed, seen) = timing_verdict(&wn.persisted().await, "c5");
     na.check("tool_timing", timed, Cause::Harness, seen);
-    // The same tool again: a grant for the session would not ask twice.
+    // A tool granted for the session: asked once, then not again in this session.
+    let (first, granted_session) = Box::pin(native_grant(
+        &manager,
+        &wn,
+        &fake,
+        kn.k("TURN-PERM2"),
+        "AGAIN-SESSION",
+        "answered perm2",
+        crate::chat::types::PermissionAnswerScope::Session,
+    ))
+    .await;
+    na_sent += 1;
     let ends = wn.turn_ends();
     manager
-        .send_message(&nid, &kn.k("TURN-PERM2"))
+        .send_message(&nid, &kn.k("TURN-PERM3"))
         .await
         .unwrap();
     na_sent += 1;
-    let again = wn.permission_id(WAIT, "AGAIN-$").await;
-    if let Some(id) = &again {
-        manager
-            .route_permission_response(&nid, id, true, false)
-            .await
-            .unwrap();
+    // The identical call: the backend answers it (the tool runs, nobody is asked).
+    let ran_again = wait_body_nth(&fake, &kn.k("TURN-PERM3"), 1, WAIT)
+        .await
+        .is_some();
+    // The backend answers the second request itself (its decision says `session`); a
+    // request it left to the user would have no such decision.
+    let asked = wn.permission_ids("AGAIN-SESSION").await;
+    let events = wn.all().await;
+    let answered_by_backend = |id: &String| {
+        events.iter().any(|e| {
+            matches!(e, ChatEvent::PermissionDecision { id: d, scope: Some(s), .. }
+                if d == id && *s == crate::chat::types::PermissionAnswerScope::Session)
+        })
+    };
+    let asked_again = !ran_again || asked.iter().skip(1).any(|id| !answered_by_backend(id));
+    for id in asked.iter().skip(1).filter(|id| !answered_by_backend(id)) {
+        let _ = manager
+            .route_permission_response(
+                &nid,
+                id,
+                true,
+                crate::chat::types::PermissionAnswerScope::Once,
+                false,
+            )
+            .await;
     }
-    wait_body_nth(&fake, &kn.k("TURN-PERM2"), 1, WAIT).await;
     na.check(
         "permissions.session",
-        again.is_none(),
+        first.is_some() && granted_session && !asked_again,
         Cause::Harness,
-        format!("redemandée au second appel={}", again.is_some()),
+        format!(
+            "demandée={}, accordée pour la session={granted_session}, redemandée={asked_again}",
+            first.is_some()
+        ),
     );
-    let init = wn.system_init().await;
-    let scopes = match &init {
+    wn.said(WAIT, "answered perm3").await;
+    wn.settle(ends, &manager).await;
+
+    // `always`: not offered and refused on every engine in this lot (P11b).
+    let offers_always = match &wn.system_init().await {
         Some(ChatEvent::SystemInit { capabilities, .. }) => capabilities
             .as_ref()
             .and_then(|c| c.get("permission_scopes").cloned())
-            .unwrap_or(Value::Null),
-        _ => Value::Null,
+            .is_some_and(|s| s.to_string().contains("always")),
+        _ => false,
     };
+    std::fs::write(stage.dir.path().join("always.txt"), "ALWAYS-ONE").unwrap();
+    let (_, granted_always) = Box::pin(native_grant(
+        &manager,
+        &wn,
+        &fake,
+        kn.k("TURN-ALWAYS"),
+        "ALWAYS-EDITED",
+        "answered always",
+        crate::chat::types::PermissionAnswerScope::Always,
+    ))
+    .await;
+    na_sent += 1;
     na.check(
         "permissions.always",
-        scopes.to_string().to_lowercase().contains("always"),
+        offers_always && granted_always,
         Cause::Harness,
-        format!("permission_scopes={scopes}"),
+        format!("portée offerte={offers_always}, accordée={granted_always}"),
     );
-    wn.settle(ends, &manager).await;
 
     // cancel_tools.
     let ends = wn.turn_ends();

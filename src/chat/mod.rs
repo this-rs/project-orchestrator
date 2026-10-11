@@ -48,6 +48,7 @@ pub mod relay;
 pub mod routing;
 #[cfg(test)]
 mod routing_modes_e2e_tests;
+pub mod session_grants;
 pub mod session_record;
 pub(crate) mod skill_hook;
 pub mod stages;

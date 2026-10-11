@@ -7,6 +7,49 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
+// PermissionAnswerScope — how long a permission granted by the user lasts
+// ---------------------------------------------------------------------------
+
+/// How long an approval given to a permission request lasts (`scope` of the
+/// `permission_response` frame, of `POST .../permissions/{request_id}` and of
+/// the NATS `control_response` RPC). Absent means `once`.
+///
+/// - `once`: this call only.
+/// - `session`: the backend answers itself the later requests of THIS session the
+///   grant covers (`chat::session_grants`: the identical call; any call of a read-only
+///   built-in tool of `nexus-tools`). Never handed to the provider as a rule.
+/// - `always`: part of the contract, refused on every engine in this lot (P11b: lasting
+///   rules need a hardened matcher first).
+///
+/// A scope the session does not declare (`capabilities.permission_scopes`) is
+/// REFUSED with a typed error, never answered as a narrower one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionAnswerScope {
+    #[default]
+    Once,
+    Session,
+    Always,
+}
+
+impl PermissionAnswerScope {
+    /// The wire name (`once`, `session`, `always`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Session => "session",
+            Self::Always => "always",
+        }
+    }
+
+    /// Wire form of [`ChatEvent::PermissionDecision::scope`]: only an approval
+    /// that outlives the call says how long.
+    pub fn lasting(self, allow: bool) -> Option<Self> {
+        (allow && self != Self::Once).then_some(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SpawnedBy — typed origin for sessions spawned by the pipeline or runner
 // ---------------------------------------------------------------------------
 
@@ -731,6 +774,11 @@ pub enum ChatEvent {
         /// 0-based index of the offending element of a list, when one is.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         index: Option<usize>,
+        /// The permission request a refusal is about (`permission_scope_unsupported`): the
+        /// `id` of the `permission_request` / `permission_response`, so a client with
+        /// several requests waiting puts the refusal on the right one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     /// User's decision on a permission request (allow or deny).
     /// Persisted alongside the original PermissionRequest so the decision
@@ -740,6 +788,14 @@ pub enum ChatEvent {
         id: String,
         /// Whether the tool was allowed
         allow: bool,
+        /// How long the approval lasts, when it outlives the call (`session`,
+        /// `always`). Absent: this call only, or a refusal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<PermissionAnswerScope>,
+        /// What the approval covers, as the user is shown it, when it outlives the call
+        /// (`session`: the grant of `chat::session_grants`, e.g. `Bash: git status`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule: Option<String>,
     },
     /// Permission mode was changed mid-session
     PermissionModeChanged {
@@ -2216,14 +2272,19 @@ mod tests {
                 code: None,
                 reason: None,
                 index: None,
+                request_id: None,
             },
             ChatEvent::PermissionDecision {
                 id: "pr_1".into(),
                 allow: true,
+                scope: Some(PermissionAnswerScope::Session),
+                rule: Some("Bash: git status".into()),
             },
             ChatEvent::PermissionDecision {
                 id: "pr_2".into(),
                 allow: false,
+                scope: None,
+                rule: None,
             },
             ChatEvent::ModelChanged {
                 model: "claude-opus-4-6".into(),
@@ -2577,6 +2638,7 @@ mod tests {
                 code: None,
                 reason: None,
                 index: None,
+                request_id: None,
             },
             ChatEvent::PermissionRequest {
                 id: "pr1".into(),

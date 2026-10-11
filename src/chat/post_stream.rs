@@ -161,6 +161,7 @@ pub(crate) async fn await_write(
                 code: Some(PERSISTENCE_DELAYED_CODE.to_string()),
                 reason: Some(step.to_string()),
                 index: None,
+                request_id: None,
             })
         }
     }
@@ -222,6 +223,7 @@ impl StepBudget {
             code: Some(code.to_string()),
             reason: Some(step.to_string()),
             index: None,
+            request_id: None,
         };
         let _ = self.events_tx.send(event.clone());
         if let Some(ref nats) = self.nats {
@@ -1513,6 +1515,7 @@ mod integration_tests {
                 stream_task: Arc::new(std::sync::Mutex::new(None)),
                 post_stream_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
                 pending_permission_inputs: Arc::new(Mutex::new(HashMap::new())),
+                session_grants: Arc::default(),
                 auto_continue: Arc::new(AtomicBool::new(false)),
                 auto_continue_count: Arc::new(AtomicU32::new(0)),
                 max_auto_continues: 0,
