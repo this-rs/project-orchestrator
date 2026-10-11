@@ -456,6 +456,9 @@ pub trait TurnServices: Send + Sync {
     async fn model_for_images(&self, _session_id: &str) -> Option<String> {
         None
     }
+    /// The model [`Self::model_for_images`] named could not be made active: whatever the
+    /// host decided for the turn on that ground is undone. Default: nothing.
+    async fn image_model_not_applied(&self, _session_id: &str, _model: &str) {}
     /// Hands an event of the session to the other instances (NATS), as the Claude
     /// Code engine publishes each of its events. Default: nowhere.
     fn publish(&self, _session_id: &str, _event: &ChatEvent) {}
@@ -919,6 +922,9 @@ impl AgentSessionHandle {
                 if let Some(model) = services.model_for_images(&self.session_id).await {
                     if let Err(error) = self.set_model(&model).await {
                         tracing::warn!(session_id = %self.session_id, %model, %error, "the model that reads the images could not be made active");
+                        services
+                            .image_model_not_applied(&self.session_id, &model)
+                            .await;
                     }
                 }
             }
@@ -1635,6 +1641,8 @@ pub(crate) mod fake {
         pub permission_answers: StdMutex<Vec<(String, PermissionDecision)>>,
         pub interrupts: StdMutex<Vec<InterruptScope>>,
         pub models: StdMutex<Vec<String>>,
+        /// The next `set_model` fails with this error.
+        pub fail_set_model: StdMutex<Option<ProviderError>>,
         pub modes: StdMutex<Vec<PolicyMode>>,
         pub closed: AtomicBool,
         pub turns_started: StdMutex<Vec<String>>,
@@ -1763,6 +1771,9 @@ pub(crate) mod fake {
             Ok(CancelOutcome::default())
         }
         async fn set_model(&self, model: &str) -> Result<(), ProviderError> {
+            if let Some(error) = self.state.fail_set_model.lock().unwrap().take() {
+                return Err(error);
+            }
             self.state.models.lock().unwrap().push(model.to_string());
             Ok(())
         }
@@ -2902,6 +2913,7 @@ mod after_turn_tests {
         state: Arc<super::fake::FakeState>,
         turns_seen_when_asked: StdMutex<Option<usize>>,
         route_to: Option<&'static str>,
+        not_applied: StdMutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -2939,16 +2951,26 @@ mod after_turn_tests {
                 Some(self.state.turns_started.lock().unwrap().len());
             self.route_to.map(str::to_string)
         }
+        async fn image_model_not_applied(&self, _session_id: &str, model: &str) {
+            self.not_applied.lock().unwrap().push(model.to_string());
+        }
     }
 
     async fn image_turn(route_to: Option<&'static str>) -> (FakeProvider, Arc<ImageHost>) {
+        image_turn_on(FakeProvider::new(), route_to).await
+    }
+
+    async fn image_turn_on(
+        provider: FakeProvider,
+        route_to: Option<&'static str>,
+    ) -> (FakeProvider, Arc<ImageHost>) {
         let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let runtime = AgentRuntime::new(graph);
-        let provider = FakeProvider::new();
         let host = Arc::new(ImageHost {
             state: Arc::clone(&provider.state),
             turns_seen_when_asked: StdMutex::new(None),
             route_to,
+            not_applied: StdMutex::new(Vec::new()),
         });
         let handle = runtime
             .adopt(
@@ -2977,6 +2999,17 @@ mod after_turn_tests {
         let (provider, host) = image_turn(Some("vision")).await;
         assert_eq!(*host.turns_seen_when_asked.lock().unwrap(), Some(0));
         assert_eq!(*provider.state.models.lock().unwrap(), ["vision"]);
+    }
+
+    /// A model that could not be made active is handed back to the host, which undoes what
+    /// it decided for the turn (`TurnRouter::forget_image_change`).
+    #[tokio::test]
+    async fn a_model_that_could_not_be_made_active_is_handed_back_to_the_host() {
+        let provider = FakeProvider::new();
+        *provider.state.fail_set_model.lock().unwrap() = Some(ProviderError::Closed);
+        let (provider, host) = image_turn_on(provider, Some("vision")).await;
+        assert!(provider.state.models.lock().unwrap().is_empty());
+        assert_eq!(*host.not_applied.lock().unwrap(), ["vision"]);
     }
 
     #[tokio::test]

@@ -1779,6 +1779,12 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         super::agent_hooks::model_for_images(&router).await
     }
 
+    async fn image_model_not_applied(&self, session_id: &str, _model: &str) {
+        if let Some(router) = self.turn_routing.get(session_id) {
+            router.forget_image_change();
+        }
+    }
+
     async fn continuation(&self, session_id: &str) -> String {
         let ctx = super::post_stream::PostStreamContext::build(
             &self.graph,
@@ -2817,18 +2823,7 @@ impl ChatManager {
     ) -> Option<super::types::EffectiveCapabilities> {
         use super::types::{EffectiveCapabilities, EffectiveCapability, EffectiveCause};
         let images = match self.turn_routing.get(session_id) {
-            Some(router) => {
-                let images =
-                    super::agent_hooks::effective_images(&router, snapshot_images.unwrap_or(false))
-                        .await;
-                // Without a snapshot, a fallback on it has nothing to say.
-                if snapshot_images.is_none()
-                    && images.source == super::types::EffectiveSource::Snapshot
-                {
-                    return None;
-                }
-                images
-            }
+            Some(router) => super::agent_hooks::effective_images(&router, snapshot_images).await?,
             None => EffectiveCapability::snapshot(snapshot_images?, EffectiveCause::NoRouter),
         };
         Some(EffectiveCapabilities { images })
@@ -24891,5 +24886,141 @@ mod held_context_tests {
             "the objective step still ran after the stuck one"
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+/// F-R4: the host's own order — `prepare` hands the router the turn's input (its images
+/// included), so `model_for_images`, asked right after, routes an image turn to a model that
+/// reads it. Played with the REAL services and the real decision.
+#[cfg(test)]
+mod image_turn_services_tests {
+    use super::*;
+    use crate::chat::agent_hooks::{PoolSource, TurnRouter, TurnRouterSpec, TurnRouting};
+    use crate::chat::agent_runtime::TurnServices;
+    use crate::chat::message_attachments::{self, MessageAttachment};
+    use crate::chat::provider::cognitive::candidates::ModelFacts;
+    use crate::chat::provider::cognitive::decider::decide_with;
+    use crate::chat::provider::cognitive::decision::{CognitiveDecision, DecideRequest, Decider};
+    use crate::chat::provider::cognitive::scorer::PriorHints;
+    use crate::chat::provider::cognitive::{LearningStage, ProviderRoutingMode, RoutingSettings};
+
+    struct Real;
+
+    #[async_trait::async_trait]
+    impl Decider for Real {
+        async fn decide(&self, request: &DecideRequest) -> anyhow::Result<CognitiveDecision> {
+            Ok(decide_with(
+                Uuid::new_v4(),
+                chrono::Utc::now(),
+                request,
+                &[],
+                &PriorHints::new(),
+            ))
+        }
+    }
+
+    struct Pool;
+
+    #[async_trait::async_trait]
+    impl PoolSource for Pool {
+        async fn pool(&self, provider_id: &str) -> Vec<ModelFacts> {
+            self.project_pool(None)
+                .await
+                .into_iter()
+                .filter(|f| f.provider_id == provider_id)
+                .collect()
+        }
+        async fn project_pool(&self, _project_slug: Option<&str>) -> Vec<ModelFacts> {
+            ["flash", "vision"]
+                .into_iter()
+                .map(|model| ModelFacts {
+                    provider_id: "deepseek".into(),
+                    model: model.into(),
+                    supports_tools: true,
+                    supports_images: model == "vision",
+                    context_window: Some(1_000_000),
+                    window_unknown: None,
+                    price: None,
+                    cost_basis: nexus_claude::agent::CostBasis::Unknown,
+                    healthy: Some(true),
+                    allowed_for_project: true,
+                    sandboxed: false,
+                })
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_hands_the_router_the_images_so_the_turn_is_routed_before_it_is_sent() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let manager = ChatManager::new_without_memory(
+            graph.clone(),
+            crate::test_helpers::mock_app_state().meili,
+            ChatConfig {
+                max_sessions: 10,
+                ..Default::default()
+            },
+        );
+        let session = crate::test_helpers::test_chat_session(None);
+        graph.create_chat_session(&session).await.unwrap();
+        let sid = session.id.to_string();
+        let router = Arc::new(TurnRouter::new(TurnRouterSpec {
+            decider: Arc::new(Real),
+            pool: Arc::new(Pool),
+            routing: RoutingSettings {
+                mode: ProviderRoutingMode::Full,
+                stage: LearningStage::Auto,
+                exploration_epsilon: 0.0,
+                ..RoutingSettings::default()
+            },
+            provider_id: "deepseek".into(),
+            session_id: Some(session.id),
+            project_slug: None,
+            trust: false,
+            explicit_model: false,
+            provider_imposed: false,
+            allowed_models: None,
+            routing_pool: None,
+            current_model: "flash".into(),
+            next_turn: 0,
+            moved_in: false,
+        }));
+        router.set_model_live(true);
+        let routing = Arc::new(TurnRouting::default());
+        routing.insert(&sid, Arc::clone(&router));
+        let services = ManagerTurnServices {
+            graph: graph.clone(),
+            enrichment_pipeline: manager.enrichment_pipeline.clone(),
+            turn_routing: routing,
+            documents: crate::documents::store::DocumentStore::new(std::env::temp_dir()),
+            nats: None,
+            anchor: Default::default(),
+            session: AgentTurnState::default(),
+            search: crate::test_helpers::mock_app_state().meili,
+            event_emitter: None,
+            context_injector: None,
+            step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
+            stall_step: None,
+        };
+        // Before any turn input, nothing says an image comes.
+        assert_eq!(services.model_for_images(&sid).await, None);
+        let stored = message_attachments::encode(
+            "what is on this screenshot?",
+            &[MessageAttachment {
+                id: Uuid::new_v4(),
+                filename: "shot.png".into(),
+                mime_type: "image/png".into(),
+                size_bytes: 4,
+            }],
+        );
+        let turn = crate::refs::turn::expand_user_turn_if(&graph, &stored, false).await;
+        services.prepare(&sid, &stored, &stored, &turn).await;
+        assert_eq!(
+            services.model_for_images(&sid).await.as_deref(),
+            Some("vision")
+        );
+        // The host could not apply it: the router is put back as it was.
+        services.image_model_not_applied(&sid, "vision").await;
+        assert_eq!(router.next_turn_context(0).current_model, "flash");
     }
 }
