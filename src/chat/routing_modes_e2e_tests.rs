@@ -739,3 +739,70 @@ async fn a_pinned_model_is_never_substituted_even_in_a_conversation_in_auto() {
             .as_ref()
             .is_none_or(|c| (c.provider_id.as_str(), c.model.as_str()) == ("worker", "wa"))));
 }
+
+/// Review of #702 (2): a delegation (`spawned_by`) follows the settings' stage. It cannot
+/// put itself in Auto: `routing_mode: full` on its opening request is dropped, so under
+/// `primary` + `shadow` it opens on the primary, sends nothing elsewhere, stores no mode,
+/// and every decision is `shadow`, none applied.
+#[tokio::test]
+async fn a_delegation_cannot_put_itself_in_auto() {
+    use super::provider::cognitive::{LearningStage, ProviderRoutingMode};
+    let w = world("primary", "shadow").await;
+    let mut delegated = executor();
+    delegated.routing_mode = Some(ProviderRoutingMode::Full);
+    let e = open(&w, &delegated).await;
+    turn(&w, &e, DEBUG).await;
+    let opened = node(&w, &e).await;
+    assert_eq!(opened.provider_id.as_deref(), Some("primary"));
+    assert_eq!(opened.routing_mode, None, "no mode stored for a resume");
+    assert!(turns(&w.worker).is_empty(), "no turn went elsewhere");
+    let all = decisions(&w).await;
+    assert!(!all.is_empty());
+    assert!(
+        all.iter()
+            .all(|d| !d.applied && d.stage == LearningStage::Shadow),
+        "{all:#?}"
+    );
+}
+
+/// Review of #702 (4): a resume rebuilds the conversation's Auto from what the node stores
+/// (the mode as a string): after a close and a resume, under `primary` + `shadow`, the
+/// debug turn still changes the model, decided at `stage: auto`.
+#[tokio::test]
+async fn a_resumed_conversation_in_auto_still_routes_at_the_auto_stage() {
+    use super::provider::cognitive::{LearningStage, ProviderRoutingMode};
+    let w = world("primary", "shadow").await;
+    probe_wb(&w).await;
+    let mut auto = pilot();
+    auto.routing_mode = Some(ProviderRoutingMode::Full);
+    let p = open(&w, &auto).await;
+    assert_eq!(node(&w, &p).await.routing_mode.as_deref(), Some("full"));
+    w.manager.close_session(&p).await.unwrap();
+    let claims = crate::auth::jwt::Claims::service_account("e2e");
+    w.manager
+        .resume_session(&p, SIMPLE, Some(&claims))
+        .await
+        .unwrap_or_else(|e| panic!("resume failed: {e:#}"));
+    for _ in 0..400 {
+        if !model_of_turn(&w.worker, SIMPLE, &[DEBUG]).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(model_of_turn(&w.worker, SIMPLE, &[DEBUG]), ["wa"]);
+    idle(&w, &p).await;
+    let resumed_at = decisions_of(&w, &p).await.len();
+    let events = turn_events(&w, &p, DEBUG).await;
+    assert_eq!(model_of_turn(&w.worker, DEBUG, &[]), ["wb"]);
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, ChatEvent::ModelChanged { model } if model == "wb")));
+    let after = decisions_of(&w, &p).await;
+    assert!(after.len() > resumed_at, "the resumed turns are decided");
+    let change = after
+        .iter()
+        .find(|d| d.turn_index.is_some() && d.chosen.as_ref().is_some_and(|c| c.model == "wb"))
+        .expect("the debug turn is decided");
+    assert_eq!(change.stage, LearningStage::Auto);
+    assert!(change.applied, "{change:#?}");
+}

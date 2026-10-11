@@ -2534,6 +2534,65 @@ mod turn_routing {
             .count();
         assert_eq!(set_models, 1);
     }
+
+    /// Review of #702 (3): a change the session refuses (its `set_model` fails) leaves the
+    /// turn on the old model, and the stored decision says so: not applied, and why (as a
+    /// refused provider move does).
+    #[tokio::test]
+    async fn a_model_change_the_session_refuses_is_stored_not_applied() {
+        use crate::chat::manager::OpeningTurn;
+        use crate::chat::provider::cognitive::decider::CognitiveRouting;
+        use crate::chat::provider::cognitive::store::{DecisionFilter, RoutingArmStore};
+        use crate::neo4j::routing::Neo4jRoutingStore;
+        // The session cannot switch model live: its `set_model` fails.
+        let r = rig("full", "auto", false, None, vec![Answer::Pick("big")]).await;
+        let store = Arc::new(Neo4jRoutingStore::new(r.graph.clone()));
+        let manager = r
+            .manager
+            .with_cognitive_routing(CognitiveRouting::new(store.clone()));
+        let router = manager
+            .register_turn_router(
+                &r.sid,
+                "claude-code",
+                "small",
+                None,
+                OpeningTurn {
+                    provider_imposed: false,
+                    moved_in: false,
+                    routing_pool: None,
+                    routing_mode: None,
+                    explicit_model: false,
+                    permission_mode: None,
+                    message: DEBUG,
+                    next_turn: 0,
+                },
+            )
+            .await
+            .expect("a router is registered");
+        // The router believes it can: the change is decided, applied, then refused.
+        router.set_model_live(true);
+        manager.apply_turn_directive(&r.sid, DEBUG).await;
+        assert!(r
+            .provider
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::SetModel(m) if m == "big")));
+        let decided = r.decider.decisions.lock().unwrap()[0].clone();
+        assert!(decided.applied, "the decider applied it: {decided:#?}");
+        let stored = store
+            .decisions(&DecisionFilter::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == decided.id)
+            .expect("the refused change is stored on its decision");
+        assert!(!stored.applied, "{stored:#?}");
+        assert!(
+            stored.reason.ends_with("; not_changed: set_model_failed"),
+            "{}",
+            stored.reason
+        );
+    }
 }
 
 // ── Provider switch (B-SW) ──────────────────────────────────────────────────

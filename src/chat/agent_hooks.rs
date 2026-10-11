@@ -358,6 +358,10 @@ pub(crate) struct TurnRouter {
     /// is recorded, never applied (no two moves in a row).
     moved_in: AtomicBool,
     predecided: Mutex<Option<PreDecided>>,
+    /// The last decision asked for a turn, with the turn's index: the decision a change of
+    /// model comes from, which the host marks not applied when the change cannot be sent
+    /// ([`TurnRouter::decision_of_turn`]).
+    decided: Mutex<Option<(u32, CognitiveDecision)>>,
     last_message: Mutex<Option<String>>,
     state: Mutex<TurnState>,
     timeout: Duration,
@@ -377,20 +381,11 @@ struct RouterChoice {
     /// Every pair of the conversation's pool, whatever its provider: the candidates of a
     /// provider check in mode `full`. `None` = no pool.
     routing_pool: Option<Vec<RoutingPoolEntry>>,
-    /// The user handed this conversation's routing to PO (Auto, or a pool): its decisions
-    /// are taken at the `auto` stage whatever the settings' stage (decision R-S1).
-    conversation_routes: bool,
-}
-
-impl RouterChoice {
-    /// The settings the conversation's decisions are asked with: the stage is `auto` when
-    /// the user chose the conversation's routing ([`conversation_stage`]), the settings'
-    /// stage otherwise (sessions that asked nothing, executors, delegations).
-    fn settings(&self) -> RoutingSettings {
-        let mut settings = self.routing.clone();
-        settings.stage = conversation_stage(settings.stage, self.conversation_routes);
-        settings
-    }
+    /// The settings' stage the session opened with. `routing.stage` is the stage in force
+    /// for THIS conversation: `auto` when the user handed its routing to PO (Auto, or a
+    /// pool), this one otherwise (decision R-S1, [`conversation_stage`]). Kept so that
+    /// [`TurnRouter::reroute`] can fall back to it when the user picks one model again.
+    settings_stage: LearningStage,
 }
 
 /// What opens a [`TurnRouter`].
@@ -429,16 +424,19 @@ impl TurnRouter {
             pick: None,
             apply: false,
         });
+        let settings_stage = spec.routing.stage;
+        let mut routing = spec.routing;
+        routing.stage = conversation_stage(settings_stage, spec.conversation_routes);
         Self {
             decider: spec.decider,
             pool: spec.pool,
             choice: Mutex::new(RouterChoice {
-                routing: spec.routing,
+                routing,
                 explicit_model: spec.explicit_model,
                 provider_imposed: spec.provider_imposed,
                 allowed_models: spec.allowed_models,
                 routing_pool: spec.routing_pool,
-                conversation_routes: spec.conversation_routes,
+                settings_stage,
             }),
             provider_id: spec.provider_id,
             session_id: spec.session_id,
@@ -448,6 +446,7 @@ impl TurnRouter {
             manual: AtomicBool::new(false),
             moved_in: AtomicBool::new(spec.moved_in),
             predecided: Mutex::new(predecided),
+            decided: Mutex::new(None),
             last_message: Mutex::new(None),
             state: Mutex::new(TurnState {
                 current_model: spec.current_model,
@@ -494,8 +493,9 @@ impl TurnRouter {
         choice.routing_pool = None;
         // Auto, or a pool (`allowed_models` is only given for two models or more): the
         // user's choice, applied at the `auto` stage (decision R-S1).
-        choice.conversation_routes =
+        let conversation_routes =
             mode == ProviderRoutingMode::Full || choice.allowed_models.is_some();
+        choice.routing.stage = conversation_stage(choice.settings_stage, conversation_routes);
         self.manual.store(false, Ordering::SeqCst);
     }
 
@@ -511,6 +511,15 @@ impl TurnRouter {
         ctx.input_chars = input_chars;
         state.next_turn += 1;
         ctx
+    }
+
+    /// The decision asked for turn `turn_index`, if it is the last one asked: the decision
+    /// a change of that turn came from.
+    pub(crate) fn decision_of_turn(&self, turn_index: u32) -> Option<CognitiveDecision> {
+        locked(&self.decided)
+            .take()
+            .filter(|(turn, _)| *turn == turn_index)
+            .map(|(_, decision)| decision)
     }
 
     /// An applied change that could not be sent: the model did not change.
@@ -624,10 +633,13 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
     };
     // No two moves in a row: the turn right after a move (or a model change) is only recorded.
     let just_moved = router.moved_in.swap(false, Ordering::SeqCst);
-    let settings = choice.settings();
-    let apply = settings.stage == LearningStage::Auto && !just_moved && !just_changed;
+    let apply = choice.routing.stage == LearningStage::Auto && !just_moved && !just_changed;
     let current = Pick::new(&router.provider_id, &current_model);
-    let mut request = DecideRequest::new(router.signature(), settings_for(&settings, apply), pool);
+    let mut request = DecideRequest::new(
+        router.signature(),
+        settings_for(&choice.routing, apply),
+        pool,
+    );
     request.trust = router.trust;
     request.current = Some(current.clone());
     request.session_id = router.session_id;
@@ -636,6 +648,7 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
         return ProviderPlan::Stay;
     };
     let apply = apply && decision.applied;
+    *locked(&router.decided) = Some((turn, decision.clone()));
     *locked(&router.predecided) = Some(PreDecided {
         turn_index: turn,
         pick: decision.chosen.clone(),
@@ -712,9 +725,8 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
             let just_changed = locked(&router.state)
                 .last_change_turn
                 .is_some_and(|turn| turn.checked_add(1) == Some(ctx.turn_index));
-            let settings = choice.settings();
-            let apply = settings.stage == LearningStage::Auto && !just_changed;
-            let mut settings = settings_for(&settings, apply);
+            let apply = choice.routing.stage == LearningStage::Auto && !just_changed;
+            let mut settings = settings_for(&choice.routing, apply);
             // A pool is routed like `full` inside it, whatever the settings' mode.
             if choice.allowed_models.is_some() {
                 settings.mode = ProviderRoutingMode::Full;
@@ -732,6 +744,7 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
             let Some(decision) = router.ask(request).await else {
                 return TurnDirective::none();
             };
+            *locked(&router.decided) = Some((ctx.turn_index, decision.clone()));
             if !apply || !decision.applied {
                 return TurnDirective::none();
             }
@@ -1551,11 +1564,15 @@ mod provider_move_tests {
         assert_eq!(decider.last().settings.stage, LearningStage::Shadow);
 
         let router = router_after_auto(decider.clone());
+        // The stage in force lives in `choice.routing.stage` itself: every reader of it
+        // (F-R4's effective capabilities, `model_for_images`) gets the conversation's.
+        assert_eq!(locked(&router.choice).routing.stage, LearningStage::Auto);
         assert!(is_move_to(&plan_provider_move(&router).await, "local2"));
         assert_eq!(decider.last().settings.stage, LearningStage::Auto);
 
-        // One model ticked: strict, nothing is asked any more.
+        // One model ticked: strict, nothing is asked any more, the settings' stage is back.
         router.reroute(ProviderRoutingMode::Primary, None, true);
+        assert_eq!(locked(&router.choice).routing.stage, LearningStage::Shadow);
         let calls = decider.calls();
         assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
         let directive = directive_for_turn(&router, &TurnContext::new(2, "m")).await;
