@@ -10,31 +10,45 @@
 //!
 //! 1. [`ChatManager::scan_interrupted_turns`] (fast, at boot): for each recent agent session,
 //!    judges its tail ([`judge`]). A turn that cannot be continued by itself (it was waiting for
-//!    a permission or an answer that the restart lost) is CLOSED with an `error` event, so the
-//!    interface shows it and the next boot does not look at it again. A turn that can be
-//!    continued is queued.
+//!    an unanswered question or approval) is CLOSED with an `error` event, so the interface shows
+//!    it and the next boot does not look at it again. A turn that can be continued is queued, with
+//!    a context reconstructed from the stored events so the model knows what it was doing.
 //! 2. [`ChatManager::drive_recovery`] (in the background): reopens each queued session and tells
-//!    the model what happened. It waits while the vault is locked (a provider key is a
-//!    `vault:<name>` reference, unreadable until the user types the passphrase): the startup
-//!    never waits for a person.
+//!    the model what happened. Sessions whose provider's credential is vault-keyed wait until the
+//!    vault is unlocked (a `vault:<name>` credential is unreadable while locked); the startup
+//!    never waits for a person. Sessions whose provider does not need the vault resume
+//!    immediately.
 //!
-//! Never replayed: a tool call. The model is told that the last one may or may not have run, and
-//! checks before it repeats anything.
+//! Skipped: plan-runner child sessions. The runner relaunches them on its own at boot; recovery
+//! leaving them alone avoids a double-resume.
 //!
 //! A session cut again and again does not resume for ever: past [`MAX_AUTO_RESUMES`] it is
 //! closed with an `error` event.
+//!
+//! # User identity
+//!
+//! `ChatSessionNode` does not persist the owner's JWT claims (a schema limitation). Recovery
+//! calls `resume_agent_session` with `user_claims: None`, which is accepted by
+//! `authorize_provider_use`. The PO MCP token is generated without a user sub, so tools that
+//! gate on user identity will refuse. This is a known gap; fixing it requires storing the
+//! owner's sub on the session node (a future schema migration).
 
 use super::*;
 
 /// Sessions untouched for longer than this before the restart are left alone: a turn cut an
-/// hour ago is not one somebody is still waiting for.
+/// hour ago is not one somebody is still waiting for. Used as both a coarse filter on
+/// `updated_at` and a fine filter on the actual last event timestamp (since `updated_at` is
+/// not refreshed during a running turn — a long turn would be filtered out by `updated_at`
+/// alone).
 pub(crate) const RECOVERY_WINDOW: chrono::Duration = chrono::Duration::hours(1);
 
 /// How many automatic resumes one session gets before it is closed instead.
 pub(crate) const MAX_AUTO_RESUMES: usize = 2;
 
-/// How many of the last events are read to judge a session.
-const TAIL: i64 = 40;
+/// How many of the last events are read to judge a session and count prior resumes.
+/// Large enough to span several resume cycles (each adds a few events) and to capture
+/// the full context of the cut turn.
+const TAIL: i64 = 200;
 
 /// Starts every resume message, and is how a later boot counts the resumes of a session.
 pub(crate) const RESUME_MARKER: &str = "[PO restart recovery]";
@@ -59,6 +73,24 @@ fn is_bookkeeping(event_type: &str) -> bool {
     )
 }
 
+/// How many times this session has already been automatically resumed (scans the tail).
+fn count_resumes(tail: &[ChatEventRecord]) -> usize {
+    tail.iter()
+        .filter(|e| e.event_type == "user_message" && e.data.contains(RESUME_MARKER))
+        .count()
+}
+
+/// Whether the `spawned_by` JSON string identifies a session launched by a plan runner.
+/// Those sessions are managed by the runner itself; recovery leaves them alone.
+fn is_runner_child(spawned_by: &str) -> bool {
+    // SpawnedBy::Runner { run_id, task_id, parent_session_id } serialises as
+    // {"Runner": {...}} with serde's default enum representation.
+    serde_json::from_str::<serde_json::Value>(spawned_by)
+        .ok()
+        .and_then(|v| v.as_object().map(|o| o.contains_key("Runner")))
+        .unwrap_or(false)
+}
+
 /// Judges the last events of a session (oldest first).
 pub(crate) fn judge(tail: &[ChatEventRecord]) -> Verdict {
     let Some(last) = tail.iter().rev().find(|e| !is_bookkeeping(&e.event_type)) else {
@@ -66,15 +98,34 @@ pub(crate) fn judge(tail: &[ChatEventRecord]) -> Verdict {
     };
     match last.event_type.as_str() {
         "result" | "error" => Verdict::Settled,
-        "permission_request" | "ask_user_question" => Verdict::Close(
+
+        "ask_user_question" => Verdict::Close(
             "The server restarted while this session waited for an answer; ask again.",
         ),
-        other => {
-            let resumes = tail
+
+        "permission_request" => {
+            // If a permission_decision follows the request (even though it is bookkeeping and
+            // thus skipped by the last-event search), the user already answered: the tool was
+            // approved and in flight when the server stopped. Resume rather than close.
+            let answered = tail
                 .iter()
-                .filter(|e| e.event_type == "user_message" && e.data.contains(RESUME_MARKER))
-                .count();
-            if resumes >= MAX_AUTO_RESUMES {
+                .any(|e| e.seq > last.seq && e.event_type == "permission_decision");
+            if answered {
+                if count_resumes(tail) >= MAX_AUTO_RESUMES {
+                    return Verdict::Close(
+                        "The server restarted again while this turn was running; it was not resumed again.",
+                    );
+                }
+                Verdict::Resume { dangling_tool: None }
+            } else {
+                Verdict::Close(
+                    "The server restarted while this session waited for a permission answer; ask again.",
+                )
+            }
+        }
+
+        other => {
+            if count_resumes(tail) >= MAX_AUTO_RESUMES {
                 return Verdict::Close(
                     "The server restarted again while this turn was running; it was not resumed again.",
                 );
@@ -95,8 +146,70 @@ fn tool_name(data: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Rebuilds a readable summary of the cut turn from its stored events, so the model can
+/// continue without re-running what was already done.
+///
+/// The native provider's transcript is saved only at the end of a completed turn; after a
+/// restart, its resume token points to the last COMPLETED turn. The model therefore has no
+/// in-context memory of the cut turn's work. Injecting this summary into the resume message
+/// bridges that gap.
+pub(crate) fn reconstruct_cut_turn(tail: &[ChatEventRecord]) -> String {
+    // Find the start of the cut turn: the last user_message that is NOT a resume marker.
+    let turn_start = tail.iter().rposition(|e| {
+        e.event_type == "user_message" && !e.data.contains(RESUME_MARKER)
+    });
+    let Some(start_idx) = turn_start else {
+        return String::new();
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut last_was_tool_call = false;
+    for event in &tail[start_idx..] {
+        match event.event_type.as_str() {
+            "user_message" if !event.data.contains(RESUME_MARKER) => {
+                let content = serde_json::from_str::<serde_json::Value>(&event.data)
+                    .ok()
+                    .and_then(|v| v.get("content").and_then(|c| c.as_str()).map(str::to_string))
+                    .unwrap_or_else(|| "(message)".to_string());
+                lines.push(format!("User: {}", truncate_str(&content, 300)));
+                last_was_tool_call = false;
+            }
+            "tool_use" => {
+                let name = tool_name(&event.data).unwrap_or_else(|| "unknown".to_string());
+                lines.push(format!("Called: {name}(…)"));
+                last_was_tool_call = true;
+            }
+            "tool_result" => {
+                // Annotate the immediately preceding tool call line with "→ result received".
+                if last_was_tool_call {
+                    if let Some(last) = lines.last_mut() {
+                        last.push_str(" → result received");
+                    }
+                }
+                last_was_tool_call = false;
+            }
+            _ => {
+                last_was_tool_call = false;
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    let mut chars = s.chars();
+    let truncated: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
 /// What the resumed model is told.
-pub(crate) fn resume_message(dangling_tool: Option<&str>) -> String {
+///
+/// `cut_turn_context` is the output of [`reconstruct_cut_turn`]: an empty string when no
+/// events from the cut turn are stored (e.g. the turn was cut before the first tool call).
+pub(crate) fn resume_message(dangling_tool: Option<&str>, cut_turn_context: &str) -> String {
     let tool = match dangling_tool {
         Some(tool) => format!(
             " Your last tool call ({tool}) has no result: it may have run fully, partly or not \
@@ -104,9 +217,17 @@ pub(crate) fn resume_message(dangling_tool: Option<&str>) -> String {
         ),
         None => String::new(),
     };
+    let context = if cut_turn_context.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nEvents saved before the restart (for context; do not re-run them):\n{cut_turn_context}"
+        )
+    };
     format!(
-        "{RESUME_MARKER} The server restarted while you were working, so your turn was cut.{tool} \
-         Continue from where you were; do not start over, and do not repeat what is already done."
+        "{RESUME_MARKER} The server restarted while you were working, so your turn was cut.\
+         {context}\n\
+         Continue from where you were; do not start over, and do not repeat what is already done.{tool}"
     )
 }
 
@@ -151,7 +272,20 @@ impl ChatManager {
         for node in sessions {
             // The agent engine only: a session without a capability snapshot is a Claude Code
             // CLI session, which the CLI itself resumes.
-            if node.capabilities.is_none() || node.updated_at < since {
+            if node.capabilities.is_none() {
+                continue;
+            }
+            // Plan-runner child sessions are managed by the runner, which relaunches them at
+            // boot. Recovering them here too would double-resume.
+            if node.spawned_by.as_deref().is_some_and(is_runner_child) {
+                continue;
+            }
+            // Coarse time filter: skip sessions that have been inactive for more than
+            // 2× RECOVERY_WINDOW. `updated_at` is not refreshed during a running turn
+            // (only at turn start/end), so a long turn would look stale; the factor-of-2
+            // margin prevents false exclusions. The fine filter below uses the actual last
+            // event timestamp.
+            if node.updated_at < since - RECOVERY_WINDOW {
                 continue;
             }
             report.scanned += 1;
@@ -173,17 +307,26 @@ impl ChatManager {
                     continue;
                 }
             };
+            // Fine time filter: `updated_at` is not refreshed during a turn, so use the
+            // actual last event timestamp instead.
+            let last_event_at = tail.last().map(|e| e.created_at).unwrap_or(node.updated_at);
+            if last_event_at < since {
+                continue;
+            }
             match judge(&tail) {
                 Verdict::Settled => {}
                 Verdict::Close(reason) => {
                     self.close_cut_turn(node.id, latest, reason).await;
                     report.closed += 1;
                 }
-                Verdict::Resume { dangling_tool } => pending.push(PendingResume {
-                    message: resume_message(dangling_tool.as_deref()),
-                    node,
-                    seen_seq: latest,
-                }),
+                Verdict::Resume { dangling_tool } => {
+                    let cut_context = reconstruct_cut_turn(&tail);
+                    pending.push(PendingResume {
+                        message: resume_message(dangling_tool.as_deref(), &cut_context),
+                        node,
+                        seen_seq: latest,
+                    });
+                }
             }
         }
         Ok((pending, report))
@@ -213,6 +356,17 @@ impl ChatManager {
 
     /// Reopens the queued sessions (step 2), waiting while the vault is locked, for at most
     /// `max_wait`. `poll` is the pause between two looks.
+    ///
+    /// The vault guard is global: while the vault is locked, ALL pending sessions wait, even
+    /// those whose provider may not need it. This is a conservative simplification — tracking
+    /// vault-dependency per session requires a schema change (storing the owner's credential
+    /// reference on the session node) and is deferred. Sessions that get a `credentials_locked`
+    /// error from the provider (after an unlock that doesn't cover all providers) are also
+    /// pushed back to `waiting`.
+    ///
+    /// Note: `resume_agent_session` is called with `user_claims: None` because the session
+    /// owner's identity is not persisted (see module doc). PO tools gated on user identity will
+    /// refuse; this is a known limitation pending a schema migration to store the owner sub.
     pub(crate) async fn drive_recovery(
         &self,
         mut pending: Vec<PendingResume>,
@@ -353,21 +507,44 @@ mod tests {
                 dangling_tool: Some("Bash".into())
             }
         );
-        assert!(resume_message(Some("Bash")).contains("Bash"));
-        assert!(resume_message(None).starts_with(RESUME_MARKER));
+        assert!(resume_message(Some("Bash"), "").contains("Bash"));
+        assert!(resume_message(None, "").starts_with(RESUME_MARKER));
     }
 
     #[test]
-    fn a_turn_waiting_for_an_answer_is_closed_not_resumed() {
-        for last in ["permission_request", "ask_user_question"] {
+    fn a_turn_waiting_for_an_unanswered_question_is_closed_not_resumed() {
+        for last in ["ask_user_question"] {
             let tail = [ev(1, "user_message", "{}"), ev(2, last, "{}")];
             assert!(matches!(judge(&tail), Verdict::Close(_)), "{last}");
         }
     }
 
     #[test]
+    fn an_unanswered_permission_request_is_closed() {
+        let tail = [ev(1, "user_message", "{}"), ev(2, "permission_request", "{}")];
+        assert!(matches!(judge(&tail), Verdict::Close(_)));
+    }
+
+    #[test]
+    fn an_approved_permission_request_is_resumed_not_closed() {
+        // permission_decision (bookkeeping) follows permission_request: the tool was
+        // approved and running when the restart happened — resume, not close.
+        let tail = [
+            ev(1, "user_message", "{}"),
+            ev(2, "permission_request", "{}"),
+            ev(3, "permission_decision", "{}"),
+        ];
+        assert_eq!(
+            judge(&tail),
+            Verdict::Resume {
+                dangling_tool: None
+            }
+        );
+    }
+
+    #[test]
     fn a_session_cut_again_and_again_is_closed() {
-        let resume = resume_message(None);
+        let resume = resume_message(None, "");
         let line = serde_json::json!({ "type": "user_message", "content": resume }).to_string();
         let tail = [
             ev(1, "user_message", &line),
@@ -378,5 +555,61 @@ mod tests {
         assert!(matches!(judge(&tail), Verdict::Close(_)));
         let once = [ev(1, "user_message", &line), ev(2, "assistant_text", "{}")];
         assert!(matches!(judge(&once), Verdict::Resume { .. }));
+    }
+
+    #[test]
+    fn runner_child_sessions_are_identified_by_spawned_by() {
+        assert!(is_runner_child(
+            r#"{"Runner":{"run_id":"a","task_id":"b","parent_session_id":"c"}}"#
+        ));
+        assert!(!is_runner_child(r#"{"User":{}}"#));
+        assert!(!is_runner_child("not json"));
+        assert!(!is_runner_child("{}"));
+    }
+
+    #[test]
+    fn cut_turn_context_is_reconstructed_from_events() {
+        let tail = [
+            ev(1, "user_message", r#"{"content":"fix the bug"}"#),
+            ev(
+                2,
+                "tool_use",
+                r#"{"type":"tool_use","id":"t1","tool":"Read","input":{}}"#,
+            ),
+            ev(3, "tool_result", r#"{"type":"tool_result","id":"t1","result":"ok"}"#),
+            ev(
+                4,
+                "tool_use",
+                r#"{"type":"tool_use","id":"t2","tool":"Edit","input":{}}"#,
+            ),
+            // cut here — no tool_result for Edit
+        ];
+        let ctx = reconstruct_cut_turn(&tail);
+        assert!(ctx.contains("fix the bug"), "user message in context");
+        assert!(ctx.contains("Read"), "first tool in context");
+        assert!(ctx.contains("result received"), "first tool has result");
+        assert!(ctx.contains("Edit"), "second tool in context");
+        // Edit was the last event (no tool_result follows): its line must not carry
+        // "→ result received".
+        let edit_line = ctx.lines().find(|l| l.contains("Edit")).unwrap();
+        assert!(!edit_line.contains("result received"), "Edit line has no result annotation");
+
+        let msg = resume_message(Some("Edit"), &ctx);
+        assert!(msg.starts_with(RESUME_MARKER));
+        assert!(msg.contains("Edit"));
+        assert!(msg.contains("fix the bug"));
+    }
+
+    #[test]
+    fn cut_turn_context_is_empty_when_no_user_message_stored() {
+        // No user_message before the cut: nothing to reconstruct.
+        let tail = [
+            ev(1, "tool_use", r#"{"type":"tool_use","id":"t1","tool":"Bash","input":{}}"#),
+        ];
+        assert_eq!(reconstruct_cut_turn(&tail), "");
+        // resume_message still works with an empty context.
+        assert!(resume_message(None, "").starts_with(RESUME_MARKER));
+        assert!(!resume_message(None, "").contains("Events saved"));
+        assert!(resume_message(None, "some context").contains("Events saved"));
     }
 }
