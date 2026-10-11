@@ -534,10 +534,9 @@ mod tests {
 
     #[test]
     fn a_turn_waiting_for_an_unanswered_question_is_closed_not_resumed() {
-        for last in ["ask_user_question"] {
-            let tail = [ev(1, "user_message", "{}"), ev(2, last, "{}")];
-            assert!(matches!(judge(&tail), Verdict::Close(_)), "{last}");
-        }
+        let last = "ask_user_question";
+        let tail = [ev(1, "user_message", "{}"), ev(2, last, "{}")];
+        assert!(matches!(judge(&tail), Verdict::Close(_)), "{last}");
     }
 
     #[test]
