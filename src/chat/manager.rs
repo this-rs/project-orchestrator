@@ -1500,6 +1500,25 @@ pub(crate) const CHILD_ENV_TOOLING: &[&str] = &[
 /// of variable names (e.g. `GH_TOKEN,AWS_PROFILE`).
 pub(crate) const CHILD_ENV_INHERIT_VAR: &str = "CHAT_CHILD_ENV_INHERIT";
 
+/// The person behind these claims, as the owner of what they open (P11b): the `sub` of a
+/// person's session JWT, of their MCP token, or of an agent session token minted for them.
+/// `None` for the server's own service account, the anonymous user (no-auth mode, the
+/// standalone MCP server) and any other kind of token (a vault token opens nothing).
+pub(crate) fn person_behind(claims: &crate::auth::jwt::Claims) -> Option<&str> {
+    use crate::auth::jwt::{
+        ANONYMOUS_USER_ID, SERVICE_ACCOUNT_EMAIL, TOKEN_TYPE_AGENT_SESSION, TOKEN_TYPE_MCP,
+    };
+    let kind_of_person = match claims.token_type.as_deref() {
+        None => true,
+        Some(kind) => kind == TOKEN_TYPE_MCP || kind == TOKEN_TYPE_AGENT_SESSION,
+    };
+    (kind_of_person
+        && claims.email != SERVICE_ACCOUNT_EMAIL
+        && claims.sub != ANONYMOUS_USER_ID.to_string()
+        && !claims.sub.is_empty())
+    .then_some(claims.sub.as_str())
+}
+
 /// The MCP server names the native engine keeps for the servers the backend attaches
 /// (nexus-tools, the browser). A server of the session under one of them would REPLACE
 /// the backend's (nexus only attaches its defaults when the name is free), and its tools
@@ -3884,23 +3903,42 @@ impl ChatManager {
     }
 
     /// The person a session opened by these claims belongs to (`ChatSessionNode::owner`,
-    /// P11b): a signed-in person is the owner; an agent session's token hands down the
-    /// owner of the session it was minted for (a delegated session belongs to the person
-    /// behind its parent); the server itself (a plan run, a protocol), an anonymous caller
-    /// or no claims at all: nobody.
+    /// P11b):
+    /// - a signed-in person, with their session JWT or their MCP token, is the owner;
+    /// - an agent session's token hands down the owner of the session it was minted for (a
+    ///   delegated session belongs to the person behind its parent). When that parent
+    ///   cannot be read, the token's own `sub` (the person it was minted for, copied by
+    ///   `generate_session_token`) is the owner; a token minted for the server itself is
+    ///   then REFUSED: a session is never left without an owner by a read that failed
+    ///   (`owner` is written once, at open);
+    /// - the server itself (a plan run, a protocol), an anonymous caller or no claims at
+    ///   all: nobody.
     pub(crate) async fn session_owner(
         &self,
         claims: Option<&crate::auth::jwt::Claims>,
-    ) -> Option<String> {
-        let claims = claims?;
+    ) -> Result<Option<String>> {
+        let Some(claims) = claims else {
+            return Ok(None);
+        };
         if claims.is_agent_session() {
-            let parent = crate::auth::jwt::agent_session_binding(claims)?
-                .session_id
-                .parse::<Uuid>()
-                .ok()?;
-            return self.graph.get_chat_session(parent).await.ok()??.owner;
+            let parent = crate::auth::jwt::agent_session_binding(claims)
+                .and_then(|binding| binding.session_id.parse::<Uuid>().ok());
+            let read = match parent {
+                Some(parent) => self.graph.get_chat_session(parent).await.ok().flatten(),
+                None => None,
+            };
+            if let Some(parent) = read {
+                return Ok(parent.owner);
+            }
+            return match person_behind(claims) {
+                Some(sub) => Ok(Some(sub.to_string())),
+                None => Err(anyhow!(
+                    "the session that opens this one cannot be read, and its token names no \
+                     person: the new session would have no owner"
+                )),
+            };
         }
-        (claims.is_human() && !claims.is_service_account()).then(|| claims.sub.clone())
+        Ok(person_behind(claims).map(str::to_string))
     }
 
     /// Environment of the project-orchestrator MCP server of one session: the
@@ -4543,6 +4581,9 @@ impl ChatManager {
         relay: Option<&super::relay::RelayedFrom>,
         session_id: Uuid,
     ) -> Result<CreateSessionResponse> {
+        // Who the session belongs to, settled before anything is opened: a refusal (no owner
+        // can be named for a delegated session) leaves nothing behind.
+        let owner = self.session_owner(request.user_claims.as_ref()).await?;
         // Check max sessions
         {
             let sessions = self.active_sessions.read().await;
@@ -4720,7 +4761,7 @@ impl ChatManager {
                 super::neutral_place::ExecutionPlace::Project
             },
             access,
-            owner: self.session_owner(request.user_claims.as_ref()).await,
+            owner,
         };
         self.graph
             .create_chat_session(&session_node)
@@ -13478,12 +13519,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            m.session_owner(Some(&human)).await,
+            m.session_owner(Some(&human)).await.unwrap(),
             Some(person.to_string())
         );
         let server = crate::auth::jwt::Claims::service_account("runner");
-        assert_eq!(m.session_owner(Some(&server)).await, None);
-        assert_eq!(m.session_owner(None).await, None);
+        assert_eq!(m.session_owner(Some(&server)).await.unwrap(), None);
+        assert_eq!(m.session_owner(None).await.unwrap(), None);
 
         // The agent session token of a session P owns opens sessions P owns.
         let parent = crate::neo4j::models::ChatSessionNode {
@@ -13502,8 +13543,94 @@ mod tests {
         let agent = crate::auth::jwt::decode_jwt(&token, secret).unwrap();
         assert!(agent.is_agent_session());
         assert_eq!(
-            m.session_owner(Some(&agent)).await,
+            m.session_owner(Some(&agent)).await.unwrap(),
             Some(person.to_string())
+        );
+    }
+
+    /// Review of #699, finding 2: a read of the parent that fails never leaves a delegated
+    /// session without an owner (written once, at open). The token's `sub` is the person
+    /// it was minted for; a token minted for the server itself is refused.
+    #[tokio::test]
+    async fn a_delegated_session_whose_parent_cannot_be_read_is_not_left_without_owner() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        let m = ChatManager::new_without_memory(graph, mock_app_state().meili, test_config());
+        let secret = "test-secret-key-minimum-32-chars!!";
+        let parent = crate::neo4j::models::ChatSessionNode {
+            owner: Some("someone-else".into()),
+            ..crate::test_helpers::test_chat_session(None)
+        };
+        mock.create_chat_session(&parent).await.unwrap();
+        let binding = crate::auth::jwt::AgentSessionBinding {
+            session_id: parent.id.to_string(),
+            ceiling: None,
+            tool_profile: None,
+            third_party: false,
+        };
+        let agent_of = |claims: &crate::auth::jwt::Claims| {
+            let (token, _) =
+                crate::auth::jwt::generate_session_token(claims, Some(&binding), secret, 60)
+                    .unwrap();
+            crate::auth::jwt::decode_jwt(&token, secret).unwrap()
+        };
+        let person = Uuid::new_v4();
+        let human = crate::auth::jwt::decode_jwt(
+            &crate::auth::jwt::encode_jwt(person, "p@ffs.holdings", "P", secret, 60).unwrap(),
+            secret,
+        )
+        .unwrap();
+        mock.fail_reads.lock().unwrap().insert("get_chat_session");
+
+        assert_eq!(
+            m.session_owner(Some(&agent_of(&human))).await.unwrap(),
+            Some(person.to_string()),
+            "the person the token was minted for"
+        );
+        let server = crate::auth::jwt::Claims::service_account("runner");
+        assert!(
+            m.session_owner(Some(&agent_of(&server))).await.is_err(),
+            "no person to fall back on: the open is refused"
+        );
+
+        // Readable again: the parent's owner wins over the token's `sub`.
+        mock.fail_reads.lock().unwrap().clear();
+        assert_eq!(
+            m.session_owner(Some(&agent_of(&human))).await.unwrap(),
+            Some("someone-else".to_string())
+        );
+    }
+
+    /// Review of #699, finding 3: a person opening a session from an MCP client (their MCP
+    /// token) owns it, like with their session JWT.
+    #[tokio::test]
+    async fn a_session_opened_with_a_persons_mcp_token_belongs_to_that_person() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        let m = ChatManager::new_without_memory(graph, mock_app_state().meili, test_config());
+        let secret = "test-secret-key-minimum-32-chars!!";
+        let person = Uuid::new_v4();
+        let (token, _) = crate::auth::jwt::encode_mcp_token(
+            person,
+            "p@ffs.holdings",
+            "P",
+            "mcp:read mcp:write",
+            secret,
+            60,
+        )
+        .unwrap();
+        let mcp = crate::auth::jwt::decode_jwt(&token, secret).unwrap();
+        assert!(mcp.is_mcp_token());
+        assert_eq!(
+            m.session_owner(Some(&mcp)).await.unwrap(),
+            Some(person.to_string())
+        );
+        // The anonymous user (no-auth mode, the standalone MCP server) owns nothing.
+        assert_eq!(
+            m.session_owner(Some(&crate::auth::jwt::Claims::anonymous()))
+                .await
+                .unwrap(),
+            None
         );
     }
 

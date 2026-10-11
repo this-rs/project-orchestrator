@@ -908,14 +908,17 @@ pub async fn respond_permission(
         .ok_or_else(|| AppError::NotFound(format!("Session {} not found", session_id)))?;
     // Only the person the session belongs to answers it (review #679 finding 6): another
     // signed-in user could otherwise approve, or grant for the session, a call in someone
-    // else's conversation.
-    if let Some(axum::Extension(caller)) = &claims {
-        if !session.answerable_by(&caller.sub) {
-            return Err(AppError::Forbidden(
-                "only the person this conversation belongs to can answer its permission requests"
-                    .to_string(),
-            ));
-        }
+    // else's conversation. A caller without claims (authentication off) is nobody: a
+    // session that has an owner is refused, as on the WebSocket (which carries the
+    // anonymous user then); a session without one is answered as before.
+    let caller = claims
+        .as_ref()
+        .map_or("", |axum::Extension(c)| c.sub.as_str());
+    if !session.answerable_by(caller) {
+        return Err(AppError::Forbidden(
+            "only the person this conversation belongs to can answer its permission requests"
+                .to_string(),
+        ));
     }
 
     let status = |events: Vec<crate::neo4j::models::ChatEventRecord>| {

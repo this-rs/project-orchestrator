@@ -19,6 +19,8 @@ pub mod mcp_federation_handlers;
 pub mod network_tools_handlers;
 pub mod neural_routing_handlers;
 pub mod note_handlers;
+#[cfg(test)]
+mod permission_ws_tests;
 pub mod persona_handlers;
 pub mod profile_handlers;
 pub mod project_handlers;

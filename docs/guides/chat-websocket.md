@@ -195,9 +195,12 @@ on the WebSocket as on REST and NATS. The resulting `permission_decision` carrie
 `POST /api/chat/sessions/{id}/permissions/{request_id}` takes `{"allow", "scope"?}` (400
 `permission_scope_unsupported`); it is a human route (an agent session token gets 403). Only
 the person the conversation belongs to answers it (the one who opened it, or the person behind
-the agent session that opened it; a session the server opened itself has no owner): another
-person gets 403 on REST and, on the WebSocket, an `error` frame `{"code":
-"permission_forbidden", "request_id": "<id>"}`; nothing is answered.
+the agent session that opened it, or the person whose MCP token opened it; a session the server
+opened itself has no owner): another person gets 403 on REST and, on the WebSocket, an `error`
+frame `{"code": "permission_forbidden", "reason": "not_owner", "request_id": "<id>"}`; nothing
+is answered. The check fails closed: when the session cannot be read, the WebSocket refuses with
+`"reason": "owner_unreadable"` (REST: 500 / 404), and with the authentication off (no person
+behind the caller) a session that has an owner is refused on both.
 
 #### `input_response` -- Respond to an input request
 
