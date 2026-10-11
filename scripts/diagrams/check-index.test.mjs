@@ -590,6 +590,30 @@ test('verified_sha: ancetre de HEAD, hors historique, absent, ou non verifiable 
   }
 });
 
+test('verified_sha: un sha abrege qui designe plusieurs commits est ambigu', () => {
+  const root = mkdtempSync(join(tmpdir(), 'diagram-sha-ambiguous-'));
+  try {
+    const repo = join(root, 'repo');
+    mkdirSync(repo);
+    execFileSync('git', ['-C', repo, 'init', '-q']);
+    // Assez de commits pour que deux d'entre eux partagent un prefixe de 4 caracteres.
+    let stream = '';
+    for (let i = 0; i < 1500; i++) {
+      const msg = `c${i}\n`;
+      stream += `commit refs/heads/many\ncommitter t <t@t> ${i} +0000\ndata ${Buffer.byteLength(msg)}\n${msg}\n`;
+    }
+    const imported = spawnSync('git', ['-C', repo, 'fast-import', '--quiet'], { input: stream, encoding: 'utf8' });
+    assert.equal(imported.status, 0, imported.stderr);
+    const shas = execFileSync('git', ['-C', repo, 'rev-list', 'refs/heads/many'], { encoding: 'utf8' }).trim().split('\n');
+    const seen = new Set();
+    const prefix = shas.map((s) => s.slice(0, 4)).find((p) => (seen.has(p) ? true : (seen.add(p), false)));
+    assert.ok(prefix, 'deux commits partagent un prefixe');
+    assert.equal(commitStatus(repo, prefix), 'ambiguous');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('gate: un verified_sha qui ne designe aucun commit du depot echoue', () => {
   const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
   try {

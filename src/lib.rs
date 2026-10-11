@@ -1814,17 +1814,21 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         let engine = Arc::new(runner::TriggerEngine::new(graph.clone()));
         // A trigger that fires starts its plan's run, through the same runner
         // factory as POST /api/plans/{id}/run.
-        let dispatcher = Arc::new(runner::TriggerDispatcher::new(
-            graph.clone(),
-            engine,
-            Arc::new(runner::PlanRunnerFactory::new(
-                cm.clone(),
+        let dispatcher = Arc::new(
+            runner::TriggerDispatcher::new(
                 graph.clone(),
-                orchestrator.context_builder().clone(),
-                orchestrator.runner_config(),
-                Some(event_bus.clone() as Arc<dyn events::EventEmitter>),
-            )),
-        ));
+                engine,
+                Arc::new(runner::PlanRunnerFactory::new(
+                    cm.clone(),
+                    graph.clone(),
+                    orchestrator.context_builder().clone(),
+                    orchestrator.runner_config(),
+                    Some(event_bus.clone() as Arc<dyn events::EventEmitter>),
+                )),
+            )
+            // Authors the access policy no longer lets in start no run.
+            .with_access_policy(config.auth_config.clone()),
+        );
 
         // Schedule provider — evaluates cron triggers every 60s
         let schedule_provider = runner::providers::schedule::ScheduleProvider::new(

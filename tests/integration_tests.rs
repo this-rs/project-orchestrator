@@ -1002,6 +1002,7 @@ async fn test_trigger_type_filter_is_bound_not_spliced() {
         created_at: chrono::Utc::now(),
         author: None,
         disabled_reason: None,
+        approved_mark: None,
     };
     let schedule = Trigger {
         id: Uuid::new_v4(),
@@ -1114,6 +1115,7 @@ async fn test_trigger_firing_binds_plan_run_id() {
         created_at: chrono::Utc::now(),
         author: None,
         disabled_reason: None,
+        approved_mark: None,
     };
     client.create_trigger_impl(&trigger).await.unwrap();
 
@@ -1258,6 +1260,7 @@ async fn trigger_on_new_plan(
         created_at: chrono::Utc::now(),
         author: None,
         disabled_reason: None,
+        approved_mark: None,
     };
     client.create_trigger_impl(&trigger).await.unwrap();
     trigger
@@ -1544,6 +1547,61 @@ async fn test_trigger_without_author_is_disabled_at_startup() {
     for t in [&legacy, &webhook, &authored] {
         drop_trigger_and_plan(&client, &raw, t).await;
     }
+}
+
+/// (Round 3, nit) The approval records the plan's mark in the approving write
+/// itself (create, enable), from the database: what the dispatcher compares
+/// is two values the database wrote, never two clocks.
+#[tokio::test]
+async fn test_trigger_approval_records_the_plans_mark() {
+    use project_orchestrator::runner::{PlanContent, TriggerAuthor, TriggerType};
+    let Some((client, raw)) = trigger_test_graph().await else {
+        return;
+    };
+    // No mark yet: the approval records none.
+    let trigger = trigger_on_new_plan(&client, &raw, TriggerType::Schedule, 0).await;
+    let stored = client.get_trigger_impl(trigger.id).await.unwrap().unwrap();
+    assert_eq!(stored.approved_mark, None);
+
+    // A third party writes the plan: the trigger's approval no longer matches.
+    client
+        .mark_third_party_write_impl(PlanContent::Plan(trigger.plan_id))
+        .await
+        .unwrap();
+    let mark = client
+        .plan_third_party_written_at_impl(trigger.plan_id)
+        .await
+        .unwrap()
+        .expect("marked");
+    assert_ne!(
+        client
+            .get_trigger_impl(trigger.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .approved_mark,
+        Some(mark)
+    );
+
+    // Enabling approves the plan as it is: the mark is recorded, exactly.
+    let author = TriggerAuthor::from_claims(
+        &project_orchestrator::auth::jwt::Claims::service_account("integration-author"),
+    );
+    let enabled = client
+        .enable_trigger_as_impl(trigger.id, &author)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(enabled.approved_mark, Some(mark));
+
+    // A trigger created on the marked plan records it at creation.
+    let mut second = trigger.clone();
+    second.id = Uuid::new_v4();
+    let created = client.create_trigger_impl(&second).await.unwrap();
+    assert_eq!(created.approved_mark, Some(mark));
+
+    client.delete_trigger_impl(second.id).await.unwrap();
+    drop_trigger_and_plan(&client, &raw, &trigger).await;
 }
 
 /// (Round 2, finding 1) A write by a third-party session on a plan, a task,

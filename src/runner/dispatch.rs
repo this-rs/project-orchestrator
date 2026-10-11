@@ -269,7 +269,8 @@ pub struct FireRequest {
 /// their cooldown.
 pub const MAX_EVENT_CHAIN_DEPTH: u32 = 5;
 
-/// `Trigger::disabled_reason` of a trigger whose author is no longer a user.
+/// `Trigger::disabled_reason` of a trigger whose author is no longer a user,
+/// or is no longer allowed in by the access policy.
 pub const AUTHOR_REVOKED: &str = "author_revoked";
 
 /// `Trigger::disabled_reason` the startup migration sets on a schedule or
@@ -302,6 +303,9 @@ pub struct TriggerDispatcher {
     graph: Arc<dyn GraphStore>,
     engine: Arc<TriggerEngine>,
     starter: Arc<dyn PlanRunStarter>,
+    /// The server's access policy (`allowed_email_domain` / `allowed_emails`),
+    /// applied to a trigger's author when it fires. `None`: no-auth mode.
+    access_policy: Option<crate::AuthConfig>,
 }
 
 impl std::fmt::Debug for TriggerDispatcher {
@@ -320,7 +324,16 @@ impl TriggerDispatcher {
             graph,
             engine,
             starter,
+            access_policy: None,
         }
+    }
+
+    /// Applies the server's access policy to trigger authors at fire time: an
+    /// author the policy no longer lets in (removed from the allow-list) is
+    /// revoked, as their own requests are refused.
+    pub fn with_access_policy(mut self, policy: Option<crate::AuthConfig>) -> Self {
+        self.access_policy = policy;
+        self
     }
 
     /// Evaluate the guards of `trigger` and, when it fires, start the plan run
@@ -360,6 +373,7 @@ impl TriggerDispatcher {
         {
             return self.refused(trigger, request.payload, error).await;
         }
+        let unapproved = self.unapproved_since(trigger).await?;
 
         match self
             .graph
@@ -394,14 +408,10 @@ impl TriggerDispatcher {
             Some(error) => Err(anyhow!(error)),
             None => match resolve_run_location(self.graph.as_ref(), trigger.plan_id).await {
                 Ok((cwd, project_slug)) => {
-                    match self.run_claims_now(trigger, request.claims).await {
-                        Ok(claims) => {
-                            self.starter
-                                .start_run(trigger.plan_id, source, cwd, project_slug, claims)
-                                .await
-                        }
-                        Err(e) => Err(e),
-                    }
+                    let claims = Self::run_claims_now(trigger, request.claims, unapproved);
+                    self.starter
+                        .start_run(trigger.plan_id, source, cwd, project_slug, claims)
+                        .await
                 }
                 Err(e) => Err(e),
             },
@@ -464,30 +474,33 @@ impl TriggerDispatcher {
         caller.or_else(|| trigger.author.as_ref().map(|a| a.claims()))
     }
 
-    /// [`Self::run_claims`], restricted when a third-party session wrote the
-    /// plan (or its tasks, steps, constraints, decisions) after the trigger
-    /// was last approved — created or enabled, `author.recorded_at`. Nobody
-    /// approved what the run would execute: it starts with a third-party
-    /// lineage, so its agents get the restricted profile, as if that session
-    /// had started it. Enabling the trigger again approves the plan as it is.
-    pub async fn run_claims_now(
-        &self,
-        trigger: &Trigger,
-        caller: Option<Claims>,
-    ) -> Result<Option<Claims>> {
-        let claims = Self::run_claims(trigger, caller);
+    /// Whether a third-party session wrote the plan (or its tasks, steps,
+    /// constraints, decisions) since the trigger was approved — created or
+    /// enabled. The plan's mark is compared, as a value, with the one the
+    /// trigger recorded in the approving write (`approved_mark`): no clock is
+    /// compared with another. Read BEFORE the reservation: a read that fails
+    /// burns no signal.
+    pub async fn unapproved_since(&self, trigger: &Trigger) -> Result<bool> {
         let written = self
             .graph
             .plan_third_party_written_at(trigger.plan_id)
             .await?;
-        let approved = trigger.author.as_ref().map(|a| a.recorded_at);
-        let unapproved = match (written, approved) {
-            (Some(written), Some(approved)) => written > approved,
-            (Some(_), None) => true,
-            (None, _) => false,
-        };
+        Ok(written.is_some() && written != trigger.approved_mark)
+    }
+
+    /// [`Self::run_claims`], restricted when `unapproved`
+    /// ([`Self::unapproved_since`]): nobody approved what the run would
+    /// execute, so it starts with a third-party lineage and its agents get the
+    /// restricted profile, as if that session had started it. Enabling the
+    /// trigger again approves the plan as it is.
+    pub fn run_claims_now(
+        trigger: &Trigger,
+        caller: Option<Claims>,
+        unapproved: bool,
+    ) -> Option<Claims> {
+        let claims = Self::run_claims(trigger, caller);
         if !unapproved {
-            return Ok(claims);
+            return claims;
         }
         warn!(
             "Trigger {}: plan {} was written by a third-party session after the trigger was \
@@ -496,9 +509,7 @@ impl TriggerDispatcher {
         );
         let session = format!("trigger-{}", trigger.id);
         let base = claims.unwrap_or_else(|| Claims::service_account(&session));
-        Ok(Some(crate::auth::jwt::with_third_party_lineage(
-            base, &session,
-        )))
+        Some(crate::auth::jwt::with_third_party_lineage(base, &session))
     }
 
     /// Why this firing starts no run whatever else happens now: a schedule or
@@ -525,7 +536,7 @@ impl TriggerDispatcher {
                     .disable_trigger(trigger.id, Some(AUTHOR_REVOKED))
                     .await?;
                 return Ok(Some(format!(
-                    "the author of trigger {} is no longer a user: the trigger is disabled \
+                    "the author of trigger {} is no longer a user, or no longer allowed in: the trigger is disabled \
                      ({AUTHOR_REVOKED}); someone must enable it again to run it as themselves",
                     trigger.id
                 )));
@@ -544,13 +555,22 @@ impl TriggerDispatcher {
 
     /// Whether the person behind `author` is gone: a user id (the `sub` of a
     /// person's token, and of an `agent_session` minted for that person) that
-    /// no longer names a user. The anonymous user (no-auth mode, the local MCP
+    /// no longer names a user, or whose current email the server's access
+    /// policy no longer lets in. The anonymous user (no-auth mode, the local MCP
     /// server) and internal identities (not a user id) have no account to
     /// lose and are never revoked.
     async fn author_revoked(&self, author: &crate::runner::TriggerAuthor) -> Result<bool> {
         match author.sub.parse::<Uuid>() {
             Ok(id) if id != crate::auth::jwt::ANONYMOUS_USER_ID => {
-                Ok(self.graph.get_user_by_id(id).await?.is_none())
+                match self.graph.get_user_by_id(id).await? {
+                    None => Ok(true),
+                    // The user's CURRENT email against the CURRENT policy, as
+                    // every request of theirs is checked (`enforce_token_policy`).
+                    Some(user) => Ok(self
+                        .access_policy
+                        .as_ref()
+                        .is_some_and(|policy| !policy.is_email_allowed(&user.email))),
+                }
             }
             _ => Ok(false),
         }
@@ -705,6 +725,7 @@ pub(crate) mod tests {
                 TEST_AUTHOR,
             ))),
             disabled_reason: None,
+            approved_mark: None,
         }
     }
 
@@ -1457,6 +1478,116 @@ pub(crate) mod tests {
         assert!(trigger.last_fired.is_none());
 
         let outcome = dispatcher.dispatch(&trigger, signal("e1")).await.unwrap();
+        assert!(
+            matches!(outcome, DispatchOutcome::Started { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(starter.calls.lock().await.len(), 1);
+    }
+
+    /// (Round 3, finding 4) The author is checked against the server's access
+    /// policy when the trigger fires, with the user's current email: someone
+    /// removed from the allow-list starts no run, as their requests are
+    /// refused; the trigger is disabled (`author_revoked`).
+    #[tokio::test]
+    async fn a_trigger_whose_author_left_the_allow_list_does_not_start() {
+        let mock = Arc::new(MockGraphStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = runnable_plan(&mock, dir.path()).await;
+        let person = person_claims();
+        register_user(mock.as_ref(), &person).await;
+        let mut trigger = trigger_of(plan_id, TriggerType::Schedule);
+        trigger.author = Some(TriggerAuthor::from_claims(&person));
+        mock.create_trigger(&trigger).await.unwrap();
+        let policy = |allowed: &str| {
+            let mut config = crate::test_helpers::test_auth_config();
+            config.allowed_emails = Some(vec![allowed.to_string()]);
+            Some(config)
+        };
+        let starter = Arc::new(RecordingStarter::on(mock.clone()));
+        let dispatcher_under = |allowed: &str| {
+            TriggerDispatcher::new(
+                mock.clone(),
+                Arc::new(TriggerEngine::new(mock.clone())),
+                starter.clone(),
+            )
+            .with_access_policy(policy(allowed))
+        };
+
+        // On the allow-list: the run starts.
+        let outcome = dispatcher_under(&person.email)
+            .dispatch(&trigger, signal("m1"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, DispatchOutcome::Started { .. }),
+            "{outcome:?}"
+        );
+        finish_all_runs(&mock).await;
+
+        // Removed from it: no run, recorded, disabled.
+        let outcome = dispatcher_under("someone-else@example.com")
+            .dispatch(&trigger, signal("m2"))
+            .await
+            .unwrap();
+        let DispatchOutcome::StartFailed { error, .. } = outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert!(error.contains("no longer allowed in"), "{error}");
+        assert_eq!(starter.calls.lock().await.len(), 1);
+        let disabled = mock.get_trigger(trigger.id).await.unwrap().unwrap();
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.disabled_reason.as_deref(), Some(AUTHOR_REVOKED));
+    }
+
+    /// (Round 3, nit) Approval and mark are compared as values, never as two
+    /// clocks: an approving instance whose clock runs ahead (its
+    /// `recorded_at` later than the database's mark) does not let a later
+    /// third-party write run at full privilege.
+    #[tokio::test]
+    async fn approval_is_decided_without_comparing_clocks() {
+        let mock = Arc::new(MockGraphStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = runnable_plan(&mock, dir.path()).await;
+        let mut trigger = trigger_of(plan_id, TriggerType::Schedule);
+        trigger.author.as_mut().unwrap().recorded_at = Utc::now() + chrono::Duration::days(1);
+        let trigger = mock.create_trigger(&trigger).await.unwrap();
+        let (dispatcher, starter) = dispatcher_with(&mock);
+
+        // Written by a third party after the approval.
+        mock.mark_third_party_write(crate::runner::PlanContent::Plan(plan_id))
+            .await
+            .unwrap();
+        let trigger = mock.get_trigger(trigger.id).await.unwrap().unwrap();
+        let outcome = dispatcher.dispatch(&trigger, signal("m1")).await.unwrap();
+        assert!(
+            matches!(outcome, DispatchOutcome::Started { .. }),
+            "{outcome:?}"
+        );
+        let claims = starter.claims.lock().await[0].clone().unwrap();
+        assert!(
+            crate::auth::jwt::agent_session_binding(&claims).is_some_and(|b| b.third_party),
+            "restricted, whatever the approving instance's clock said"
+        );
+    }
+
+    /// (Round 3, nit) The plan's mark is read before the reservation: a read
+    /// that fails is an error of the dispatch and burns no signal, so the
+    /// same signal starts its run once the graph answers again.
+    #[tokio::test]
+    async fn a_mark_read_error_burns_no_signal() {
+        use std::sync::atomic::Ordering;
+        let mock = Arc::new(MockGraphStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = runnable_plan(&mock, dir.path()).await;
+        let trigger = trigger_of(plan_id, TriggerType::Schedule);
+        mock.create_trigger(&trigger).await.unwrap();
+        let (dispatcher, starter) = dispatcher_with(&mock);
+
+        mock.fail_mark_read.store(true, Ordering::SeqCst);
+        assert!(dispatcher.dispatch(&trigger, signal("m1")).await.is_err());
+        mock.fail_mark_read.store(false, Ordering::SeqCst);
+        let outcome = dispatcher.dispatch(&trigger, signal("m1")).await.unwrap();
         assert!(
             matches!(outcome, DispatchOutcome::Started { .. }),
             "{outcome:?}"

@@ -35,7 +35,8 @@ impl Neo4jClient {
                 cooldown_secs: $cooldown_secs,
                 fire_count: 0,
                 created_at: datetime($created_at),
-                author: $author
+                author: $author,
+                approved_mark: toString(p.third_party_written_at)
             })
             CREATE (t)-[:TRIGGERS]->(p)
             RETURN t
@@ -53,8 +54,14 @@ impl Neo4jClient {
         .param("created_at", trigger.created_at.to_rfc3339())
         .param("author", author_param(trigger.author.as_ref()));
 
-        self.graph.run(q).await?;
-        Ok(trigger.clone())
+        // The stored node: `approved_mark` is the plan's, read in this write,
+        // in the string form `plan_third_party_written_at_impl` reads it, so
+        // the two compare equal exactly when nothing was written since.
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => self.node_to_trigger(&row.get::<neo4rs::Node>("t")?),
+            None => Ok(trigger.clone()),
+        }
     }
 
     /// Get a Trigger by its UUID.
@@ -226,7 +233,9 @@ impl Neo4jClient {
         let q = query(
             r#"
             MATCH (t:Trigger {id: $id})
-            SET t.enabled = true, t.author = $author
+            OPTIONAL MATCH (p:Plan {id: t.plan_id})
+            SET t.enabled = true, t.author = $author,
+                t.approved_mark = toString(p.third_party_written_at)
             REMOVE t.disabled_reason
             RETURN t
             "#,
@@ -345,6 +354,7 @@ impl Neo4jClient {
         let last_fired: Option<String> = node.get("last_fired").ok();
         let author: Option<String> = node.get("author").ok();
         let disabled_reason: Option<String> = node.get("disabled_reason").ok();
+        let approved_mark: Option<String> = node.get("approved_mark").ok();
 
         let tt = match trigger_type.as_str() {
             "schedule" => TriggerType::Schedule,
@@ -369,6 +379,7 @@ impl Neo4jClient {
                 .and_then(|a| serde_json::from_str(&a).ok()),
             // A disabled_reason only means something on a disabled trigger.
             disabled_reason: disabled_reason.filter(|r| !r.is_empty() && !enabled),
+            approved_mark: approved_mark.and_then(|s| s.parse::<DateTime<Utc>>().ok()),
         })
     }
 

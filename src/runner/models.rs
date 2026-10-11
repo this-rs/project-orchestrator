@@ -695,6 +695,14 @@ pub struct Trigger {
     /// trigger is enabled again.
     #[serde(default)]
     pub disabled_reason: Option<String>,
+    /// The plan's third-party mark (`third_party_written_at`) when the trigger
+    /// was approved (created or enabled), read in the same graph write: the
+    /// plan as approved. A firing that finds another mark runs restricted.
+    /// Compared as a value, never against a clock (`author.recorded_at` is
+    /// the application's clock, the mark the database's). Written by the store
+    /// at create and enable; any value passed in is ignored.
+    #[serde(default)]
+    pub approved_mark: Option<DateTime<Utc>>,
 }
 
 /// The caller that created or enabled a [`Trigger`], recorded so a run the
