@@ -244,7 +244,12 @@ async fn chain_depth_of_event(
 ) -> u32 {
     let named = match event.entity_type {
         EntityType::Runner => match event.entity_id.parse::<uuid::Uuid>() {
-            Ok(run_id) => graph.get_plan_run(run_id).await.ok().flatten(),
+            Ok(run_id) => graph
+                .get_plan_run(run_id)
+                .await
+                .map_err(|e| warn!("Event chain depth: run {run_id} unreadable: {e:#}"))
+                .ok()
+                .flatten(),
             Err(_) => None,
         },
         _ => None,
@@ -254,6 +259,7 @@ async fn chain_depth_of_event(
         (None, Some(plan_id)) => graph
             .list_plan_runs(plan_id, 1)
             .await
+            .map_err(|e| warn!("Event chain depth: runs of plan {plan_id} unreadable: {e:#}"))
             .ok()
             .and_then(|runs| runs.into_iter().next())
             .filter(is_recent),
@@ -268,7 +274,10 @@ async fn chain_depth_of_event(
     let around = graph
         .list_all_plan_runs(CHAIN_RECENT_RUNS, 0, None, None)
         .await
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            warn!("Event chain depth: recent runs unreadable, counted as none: {e:#}");
+            Vec::new()
+        })
         .iter()
         .filter(|r| is_recent(r))
         .map(depth_of_run)

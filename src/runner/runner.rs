@@ -517,6 +517,11 @@ pub struct PlanRunner {
     /// session opens and learns from how the attempt ends. `None` = nothing
     /// decided, nothing recorded.
     routing: Option<Arc<crate::runner::routing::RoutingHandle>>,
+    /// The plan's third-party mark (`third_party_written_at`) when this run
+    /// started: `Some(None)` when there was none. `None` when unknown (a run
+    /// resumed after a restart): agents then compare the mark with the run's
+    /// start time. See [`Self::claims_for_agent`].
+    plan_mark_at_start: Arc<std::sync::Mutex<Option<Option<chrono::DateTime<chrono::Utc>>>>>,
     /// Every session request this runner built (tests read what was asked).
     #[cfg(test)]
     request_spy: Arc<std::sync::Mutex<Vec<ChatRequest>>>,
@@ -743,6 +748,7 @@ impl PlanRunner {
             run_model: None,
             run_max_tokens: None,
             routing: None,
+            plan_mark_at_start: Default::default(),
             #[cfg(test)]
             request_spy: Default::default(),
         }
@@ -756,6 +762,61 @@ impl PlanRunner {
     ) -> Self {
         self.routing = routing;
         self
+    }
+
+    /// The claims the next agent of run `run_id` opens its session with, read
+    /// again before EACH launch: the run's caller ([`agent_claims`]), with a
+    /// third-party lineage when a third-party session wrote the plan's content
+    /// after the run started — what the agent is about to execute was then
+    /// approved by nobody, and it runs restricted like the rest of the run
+    /// from there on. Compared with the mark seen at start (no clock
+    /// involved); for a run resumed after a restart, with its start time. A
+    /// mark that cannot be read restricts.
+    pub(crate) async fn claims_for_agent(
+        &self,
+        run_id: Uuid,
+        plan_id: Uuid,
+    ) -> crate::auth::jwt::Claims {
+        let claims = agent_claims(self.user_claims.as_ref(), run_id);
+        if crate::auth::jwt::agent_session_binding(&claims).is_some_and(|b| b.third_party) {
+            return claims;
+        }
+        let restricted =
+            |claims| crate::auth::jwt::with_third_party_lineage(claims, &format!("run-{run_id}"));
+        let current = match self.graph.plan_third_party_written_at(plan_id).await {
+            Ok(Some(mark)) => mark,
+            Ok(None) => return claims,
+            Err(e) => {
+                warn!(%run_id, "Third-party mark of plan {plan_id} unreadable: agent restricted: {e:#}");
+                return restricted(claims);
+            }
+        };
+        let baseline = *self
+            .plan_mark_at_start
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let newer = match baseline {
+            Some(seen) => seen != Some(current),
+            None => {
+                let started = RUNNER_STATE
+                    .read()
+                    .await
+                    .as_ref()
+                    .filter(|s| s.run_id == run_id)
+                    .map(|s| s.started_at);
+                started.is_none_or(|start| current > start)
+            }
+        };
+        if newer {
+            warn!(
+                %run_id,
+                "Plan {plan_id} was written by a third-party session during the run: \
+                 the next agents run restricted"
+            );
+            restricted(claims)
+        } else {
+            claims
+        }
     }
 
     /// Set user claims inherited from the caller who started the run.
@@ -1163,6 +1224,21 @@ impl PlanRunner {
 
         // Proof of life from before the PlanRun exists in the graph: the
         // reconciliation sweep must never see this run as abandoned.
+        // The plan's third-party mark as the run starts: content a third party
+        // writes from now on was not there when the run was approved
+        // (`claims_for_agent`). Unreadable: every later mark counts as new.
+        let mark = match self.graph.plan_third_party_written_at(plan_id).await {
+            Ok(mark) => mark,
+            Err(e) => {
+                warn!(%run_id, "Third-party mark of plan {plan_id} unreadable at start: {e:#}");
+                Some(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+            }
+        };
+        *self
+            .plan_mark_at_start
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(mark);
+
         let live = LiveRunGuard::register(run_id);
         self.graph.create_plan_run(&state).await?;
 
@@ -3229,7 +3305,7 @@ impl PlanRunner {
             permission_mode: Some("bypassPermissions".to_string()),
             add_dirs: None,
             workspace_slug: None,
-            user_claims: Some(agent_claims(self.user_claims.as_ref(), run_id)),
+            user_claims: Some(self.claims_for_agent(run_id, plan_id).await),
             spawned_by: Some(
                 serde_json::json!({
                     "type": "runner",
@@ -5143,6 +5219,7 @@ impl Clone for PlanRunner {
             run_model: self.run_model.clone(),
             run_max_tokens: self.run_max_tokens,
             routing: self.routing.clone(),
+            plan_mark_at_start: self.plan_mark_at_start.clone(),
             #[cfg(test)]
             request_spy: self.request_spy.clone(),
         }
@@ -9159,6 +9236,83 @@ mod tests {
             *global = Some(RunnerState::new(run_id, plan.id, 1, TriggerSource::Manual));
         }
         (plan.id, run_id)
+    }
+
+    /// (Round 3, finding 1) A person's run starts at full privilege; a
+    /// third-party session then rewrites the plan's content. Every agent the
+    /// run launches after that is restricted: the mark is read again before
+    /// each launch. A mark already there when the run started (approved by
+    /// whoever started it) restricts nothing.
+    #[tokio::test]
+    async fn a_third_party_edit_during_a_full_run_restricts_the_remaining_tasks() {
+        use crate::auth::jwt::agent_session_binding;
+        use nexus_claude::agent::CostBasis;
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (runner, graph, fake) = routed_runner(None).await;
+        let person = crate::runner::dispatch::tests::person_claims();
+        let runner = runner.with_user_claims(person.clone());
+        let (plan_id, run_id) = seed_run(&graph).await;
+        let tasks: Vec<_> = (0..3).map(|_| crate::test_helpers::test_task()).collect();
+        for task in &tasks {
+            graph.create_task(plan_id, task).await.unwrap();
+        }
+        let lineage = |i: usize| {
+            let request = runner.request_spy.lock().unwrap()[i].clone();
+            let claims = request.user_claims.expect("claims");
+            assert_eq!(claims.sub, person.sub, "still the person's run");
+            agent_session_binding(&claims).is_some_and(|b| b.third_party)
+        };
+
+        // A mark from before the run (the person started it on that plan).
+        graph
+            .mark_third_party_write(crate::runner::PlanContent::Plan(plan_id))
+            .await
+            .unwrap();
+        let at_start = graph.plan_third_party_written_at(plan_id).await.unwrap();
+        *runner.plan_mark_at_start.lock().unwrap() = Some(at_start);
+
+        run_attempt(
+            &runner,
+            &fake,
+            plan_id,
+            run_id,
+            &tasks[0],
+            1,
+            CostBasis::Reported,
+        )
+        .await;
+        assert!(!lineage(0), "the first task runs as the person, full");
+
+        // A third-party session rewrites a task that has not run yet.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        graph
+            .mark_third_party_write(crate::runner::PlanContent::Task(tasks[2].id))
+            .await
+            .unwrap();
+        run_attempt(
+            &runner,
+            &fake,
+            plan_id,
+            run_id,
+            &tasks[1],
+            1,
+            CostBasis::Reported,
+        )
+        .await;
+        run_attempt(
+            &runner,
+            &fake,
+            plan_id,
+            run_id,
+            &tasks[2],
+            1,
+            CostBasis::Reported,
+        )
+        .await;
+        assert!(lineage(1), "the next agent is restricted");
+        assert!(lineage(2), "and every one after it");
+        reset_globals().await;
     }
 
     #[tokio::test]

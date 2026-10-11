@@ -132,7 +132,8 @@ export function looksLikeHost(segment) {
 //   'absent' : il n'existe pas ; 'ambiguous' : le sha abrege designe plusieurs objets ;
 //   'unknown' : pas un depot git, ou un clone superficiel (l'historique est incomplet).
 export function commitStatus(root, sha) {
-  const git = (args) => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' });
+  // Messages de git en anglais quelle que soit la locale : l'ambiguite se lit dans stderr.
+  const git = (args) => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C', LANGUAGE: 'C' } });
   const inside = git(['rev-parse', '--is-inside-work-tree']);
   if (inside.status !== 0 || inside.stdout.trim() !== 'true') return 'unknown';
   const shallow = git(['rev-parse', '--is-shallow-repository']).stdout.trim() === 'true';

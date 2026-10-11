@@ -200,6 +200,7 @@ mod tests {
             created_at: Utc::now(),
             author: None,
             disabled_reason: None,
+            approved_mark: None,
         }
     }
 

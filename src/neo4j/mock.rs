@@ -152,6 +152,8 @@ pub struct MockGraphStore {
     pub trigger_reservations: RwLock<HashMap<(Uuid, String), chrono::DateTime<chrono::Utc>>>,
     /// `third_party_written_at` per plan (`mark_third_party_write`).
     pub plan_third_party_writes: RwLock<HashMap<Uuid, chrono::DateTime<chrono::Utc>>>,
+    /// Makes `plan_third_party_written_at` fail (a graph error).
+    pub fail_mark_read: std::sync::atomic::AtomicBool,
 
     // Relationships (adjacency lists)
     pub plan_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
@@ -367,6 +369,7 @@ impl MockGraphStore {
             trigger_firings: RwLock::new(HashMap::new()),
             trigger_reservations: RwLock::new(HashMap::new()),
             plan_third_party_writes: RwLock::new(HashMap::new()),
+            fail_mark_read: std::sync::atomic::AtomicBool::new(false),
             plan_tasks: RwLock::new(HashMap::new()),
             task_steps: RwLock::new(HashMap::new()),
             task_decisions: RwLock::new(HashMap::new()),
@@ -12030,9 +12033,17 @@ impl GraphStore for MockGraphStore {
         &self,
         trigger: &crate::runner::Trigger,
     ) -> anyhow::Result<crate::runner::Trigger> {
+        // As the store does: the plan's mark is read in the same write.
+        let mut stored = trigger.clone();
+        stored.approved_mark = self
+            .plan_third_party_writes
+            .read()
+            .await
+            .get(&trigger.plan_id)
+            .copied();
         let mut triggers = self.triggers.write().await;
-        triggers.insert(trigger.id, trigger.clone());
-        Ok(trigger.clone())
+        triggers.insert(trigger.id, stored.clone());
+        Ok(stored)
     }
 
     async fn get_trigger(
@@ -12127,6 +12138,12 @@ impl GraphStore for MockGraphStore {
         &self,
         plan_id: Uuid,
     ) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
+        if self
+            .fail_mark_read
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("mark read failed (test)");
+        }
         Ok(self
             .plan_third_party_writes
             .read()
@@ -12167,11 +12184,13 @@ impl GraphStore for MockGraphStore {
         trigger_id: Uuid,
         author: &crate::runner::TriggerAuthor,
     ) -> anyhow::Result<Option<crate::runner::Trigger>> {
+        let marks = self.plan_third_party_writes.read().await;
         let mut triggers = self.triggers.write().await;
         Ok(triggers.get_mut(&trigger_id).map(|t| {
             t.enabled = true;
             t.author = Some(author.clone());
             t.disabled_reason = None;
+            t.approved_mark = marks.get(&t.plan_id).copied();
             t.clone()
         }))
     }
