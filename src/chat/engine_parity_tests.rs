@@ -276,26 +276,6 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
                   session) et le backend ne la transmet pas",
         },
     ),
-    (
-        Engine::Native,
-        "background_tasks",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "P4",
-            why: "le natif ne rapporte pas de tâche d'arrière-plan (capacité background_tasks = \
-                  false) : rien n'est suivi",
-        },
-    ),
-    (
-        Engine::Native,
-        "cancel_task",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "P12",
-            why: "cancel_task n'a pas de branche moteur agent : refus typé \
-                  (CancelTaskUnsupported, 501 sur la route) et le natif n'a pas de tâche à annuler",
-        },
-    ),
 ];
 
 /// The verdicts of one engine, with what was seen (diagnostics, not in the table).
@@ -2894,7 +2874,7 @@ fn a_declared_gap_fixed_silently_turns_the_matrix_red() {
     let mut na = as_declared(Engine::Native);
     na.rows
         .iter_mut()
-        .find(|(f, _, _)| *f == "background_tasks")
+        .find(|(f, _, _)| *f == "permissions.always")
         .unwrap()
         .1 = Verdict::Ok;
     let problems = audit(&cc, &na, &expected);

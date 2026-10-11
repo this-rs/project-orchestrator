@@ -67,7 +67,9 @@ use super::provider::cognitive::candidates::{self, ModelFacts, Slot};
 use super::provider::cognitive::decider::HYSTERESIS_MARGIN;
 use super::provider::cognitive::decision::{CognitiveDecision, DecideRequest, Decider, Pick};
 use super::provider::cognitive::signature::{ContextHints, TaskSignature};
-use super::provider::cognitive::{LearningStage, ProviderRoutingMode, RoutingSettings};
+use super::provider::cognitive::{
+    conversation_stage, LearningStage, ProviderRoutingMode, RoutingSettings,
+};
 use super::types::{EffectiveCapability, EffectiveCause, EffectiveSource, RoutingPoolEntry};
 
 /// The table the Claude path hands to its CLI: event name → matchers.
@@ -356,13 +358,17 @@ pub(crate) struct TurnRouter {
     /// is recorded, never applied (no two moves in a row).
     moved_in: AtomicBool,
     predecided: Mutex<Option<PreDecided>>,
+    /// The last decision asked for a turn, with the turn's index: the decision a change of
+    /// model comes from, which the host marks not applied when the change cannot be sent
+    /// ([`TurnRouter::decision_of_turn`]).
+    decided: Mutex<Option<(u32, CognitiveDecision)>>,
     last_message: Mutex<Option<String>>,
     /// The next turn carries an image (`set_turn_input`): its decision excludes the models
     /// that cannot read one (`needs_images`, `RejectReason::NoImages`).
     last_has_images: AtomicBool,
-    /// The model in force before [`model_for_images`] changed it for the turn about to be
-    /// sent: what [`TurnRouter::forget_image_change`] puts back when the host could not apply it.
-    image_change: Mutex<Option<String>>,
+    /// The turn [`model_for_images`] changed the model for, and the model in force before:
+    /// what [`TurnRouter::forget_image_change`] puts back when the host could not apply it.
+    image_change: Mutex<Option<(u32, String)>>,
     state: Mutex<TurnState>,
     timeout: Duration,
 }
@@ -381,6 +387,11 @@ struct RouterChoice {
     /// Every pair of the conversation's pool, whatever its provider: the candidates of a
     /// provider check in mode `full`. `None` = no pool.
     routing_pool: Option<Vec<RoutingPoolEntry>>,
+    /// The settings' stage the session opened with. `routing.stage` is the stage in force
+    /// for THIS conversation: `auto` when the user handed its routing to PO (Auto, or a
+    /// pool), this one otherwise (decision R-S1, [`conversation_stage`]). Kept so that
+    /// [`TurnRouter::reroute`] can fall back to it when the user picks one model again.
+    settings_stage: LearningStage,
 }
 
 /// What opens a [`TurnRouter`].
@@ -396,6 +407,8 @@ pub(crate) struct TurnRouterSpec {
     pub provider_imposed: bool,
     pub allowed_models: Option<Vec<String>>,
     pub routing_pool: Option<Vec<RoutingPoolEntry>>,
+    /// The conversation asked for Auto or a pool (decision R-S1).
+    pub conversation_routes: bool,
     pub current_model: String,
     /// Index the next turn counted by the router itself gets (legacy engine).
     pub next_turn: u32,
@@ -417,15 +430,19 @@ impl TurnRouter {
             pick: None,
             apply: false,
         });
+        let settings_stage = spec.routing.stage;
+        let mut routing = spec.routing;
+        routing.stage = conversation_stage(settings_stage, spec.conversation_routes);
         Self {
             decider: spec.decider,
             pool: spec.pool,
             choice: Mutex::new(RouterChoice {
-                routing: spec.routing,
+                routing,
                 explicit_model: spec.explicit_model,
                 provider_imposed: spec.provider_imposed,
                 allowed_models: spec.allowed_models,
                 routing_pool: spec.routing_pool,
+                settings_stage,
             }),
             provider_id: spec.provider_id,
             session_id: spec.session_id,
@@ -435,6 +452,7 @@ impl TurnRouter {
             manual: AtomicBool::new(false),
             moved_in: AtomicBool::new(spec.moved_in),
             predecided: Mutex::new(predecided),
+            decided: Mutex::new(None),
             last_message: Mutex::new(None),
             last_has_images: AtomicBool::new(false),
             image_change: Mutex::new(None),
@@ -496,6 +514,11 @@ impl TurnRouter {
         choice.explicit_model = explicit_model;
         choice.provider_imposed = false;
         choice.routing_pool = None;
+        // Auto, or a pool (`allowed_models` is only given for two models or more): the
+        // user's choice, applied at the `auto` stage (decision R-S1).
+        let conversation_routes =
+            mode == ProviderRoutingMode::Full || choice.allowed_models.is_some();
+        choice.routing.stage = conversation_stage(choice.settings_stage, conversation_routes);
         self.manual.store(false, Ordering::SeqCst);
     }
 
@@ -517,12 +540,24 @@ impl TurnRouter {
     /// it, or closed): the model did not change, and the decision kept for the turn is dropped,
     /// so the next turn (with or without an image) is decided afresh, never handed a change
     /// nobody decided for it.
-    pub(crate) fn forget_image_change(&self) {
-        let Some(before) = locked(&self.image_change).take() else {
-            return;
-        };
+    ///
+    /// Returns the decision the change came from, which the host stores back as NOT applied
+    /// (`not_changed:`, as a refused move or a legacy `set_model` that failed): the decision
+    /// said `applied: true`, and the model did not change.
+    pub(crate) fn forget_image_change(&self) -> Option<CognitiveDecision> {
+        let (turn, before) = locked(&self.image_change).take()?;
         self.forget_change(&before);
         *locked(&self.predecided) = None;
+        self.decision_of_turn(turn)
+    }
+
+    /// The decision asked for turn `turn_index`, if it is the last one asked: the decision
+    /// a change of that turn came from.
+    pub(crate) fn decision_of_turn(&self, turn_index: u32) -> Option<CognitiveDecision> {
+        locked(&self.decided)
+            .take()
+            .filter(|(turn, _)| *turn == turn_index)
+            .map(|(_, decision)| decision)
     }
 
     /// An applied change that could not be sent: the model did not change.
@@ -667,6 +702,7 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
         return ProviderPlan::Stay;
     };
     let apply = apply && decision.applied;
+    *locked(&router.decided) = Some((turn, decision.clone()));
     *locked(&router.predecided) = Some(PreDecided {
         turn_index: turn,
         pick: decision.chosen.clone(),
@@ -760,6 +796,7 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
             let Some(decision) = router.ask(request).await else {
                 return TurnDirective::none();
             };
+            *locked(&router.decided) = Some((ctx.turn_index, decision.clone()));
             if !apply || !decision.applied {
                 return TurnDirective::none();
             }
@@ -846,7 +883,8 @@ struct Routing {
 }
 
 /// The stage this conversation's decisions are taken at. Decision R-S1 (#702) makes it the
-/// conversation's own (`RouterChoice::settings`); read here only.
+/// conversation's own: `choice.routing.stage` holds it (`auto` for an Auto conversation or a
+/// pool, the settings' stage otherwise, [`conversation_stage`]); read here only.
 fn effective_stage(choice: &RouterChoice) -> LearningStage {
     choice.routing.stage
 }
@@ -912,6 +950,9 @@ pub(crate) async fn model_for_images(router: &TurnRouter) -> Option<String> {
             request.session_id = router.session_id;
             request.turn_index = Some(turn);
             let decision = router.ask(request).await?;
+            // Kept as the decision of the turn: the one the host marks not applied when the
+            // model cannot be made active ([`TurnRouter::forget_image_change`]).
+            *locked(&router.decided) = Some((turn, decision.clone()));
             if !decision.applied {
                 return None;
             }
@@ -928,7 +969,7 @@ pub(crate) async fn model_for_images(router: &TurnRouter) -> Option<String> {
     if pick.provider_id != router.provider_id || same_model(&pick.model, &current_model) {
         return None;
     }
-    *locked(&router.image_change) = Some(current_model);
+    *locked(&router.image_change) = Some((turn, current_model));
     let mut state = locked(&router.state);
     state.current_model = pick.model.clone();
     state.last_change_turn = Some(turn);
@@ -1118,6 +1159,18 @@ impl TurnRouting {
 
     pub(crate) fn remove(&self, session_id: &str) {
         locked(&self.routers).remove(session_id);
+    }
+
+    /// Removes the session's router only if it is still `router` (`Arc::ptr_eq`): an
+    /// opening that failed never takes away the router of one that replaced it.
+    pub(crate) fn remove_if(&self, session_id: &str, router: &Arc<TurnRouter>) {
+        let mut routers = locked(&self.routers);
+        if routers
+            .get(session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, router))
+        {
+            routers.remove(session_id);
+        }
     }
 }
 
@@ -1582,6 +1635,7 @@ mod provider_move_tests {
             provider_imposed: false,
             allowed_models: None,
             routing_pool: None,
+            conversation_routes: false,
             current_model: "m".into(),
             next_turn: 1,
             moved_in: false,
@@ -1789,6 +1843,81 @@ mod provider_move_tests {
         assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
         assert_eq!(decider.calls(), 0);
     }
+
+    /// Decision R-S1: the settings' stage governs a session that asked nothing (`full` from
+    /// the settings, `shadow`: recorded, never applied); the user's Auto on the conversation
+    /// decides it at the `auto` stage; one model ticked afterwards pins it again.
+    #[tokio::test]
+    async fn the_conversations_auto_is_decided_at_the_auto_stage_whatever_the_settings() {
+        let decider = Fake::picking("local2", 0.9, 0.1);
+        let router = router(spec(
+            decider.clone(),
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Full,
+            LearningStage::Shadow,
+        ));
+        assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
+        assert_eq!(decider.last().settings.stage, LearningStage::Shadow);
+
+        let router = router_after_auto(decider.clone());
+        // The stage in force lives in `choice.routing.stage` itself: every reader of it
+        // (F-R4's effective capabilities, `model_for_images`) gets the conversation's.
+        assert_eq!(locked(&router.choice).routing.stage, LearningStage::Auto);
+        assert!(is_move_to(&plan_provider_move(&router).await, "local2"));
+        assert_eq!(decider.last().settings.stage, LearningStage::Auto);
+
+        // One model ticked: strict, nothing is asked any more, the settings' stage is back.
+        router.reroute(ProviderRoutingMode::Primary, None, true);
+        assert_eq!(locked(&router.choice).routing.stage, LearningStage::Shadow);
+        let calls = decider.calls();
+        assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
+        let directive = directive_for_turn(&router, &TurnContext::new(2, "m")).await;
+        assert_eq!(directive.model, None);
+        assert_eq!(decider.calls(), calls);
+    }
+
+    /// A pool (two models ticked) chosen on a conversation of a `primary` + `shadow` setting
+    /// changes the model between turns: the decision is asked, and stored, at `auto`.
+    #[tokio::test]
+    async fn a_pool_chosen_on_the_conversation_is_decided_at_the_auto_stage() {
+        let decider = Arc::new(Fake {
+            pick: Pick::new("local", "big"),
+            score: 0.9,
+            current_score: 0.1,
+            explored: false,
+            requests: StdMutex::new(Vec::new()),
+        });
+        let router = router(spec(
+            decider.clone(),
+            Arc::new(OneProvider),
+            ProviderRoutingMode::Primary,
+            LearningStage::Shadow,
+        ));
+        router.reroute(
+            ProviderRoutingMode::Mixed,
+            Some(vec!["m".into(), "big".into()]),
+            false,
+        );
+        let directive = directive_for_turn(&router, &TurnContext::new(1, "m")).await;
+        assert_eq!(directive.model.as_deref(), Some("big"));
+        let asked = decider.last();
+        assert_eq!(
+            (asked.settings.mode, asked.settings.stage),
+            (ProviderRoutingMode::Full, LearningStage::Auto)
+        );
+    }
+
+    /// A router of a `full` + `shadow` setting whose conversation was handed to PO (Auto).
+    fn router_after_auto(decider: Arc<Fake>) -> TurnRouter {
+        let router = router(spec(
+            decider,
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Primary,
+            LearningStage::Shadow,
+        ));
+        router.reroute(ProviderRoutingMode::Full, None, false);
+        router
+    }
 }
 
 /// F-R4: the capability shown follows the routing candidates, and an image turn is routed
@@ -1887,6 +2016,7 @@ mod image_routing_tests {
             provider_imposed: false,
             allowed_models,
             routing_pool: None,
+            conversation_routes: false,
             current_model: "flash".into(),
             next_turn: 1,
             moved_in: false,
@@ -2123,8 +2253,17 @@ mod image_routing_tests {
         );
         router.set_turn_input(&with_picture("look"));
         assert_eq!(model_for_images(&router).await.as_deref(), Some("vision"));
+        let image_decision = decider.decisions.lock().unwrap()[0].clone();
+        assert!(image_decision.applied);
         // The host could not make `vision` active: the turn was refused, never started.
-        router.forget_image_change();
+        // The decision the change came from is handed back, for the host to store it as
+        // not applied (it said `applied: true`).
+        let undone = router
+            .forget_image_change()
+            .expect("the decision of the image change is handed back");
+        assert_eq!(undone.id, image_decision.id);
+        // Handed back once: a second undo has nothing left to rewrite.
+        assert!(router.forget_image_change().is_none());
         {
             let state = locked(&router.state);
             assert_eq!(state.current_model, "flash");
@@ -2298,6 +2437,44 @@ mod image_routing_tests {
         router.set_model_live(true);
         router.set_turn_input(&with_picture("look"));
         router
+    }
+
+    /// R-S1 x F-R4: the user put THIS conversation on Auto while the global stage is
+    /// `shadow`. The conversation is routed at the `auto` stage, so the image turn really
+    /// goes to the model that reads images (and the capability is promised), where the same
+    /// settings without the conversation's Auto only record.
+    #[tokio::test]
+    async fn an_auto_conversation_under_the_global_shadow_stage_switches_to_the_image_model() {
+        let decider = Arc::new(Real::default());
+        let mut spec = spec(
+            decider.clone(),
+            Arc::new(Pool(deepseek_with_vision())),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        spec.routing.stage = LearningStage::Shadow;
+        spec.conversation_routes = true;
+        let router = TurnRouter::new(spec);
+        router.set_model_live(true);
+        router.set_turn_input(&with_picture("look"));
+        let images = effective_images(&router, Some(false)).await.unwrap();
+        assert_eq!(
+            (images.value, images.source, images.cause),
+            (
+                true,
+                EffectiveSource::RoutingPool,
+                EffectiveCause::PoolHasIt
+            )
+        );
+        assert_eq!(model_for_images(&router).await.as_deref(), Some("vision"));
+        let decision = decider.decisions.lock().unwrap()[0].clone();
+        assert_eq!(decision.stage, LearningStage::Auto, "{decision:#?}");
+        assert!(decision.applied, "{decision:#?}");
+        // The hook of the turn finds the change made and asks nothing more.
+        let directive = directive_for_turn(&router, &TurnContext::new(1, "vision")).await;
+        assert_eq!(directive.model, None);
+        assert_eq!(decider.decisions.lock().unwrap().len(), 1);
+        assert_eq!(router.next_turn_context(0).current_model, "vision");
     }
 
     /// Shadow and advisory only record; an imposed model is never replaced: no promise, no

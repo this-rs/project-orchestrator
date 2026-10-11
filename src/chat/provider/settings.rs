@@ -485,8 +485,8 @@ const LAUNCHER_SUBCOMMANDS: &[(&str, &[&str])] = &[
 ];
 
 /// Options of those launchers that take the NEXT argument as their value
-/// (`npx -p <pkg>`, `env -u <var>`, `node -r <module>`, `pnpm -C <dir>`): that value
-/// is not a program.
+/// (`npx -p <pkg>`, `env -u <var>`, `node -r <module>`, `pnpm -C <dir>`,
+/// `npm exec --registry <url>`): that value is not a program.
 const LAUNCHER_OPTIONS_WITH_VALUE: &[&str] = &[
     "-p",
     "--package",
@@ -505,6 +505,7 @@ const LAUNCHER_OPTIONS_WITH_VALUE: &[&str] = &[
     "--cwd",
     "--prefix",
     "--workspace",
+    "--registry",
 ];
 
 /// How deep a command line given to a launcher ([`command_option`]) is read, nested
@@ -1669,6 +1670,22 @@ mod tests {
             &["npm", "exec", "openclaw", "acp"][..],
             &["npm", "x", "openclaw", "acp"],
             &["npm", "exec", "--yes", "--", "openclaw", "acp"],
+            // Review of #684, finding 4: `--registry <url>` takes a value.
+            &[
+                "npm",
+                "exec",
+                "--registry",
+                "https://registry.example",
+                "openclaw",
+                "acp",
+            ],
+            &[
+                "npx",
+                "--registry",
+                "https://registry.example",
+                "openclaw",
+                "acp",
+            ],
             &[
                 "npm",
                 "--prefix",
@@ -1715,6 +1732,7 @@ mod tests {
             // A launcher command that runs nothing named after it.
             &["npm", "install", "openclaw"],
             &["npm", "--prefix", "/srv/openclaw", "start"],
+            &["npx", "--registry", "https://openclaw.example", "my-agent"],
             &["yarn", "add", "openclaw"],
             &["pnpm", "-C", "/srv/openclaw", "dlx", "my-agent"],
             &[

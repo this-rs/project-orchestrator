@@ -20,6 +20,7 @@ pub(crate) mod agent_hooks;
 pub mod agent_runtime;
 pub mod anchor;
 pub mod anchor_resolver;
+pub mod cancel_relay;
 pub mod cost;
 #[cfg(test)]
 mod engine_parity_tests;

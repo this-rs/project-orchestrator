@@ -69,18 +69,20 @@ fn matches(pattern: &str, subject: &str) -> bool {
 
 /// Delivers one message to every matching subscription.
 fn route(
-    state: &Mutex<State>,
+    state_ref: &Mutex<State>,
     subject: &str,
     reply: Option<&str>,
     hdr: Option<&[u8]>,
     body: &[u8],
 ) {
-    let mut state = state.lock().unwrap();
+    let mut state = state_ref.lock().unwrap();
     let mut done = Vec::new();
+    let mut delivered = false;
     for (key, sub) in state.subs.iter_mut() {
         if !matches(&sub.subject, subject) {
             continue;
         }
+        delivered = true;
         let reply = reply.map(|r| format!(" {r}")).unwrap_or_default();
         let mut frame = match hdr {
             Some(h) => format!(
@@ -108,6 +110,18 @@ fn route(
     for key in done {
         state.subs.remove(&key);
     }
+    // A request nobody subscribes to: like nats-server for a client that sent
+    // `no_responders` (async_nats always does), an empty 503 status message on the
+    // reply subject, so the requester learns it at once.
+    if let (false, Some(inbox)) = (delivered, reply) {
+        drop(state);
+        route_status(state_ref, inbox);
+    }
+}
+
+/// The "no responders" status message on `inbox`.
+fn route_status(state: &Mutex<State>, inbox: &str) {
+    route(state, inbox, None, Some(b"NATS/1.0 503\r\n\r\n"), b"");
 }
 
 async fn serve(socket: tokio::net::TcpStream, conn: u64, port: u16, state: Arc<Mutex<State>>) {

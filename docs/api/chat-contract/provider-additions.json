@@ -214,8 +214,15 @@
         "provider_unavailable": 503,
         "no_provider": 409,
         "empty_message": 400,
-        "same_provider": 400
+        "same_provider": 400,
+        "owner_unreachable": 409,
+        "owner_timeout": 504,
+        "session_gone": 410,
+        "owner_protocol": 502,
+        "owner_failed": 502,
+        "relay_failed": 502
       },
+      "cancel_refusals": "LIVRE (P12, #663 + revue 2). POST /api/chat/sessions/{id}/cancel-tools et /cancel-task/{task_id} : 200 CancelToolsResult / CancelTaskResult quand l instance qui tient la session a agi (capped:true = plafond) ; refus du provider = 422 unsupported (tool_cancel : Claude Code par SSH ou hors Unix ; background_tasks), aussi via une autre instance. Sinon : 409 owner_unreachable (aucune instance ne tient la session, AVEC OU SANS NATS : rien ne tourne, le client l affiche comme deja arrete ; retryable:false), 504 owner_timeout (pas de reponse a temps ; retryable:false pour cancel-tools, true pour cancel-task), 410 session_gone (seule l instance qui vient de perdre la session a repondu, apres 1,5 s de grace ; retryable:true), 502 owner_protocol / owner_failed / relay_failed. Jamais un 200 pour une annulation qui n a pas eu lieu. Fil : refus du provider = error { code: cancel_refused, reason: <capacite> } a tous les clients ; un cancel_tools WS en echec = error { code: cancel_failed, reason: <code ci-dessus> } au client qui l a demande. Requete/reponse NATS versionnee (v: 2) ; une instance plus ancienne recoit le format qu elle lit.",
       "switch_provider_refusals": "POST /api/chat/sessions/{id}/switch-provider : empty_message (message vide) et same_provider (deja sur ce provider ; provider_id = celui de la session), 400, retryable:false, texte de error inchange ; 400 sans code pour un id de session invalide, 404 session inconnue ; tout autre refus est celui de l ouverture de la nouvelle session (consentement : endpoint_not_allowed 403, etc.)",
       "forbidden_403_prefixed": {
         "doc": "403 dont le corps est {\"error\": \"<code>: <message>\"} (pas de champ code séparé) — livrés",

@@ -491,26 +491,6 @@ pub struct CancelTaskResult {
     pub capped: bool,
 }
 
-/// `cancel_task` asked of a session of the agent engine: it tracks no background
-/// task of its own yet (P4) and has nothing to stop (P12). Refused, typed, instead
-/// of the silent success it used to answer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CancelTaskUnsupported {
-    pub session_id: String,
-}
-
-impl std::fmt::Display for CancelTaskUnsupported {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "cancel_task is not available on the agent engine yet: session {} tracks no background task",
-            self.session_id
-        )
-    }
-}
-
-impl std::error::Error for CancelTaskUnsupported {}
-
 /// Runtime-mutable environment config for Claude CLI subprocess.
 ///
 /// These fields can be changed at runtime via the REST API and are
@@ -701,6 +681,10 @@ pub struct ChatManager {
     /// Per-turn model routing (`full` mode): the shared decider and the router of each
     /// live session. Empty until [`ChatManager::with_turn_decider`].
     pub(crate) turn_routing: Arc<super::agent_hooks::TurnRouting>,
+    /// One resume at a time per session (review of #684, finding 2): two messages to a
+    /// session that is not live would each resume it, and the one that fails would undo
+    /// what the other set up.
+    pub(crate) resume_locks: Arc<SessionLocks>,
     /// The `refs_v1` switch (on unless `REFS_V1=0`): whether the API layer folds
     /// `refs` into messages and the server announces the capability.
     pub(crate) refs_v1: bool,
@@ -1265,6 +1249,9 @@ pub(crate) struct ManagerTurnServices {
     step_budget: Duration,
     /// A step made to never answer (tests only, `None` in production).
     stall_step: Option<&'static str>,
+    /// Where routing decisions are stored (`CognitiveRouting::store`): a change of model a
+    /// turn could not make is written back on its decision. `None`: nowhere.
+    routing_store: Option<Arc<dyn super::provider::cognitive::store::RoutingArmStore>>,
 }
 
 /// What a session of the agent engine keeps for the end of its turns: the fields of
@@ -1658,6 +1645,23 @@ impl HeldContext {
 /// Largest share of the model's window the held context may take.
 pub(crate) const HELD_CONTEXT_WINDOW_SHARE: f64 = 0.05;
 
+/// The decision of a model change that could not be made says so: not applied, and why
+/// (`not_changed: <code>`). Nothing to write without a store.
+async fn record_not_changed(
+    store: Option<&Arc<dyn super::provider::cognitive::store::RoutingArmStore>>,
+    mut decision: super::provider::cognitive::decision::CognitiveDecision,
+    code: &str,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    decision.applied = false;
+    decision.reason = format!("{}; not_changed: {code}", decision.reason);
+    if let Err(error) = store.put_decision(&decision).await {
+        warn!(decision_id = %decision.id, %error, "the refused change was not recorded on its decision");
+    }
+}
+
 impl ManagerTurnServices {
     /// One end-of-turn step under its own budget ([`run_step`]); `stall_step` makes
     /// the named one never answer (tests only: proves the budgets are per step).
@@ -1780,8 +1784,13 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
     }
 
     async fn image_model_not_applied(&self, session_id: &str, _model: &str) {
-        if let Some(router) = self.turn_routing.get(session_id) {
-            router.forget_image_change();
+        let Some(router) = self.turn_routing.get(session_id) else {
+            return;
+        };
+        // The decision said the image model was applied; it was not (as the legacy
+        // `set_model` that fails, `apply_turn_directive`).
+        if let Some(decision) = router.forget_image_change() {
+            record_not_changed(self.routing_store.as_ref(), decision, "set_model_failed").await;
         }
     }
 
@@ -2305,7 +2314,9 @@ where
 /// without them (`dropped`, [`open_dropping_refused_mcp`]), or the provider did on its
 /// own — an ACP agent that refuses `mcpServers` at `session/new` is asked again
 /// without them by nexus, which only says so in the session's capabilities
-/// (`per_session_mcp: false`). Either way the token went to the agent in the refused
+/// (`per_session_mcp: false`). Those are the SESSION's (nexus #87): a concurrent opening
+/// of the same instance that was refused does not turn a session that kept its servers to
+/// `false`, so its token is not revoked. Either way the token went to the agent in the refused
 /// request and nothing will ever present it legitimately: it is revoked.
 pub(crate) fn opened_without_mcp(
     requested: bool,
@@ -2321,9 +2332,21 @@ pub(crate) fn opened_without_mcp(
 /// refused, a spec that cannot be built, a provider unavailable or that refuses the
 /// session, a window too small, or the opening future dropped. [`Self::disarm`]
 /// once the session is handed over.
+///
+/// Undoes only what THIS opening set up (review of #684, finding 2): the token whose
+/// `jti` it minted ([`Self::minted`]), the router it registered when that router is
+/// still the session's ([`Self::registered`], `Arc::ptr_eq`). A concurrent resume of
+/// the same session that succeeded keeps its own. Resumes of one session are also
+/// serialised ([`SessionLocks`]): the session's `nexus-tools` token is kept per
+/// session, not per minting, and a new PO token supersedes the session's others.
 struct OpeningCleanup {
     session_id: String,
     turn_routing: Arc<super::agent_hooks::TurnRouting>,
+    /// The router this opening registered.
+    router: Option<Arc<super::agent_hooks::TurnRouter>>,
+    /// The `jti` of the PO token minted for this opening's spec: `None` until the spec
+    /// is built (a token minted by a build that failed is then the session's only one).
+    jti: Option<String>,
     armed: bool,
 }
 
@@ -2332,7 +2355,32 @@ impl OpeningCleanup {
         Self {
             session_id: session_id.to_string(),
             turn_routing: Arc::clone(turn_routing),
+            router: None,
+            jti: None,
             armed: true,
+        }
+    }
+
+    /// The router this opening registered (`None`: routing is not configured).
+    fn registered(&mut self, router: Option<Arc<super::agent_hooks::TurnRouter>>) {
+        self.router = router;
+    }
+
+    /// The spec this opening built: the `jti` of the PO token it carries.
+    fn minted(&mut self, spec: &nexus_claude::agent::SessionSpec, secret: Option<&str>) {
+        self.jti = minted_jti(spec, secret);
+    }
+
+    /// Revokes the PO token of this opening (the session's `nexus-tools` token with
+    /// it); every token of the session when the opening never knew its own.
+    fn revoke_token(&self) {
+        match self.jti.as_deref() {
+            Some(jti) => {
+                crate::auth::agent_tokens::revoke_minted(&self.session_id, jti);
+            }
+            None => {
+                crate::auth::agent_tokens::revoke_session(&self.session_id);
+            }
         }
     }
 
@@ -2344,10 +2392,61 @@ impl OpeningCleanup {
 impl Drop for OpeningCleanup {
     fn drop(&mut self) {
         if self.armed {
-            // Nothing will ever use this session's token.
-            crate::auth::agent_tokens::revoke_session(&self.session_id);
-            self.turn_routing.remove(&self.session_id);
+            // Nothing will ever use this opening's token.
+            self.revoke_token();
+            if let Some(router) = &self.router {
+                self.turn_routing.remove_if(&self.session_id, router);
+            }
         }
+    }
+}
+
+/// The `jti` of the PO token `spec` carries (its project-orchestrator server), read
+/// with the server's signing key. `None` without a key, a server or a token.
+pub(crate) fn minted_jti(
+    spec: &nexus_claude::agent::SessionSpec,
+    secret: Option<&str>,
+) -> Option<String> {
+    let secret = secret?;
+    match spec.mcp_servers.get(PO_MCP_SERVER) {
+        Some(nexus_claude::agent::McpServerSpec::Stdio { env, .. }) => env
+            .get("PO_AUTH_TOKEN")
+            .and_then(|token| crate::auth::jwt::decode_jwt(token, secret).ok())
+            .and_then(|claims| claims.jti),
+        _ => None,
+    }
+}
+
+/// One lock per session id, held for as long as someone holds its guard: resumes of
+/// one session run one after the other. An entry whose lock nobody holds is dropped.
+#[derive(Default)]
+pub(crate) struct SessionLocks(
+    std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+);
+
+impl SessionLocks {
+    /// Waits for the session's lock.
+    pub(crate) async fn lock(&self, session_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(session_id).and_then(std::sync::Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        let mut locks = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        locks.len()
     }
 }
 
@@ -2509,6 +2608,7 @@ impl ChatManager {
             nn_router: None,
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             turn_routing: Arc::new(super::agent_hooks::TurnRouting::default()),
+            resume_locks: Arc::new(SessionLocks::default()),
             refs_v1: crate::refs::flag::from_env(),
             document_store: crate::documents::store::DocumentStore::new(
                 crate::documents::store::default_storage_dir(),
@@ -2592,6 +2692,7 @@ impl ChatManager {
             nn_router: None,
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             turn_routing: Arc::new(super::agent_hooks::TurnRouting::default()),
+            resume_locks: Arc::new(SessionLocks::default()),
             refs_v1: crate::refs::flag::from_env(),
             document_store: crate::documents::store::DocumentStore::new(
                 crate::documents::store::default_storage_dir(),
@@ -2775,6 +2876,12 @@ impl ChatManager {
                 provider_imposed: turn.provider_imposed && !turn.moved_in,
                 allowed_models,
                 routing_pool: turn.routing_pool.clone(),
+                // Auto, or two models ticked or more: the user's choice for THIS
+                // conversation, decided at the `auto` stage (decision R-S1).
+                conversation_routes: super::provider::cognitive::conversation_routes(
+                    turn.routing_mode,
+                    turn.routing_pool.as_ref().map_or(0, Vec::len),
+                ),
                 current_model: model.to_owned(),
                 next_turn: turn.next_turn,
                 moved_in: turn.moved_in,
@@ -2806,6 +2913,11 @@ impl ChatManager {
             {
                 warn!(session_id, error = %error, "turn routing could not change the model");
                 router.forget_change(&before);
+                // The stored decision says the change did not go out (as a refused move).
+                if let Some(decision) = router.decision_of_turn(ctx.turn_index) {
+                    self.record_refused_change(decision, "set_model_failed")
+                        .await;
+                }
             }
         }
     }
@@ -2922,6 +3034,19 @@ impl ChatManager {
         if let Err(error) = store.put_decision(&decision).await {
             warn!(decision_id = %decision.id, %error, "the refused move was not recorded on its decision");
         }
+    }
+
+    /// The decision of a model change that could not be sent says so: not applied, and why.
+    async fn record_refused_change(
+        &self,
+        decision: super::provider::cognitive::decision::CognitiveDecision,
+        code: &str,
+    ) {
+        let store = self
+            .cognitive_routing
+            .as_ref()
+            .and_then(|routing| routing.store.clone());
+        record_not_changed(store.as_ref(), decision, code).await;
     }
 
     /// Emit the light `attention_changed` signal for a session (no-op without
@@ -5223,6 +5348,20 @@ impl ChatManager {
         // The menu's ticks, read once: one model ticked is strict, an empty pool is none.
         let settled = request.settled_routing();
         let request = settled.as_ref().unwrap_or(request);
+        // A delegation (an agent caller, a spawned session) follows the settings' stage: it
+        // cannot hand its own routing to PO (decision R-S1). Its Auto or pool is dropped, not
+        // refused: the delegation still opens, routed as a session that asked nothing.
+        let delegated = (request.spawned_by.is_some()
+            && (request.routing_mode.is_some() || request.routing_pool.is_some()))
+        .then(|| {
+            warn!("a delegated session cannot choose its routing: routing_mode and routing_pool dropped");
+            ChatRequest {
+                routing_mode: None,
+                routing_pool: None,
+                ..request.clone()
+            }
+        });
+        let request = delegated.as_ref().unwrap_or(request);
         let session_id = Uuid::new_v4();
         if !request.cwd.trim().is_empty() {
             return self
@@ -5832,6 +5971,12 @@ impl ChatManager {
             self.active_sessions.clone(),
             nats_cancel.clone(),
         );
+        // cancel_task asked on another instance (request/reply).
+        self.spawn_nats_cancel_task_listener(
+            &session_id.to_string(),
+            self.active_sessions.clone(),
+            nats_cancel.clone(),
+        );
 
         // Spawn the per-session background-tasks poller (T12 of plan
         // 754a1379). Wakes up every BACKGROUND_TASKS_POLL_INTERVAL_SECS
@@ -6114,6 +6259,7 @@ impl ChatManager {
                     pid: None,
                     parent_tool_use_id: parent_tool_use_id.map(String::from),
                     pending_removal_at: None,
+                    signalled: false,
                 }
             });
 
@@ -6126,6 +6272,7 @@ impl ChatManager {
             // surprises us with a fresh ToolUse on the same id, cancel
             // the pending removal — the task is alive after all.
             entry.pending_removal_at = None;
+            entry.signalled = false;
 
             let snap = tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>();
             (snap, was_vacant)
@@ -6236,7 +6383,28 @@ impl ChatManager {
             return;
         };
 
-        // Update the task's pid and capture a fresh snapshot.
+        // Update the task's pid and capture a fresh snapshot. A task stopped
+        // before its pid was known (`cancel_task` within the claim's first
+        // second: marked `pending_removal_at`, nothing signalled) is signalled
+        // here, once: nothing else would, and a `cancel_task` asked again finds
+        // it signalled (review of #691, finding 1).
+        //
+        // Only when the claim is unambiguous (review of #694, point 2): several new
+        // processes in the same second (two tools started together) means the
+        // first candidate may be the neighbour's. The pid is still recorded, as
+        // before, but nothing is sent automatically: the task stays marked
+        // stopping and NOT signalled, so an explicit Stop asked again signals it
+        // (it is not the no-op), as before #691.
+        let unambiguous = candidates.len() == 1;
+        if !unambiguous {
+            debug!(
+                session_id = %session_id,
+                tool_use_id = %tool_use_id,
+                candidates = candidates.len(),
+                "async_pid_claim: several new processes; a stop before the claim is left to an explicit Stop"
+            );
+        }
+        let mut stop_now = false;
         let snapshot = {
             let sessions = active_sessions.read().await;
             let Some(active) = sessions.get(&session_id) else {
@@ -6253,8 +6421,23 @@ impl ChatManager {
                 return;
             };
             task.pid = Some(claimed);
+            if unambiguous && task.pending_removal_at.is_some() && !task.signalled {
+                task.signalled = true;
+                stop_now = true;
+            }
             tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>()
         };
+
+        if stop_now {
+            let killed = Self::kill_subtree(claimed);
+            info!(
+                session_id = %session_id,
+                tool_use_id = %tool_use_id,
+                root_pid = claimed,
+                killed_count = killed.len(),
+                "async_pid_claim: the task was stopped before its pid was known: SIGINT'd subtree"
+            );
+        }
 
         info!(
             session_id = %session_id,
@@ -6364,6 +6547,7 @@ impl ChatManager {
                     pid: None,
                     parent_tool_use_id: Some(correlation_id.to_string()),
                     pending_removal_at: None,
+                    signalled: false,
                 },
             );
             info!(
@@ -6491,6 +6675,10 @@ impl ChatManager {
                     cli_reports_live_tasks,
                 ) {
                     info.pending_removal_at = Some(now_inst);
+                    // Found dead: no signal may go to its pid any more (it may
+                    // name another process by now). A `cancel_task` before the
+                    // purge is the no-op (review of #694, point 1).
+                    info.signalled = true;
                     newly_marked += 1;
                 }
             }
@@ -6845,12 +7033,18 @@ impl ChatManager {
                                      so next message triggers resume_session",
                                     session_id, err_str
                                 );
-                                active_sessions.write().await.remove(&session_id);
-                                notify_attention(
-                                    &event_emitter,
-                                    AttentionSubject::Session(session_id.to_string()),
-                                    AttentionReason::SessionInactive,
-                                );
+                                // Only the entry of THIS client: a resume that
+                                // replaced it meanwhile keeps its session and its
+                                // NATS listeners (review of #685, finding 2).
+                                if Self::forget_if_client(&active_sessions, &session_id, &client)
+                                    .await
+                                {
+                                    notify_attention(
+                                        &event_emitter,
+                                        AttentionSubject::Session(session_id.to_string()),
+                                        AttentionReason::SessionInactive,
+                                    );
+                                }
                             }
 
                             emit_chat(
@@ -7483,12 +7677,21 @@ impl ChatManager {
                                              active_sessions so the next message resumes it",
                                             session_id
                                         );
-                                        active_sessions.write().await.remove(&session_id);
-                                        notify_attention(
-                                            &event_emitter,
-                                            AttentionSubject::Session(session_id.to_string()),
-                                            AttentionReason::SessionInactive,
-                                        );
+                                        // Only the entry of THIS client (review of
+                                        // #685, finding 2).
+                                        if Self::forget_if_client(
+                                            &active_sessions,
+                                            &session_id,
+                                            &client,
+                                        )
+                                        .await
+                                        {
+                                            notify_attention(
+                                                &event_emitter,
+                                                AttentionSubject::Session(session_id.to_string()),
+                                                AttentionReason::SessionInactive,
+                                            );
+                                        }
                                     }
                                     emit_chat(
                                         ChatEvent::Error {
@@ -8503,6 +8706,10 @@ impl ChatManager {
     /// Removes a legacy session from `active_sessions` when its CLI process is
     /// gone (stdout at EOF). A session being streamed holds the client lock and
     /// is left alone: its own stream reports a death.
+    ///
+    /// Only the entry whose CLI was found dead is removed: if a resume replaced it
+    /// meanwhile (between the read and the write lock), the new session and its
+    /// NATS listeners are left alone (review of #673, finding 4).
     pub(crate) async fn evict_if_cli_dead(&self, session_id: &str) -> bool {
         let client = match self.active_sessions.read().await.get(session_id) {
             Some(s) => s.client.clone(),
@@ -8512,14 +8719,46 @@ impl ChatManager {
             Ok(c) => !c.is_alive().await,
             Err(_) => false,
         };
-        if dead {
-            warn!(
-                session_id = %session_id,
-                "CLI process is gone, dropping the session from active_sessions so the message resumes it"
-            );
-            self.active_sessions.write().await.remove(session_id);
+        if !dead || !Self::forget_if_client(&self.active_sessions, session_id, &client).await {
+            return false;
         }
-        dead
+        warn!(
+            session_id = %session_id,
+            "CLI process is gone, dropped the session from active_sessions so the message resumes it"
+        );
+        true
+    }
+
+    /// Removes a legacy session from `active_sessions` AND ends its per-session
+    /// NATS listeners (`nats_cancel`), only while the entry is still the one of
+    /// `client` (`Arc::ptr_eq`, under the write lock): a resume that replaced it
+    /// keeps its session and its listeners (review of #673, finding 4; of #685,
+    /// finding 2). Whether it was removed.
+    ///
+    /// A removal that leaves the listeners running keeps an instance answering for
+    /// a session it no longer holds: after a resume on another instance, its `gone`
+    /// could reach a canceller before the real owner's answer (review N1 of #663).
+    /// Every removal of a dead CLI goes through here; the others cancel
+    /// `nats_cancel` themselves (`close_session`, a replaced session).
+    async fn forget_if_client(
+        active_sessions: &RwLock<HashMap<String, ActiveSession>>,
+        session_id: &str,
+        client: &Arc<Mutex<InteractiveClient>>,
+    ) -> bool {
+        let removed = {
+            let mut sessions = active_sessions.write().await;
+            match sessions.get(session_id) {
+                Some(s) if Arc::ptr_eq(&s.client, client) => sessions.remove(session_id),
+                _ => None,
+            }
+        };
+        match removed {
+            Some(session) => {
+                session.nats_cancel.cancel();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Deliver a user message: local CLI -> owning instance (NATS) ->
@@ -9375,6 +9614,10 @@ impl ChatManager {
         user_claims: Option<&crate::auth::jwt::Claims>,
     ) -> Result<()> {
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
+        // The live handle (if any) this resume starts from, read before anything awaits: a
+        // resume that finds ANOTHER one once it holds the session's lock was overtaken by
+        // a resume that succeeded meanwhile (review of #696, finding 1).
+        let seen = self.agent_runtime.get(session_id).await;
 
         // Load session from Neo4j
         let mut session_node = self
@@ -9431,7 +9674,7 @@ impl ChatManager {
                 ));
             }
             return self
-                .resume_agent_session(&session_node, message, user_claims)
+                .resume_agent_session(&session_node, message, user_claims, seen)
                 .await;
         }
 
@@ -9762,6 +10005,11 @@ impl ChatManager {
         // as create_session. The old listener was cancelled above via
         // old_session.nats_cancel.cancel().
         self.spawn_nats_cancel_tools_listener(
+            session_id,
+            self.active_sessions.clone(),
+            nats_cancel.clone(),
+        );
+        self.spawn_nats_cancel_task_listener(
             session_id,
             self.active_sessions.clone(),
             nats_cancel.clone(),
@@ -10755,10 +11003,13 @@ impl ChatManager {
     ///
     /// ## Cross-instance routing
     ///
-    /// If the session is not local, the request is propagated via NATS
-    /// `chat.{session_id}.cancel_tools` so the owning instance executes
-    /// the SIGINT. The local rate cap still applies to prevent flooding
-    /// NATS itself.
+    /// If the session is not local, the request goes over NATS
+    /// (`events.chat.{session_id}.cancel_tools`, request/reply) to the owning
+    /// instance, which applies ITS cap, stops the tools and answers what it did
+    /// or its typed refusal; no answer is a typed error (`cancel_relay`:
+    /// `owner_unreachable`, `owner_timeout`, `session_gone`, `owner_protocol`),
+    /// never a success. A session no instance holds is `owner_unreachable`, with or without NATS (one
+    /// rule for every topology, review N2).
     pub async fn cancel_running_tools(&self, session_id: &str) -> Result<CancelToolsResult> {
         // The agent engine: the session handle stops the tools through the
         // provider (`AgentSession::cancel_tools`, scope all), under the same
@@ -10790,20 +11041,25 @@ impl ChatManager {
         let (cli_pid, history, cap, window, events_tx) = match session_state {
             Some(state) => state,
             None => {
-                // Session not local — still enforce a "soft" cap by
-                // doing nothing locally; remote owner has its own cap.
-                debug!(
-                    session_id = %session_id,
-                    "cancel_running_tools: session not active locally; routing via NATS only"
-                );
+                // Session not local: the instance that holds it answers over NATS
+                // (request/reply, its cap applies) with what it did, its refusal, or
+                // the typed reason there is no answer (`cancel_relay`) — never a
+                // success it did not report.
                 if let Some(ref nats) = self.nats {
-                    nats.publish_cancel_tools(session_id);
+                    return super::cancel_relay::relay(
+                        nats,
+                        nats.cancel_tools_subject(session_id),
+                        serde_json::json!({}),
+                        super::cancel_relay::CancelKind::Tools,
+                    )
+                    .await;
                 }
-                return Ok(CancelToolsResult {
-                    cli_pid: None,
-                    killed_pids: Vec::new(),
-                    capped: false,
-                });
+                // Single instance: no instance holds it live — the same typed answer
+                // as with NATS and nobody answering (`owner_unreachable`).
+                debug!(session_id = %session_id, "cancel_running_tools: no such live session");
+                return Err(anyhow::Error::new(
+                    super::cancel_relay::CancelRelayError::OwnerUnreachable,
+                ));
             }
         };
 
@@ -10845,12 +11101,12 @@ impl ChatManager {
         };
         let _ = events_tx.send(event.clone());
 
-        // Cross-instance fan-out — both the cancel SIGNAL (so the
-        // owning instance executes the SIGINT if remote) and the
-        // ChatEvent (so remote clients of this session see the cancel
-        // in their feed).
+        // Cross-instance fan-out of the ChatEvent (so remote clients of this
+        // session see the cancel in their feed). NOT the cancel signal: this
+        // instance holds the session and just did it; publishing it reached this
+        // instance's own listener, which signalled the tools a second time and
+        // counted the cap twice (review N8).
         if let Some(ref nats) = self.nats {
-            nats.publish_cancel_tools(session_id);
             nats.publish_chat_event(session_id, event);
         }
 
@@ -10879,9 +11135,9 @@ impl ChatManager {
     /// 3. If `pid.is_none()` (claim race — `track_background_task_start`
     ///    spawned the async claim but it hasn't fired yet, OR the
     ///    subprocess crashed before pgrep saw it): logs a warning and
-    ///    falls back to V1 map-side-only cancel. `killed_pids` is empty
-    ///    in this edge case — the user can fall back to the global
-    ///    `cancel_running_tools` if needed.
+    ///    marks it only. `killed_pids` is empty in this edge case; the
+    ///    claim, when it finds the pid of a task marked stopping, sends the
+    ///    SIGINT itself (review of #691, finding 1).
     /// 4. Broadcasts a fresh `ChatEvent::ActiveTasksUpdate` so the
     ///    frontend immediately reflects the cancelled state.
     ///
@@ -10899,11 +11155,21 @@ impl ChatManager {
     ///
     /// ## NATS routing
     ///
-    /// Cross-instance: if the session is owned by another instance,
-    /// publishes a `cancel_task` event over NATS so the owning instance
-    /// performs the local map mutation. (Mirror of
-    /// `publish_cancel_tools` — added in a follow-up alongside the
-    /// listener wiring.)
+    /// Cross-instance: if no session of this instance holds it, the request
+    /// goes over NATS (`events.chat.{id}.cancel_task`, request/reply) to the
+    /// instance that does — Claude Code (`spawn_nats_cancel_task_listener`) or
+    /// agent engine (`spawn_agent_nats_listeners`) — and its answer is returned:
+    /// what it stopped, `capped`, or its refusal (the `ProviderError` back in the
+    /// `Err`). No answer at all is a typed error (`cancel_relay`: `owner_unreachable`
+    /// when nobody subscribes, `owner_timeout`, `session_gone`, `owner_protocol`),
+    /// never a success. A session no instance holds is `owner_unreachable`, with or without NATS.
+    ///
+    /// ## Agent engine
+    ///
+    /// `AgentSessionHandle::cancel_task`: the provider stops the task
+    /// (`cancel_tools(task { id })`), a provider that cannot is a typed refusal
+    /// (`Err` holding `ProviderError::Unsupported`, `error { code: cancel_refused }`
+    /// on the wire), never a success.
     ///
     /// ## Returns
     ///
@@ -10913,17 +11179,56 @@ impl ChatManager {
     ///   path described above.
     /// - `capped: true` if the rate cap was hit (no broadcast, no map
     ///   mutation, no kill).
-    /// - Returns `Ok(...)` even if the session is unknown or the
-    ///   task_id isn't in the map (idempotent — clicking Stop twice on
-    ///   the same task is fine).
+    /// - Returns `Ok(...)` when the session is held but the task_id is
+    ///   not (idempotent — clicking Stop twice on the same task is fine);
+    ///   a session no instance holds is `Err(owner_unreachable)`.
     pub async fn cancel_task(&self, session_id: &str, task_id: &str) -> Result<CancelTaskResult> {
-        if self.agent_runtime.owns(session_id).await {
-            return Err(anyhow::Error::new(CancelTaskUnsupported {
-                session_id: session_id.to_string(),
-            }));
+        // The agent engine: the session handle stops the task through its provider
+        // (`AgentSession::cancel_tools(task { id })`), under the same per-session cap,
+        // and refuses, typed, what the provider cannot do.
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return handle.cancel_task(task_id).await;
         }
+        if let Some(result) =
+            Self::cancel_legacy_task(&self.active_sessions, &self.nats, session_id, task_id).await
+        {
+            return Ok(result);
+        }
+        // Not held here: the instance that holds the session answers over NATS
+        // (`spawn_nats_cancel_task_listener`, `spawn_agent_nats_listeners`) with what
+        // it did, or why it could not.
+        // No answer at all is a typed error (`cancel_relay`), never a success.
+        if let Some(ref nats) = self.nats {
+            return super::cancel_relay::relay(
+                nats,
+                nats.cancel_task_subject(session_id),
+                serde_json::json!({ "task_id": task_id }),
+                super::cancel_relay::CancelKind::Task,
+            )
+            .await;
+        }
+        // Single instance: no instance holds it live — the same typed answer as
+        // with NATS and nobody answering (`owner_unreachable`).
+        debug!(
+            session_id = %session_id,
+            task_id = %task_id,
+            "cancel_task: no such live session"
+        );
+        Err(anyhow::Error::new(
+            super::cancel_relay::CancelRelayError::OwnerUnreachable,
+        ))
+    }
+
+    /// [`Self::cancel_task`] on a Claude Code session of THIS instance; `None` when
+    /// it holds no such session. Callable without the manager (the NATS listener).
+    async fn cancel_legacy_task(
+        active_sessions: &RwLock<HashMap<String, ActiveSession>>,
+        nats: &Option<Arc<crate::events::NatsEmitter>>,
+        session_id: &str,
+        task_id: &str,
+    ) -> Option<CancelTaskResult> {
         let session_state = {
-            let sessions = self.active_sessions.read().await;
+            let sessions = active_sessions.read().await;
             sessions.get(session_id).map(|s| {
                 (
                     s.cancel_task_history.clone(),
@@ -10935,53 +11240,55 @@ impl ChatManager {
             })
         };
 
-        let (history, cap, window, events_tx, tasks_arc) = match session_state {
-            Some(state) => state,
-            None => {
+        let (history, cap, window, events_tx, tasks_arc) = session_state?;
+
+        let no_op = |capped: bool| CancelTaskResult {
+            task_id: task_id.to_string(),
+            killed_pids: Vec::new(),
+            capped,
+        };
+
+        // One critical section on the task map for the whole decision: whether
+        // the task was already signalled, the rate cap, the mark and the pid.
+        //
+        // - A task already SIGNALLED (by a stop that knew its pid, or by the PID
+        //   claim for a stop that came first) is a no-op, not counted in the cap:
+        //   a retry after a `session_gone` / `owner_timeout` from a real owner
+        //   that did stop it, a second click, or a concurrent cancel waiting on
+        //   this lock, never SIGINTs the same pid twice (reviews of #685,
+        //   finding 3, and of #691, findings 1 and 2).
+        // - A task marked stopping but NOT signalled (stopped before its pid was
+        //   known, or marked by the death poller) is not a no-op: it is signalled
+        //   now if its pid is known; otherwise the PID claim will do it.
+        // - Marking and reading the pid together means a concurrent claim cannot
+        //   populate the pid AFTER we read it (plan fc35b25e, T4).
+        // Lock order: tasks, then the cap history (taken nowhere else first).
+        let (snapshot, task_pid) = {
+            let mut tasks = tasks_arc.lock().await;
+            if tasks.get(task_id).is_some_and(|t| t.signalled) {
                 debug!(
                     session_id = %session_id,
                     task_id = %task_id,
-                    "cancel_task: session not active locally; idempotent no-op"
+                    "cancel_task: already signalled; idempotent no-op"
                 );
-                if let Some(ref _nats) = self.nats {
-                    // TODO follow-up: nats.publish_cancel_task(session_id, task_id)
-                    // once the cross-instance listener exists.
-                }
-                return Ok(CancelTaskResult {
-                    task_id: task_id.to_string(),
-                    killed_pids: Vec::new(),
-                    capped: false,
-                });
+                return Some(no_op(false));
             }
-        };
-
-        // Rate cap.
-        let capped = !Self::check_and_record_cancel_cap(&history, cap, window).await;
-        if capped {
-            warn!(
-                session_id = %session_id,
-                task_id = %task_id,
-                cap = cap,
-                window_secs = window.as_secs(),
-                "cancel_task: rate cap hit, refusing"
-            );
-            return Ok(CancelTaskResult {
-                task_id: task_id.to_string(),
-                killed_pids: Vec::new(),
-                capped: true,
-            });
-        }
-
-        // V2 (plan fc35b25e, T4): atomically extract the task's pid AND
-        // mark for removal under a single tasks-lock op, then capture the
-        // snapshot for broadcast. Doing both in the same critical section
-        // ensures a concurrent claim-update from `async_pid_claim` cannot
-        // populate the pid AFTER we read it.
-        let (snapshot, task_pid) = {
-            let mut tasks = tasks_arc.lock().await;
+            if !Self::check_and_record_cancel_cap(&history, cap, window).await {
+                warn!(
+                    session_id = %session_id,
+                    task_id = %task_id,
+                    cap = cap,
+                    window_secs = window.as_secs(),
+                    "cancel_task: rate cap hit, refusing"
+                );
+                return Some(no_op(true));
+            }
             let pid = if let Some(entry) = tasks.get_mut(task_id) {
-                entry.pending_removal_at = Some(std::time::Instant::now());
+                entry
+                    .pending_removal_at
+                    .get_or_insert_with(std::time::Instant::now);
                 let captured = entry.pid;
+                entry.signalled = captured.is_some();
                 info!(
                     session_id = %session_id,
                     task_id = %task_id,
@@ -11005,7 +11312,8 @@ impl ChatManager {
         };
 
         // V2: SIGINT the subtree if the async claim populated a pid;
-        // otherwise log a warning and fall back to map-side-only cancel.
+        // otherwise the claim signals it when it finds the pid (the task is
+        // marked stopping), and this answer has no pid.
         let killed_pids = match task_pid {
             Some(root_pid) => {
                 let killed = Self::kill_subtree(root_pid);
@@ -11022,7 +11330,7 @@ impl ChatManager {
                 warn!(
                     session_id = %session_id,
                     task_id = %task_id,
-                    "cancel_task: no PID stored (claim race or subprocess crashed before discovery), map-side only"
+                    "cancel_task: no PID stored yet (claim pending: it signals the task when it finds the pid; or the subprocess crashed before discovery)"
                 );
                 Vec::new()
             }
@@ -11030,12 +11338,11 @@ impl ChatManager {
 
         let event = ChatEvent::ActiveTasksUpdate { tasks: snapshot };
         let _ = events_tx.send(event.clone());
-        if let Some(ref nats) = self.nats {
+        if let Some(nats) = nats {
             nats.publish_chat_event(session_id, event);
-            // TODO follow-up: nats.publish_cancel_task(session_id, task_id);
         }
 
-        Ok(CancelTaskResult {
+        Some(CancelTaskResult {
             task_id: task_id.to_string(),
             killed_pids,
             capped: false,
@@ -11053,6 +11360,9 @@ impl ChatManager {
     /// toolbar indicator and any in-progress MonitorCards before the
     /// next `ChatEvent::ActiveTasksUpdate` lands.
     pub async fn get_active_background_tasks(&self, session_id: &str) -> Vec<BackgroundTaskInfo> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return handle.active_background_tasks().await;
+        }
         // Drop the read lock on `active_sessions` before taking the
         // per-session mutex to avoid holding two locks simultaneously
         // and keep the borrow-checker happy (the inner Arc clone moves
@@ -11139,7 +11449,11 @@ impl ChatManager {
             };
 
             loop {
+                // `biased`: a listener whose session was removed (its token
+                // cancelled) stops before reading a request it would answer
+                // `gone` (review of #673, finding 1).
                 tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => {
                         debug!(
                             "NATS cancel_tools listener cancelled for session {} (session replaced)",
@@ -11148,7 +11462,12 @@ impl ChatManager {
                         break;
                     }
                     msg = subscriber.next() => {
-                        let Some(_msg) = msg else { break; };
+                        let Some(msg) = msg else { break; };
+                        // A request (`cancel_running_tools` on another instance)
+                        // gets an answer; a plain publish (the local path's
+                        // fan-out) does not.
+                        let reply_to = msg.reply;
+                        let asker_v2 = super::cancel_relay::asker_v2(&msg.payload);
 
                         // Pull the session's cli_pid + cap state (or stop
                         // if the session was removed locally).
@@ -11168,6 +11487,16 @@ impl ChatManager {
                                 "Session {} no longer active, stopping NATS cancel_tools listener",
                                 session_id
                             );
+                            // The asker learns it at once, typed (`session_gone`).
+                            if let Some(reply_to) = reply_to {
+                                super::cancel_relay::publish(
+                                    &nats,
+                                    reply_to,
+                                    asker_v2,
+                                    &super::cancel_relay::CancelReply::<CancelToolsResult>::Gone,
+                                )
+                                .await;
+                            }
                             break;
                         };
 
@@ -11175,23 +11504,121 @@ impl ChatManager {
                         // against a remote instance flooding the NATS
                         // subject. Mirrors the cap applied by the
                         // local-path of `cancel_running_tools`.
-                        if !Self::check_and_record_cancel_cap(&history, cap, window).await {
+                        let capped = !Self::check_and_record_cancel_cap(&history, cap, window).await;
+                        let killed = if capped {
                             warn!(
                                 session_id = %session_id,
                                 cap = cap,
                                 window_secs = window.as_secs(),
                                 "NATS cancel_tools listener: rate cap hit, dropping signal"
                             );
-                            continue;
+                            Vec::new()
+                        } else {
+                            let killed = Self::kill_descendants(cli_pid);
+                            info!(
+                                session_id = %session_id,
+                                cli_pid = ?cli_pid,
+                                descendant_count = killed.len(),
+                                "NATS cancel_tools received, SIGINT sent to descendants"
+                            );
+                            killed
+                        };
+                        if let Some(reply_to) = reply_to {
+                            let result = CancelToolsResult {
+                                cli_pid,
+                                killed_pids: killed,
+                                capped,
+                            };
+                            super::cancel_relay::publish(
+                                &nats,
+                                reply_to,
+                                asker_v2,
+                                &super::cancel_relay::CancelReply::Result(result),
+                            )
+                            .await;
                         }
+                    }
+                }
+            }
+        });
+    }
 
-                        let killed = Self::kill_descendants(cli_pid);
-                        info!(
-                            session_id = %session_id,
-                            cli_pid = ?cli_pid,
-                            descendant_count = killed.len(),
-                            "NATS cancel_tools received, SIGINT sent to descendants"
+    /// Spawn the per-session NATS responder for `cancel_task` asked on another
+    /// instance (P12): request/reply on `events.chat.{id}.cancel_task`, answered
+    /// with what [`Self::cancel_legacy_task`] did here (`cancel_relay::CancelReply`) —
+    /// the cap applies on this side, as for a local call. One task per request,
+    /// bounded by `OWNER_CANCEL_BOUND`. When the session has left: `gone`, then the
+    /// listener ends.
+    fn spawn_nats_cancel_task_listener(
+        &self,
+        session_id: &str,
+        active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+        cancel: CancellationToken,
+    ) {
+        let Some(nats) = self.nats.clone() else {
+            return;
+        };
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            let mut subscriber = match nats.subscribe_cancel_task(&session_id).await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    warn!(session_id = %session_id, "Failed to subscribe to NATS cancel_task: {}", e);
+                    return;
+                }
+            };
+            let nats_opt = Some(Arc::clone(&nats));
+            loop {
+                // `biased`: see `spawn_nats_cancel_tools_listener`.
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    msg = subscriber.next() => {
+                        let Some(msg) = msg else { break };
+                        let Some(reply_to) = msg.reply else { continue };
+                        let task_id = super::cancel_relay::task_id_of(&msg.payload);
+                        let asker_v2 = super::cancel_relay::asker_v2(&msg.payload);
+                        // The session left this instance (a removal path that did not
+                        // end this listener): `gone`, which the asker only keeps if no
+                        // instance holding the session answers (`GONE_GRACE`).
+                        if !active_sessions.read().await.contains_key(&session_id) {
+                            super::cancel_relay::publish(
+                                &nats,
+                                reply_to,
+                                asker_v2,
+                                &super::cancel_relay::CancelReply::<CancelTaskResult>::Gone,
+                            )
+                            .await;
+                            break;
+                        }
+                        // One task per request, bounded: a slow cancel never holds
+                        // the next one, and the asker always gets an answer.
+                        let (nats, nats_opt, sessions, sid) = (
+                            Arc::clone(&nats),
+                            nats_opt.clone(),
+                            Arc::clone(&active_sessions),
+                            session_id.clone(),
                         );
+                        tokio::spawn(async move {
+                            super::cancel_relay::answer(
+                                &nats,
+                                reply_to,
+                                asker_v2,
+                                super::cancel_relay::CancelKind::Task,
+                                async {
+                                    Self::cancel_legacy_task(&sessions, &nats_opt, &sid, &task_id)
+                                        .await
+                                        .ok_or_else(|| {
+                                            anyhow::Error::new(
+                                                super::cancel_relay::CancelRelayError::SessionGone {
+                                                    kind: super::cancel_relay::CancelKind::Task,
+                                                },
+                                            )
+                                        })
+                                },
+                            )
+                            .await;
+                        });
                     }
                 }
             }
@@ -11987,6 +12414,15 @@ impl ChatManager {
             || request.run_provider.is_some();
         // The conversation's own mode replaces the settings' (the chat menu: Auto = full).
         let mut settings = settings;
+        // Auto, or two models ticked or more: the user's choice for THIS conversation is
+        // decided at the `auto` stage, whatever the settings' stage (decision R-S1).
+        settings.stage = super::provider::cognitive::conversation_stage(
+            settings.stage,
+            super::provider::cognitive::conversation_routes(
+                request.routing_mode,
+                Self::routing_pool_of(request).map_or(0, <[_]>::len),
+            ),
+        );
         if let Some(mode) = request.routing_mode {
             settings.mode = mode;
         }
@@ -12516,24 +12952,26 @@ impl ChatManager {
             other => other,
         };
         // From here, a failure undoes the router and the token (finding 5 of #682).
-        let cleanup = OpeningCleanup::new(&sid, &self.turn_routing);
-        self.register_turn_router(
-            &sid,
-            provider_id,
-            model,
-            project_slug,
-            OpeningTurn {
-                explicit_model: request.model.is_some(),
-                provider_imposed: request.provider.is_some(),
-                moved_in: super::relay::moved_by_auto(relay),
-                routing_mode: request.routing_mode,
-                routing_pool: request.routing_pool.clone(),
-                permission_mode: request.permission_mode.as_deref(),
-                message: &crate::refs::turn::visible_text(&request.message),
-                next_turn: 0,
-            },
-        )
-        .await;
+        let mut cleanup = OpeningCleanup::new(&sid, &self.turn_routing);
+        let router = self
+            .register_turn_router(
+                &sid,
+                provider_id,
+                model,
+                project_slug,
+                OpeningTurn {
+                    explicit_model: request.model.is_some(),
+                    provider_imposed: request.provider.is_some(),
+                    moved_in: super::relay::moved_by_auto(relay),
+                    routing_mode: request.routing_mode,
+                    routing_pool: request.routing_pool.clone(),
+                    permission_mode: request.permission_mode.as_deref(),
+                    message: &crate::refs::turn::visible_text(&request.message),
+                    next_turn: 0,
+                },
+            )
+            .await;
+        cleanup.registered(router);
         let spec = self
             .build_agent_spec_with_access(
                 AgentSpecInput {
@@ -12562,6 +13000,7 @@ impl ChatManager {
                 access,
             )
             .await?;
+        cleanup.minted(&spec, self.config.jwt_secret.as_deref());
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
         self.authorize_provider_use(ProviderUse {
             provider_id,
@@ -12597,7 +13036,7 @@ impl ChatManager {
         let without_mcp = opened_without_mcp(per_session_mcp, dropped, session.capabilities());
         if without_mcp {
             // The token minted for the refused spec's PO server: nothing holds it.
-            crate::auth::agent_tokens::revoke_session(&sid);
+            cleanup.revoke_token();
             host_missing.push(super::agent_runtime::PO_TOOLS_FEATURE.to_string());
         }
         // ... and does the model's window hold the tool schemas the session was
@@ -12680,6 +13119,10 @@ impl ChatManager {
             context_injector: self.context_injector.clone(),
             step_budget: super::post_stream::POST_STREAM_STEP_BUDGET,
             stall_step: None,
+            routing_store: self
+                .cognitive_routing
+                .as_ref()
+                .and_then(|routing| routing.store.clone()),
         })
     }
 
@@ -12809,6 +13252,63 @@ impl ChatManager {
         self.spawn_agent_nats_listeners(handle);
     }
 
+    /// The loop of an agent-engine cancel listener: hands each request to `on_request`
+    /// until the session closes. `biased`, the close first: once `closed` is
+    /// cancelled no request is read any more, even one already waiting, so a session
+    /// being closed (or adopted again) does not ask its provider session to cancel
+    /// (review of #685, finding 1; the legacy listeners do the same since #673).
+    async fn serve_agent_cancels<M>(
+        mut requests: impl futures::Stream<Item = M> + Unpin,
+        closed: CancellationToken,
+        mut on_request: impl FnMut(M),
+    ) {
+        loop {
+            tokio::select! {
+                biased;
+                _ = closed.cancelled() => break,
+                msg = requests.next() => {
+                    let Some(msg) = msg else { break };
+                    on_request(msg);
+                }
+            }
+        }
+    }
+
+    /// `work` (a cancel asked of an agent-engine session from another instance),
+    /// unless the session closes before it answers: then `session_gone`, which a
+    /// v2 asker reads as provisional (the real owner, if any, still answers),
+    /// instead of what a provider session being closed would say (`failed`,
+    /// `refused`: final answers that would beat the real owner's). A request read
+    /// just before the close lands here (review of #685, finding 1).
+    ///
+    /// The close is watched for the whole cancel, not only at its start (review
+    /// of #691, finding 3): a close during `work` drops it and answers `gone`, and
+    /// an outcome that comes back once the session is closed is replaced by
+    /// `gone` too. The cancel may then have reached the provider already (the
+    /// signal may have left): `gone` says nothing about that, which is what the
+    /// 410 tells the user ("may or may not have been stopped"; cancel-task is
+    /// retryable, a task signalled twice is still one stopped task).
+    async fn unless_agent_closed<T>(
+        closed: &CancellationToken,
+        kind: super::cancel_relay::CancelKind,
+        work: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let gone =
+            || anyhow::Error::new(super::cancel_relay::CancelRelayError::SessionGone { kind });
+        if closed.is_cancelled() {
+            return Err(gone());
+        }
+        let outcome = tokio::select! {
+            biased;
+            _ = closed.cancelled() => return Err(gone()),
+            outcome = work => outcome,
+        };
+        if closed.is_cancelled() {
+            return Err(gone());
+        }
+        outcome
+    }
+
     /// What the other instances can ask of a session of the agent engine this
     /// instance runs, as for a Claude Code session (`spawn_nats_*_listener`):
     /// an interrupt, a cancel of the running tools, a streaming snapshot (a
@@ -12840,26 +13340,73 @@ impl ChatManager {
         }
         {
             // `cancel_tools` asked on another instance (`cancel_running_tools`
-            // there finds no local session and publishes): the handle applies
+            // there finds no local session and asks over NATS): the handle applies
             // the cap and stops the tools, as `spawn_nats_cancel_tools_listener`
-            // does for a Claude Code session.
+            // does for a Claude Code session, and the asker gets what it did or
+            // the typed refusal. One task per request, bounded
+            // (`cancel_relay::OWNER_CANCEL_BOUND`).
             let (nats, handle, sid) = (nats.clone(), Arc::clone(&handle), sid.clone());
             tokio::spawn(async move {
-                let Ok(mut sub) = nats.subscribe_cancel_tools(&sid).await else {
+                let Ok(sub) = nats.subscribe_cancel_tools(&sid).await else {
                     warn!(session_id = %sid, "agent engine: NATS cancel_tools subscription failed");
                     return;
                 };
-                loop {
-                    tokio::select! {
-                        _ = handle.closed.cancelled() => break,
-                        msg = sub.next() => {
-                            if msg.is_none() { break; }
-                            if let Err(e) = handle.cancel_tools().await {
-                                warn!(session_id = %sid, error = %e, "agent engine: NATS cancel_tools failed");
+                let closed = handle.closed.clone();
+                Self::serve_agent_cancels(sub, closed, move |msg: async_nats::Message| {
+                    let (nats, handle) = (nats.clone(), Arc::clone(&handle));
+                    tokio::spawn(async move {
+                        let kind = super::cancel_relay::CancelKind::Tools;
+                        let work =
+                            Self::unless_agent_closed(&handle.closed, kind, handle.cancel_tools());
+                        let asker_v2 = super::cancel_relay::asker_v2(&msg.payload);
+                        match msg.reply {
+                            Some(reply_to) => {
+                                super::cancel_relay::answer(&nats, reply_to, asker_v2, kind, work)
+                                    .await
+                            }
+                            None => {
+                                if let Err(e) = work.await {
+                                    warn!(session_id = %handle.session_id, error = %e, "agent engine: NATS cancel_tools failed");
+                                }
                             }
                         }
-                    }
-                }
+                    });
+                })
+                .await;
+            });
+        }
+        {
+            // `cancel_task` asked on another instance: the handle stops the task
+            // (cap included) and the asker gets what it did, or the typed refusal.
+            // One task per request, bounded.
+            let (nats, handle, sid) = (nats.clone(), Arc::clone(&handle), sid.clone());
+            tokio::spawn(async move {
+                let Ok(sub) = nats.subscribe_cancel_task(&sid).await else {
+                    warn!(session_id = %sid, "agent engine: NATS cancel_task subscription failed");
+                    return;
+                };
+                let closed = handle.closed.clone();
+                Self::serve_agent_cancels(sub, closed, move |msg: async_nats::Message| {
+                    let Some(reply_to) = msg.reply else { return };
+                    let task_id = super::cancel_relay::task_id_of(&msg.payload);
+                    let (nats, handle) = (nats.clone(), Arc::clone(&handle));
+                    tokio::spawn(async move {
+                        let kind = super::cancel_relay::CancelKind::Task;
+                        super::cancel_relay::answer(
+                            &nats,
+                            reply_to,
+                            super::cancel_relay::asker_v2(&msg.payload),
+                            kind,
+                            Self::unless_agent_closed(
+                                &handle.closed,
+                                kind,
+                                handle.cancel_task(&task_id),
+                            ),
+                        )
+                        .await;
+                    });
+                })
+                .await;
             });
         }
         {
@@ -12918,12 +13465,31 @@ impl ChatManager {
     /// Reopens a session of the agent engine that is no longer live, from its
     /// persisted resume token (a new session when it never got one), then
     /// delivers `message`.
+    ///
+    /// `seen`: the live handle the caller started from, read before it awaited anything
+    /// (`None`: the session was not live; a dead handle: a resume after a failed send).
     async fn resume_agent_session(
         &self,
         node: &ChatSessionNode,
         message: &str,
         user_claims: Option<&crate::auth::jwt::Claims>,
+        seen: Option<Arc<super::agent_runtime::AgentSessionHandle>>,
     ) -> Result<()> {
+        let sid = node.id.to_string();
+        // One resume of a session at a time (reviews of #684, finding 2, and #696, finding
+        // 1): two messages to a session that is not live — or two failed sends on one dead
+        // handle — would each resume it, each minting a token that supersedes the other's,
+        // the second ending the first's handle, and the one that fails would undo what the
+        // other set up. Once it holds the lock, a resume that finds a live handle OTHER than
+        // the one it started from was overtaken by a resume that succeeded: its message goes
+        // to that session, through `send_message` (routing applies in `full` mode). The same
+        // handle (dead, a resume after a failed send) or none: it resumes.
+        let _resuming = self.resume_locks.lock(&sid).await;
+        if let Some(now) = self.agent_runtime.get(&sid).await {
+            if seen.as_ref().is_none_or(|seen| !Arc::ptr_eq(seen, &now)) {
+                return self.send_message(&sid, message).await;
+            }
+        }
         let provider_id = node
             .provider_id
             .clone()
@@ -12935,7 +13501,6 @@ impl ChatManager {
             &node.model,
             node.capabilities.as_deref(),
         );
-        let sid = node.id.to_string();
         let (system_prompt, _) = self
             .build_system_prompt_anchored(
                 node.execution_place,
@@ -12948,35 +13513,37 @@ impl ChatManager {
             )
             .await;
         // From here, a failure undoes the router and the token (finding 5 of #682).
-        let cleanup = OpeningCleanup::new(&sid, &self.turn_routing);
+        let mut cleanup = OpeningCleanup::new(&sid, &self.turn_routing);
         // A resumed session starts counting its turns again; the harness is the authority
         // on the index, and nothing says whether its model was named by the request.
-        self.register_turn_router(
-            &sid,
-            &provider_id,
-            &node.model,
-            node.project_slug.as_deref(),
-            OpeningTurn {
-                // The mode the conversation was opened with stays its own across a resume.
-                routing_mode: node.routing_mode.as_deref().and_then(|m| {
-                    serde_json::from_value(serde_json::Value::String(m.to_owned())).ok()
-                }),
-                routing_pool: node
-                    .routing_pool
-                    .as_deref()
-                    .and_then(|json| serde_json::from_str(json).ok()),
-                explicit_model: false,
-                permission_mode: node.permission_mode.as_deref(),
-                // A provider the request named stays imposed across a resume (a conversation
-                // opened with ticked models names its pilot without imposing it).
-                provider_imposed: node.routed_by.as_deref() == Some("request")
-                    && node.routing_pool.is_none(),
-                moved_in: false,
-                message,
-                next_turn: 0,
-            },
-        )
-        .await;
+        let router = self
+            .register_turn_router(
+                &sid,
+                &provider_id,
+                &node.model,
+                node.project_slug.as_deref(),
+                OpeningTurn {
+                    // The mode the conversation was opened with stays its own across a resume.
+                    routing_mode: node.routing_mode.as_deref().and_then(|m| {
+                        serde_json::from_value(serde_json::Value::String(m.to_owned())).ok()
+                    }),
+                    routing_pool: node
+                        .routing_pool
+                        .as_deref()
+                        .and_then(|json| serde_json::from_str(json).ok()),
+                    explicit_model: false,
+                    permission_mode: node.permission_mode.as_deref(),
+                    // A provider the request named stays imposed across a resume (a conversation
+                    // opened with ticked models names its pilot without imposing it).
+                    provider_imposed: node.routed_by.as_deref() == Some("request")
+                        && node.routing_pool.is_none(),
+                    moved_in: false,
+                    message,
+                    next_turn: 0,
+                },
+            )
+            .await;
+        cleanup.registered(router);
         // A resume keeps the access the session was opened with and can only narrow it.
         let access = super::provider::policy::SessionAccess::for_resume(node.access, None);
         let spec = self
@@ -13007,6 +13574,7 @@ impl ChatManager {
                 access,
             )
             .await?;
+        cleanup.minted(&spec, self.config.jwt_secret.as_deref());
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
         // A resume is a new sending of the project's content: consent, guard
         // and journal apply again (a consent may have been revoked meanwhile).
@@ -13043,7 +13611,7 @@ impl ChatManager {
         let without_mcp = opened_without_mcp(per_session_mcp, dropped, session.capabilities());
         if without_mcp {
             // As at an opening: the token went out in the refused request.
-            crate::auth::agent_tokens::revoke_session(&sid);
+            cleanup.revoke_token();
             host_missing.push(super::agent_runtime::PO_TOOLS_FEATURE.to_string());
         }
         let latest = self
@@ -13144,6 +13712,8 @@ impl ChatManager {
             let session = sessions
                 .remove(session_id)
                 .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
+            // Its NATS listeners end with it (review N1).
+            session.nats_cancel.cancel();
             (
                 session.client,
                 session.protocol_run_id,
@@ -13259,19 +13829,21 @@ impl ChatManager {
                         );
                     }
                 }
-                // The agent engine's sessions, by the same rule. It tracks no
-                // background task of its own (P4): a running turn keeps it.
+                // The agent engine's sessions, by the same rule: a running turn or a
+                // background task its provider still reports running (P4) keeps it.
                 for handle in manager.agent_runtime.handles().await {
                     let idle = handle.idle_for();
                     let is_streaming = handle.is_streaming.load(Ordering::SeqCst);
-                    if session_is_expired(idle, timeout, is_streaming, 0) {
+                    let background_tasks = handle.active_background_tasks().await.len();
+                    if session_is_expired(idle, timeout, is_streaming, background_tasks) {
                         expired.push(handle.session_id.clone());
                     } else if idle > timeout {
                         debug!(
                             session_id = %handle.session_id,
                             idle_secs = idle.as_secs(),
                             is_streaming,
-                            "Idle agent session kept alive: a turn is running"
+                            background_tasks,
+                            "Idle agent session kept alive: work still in progress"
                         );
                     }
                 }
@@ -16870,6 +17442,110 @@ mod tests {
         assert!(!manager.is_session_active(&id).await, "evicted");
     }
 
+    /// Review N1 of #663: the CLI dies on instance A, the session resumes on B, a
+    /// cancel comes from C. The eviction on A ends A's NATS listeners (before: they
+    /// kept answering `gone` for a session A no longer holds, which a canceller
+    /// took as 410 "nothing cancelled" while B did cancel). C gets B's answer —
+    /// and, between the death on A and the resume on B, `owner_unreachable`, not
+    /// A's stale `session_gone`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancel_after_the_session_moved_gets_the_new_owners_answer() {
+        use super::super::cancel_relay::CancelRelayError;
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("fake-claude");
+        std::fs::write(
+            &cli,
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo '2.1.287 (Claude Code)'; exit 0;;\nesac\nexec cat > /dev/null\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let broker = TestBroker::start().await;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let instance = |nats: Arc<NatsEmitter>| {
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            let state = mock_app_state();
+            ChatManager::new_without_memory(dyn_graph, state.meili, test_config()).with_nats(nats)
+        };
+        let a = instance(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+        let b = instance(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+        let c = instance(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+        for m in [&a, &b] {
+            m.update_claude_cli_path(Some(cli.display().to_string()))
+                .await;
+        }
+        let mut s = test_chat_session(None);
+        s.provider_id = Some("claude-code".into());
+        s.cwd = dir.path().display().to_string();
+        graph.create_chat_session(&s).await.unwrap();
+        let id = s.id.to_string();
+        async fn pid_of(m: &ChatManager, id: &str) -> u32 {
+            let client = m
+                .active_sessions
+                .read()
+                .await
+                .get(id)
+                .unwrap()
+                .client
+                .clone();
+            let pid = client.lock().await.child_pid().await.expect("pid");
+            pid
+        }
+        // Asked again while the owner's listeners subscribe.
+        async fn ask(m: &ChatManager, id: &str) -> Result<CancelToolsResult> {
+            let mut last = None;
+            for _ in 0..30 {
+                match m.cancel_running_tools(id).await {
+                    Err(e)
+                        if e.downcast_ref::<CancelRelayError>()
+                            == Some(&CancelRelayError::OwnerUnreachable) =>
+                    {
+                        last = Some(Err(e));
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    other => return other,
+                }
+            }
+            last.unwrap()
+        }
+
+        // On A, then its CLI dies and A evicts it.
+        a.resume_session(&id, "hello", None).await.unwrap();
+        let a_pid = pid_of(&a, &id).await;
+        assert_eq!(
+            ask(&c, &id).await.unwrap().cli_pid,
+            Some(a_pid),
+            "A answers while it holds it"
+        );
+        unsafe { libc::kill(a_pid as i32, libc::SIGKILL) };
+        for _ in 0..50 {
+            if a.evict_if_cli_dead(&id).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!a.is_session_active(&id).await, "evicted on A");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Nobody holds it: not A's stale `gone`.
+        let between = c.cancel_running_tools(&id).await.unwrap_err();
+        assert_eq!(
+            between.downcast_ref::<CancelRelayError>(),
+            Some(&CancelRelayError::OwnerUnreachable),
+            "{between:#}"
+        );
+
+        // Resumed on B: C gets B's real answer.
+        b.resume_session(&id, "again", None).await.unwrap();
+        let b_pid = pid_of(&b, &id).await;
+        let answered = ask(&c, &id).await.unwrap();
+        assert_eq!(answered.cli_pid, Some(b_pid), "{answered:?}");
+        let _ = b.close_session(&id).await;
+    }
+
     #[tokio::test]
     async fn resuming_a_session_bound_to_a_non_claude_provider_is_unavailable_on_the_legacy_path() {
         let (manager, graph) = manager_with_mock();
@@ -17196,6 +17872,14 @@ mod tests {
             .await;
         assert!(refused.is_err());
         let sid = sid.to_string();
+        // Not vacuous: a token WAS minted for the refused opening (review of #684, finding 3).
+        let minted = crate::auth::agent_tokens::minted_for(&sid);
+        assert_eq!(
+            minted.len(),
+            1,
+            "the opening minted its token before it was refused"
+        );
+        assert!(!crate::auth::agent_tokens::is_live(&minted[0]));
         assert!(
             manager.turn_routing.get(&sid).is_none(),
             "a refused opening leaves no router"
@@ -17211,10 +17895,17 @@ mod tests {
         node.provider_id = Some("elsewhere".into());
         graph.create_chat_session(&node).await.unwrap();
         let refused = manager
-            .resume_agent_session(&node, "again", req.user_claims.as_ref())
+            .resume_agent_session(&node, "again", req.user_claims.as_ref(), None)
             .await;
         assert!(refused.is_err());
         let sid = node.id.to_string();
+        let minted = crate::auth::agent_tokens::minted_for(&sid);
+        assert_eq!(
+            minted.len(),
+            1,
+            "the resume minted its token before it was refused"
+        );
+        assert!(!crate::auth::agent_tokens::is_live(&minted[0]));
         assert!(
             manager.turn_routing.get(&sid).is_none(),
             "a refused resume leaves no router"
@@ -17223,6 +17914,314 @@ mod tests {
         manager.close_session(&ok).await.unwrap();
     }
 
+    /// A third-party instance (`acp`) a project consented to, played by the fake.
+    async fn consented_acp_instance(
+        graph: &crate::neo4j::mock::MockGraphStore,
+        id: &str,
+        slug: &str,
+    ) {
+        let record = crate::chat::provider::settings::InstanceRecord {
+            id: id.into(),
+            kind: "acp".into(),
+            label: "ACP".into(),
+            origin: crate::chat::provider::settings::process_origin("acp", None),
+            cost_source: "none".into(),
+            credential_ref: "none".into(),
+            ..Default::default()
+        };
+        super::super::agent_e2e_tests::store_instance(graph, &record).await;
+        super::super::agent_e2e_tests::consent(graph, slug, id, &record.origin).await;
+    }
+
+    async fn open_on(
+        manager: &ChatManager,
+        req: &ChatRequest,
+        sid: Uuid,
+        provider_id: &str,
+    ) -> Result<CreateSessionResponse> {
+        manager
+            .open_agent_session(AgentOpen {
+                request: req,
+                session_id: sid,
+                provider_id,
+                model: "m",
+                system_prompt: "p",
+                add_dirs: &[],
+                project_slug: Some("exits"),
+                relay: None,
+                access: Default::default(),
+            })
+            .await
+    }
+
+    /// What a failed opening leaves: no router, and the token it minted (when it got that
+    /// far, `minted`) is not live. `minted_for` makes the check non-vacuous: it lists the
+    /// tokens that WERE minted for the session.
+    fn left_nothing(manager: &ChatManager, sid: &str, minted: bool, exit: &str) {
+        assert!(
+            manager.turn_routing.get(sid).is_none(),
+            "{exit}: no router left"
+        );
+        let tokens = crate::auth::agent_tokens::minted_for(sid);
+        if minted {
+            assert_eq!(
+                tokens.len(),
+                1,
+                "{exit}: a token was minted before the failure"
+            );
+            assert!(
+                !crate::auth::agent_tokens::is_live(&tokens[0]),
+                "{exit}: its token is revoked"
+            );
+        } else {
+            assert!(tokens.is_empty(), "{exit}: failed before any token");
+        }
+    }
+
+    /// Review of #684, finding 3: every exit of an opening that stops short — provider
+    /// unavailable, window too small, a spec that cannot be built, the opening future
+    /// dropped — leaves neither its router nor the token it minted.
+    #[tokio::test]
+    async fn every_exit_of_a_failed_opening_leaves_no_router_nor_minted_token() {
+        use nexus_claude::agent::{
+            ContextWindow, ContextWindowSource, ProviderError, ProviderHealth,
+        };
+        let (manager, graph, fake) = signed_routed_agent_manager();
+        *fake.kind.lock().unwrap() = nexus_claude::agent::ProviderKind::Acp;
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        consented_acp_instance(&graph, "acp-exits", "exits").await;
+        let mut req = agent_request("");
+        req.user_claims = Some(person_claims());
+
+        // The setup opens: routing and token are set up, so what follows is not vacuous.
+        let sid = Uuid::new_v4();
+        open_on(&manager, &req, sid, "acp-exits")
+            .await
+            .expect("opens");
+        let ok = sid.to_string();
+        assert!(manager.turn_routing.get(&ok).is_some());
+        let tokens = crate::auth::agent_tokens::minted_for(&ok);
+        assert!(crate::auth::agent_tokens::is_live(&tokens[0]));
+        manager.close_session(&ok).await.unwrap();
+
+        // The provider says it is unavailable (the preflight, A30).
+        *fake.health.lock().unwrap() = Some(ProviderHealth::unavailable(
+            ProviderError::EndpointUnreachable {
+                detail: "down".into(),
+            },
+        ));
+        let sid = Uuid::new_v4();
+        assert!(open_on(&manager, &req, sid, "acp-exits").await.is_err());
+        left_nothing(&manager, &sid.to_string(), true, "health");
+        *fake.health.lock().unwrap() = None;
+
+        // The model's window cannot hold the tool schemas: the session opened, then closed.
+        fake.caps.lock().unwrap().context_window = Some(ContextWindow {
+            value: 10,
+            source: ContextWindowSource::Probed,
+        });
+        let sid = Uuid::new_v4();
+        let error = open_on(&manager, &req, sid, "acp-exits").await.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<ProviderError>(),
+                Some(ProviderError::ContextTooSmall { .. })
+            ),
+            "{error:#}"
+        );
+        let spec = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            crate::auth::agent_tokens::minted_for(&sid.to_string()),
+            vec![spec_token_jti(&spec)],
+            "the token that went to the provider"
+        );
+        left_nothing(&manager, &sid.to_string(), true, "window");
+        fake.caps.lock().unwrap().context_window = None;
+
+        // The spec cannot be built (an unknown permission mode): before any token.
+        let mut bad = req.clone();
+        bad.permission_mode = Some("no-such-mode".into());
+        let sid = Uuid::new_v4();
+        assert!(open_on(&manager, &bad, sid, "acp-exits").await.is_err());
+        left_nothing(&manager, &sid.to_string(), false, "spec");
+
+        // The opening future is dropped while the provider opens.
+        *fake.open_delay.lock().unwrap() = Some(Duration::from_secs(30));
+        let sid = Uuid::new_v4();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(200),
+            open_on(&manager, &req, sid, "acp-exits")
+        )
+        .await
+        .is_err());
+        left_nothing(&manager, &sid.to_string(), true, "abort");
+    }
+
+    /// Review of #684, finding 2: an opening that fails undoes only what IT set up. A
+    /// concurrent resume of the same session that succeeded (it minted after, and
+    /// registered its router over this one's) keeps its token and its router.
+    #[tokio::test]
+    async fn a_failed_opening_never_undoes_a_concurrent_one_that_succeeded() {
+        let (manager, _graph, _fake) = signed_routed_agent_manager();
+        let sid = Uuid::new_v4().to_string();
+        let turn = || OpeningTurn {
+            explicit_model: false,
+            provider_imposed: false,
+            moved_in: false,
+            routing_mode: None,
+            routing_pool: None,
+            permission_mode: None,
+            message: "hello",
+            next_turn: 0,
+        };
+        // The opening that will fail: its router, its token.
+        let mut failed = OpeningCleanup::new(&sid, &manager.turn_routing);
+        failed.registered(
+            manager
+                .register_turn_router(&sid, "claude-code", "m", None, turn())
+                .await,
+        );
+        assert!(failed.router.is_some(), "routing is configured");
+        let failed_jti = format!("jti-failed-{sid}");
+        crate::auth::agent_tokens::register(&failed_jti, Some(&sid));
+        failed.jti = Some(failed_jti.clone());
+        // The concurrent one that succeeds: a new token, a new router.
+        let won_jti = format!("jti-won-{sid}");
+        crate::auth::agent_tokens::register(&won_jti, Some(&sid));
+        let won = manager
+            .register_turn_router(&sid, "claude-code", "m", None, turn())
+            .await
+            .expect("a router");
+        drop(failed);
+        assert!(
+            crate::auth::agent_tokens::is_live(&won_jti),
+            "the token of the opening that succeeded stays live"
+        );
+        assert!(
+            manager
+                .turn_routing
+                .get(&sid)
+                .is_some_and(|router| Arc::ptr_eq(&router, &won)),
+            "its router stays"
+        );
+        // Alone, the failed opening undoes its own.
+        let mut alone = OpeningCleanup::new(&sid, &manager.turn_routing);
+        alone.registered(manager.turn_routing.get(&sid));
+        alone.jti = Some(won_jti.clone());
+        drop(alone);
+        assert!(!crate::auth::agent_tokens::is_live(&won_jti));
+        assert!(manager.turn_routing.get(&sid).is_none());
+    }
+
+    /// Review of #684, finding 2: two messages to a session that is not live resume it
+    /// ONCE. The second waits for the first and is delivered to the session it resumed:
+    /// no second token superseding the first, no second agent process.
+    #[tokio::test]
+    async fn two_messages_to_a_session_that_is_not_live_resume_it_once() {
+        let (manager, _graph, fake) = signed_routed_agent_manager();
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        let mut req = agent_request("hello");
+        req.user_claims = Some(person_claims());
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+        fake.state.opened_specs.lock().unwrap().clear();
+        // Each resume yields while the provider opens: without the lock, both resume.
+        *fake.open_delay.lock().unwrap() = Some(Duration::from_millis(100));
+        let (first, second) = tokio::join!(
+            manager.resume_session(&sid, "one", req.user_claims.as_ref()),
+            manager.resume_session(&sid, "two", req.user_claims.as_ref()),
+        );
+        first.unwrap();
+        second.unwrap();
+        let resumed = fake.state.opened_specs.lock().unwrap().clone();
+        assert_eq!(resumed.len(), 1, "the session is resumed once");
+        assert!(
+            crate::auth::agent_tokens::is_live(&spec_token_jti(&resumed[0])),
+            "its token is live"
+        );
+        assert!(manager.agent_runtime.get(&sid).await.is_some());
+        assert_eq!(manager.resume_locks.len(), 0, "no lock is kept");
+        // Both messages reached the session (review of #696, nit 4).
+        delivered(&fake, &["one", "two"]).await;
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// Waits until the fake agent has started a turn for each of `texts` (a message that
+    /// waited behind a running turn starts its own once that turn ends).
+    async fn delivered(fake: &super::super::agent_runtime::fake::FakeProvider, texts: &[&str]) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let turns = fake.state.turns_started.lock().unwrap().clone();
+            if texts
+                .iter()
+                .all(|t| turns.iter().any(|turn| turn.contains(t)))
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "not all delivered: {texts:?} in {turns:?}"
+            );
+            fake.state.end_turn();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Review of #696, finding 1: two sends that fail on ONE dead handle each fall back to
+    /// a resume (`seen` is that handle). The first resumes; the second, once it holds the
+    /// lock, finds a live handle other than the one it started from and delivers its
+    /// message there: one resume, both messages delivered. Before, both resumed (the
+    /// second minting a token that superseded the first's and ending its handle).
+    #[tokio::test]
+    async fn two_failed_sends_on_one_dead_session_resume_it_once_and_deliver_both() {
+        let (manager, graph, fake) = signed_routed_agent_manager();
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        let mut req = agent_request("hello");
+        req.user_claims = Some(person_claims());
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        fake.state.end_turn();
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        // The handle both sends failed on.
+        let dead = manager.agent_runtime.get(&sid).await.expect("live");
+        fake.state.opened_specs.lock().unwrap().clear();
+        fake.state.turns_started.lock().unwrap().clear();
+        *fake.open_delay.lock().unwrap() = Some(Duration::from_millis(100));
+        let (first, second) = tokio::join!(
+            manager.resume_agent_session(
+                &node,
+                "one",
+                req.user_claims.as_ref(),
+                Some(Arc::clone(&dead))
+            ),
+            manager.resume_agent_session(
+                &node,
+                "two",
+                req.user_claims.as_ref(),
+                Some(Arc::clone(&dead))
+            ),
+        );
+        first.unwrap();
+        second.unwrap();
+        let resumed = fake.state.opened_specs.lock().unwrap().clone();
+        assert_eq!(resumed.len(), 1, "the session is resumed once");
+        let live = manager.agent_runtime.get(&sid).await.expect("live");
+        assert!(
+            !Arc::ptr_eq(&live, &dead),
+            "the resume replaced the dead handle"
+        );
+        assert!(crate::auth::agent_tokens::is_live(&spec_token_jti(
+            &resumed[0]
+        )));
+        delivered(&fake, &["one", "two"]).await;
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+    }
     #[tokio::test]
     async fn agent_path_opens_a_session_persists_the_snapshot_and_streams_a_turn() {
         use nexus_claude::agent::{AgentEvent, StopReason};
@@ -18344,6 +19343,7 @@ mod tests {
                 pid: Some(1234),
                 parent_tool_use_id: None,
                 pending_removal_at: dying.then(std::time::Instant::now),
+                signalled: false,
             }
         }
 
@@ -23099,6 +24099,7 @@ mod tests {
                 pid: None,
                 parent_tool_use_id: Some("tool_T1".into()),
                 pending_removal_at: None,
+                signalled: false,
             },
         );
 
@@ -23166,18 +24167,583 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cancel_task_unknown_session_idempotent() {
+    /// Review N2 of #663: a session no instance holds gets the same typed answer on a
+    /// single instance as across instances (NATS, nobody answering):
+    /// `owner_unreachable` (409, not retryable), for both cancels — not a 200 here and
+    /// a 409 there.
+    async fn test_cancel_on_unknown_session_is_owner_unreachable() {
+        use super::super::cancel_relay::CancelRelayError;
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         // No session inserted at all.
-        let result = manager
-            .cancel_task("ghost-session", "tool_X")
+        for error in [
+            manager
+                .cancel_task("ghost-session", "tool_X")
+                .await
+                .unwrap_err(),
+            manager
+                .cancel_running_tools("ghost-session")
+                .await
+                .unwrap_err(),
+        ] {
+            assert_eq!(
+                error.downcast_ref::<CancelRelayError>(),
+                Some(&CancelRelayError::OwnerUnreachable)
+            );
+        }
+    }
+
+    /// Review of #673, finding 4: the eviction of a dead CLI removes only the entry
+    /// it found dead. A resume that replaced the entry meanwhile keeps its session
+    /// and its NATS listeners (before: the new session was removed and its
+    /// listeners cancelled).
+    #[tokio::test]
+    async fn evicting_a_dead_cli_leaves_a_session_that_replaced_it() {
+        let (old, _) = create_dummy_session(false, "", vec![]);
+        let (new, _) = create_dummy_session(false, "", vec![]);
+        let (old_client, old_token) = (old.client.clone(), old.nats_cancel.clone());
+        let new_token = new.nats_cancel.clone();
+        let sessions = RwLock::new(HashMap::new());
+        // A resume replaced the entry whose CLI was found dead.
+        sessions.write().await.insert("s".to_string(), new);
+        assert!(!ChatManager::forget_if_client(&sessions, "s", &old_client).await);
+        assert!(
+            sessions.read().await.contains_key("s"),
+            "the new session stays"
+        );
+        assert!(!new_token.is_cancelled(), "its listeners keep running");
+
+        // The entry is still the dead one: removed, its listeners ended.
+        sessions.write().await.insert("s".to_string(), old);
+        assert!(ChatManager::forget_if_client(&sessions, "s", &old_client).await);
+        assert!(!sessions.read().await.contains_key("s"));
+        assert!(old_token.is_cancelled());
+    }
+
+    /// Review of #685, finding 3: a task already being stopped (its grace period
+    /// runs, its pid kept) is not signalled again by a second cancel_task (a retry
+    /// after a `session_gone`, a second click), nor counted twice in the cap.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_task_already_being_stopped_is_not_signalled_again() {
+        let mut task = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let task_pid = task.id();
+        let (session, _) = create_dummy_session(false, "", vec![]);
+        let history = session.cancel_task_history.clone();
+        session.active_background_tasks.lock().await.insert(
+            "tool_Twice".into(),
+            BackgroundTaskInfo {
+                id: "tool_Twice".into(),
+                kind: BackgroundTaskKind::BashBackground,
+                description: "sleep".into(),
+                started_at: chrono::Utc::now(),
+                last_seen_at: chrono::Utc::now(),
+                pid: Some(task_pid),
+                parent_tool_use_id: Some("tool_Twice".into()),
+                pending_removal_at: None,
+                signalled: false,
+            },
+        );
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-twice".into(), session);
+
+        let first = manager.cancel_task("s-twice", "tool_Twice").await.unwrap();
+        assert!(first.killed_pids.contains(&task_pid), "{first:?}");
+        assert!(!task.wait().unwrap().success(), "signalled once");
+
+        let again = manager.cancel_task("s-twice", "tool_Twice").await.unwrap();
+        assert!(!again.capped && again.killed_pids.is_empty(), "{again:?}");
+        assert_eq!(history.lock().await.len(), 1, "counted once");
+    }
+
+    fn tracked_task(id: &str, pid: Option<u32>) -> BackgroundTaskInfo {
+        BackgroundTaskInfo {
+            id: id.into(),
+            kind: BackgroundTaskKind::BashBackground,
+            description: "sleep".into(),
+            started_at: chrono::Utc::now(),
+            last_seen_at: chrono::Utc::now(),
+            pid,
+            parent_tool_use_id: Some(id.into()),
+            pending_removal_at: None,
+            signalled: false,
+        }
+    }
+
+    /// Review of #691, finding 1: a Stop in the first second of a background task
+    /// comes before its pid is known. It signals nothing, and marks the task
+    /// stopping. The PID claim that follows signals it (before: it only filled the
+    /// pid, and the no-op of a retry left the process running, untracked). Once
+    /// signalled, asking again is the no-op.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_task_stopped_before_its_pid_is_known_is_signalled_when_it_is_found() {
+        // A fake CLI whose child is the background task.
+        let mut cli = std::process::Command::new("sh")
+            .args(["-c", "sleep 30; true"])
+            .spawn()
+            .unwrap();
+        let (mut session, _) = create_dummy_session(false, "", vec![]);
+        session.child_pid = Some(cli.id());
+        let (history, events_tx, tasks) = (
+            session.cancel_task_history.clone(),
+            session.events_tx.clone(),
+            session.active_background_tasks.clone(),
+        );
+        tasks
+            .lock()
+            .await
+            .insert("tool_Early".into(), tracked_task("tool_Early", None));
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-early".into(), session);
+
+        let early = manager.cancel_task("s-early", "tool_Early").await.unwrap();
+        assert!(!early.capped && early.killed_pids.is_empty(), "{early:?}");
+
+        ChatManager::async_pid_claim(
+            "s-early".into(),
+            manager.active_sessions.clone(),
+            events_tx,
+            None,
+            "tool_Early".into(),
+            vec![],
+        )
+        .await;
+        let pid = tasks.lock().await["tool_Early"].pid;
+        assert!(pid.is_some(), "the claim found the task's process");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_alive(pid) == Some(true) {
+            assert!(
+                Instant::now() < deadline,
+                "the task's process was signalled once its pid was found"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = cli.wait();
+
+        let again = manager.cancel_task("s-early", "tool_Early").await.unwrap();
+        assert!(!again.capped && again.killed_pids.is_empty(), "{again:?}");
+        assert_eq!(history.lock().await.len(), 1, "the no-op is not counted");
+    }
+
+    /// Review of #694, point 1: a task the death poller found dead is never
+    /// signalled: by the time a Stop comes (before the purge), its pid may name
+    /// another process. The reuse is played by pointing the entry at a live
+    /// process after the poller marked it: it must survive the Stop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_task_found_dead_is_never_signalled_even_if_its_pid_was_reused() {
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = gone.id();
+        gone.wait().unwrap();
+        let (map, events_tx) =
+            session_with_silent_background_task("s-reused", Some(dead_pid), 0).await;
+        ChatManager::tick_purge_background_tasks(
+            "s-reused",
+            &map,
+            &events_tx,
+            &None,
+            Duration::from_secs(BACKGROUND_TASK_PURGE_GRACE_SECS),
+        )
+        .await;
+        assert!(silent_task_is_marked(&map, "s-reused").await);
+
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let other_pid = other.id();
+        map.read().await["s-reused"]
+            .active_background_tasks
+            .lock()
+            .await
+            .get_mut("tool_silent")
+            .unwrap()
+            .pid = Some(other_pid);
+
+        let stop = ChatManager::cancel_legacy_task(&map, &None, "s-reused", "tool_silent")
             .await
             .unwrap();
-        assert_eq!(result.task_id, "tool_X");
-        assert!(!result.capped);
-        assert!(result.killed_pids.is_empty());
+        assert!(stop.killed_pids.is_empty(), "{stop:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            process_alive(Some(other_pid)),
+            Some(true),
+            "the process now holding the pid was left alone"
+        );
+        let _ = other.kill();
+        let _ = other.wait();
+    }
+
+    /// Review of #694, point 2: a claim that finds several new processes in the
+    /// same second (two tools started together) records the first, as before, but
+    /// does not signal a task stopped before it: the first candidate may be the
+    /// neighbour's. The task stays stopping and not signalled, so an explicit Stop
+    /// asked again signals it.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn an_ambiguous_claim_signals_nothing_and_leaves_it_to_an_explicit_stop() {
+        let mut cli = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & sleep 30; true"])
+            .spawn()
+            .unwrap();
+        let cli_pid = cli.id();
+        let (mut session, _) = create_dummy_session(false, "", vec![]);
+        session.child_pid = Some(cli_pid);
+        let (events_tx, tasks) = (
+            session.events_tx.clone(),
+            session.active_background_tasks.clone(),
+        );
+        tasks
+            .lock()
+            .await
+            .insert("tool_Two".into(), tracked_task("tool_Two", None));
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-two".into(), session);
+
+        let early = manager.cancel_task("s-two", "tool_Two").await.unwrap();
+        assert!(early.killed_pids.is_empty(), "{early:?}");
+        ChatManager::async_pid_claim(
+            "s-two".into(),
+            manager.active_sessions.clone(),
+            events_tx,
+            None,
+            "tool_Two".into(),
+            vec![],
+        )
+        .await;
+        let both = ChatManager::get_descendant_pids(cli_pid);
+        assert_eq!(both.len(), 2, "two new processes: {both:?}");
+        let claimed = {
+            let tasks = tasks.lock().await;
+            assert!(!tasks["tool_Two"].signalled);
+            tasks["tool_Two"]
+                .pid
+                .expect("the first candidate is recorded")
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for pid in &both {
+            assert_eq!(process_alive(Some(*pid)), Some(true), "{pid} signalled");
+        }
+
+        let explicit = manager.cancel_task("s-two", "tool_Two").await.unwrap();
+        assert!(explicit.killed_pids.contains(&claimed), "{explicit:?}");
+
+        for pid in both {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+        let _ = cli.kill();
+        let _ = cli.wait();
+    }
+
+    /// Review of #691, finding 2: two concurrent stops of one task signal it once
+    /// and count once in the cap (before: both passed the check and both counted).
+    /// The cap history is held so that both are in flight together.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn two_concurrent_stops_signal_a_task_once_and_count_once() {
+        let mut task = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let task_pid = task.id();
+        let (session, _) = create_dummy_session(false, "", vec![]);
+        let history = session.cancel_task_history.clone();
+        session.active_background_tasks.lock().await.insert(
+            "tool_Both".into(),
+            tracked_task("tool_Both", Some(task_pid)),
+        );
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        sessions.write().await.insert("s-both".to_string(), session);
+
+        let held = history.lock().await;
+        let stop = || {
+            let sessions = Arc::clone(&sessions);
+            tokio::spawn(async move {
+                ChatManager::cancel_legacy_task(&sessions, &None, "s-both", "tool_Both")
+                    .await
+                    .expect("a session of this instance")
+            })
+        };
+        let (a, b) = (stop(), stop());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(held);
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+
+        assert!(!a.capped && !b.capped, "{a:?} {b:?}");
+        let signalled = [&a, &b]
+            .iter()
+            .filter(|r| r.killed_pids.contains(&task_pid))
+            .count();
+        assert_eq!(signalled, 1, "signalled once: {a:?} {b:?}");
+        assert_eq!(history.lock().await.len(), 1, "counted once");
+        assert!(!task.wait().unwrap().success());
+    }
+
+    /// Review of #691, finding 3: the close of an agent-engine session is watched
+    /// for the whole cancel, not only at its start. A close during the cancel, or
+    /// one that comes with its outcome, answers `gone` (provisional), never the
+    /// provider's final answer.
+    #[tokio::test]
+    async fn a_close_during_an_agent_cancel_answers_gone() {
+        use super::super::cancel_relay::{CancelKind, CancelRelayError};
+        let gone = |outcome: Result<u32>| {
+            outcome
+                .unwrap_err()
+                .downcast_ref::<CancelRelayError>()
+                .cloned()
+                == Some(CancelRelayError::SessionGone {
+                    kind: CancelKind::Tools,
+                })
+        };
+
+        // Closed while the cancel runs.
+        let closed = CancellationToken::new();
+        let closing = closed.clone();
+        let outcome = ChatManager::unless_agent_closed(&closed, CancelKind::Tools, async move {
+            closing.cancel();
+            tokio::task::yield_now().await;
+            Ok(7)
+        })
+        .await;
+        assert!(gone(outcome));
+
+        // Closed as the cancel answers.
+        let closed = CancellationToken::new();
+        let closing = closed.clone();
+        let outcome = ChatManager::unless_agent_closed(&closed, CancelKind::Tools, async move {
+            closing.cancel();
+            Ok(7)
+        })
+        .await;
+        assert!(gone(outcome));
+
+        // Open throughout: the cancel's own answer.
+        let closed = CancellationToken::new();
+        let outcome =
+            ChatManager::unless_agent_closed(&closed, CancelKind::Tools, async { Ok(7) }).await;
+        assert_eq!(outcome.unwrap(), 7);
+    }
+
+    /// A connected CLI whose turn ends before any `Result` (it died mid-turn).
+    struct DiesMidTurn;
+
+    #[async_trait::async_trait]
+    impl nexus_claude::transport::Transport for DiesMidTurn {
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        async fn connect(&mut self) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        async fn send_message(
+            &mut self,
+            _: nexus_claude::transport::InputMessage,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        fn receive_messages(
+            &mut self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = nexus_claude::Result<nexus_claude::Message>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+        async fn send_control_request(
+            &mut self,
+            _: nexus_claude::ControlRequest,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        async fn receive_control_response(
+            &mut self,
+        ) -> nexus_claude::Result<Option<nexus_claude::ControlResponse>> {
+            Ok(None)
+        }
+        async fn send_sdk_control_request(
+            &mut self,
+            _: serde_json::Value,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        async fn send_sdk_control_response(
+            &mut self,
+            _: serde_json::Value,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        async fn disconnect(&mut self) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Review of #685, finding 2: a turn that finds its CLI dead drops the session
+    /// only while the entry is still the one of that CLI. A resume that replaced
+    /// it during the turn keeps its session and its NATS listeners (before: the
+    /// new session was removed and its listeners cancelled). The turn waits for
+    /// its CLI (held by the test) while the entry is replaced.
+    async fn a_turn_on_a_dead_cli_leaves_the_session_that_replaced_it(dead: InteractiveClient) {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let sid = Uuid::new_v4().to_string();
+        let (mut old, _) = create_dummy_session(false, "", vec![]);
+        old.client = Arc::new(Mutex::new(dead));
+        let (old_client, old_streaming) = (old.client.clone(), old.is_streaming.clone());
+        let mut events = old.events_tx.subscribe();
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(sid.clone(), old);
+
+        let held = old_client.lock().await;
+        manager.send_message(&sid, "hi").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !old_streaming.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the turn started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (new, _) = create_dummy_session(false, "", vec![]);
+        let (new_client, new_token) = (new.client.clone(), new.nats_cancel.clone());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(sid.clone(), new);
+        drop(held);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Ok(ChatEvent::Error { .. }) => break,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => panic!("no error event"),
+                }
+            }
+        })
+        .await
+        .expect("the turn reports its dead CLI");
+        let sessions = manager.active_sessions.read().await;
+        let kept = sessions
+            .get(&sid)
+            .expect("the session that replaced it stays");
+        assert!(Arc::ptr_eq(&kept.client, &new_client));
+        assert!(!new_token.is_cancelled(), "its NATS listeners keep running");
+    }
+
+    /// The write fails (`Not connected`): the "CLI appears dead" path.
+    #[tokio::test]
+    async fn a_turn_whose_write_finds_the_cli_dead_leaves_the_session_that_replaced_it() {
+        a_turn_on_a_dead_cli_leaves_the_session_that_replaced_it(create_dummy_client()).await;
+    }
+
+    /// The stream ends before a `Result`: the "CLI left before answering" path.
+    #[tokio::test]
+    async fn a_turn_whose_cli_ends_before_a_result_leaves_the_session_that_replaced_it() {
+        let mut dead = InteractiveClient::from_transport(Box::new(DiesMidTurn));
+        dead.connect().await.unwrap();
+        a_turn_on_a_dead_cli_leaves_the_session_that_replaced_it(dead).await;
+    }
+
+    /// Review of #685, finding 1: an agent-engine cancel listener reads no request
+    /// once its session closed, even one already waiting (`biased`, the close
+    /// first). Without it `select!` picks a ready branch at random: over 64 runs a
+    /// request would be read.
+    #[tokio::test]
+    async fn an_agent_cancel_listener_reads_no_request_once_the_session_closed() {
+        let closed = CancellationToken::new();
+        closed.cancel();
+        for _ in 0..64 {
+            let mut read = 0;
+            ChatManager::serve_agent_cancels(
+                futures::stream::iter([1, 2, 3]),
+                closed.clone(),
+                |_| read += 1,
+            )
+            .await;
+            assert_eq!(read, 0);
+        }
+        // Open, it serves every request until the subscription ends.
+        let mut read = 0;
+        ChatManager::serve_agent_cancels(
+            futures::stream::iter([1, 2, 3]),
+            CancellationToken::new(),
+            |_| read += 1,
+        )
+        .await;
+        assert_eq!(read, 3);
+    }
+
+    /// Review of #685, finding 1: a cancel read just before the session closed is
+    /// answered `gone` (provisional: the real owner still answers), not with what
+    /// the closing provider session says (a result, a refusal or a failure, all
+    /// final: they would beat the real owner's answer).
+    #[tokio::test]
+    async fn a_cancel_on_a_closing_agent_session_answers_gone() {
+        use super::super::cancel_relay::{CancelKind, CancelReply};
+        let (manager, _graph, _fake) = agent_manager();
+        let sid = manager
+            .create_session(&agent_request("first"))
+            .await
+            .unwrap()
+            .session_id;
+        let handle = manager.agent_runtime.get(&sid).await.expect("a handle");
+        // Open, the provider answers.
+        let open = CancelReply::of(
+            ChatManager::unless_agent_closed(
+                &handle.closed,
+                CancelKind::Tools,
+                handle.cancel_tools(),
+            )
+            .await,
+        );
+        assert!(!open.is_gone());
+
+        handle.closed.cancel();
+        let tools = CancelReply::of(
+            ChatManager::unless_agent_closed(
+                &handle.closed,
+                CancelKind::Tools,
+                handle.cancel_tools(),
+            )
+            .await,
+        );
+        assert!(tools.is_gone());
+        let task = CancelReply::of(
+            ChatManager::unless_agent_closed(
+                &handle.closed,
+                CancelKind::Task,
+                handle.cancel_task("tool_T"),
+            )
+            .await,
+        );
+        assert!(task.is_gone());
     }
 
     #[tokio::test]
@@ -23233,6 +24799,7 @@ mod tests {
                 pid: None,
                 parent_tool_use_id: Some("tool_NoPid".into()),
                 pending_removal_at: None,
+                signalled: false,
             },
         );
 
@@ -23305,6 +24872,7 @@ mod tests {
                 pid: Some(real_pid),
                 parent_tool_use_id: Some("tool_Real".into()),
                 pending_removal_at: None,
+                signalled: false,
             },
         );
 
@@ -23330,6 +24898,205 @@ mod tests {
             !exit.success(),
             "subprocess should have been signalled, not exited cleanly"
         );
+    }
+
+    /// P12 (review of #663, points 4 and 6): a Claude Code session of the legacy
+    /// engine held by ANOTHER instance. That instance's `cancel_task` and
+    /// `cancel_running_tools` ask the owner over NATS (test broker) and return what
+    /// it did: the task's process (a real `sleep`) is signalled and its pid comes
+    /// back, the running tool (a real child of a fake CLI) too. Once the session has
+    /// left the owner, the owner answers `gone` at once: a typed `session_gone`,
+    /// never the old silent success.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_legacy_session_answers_cancels_from_another_instance_over_nats() {
+        use super::super::cancel_relay::CancelRelayError;
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+
+        let mut task = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let task_pid = task.id();
+        // A fake CLI whose child is the running tool.
+        let mut cli = std::process::Command::new("sh")
+            .args(["-c", "sleep 30; true"])
+            .spawn()
+            .unwrap();
+        let cli_pid = cli.id();
+
+        let broker = TestBroker::start().await;
+        let owner_nats = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let state = mock_app_state();
+        let owner = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
+            .with_nats(Arc::clone(&owner_nats));
+        let (mut session, _) = create_dummy_session(false, "", vec![]);
+        session.child_pid = Some(cli_pid);
+        session.active_background_tasks.lock().await.insert(
+            "tool_Far".into(),
+            BackgroundTaskInfo {
+                id: "tool_Far".into(),
+                kind: BackgroundTaskKind::BashBackground,
+                description: "far sleep".into(),
+                started_at: chrono::Utc::now(),
+                last_seen_at: chrono::Utc::now(),
+                pid: Some(task_pid),
+                parent_tool_use_id: Some("tool_Far".into()),
+                pending_removal_at: None,
+                signalled: false,
+            },
+        );
+        owner
+            .active_sessions
+            .write()
+            .await
+            .insert("s-far".into(), session);
+        let token = CancellationToken::new();
+        owner.spawn_nats_cancel_task_listener(
+            "s-far",
+            owner.active_sessions.clone(),
+            token.clone(),
+        );
+        owner.spawn_nats_cancel_tools_listener(
+            "s-far",
+            owner.active_sessions.clone(),
+            token.clone(),
+        );
+
+        let state = mock_app_state();
+        // A short deadline: a `gone` alone for cancel_tools is kept until it.
+        let far = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
+            .with_nats(Arc::new(
+                NatsEmitter::new(broker.client().await, "events")
+                    .with_cancel_rpc_timeout(Duration::from_secs(3)),
+            ));
+        // The owner's listeners may still be subscribing.
+        let mut stopped = None;
+        for _ in 0..20 {
+            match far.cancel_task("s-far", "tool_Far").await {
+                Ok(result) => {
+                    stopped = Some(result);
+                    break;
+                }
+                Err(e)
+                    if e.downcast_ref::<CancelRelayError>()
+                        == Some(&CancelRelayError::OwnerUnreachable) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("{e:#}"),
+            }
+        }
+        let stopped = stopped.expect("the owner answered");
+        assert!(stopped.killed_pids.contains(&task_pid), "{stopped:?}");
+        assert!(
+            !task.wait().unwrap().success(),
+            "the task's process was signalled"
+        );
+
+        let mut tools = None;
+        for _ in 0..20 {
+            match far.cancel_running_tools("s-far").await {
+                Ok(result) => {
+                    tools = Some(result);
+                    break;
+                }
+                Err(e)
+                    if e.downcast_ref::<CancelRelayError>()
+                        == Some(&CancelRelayError::OwnerUnreachable) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("{e:#}"),
+            }
+        }
+        let tools = tools.expect("the owner answered");
+        assert!(!tools.capped && !tools.killed_pids.is_empty(), "{tools:?}");
+        assert_eq!(tools.cli_pid, Some(cli_pid));
+        let _ = cli.kill();
+        let _ = cli.wait();
+
+        // The session leaves the owner: both answer `gone`, typed. cancel_task
+        // reports it after GONE_GRACE (retryable); cancel_tools keeps listening for
+        // a real owner until its deadline, then reports it, not retryable (review
+        // of #673, finding 1).
+        owner.active_sessions.write().await.remove("s-far");
+        let started = std::time::Instant::now();
+        let gone = far.cancel_task("s-far", "tool_Far").await.unwrap_err();
+        assert_eq!(
+            gone.downcast_ref::<CancelRelayError>(),
+            Some(&CancelRelayError::SessionGone {
+                kind: super::super::cancel_relay::CancelKind::Task
+            })
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= super::super::cancel_relay::GONE_GRACE && elapsed < Duration::from_secs(3),
+            "answered after the grace, not timed out: {elapsed:?}"
+        );
+        // Measured from the cancel_tools alone (review of #685, finding 5): it waits
+        // for a real owner up to the asker's deadline (3 s here), and no longer.
+        let started = std::time::Instant::now();
+        let gone = far.cancel_running_tools("s-far").await.unwrap_err();
+        let elapsed = started.elapsed();
+        let gone = gone.downcast_ref::<CancelRelayError>().cloned();
+        assert_eq!(
+            gone,
+            Some(CancelRelayError::SessionGone {
+                kind: super::super::cancel_relay::CancelKind::Tools
+            })
+        );
+        assert!(!gone.unwrap().failure().retryable);
+        assert!(
+            elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(5),
+            "answered at the deadline, not before nor long after: {elapsed:?}"
+        );
+        token.cancel();
+    }
+
+    /// Review N8 of #663: a cancel_tools on the instance that holds the session is
+    /// done once. It used to also publish the cancel signal on NATS, which this
+    /// instance's own listener received: the tools were signalled twice and the
+    /// cap counted twice.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_local_cancel_tools_is_done_once_not_echoed_by_its_own_listener() {
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+
+        let mut cli = std::process::Command::new("sh")
+            .args(["-c", "sleep 30; true"])
+            .spawn()
+            .unwrap();
+        let broker = TestBroker::start().await;
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
+            .with_nats(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+        let (mut session, _) = create_dummy_session(false, "", vec![]);
+        session.child_pid = Some(cli.id());
+        let history = session.cancel_tools_history.clone();
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-once".into(), session);
+        let token = CancellationToken::new();
+        manager.spawn_nats_cancel_tools_listener(
+            "s-once",
+            manager.active_sessions.clone(),
+            token.clone(),
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let result = manager.cancel_running_tools("s-once").await.unwrap();
+        assert!(!result.capped);
+        // Leave the echo, if any, the time to arrive.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(history.lock().await.len(), 1, "one cancel, counted once");
+        token.cancel();
+        let _ = cli.kill();
+        let _ = cli.wait();
     }
 
     // ========================================================================
@@ -23551,6 +25318,7 @@ mod tests {
                 pid: None,
                 parent_tool_use_id: Some("toolu_existing".into()),
                 pending_removal_at: None,
+                signalled: false,
             },
         );
 
@@ -23641,6 +25409,7 @@ mod tests {
                 pid: None,
                 parent_tool_use_id: Some("tool_known".into()),
                 pending_removal_at: None,
+                signalled: false,
             },
         );
 
@@ -23729,6 +25498,7 @@ mod tests {
                 pid,
                 parent_tool_use_id: None,
                 pending_removal_at: None,
+                signalled: false,
             },
         );
         session
@@ -23875,6 +25645,7 @@ mod tests {
                     pid: None,
                     parent_tool_use_id: None,
                     pending_removal_at: Some(stale_at),
+                    signalled: false,
                 },
             );
             tasks.insert(
@@ -23888,6 +25659,7 @@ mod tests {
                     pid: None,
                     parent_tool_use_id: None,
                     pending_removal_at: None,
+                    signalled: false,
                 },
             );
         }
@@ -23956,6 +25728,7 @@ mod tests {
                     pid: None,
                     parent_tool_use_id: None,
                     pending_removal_at: None,
+                    signalled: false,
                 },
             );
             tasks.insert(
@@ -23969,6 +25742,7 @@ mod tests {
                     pid: None,
                     parent_tool_use_id: None,
                     pending_removal_at: None,
+                    signalled: false,
                 },
             );
         }
@@ -24037,6 +25811,7 @@ mod tests {
                 pid: None,
                 parent_tool_use_id: None,
                 pending_removal_at: Some(now),
+                signalled: false,
             },
         );
 
@@ -24360,6 +26135,7 @@ mod refs_turn_services_tests {
             context_injector: None,
             step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             stall_step: None,
+            routing_store: None,
         };
 
         let note = Uuid::new_v4();
@@ -24451,6 +26227,7 @@ mod held_context_tests {
             context_injector: None,
             step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             stall_step: None,
+            routing_store: None,
         }
     }
 
@@ -24952,6 +26729,10 @@ mod image_turn_services_tests {
 
     #[tokio::test]
     async fn prepare_hands_the_router_the_images_so_the_turn_is_routed_before_it_is_sent() {
+        use crate::chat::provider::cognitive::store::{
+            DecisionFilter, InMemoryRoutingStore, RoutingArmStore,
+        };
+        let store = Arc::new(InMemoryRoutingStore::new());
         let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let manager = ChatManager::new_without_memory(
             graph.clone(),
@@ -24981,6 +26762,7 @@ mod image_turn_services_tests {
             provider_imposed: false,
             allowed_models: None,
             routing_pool: None,
+            conversation_routes: false,
             current_model: "flash".into(),
             next_turn: 0,
             moved_in: false,
@@ -25001,6 +26783,7 @@ mod image_turn_services_tests {
             context_injector: None,
             step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             stall_step: None,
+            routing_store: Some(store.clone()),
         };
         // Before any turn input, nothing says an image comes.
         assert_eq!(services.model_for_images(&sid).await, None);
@@ -25022,5 +26805,25 @@ mod image_turn_services_tests {
         // The host could not apply it: the router is put back as it was.
         services.image_model_not_applied(&sid, "vision").await;
         assert_eq!(router.next_turn_context(0).current_model, "flash");
+        // ...and the decision, which said `applied: true`, is stored as what happened: not
+        // applied, and why (as a legacy `set_model` that fails, or a refused move).
+        let stored = store.decisions(&DecisionFilter::default()).await.unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "the image decision is written back: {stored:#?}"
+        );
+        assert!(!stored[0].applied, "{:#?}", stored[0]);
+        assert_eq!(
+            stored[0].chosen.as_ref().map(|p| p.model.as_str()),
+            Some("vision")
+        );
+        assert!(
+            stored[0]
+                .reason
+                .ends_with("; not_changed: set_model_failed"),
+            "{}",
+            stored[0].reason
+        );
     }
 }

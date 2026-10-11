@@ -143,7 +143,7 @@ async-trait = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Chat / Claude Code SDK
-nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "87f68287af7cf52d88c568a54e5b26a01285bab7", features = ["memory", "auto-download", "provider-native", "provider-codex", "provider-acp"] }
+nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "4260967982df4e8f79592bef089fc796a019ca3a", features = ["memory", "auto-download", "provider-native", "provider-codex", "provider-acp"] }
 tokio-stream = { workspace = true }
 
 # Auth
@@ -257,11 +257,11 @@ wiremock = "0.6.5"
 proptest = "1"
 # The scripted provider of nexus (a harness that calls the session hooks), for the tests of
 # per-turn model routing. Same pin as the dependency above.
-nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "87f68287af7cf52d88c568a54e5b26a01285bab7", features = ["testkit"] }
+nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "4260967982df4e8f79592bef089fc796a019ca3a", features = ["testkit"] }
 # The REAL verifier of the signed profile token of nexus-tools (B40): the tests check that the
 # token the backend signs is the one the server accepts, and that a tool outside it never runs.
 # Dev-only, pure Rust, same pin as above (which contains nexus-tools, #68).
-nexus-tools = { git = "https://github.com/this-rs/nexus.git", rev = "87f68287af7cf52d88c568a54e5b26a01285bab7", features = ["test-tools"] }
+nexus-tools = { git = "https://github.com/this-rs/nexus.git", rev = "4260967982df4e8f79592bef089fc796a019ca3a", features = ["test-tools"] }
 # A real WebSocket client, to test the chat handler end to end (already in the lock
 # tree through axum).
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }

@@ -92,7 +92,14 @@ CHAT_PROVIDER_ACP_COMMANDS='{"openclaw":["openclaw","acp","--url","wss://gateway
     (`npx -c "openclaw acp"`, `pnpm -c exec "openclaw acp"`, `env -S "openclaw acp"`).
     An option value, another argument or a URL is never read
     (`--config ~/.openclaw/openclaw.json`, `--profile openclaw`, `wss://gw/openclaw` leave the
-    agent its servers): a wrapper script of another name needs `"per_session_mcp": false`;
+    agent its servers): a wrapper script of another name needs `"per_session_mcp": false`.
+    So does a command run through a shell or a wrapper the name is not read through: `sh -c`,
+    `bash -lc`, `timeout`, `nohup`, `sudo`, `bun x`, and the implicit launches
+    `yarn openclaw` / `pnpm openclaw`. Missing one is not a security gap, only a
+    round-trip: the agent refuses the servers, nexus opens the session again without them,
+    and the PO token that went out in the refused request is revoked (next point). The
+    options of a launcher that take a value (`--registry <url>`, `--prefix <dir>`,
+    `-p <package>`, …) are skipped;
   - **the refusal, learned**: an agent that refuses the servers is asked again once without
     them (the session says so on the thread, `system:mcp_servers_refused`), and the next
     sessions of that instance are opened without them. Learned **in memory**: a restart of the
