@@ -986,20 +986,49 @@ branch refs/heads/feature
         assert!(commits.unwrap().is_empty());
     }
 
+    /// `resolve_worktrees` cherry-picks every registered agent worktree's
+    /// commits onto `branch`. It must therefore NEVER run against the real
+    /// repository the tests are launched from: on a machine where an agent
+    /// worktree (`.claude/worktrees/agent-*`) is registered, the old version of
+    /// this test rewrote the developer's current branch with that agent's
+    /// commits (11/10/2026: ten foreign commits reached a pushed branch). It
+    /// now runs in a throwaway repository without agent worktrees.
     #[tokio::test]
     async fn test_resolve_worktrees_no_agents() {
-        let cwd = std::env::current_dir()
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["commit", "-q", "--allow-empty", "-m", "init"][..],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {:?}", args);
+        }
+        let cwd = root.to_string_lossy().to_string();
+        let head_before = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
             .unwrap()
-            .to_string_lossy()
-            .to_string();
+            .stdout;
         let lock = Arc::new(Mutex::new(()));
-        let branch = current_branch(&cwd).await.unwrap_or("main".to_string());
-        let resolution = WorktreeCollector::resolve_worktrees(&branch, &cwd, lock).await;
+        let resolution = WorktreeCollector::resolve_worktrees("main", &cwd, lock).await;
         assert!(resolution.is_ok());
         let r = resolution.unwrap();
-        // In a clean repo without agent worktrees, everything should be zero
         assert_eq!(r.total_merged, 0);
         assert_eq!(r.total_conflicts, 0);
+        let head_after = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(head_before, head_after, "the branch must not move");
     }
 
     /// `cleanup_worktrees` runs at the end of every plan run. It must only
