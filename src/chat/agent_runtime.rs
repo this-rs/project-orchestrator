@@ -1230,6 +1230,36 @@ impl AgentRuntime {
         services: Option<Arc<dyn TurnServices>>,
         extra_degraded: Vec<String>,
     ) -> Arc<AgentSessionHandle> {
+        self.adopt_declaring(
+            session_id,
+            provider_id,
+            session,
+            first_seq,
+            provider_kind,
+            tool_policy,
+            services,
+            extra_degraded,
+            self.read_only_mcp_tools.clone(),
+        )
+        .await
+    }
+
+    /// [`Self::adopt_with`] for a session whose declared read-only MCP tools are these
+    /// (the runtime's, minus what the session's project redefines:
+    /// `session_grants::declarations_for_project`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn adopt_declaring(
+        &self,
+        session_id: &str,
+        provider_id: &str,
+        session: Arc<dyn AgentSession>,
+        first_seq: i64,
+        provider_kind: &str,
+        tool_policy: serde_json::Value,
+        services: Option<Arc<dyn TurnServices>>,
+        extra_degraded: Vec<String>,
+        read_only_mcp_tools: Vec<String>,
+    ) -> Arc<AgentSessionHandle> {
         let mut degraded = degraded_features(session.capabilities());
         for feature in extra_degraded {
             if !degraded.contains(&feature) {
@@ -1266,7 +1296,7 @@ impl AgentRuntime {
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
             session_grants: std::sync::Mutex::new(super::session_grants::SessionGrants::declaring(
-                self.read_only_mcp_tools.clone(),
+                read_only_mcp_tools,
             )),
             asked_calls: std::sync::Mutex::new(HashMap::new()),
             asker: super::session_grants::Asker::from_provider_kind(provider_kind),

@@ -163,7 +163,10 @@ that cannot run code the model can change. Everything is an allowlist; anything 
   a declaration binds a NAME, not a server.** The Claude Code CLI also loads the project's
   `.mcp.json`, and a project server may take the name of a server configured elsewhere; a
   configuration the model can edit could then put another program behind a declared name (the
-  CLI still asks to approve a new project server, and a new session is needed). Declare only
+  CLI still asks to approve a new project server, and a new session is needed). So at every
+  opening (new session, resume) the backend ignores, for that session, a declaration whose
+  server a `.mcp.json` of the project (its directory or one above) defines, and every
+  declaration when such a file cannot be read for sure or the session is remote. Declare only
   tools of servers the projects cannot redefine: the backend's own servers, or servers whose
   name no project's `.mcp.json` uses (projects whose MCP configuration is not reviewed should
   not have their servers approved for all). The backend does not pass a strict MCP

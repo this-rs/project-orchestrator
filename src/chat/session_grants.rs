@@ -619,8 +619,9 @@ fn runs_only_what_it_shows(words: &[Word]) -> bool {
 }
 
 /// How many operands (arguments that are neither an option nor a redirection) these
-/// words hold, counted the conservative way: after `--` everything is one, and a word
-/// that follows an option (it may be that option's value) counts too.
+/// words hold, counted the conservative way: after `--` or after the first operand
+/// everything is one (options end there for a POSIX `uniq`), and a word that follows an
+/// option (it may be that option's value) counts too.
 fn operands(args: &[Word]) -> usize {
     let mut count = 0;
     let mut options_end = false;
@@ -639,9 +640,11 @@ fn operands(args: &[Word]) -> usize {
             redirect_target = operator.trim_end_matches(['<', '>', '&', '|']).is_empty();
             continue;
         }
-        if !options_end && text == "--" {
+        // Once an operand is seen, every word is one: BSD `uniq` (macOS), or GNU's with
+        // `POSIXLY_CORRECT`, stops reading options at the first operand.
+        if !options_end && count == 0 && text == "--" {
             options_end = true;
-        } else if options_end || !text.starts_with('-') || text == "-" {
+        } else if options_end || count > 0 || !text.starts_with('-') || text == "-" {
             count += 1;
         }
     }
@@ -683,6 +686,91 @@ fn grant_with(call: &AskedCall, read_only_mcp: &[String]) -> Option<SessionGrant
             input: canonical_input(call)?,
         }),
     }
+}
+
+/// The project-scope MCP configuration file the Claude Code CLI loads.
+const PROJECT_MCP_FILE: &str = ".mcp.json";
+
+/// A server name as the CLI puts it in a tool name (`mcp__<server>__<tool>`): every
+/// character outside `[A-Za-z0-9_-]` becomes `_`.
+fn mcp_name_part(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The servers (as named in tool names) that a project's `.mcp.json` defines, in the
+/// project directory or any directory above it. `None` when one of those files exists
+/// but cannot be read or understood: then nothing is known for sure.
+fn project_mcp_servers(project_dir: &std::path::Path) -> Option<Vec<String>> {
+    let mut servers = Vec::new();
+    for dir in project_dir.ancestors() {
+        let text = match std::fs::read_to_string(dir.join(PROJECT_MCP_FILE)) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        let config: Value = serde_json::from_str(&text).ok()?;
+        match config.get("mcpServers") {
+            None => {}
+            Some(Value::Object(defined)) => {
+                servers.extend(defined.keys().map(|k| mcp_name_part(k)))
+            }
+            Some(_) => return None,
+        }
+    }
+    Some(servers)
+}
+
+/// The declared read-only MCP tools that hold for a session opened in `project_dir`
+/// (review of #688, finding C). A declaration binds a NAME: the Claude Code CLI also loads
+/// the project's `.mcp.json`, where a server may take the name of one configured
+/// elsewhere, and a project file the model can edit could put another program behind a
+/// declared name. So, for that session, a declaration whose server the project's
+/// `.mcp.json` (here or above) defines is ignored; all are ignored when such a file cannot
+/// be read for sure, or when the project's files are not on this machine (`None`: a
+/// remote session). Read at every opening (a new session, a resume): the CLI reads its
+/// configuration at start too. Applied whatever the engine (only the CLI reads that
+/// file, so elsewhere it only ever ignores more).
+pub fn declarations_for_project(
+    declared: &[String],
+    project_dir: Option<&std::path::Path>,
+) -> Vec<String> {
+    if declared.is_empty() {
+        return Vec::new();
+    }
+    let Some(project_servers) = project_dir.and_then(project_mcp_servers) else {
+        tracing::warn!(
+            "read-only MCP declarations ignored for this session: the project's MCP \
+             configuration cannot be read for sure"
+        );
+        return Vec::new();
+    };
+    declared
+        .iter()
+        .filter(|tool| {
+            let server = tool
+                .strip_prefix("mcp__")
+                .and_then(|rest| rest.split_once("__"))
+                .map(|(server, _)| server);
+            let redefined = server.is_none_or(|server| project_servers.iter().any(|p| p == server));
+            if redefined {
+                tracing::warn!(
+                    tool = %tool,
+                    "read-only MCP declaration ignored for this session: the project's \
+                     .mcp.json defines a server of that name"
+                );
+            }
+            !redefined
+        })
+        .cloned()
+        .collect()
 }
 
 /// The grants of one session.
@@ -1027,10 +1115,6 @@ mod tests {
         }
     }
 
-    /// The review of #688 (finding 3): the options of the allowlist's programs that WRITE
-    /// a file are refused like those that run one (also abbreviated, with an attached or
-    /// `=` value, inside a cluster); `uniq`'s second operand is the file it truncates. A
-    /// glob next to such a program could become one of them: refused too.
     /// The review of #688 at 60a277e7 (finding A): a quoted word that looks like a
     /// redirection is a literal operand for the shell, so `uniq` gets it as its output
     /// file; it must count, and must not hide the word after it.
@@ -1057,6 +1141,31 @@ mod tests {
         assert!(grant_for(&bash("uniq a.txt >'out.txt'")).is_none());
     }
 
+    /// The review of #698 (finding 1): `uniq` on macOS (BSD), or GNU's with
+    /// `POSIXLY_CORRECT`, stops reading options at its first operand, so a word that
+    /// begins with a dash after it is an operand (its output file): it counts.
+    #[test]
+    fn a_dash_word_after_the_first_operand_counts_as_an_operand_of_uniq() {
+        for command in [
+            "uniq a.txt -c",
+            "uniq a.txt -",
+            "uniq a.txt --",
+            "uniq a.txt -- b.txt",
+            "uniq -c a.txt -d",
+            "cat a | uniq - -c",
+        ] {
+            refused_everywhere(command);
+        }
+        // Options before the first operand are options, and `--` there ends them.
+        for command in ["uniq -c -d a.txt", "uniq -c -- a.txt", "uniq -c", "uniq -"] {
+            assert!(grant_for(&bash(command)).is_some(), "{command:?}");
+        }
+    }
+
+    /// The review of #688 (finding 3): the options of the allowlist's programs that WRITE
+    /// a file are refused like those that run one (also abbreviated, with an attached or
+    /// `=` value, inside a cluster); `uniq`'s second operand is the file it truncates. A
+    /// glob next to such a program could become one of them: refused too.
     #[test]
     fn an_option_that_writes_a_file_is_refused() {
         for command in [
@@ -1388,6 +1497,67 @@ mod tests {
         grants.add(session.grant_for(&list("a")).expect("declared read-only"));
         assert!(grants.covering(&list("a")).is_some());
         assert!(grants.covering(&list("b")).is_none());
+    }
+
+    /// The review of #688 (finding C): a declaration binds a name, and the CLI also loads
+    /// the project's `.mcp.json`. For a session opened in a project whose `.mcp.json`
+    /// (there or above) defines a server of a declared tool, that declaration is ignored;
+    /// all are, when such a file cannot be read for sure or the project is not local.
+    #[test]
+    fn a_declaration_whose_server_the_project_defines_is_ignored_for_the_session() {
+        let declared: Vec<String> = ["mcp__acme__list", "mcp__docs_srv__search", "mcp__po__notes"]
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("ws").join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let write = |dir: &std::path::Path, text: &str| {
+            std::fs::write(dir.join(".mcp.json"), text).unwrap();
+        };
+        // No project file: every declaration holds.
+        assert_eq!(
+            declarations_for_project(&declared, Some(&project)),
+            declared
+        );
+        // The project defines `acme`: ignored for that session, the others hold.
+        write(
+            &project,
+            r#"{"mcpServers": {"acme": {"command": "x"}, "other": {"command": "y"}}}"#,
+        );
+        assert_eq!(
+            declarations_for_project(&declared, Some(&project)),
+            vec!["mcp__docs_srv__search", "mcp__po__notes"]
+        );
+        let session = SessionGrants::declaring(declarations_for_project(&declared, Some(&project)));
+        let list = call(
+            Asker::ClaudeCode,
+            "mcp__acme__list",
+            None,
+            json!({ "dir": "a" }),
+        );
+        assert!(session.grant_for(&list).is_none());
+        // A directory above defines `docs.srv` (named `docs_srv` in tool names).
+        write(
+            &root.path().join("ws"),
+            r#"{"mcpServers": {"docs.srv": {"type": "http", "url": "http://x"}}}"#,
+        );
+        assert_eq!(
+            declarations_for_project(&declared, Some(&project)),
+            vec!["mcp__po__notes"]
+        );
+        // A file that cannot be read for sure: none holds.
+        for broken in ["{not json", r#"{"mcpServers": ["acme"]}"#] {
+            write(&project, broken);
+            assert!(
+                declarations_for_project(&declared, Some(&project)).is_empty(),
+                "{broken}"
+            );
+        }
+        // The project's files are not on this machine (a remote session): none holds.
+        assert!(declarations_for_project(&declared, None).is_empty());
+        // Nothing declared: nothing read.
+        assert!(declarations_for_project(&[], None).is_empty());
     }
 
     /// A third party's MCP tool named like a built-in is not that built-in: it can do

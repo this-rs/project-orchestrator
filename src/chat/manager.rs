@@ -5000,7 +5000,10 @@ impl ChatManager {
                     oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
                     session_grants: Arc::new(std::sync::Mutex::new(
                         super::session_grants::SessionGrants::declaring(
-                            self.config.read_only_mcp_tools.clone(),
+                            super::session_grants::declarations_for_project(
+                                &self.config.read_only_mcp_tools,
+                                Some(std::path::Path::new(&crate::expand_tilde(&request.cwd))),
+                            ),
                         ),
                     )),
                     oob_trigger_cap,
@@ -9067,7 +9070,12 @@ impl ChatManager {
                     oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
                     session_grants: Arc::new(std::sync::Mutex::new(
                         super::session_grants::SessionGrants::declaring(
-                            self.config.read_only_mcp_tools.clone(),
+                            super::session_grants::declarations_for_project(
+                                &self.config.read_only_mcp_tools,
+                                Some(std::path::Path::new(&crate::expand_tilde(
+                                    &session_node.cwd,
+                                ))),
+                            ),
                         ),
                     )),
                     oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
@@ -11782,6 +11790,9 @@ impl ChatManager {
             &spec,
             self.config.nexus_tools_path.as_deref(),
         );
+        // The project's files are on this machine unless the instance is remote.
+        let project_dir =
+            (!super::provider::resolver::is_remote_instance(provider_id)).then(|| spec.cwd.clone());
         let session = provider.open(spec).await.map_err(|e| {
             // Nothing will ever use this session's token.
             crate::auth::agent_tokens::revoke_session(&sid);
@@ -11805,6 +11816,7 @@ impl ChatManager {
             1,
             tool_policy,
             nexus_missing,
+            project_dir,
         )
         .await;
         if let Some(handle) = self.agent_runtime.get(&sid).await {
@@ -11856,6 +11868,9 @@ impl ChatManager {
     /// and registers the live session. `nexus_missing`: the session was opened without
     /// its `nexus-tools` server ([`lacks_nexus_tools`]), which it reports as a feature it
     /// does not have rather than leaving only a line in the server's log.
+    /// `project_dir`: the session's project directory on THIS machine (`None` for a remote
+    /// session), whose `.mcp.json` decides which read-only MCP declarations hold for it
+    /// (`session_grants::declarations_for_project`).
     #[allow(clippy::too_many_arguments)]
     async fn finish_agent_open(
         &self,
@@ -11866,6 +11881,7 @@ impl ChatManager {
         first_seq: i64,
         tool_policy: serde_json::Value,
         nexus_missing: bool,
+        project_dir: Option<std::path::PathBuf>,
     ) {
         self.warn_if_forced(provider_id, session.as_ref());
         if let Some(router) = self.turn_routing.get(session_id) {
@@ -11890,7 +11906,7 @@ impl ChatManager {
         };
         let handle = self
             .agent_runtime
-            .adopt_with(
+            .adopt_declaring(
                 session_id,
                 provider_id,
                 session,
@@ -11899,6 +11915,10 @@ impl ChatManager {
                 tool_policy,
                 Some(self.turn_services()),
                 extra_degraded,
+                super::session_grants::declarations_for_project(
+                    &self.config.read_only_mcp_tools,
+                    project_dir.as_deref(),
+                ),
             )
             .await;
         self.spawn_agent_nats_listeners(handle);
@@ -12120,6 +12140,9 @@ impl ChatManager {
             &spec,
             self.config.nexus_tools_path.as_deref(),
         );
+        // The project's files are on this machine unless the instance is remote.
+        let project_dir = (!super::provider::resolver::is_remote_instance(&provider_id))
+            .then(|| spec.cwd.clone());
         let session = match token {
             Some(token) => provider.resume(spec, token).await,
             None => provider.open(spec).await,
@@ -12138,6 +12161,7 @@ impl ChatManager {
             latest + 1,
             tool_policy,
             nexus_missing,
+            project_dir,
         )
         .await;
         let handle = self
