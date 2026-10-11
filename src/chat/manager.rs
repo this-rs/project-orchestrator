@@ -9439,6 +9439,10 @@ impl ChatManager {
         user_claims: Option<&crate::auth::jwt::Claims>,
     ) -> Result<()> {
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
+        // The live handle (if any) this resume starts from, read before anything awaits: a
+        // resume that finds ANOTHER one once it holds the session's lock was overtaken by
+        // a resume that succeeded meanwhile (review of #696, finding 1).
+        let seen = self.agent_runtime.get(session_id).await;
 
         // Load session from Neo4j
         let mut session_node = self
@@ -9495,7 +9499,7 @@ impl ChatManager {
                 ));
             }
             return self
-                .resume_agent_session(&session_node, message, user_claims)
+                .resume_agent_session(&session_node, message, user_claims, seen)
                 .await;
         }
 
@@ -12985,23 +12989,29 @@ impl ChatManager {
     /// Reopens a session of the agent engine that is no longer live, from its
     /// persisted resume token (a new session when it never got one), then
     /// delivers `message`.
+    ///
+    /// `seen`: the live handle the caller started from, read before it awaited anything
+    /// (`None`: the session was not live; a dead handle: a resume after a failed send).
     async fn resume_agent_session(
         &self,
         node: &ChatSessionNode,
         message: &str,
         user_claims: Option<&crate::auth::jwt::Claims>,
+        seen: Option<Arc<super::agent_runtime::AgentSessionHandle>>,
     ) -> Result<()> {
         let sid = node.id.to_string();
-        // One resume of a session at a time (review of #684, finding 2): two messages to a
-        // session that is not live would each resume it, each minting a token that
-        // supersedes the other's, and the one that fails would undo what the other set up.
-        // A resume that waited for one that succeeded delivers its message to that session.
-        // A session that was live (a resume after a failed send) is resumed as before.
-        let was_live = self.agent_runtime.get(&sid).await.is_some();
+        // One resume of a session at a time (reviews of #684, finding 2, and #696, finding
+        // 1): two messages to a session that is not live — or two failed sends on one dead
+        // handle — would each resume it, each minting a token that supersedes the other's,
+        // the second ending the first's handle, and the one that fails would undo what the
+        // other set up. Once it holds the lock, a resume that finds a live handle OTHER than
+        // the one it started from was overtaken by a resume that succeeded: its message goes
+        // to that session, through `send_message` (routing applies in `full` mode). The same
+        // handle (dead, a resume after a failed send) or none: it resumes.
         let _resuming = self.resume_locks.lock(&sid).await;
-        if !was_live {
-            if let Some(handle) = self.agent_runtime.get(&sid).await {
-                return handle.send_message(message).await;
+        if let Some(now) = self.agent_runtime.get(&sid).await {
+            if seen.as_ref().is_none_or(|seen| !Arc::ptr_eq(seen, &now)) {
+                return self.send_message(&sid, message).await;
             }
         }
         let provider_id = node
@@ -17301,7 +17311,7 @@ mod tests {
         node.provider_id = Some("elsewhere".into());
         graph.create_chat_session(&node).await.unwrap();
         let refused = manager
-            .resume_agent_session(&node, "again", req.user_claims.as_ref())
+            .resume_agent_session(&node, "again", req.user_claims.as_ref(), None)
             .await;
         assert!(refused.is_err());
         let sid = node.id.to_string();
@@ -17548,10 +17558,86 @@ mod tests {
         );
         assert!(manager.agent_runtime.get(&sid).await.is_some());
         assert_eq!(manager.resume_locks.len(), 0, "no lock is kept");
+        // Both messages reached the session (review of #696, nit 4).
+        delivered(&fake, &["one", "two"]).await;
         fake.state.end_turn();
         manager.close_session(&sid).await.unwrap();
     }
 
+    /// Waits until the fake agent has started a turn for each of `texts` (a message that
+    /// waited behind a running turn starts its own once that turn ends).
+    async fn delivered(fake: &super::super::agent_runtime::fake::FakeProvider, texts: &[&str]) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let turns = fake.state.turns_started.lock().unwrap().clone();
+            if texts
+                .iter()
+                .all(|t| turns.iter().any(|turn| turn.contains(t)))
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "not all delivered: {texts:?} in {turns:?}"
+            );
+            fake.state.end_turn();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Review of #696, finding 1: two sends that fail on ONE dead handle each fall back to
+    /// a resume (`seen` is that handle). The first resumes; the second, once it holds the
+    /// lock, finds a live handle other than the one it started from and delivers its
+    /// message there: one resume, both messages delivered. Before, both resumed (the
+    /// second minting a token that superseded the first's and ending its handle).
+    #[tokio::test]
+    async fn two_failed_sends_on_one_dead_session_resume_it_once_and_deliver_both() {
+        let (manager, graph, fake) = signed_routed_agent_manager();
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        let mut req = agent_request("hello");
+        req.user_claims = Some(person_claims());
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        fake.state.end_turn();
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        // The handle both sends failed on.
+        let dead = manager.agent_runtime.get(&sid).await.expect("live");
+        fake.state.opened_specs.lock().unwrap().clear();
+        fake.state.turns_started.lock().unwrap().clear();
+        *fake.open_delay.lock().unwrap() = Some(Duration::from_millis(100));
+        let (first, second) = tokio::join!(
+            manager.resume_agent_session(
+                &node,
+                "one",
+                req.user_claims.as_ref(),
+                Some(Arc::clone(&dead))
+            ),
+            manager.resume_agent_session(
+                &node,
+                "two",
+                req.user_claims.as_ref(),
+                Some(Arc::clone(&dead))
+            ),
+        );
+        first.unwrap();
+        second.unwrap();
+        let resumed = fake.state.opened_specs.lock().unwrap().clone();
+        assert_eq!(resumed.len(), 1, "the session is resumed once");
+        let live = manager.agent_runtime.get(&sid).await.expect("live");
+        assert!(
+            !Arc::ptr_eq(&live, &dead),
+            "the resume replaced the dead handle"
+        );
+        assert!(crate::auth::agent_tokens::is_live(&spec_token_jti(
+            &resumed[0]
+        )));
+        delivered(&fake, &["one", "two"]).await;
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+    }
     #[tokio::test]
     async fn agent_path_opens_a_session_persists_the_snapshot_and_streams_a_turn() {
         use nexus_claude::agent::{AgentEvent, StopReason};
