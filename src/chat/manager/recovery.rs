@@ -14,10 +14,10 @@
 //!    it and the next boot does not look at it again. A turn that can be continued is queued, with
 //!    a context reconstructed from the stored events so the model knows what it was doing.
 //! 2. [`ChatManager::drive_recovery`] (in the background): reopens each queued session and tells
-//!    the model what happened. Sessions whose provider's credential is vault-keyed wait until the
-//!    vault is unlocked (a `vault:<name>` credential is unreadable while locked); the startup
-//!    never waits for a person. Sessions whose provider does not need the vault resume
-//!    immediately.
+//!    the model what happened. ALL sessions wait for the vault to be unlocked before any resume
+//!    starts (a global guard: `vault:<name>` credentials are unreadable while locked, and the
+//!    guard is conservative — it blocks even sessions that do not need the vault). The startup
+//!    never waits for a person.
 //!
 //! Skipped: plan-runner child sessions. The runner relaunches them on its own at boot; recovery
 //! leaving them alone avoids a double-resume.
@@ -73,9 +73,18 @@ fn is_bookkeeping(event_type: &str) -> bool {
     )
 }
 
-/// How many times this session has already been automatically resumed (scans the tail).
+/// How many times this session has already been automatically resumed, counting only the
+/// resumes that belong to the CURRENT turn (after the last real user message). With TAIL=200
+/// earlier turns' resume markers would otherwise accumulate and trigger false closes.
 fn count_resumes(tail: &[ChatEventRecord]) -> usize {
-    tail.iter()
+    // Find the start of the current turn: the last user_message that is NOT a resume marker.
+    let turn_start = tail
+        .iter()
+        .rposition(|e| e.event_type == "user_message" && !e.data.contains(RESUME_MARKER))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    tail[turn_start..]
+        .iter()
         .filter(|e| e.event_type == "user_message" && e.data.contains(RESUME_MARKER))
         .count()
 }
@@ -116,18 +125,28 @@ pub(crate) fn judge(tail: &[ChatEventRecord]) -> Verdict {
             // If a permission_decision follows the request (even though it is bookkeeping and
             // thus skipped by the last-event search), the user already answered: the tool was
             // approved and in flight when the server stopped. Resume rather than close.
-            let answered = tail
-                .iter()
-                .any(|e| e.seq > last.seq && e.event_type == "permission_decision");
+            //
+            // Match by decision id == request id (not just position), and require allow:true so
+            // a denial is treated as "not answered" and the session is closed instead.
+            let request_id = extract_json_str(&last.data, "id");
+            let answered = request_id.as_deref().is_some_and(|rid| {
+                tail.iter().any(|e| {
+                    e.seq > last.seq
+                        && e.event_type == "permission_decision"
+                        && extract_json_str(&e.data, "id").as_deref() == Some(rid)
+                        && extract_json_bool(&e.data, "allow").unwrap_or(false)
+                })
+            });
             if answered {
                 if count_resumes(tail) >= MAX_AUTO_RESUMES {
                     return Verdict::Close(
                         "The server restarted again while this turn was running; it was not resumed again.",
                     );
                 }
-                Verdict::Resume {
-                    dangling_tool: None,
-                }
+                // The approved tool was in flight when the server stopped: tell the model its
+                // result is unknown (it may have run fully, partly, or not at all).
+                let dangling_tool = extract_json_str(&last.data, "tool");
+                Verdict::Resume { dangling_tool }
             } else {
                 Verdict::Close(
                     "The server restarted while this session waited for a permission answer; ask again.",
@@ -150,11 +169,24 @@ pub(crate) fn judge(tail: &[ChatEventRecord]) -> Verdict {
 }
 
 fn tool_name(data: &str) -> Option<String> {
+    extract_json_str(data, "tool")
+}
+
+/// Extract a string field from a JSON blob stored in `ChatEventRecord.data`.
+fn extract_json_str(data: &str, field: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(data)
         .ok()?
-        .get("tool")?
+        .get(field)?
         .as_str()
         .map(str::to_string)
+}
+
+/// Extract a bool field from a JSON blob stored in `ChatEventRecord.data`.
+fn extract_json_bool(data: &str, field: &str) -> Option<bool> {
+    serde_json::from_str::<serde_json::Value>(data)
+        .ok()?
+        .get(field)?
+        .as_bool()
 }
 
 /// Rebuilds a readable summary of the cut turn from its stored events, so the model can
@@ -172,8 +204,12 @@ pub(crate) fn reconstruct_cut_turn(tail: &[ChatEventRecord]) -> String {
     let Some(start_idx) = turn_start else {
         return String::new();
     };
+    // Map tool_use id → index in `lines` so results are matched by id, not position.
+    // Parallel tool calls (two tool_use events before either result) would be misattributed
+    // with a positional approach; id-based matching is correct for any ordering.
+    let mut tool_call_lines: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut lines: Vec<String> = Vec::new();
-    let mut last_was_tool_call = false;
     for event in &tail[start_idx..] {
         match event.event_type.as_str() {
             "user_message" if !event.data.contains(RESUME_MARKER) => {
@@ -186,25 +222,39 @@ pub(crate) fn reconstruct_cut_turn(tail: &[ChatEventRecord]) -> String {
                     })
                     .unwrap_or_else(|| "(message)".to_string());
                 lines.push(format!("User: {}", truncate_str(&content, 300)));
-                last_was_tool_call = false;
             }
             "tool_use" => {
-                let name = tool_name(&event.data).unwrap_or_else(|| "unknown".to_string());
-                lines.push(format!("Called: {name}(…)"));
-                last_was_tool_call = true;
+                let v = serde_json::from_str::<serde_json::Value>(&event.data).ok();
+                let id = v
+                    .as_ref()
+                    .and_then(|v| v.get("id"))
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = v
+                    .as_ref()
+                    .and_then(|v| v.get("tool"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("unknown");
+                let input_preview = v
+                    .as_ref()
+                    .and_then(|v| v.get("input"))
+                    .map(|i| truncate_str(&i.to_string(), 60))
+                    .unwrap_or_default();
+                let idx = lines.len();
+                lines.push(format!("Called: {name}({input_preview})"));
+                if !id.is_empty() {
+                    tool_call_lines.insert(id, idx);
+                }
             }
             "tool_result" => {
-                // Annotate the immediately preceding tool call line with "→ result received".
-                if last_was_tool_call {
-                    if let Some(last) = lines.last_mut() {
-                        last.push_str(" → result received");
-                    }
+                // Match the result to its call by id (same id as the originating tool_use).
+                let id = extract_json_str(&event.data, "id");
+                if let Some(idx) = id.as_deref().and_then(|id| tool_call_lines.get(id)) {
+                    lines[*idx].push_str(" → result received");
                 }
-                last_was_tool_call = false;
             }
-            _ => {
-                last_was_tool_call = false;
-            }
+            _ => {}
         }
     }
     lines.join("\n")
@@ -552,17 +602,53 @@ mod tests {
     fn an_approved_permission_request_is_resumed_not_closed() {
         // permission_decision (bookkeeping) follows permission_request: the tool was
         // approved and running when the restart happened — resume, not close.
+        // IDs must match, and allow must be true; the tool name from the request becomes
+        // dangling_tool so the model is told it may have run fully/partly/not at all.
         let tail = [
             ev(1, "user_message", "{}"),
-            ev(2, "permission_request", "{}"),
-            ev(3, "permission_decision", "{}"),
+            ev(
+                2,
+                "permission_request",
+                r#"{"id":"p1","tool":"Bash","input":{"cmd":"ls"}}"#,
+            ),
+            ev(3, "permission_decision", r#"{"id":"p1","allow":true}"#),
         ];
         assert_eq!(
             judge(&tail),
             Verdict::Resume {
-                dangling_tool: None
+                dangling_tool: Some("Bash".into())
             }
         );
+    }
+
+    #[test]
+    fn a_denied_permission_request_is_closed() {
+        // A denial (allow: false) must close the session just like no decision at all.
+        let tail = [
+            ev(1, "user_message", "{}"),
+            ev(
+                2,
+                "permission_request",
+                r#"{"id":"p1","tool":"Bash","input":{}}"#,
+            ),
+            ev(3, "permission_decision", r#"{"id":"p1","allow":false}"#),
+        ];
+        assert!(matches!(judge(&tail), Verdict::Close(_)));
+    }
+
+    #[test]
+    fn a_mismatched_decision_id_is_treated_as_unanswered() {
+        // decision id does not match request id → treat as unanswered → Close.
+        let tail = [
+            ev(1, "user_message", "{}"),
+            ev(
+                2,
+                "permission_request",
+                r#"{"id":"p1","tool":"Bash","input":{}}"#,
+            ),
+            ev(3, "permission_decision", r#"{"id":"p2","allow":true}"#),
+        ];
+        assert!(matches!(judge(&tail), Verdict::Close(_)));
     }
 
     #[test]
