@@ -41,6 +41,9 @@ use uuid::Uuid;
 
 use crate::expand_tilde;
 
+mod recovery;
+pub use recovery::{RecoveryReport, ScanReport};
+
 /// Broadcast channel buffer size for WebSocket subscribers
 const BROADCAST_BUFFER: usize = 256;
 
@@ -17860,6 +17863,175 @@ mod tests {
         manager.close_session(&ok).await.unwrap();
     }
 
+    /// A session of the agent engine opened by a first manager, whose last events are `tail`
+    /// (type, data), and a SECOND manager over the same graph: the server after a restart.
+    async fn restarted_with_tail(
+        tail: &[(&str, &str)],
+    ) -> (
+        ChatManager,
+        Arc<crate::neo4j::mock::MockGraphStore>,
+        super::super::agent_runtime::fake::FakeProvider,
+        Uuid,
+    ) {
+        let (before, graph, _fake) = agent_manager();
+        let created = before
+            .create_session(&agent_request("hello"))
+            .await
+            .unwrap();
+        let sid = Uuid::parse_str(&created.session_id).unwrap();
+        before.close_session(&created.session_id).await.unwrap();
+        graph.delete_chat_events(sid).await.unwrap();
+        for (i, (event_type, data)) in tail.iter().enumerate() {
+            graph
+                .store_chat_events(
+                    sid,
+                    vec![ChatEventRecord {
+                        id: Uuid::new_v4(),
+                        session_id: sid,
+                        seq: i as i64 + 1,
+                        event_type: event_type.to_string(),
+                        data: data.to_string(),
+                        created_at: chrono::Utc::now(),
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let mut config = test_config();
+        config.provider_path = crate::chat::config::ProviderPath::Agent;
+        let fake = super::super::agent_runtime::fake::FakeProvider::new();
+        let after = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+            .with_provider_source(Arc::new(fake.clone()));
+        (after, graph, fake, sid)
+    }
+
+    #[tokio::test]
+    async fn a_turn_cut_by_a_restart_is_resumed_and_the_model_is_told() {
+        let (manager, _graph, fake, _sid) = restarted_with_tail(&[
+            ("user_message", r#"{"type":"user_message","content":"go"}"#),
+            (
+                "assistant_text",
+                r#"{"type":"assistant_text","content":"I start"}"#,
+            ),
+        ])
+        .await;
+        let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!((scan.scanned, scan.closed, pending.len()), (1, 0, 1));
+        let report = manager
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(2))
+            .await;
+        assert_eq!(report.resumed, 1);
+        let turns = fake.state.turns_started.lock().unwrap().clone();
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].starts_with(recovery::RESUME_MARKER),
+            "{}",
+            turns[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_turn_is_not_resumed_at_boot() {
+        let (manager, _graph, fake, _sid) = restarted_with_tail(&[
+            ("user_message", "{}"),
+            ("assistant_text", "{}"),
+            ("result", "{}"),
+        ])
+        .await;
+        let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!((scan.scanned, scan.closed, pending.len()), (1, 0, 0));
+        assert!(fake.state.turns_started.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_turn_waiting_for_an_answer_is_closed_once_and_not_judged_again() {
+        let (manager, graph, _fake, sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("permission_request", "{}")]).await;
+        let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!((scan.closed, pending.len()), (1, 0));
+        let events = graph.get_chat_events(sid, 0, 50).await.unwrap();
+        assert_eq!(events.last().unwrap().event_type, "error");
+        // The next boot finds it settled.
+        let (_, again) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!(again.closed, 0, "closed once");
+    }
+
+    #[tokio::test]
+    async fn a_session_the_user_wrote_to_meanwhile_is_not_resumed_twice() {
+        let (manager, graph, fake, sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        graph
+            .store_chat_events(
+                sid,
+                vec![ChatEventRecord {
+                    id: Uuid::new_v4(),
+                    session_id: sid,
+                    seq: 3,
+                    event_type: "user_message".into(),
+                    data: "{}".into(),
+                    created_at: chrono::Utc::now(),
+                }],
+            )
+            .await
+            .unwrap();
+        let report = manager
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(1))
+            .await;
+        assert_eq!((report.resumed, report.skipped), (0, 1));
+        assert!(fake.state.turns_started.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_recovery_waits_while_the_vault_is_locked_then_resumes() {
+        let (manager, _graph, fake, _sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        let vault = crate::vault::VaultService::ephemeral();
+        let manager = manager.with_vault(vault.clone());
+        assert!(
+            !vault.is_unlocked(chrono::Utc::now()),
+            "a fresh vault is locked"
+        );
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        let manager = Arc::new(manager);
+        let driving = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .drive_recovery(pending, Duration::from_millis(20), Duration::from_secs(10))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            fake.state.turns_started.lock().unwrap().is_empty(),
+            "nothing resumes while the vault is locked"
+        );
+        vault
+            .init("a long passphrase".into(), chrono::Duration::seconds(600))
+            .await
+            .unwrap();
+        let report = driving.await.unwrap();
+        assert_eq!(report.resumed, 1);
+    }
+
+    #[tokio::test]
+    async fn a_recovery_that_waits_for_ever_gives_up_and_says_so() {
+        let (manager, _graph, _fake, _sid) =
+            restarted_with_tail(&[("user_message", "{}"), ("assistant_text", "{}")]).await;
+        let manager = manager.with_vault(crate::vault::VaultService::ephemeral());
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        let report = manager
+            .drive_recovery(
+                pending,
+                Duration::from_millis(10),
+                Duration::from_millis(60),
+            )
+            .await;
+        assert_eq!((report.resumed, report.abandoned), (0, 1));
+    }
+
     /// A third-party instance (`acp`) a project consented to, played by the fake.
     async fn consented_acp_instance(
         graph: &crate::neo4j::mock::MockGraphStore,
@@ -18168,6 +18340,7 @@ mod tests {
         fake.state.end_turn();
         manager.close_session(&sid).await.unwrap();
     }
+
     #[tokio::test]
     async fn agent_path_opens_a_session_persists_the_snapshot_and_streams_a_turn() {
         use nexus_claude::agent::{AgentEvent, StopReason};

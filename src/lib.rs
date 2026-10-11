@@ -1113,6 +1113,7 @@ pub const BOOT_PHASES: &[(&str, &str)] = &[
     ("claude_mcp", "Claude Code MCP setup"),
     ("protocol_recovery", "Recovering interrupted protocols"),
     ("runs", "Reconciling plan runs"),
+    ("chat_turns", "Resuming interrupted chat turns"),
     ("triggers", "Plan triggers"),
     ("migrations", "Data migrations"),
     ("identity", "Instance identity"),
@@ -1804,6 +1805,41 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                 }
             }
         });
+    }
+
+    // Agent turns cut by the restart: judged now (fast), resumed in the background, once the
+    // vault lets the providers read their keys. The startup never waits for a person.
+    boot.start("chat_turns");
+    match chat_manager.as_ref() {
+        None => boot.skip("chat_turns", "no chat manager"),
+        Some(cm) => match cm.scan_interrupted_turns().await {
+            Err(e) => boot.fail("chat_turns", e),
+            Ok((pending, scan)) => {
+                boot.done_with(
+                    "chat_turns",
+                    format!(
+                        "{} session(s) read, {} closed, {} to resume",
+                        scan.scanned,
+                        scan.closed,
+                        pending.len()
+                    ),
+                );
+                if !pending.is_empty() {
+                    let cm = cm.clone();
+                    tokio::spawn(async move {
+                        // A locked vault is waited for up to a day.
+                        let report = cm
+                            .drive_recovery(
+                                pending,
+                                std::time::Duration::from_secs(5),
+                                std::time::Duration::from_secs(24 * 3600),
+                            )
+                            .await;
+                        tracing::info!("Chat turn recovery: {:?}", report);
+                    });
+                }
+            }
+        },
     }
 
     // Boot trigger providers (Schedule + Event) for automatic plan execution
