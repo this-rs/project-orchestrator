@@ -253,6 +253,7 @@ impl EventMapper {
                     code: None,
                     reason: None,
                     index: None,
+                    request_id: None,
                 }]
             }
             // A notice is a diagnostic: nothing in a turn.
@@ -341,6 +342,7 @@ fn error_event(error: &ProviderError) -> ChatEvent {
         code: None,
         reason: None,
         index: None,
+        request_id: None,
     }
 }
 

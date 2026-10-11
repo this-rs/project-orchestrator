@@ -955,6 +955,15 @@ async fn handle_ws_chat_loop(
                                         let request_id = id.clone().unwrap_or_default();
                                         let decision = if allow { "allow" } else { "deny" };
 
+                                        // Only the person the session belongs to answers it, as on REST
+                                        // (review #679 finding 6).
+                                        if let Err(why) = may_answer_permissions(state.orchestrator.neo4j(), &session_id, &claims).await {
+                                            warn!(session_id = %session_id, request_id = %request_id, reason = why.reason(), "permission response refused before delivery");
+                                            let err = permission_forbidden_frame(&request_id, why);
+                                            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                            continue;
+                                        }
+
                                         // Dedup: ignore duplicate responses (double-click protection)
                                         if !request_id.is_empty() && !responded_permission_ids.insert(request_id.clone()) {
                                             warn!(
@@ -990,15 +999,7 @@ async fn handle_ws_chat_loop(
                                             // Refused, not answered: the request still waits, the same
                                             // id may be answered again (with a scope the session offers).
                                             responded_permission_ids.remove(&request_id);
-                                            let err = serde_json::json!({
-                                                "type": "error",
-                                                "message": format!(
-                                                    "This session cannot keep a permission for the scope '{}': answer with a scope it offers.",
-                                                    scope.as_str()
-                                                ),
-                                                "code": crate::chat::manager::PERMISSION_SCOPE_UNSUPPORTED_RPC,
-                                                "reason": scope.as_str(),
-                                            });
+                                            let err = scope_unsupported_frame(&request_id, *scope);
                                             let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
                                         } else if let Err(e) = send_result {
                                             warn!(
@@ -1294,6 +1295,99 @@ pub fn spawn_entity_extraction(state: &OrchestratorState, session_id: &str, mess
     });
 }
 
+/// The `error` frame of a `permission_response` whose scope the session cannot keep
+/// (`permission_scope_unsupported`): nothing was answered, the request still waits.
+/// `request_id` is the `id` of the refused answer, so a client with several requests
+/// waiting puts the refusal on the right one (frontend #323, finding 1).
+pub(crate) fn scope_unsupported_frame(
+    request_id: &str,
+    scope: crate::chat::types::PermissionAnswerScope,
+) -> serde_json::Value {
+    serde_json::to_value(crate::chat::types::ChatEvent::Error {
+        message: format!(
+            "This session cannot keep a permission for the scope '{}': answer with a scope it offers.",
+            scope.as_str()
+        ),
+        parent_tool_use_id: None,
+        code: Some(crate::chat::manager::PERMISSION_SCOPE_UNSUPPORTED_RPC.to_string()),
+        reason: Some(scope.as_str().to_string()),
+        index: None,
+        request_id: Some(request_id.to_string()),
+    })
+    .unwrap_or_default()
+}
+
+/// Code of the `error` frame refusing a `permission_response` from a person the session
+/// does not belong to (the REST twin answers 403).
+pub(crate) const PERMISSION_FORBIDDEN: &str = "permission_forbidden";
+
+/// Why a `permission_response` is refused before it reaches anything (the `reason` of
+/// its `permission_forbidden` frame).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnswerRefusal {
+    /// The session belongs to another person (`not_owner`).
+    NotOwner,
+    /// The session, hence its owner, cannot be read right now (`owner_unreadable`):
+    /// refused, never let through (fail closed), the person may answer again.
+    OwnerUnreadable,
+}
+
+impl AnswerRefusal {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::NotOwner => "not_owner",
+            Self::OwnerUnreadable => "owner_unreadable",
+        }
+    }
+}
+
+/// Whether the person behind `claims` may answer the permission requests of `session_id`
+/// ([`crate::neo4j::models::ChatSessionNode::answerable_by`]). FAILS CLOSED: a session
+/// whose owner cannot be read (a graph error, no such session, an id that is not one) is
+/// refused, like the REST twin (500 / 404 there). With the authentication off the socket
+/// carries the anonymous user, who owns nothing: a session that has an owner is refused,
+/// as on REST.
+pub(crate) async fn may_answer_permissions(
+    neo4j: &dyn crate::neo4j::traits::GraphStore,
+    session_id: &str,
+    claims: &Claims,
+) -> Result<(), AnswerRefusal> {
+    let Ok(id) = session_id.parse::<uuid::Uuid>() else {
+        return Err(AnswerRefusal::OwnerUnreadable);
+    };
+    match neo4j.get_chat_session(id).await {
+        Ok(Some(session)) if session.answerable_by(&claims.sub) => Ok(()),
+        Ok(Some(_)) => Err(AnswerRefusal::NotOwner),
+        Ok(None) | Err(_) => Err(AnswerRefusal::OwnerUnreadable),
+    }
+}
+
+/// The `error` frame refusing a `permission_response` before delivery: nothing was
+/// answered, the request still waits (for the session's owner, or for a retry when the
+/// owner could not be read).
+pub(crate) fn permission_forbidden_frame(
+    request_id: &str,
+    why: AnswerRefusal,
+) -> serde_json::Value {
+    let message = match why {
+        AnswerRefusal::NotOwner => {
+            "Only the person this conversation belongs to can answer its permission requests."
+        }
+        AnswerRefusal::OwnerUnreadable => {
+            "Who this conversation belongs to could not be checked: nothing was answered, try again."
+        }
+    };
+    serde_json::to_value(crate::chat::types::ChatEvent::Error {
+        message: message.to_string(),
+        parent_tool_use_id: None,
+        code: Some(PERMISSION_FORBIDDEN.to_string()),
+        reason: Some(why.reason().to_string()),
+        index: None,
+        request_id: Some(request_id.to_string()),
+    })
+    .unwrap_or_default()
+}
+
 /// A `permission_response` frame, delivered like `POST .../permissions/{id}` and the NATS
 /// RPC: STRICTLY. An answer to a request that no longer waits (the backend answered it
 /// under a session grant a moment before, another tab did) is refused (`NotPending`):
@@ -1443,6 +1537,105 @@ mod tests {
             "Expected RecvError::Closed after sender is dropped, got: {:?}",
             result
         );
+    }
+
+    /// Two requests waiting, two `session` answers refused (frontend #323, finding 1): each
+    /// refusal names ITS request, so the client never puts A's refusal on B.
+    #[test]
+    fn a_refused_scope_names_the_request_it_refuses() {
+        use crate::chat::types::PermissionAnswerScope;
+        let a = scope_unsupported_frame("pr_A", PermissionAnswerScope::Session);
+        let b = scope_unsupported_frame("pr_B", PermissionAnswerScope::Always);
+        assert_eq!(a["type"], "error", "{a}");
+        assert_eq!(a["code"], "permission_scope_unsupported", "{a}");
+        assert_eq!(a["reason"], "session", "{a}");
+        assert_eq!(a["request_id"], "pr_A", "{a}");
+        assert_eq!(b["reason"], "always", "{b}");
+        assert_eq!(b["request_id"], "pr_B", "{b}");
+        // Still an `error` event any client reads (the readable line is kept).
+        let parsed: ChatEvent = serde_json::from_value(a.clone()).unwrap();
+        assert!(
+            matches!(parsed, ChatEvent::Error { request_id: Some(ref id), .. } if id == "pr_A"),
+            "{a}"
+        );
+    }
+
+    /// Review #679 finding 6, the WebSocket twin of the REST 403: another person's
+    /// `permission_response` is refused (an `error` frame naming the request), the owner's
+    /// and anyone's on a session nobody owns go through.
+    #[tokio::test]
+    async fn only_the_owner_answers_on_the_websocket() {
+        use crate::neo4j::traits::GraphStore;
+        let mock = crate::neo4j::mock::MockGraphStore::new();
+        let owner = uuid::Uuid::new_v4().to_string();
+        let owned = crate::neo4j::models::ChatSessionNode {
+            owner: Some(owner.clone()),
+            ..crate::test_helpers::test_chat_session(None)
+        };
+        let free = crate::test_helpers::test_chat_session(None);
+        mock.create_chat_session(&owned).await.unwrap();
+        mock.create_chat_session(&free).await.unwrap();
+        let person = |sub: &str| Claims {
+            sub: sub.to_string(),
+            ..Claims::anonymous()
+        };
+        let other = uuid::Uuid::new_v4().to_string();
+
+        let owned_id = owned.id.to_string();
+        assert_eq!(
+            may_answer_permissions(&mock, &owned_id, &person(&other)).await,
+            Err(AnswerRefusal::NotOwner)
+        );
+        assert_eq!(
+            may_answer_permissions(&mock, &owned_id, &person(&owner)).await,
+            Ok(())
+        );
+        assert_eq!(
+            may_answer_permissions(&mock, &free.id.to_string(), &person(&other)).await,
+            Ok(())
+        );
+
+        let frame = permission_forbidden_frame("pr_9", AnswerRefusal::NotOwner);
+        assert_eq!(frame["type"], "error", "{frame}");
+        assert_eq!(frame["code"], PERMISSION_FORBIDDEN, "{frame}");
+        assert_eq!(frame["reason"], "not_owner", "{frame}");
+        assert_eq!(frame["request_id"], "pr_9", "{frame}");
+    }
+
+    /// Review of #699, finding 1: the owner check FAILS CLOSED. A session the graph cannot
+    /// read (an error, no such session, not an id) is refused, never let through: the
+    /// local routing does not check the owner again.
+    #[tokio::test]
+    async fn a_websocket_answer_is_refused_when_the_owner_cannot_be_read() {
+        use crate::neo4j::traits::GraphStore;
+        let mock = crate::neo4j::mock::MockGraphStore::new();
+        let free = crate::test_helpers::test_chat_session(None);
+        mock.create_chat_session(&free).await.unwrap();
+        let someone = Claims {
+            sub: uuid::Uuid::new_v4().to_string(),
+            ..Claims::anonymous()
+        };
+        let sid = free.id.to_string();
+        assert_eq!(may_answer_permissions(&mock, &sid, &someone).await, Ok(()));
+
+        mock.fail_reads.lock().unwrap().insert("get_chat_session");
+        assert_eq!(
+            may_answer_permissions(&mock, &sid, &someone).await,
+            Err(AnswerRefusal::OwnerUnreadable)
+        );
+        mock.fail_reads.lock().unwrap().clear();
+        assert_eq!(
+            may_answer_permissions(&mock, &uuid::Uuid::new_v4().to_string(), &someone).await,
+            Err(AnswerRefusal::OwnerUnreadable)
+        );
+        assert_eq!(
+            may_answer_permissions(&mock, "not-an-id", &someone).await,
+            Err(AnswerRefusal::OwnerUnreadable)
+        );
+        let frame = permission_forbidden_frame("pr_1", AnswerRefusal::OwnerUnreadable);
+        assert_eq!(frame["code"], PERMISSION_FORBIDDEN, "{frame}");
+        assert_eq!(frame["reason"], "owner_unreadable", "{frame}");
+        assert_eq!(frame["request_id"], "pr_1", "{frame}");
     }
 
     /// Verify the dormant event JSON format matches what the frontend expects.

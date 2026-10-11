@@ -7615,6 +7615,14 @@ impl GraphStore for MockGraphStore {
 
     async fn get_chat_session(&self, id: Uuid) -> Result<Option<ChatSessionNode>> {
         self.count_read();
+        // Failure injection without a `read_log` entry (counted read logs stay as they are).
+        if self
+            .fail_reads
+            .lock()
+            .is_ok_and(|f| f.contains("get_chat_session"))
+        {
+            anyhow::bail!("injected failure of get_chat_session");
+        }
         Ok(self.chat_sessions.read().await.get(&id).cloned())
     }
 

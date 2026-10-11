@@ -402,6 +402,7 @@
           "message": "Tool execution failed: permission denied",
           "parent_tool_use_id": "toolu_01ParentTask0000000000",
           "reason": "unknown_kind",
+          "request_id": "pr_1",
           "type": "error"
         },
         "minimal": {
@@ -427,6 +428,10 @@
           "type": "string"
         },
         "reason": {
+          "required": false,
+          "type": "string"
+        },
+        "request_id": {
           "required": false,
           "type": "string"
         },

@@ -148,10 +148,11 @@ that cannot run code the model can change. Everything is an allowlist; anything 
   path, no diff, so one grant would cover every later patch), its `shell` (nexus joins the argv
   with spaces: `["rm","a b"]` and `["rm","a","b"]` read the same) or `request_permissions`;
   never an ACP agent;
-- **any call of a read-only built-in tool of the native engine** (`mcp__nexus__Read`, `Glob`,
-  `Grep`, `LS`, `NotebookRead`), identified by the adapter, never by the name's suffix;
 - **the identical call** (same tool, same input; a command's surrounding blanks trimmed, its
-  `description` ignored, every other field compared) for: the file tools (`Write`, `Edit`,
+  `description` ignored, every other field compared) for: the read-only built-in tools of the
+  native engine (`mcp__nexus__Read`, `Glob`, `Grep`, `LS`, `NotebookRead`, identified by the
+  adapter, never by the name's suffix; never the whole tool, which would cover any later read
+  the session can reach), the file tools (`Write`, `Edit`,
   `MultiEdit`, `NotebookEdit`), a read of the Claude Code CLI (it asks a read only outside the
   working directory, so never the whole tool), `WebFetch`, `WebSearch`;
 - **a third party's MCP tool, only when the operator declared it read-only**, by its exact name,
@@ -207,12 +208,21 @@ Only requests the provider asked reach the backend, after its own policy (read-o
 denies, trust) and the project's consent. Another session, or the same one after a restart, asks
 again. `always` is part of the contract but refused on every engine for now (P11b). A scope that
 cannot be kept is refused with an `error` frame `{"code": "permission_scope_unsupported",
-"reason": "<scope>"}`; nothing is answered and the request stays waiting. An answer to a request
+"reason": "<scope>", "request_id": "<id>"}` (`request_id`: the `id` of the refused answer, so a
+client with several requests waiting marks the right one); nothing is answered and the request
+stays waiting. An answer to a request
 that no longer waits (answered by the backend under a grant, or from another tab) is ignored,
 on the WebSocket as on REST and NATS. The resulting `permission_decision` carries `scope` and
 `rule` (what a session grant covers, e.g. `Bash: ls -la`). The REST twin
 `POST /api/chat/sessions/{id}/permissions/{request_id}` takes `{"allow", "scope"?}` (400
-`permission_scope_unsupported`); it is a human route (an agent session token gets 403).
+`permission_scope_unsupported`); it is a human route (an agent session token gets 403). Only
+the person the conversation belongs to answers it (the one who opened it, or the person behind
+the agent session that opened it, or the person whose MCP token opened it; a session the server
+opened itself has no owner): another person gets 403 on REST and, on the WebSocket, an `error`
+frame `{"code": "permission_forbidden", "reason": "not_owner", "request_id": "<id>"}`; nothing
+is answered. The check fails closed: when the session cannot be read, the WebSocket refuses with
+`"reason": "owner_unreadable"` (REST: 500 / 404), and with the authentication off (no person
+behind the caller) a session that has an owner is refused on both.
 
 #### `input_response` -- Respond to an input request
 

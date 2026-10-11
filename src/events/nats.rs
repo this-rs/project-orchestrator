@@ -654,6 +654,7 @@ mod tests {
                 code: None,
                 reason: None,
                 index: None,
+                request_id: None,
             },
         ];
 

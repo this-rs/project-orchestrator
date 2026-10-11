@@ -200,6 +200,7 @@ impl StepBudget {
             code: Some(code.to_string()),
             reason: Some(step.to_string()),
             index: None,
+            request_id: None,
         };
         let _ = self.events_tx.send(event.clone());
         if let Some(ref nats) = self.nats {

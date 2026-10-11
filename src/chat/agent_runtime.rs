@@ -209,6 +209,7 @@ pub(crate) fn images_refused(reason: &str, message: String) -> ChatEvent {
         code: Some("images_refused".to_string()),
         reason: Some(reason.to_string()),
         index: None,
+        request_id: None,
     }
 }
 

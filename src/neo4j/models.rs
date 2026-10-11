@@ -261,6 +261,21 @@ pub struct ChatSessionNode {
     /// (`normal` | `read_only`). Absent on every session written before it existed: `normal`.
     #[serde(default, skip_serializing_if = "SessionAccess::is_normal")]
     pub access: SessionAccess,
+    /// The person the session belongs to (the `sub` of the user who opened it, or of the
+    /// person behind the agent session that opened it), fixed at open. Only that person
+    /// answers its permission requests (P11b, review #679 finding 6). Absent on a session
+    /// opened by the server itself (a plan run, a protocol) and on every session written
+    /// before it existed: any signed-in person answers, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
+impl ChatSessionNode {
+    /// Whether the person `sub` may answer this session's permission requests: the owner,
+    /// or anyone on a session that has none.
+    pub fn answerable_by(&self, sub: &str) -> bool {
+        self.owner.as_deref().is_none_or(|owner| owner == sub)
+    }
 }
 
 // ============================================================================
@@ -3501,6 +3516,7 @@ mod tests {
             resume_token: None,
             execution_place: Default::default(),
             access: Default::default(),
+            owner: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -3537,6 +3553,7 @@ mod tests {
             resume_token: None,
             execution_place: Default::default(),
             access: Default::default(),
+            owner: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
