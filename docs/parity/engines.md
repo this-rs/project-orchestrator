@@ -38,9 +38,11 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `session_record` | le dossier de session porte message_count, total_cost_usd et un titre | ok | ok |
 | `background_tasks` | une tâche d'arrière-plan est suivie (active_tasks_update) | ok | ok |
 | `cancel_task` | cancel_task arrête une tâche d'arrière-plan | ok | ok |
+| `ask_user_question` | une question du modèle s'affiche (ask_user_question) et la réponse de l'utilisateur lui revient au tour suivant | ok | ok |
+| `subagents` | un sous-agent (Agent / Task) travaille et sa réponse revient en résultat ; sur le natif, une session enfant qui ne peut pas re-déléguer | ok | ok |
 | `system_init.degraded` | system_init n'annonce comme manquant qu'une limite du modèle (liste fermée) | ok | ok |
 
-`ok` : Claude Code 24/27, natif 25/27.
+`ok` : Claude Code 26/29, natif 27/29.
 
 ## Écarts déclarés
 

@@ -183,6 +183,9 @@ fn native_provider(
     let mut config = NativeConfig::new(record.id.clone());
     config.default_model = record.default_model.clone();
     config.strict_tool_exposure = STRICT_TOOL_EXPOSURE;
+    // The harness's own `AskUserQuestion` (P18): its `question { reply: turn }` becomes the
+    // `ask_user_question` card (synthetic, A45) and the user's answer is the next turn.
+    config.ask_user_question = true;
     // Only "free" is known without a price table; the rest stays `unknown`
     // (no amount) until a price is configured (A21: never an invented price).
     if record.cost_source == "free" {

@@ -434,6 +434,24 @@ impl SessionHooks for ToolAccessHooks {
             None => TurnDirective::default(),
         }
     }
+
+    // The sub-agents of the session (P18) are the inner hooks' to run: the gate only judges
+    // tool calls, and the child session is held to its own gate.
+    fn runs_subagents(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.runs_subagents())
+    }
+
+    async fn run_subagent(
+        &self,
+        request: &nexus_claude::agent::SubagentRequest,
+    ) -> Result<String, String> {
+        match &self.inner {
+            Some(inner) => inner.run_subagent(request).await,
+            None => Err("this session runs no sub-agent".to_owned()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

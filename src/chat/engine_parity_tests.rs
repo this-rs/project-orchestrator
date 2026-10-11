@@ -36,7 +36,7 @@ use chrono::Utc;
 use nexus_claude::agent::{
     AgentProvider, AgentSession, Capabilities, CompactionInfo, HookVerdict, ModelInfo,
     ProviderError, ProviderHealth, ProviderKind, ResumeToken, SessionHooks, SessionSpec,
-    ToolCallInfo, ToolResultInfo, TurnContext, TurnDirective,
+    SubagentRequest, ToolCallInfo, ToolResultInfo, TurnContext, TurnDirective,
 };
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -218,6 +218,14 @@ const FUNCTIONS: &[(&str, &str)] = &[
         "une tâche d'arrière-plan est suivie (active_tasks_update)",
     ),
     ("cancel_task", "cancel_task arrête une tâche d'arrière-plan"),
+    (
+        "ask_user_question",
+        "une question du modèle s'affiche (ask_user_question) et la réponse de l'utilisateur lui revient au tour suivant",
+    ),
+    (
+        "subagents",
+        "un sous-agent (Agent / Task) travaille et sa réponse revient en résultat ; sur le natif, une session enfant qui ne peut pas re-déléguer",
+    ),
     (
         "system_init.degraded",
         "system_init n'annonce comme manquant qu'une limite du modèle (liste fermée)",
@@ -684,7 +692,7 @@ impl Stage {
     /// A backend process: a manager on the stage's graph and NATS, Claude Code on
     /// the CLI `cli`, the native instance tapped (its hooks recorded in `answers`).
     /// Called again to "restart" the backend: the graph is all that survives.
-    async fn backend(&self, cli: &FakeClaude, answers: &Arc<Answers>) -> ChatManager {
+    async fn backend(&self, cli: &FakeClaude, answers: &Arc<Answers>) -> Arc<ChatManager> {
         let config = ChatConfig {
             provider_path: ProviderPath::Legacy,
             mcp_server_path: fake_bin("fake_mcp"),
@@ -711,10 +719,13 @@ impl Stage {
             .provider_for("local")
             .await
             .unwrap_or_else(|e| panic!("the native instance: {e:#}"));
-        manager.with_provider_source(Arc::new(Tap {
+        let manager = Arc::new(manager.with_provider_source(Arc::new(Tap {
             inner: real,
             answers: Arc::clone(answers),
-        }))
+        })));
+        // The native sessions run their `Agent` calls as child sessions (P18).
+        manager.enable_subagents();
+        manager
     }
 
     /// Asks the session, from the other instance, until its owner answers. A
@@ -1141,6 +1152,23 @@ fn cc_tool_result(id: &str, content: &str, is_error: bool) -> Value {
     }))
 }
 
+/// What a sub-agent says, inside the Task call `parent`.
+fn sub_agent_text(parent: &str, t: &str) -> Value {
+    emit(json!({
+        "type": "assistant",
+        "message": {"id": "msg_sub", "type": "message", "role": "assistant",
+                    "model": "fake-claude", "content": [{"type": "text", "text": t}],
+                    "stop_reason": "end_turn"},
+        "parent_tool_use_id": parent,
+    }))
+}
+
+/// The input of the question both engines ask (Claude Code's AskUserQuestion shape).
+fn question_input() -> Value {
+    json!({"questions": [{"question": "Which database?", "header": "DB",
+        "options": [{"label": "Postgres"}, {"label": "SQLite"}], "multiSelect": false}]})
+}
+
 fn result(subtype: &str, t: &str, is_error: bool) -> Value {
     emit(json!({
         "type": "result", "subtype": subtype, "duration_ms": 12, "duration_api_ms": 7,
@@ -1325,6 +1353,32 @@ fn transcript_main(k: Keys, cwd: &str) -> Vec<Value> {
     // References, then an image attachment.
     t.extend(answer(&k.k("TURN-REFS"), "answered refs"));
     t.extend(answer(&k.k("TURN-IMG"), "answered img"));
+    // TURN-ASK: the CLI's AskUserQuestion comes as a can_use_tool request: the engine shows
+    // the question and allows it by itself; the user's answer is the next turn.
+    t.extend(vec![
+        await_in(&k.k("TURN-ASK")),
+        cc_tool_use("t-ask", "AskUserQuestion", question_input()),
+        permission_request("req-ask", "AskUserQuestion", question_input(), "t-ask"),
+        await_in("req-ask"),
+        cc_tool_result("t-ask", "the user was asked", false),
+        text("asked"),
+        result_ok("asked"),
+    ]);
+    t.extend(answer(&k.k("ANSWER"), "answered ask"));
+    // TURN-AGENT: a sub-agent (the CLI's Task): its messages carry the parent tool_use id,
+    // its answer is the tool's result.
+    t.extend(vec![
+        await_in(&k.k("TURN-AGENT")),
+        cc_tool_use(
+            "t-agent",
+            "Task",
+            json!({"description": "find the spec", "prompt": k.k("SUB-PROMPT")}),
+        ),
+        sub_agent_text("t-agent", &k.k("SUB-SAID")),
+        cc_tool_result("t-agent", &k.k("SUB-ANSWER"), false),
+        text("answered agent"),
+        result_ok("answered agent"),
+    ]);
     // Closed by the backend going down (EOF on stdin).
     t.push(wait_eof());
     t
@@ -1402,6 +1456,12 @@ impl SessionHooks for Recording {
     }
     async fn before_turn(&self, ctx: &TurnContext) -> TurnDirective {
         self.inner.before_turn(ctx).await
+    }
+    fn runs_subagents(&self) -> bool {
+        self.inner.runs_subagents()
+    }
+    async fn run_subagent(&self, request: &SubagentRequest) -> Result<String, String> {
+        self.inner.run_subagent(request).await
     }
 }
 
@@ -1623,6 +1683,19 @@ fn native_script(k: Keys, cwd: &str) -> Value {
         // References, the image.
         says(&k.k("TURN-REFS"), "answered refs"),
         says(&k.k("TURN-IMG"), "answered img"),
+        // TURN-ASK: the harness's AskUserQuestion; the turn ends on it, the answer is a turn.
+        calls(&k.k("TURN-ASK"), "cq1", "AskUserQuestion", question_input()),
+        says(&k.k("ANSWER"), "answered ask"),
+        // TURN-AGENT: the harness's Agent; the child session's own request (its prompt, not
+        // the parent's key) is answered before the parent goes on with the result.
+        calls(
+            &k.k("TURN-AGENT"),
+            "ca1",
+            "Agent",
+            json!({"description": "find the spec", "prompt": k.k("SUB-PROMPT")}),
+        ),
+        says(&k.k("SUB-PROMPT"), &k.k("SUB-ANSWER")),
+        says(&k.k("TURN-AGENT"), "answered agent"),
     ];
     // A turn whose reported size makes the next model call compact first; the
     // summary request carries the guidance of the before_compaction hook.
@@ -2184,6 +2257,70 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
     );
     w.settle(ends, &manager).await;
 
+    // A question to the user: shown, allowed by the engine, answered by a turn.
+    let ends = w.turn_ends();
+    manager.send_message(&sid, &kc.k("TURN-ASK")).await.unwrap();
+    cc_sent += 1;
+    let shown = w
+        .wait(WAIT, |e| {
+            matches!(e, ChatEvent::AskUserQuestion { tool_call_id, questions, .. }
+                if tool_call_id == "t-ask" && questions.to_string().contains("Which database?"))
+        })
+        .await;
+    let allowed = cli.wait_line(0, "req-ask", WAIT).await.unwrap_or_default();
+    w.settle(ends, &manager).await;
+    let ends = w.turn_ends();
+    // What the frontend sends for the answer (`input_response`): an inert user turn.
+    manager
+        .send_message(
+            &sid,
+            &crate::refs::compose::inert(&format!("{}: Postgres", kc.k("ANSWER"))),
+        )
+        .await
+        .unwrap();
+    cc_sent += 1;
+    let answer_read = cli.wait_line(0, &kc.k("ANSWER"), WAIT).await.is_some();
+    cc.check(
+        "ask_user_question",
+        shown
+            && allowed.contains("\"behavior\":\"allow\"")
+            && answer_read
+            && w.said(WAIT, "answered ask").await,
+        Cause::Harness,
+        format!(
+            "ask_user_question={shown}, autorisée={}, réponse lue au tour suivant={answer_read}",
+            allowed.contains("\"behavior\":\"allow\"")
+        ),
+    );
+    w.settle(ends, &manager).await;
+
+    // A sub-agent: its messages under the Task call, its answer as the result.
+    let ends = w.turn_ends();
+    manager
+        .send_message(&sid, &kc.k("TURN-AGENT"))
+        .await
+        .unwrap();
+    cc_sent += 1;
+    let nested = w
+        .wait(WAIT, |e| {
+            matches!(e, ChatEvent::AssistantText { content, parent_tool_use_id: Some(p) }
+                if p == "t-agent" && content.contains(&kc.k("SUB-SAID")))
+        })
+        .await;
+    let returned = w
+        .wait(WAIT, |e| {
+            matches!(e, ChatEvent::ToolResult { id, result, is_error: false, .. }
+                if id == "t-agent" && result.to_string().contains(&kc.k("SUB-ANSWER")))
+        })
+        .await;
+    cc.check(
+        "subagents",
+        nested && returned && w.said(WAIT, "answered agent").await,
+        Cause::Harness,
+        format!("messages du sous-agent sous t-agent={nested}, réponse en résultat={returned}"),
+    );
+    w.settle(ends, &manager).await;
+
     // The announcement and the record.
     let init = w.system_init().await;
     let unduly = init.as_ref().map(not_model_limits);
@@ -2690,6 +2827,115 @@ async fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
         part,
         Cause::Harness,
         format!("partie image_url={part}"),
+    );
+    wn.settle(ends, &manager).await;
+
+    // A question to the user: the harness's AskUserQuestion, shown as a synthetic card
+    // (A45); the turn ends on it and the answer is the next turn.
+    let ends = wn.turn_ends();
+    manager.send_message(&nid, &kn.k("TURN-ASK")).await.unwrap();
+    na_sent += 1;
+    let shown = wn
+        .wait(WAIT, |e| {
+            matches!(e, ChatEvent::AskUserQuestion { tool_call_id, questions, synthetic: Some(true), .. }
+                if tool_call_id == "cq1" && questions.to_string().contains("Which database?"))
+        })
+        .await;
+    let ended = wn.turn_end_after(ends).await;
+    // The model was not asked again within the turn: the question ended it.
+    let asked_once = bodies(&fake)
+        .iter()
+        .filter(|b| b.contains(&kn.k("TURN-ASK")) && !b.contains(&kn.k("ANSWER")))
+        .count()
+        == 1;
+    wn.settle(ends, &manager).await;
+    let ends = wn.turn_ends();
+    manager
+        .send_message(
+            &nid,
+            &crate::refs::compose::inert(&format!("{}: Postgres", kn.k("ANSWER"))),
+        )
+        .await
+        .unwrap();
+    na_sent += 1;
+    let answer_body = wait_body(&fake, &kn.k("ANSWER")).await.unwrap_or_default();
+    // The answer follows the question and its result in what the model reads.
+    let after_question = answer_body.contains("next user message")
+        && last_user(&answer_body)
+            .to_string()
+            .contains(&kn.k("ANSWER"));
+    na.check(
+        "ask_user_question",
+        shown && ended && asked_once && after_question && wn.said(WAIT, "answered ask").await,
+        Cause::Harness,
+        format!(
+            "ask_user_question synthétique={shown}, tour terminé={ended}, une seule requête={asked_once}, \
+             réponse au tour suivant après la question={after_question}"
+        ),
+    );
+    wn.settle(ends, &manager).await;
+
+    // A sub-agent: the harness's Agent runs as a child session (A18) that cannot delegate.
+    let ends = wn.turn_ends();
+    manager
+        .send_message(&nid, &kn.k("TURN-AGENT"))
+        .await
+        .unwrap();
+    na_sent += 1;
+    let parent_body = wait_body(&fake, &kn.k("TURN-AGENT"))
+        .await
+        .unwrap_or_default();
+    let offered = |body: &str| -> Vec<String> {
+        serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|b| b["tools"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str().map(str::to_string))
+            .collect()
+    };
+    let returned = wn
+        .wait(WAIT, |e| {
+            matches!(e, ChatEvent::ToolResult { id, result, is_error: false, .. }
+                if id == "ca1" && result.to_string().contains(&kn.k("SUB-ANSWER")))
+        })
+        .await;
+    // The child's own request: its prompt, without the parent's turn.
+    let child_body = bodies(&fake)
+        .into_iter()
+        .find(|b| b.contains(&kn.k("SUB-PROMPT")) && !b.contains(&kn.k("TURN-AGENT")))
+        .unwrap_or_default();
+    let parent_offers = offered(&parent_body).iter().any(|t| t == "Agent");
+    let child_tools = offered(&child_body);
+    let child_cannot_delegate =
+        !child_tools.is_empty() && !child_tools.iter().any(|t| t == "Agent");
+    let children = stage
+        .graph
+        .get_session_children(Uuid::parse_str(&nid).unwrap())
+        .await
+        .unwrap_or_default();
+    let in_tree = children.iter().any(|c| {
+        c.spawned_by
+            .as_deref()
+            .and_then(super::types::SpawnedBy::from_json_str)
+            .is_some_and(|s| {
+                matches!(s, super::types::SpawnedBy::Conversation { tool_use_id: Some(ref t), .. } if t == "ca1")
+            })
+    });
+    na.check(
+        "subagents",
+        parent_offers
+            && returned
+            && child_cannot_delegate
+            && in_tree
+            && wn.said(WAIT, "answered agent").await,
+        Cause::Harness,
+        format!(
+            "Agent offert au parent={parent_offers}, réponse de l'enfant en résultat={returned}, \
+             session enfant dans l'arbre={in_tree}, outils de l'enfant sans Agent={child_cannot_delegate} \
+             ({} outils)",
+            child_tools.len()
+        ),
     );
     wn.settle(ends, &manager).await;
 
