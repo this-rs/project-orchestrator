@@ -1,5 +1,5 @@
 %% name: po-frontend-chat
-%% covers: frontend:src/services/{chatWebSocket,chat,wsAdapter}.ts frontend:src/hooks/{useChat,useChatUrlSync,useSessionTree}.ts frontend:src/hooks/runner/useConversationWs.ts frontend:src/atoms/{chat,modelCatalog}.ts frontend:src/utils/chatAssembly.ts frontend:src/types/chat.ts frontend:src/constants/models.ts frontend:src/components/chat/{ChatPanel,ChatInput,ActivityBar,ChatMessages,ChatMessageBubble,ChatSessionContext,PermissionRequestBlock,PermissionSettingsPanel,SessionList}.tsx frontend:src/components/chat/{messageQueue,inputAction,runningActivity,chatUrlState,sessionListUtils,sessionActivity}.ts frontend:src/components/chat/tools/**
+%% covers: frontend:src/services/{chatWebSocket,chat,wsAdapter}.ts frontend:src/hooks/{useChat,useChatUrlSync,useSessionTree,useEffectiveCapabilities}.ts frontend:src/hooks/runner/useConversationWs.ts frontend:src/atoms/{chat,modelCatalog}.ts frontend:src/utils/chatAssembly.ts frontend:src/types/chat.ts frontend:src/constants/models.ts frontend:src/components/chat/{ChatPanel,ChatInput,ActivityBar,ChatMessages,ChatMessageBubble,ChatSessionContext,PermissionRequestBlock,PermissionSettingsPanel,SessionList}.tsx frontend:src/components/chat/{messageQueue,inputAction,runningActivity,chatUrlState,sessionListUtils,sessionActivity}.ts frontend:src/components/chat/tools/**
 %% verified: ff5bb7b0
 %% ---
 %% PROUVE : le harness de chat côté navigateur — du socket /ws/chat/{id} au rendu
@@ -192,6 +192,9 @@ flowchart TD
         SESSIONS --> ACTIVITY
         LIVEACT --> ACTIVITY
         PANEL --> URL
+        EFFCAPS["✅ F-R4 — capacités EFFECTIVES (décision 11cefdb2) : useChat monte useEffectiveCapabilities, qui relit GET /api/chat/sessions/{id}.effective_capabilities à chaque system_init, changement de routage (chatSessionRoutingAtom) et fin de tour → chatSessionEffectiveCapabilitiesStateAtom (clé = session : jamais celle d'une autre conversation) ; la réponse de PUT …/routing (RoutingSelectionMenu.sendRouting) l'écrit directement ;<br/>composeur : chatSessionCapabilitiesAtom.images = effective.value quand source = routing_pool ET (value vrai OU le modèle lui-même déclare images:false) — le routage n'ELARGIT que, (l'image est acceptée si UN candidat la lit ; le tour est routé vers lui côté serveur) ; refus dit par cause (chatSessionImagesCauseAtom : model · harness · routing · routing_unprobed, i18n routing.capabilities.composer.*) ;<br/>bandeau ET icône repliée (#339, gapItems → CapabilityGapsButton) : ChatPanel lit chatSessionEngineFactsAtom / chatSessionDeclaredFactsAtom = constants/engine withEffectiveImages (pool qui lit les images → aucune ligne images ; pool sans vision → routing_images ; pool non construit → images_pool_unbuilt, cause model, i18n routing.capabilities.banner.*) ; primary / aucun routeur / rien dit = inchangé<br/><i>vérifié : ChatInput.effectiveCapabilities.test (le composeur rouge sans la prise en compte du pool), ChatPanel.capabilityBanner.test (icône), RoutingSelectionMenu.test (réponse du PUT)</i>"]
+        PANEL --> EFFCAPS
+        EFFCAPS --> INPUT
     end
 
     PANEL --> EFFECT

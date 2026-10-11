@@ -63,14 +63,14 @@ use serde_json::Value;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use super::provider::cognitive::candidates::ModelFacts;
+use super::provider::cognitive::candidates::{self, ModelFacts, Slot};
 use super::provider::cognitive::decider::HYSTERESIS_MARGIN;
 use super::provider::cognitive::decision::{CognitiveDecision, DecideRequest, Decider, Pick};
 use super::provider::cognitive::signature::{ContextHints, TaskSignature};
 use super::provider::cognitive::{
     conversation_stage, LearningStage, ProviderRoutingMode, RoutingSettings,
 };
-use super::types::RoutingPoolEntry;
+use super::types::{EffectiveCapability, EffectiveCause, EffectiveSource, RoutingPoolEntry};
 
 /// The table the Claude path hands to its CLI: event name → matchers.
 pub(crate) type HookTable = HashMap<String, Vec<HookMatcher>>;
@@ -363,6 +363,12 @@ pub(crate) struct TurnRouter {
     /// ([`TurnRouter::decision_of_turn`]).
     decided: Mutex<Option<(u32, CognitiveDecision)>>,
     last_message: Mutex<Option<String>>,
+    /// The next turn carries an image (`set_turn_input`): its decision excludes the models
+    /// that cannot read one (`needs_images`, `RejectReason::NoImages`).
+    last_has_images: AtomicBool,
+    /// The turn [`model_for_images`] changed the model for, and the model in force before:
+    /// what [`TurnRouter::forget_image_change`] puts back when the host could not apply it.
+    image_change: Mutex<Option<(u32, String)>>,
     state: Mutex<TurnState>,
     timeout: Duration,
 }
@@ -448,6 +454,8 @@ impl TurnRouter {
             predecided: Mutex::new(predecided),
             decided: Mutex::new(None),
             last_message: Mutex::new(None),
+            last_has_images: AtomicBool::new(false),
+            image_change: Mutex::new(None),
             state: Mutex::new(TurnState {
                 current_model: spec.current_model,
                 last_change_turn: None,
@@ -460,6 +468,21 @@ impl TurnRouter {
     /// The text the next turn will carry: the hook only sees its length.
     pub(crate) fn set_last_message(&self, message: &str) {
         *locked(&self.last_message) = Some(message.to_owned());
+    }
+
+    /// The next turn, from its STORED form (`<po-attachments>`/`<po-refs>` blocks
+    /// included): the routing reads what the user typed, and whether an image goes with it
+    /// (F-R4: the decision then keeps only the candidates that read images).
+    pub(crate) fn set_turn_input(&self, stored: &str) {
+        let (_, attachments) = super::message_attachments::split(stored);
+        let images = attachments.iter().any(super::message_attachments::is_image);
+        self.last_has_images.store(images, Ordering::SeqCst);
+        self.set_last_message(&crate::refs::turn::visible_text(stored));
+    }
+
+    /// Whether the next turn carries an image, as last set.
+    pub(crate) fn turn_has_images(&self) -> bool {
+        self.last_has_images.load(Ordering::SeqCst)
     }
 
     /// The text the next turn will carry, as last set.
@@ -513,6 +536,21 @@ impl TurnRouter {
         ctx
     }
 
+    /// The model [`model_for_images`] chose could not be made active (the session refused
+    /// it, or closed): the model did not change, and the decision kept for the turn is dropped,
+    /// so the next turn (with or without an image) is decided afresh, never handed a change
+    /// nobody decided for it.
+    ///
+    /// Returns the decision the change came from, which the host stores back as NOT applied
+    /// (`not_changed:`, as a refused move or a legacy `set_model` that failed): the decision
+    /// said `applied: true`, and the model did not change.
+    pub(crate) fn forget_image_change(&self) -> Option<CognitiveDecision> {
+        let (turn, before) = locked(&self.image_change).take()?;
+        self.forget_change(&before);
+        *locked(&self.predecided) = None;
+        self.decision_of_turn(turn)
+    }
+
     /// The decision asked for turn `turn_index`, if it is the last one asked: the decision
     /// a change of that turn came from.
     pub(crate) fn decision_of_turn(&self, turn_index: u32) -> Option<CognitiveDecision> {
@@ -534,7 +572,7 @@ impl TurnRouter {
         let message = locked(&self.last_message).clone().unwrap_or_default();
         TaskSignature::from_chat_request(
             &message,
-            false,
+            self.turn_has_images(),
             self.project_slug.as_deref(),
             ContextHints::default(),
         )
@@ -553,6 +591,16 @@ impl TurnRouter {
                 None
             }
         }
+    }
+}
+
+/// Forgets, when dropped, that the turn carries images.
+struct ImagesOfTheTurn<'a>(&'a TurnRouter);
+
+impl Drop for ImagesOfTheTurn<'_> {
+    fn drop(&mut self) {
+        self.0.last_has_images.store(false, Ordering::SeqCst);
+        locked(&self.0.image_change).take();
     }
 }
 
@@ -595,11 +643,8 @@ pub(crate) enum ProviderPlan {
 ///   margin. Anything else stays.
 pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
     let choice = locked(&router.choice).clone();
-    if choice.routing.mode != ProviderRoutingMode::Full
-        || choice.explicit_model
-        || choice.provider_imposed
-        || router.manual.load(Ordering::SeqCst)
-    {
+    let routing = routing_of(router, &choice);
+    if !routing.provider {
         return ProviderPlan::Stay;
     }
     let mut pool = match tokio::time::timeout(
@@ -633,7 +678,16 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
     };
     // No two moves in a row: the turn right after a move (or a model change) is only recorded.
     let just_moved = router.moved_in.swap(false, Ordering::SeqCst);
-    let apply = choice.routing.stage == LearningStage::Auto && !just_moved && !just_changed;
+    // F-R4: a turn the pair in force cannot read must leave it, whatever the anti-flapping.
+    let blind = cannot_read_turn(router, &pool, &router.provider_id, &current_model);
+    if blind && !router.set_model_live.load(Ordering::SeqCst) {
+        // The model of THIS provider cannot be changed live: its other models are no way to
+        // read the image, only a move is (the effective capability counts them out too).
+        pool.retain(|f| {
+            f.provider_id != router.provider_id || same_model(&f.model, &current_model)
+        });
+    }
+    let apply = routing.auto && (blind || (!just_moved && !just_changed));
     let current = Pick::new(&router.provider_id, &current_model);
     let mut request = DecideRequest::new(
         router.signature(),
@@ -658,7 +712,7 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
         Some(pick) if apply && pick.provider_id != router.provider_id => pick.clone(),
         _ => return ProviderPlan::Stay,
     };
-    if decision.explored {
+    if decision.explored && !blind {
         debug!(provider = %pick.provider_id, "an exploration draw never moves a conversation");
         return ProviderPlan::Stay;
     }
@@ -695,6 +749,10 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
 /// * `full` + `auto`: the pick is used when the decision is applied and differs from the
 ///   current model. A failing or slow decider (2 s) never fails the turn.
 pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -> TurnDirective {
+    // What the turn carries is the turn's own: whatever this returns, a later decision of the
+    // same session (a compaction during the turn, the next turn before its input is set) never
+    // reads this turn's images.
+    let _images_read = ImagesOfTheTurn(router);
     {
         // The harness knows the model the turn would run on, whoever changed it, and the
         // index of the turn.
@@ -706,16 +764,8 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
         .take()
         .filter(|pre| pre.turn_index == ctx.turn_index);
     let choice = locked(&router.choice).clone();
-    // `full` routes everything; a pool (mixed, models ticked in the menu) routes among them.
-    let routed =
-        choice.routing.mode == ProviderRoutingMode::Full || choice.allowed_models.is_some();
-    if !routed
-        || choice.explicit_model
-        // A pool none of whose models is on this provider: nothing to route among here.
-        || choice.allowed_models.as_ref().is_some_and(Vec::is_empty)
-        || router.manual.load(Ordering::SeqCst)
-        || !router.set_model_live.load(Ordering::SeqCst)
-    {
+    let routing = routing_of(router, &choice);
+    if !routing.model {
         return TurnDirective::none();
     }
     let pick = match predecided {
@@ -725,15 +775,17 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
             let just_changed = locked(&router.state)
                 .last_change_turn
                 .is_some_and(|turn| turn.checked_add(1) == Some(ctx.turn_index));
-            let apply = choice.routing.stage == LearningStage::Auto && !just_changed;
+            let mut pool = provider_pool(router).await;
+            if let Some(allowed) = &choice.allowed_models {
+                pool.retain(|facts| allowed.iter().any(|m| m == &facts.model));
+            }
+            // F-R4: a turn the model in force cannot read must leave it, even right after a change.
+            let blind = cannot_read_turn(router, &pool, &router.provider_id, &ctx.current_model);
+            let apply = routing.auto && (blind || !just_changed);
             let mut settings = settings_for(&choice.routing, apply);
             // A pool is routed like `full` inside it, whatever the settings' mode.
             if choice.allowed_models.is_some() {
                 settings.mode = ProviderRoutingMode::Full;
-            }
-            let mut pool = provider_pool(router).await;
-            if let Some(allowed) = &choice.allowed_models {
-                pool.retain(|facts| allowed.iter().any(|m| m == &facts.model));
             }
             let mut request = DecideRequest::new(router.signature(), settings, pool);
             request.trust = router.trust;
@@ -787,6 +839,238 @@ async fn provider_pool(router: &TurnRouter) -> Vec<ModelFacts> {
         router.pool.pool(&router.provider_id).await
     } else {
         mine
+    }
+}
+
+/// Whether two model ids name the same model: the context-window suffix (`[1m]`) and case
+/// are not part of the name.
+fn same_model(a: &str, b: &str) -> bool {
+    fn base(id: &str) -> &str {
+        let id = id.trim();
+        id.strip_suffix("[1m]").unwrap_or(id).trim_end()
+    }
+    base(a).eq_ignore_ascii_case(base(b))
+}
+
+/// The turn about to start carries an image and the pool KNOWS the pair in force cannot read
+/// it. Staying is then no option: the anti-flapping rules (no two changes in a row, no move on
+/// an exploration draw) give way to the hard constraint. A pair the pool does not list (an
+/// alias, a catalogue that does not name it, a pool not built) is NOT blind: nothing says it
+/// cannot read the image, so nothing overrides the guards — the provider refuses honestly if
+/// it really cannot.
+fn cannot_read_turn(router: &TurnRouter, pool: &[ModelFacts], provider: &str, model: &str) -> bool {
+    router.turn_has_images()
+        && pool
+            .iter()
+            .any(|f| f.provider_id == provider && same_model(&f.model, model) && !f.supports_images)
+}
+
+/// What PO may do on this conversation's turns — the ONE reading of the routing rules, shared by
+/// [`directive_for_turn`], [`plan_provider_move`], [`model_for_images`] and [`effective_images`],
+/// so the capability promised is exactly what the routing applies.
+#[derive(Debug, Clone, Copy)]
+struct Routing {
+    /// PO chooses the MODEL of the turns on the session's provider: `full` or a pool ticked
+    /// (with a model of this provider), nothing imposed nor changed by hand, a session that can
+    /// switch model live.
+    model: bool,
+    /// PO may move the conversation to ANOTHER provider: `full`, neither model nor provider
+    /// imposed, nothing changed by hand.
+    provider: bool,
+    /// The stage in force for this conversation applies the decisions (`auto`); otherwise they
+    /// are only recorded.
+    auto: bool,
+}
+
+/// The stage this conversation's decisions are taken at. Decision R-S1 (#702) makes it the
+/// conversation's own: `choice.routing.stage` holds it (`auto` for an Auto conversation or a
+/// pool, the settings' stage otherwise, [`conversation_stage`]); read here only.
+fn effective_stage(choice: &RouterChoice) -> LearningStage {
+    choice.routing.stage
+}
+
+fn routing_of(router: &TurnRouter, choice: &RouterChoice) -> Routing {
+    let free = !choice.explicit_model && !router.manual.load(Ordering::SeqCst);
+    let full = choice.routing.mode == ProviderRoutingMode::Full;
+    Routing {
+        model: free
+            && (full || choice.allowed_models.is_some())
+            // A pool none of whose models is on this provider: nothing to route among here.
+            && !choice.allowed_models.as_ref().is_some_and(Vec::is_empty)
+            && router.set_model_live.load(Ordering::SeqCst),
+        provider: free && full && !choice.provider_imposed,
+        auto: effective_stage(choice) == LearningStage::Auto,
+    }
+}
+
+/// The model of the session's provider an image turn must run on, chosen BEFORE the turn
+/// is sent (F-R4). The native harness checks the vision of its ACTIVE model when the turn is
+/// sent, before `before_turn` could change it: the host makes this model active first, and
+/// the hook of the turn finds the decision taken (it does not ask again). When the host
+/// cannot make it active, it calls [`TurnRouter::forget_image_change`].
+///
+/// `None`: nothing to change — no image, PO does not choose this conversation's model, the
+/// model in force reads images (or the pool does not say it cannot), or no candidate does
+/// (the provider then refuses the turn and says so: a pool without vision is never hidden).
+/// A decision already taken for this turn (the provider check of mode `full`) is used as is.
+pub(crate) async fn model_for_images(router: &TurnRouter) -> Option<String> {
+    if !router.turn_has_images() {
+        return None;
+    }
+    let choice = locked(&router.choice).clone();
+    let routing = routing_of(router, &choice);
+    if !routing.model || !routing.auto {
+        return None;
+    }
+    let (turn, current_model) = {
+        let state = locked(&router.state);
+        (state.next_turn, state.current_model.clone())
+    };
+    let predecided = locked(&router.predecided)
+        .clone()
+        .filter(|pre| pre.turn_index == turn);
+    let pick = match predecided {
+        Some(pre) => pre.pick.filter(|_| pre.apply)?,
+        None => {
+            let mut pool = provider_pool(router).await;
+            if let Some(allowed) = &choice.allowed_models {
+                pool.retain(|facts| allowed.iter().any(|m| m == &facts.model));
+            }
+            if !cannot_read_turn(router, &pool, &router.provider_id, &current_model) {
+                return None;
+            }
+            let mut settings = settings_for(&choice.routing, true);
+            if choice.allowed_models.is_some() {
+                settings.mode = ProviderRoutingMode::Full;
+            }
+            let mut request = DecideRequest::new(router.signature(), settings, pool);
+            request.trust = router.trust;
+            request.restrict_provider = Some(router.provider_id.clone());
+            request.current = Some(Pick::new(&router.provider_id, &current_model));
+            request.session_id = router.session_id;
+            request.turn_index = Some(turn);
+            let decision = router.ask(request).await?;
+            // Kept as the decision of the turn: the one the host marks not applied when the
+            // model cannot be made active ([`TurnRouter::forget_image_change`]).
+            *locked(&router.decided) = Some((turn, decision.clone()));
+            if !decision.applied {
+                return None;
+            }
+            let pick = decision.chosen.clone()?;
+            debug!(model = %pick.model, turn, reason = %decision.reason, "an image turn is routed to a model that reads images");
+            *locked(&router.predecided) = Some(PreDecided {
+                turn_index: turn,
+                pick: Some(pick.clone()),
+                apply: true,
+            });
+            pick
+        }
+    };
+    if pick.provider_id != router.provider_id || same_model(&pick.model, &current_model) {
+        return None;
+    }
+    *locked(&router.image_change) = Some((turn, current_model));
+    let mut state = locked(&router.state);
+    state.current_model = pick.model.clone();
+    state.last_change_turn = Some(turn);
+    Some(pick.model)
+}
+
+/// Whether the next turn of this conversation may carry images, as PO can really serve it
+/// (F-R4, decision 11cefdb2): the candidates PO may route the turn to govern, not the
+/// snapshot of the model the session opened on. `snapshot` is what that snapshot says
+/// (`None`: no snapshot stored — the legacy Claude Code engine stores none).
+///
+/// * the snapshot says yes: yes (`model_has_it`);
+/// * PO does not apply routing on this conversation ([`routing_of`]: primary, a model imposed
+///   or changed by hand, a stage that only records, a session that cannot switch model):
+///   the snapshot (`not_routed`);
+/// * PO routes but its pool lists no model, or could not be built in time: the snapshot
+///   (`pool_unbuilt`) — not probed is not absent;
+/// * otherwise: yes when at least one candidate passes the filter of an image turn
+///   (`pool_has_it`, `via` names them), no when none does (`pool_lacks_it`).
+///
+/// `None`: nothing to say — no snapshot and no candidate reached says yes. An unknown snapshot
+/// is never turned into a "no" (a Claude Code session reads images whatever its pool).
+///
+/// The pool is read ONCE (`project_pool`, the project's consent stated on each model), and the
+/// whole answer is bounded by the router's timeout.
+pub(crate) async fn effective_images(
+    router: &TurnRouter,
+    snapshot: Option<bool>,
+) -> Option<EffectiveCapability> {
+    let images = effective_images_bounded(router, snapshot == Some(true)).await;
+    (snapshot.is_some() || images.value).then_some(images)
+}
+
+async fn effective_images_bounded(router: &TurnRouter, snapshot: bool) -> EffectiveCapability {
+    if snapshot {
+        return EffectiveCapability::snapshot(true, EffectiveCause::ModelHasIt);
+    }
+    let choice = locked(&router.choice).clone();
+    let routing = routing_of(router, &choice);
+    let (by_model, by_provider) = (
+        routing.model && routing.auto,
+        routing.provider && routing.auto,
+    );
+    if !by_model && !by_provider {
+        return EffectiveCapability::snapshot(false, EffectiveCause::NotRouted);
+    }
+    let Ok(project) = tokio::time::timeout(
+        router.timeout,
+        router.pool.project_pool(router.project_slug.as_deref()),
+    )
+    .await
+    else {
+        return EffectiveCapability::snapshot(false, EffectiveCause::PoolUnbuilt);
+    };
+    let pool: Vec<ModelFacts> = project
+        .into_iter()
+        .filter(|facts| {
+            if facts.provider_id == router.provider_id {
+                // This provider's models: reachable only by a live model change.
+                by_model
+                    && choice
+                        .allowed_models
+                        .as_ref()
+                        .is_none_or(|allowed| allowed.iter().any(|m| m == &facts.model))
+            } else {
+                by_provider
+                    && choice.routing_pool.as_ref().is_none_or(|entries| {
+                        entries
+                            .iter()
+                            .any(|e| e.provider == facts.provider_id && e.model == facts.model)
+                    })
+            }
+        })
+        .collect();
+    if pool.is_empty() {
+        return EffectiveCapability::snapshot(false, EffectiveCause::PoolUnbuilt);
+    }
+    let signature = TaskSignature::from_chat_request(
+        "",
+        true,
+        router.project_slug.as_deref(),
+        ContextHints::default(),
+    );
+    let via: Vec<RoutingPoolEntry> = candidates::apply(Slot::Automatic, &signature, &pool)
+        .map(|filtered| filtered.eligible)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|facts| RoutingPoolEntry {
+            provider: facts.provider_id,
+            model: facts.model,
+        })
+        .collect();
+    EffectiveCapability {
+        value: !via.is_empty(),
+        source: EffectiveSource::RoutingPool,
+        cause: if via.is_empty() {
+            EffectiveCause::PoolLacksIt
+        } else {
+            EffectiveCause::PoolHasIt
+        },
+        via,
     }
 }
 
@@ -1633,5 +1917,599 @@ mod provider_move_tests {
         ));
         router.reroute(ProviderRoutingMode::Full, None, false);
         router
+    }
+}
+
+/// F-R4: the capability shown follows the routing candidates, and an image turn is routed
+/// to one that reads images (never substituted: the pool is constrained).
+#[cfg(test)]
+mod image_routing_tests {
+    use super::*;
+    use crate::chat::message_attachments::{self, MessageAttachment};
+    use crate::chat::provider::cognitive::candidates::RejectReason;
+    use crate::chat::provider::cognitive::decider::decide_with;
+    use crate::chat::provider::cognitive::scorer::PriorHints;
+    use chrono::Utc;
+    use nexus_claude::agent::CostBasis;
+    use std::sync::Mutex as StdMutex;
+
+    fn facts(provider: &str, model: &str, images: bool) -> ModelFacts {
+        ModelFacts {
+            provider_id: provider.into(),
+            model: model.into(),
+            supports_tools: true,
+            supports_images: images,
+            context_window: Some(1_000_000),
+            window_unknown: None,
+            price: None,
+            cost_basis: CostBasis::Unknown,
+            healthy: Some(true),
+            allowed_for_project: true,
+            sandboxed: false,
+        }
+    }
+
+    /// A fixed project pool; `pool(provider)` is its part on that provider.
+    struct Pool(Vec<ModelFacts>);
+
+    #[async_trait]
+    impl PoolSource for Pool {
+        async fn pool(&self, provider_id: &str) -> Vec<ModelFacts> {
+            self.0
+                .iter()
+                .filter(|f| f.provider_id == provider_id)
+                .cloned()
+                .collect()
+        }
+        async fn project_pool(&self, _project_slug: Option<&str>) -> Vec<ModelFacts> {
+            self.0.clone()
+        }
+    }
+
+    /// The real decision (candidates, scoring, hysteresis, reason), no store.
+    #[derive(Default)]
+    struct Real {
+        decisions: StdMutex<Vec<CognitiveDecision>>,
+    }
+
+    #[async_trait]
+    impl Decider for Real {
+        async fn decide(&self, request: &DecideRequest) -> anyhow::Result<CognitiveDecision> {
+            let decision =
+                decide_with(Uuid::new_v4(), Utc::now(), request, &[], &PriorHints::new());
+            self.decisions.lock().unwrap().push(decision.clone());
+            Ok(decision)
+        }
+    }
+
+    fn router(
+        decider: Arc<Real>,
+        pool: Vec<ModelFacts>,
+        mode: ProviderRoutingMode,
+        allowed_models: Option<Vec<String>>,
+    ) -> TurnRouter {
+        let router = TurnRouter::new(spec(decider, Arc::new(Pool(pool)), mode, allowed_models));
+        router.set_model_live(true);
+        router
+    }
+
+    fn spec(
+        decider: Arc<Real>,
+        pool: Arc<dyn PoolSource>,
+        mode: ProviderRoutingMode,
+        allowed_models: Option<Vec<String>>,
+    ) -> TurnRouterSpec {
+        TurnRouterSpec {
+            decider,
+            pool,
+            routing: RoutingSettings {
+                mode,
+                stage: LearningStage::Auto,
+                exploration_epsilon: 0.0,
+                ..RoutingSettings::default()
+            },
+            provider_id: "deepseek".into(),
+            session_id: Some(Uuid::new_v4()),
+            project_slug: Some("proj".into()),
+            trust: false,
+            explicit_model: false,
+            provider_imposed: false,
+            allowed_models,
+            routing_pool: None,
+            conversation_routes: false,
+            current_model: "flash".into(),
+            next_turn: 1,
+            moved_in: false,
+        }
+    }
+
+    /// The stored form of a message with one picture attached.
+    fn with_picture(text: &str) -> String {
+        message_attachments::encode(
+            text,
+            &[MessageAttachment {
+                id: Uuid::new_v4(),
+                filename: "shot.png".into(),
+                mime_type: "image/png".into(),
+                size_bytes: 4,
+            }],
+        )
+    }
+
+    fn deepseek_with_vision() -> Vec<ModelFacts> {
+        vec![
+            facts("deepseek", "flash", false),
+            facts("deepseek", "vision", true),
+        ]
+    }
+
+    #[test]
+    fn the_turn_input_says_whether_an_image_goes_with_it() {
+        let router = router(
+            Arc::default(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        router.set_turn_input(&with_picture("what is this?"));
+        assert!(router.turn_has_images());
+        assert_eq!(router.last_message().as_deref(), Some("what is this?"));
+        assert!(router.signature().needs_images);
+        router.set_turn_input("just text");
+        assert!(!router.turn_has_images());
+        assert!(!router.signature().needs_images);
+    }
+
+    #[tokio::test]
+    async fn a_pool_with_a_vision_model_makes_images_reachable_and_says_through_whom() {
+        let router = router(
+            Arc::default(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        let images = effective_images(&router, Some(false)).await.unwrap();
+        assert!(images.value);
+        assert_eq!(images.source, EffectiveSource::RoutingPool);
+        assert_eq!(images.cause, EffectiveCause::PoolHasIt);
+        assert_eq!(
+            images.via,
+            [RoutingPoolEntry {
+                provider: "deepseek".into(),
+                model: "vision".into()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn another_provider_with_vision_counts_in_full_but_not_in_a_pool_of_this_provider() {
+        let pool = vec![facts("deepseek", "flash", false), facts("glm", "v", true)];
+        let full = router(
+            Arc::default(),
+            pool.clone(),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        let images = effective_images(&full, Some(false)).await.unwrap();
+        assert!(images.value, "{images:?}");
+        assert_eq!(images.via[0].provider, "glm");
+
+        let mixed = router(
+            Arc::default(),
+            pool,
+            ProviderRoutingMode::Mixed,
+            Some(vec!["flash".into()]),
+        );
+        let images = effective_images(&mixed, Some(false)).await.unwrap();
+        assert!(!images.value);
+        assert_eq!(images.cause, EffectiveCause::PoolLacksIt);
+    }
+
+    #[tokio::test]
+    async fn a_pool_without_any_vision_model_still_says_images_will_not_pass() {
+        let router = router(
+            Arc::default(),
+            vec![
+                facts("deepseek", "flash", false),
+                facts("deepseek", "pro", false),
+            ],
+            ProviderRoutingMode::Full,
+            None,
+        );
+        let images = effective_images(&router, Some(false)).await.unwrap();
+        assert!(!images.value);
+        assert_eq!(images.source, EffectiveSource::RoutingPool);
+        assert_eq!(images.cause, EffectiveCause::PoolLacksIt);
+        assert!(images.via.is_empty());
+        // And the turn is not routed anywhere: the provider refuses it, said so.
+        router.set_turn_input(&with_picture("look"));
+        assert_eq!(model_for_images(&router).await, None);
+    }
+
+    #[tokio::test]
+    async fn an_empty_pool_falls_back_on_the_snapshot_with_its_cause() {
+        let router = router(Arc::default(), Vec::new(), ProviderRoutingMode::Full, None);
+        let images = effective_images(&router, Some(false)).await.unwrap();
+        assert!(!images.value);
+        assert_eq!(images.source, EffectiveSource::Snapshot);
+        assert_eq!(images.cause, EffectiveCause::PoolUnbuilt);
+    }
+
+    #[tokio::test]
+    async fn without_routing_the_snapshot_stands_as_before() {
+        // primary: PO does not choose the model.
+        let primary = router(
+            Arc::default(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Primary,
+            None,
+        );
+        let images = effective_images(&primary, Some(false)).await.unwrap();
+        assert_eq!(
+            (images.value, images.source, images.cause),
+            (false, EffectiveSource::Snapshot, EffectiveCause::NotRouted)
+        );
+        // A model changed by hand: the same.
+        let manual = router(
+            Arc::default(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        manual.mark_manual();
+        assert_eq!(
+            effective_images(&manual, Some(false)).await.unwrap().cause,
+            EffectiveCause::NotRouted
+        );
+        // A model that reads images: nothing to route for.
+        let images = effective_images(&primary, Some(true)).await.unwrap();
+        assert_eq!(
+            (images.value, images.cause),
+            (true, EffectiveCause::ModelHasIt)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_image_turn_is_routed_to_a_vision_candidate_and_the_reason_says_so() {
+        let decider = Arc::new(Real::default());
+        let router = router(
+            decider.clone(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        router.set_turn_input(&with_picture("what is on this screenshot?"));
+        assert_eq!(model_for_images(&router).await.as_deref(), Some("vision"));
+        let decision = decider.decisions.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(decision.chosen, Some(Pick::new("deepseek", "vision")));
+        assert!(decision.reason.contains("images"), "{}", decision.reason);
+        assert!(decision
+            .alternatives
+            .iter()
+            .any(|a| a.pick.model == "flash" && a.rejected == Some(RejectReason::NoImages)));
+        // The hook of that turn uses the decision taken: no second question, no change back.
+        let directive =
+            directive_for_turn(&router, &TurnContext::new(1, "vision".to_string())).await;
+        assert_eq!(directive.model, None);
+        assert_eq!(decider.decisions.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_hook_routes_an_image_turn_even_right_after_a_change() {
+        let decider = Arc::new(Real::default());
+        let router = router(
+            decider.clone(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        // The model changed on the previous turn: a text turn would only be recorded.
+        locked(&router.state).last_change_turn = Some(1);
+        router.set_turn_input(&with_picture("and this one?"));
+        let directive =
+            directive_for_turn(&router, &TurnContext::new(2, "flash".to_string())).await;
+        assert_eq!(directive.model.as_deref(), Some("vision"));
+        let decision = decider.decisions.lock().unwrap().last().cloned().unwrap();
+        assert!(decision.signature.needs_images);
+    }
+
+    #[tokio::test]
+    async fn a_text_turn_keeps_the_model_in_force() {
+        let decider = Arc::new(Real::default());
+        let router = router(
+            decider.clone(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        router.set_turn_input("why does this crash with a stack trace error");
+        assert_eq!(model_for_images(&router).await, None);
+        assert!(decider.decisions.lock().unwrap().is_empty());
+    }
+
+    /// A pool source that answers too late.
+    struct Slow;
+
+    #[async_trait]
+    impl PoolSource for Slow {
+        async fn pool(&self, _provider_id: &str) -> Vec<ModelFacts> {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Vec::new()
+        }
+        async fn project_pool(&self, _project_slug: Option<&str>) -> Vec<ModelFacts> {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            deepseek_with_vision()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_model_switch_undoes_the_router_and_drops_the_decision_it_kept() {
+        let decider = Arc::new(Real::default());
+        let router = router(
+            decider.clone(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        router.set_turn_input(&with_picture("look"));
+        assert_eq!(model_for_images(&router).await.as_deref(), Some("vision"));
+        let image_decision = decider.decisions.lock().unwrap()[0].clone();
+        assert!(image_decision.applied);
+        // The host could not make `vision` active: the turn was refused, never started.
+        // The decision the change came from is handed back, for the host to store it as
+        // not applied (it said `applied: true`).
+        let undone = router
+            .forget_image_change()
+            .expect("the decision of the image change is handed back");
+        assert_eq!(undone.id, image_decision.id);
+        // Handed back once: a second undo has nothing left to rewrite.
+        assert!(router.forget_image_change().is_none());
+        {
+            let state = locked(&router.state);
+            assert_eq!(state.current_model, "flash");
+            assert_eq!(state.last_change_turn, None);
+        }
+        assert!(locked(&router.predecided).is_none());
+        // The next turn, text only, on the same index: decided afresh, no change handed to it.
+        router.set_turn_input("why does this crash with a stack trace error");
+        let directive = directive_for_turn(&router, &TurnContext::new(1, "flash")).await;
+        let decisions = decider.decisions.lock().unwrap().clone();
+        assert_eq!(
+            decisions.len(),
+            2,
+            "asked again, not the kept image decision"
+        );
+        assert!(!decisions[1].signature.needs_images);
+        // Whatever changes now is this text turn's own decision, never the image one.
+        let own = decisions[1]
+            .chosen
+            .clone()
+            .filter(|pick| pick.model != "flash")
+            .map(|pick| pick.model);
+        assert_eq!(directive.model, own);
+    }
+
+    /// The legacy Claude Code engine stores no snapshot: unknown is never turned into a no,
+    /// even when the pool rejects every Claude model (catalogue offline: window unknown).
+    #[tokio::test]
+    async fn an_unknown_snapshot_is_never_reported_as_a_pool_without_images() {
+        let mut facts_offline = facts("deepseek", "claude-opus", true);
+        facts_offline.context_window = None;
+        facts_offline.window_unknown = Some(candidates::UnknownWindow::CatalogOffline);
+        let offline = router(
+            Arc::default(),
+            vec![facts_offline],
+            ProviderRoutingMode::Full,
+            None,
+        );
+        assert_eq!(effective_images(&offline, None).await, None);
+        assert_eq!(
+            effective_images(&offline, Some(false))
+                .await
+                .map(|i| i.cause),
+            Some(EffectiveCause::PoolLacksIt)
+        );
+        // Not routed, no snapshot: nothing to say either.
+        let primary = router_with(ProviderRoutingMode::Primary, LearningStage::Auto, false);
+        assert_eq!(effective_images(&primary, None).await, None);
+        // A pool that says yes is said, snapshot or not.
+        let full = router(
+            Arc::default(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        assert_eq!(
+            effective_images(&full, None).await.map(|i| i.value),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn model_ids_are_compared_without_the_window_suffix_and_case() {
+        assert!(same_model("flash[1m]", "FLASH"));
+        assert!(same_model("claude-opus-4[1m]", "claude-opus-4"));
+        assert!(!same_model("opus", "claude-opus-4"));
+    }
+
+    /// A pair the pool does not list is not blind: an image turn does not override "no move
+    /// right after a move", nor the model change rules.
+    #[tokio::test]
+    async fn a_model_the_pool_does_not_list_is_not_taken_as_blind() {
+        let decider = Arc::new(Real::default());
+        let mut spec = spec(
+            decider.clone(),
+            Arc::new(Pool(vec![
+                facts("deepseek", "flash", false),
+                facts("glm", "v", true),
+            ])),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        spec.current_model = "opus".into();
+        spec.moved_in = true;
+        let unlisted = TurnRouter::new(spec);
+        unlisted.set_model_live(true);
+        unlisted.set_turn_input(&with_picture("look"));
+        assert_eq!(plan_provider_move(&unlisted).await, ProviderPlan::Stay);
+        assert_eq!(model_for_images(&unlisted).await, None);
+        // The same pair, named with its window suffix, IS known blind.
+        let known = router(
+            Arc::default(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        known.set_turn_input(&with_picture("look"));
+        let pool = deepseek_with_vision();
+        assert!(cannot_read_turn(&known, &pool, "deepseek", "flash[1m]"));
+        assert!(!cannot_read_turn(&known, &pool, "deepseek", "opus"));
+    }
+
+    #[tokio::test]
+    async fn a_pool_built_too_late_is_unbuilt_never_lacking() {
+        let mut router = TurnRouter::new(spec(
+            Arc::new(Real::default()),
+            Arc::new(Slow),
+            ProviderRoutingMode::Full,
+            None,
+        ));
+        router.set_model_live(true);
+        router.timeout = Duration::from_millis(50);
+        let started = std::time::Instant::now();
+        let images = effective_images(&router, Some(false)).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            (images.value, images.source, images.cause),
+            (
+                false,
+                EffectiveSource::Snapshot,
+                EffectiveCause::PoolUnbuilt
+            )
+        );
+    }
+
+    /// `full`, but this provider cannot switch model live: its own vision models are no way to
+    /// read the image — neither promised, nor chosen by the provider check.
+    #[tokio::test]
+    async fn without_a_live_model_change_only_another_provider_reads_the_image() {
+        let pool = vec![
+            facts("deepseek", "flash", false),
+            facts("deepseek", "vision", true),
+            facts("glm", "v", true),
+        ];
+        let decider = Arc::new(Real::default());
+        let router = TurnRouter::new(spec(
+            decider.clone(),
+            Arc::new(Pool(pool)),
+            ProviderRoutingMode::Full,
+            None,
+        ));
+        let images = effective_images(&router, Some(false)).await.unwrap();
+        assert_eq!(
+            images.via,
+            [RoutingPoolEntry {
+                provider: "glm".into(),
+                model: "v".into()
+            }]
+        );
+        router.set_turn_input(&with_picture("look"));
+        assert!(matches!(
+            plan_provider_move(&router).await,
+            ProviderPlan::Move { pick, .. } if pick == Pick::new("glm", "v")
+        ));
+    }
+
+    fn router_with(mode: ProviderRoutingMode, stage: LearningStage, explicit: bool) -> TurnRouter {
+        let mut spec = spec(
+            Arc::new(Real::default()),
+            Arc::new(Pool(deepseek_with_vision())),
+            mode,
+            None,
+        );
+        spec.routing.stage = stage;
+        spec.explicit_model = explicit;
+        let router = TurnRouter::new(spec);
+        router.set_model_live(true);
+        router.set_turn_input(&with_picture("look"));
+        router
+    }
+
+    /// R-S1 x F-R4: the user put THIS conversation on Auto while the global stage is
+    /// `shadow`. The conversation is routed at the `auto` stage, so the image turn really
+    /// goes to the model that reads images (and the capability is promised), where the same
+    /// settings without the conversation's Auto only record.
+    #[tokio::test]
+    async fn an_auto_conversation_under_the_global_shadow_stage_switches_to_the_image_model() {
+        let decider = Arc::new(Real::default());
+        let mut spec = spec(
+            decider.clone(),
+            Arc::new(Pool(deepseek_with_vision())),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        spec.routing.stage = LearningStage::Shadow;
+        spec.conversation_routes = true;
+        let router = TurnRouter::new(spec);
+        router.set_model_live(true);
+        router.set_turn_input(&with_picture("look"));
+        let images = effective_images(&router, Some(false)).await.unwrap();
+        assert_eq!(
+            (images.value, images.source, images.cause),
+            (
+                true,
+                EffectiveSource::RoutingPool,
+                EffectiveCause::PoolHasIt
+            )
+        );
+        assert_eq!(model_for_images(&router).await.as_deref(), Some("vision"));
+        let decision = decider.decisions.lock().unwrap()[0].clone();
+        assert_eq!(decision.stage, LearningStage::Auto, "{decision:#?}");
+        assert!(decision.applied, "{decision:#?}");
+        // The hook of the turn finds the change made and asks nothing more.
+        let directive = directive_for_turn(&router, &TurnContext::new(1, "vision")).await;
+        assert_eq!(directive.model, None);
+        assert_eq!(decider.decisions.lock().unwrap().len(), 1);
+        assert_eq!(router.next_turn_context(0).current_model, "vision");
+    }
+
+    /// Shadow and advisory only record; an imposed model is never replaced: no promise, no
+    /// change before the turn.
+    #[tokio::test]
+    async fn shadow_advisory_and_an_imposed_model_promise_nothing_and_change_nothing() {
+        for router in [
+            router_with(ProviderRoutingMode::Full, LearningStage::Shadow, false),
+            router_with(ProviderRoutingMode::Full, LearningStage::Advisory, false),
+            router_with(ProviderRoutingMode::Full, LearningStage::Auto, true),
+        ] {
+            let images = effective_images(&router, Some(false)).await.unwrap();
+            assert_eq!(
+                (images.value, images.source, images.cause),
+                (false, EffectiveSource::Snapshot, EffectiveCause::NotRouted)
+            );
+            assert_eq!(model_for_images(&router).await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_images_of_a_turn_are_forgotten_once_its_hook_ran() {
+        let router = router(
+            Arc::default(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        router.set_turn_input(&with_picture("look"));
+        assert!(router.turn_has_images());
+        let _ = directive_for_turn(&router, &TurnContext::new(1, "flash")).await;
+        assert!(!router.turn_has_images());
+        assert!(
+            !router.signature().needs_images,
+            "a compaction during the turn reads no image"
+        );
     }
 }

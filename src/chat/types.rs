@@ -1266,6 +1266,76 @@ pub enum ClientMessage {
     InputResponse { content: String },
 }
 
+/// Where an effective capability of a conversation was read (F-R4, decision 11cefdb2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveSource {
+    /// The capabilities snapshot of the model the session opened on (A4).
+    Snapshot,
+    /// The candidates PO may route the next turn to.
+    RoutingPool,
+}
+
+/// Why an effective capability says what it says: a stable code for the interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveCause {
+    /// The session's own model has it: nothing to route for.
+    ModelHasIt,
+    /// PO does not choose this conversation's model (primary, a model imposed or changed by
+    /// hand, a stage that applies nothing, a session that cannot switch model): the snapshot.
+    NotRouted,
+    /// No router is live for this session (session not open, or no cognitive router): the snapshot.
+    NoRouter,
+    /// PO routes, but its pool lists no model at all (not built, not probed): the snapshot.
+    /// Not probed is not absent: it says nothing about the models PO could reach.
+    PoolUnbuilt,
+    /// At least one candidate of the pool has it: PO routes the turn that needs it there.
+    PoolHasIt,
+    /// The pool is built and none of its eligible candidates has it.
+    PoolLacksIt,
+}
+
+/// One capability of a conversation as the user and the composer may rely on it: the
+/// model's snapshot when PO does not route, else what the routing candidates offer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectiveCapability {
+    /// Whether the capability is reachable for the next turn.
+    pub value: bool,
+    /// Where it was read.
+    pub source: EffectiveSource,
+    /// Why.
+    pub cause: EffectiveCause,
+    /// The candidates that have it, when the routing pool was read (who PO can route to).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub via: Vec<RoutingPoolEntry>,
+}
+
+impl EffectiveCapability {
+    /// The snapshot's word, with the reason it is the one that counts.
+    pub fn snapshot(value: bool, cause: EffectiveCause) -> Self {
+        Self {
+            value,
+            source: EffectiveSource::Snapshot,
+            cause: if value {
+                EffectiveCause::ModelHasIt
+            } else {
+                cause
+            },
+            via: Vec::new(),
+        }
+    }
+}
+
+/// The capabilities of a conversation that follow its routing candidates rather than the
+/// snapshot of the model it opened on (F-R4). Only `images` for now: the one the composer
+/// gates on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectiveCapabilities {
+    /// Whether a turn may carry images.
+    pub images: EffectiveCapability,
+}
+
 /// Chat session metadata (persisted in Neo4j)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSession {
@@ -1341,6 +1411,11 @@ pub struct ChatSession {
     /// read, never by listings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<serde_json::Value>,
+    /// What the conversation can really do for its next turn, given its routing (F-R4):
+    /// `capabilities` is the snapshot of the opening model, this follows the candidates PO
+    /// may route to. Only carried by the single-session read and the routing change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_capabilities: Option<EffectiveCapabilities>,
     /// Which precedence level chose the provider (`session`, `request`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routed_by: Option<String>,
@@ -2689,6 +2764,7 @@ mod tests {
             activity: None,
             provider_id: None,
             capabilities: None,
+            effective_capabilities: None,
             routed_by: None,
             execution_place: Default::default(),
             access: Default::default(),
@@ -2914,6 +2990,7 @@ mod tests {
             activity: None,
             provider_id: None,
             capabilities: None,
+            effective_capabilities: None,
             routed_by: None,
             execution_place: Default::default(),
             access: Default::default(),

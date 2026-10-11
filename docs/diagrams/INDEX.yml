@@ -151,7 +151,7 @@ diagrams:
     file: docs/diagrams/po-frontend-chat.mmd
     covers:
       - "frontend:src/services/{chatWebSocket,chat,wsAdapter}.ts"
-      - "frontend:src/hooks/{useChat,useChatUrlSync,useSessionTree}.ts"
+      - "frontend:src/hooks/{useChat,useChatUrlSync,useSessionTree,useEffectiveCapabilities}.ts"
       - "frontend:src/hooks/runner/useConversationWs.ts"
       - "frontend:src/atoms/{chat,modelCatalog}.ts"
       - "frontend:src/utils/chatAssembly.ts"

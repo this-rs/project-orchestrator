@@ -34,6 +34,11 @@
         "required": false,
         "doc": "même instantané que system_init.capabilities ; présent sur GET /api/chat/sessions/{id}"
       },
+      "effective_capabilities": {
+        "type": "{images: {value: boolean, source: snapshot | routing_pool, cause: model_has_it | not_routed | no_router | pool_unbuilt | pool_has_it | pool_lacks_it, via?: array<{provider, model}>}} | absent",
+        "required": false,
+        "doc": "F-R4 : ce que le PROCHAIN tour peut porter compte tenu du routage de la conversation. capabilities reste le snapshot du modele d ouverture (A4) ; ici images suit les candidats du routage (routing_pool : vrai ssi un candidat eligible lit les images, via les nomme) ; sans routage (not_routed, no_router) ou pool vide (pool_unbuilt : non sonde, pas absent) = le snapshot, cause nommee. Present sur GET /api/chat/sessions/{id} et PUT /api/chat/sessions/{id}/routing"
+      },
       "execution_place": {
         "type": "string",
         "required": false,
