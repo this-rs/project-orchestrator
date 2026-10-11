@@ -125,7 +125,9 @@ pub(crate) fn judge(tail: &[ChatEventRecord]) -> Verdict {
                         "The server restarted again while this turn was running; it was not resumed again.",
                     );
                 }
-                Verdict::Resume { dangling_tool: None }
+                Verdict::Resume {
+                    dangling_tool: None,
+                }
             } else {
                 Verdict::Close(
                     "The server restarted while this session waited for a permission answer; ask again.",
@@ -164,9 +166,9 @@ fn tool_name(data: &str) -> Option<String> {
 /// bridges that gap.
 pub(crate) fn reconstruct_cut_turn(tail: &[ChatEventRecord]) -> String {
     // Find the start of the cut turn: the last user_message that is NOT a resume marker.
-    let turn_start = tail.iter().rposition(|e| {
-        e.event_type == "user_message" && !e.data.contains(RESUME_MARKER)
-    });
+    let turn_start = tail
+        .iter()
+        .rposition(|e| e.event_type == "user_message" && !e.data.contains(RESUME_MARKER));
     let Some(start_idx) = turn_start else {
         return String::new();
     };
@@ -177,7 +179,11 @@ pub(crate) fn reconstruct_cut_turn(tail: &[ChatEventRecord]) -> String {
             "user_message" if !event.data.contains(RESUME_MARKER) => {
                 let content = serde_json::from_str::<serde_json::Value>(&event.data)
                     .ok()
-                    .and_then(|v| v.get("content").and_then(|c| c.as_str()).map(str::to_string))
+                    .and_then(|v| {
+                        v.get("content")
+                            .and_then(|c| c.as_str())
+                            .map(str::to_string)
+                    })
                     .unwrap_or_else(|| "(message)".to_string());
                 lines.push(format!("User: {}", truncate_str(&content, 300)));
                 last_was_tool_call = false;
@@ -288,7 +294,11 @@ impl ChatManager {
             // relaunched by their orchestrator at boot. Recovering them here too would
             // double-resume. Conversation sub-sessions and trigger-spawned sessions have no
             // orchestrator and are included.
-            if node.spawned_by.as_deref().is_some_and(is_orchestrator_child) {
+            if node
+                .spawned_by
+                .as_deref()
+                .is_some_and(is_orchestrator_child)
+            {
                 continue;
             }
             // Coarse time filter: skip sessions that have been inactive for more than
@@ -532,7 +542,10 @@ mod tests {
 
     #[test]
     fn an_unanswered_permission_request_is_closed() {
-        let tail = [ev(1, "user_message", "{}"), ev(2, "permission_request", "{}")];
+        let tail = [
+            ev(1, "user_message", "{}"),
+            ev(2, "permission_request", "{}"),
+        ];
         assert!(matches!(judge(&tail), Verdict::Close(_)));
     }
 
@@ -605,7 +618,11 @@ mod tests {
                 "tool_use",
                 r#"{"type":"tool_use","id":"t1","tool":"Read","input":{}}"#,
             ),
-            ev(3, "tool_result", r#"{"type":"tool_result","id":"t1","result":"ok"}"#),
+            ev(
+                3,
+                "tool_result",
+                r#"{"type":"tool_result","id":"t1","result":"ok"}"#,
+            ),
             ev(
                 4,
                 "tool_use",
@@ -621,7 +638,10 @@ mod tests {
         // Edit was the last event (no tool_result follows): its line must not carry
         // "→ result received".
         let edit_line = ctx.lines().find(|l| l.contains("Edit")).unwrap();
-        assert!(!edit_line.contains("result received"), "Edit line has no result annotation");
+        assert!(
+            !edit_line.contains("result received"),
+            "Edit line has no result annotation"
+        );
 
         let msg = resume_message(Some("Edit"), &ctx);
         assert!(msg.starts_with(RESUME_MARKER));
@@ -632,9 +652,11 @@ mod tests {
     #[test]
     fn cut_turn_context_is_empty_when_no_user_message_stored() {
         // No user_message before the cut: nothing to reconstruct.
-        let tail = [
-            ev(1, "tool_use", r#"{"type":"tool_use","id":"t1","tool":"Bash","input":{}}"#),
-        ];
+        let tail = [ev(
+            1,
+            "tool_use",
+            r#"{"type":"tool_use","id":"t1","tool":"Bash","input":{}}"#,
+        )];
         assert_eq!(reconstruct_cut_turn(&tail), "");
         // resume_message still works with an empty context.
         assert!(resume_message(None, "").starts_with(RESUME_MARKER));
