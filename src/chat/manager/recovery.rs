@@ -80,15 +80,24 @@ fn count_resumes(tail: &[ChatEventRecord]) -> usize {
         .count()
 }
 
-/// Whether the `spawned_by` JSON string identifies a session launched by a plan runner.
-/// Those sessions are managed by the runner itself; recovery leaves them alone.
-fn is_runner_child(spawned_by: &str) -> bool {
-    // SpawnedBy::Runner { run_id, task_id, parent_session_id } serialises as
-    // {"Runner": {...}} with serde's default enum representation.
-    serde_json::from_str::<serde_json::Value>(spawned_by)
-        .ok()
-        .and_then(|v| v.as_object().map(|o| o.contains_key("Runner")))
-        .unwrap_or(false)
+/// Whether the `spawned_by` JSON string identifies a session managed by an orchestrator
+/// (plan runner, pipeline engine, gate-retry, or delegation). Those sessions are relaunched
+/// by their orchestrator at boot; recovery leaving them alone avoids a double-resume.
+///
+/// `SpawnedBy::Conversation` and `SpawnedBy::Trigger` are NOT orchestrator-managed:
+/// conversation sub-sessions have no orchestrator, and external triggers do not
+/// automatically re-fire after a restart.
+fn is_orchestrator_child(spawned_by: &str) -> bool {
+    use crate::chat::types::SpawnedBy;
+    matches!(
+        SpawnedBy::from_json_str(spawned_by),
+        Some(
+            SpawnedBy::Runner { .. }
+                | SpawnedBy::Pipeline { .. }
+                | SpawnedBy::Gate { .. }
+                | SpawnedBy::Delegation { .. }
+        )
+    )
 }
 
 /// Judges the last events of a session (oldest first).
@@ -275,9 +284,11 @@ impl ChatManager {
             if node.capabilities.is_none() {
                 continue;
             }
-            // Plan-runner child sessions are managed by the runner, which relaunches them at
-            // boot. Recovering them here too would double-resume.
-            if node.spawned_by.as_deref().is_some_and(is_runner_child) {
+            // Orchestrator-managed sessions (runner, pipeline, gate-retry, delegation) are
+            // relaunched by their orchestrator at boot. Recovering them here too would
+            // double-resume. Conversation sub-sessions and trigger-spawned sessions have no
+            // orchestrator and are included.
+            if node.spawned_by.as_deref().is_some_and(is_orchestrator_child) {
                 continue;
             }
             // Coarse time filter: skip sessions that have been inactive for more than
@@ -558,13 +569,31 @@ mod tests {
     }
 
     #[test]
-    fn runner_child_sessions_are_identified_by_spawned_by() {
-        assert!(is_runner_child(
-            r#"{"Runner":{"run_id":"a","task_id":"b","parent_session_id":"c"}}"#
-        ));
-        assert!(!is_runner_child(r#"{"User":{}}"#));
-        assert!(!is_runner_child("not json"));
-        assert!(!is_runner_child("{}"));
+    fn orchestrator_child_sessions_are_identified_by_spawned_by() {
+        // SpawnedBy uses #[serde(tag = "type", rename_all = "snake_case")]:
+        // internally tagged, snake_case discriminant.
+        let runner_id = Uuid::nil().to_string();
+        assert!(is_orchestrator_child(&format!(
+            r#"{{"type":"runner","run_id":"{runner_id}","task_id":"{runner_id}"}}"#
+        )));
+        assert!(is_orchestrator_child(&format!(
+            r#"{{"type":"pipeline","run_id":"{runner_id}","task_id":"{runner_id}","wave":1}}"#
+        )));
+        assert!(is_orchestrator_child(&format!(
+            r#"{{"type":"gate","run_id":"{runner_id}","task_id":"{runner_id}","gate_name":"q","attempt":1}}"#
+        )));
+        assert!(is_orchestrator_child(&format!(
+            r#"{{"type":"delegation","plan_id":"{runner_id}","task_id":"{runner_id}"}}"#
+        )));
+        // Conversation and Trigger are NOT orchestrator-managed → included in recovery.
+        assert!(!is_orchestrator_child(&format!(
+            r#"{{"type":"conversation","parent_session_id":"{runner_id}"}}"#
+        )));
+        assert!(!is_orchestrator_child(&format!(
+            r#"{{"type":"trigger","trigger_id":"{runner_id}"}}"#
+        )));
+        assert!(!is_orchestrator_child("not json"));
+        assert!(!is_orchestrator_child("{}"));
     }
 
     #[test]
