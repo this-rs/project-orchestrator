@@ -312,6 +312,54 @@ curl -X DELETE -H "Authorization: Bearer <JWT>" \
   http://localhost:8080/api/chat/sessions/{id}
 ```
 
+### POST /api/chat/sessions/{id}/cancel-tools and /cancel-task/{task_id} -- Protected
+
+Stop the running tools of a session (the turn goes on), or one background task
+(`task_id` = the `tool_use` that started it, as in `active_tasks_update`). Works on
+both engines and across instances (NATS request/reply to the instance holding the
+session). `200` with `{cli_pid?, killed_pids, capped}` / `{task_id, killed_pids,
+capped}` when the cancel was done (`capped: true`: per-session cap hit). Otherwise a
+typed error body `{error, code, retryable}`, never a `200`:
+
+| Status | `code` | Meaning |
+|---|---|---|
+| 422 | `unsupported` | the provider cannot (`tool_cancel`: Claude Code over SSH or off Unix; `background_tasks`) |
+| 409 | `owner_unreachable` | no instance holds the session live (same answer with or without NATS): nothing runs, nothing was cancelled — a client shows it as "already stopped"; not retryable |
+| 504 | `owner_timeout` | no answer in time (8 s on the owner, 10 s for the asker); the cancel may still happen. `retryable: false` for cancel-tools (a retry would stop tools started since), `true` for cancel-task |
+| 410 | `session_gone` | only the instance that just lost the session answered. cancel-task: after a 1.5 s grace for the real owner, `retryable: true` (asking again reaches the new owner). cancel-tools: only once the asker's 10 s are over (a real owner slower than 1.5 s still answers), `retryable: false` (the tools may or may not have been stopped; a retry would stop tools started since) |
+| 502 | `owner_protocol` / `owner_failed` / `relay_failed` | unreadable answer / the owner failed / the request could not be sent |
+
+Asking cancel-task again for a task already signalled (a retry after a
+`410`/`504`, a second click, two concurrent stops, within the 5 s it stays listed as
+stopping) is a no-op: `200` with empty `killed_pids`, the signal is not sent twice
+and the cap counts it once. A task stopped in its first second, before its process
+is known, answers `200` with empty `killed_pids` too; its process is signalled as
+soon as it is found (about a second later), and until then asking again is not a
+no-op. When several processes started in that same second (two tools at once), none
+is signalled automatically, since the first one found may belong to the other tool:
+asking again signals the one recorded. A task whose process was found dead is never
+signalled (its pid may belong to another process by then): asking is the no-op.
+
+A provider refusal is also announced on the session's stream as
+`error { code: "cancel_refused", reason: <capability> }`. Over the WebSocket, a
+`cancel_tools` frame is answered asynchronously; a failure the client was not
+already told of comes back as `error { code: "cancel_failed", reason: <code above> }`.
+
+Rolling upgrades: the request/reply payload is versioned (`"v": 2`); an older
+instance asking gets the format it reads, and nothing it would take for a failure.
+In a mixed cluster (instances on a release before P12 next to newer ones):
+
+- cancel-tools on a session an older instance holds: the older one stops the tools
+  but does not answer, so the newer asker reports `504 owner_timeout`
+  (`retryable: false`), although the tools were stopped.
+- cancel-task on a session an older instance holds: the older one has no
+  cancel-task listener at all, so NATS reports no responders and the newer asker
+  answers `409 owner_unreachable` ("already stopped") **while the task is still
+  running** there. Nothing was cancelled; the task can only be stopped from the
+  instance holding the session.
+
+Deploy all instances together to avoid both.
+
 ### GET /api/chat/sessions/{id}/messages -- Protected
 
 List messages in a session.
