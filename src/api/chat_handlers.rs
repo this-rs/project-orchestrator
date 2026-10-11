@@ -102,6 +102,10 @@ pub async fn create_session(
                 AppError::from_open_error(e, Some(crate::chat::provider::resolver::CLAUDE_CODE))
             })?;
 
+        // Read before the liveness check and the NATS RPC (up to its timeout): a resume
+        // that completes meanwhile then receives this message instead of being resumed
+        // over (follow-up of the review of #696).
+        let from = chat_manager.resume_point(&sid).await;
         if chat_manager.is_session_active(&sid).await {
             // 1. Session is local — send directly into the running CLI
             chat_manager
@@ -118,7 +122,7 @@ pub async fn create_session(
             // 3. No instance owns the session — resume locally (spawns CLI).
             //    Surfaces a 404 when the session doesn't exist in Neo4j.
             chat_manager
-                .resume_session(&sid, &request.message, request.user_claims.as_ref())
+                .resume_session_from(&sid, &request.message, request.user_claims.as_ref(), from)
                 .await
                 .map_err(|e| {
                     let typed =

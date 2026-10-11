@@ -2414,6 +2414,53 @@ impl SessionLocks {
     }
 }
 
+/// Where a resume starts from: the live handle of the session (or none) as the caller saw
+/// it before it awaited anything ([`ChatManager::resume_point`]). Opaque: only the manager
+/// reads it, under the session's resume lock.
+pub struct ResumeFrom(Option<Arc<super::agent_runtime::AgentSessionHandle>>);
+
+/// Test-only pause at the start of `try_remote_send`, keyed by session id: a test makes a
+/// message wait there (where a real deployment waits for the NATS RPC timeout) while
+/// another resume of the same session completes.
+#[cfg(test)]
+pub(crate) mod remote_send_hook {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+    use tokio::sync::{oneshot, Notify};
+
+    struct Hook {
+        entered: Option<oneshot::Sender<()>>,
+        release: Arc<Notify>,
+    }
+
+    static HOOKS: LazyLock<Mutex<HashMap<String, Hook>>> = LazyLock::new(Default::default);
+
+    /// Arms a pause for `session_id`: the receiver fires when a `try_remote_send` reaches
+    /// it; that call then waits until the returned `Notify` is notified. One use.
+    pub(crate) fn arm(session_id: &str) -> (oneshot::Receiver<()>, Arc<Notify>) {
+        let (tx, rx) = oneshot::channel();
+        let release = Arc::new(Notify::new());
+        HOOKS.lock().unwrap().insert(
+            session_id.to_string(),
+            Hook {
+                entered: Some(tx),
+                release: Arc::clone(&release),
+            },
+        );
+        (rx, release)
+    }
+
+    pub(super) async fn wait(session_id: &str) {
+        let hook = HOOKS.lock().unwrap().remove(session_id);
+        if let Some(mut hook) = hook {
+            if let Some(entered) = hook.entered.take() {
+                let _ = entered.send(());
+            }
+            hook.release.notified().await;
+        }
+    }
+}
+
 /// Refuses a model whose context window cannot hold the tool schemas of the
 /// session's `profile` with room to work: the schemas must take at most half of
 /// it. A window that is not known is not a refusal (nothing is invented).
@@ -7889,6 +7936,8 @@ impl ChatManager {
         message: &str,
         message_type: &str,
     ) -> Result<bool> {
+        #[cfg(test)]
+        remote_send_hook::wait(session_id).await;
         let Some(ref nats) = self.nats else {
             debug!(
                 session_id = %session_id,
@@ -8278,6 +8327,8 @@ impl ChatManager {
         content: &str,
         claims: Option<&crate::auth::jwt::Claims>,
     ) -> std::result::Result<DeliveryRoute, MessageDeliveryError> {
+        // Read before anything awaits: see `resume_point`.
+        let from = self.resume_point(session_id).await;
         if self.is_session_active(session_id).await {
             match self.queue_user_message(session_id, content).await {
                 Ok(_) => return Ok(DeliveryRoute::Local),
@@ -8287,7 +8338,10 @@ impl ChatManager {
                         error = %send_err,
                         "queue_user_message failed, attempting resume_session as fallback"
                     );
-                    return match self.resume_session(session_id, content, claims).await {
+                    return match self
+                        .resume_session_from(session_id, content, claims, from)
+                        .await
+                    {
                         Ok(()) => Ok(DeliveryRoute::ResumedAfterSendFailure),
                         Err(resume) => Err(MessageDeliveryError::SendAndResume {
                             send: send_err,
@@ -8304,7 +8358,7 @@ impl ChatManager {
         {
             return Ok(DeliveryRoute::Remote);
         }
-        self.resume_session(session_id, content, claims)
+        self.resume_session_from(session_id, content, claims, from)
             .await
             .map(|()| DeliveryRoute::Resumed)
             .map_err(MessageDeliveryError::Resume)
@@ -8681,6 +8735,8 @@ impl ChatManager {
         // write goes to a closed stdin and the turn ends empty): drop it so the
         // message takes the resume path below.
         self.evict_if_cli_dead(session_id).await;
+        // Read before anything awaits: see `resume_point`.
+        let from = self.resume_point(session_id).await;
         if self.is_session_active(session_id).await {
             match self.send_message(session_id, content).await {
                 Ok(()) => return Ok(DeliveryRoute::Local),
@@ -8690,7 +8746,10 @@ impl ChatManager {
                         error = %send_err,
                         "send_message failed, attempting resume_session as fallback"
                     );
-                    return match self.resume_session(session_id, content, claims).await {
+                    return match self
+                        .resume_session_from(session_id, content, claims, from)
+                        .await
+                    {
                         Ok(()) => Ok(DeliveryRoute::ResumedAfterSendFailure),
                         Err(resume) => Err(MessageDeliveryError::SendAndResume {
                             send: send_err,
@@ -8707,7 +8766,7 @@ impl ChatManager {
         {
             return Ok(DeliveryRoute::Remote);
         }
-        self.resume_session(session_id, content, claims)
+        self.resume_session_from(session_id, content, claims, from)
             .await
             .map(|()| DeliveryRoute::Resumed)
             .map_err(MessageDeliveryError::Resume)
@@ -9512,17 +9571,43 @@ impl ChatManager {
         Ok(())
     }
 
+    /// The live handle (if any) of `session_id`, read by a caller BEFORE it checks whether
+    /// the session is live and before it asks another instance (`try_remote_send`, up to
+    /// the NATS RPC timeout): handed to [`Self::resume_session_from`], a resume that finds
+    /// ANOTHER live handle once it holds the session's lock knows a resume succeeded while
+    /// the caller was looking, and delivers to it (follow-up of the review of #696).
+    pub async fn resume_point(&self, session_id: &str) -> ResumeFrom {
+        ResumeFrom(self.agent_runtime.get(session_id).await)
+    }
+
+    /// [`Self::resume_session_from`], from the live handle of now: for a caller that did
+    /// not look at the session before (a caller that checked `is_session_active` or tried
+    /// another instance first reads [`Self::resume_point`] before, and passes it).
     pub async fn resume_session(
         &self,
         session_id: &str,
         message: &str,
         user_claims: Option<&crate::auth::jwt::Claims>,
     ) -> Result<()> {
+        let from = self.resume_point(session_id).await;
+        self.resume_session_from(session_id, message, user_claims, from)
+            .await
+    }
+
+    /// Resumes `session_id` and delivers `message`, starting from `from`: the live handle
+    /// the caller saw before it awaited anything (its liveness check, a failed send, the
+    /// NATS RPC). A resume that finds ANOTHER live handle once it holds the session's lock
+    /// was overtaken by a resume that succeeded meanwhile, and delivers to it (review of
+    /// #696, finding 1, and its follow-up: the caller's window).
+    pub async fn resume_session_from(
+        &self,
+        session_id: &str,
+        message: &str,
+        user_claims: Option<&crate::auth::jwt::Claims>,
+        from: ResumeFrom,
+    ) -> Result<()> {
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
-        // The live handle (if any) this resume starts from, read before anything awaits: a
-        // resume that finds ANOTHER one once it holds the session's lock was overtaken by
-        // a resume that succeeded meanwhile (review of #696, finding 1).
-        let seen = self.agent_runtime.get(session_id).await;
+        let seen = from.0;
 
         // Load session from Neo4j
         let mut session_node = self
@@ -18114,6 +18199,46 @@ mod tests {
         fake.state.end_turn();
         manager.close_session(&sid).await.unwrap();
     }
+    /// Follow-up of the review of #696 (scenario A, the caller's window): a message that
+    /// finds the session not live asks another instance first (`try_remote_send`, up to
+    /// the NATS RPC timeout in a cluster). A resume of the same session that completes
+    /// during that wait must receive the message, not be resumed over: the caller reads
+    /// the live handle BEFORE its liveness check. Before, `resume_session` read it only
+    /// after the wait, saw the new handle as its own starting point and resumed a second
+    /// time (a second token superseding the first, the first turn ended by `adopt`).
+    #[tokio::test]
+    async fn a_resume_that_completes_while_a_message_asks_nats_is_not_resumed_over() {
+        let (manager, _graph, fake) = signed_routed_agent_manager();
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        let mut req = agent_request("hello");
+        req.user_claims = Some(person_claims());
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+        fake.state.opened_specs.lock().unwrap().clear();
+        fake.state.turns_started.lock().unwrap().clear();
+        let (entered, release) = remote_send_hook::arm(&sid);
+        let claims = req.user_claims.as_ref();
+        let (routed, resumed_first) =
+            tokio::join!(manager.route_user_message(&sid, "two", claims), async {
+                // "two" saw the session not live and now waits on the remote instances.
+                entered.await.unwrap();
+                let first = manager.resume_session(&sid, "one", claims).await;
+                release.notify_one();
+                first
+            },);
+        resumed_first.unwrap();
+        assert_eq!(routed.unwrap(), DeliveryRoute::Resumed);
+        let resumed = fake.state.opened_specs.lock().unwrap().clone();
+        assert_eq!(resumed.len(), 1, "the session is resumed once");
+        assert!(crate::auth::agent_tokens::is_live(&spec_token_jti(
+            &resumed[0]
+        )));
+        delivered(&fake, &["one", "two"]).await;
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+    }
+
     #[tokio::test]
     async fn agent_path_opens_a_session_persists_the_snapshot_and_streams_a_turn() {
         use nexus_claude::agent::{AgentEvent, StopReason};
