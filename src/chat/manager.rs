@@ -600,6 +600,11 @@ pub(crate) struct AgentSpecInput<'a> {
     /// directories (the provider refuses both, and the local paths mean nothing
     /// there).
     pub remote_cwd: Option<&'a str>,
+    /// The provider can be given MCP servers for this session
+    /// ([`ChatManager::carries_per_session_mcp`]). `false` (OpenClaw's ACP bridge,
+    /// whatever its capabilities say): no project-orchestrator MCP server, and the
+    /// session reports `project_orchestrator_tools` among what it does not do.
+    pub per_session_mcp: bool,
     /// The knowledge-graph hooks to give the session (`None`: none).
     pub hooks: Option<AgentHookScope>,
 }
@@ -737,6 +742,10 @@ pub struct ChatManager {
     /// Per-turn model routing (`full` mode): the shared decider and the router of each
     /// live session. Empty until [`ChatManager::with_turn_decider`].
     pub(crate) turn_routing: Arc<super::agent_hooks::TurnRouting>,
+    /// One resume at a time per session (review of #684, finding 2): two messages to a
+    /// session that is not live would each resume it, and the one that fails would undo
+    /// what the other set up.
+    pub(crate) resume_locks: Arc<SessionLocks>,
     /// The `refs_v1` switch (on unless `REFS_V1=0`): whether the API layer folds
     /// `refs` into messages and the server announces the capability.
     pub(crate) refs_v1: bool,
@@ -746,10 +755,20 @@ pub struct ChatManager {
     /// Root of the native sessions' transcripts (`<root>/<instance id>/<id>.json`, P14);
     /// `None`: kept in memory, lost with the process (nexus' default, the tests' too).
     pub(crate) native_transcripts: Option<std::path::PathBuf>,
+    /// The declared ACP agents and the root of their `HOME`s (`with_acp_homes`,
+    /// `with_acp_commands`); the default reads `CHAT_PROVIDER_ACP_COMMANDS` and keeps
+    /// nexus' default `HOME` under the user's data directory.
+    pub(crate) acp: super::provider::native_factory::AcpSetup,
     /// How far the anchor resolver drives the context (`PO_ANCHOR_CONTEXT`, default `shadow`).
     pub(crate) anchor_mode: super::anchor_resolver::AnchorContextMode,
     /// What the turns of every session share in anchor mode (resolutions, shadow runs).
     pub(crate) anchor_cache: Arc<super::anchor_resolver::AnchorCache>,
+    /// The held context of each agent session this process opened ([`HeldSlot`]):
+    /// one per session id, shared by every state built for it, so a reopen orders
+    /// against the writes still running and keeps memory when the store is behind.
+    /// One small entry per session opened since the start (its held context is
+    /// empty once delivered).
+    pub(crate) held_slots: std::sync::Mutex<HashMap<String, Arc<HeldSlot>>>,
 }
 
 // ============================================================================
@@ -1281,6 +1300,458 @@ pub(crate) struct ManagerTurnServices {
     nats: Option<Arc<crate::events::NatsEmitter>>,
     /// The anchor state of the manager when these services were built.
     anchor: super::anchor_resolver::AnchorSession,
+    /// The session's state for the end of its turns, as `ActiveSession` holds it on
+    /// the Claude Code engine.
+    session: AgentTurnState,
+    search: Arc<dyn SearchStore>,
+    event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
+    context_injector: Option<Arc<ContextInjector>>,
+    /// The budget of each end-of-turn step (`post_stream::POST_STREAM_STEP_BUDGET`).
+    step_budget: Duration,
+    /// A step made to never answer (tests only, `None` in production).
+    stall_step: Option<&'static str>,
+}
+
+/// What a session of the agent engine keeps for the end of its turns: the fields of
+/// `ActiveSession` the Claude Code engine's post-stream reads.
+#[derive(Clone, Default)]
+pub(crate) struct AgentTurnState {
+    /// Records the conversation in memory (`None`: no memory configured).
+    memory: Option<Arc<Mutex<ConversationMemoryManager>>>,
+    rfc_accumulator: Arc<Mutex<super::observation_detector::RfcAccumulator>>,
+    /// The protocol run the session was spawned in (`spawned_by`), for the enrichment.
+    protocol_run_id: Option<Uuid>,
+    protocol_state: Option<String>,
+    reasoning_path_tracker: super::feedback::ReasoningPathTracker,
+    objectives: super::post_stream::ObjectiveCounters,
+    /// The tools the session used (files, steps), live from its events.
+    work_log: Arc<std::sync::Mutex<SessionWorkLog>>,
+    /// What waits for the session's next turn after a compaction: the re-injected
+    /// context and the objective reminder of that turn ([`HeldContext`]). Never a
+    /// turn of its own (P8c): a turn started only to carry it was measured against
+    /// the window right after the compaction and compacted again (measured in
+    /// `routing_modes_e2e_tests` on integ/p8). Persisted with the session (it
+    /// survives an idle close, a restart, a resume) and cleared only once a turn
+    /// carrying it was answered ([`super::agent_runtime::TurnOutcome::answered`], in `after_turn`).
+    held: Arc<HeldSlot>,
+    /// Tool calls announced and not yet answered: id → (tool, input so far).
+    open_tools: Arc<std::sync::Mutex<HashMap<String, (String, serde_json::Value)>>>,
+}
+
+/// A session's [`HeldContext`] in this process: what waits in memory (the truth
+/// while the process lives) and the one ordered way it reaches the store.
+#[derive(Default)]
+pub(crate) struct HeldSlot {
+    memory: std::sync::Mutex<HeldMemory>,
+    /// Orders the store writes of the session: each write takes it INSIDE its task,
+    /// then stores what memory holds at that moment, so the last write to land is
+    /// the latest state (a clear can never land after a newer store, among the
+    /// writes that land within their bound — see [`Self::write_once`] for one that
+    /// was dropped). A reopen ([`Self::reopen`]) takes it too. Every holder bounds
+    /// its store call by [`HELD_WRITE_BUDGET_FACTOR`] × the step budget (a write and
+    /// the reopen's read alike: one that never answers is dropped, the slot kept
+    /// as it stands), so the lock is never held past that, and waiting for it is
+    /// bounded by the writes queued before.
+    write: tokio::sync::Mutex<()>,
+    /// A background retry of a failed write runs ([`Self::retry_in_background`]):
+    /// at most one per session.
+    retrying: std::sync::atomic::AtomicBool,
+}
+
+/// What memory holds for a session, and how it stands against the store.
+#[derive(Debug, Clone)]
+struct HeldMemory {
+    held: HeldContext,
+    /// Moves at each change of `held` (`HeldSlot::edit`): a write or a reload knows
+    /// whether memory changed since it read it.
+    generation: u64,
+    /// The generation the store is known to hold; `None`: unknown (a write failed
+    /// or ran out of time). Memory and store diverge — the slot is *unsynced* —
+    /// whenever this is not the current generation: from the first change of a
+    /// turn (`after_turn` empties memory long before its write) until a write of
+    /// that state landed.
+    stored: Option<u64>,
+}
+
+impl Default for HeldMemory {
+    /// A slot nobody wrote yet: in step with the store, which the first open of the
+    /// session in this process reads.
+    fn default() -> Self {
+        Self {
+            held: HeldContext::default(),
+            generation: 0,
+            stored: Some(0),
+        }
+    }
+}
+
+/// A held-context write gets this many step budgets before its store call is
+/// dropped (the lock released, the slot left unsynced): a store that never answers
+/// does not make every later turn of the session wait for the lock.
+pub(crate) const HELD_WRITE_BUDGET_FACTOR: u32 = 2;
+
+/// The background retries of a failed held-context write: the first after
+/// [`HELD_RETRY_FIRST_DELAY`], each next one twice later, at most
+/// [`HELD_RETRY_ATTEMPTS`]; past them the next turn writes again.
+pub(crate) const HELD_RETRY_FIRST_DELAY: Duration = Duration::from_secs(1);
+pub(crate) const HELD_RETRY_ATTEMPTS: u32 = 6;
+
+impl HeldSlot {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HeldMemory> {
+        self.memory.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What goes in front of the next turn ([`HeldContext::prefix`]).
+    fn prefix(&self) -> Option<String> {
+        self.lock().held.prefix()
+    }
+
+    /// What memory holds.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> HeldContext {
+        self.lock().held.clone()
+    }
+
+    /// Changes what memory holds; a change moves the generation (the store no
+    /// longer holds it, [`Self::unsynced`]).
+    fn edit<R>(&self, f: impl FnOnce(&mut HeldContext) -> R) -> R {
+        let mut m = self.lock();
+        let before = m.held.clone();
+        let out = f(&mut m.held);
+        if m.held != before {
+            m.generation += 1;
+        }
+        out
+    }
+
+    /// The store may not hold what memory holds: memory changed since the last
+    /// write that landed (a turn under way, a write still running), or a write
+    /// failed. The next turn writes again, and a reopen in this process keeps
+    /// memory instead of reloading the store.
+    fn unsynced(&self) -> bool {
+        let m = self.lock();
+        m.stored != Some(m.generation)
+    }
+
+    /// Replaces memory with what the store holds, read while memory was at
+    /// generation `seen` and in step with the store. Refused (memory kept) when
+    /// memory moved meanwhile: the store read is older than memory.
+    fn reload(&self, stored: HeldContext, seen: u64) -> bool {
+        let mut m = self.lock();
+        if m.generation != seen || m.stored != Some(seen) {
+            return false;
+        }
+        if m.held != stored {
+            m.held = stored;
+            m.generation += 1;
+            m.stored = Some(m.generation);
+        }
+        true
+    }
+
+    /// Replaces memory with what the store holds, as a new state of the session
+    /// starts from it: only a slot in step with the store reloads it, and only if
+    /// memory did not move during the read ([`Self::reload`]). Ordered after the
+    /// writes already started (their lock, waited for within `budget`; past it the
+    /// read goes on, the generation check alone keeping it safe). The read is
+    /// bounded like a write ([`HELD_WRITE_BUDGET_FACTOR`] × `budget`): a store that
+    /// does not answer, or cannot be read, keeps memory and releases the lock.
+    async fn reopen(&self, graph: &Arc<dyn GraphStore>, session_id: &str, budget: Duration) {
+        let _order = tokio::time::timeout(budget, self.write.lock()).await.ok();
+        let seen = {
+            let m = self.lock();
+            (m.stored == Some(m.generation)).then_some(m.generation)
+        };
+        let Some(seen) = seen else {
+            return;
+        };
+        let bound = budget * HELD_WRITE_BUDGET_FACTOR;
+        let read = match tokio::time::timeout(bound, HeldContext::load(graph, session_id)).await {
+            Ok(read) => read,
+            Err(_) => Err(anyhow!(
+                "the store did not answer within {} ms",
+                bound.as_millis()
+            )),
+        };
+        match read {
+            Ok(stored) => {
+                self.reload(stored, seen);
+            }
+            Err(e) => warn!(
+                session_id,
+                "held context: the store could not be read, memory kept: {e:#}"
+            ),
+        }
+    }
+
+    /// Writes what memory holds to the store, ordered after the writes already
+    /// started, the store call bounded ([`HELD_WRITE_BUDGET_FACTOR`] × `budget`).
+    /// The slot is in step only if memory did not move since the write read it.
+    ///
+    /// A store call dropped by the bound may still land on the server, later. If a
+    /// newer write lands first, the dropped one overwrites it there while the slot
+    /// believes itself in step: no retry, and the newer state is lost at a restart
+    /// (memory stays right while the process lives). It takes a store slower than
+    /// the bound (60 s in production). A write conditional on a version would close
+    /// it, but the generation lives in this process only (it restarts at 0, and
+    /// another instance has its own): it would need a durable version and a delete
+    /// turned into a versioned tombstone in the `GraphStore` setting API.
+    async fn write_once(
+        &self,
+        graph: &Arc<dyn GraphStore>,
+        session_id: &str,
+        budget: Duration,
+    ) -> Result<()> {
+        let _order = self.write.lock().await;
+        let (held, generation) = {
+            let m = self.lock();
+            (m.held.clone(), m.generation)
+        };
+        let bound = budget * HELD_WRITE_BUDGET_FACTOR;
+        let out = match tokio::time::timeout(bound, held.store(graph, session_id)).await {
+            Ok(out) => out,
+            Err(_) => Err(anyhow!(
+                "the store did not answer within {} ms: dropped, retried later",
+                bound.as_millis()
+            )),
+        };
+        self.lock().stored = match out {
+            Ok(()) => Some(generation),
+            Err(_) => None,
+        };
+        out
+    }
+
+    /// Writes what memory holds to the store, in a task of its own
+    /// ([`super::post_stream::spawn_write`]: never dropped, a failure logged),
+    /// ordered after the writes already started. A failed write leaves the slot
+    /// [`Self::unsynced`] and is retried in the background
+    /// ([`Self::retry_in_background`]), then by the next turn. Returns the step
+    /// (for the report) and the write to wait for.
+    fn spawn_write(
+        self: &Arc<Self>,
+        graph: &Arc<dyn GraphStore>,
+        session_id: &str,
+        budget: Duration,
+    ) -> (&'static str, tokio::task::JoinHandle<()>) {
+        let step = if self.lock().held.is_empty() {
+            "clear_held_context"
+        } else {
+            "hold_context"
+        };
+        let slot = Arc::clone(self);
+        let graph = graph.clone();
+        let sid = session_id.to_string();
+        let write = super::post_stream::spawn_write(session_id.to_string(), step, async move {
+            let out = slot.write_once(&graph, &sid, budget).await;
+            if out.is_err() {
+                slot.retry_in_background(graph, sid, budget);
+            }
+            out
+        });
+        (step, write)
+    }
+
+    /// Retries a failed write without waiting for a turn (a session closed, idle
+    /// closed or simply left keeps no stale context in the store for a restart to
+    /// reload): after [`HELD_RETRY_FIRST_DELAY`], then twice later each time, at
+    /// most [`HELD_RETRY_ATTEMPTS`] times, until the slot is in step. One retry
+    /// loop per session at a time.
+    fn retry_in_background(
+        self: &Arc<Self>,
+        graph: Arc<dyn GraphStore>,
+        sid: String,
+        budget: Duration,
+    ) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.retrying.swap(true, SeqCst) {
+            return;
+        }
+        let slot = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut delay = HELD_RETRY_FIRST_DELAY;
+            let mut in_step = false;
+            for attempt in 1..=HELD_RETRY_ATTEMPTS {
+                tokio::time::sleep(delay).await;
+                if !slot.unsynced() {
+                    in_step = true;
+                    break;
+                }
+                match slot.write_once(&graph, &sid, budget).await {
+                    Ok(()) => {
+                        info!(session_id = %sid, attempt, "held context write retried: landed")
+                    }
+                    Err(e) => {
+                        warn!(session_id = %sid, attempt, "held context write retry failed: {e:#}")
+                    }
+                }
+                if !slot.unsynced() {
+                    in_step = true;
+                    break;
+                }
+                delay *= 2;
+            }
+            slot.retrying.store(false, SeqCst);
+            // A write that failed after the last check found the slot in step saw
+            // this loop still running and left the retry to it: retry it now. Not
+            // after the attempts ran out (the next turn writes again).
+            if in_step && slot.lock().stored.is_none() {
+                slot.retry_in_background(graph, sid, budget);
+            }
+        });
+    }
+}
+
+/// What waits for a session's next turn after a compaction (`AgentTurnState::held`).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HeldContext {
+    /// The project context re-injected after the compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// The objective reminder of the turn that compacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reminder: Option<String>,
+}
+
+impl HeldContext {
+    /// Where it is stored: one setting document per session.
+    const KEY: &'static str = "held_context";
+
+    fn scope(session_id: &str) -> String {
+        format!("session:{session_id}")
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.context.is_none() && self.reminder.is_none()
+    }
+
+    /// What goes in front of the next turn: the context, then the reminder.
+    pub fn prefix(&self) -> Option<String> {
+        match (&self.context, &self.reminder) {
+            (None, None) => None,
+            (Some(c), None) => Some(c.clone()),
+            (None, Some(r)) => Some(r.clone()),
+            (Some(c), Some(r)) => Some(format!(
+                "{c}
+
+{r}"
+            )),
+        }
+    }
+
+    /// The re-injected context cut to fit the model's window: at most
+    /// [`HELD_CONTEXT_WINDOW_SHARE`] of a known window (four characters a token),
+    /// never more than the builder's own cap (`MAX_MARKDOWN_CHARS`, 6000). It cannot
+    /// by itself push a turn over nexus' compaction threshold (80 % of the window)
+    /// unless the history alone is already past 75 %.
+    pub fn cap(context: &str, window_tokens: Option<u64>) -> String {
+        const BUILDER_CAP: usize = 6000;
+        let limit = window_tokens
+            .map(|w| ((w as f64) * HELD_CONTEXT_WINDOW_SHARE * 4.0) as usize)
+            .unwrap_or(BUILDER_CAP)
+            .min(BUILDER_CAP);
+        if context.chars().count() <= limit {
+            return context.to_string();
+        }
+        const TAIL: &str = "
+[… cut to fit the context window]
+</system-reminder>";
+        let keep = limit.saturating_sub(TAIL.chars().count());
+        let mut out: String = context.chars().take(keep).collect();
+        out.push_str(TAIL);
+        out
+    }
+
+    /// The held context of `session_id`, as stored (none: empty; an unreadable
+    /// document: empty, said). A store that cannot be read is an error, not an
+    /// empty context: the caller keeps what it has.
+    pub async fn load(graph: &Arc<dyn GraphStore>, session_id: &str) -> Result<Self> {
+        let raw = graph
+            .get_llm_setting(&Self::scope(session_id), Self::KEY)
+            .await?;
+        Ok(match raw {
+            Some(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+                warn!(session_id, "held context unreadable, dropped: {e}");
+                Self::default()
+            }),
+            None => Self::default(),
+        })
+    }
+
+    /// Stores it (empty: clears it).
+    pub async fn store(&self, graph: &Arc<dyn GraphStore>, session_id: &str) -> Result<()> {
+        if self.is_empty() {
+            return Self::clear(graph, session_id).await;
+        }
+        graph
+            .put_llm_setting(
+                &Self::scope(session_id),
+                Self::KEY,
+                &serde_json::to_string(self)?,
+            )
+            .await
+    }
+
+    pub async fn clear(graph: &Arc<dyn GraphStore>, session_id: &str) -> Result<()> {
+        graph
+            .delete_llm_setting(&Self::scope(session_id), Self::KEY)
+            .await
+            .map(|_| ())
+    }
+}
+
+/// Largest share of the model's window the held context may take.
+pub(crate) const HELD_CONTEXT_WINDOW_SHARE: f64 = 0.05;
+
+impl ManagerTurnServices {
+    /// One end-of-turn step under its own budget ([`run_step`]); `stall_step` makes
+    /// the named one never answer (tests only: proves the budgets are per step).
+    async fn step<F: std::future::Future>(
+        &self,
+        after: &mut super::agent_runtime::AfterTurn,
+        session_id: &str,
+        name: &'static str,
+        fut: F,
+    ) -> Option<F::Output> {
+        let stalled = self.stall_step == Some(name);
+        run_step(after, session_id, name, self.step_budget, async move {
+            if stalled {
+                std::future::pending::<()>().await;
+            }
+            fut.await
+        })
+        .await
+    }
+
+    fn flush_open_tools(&self) {
+        let open: Vec<(String, serde_json::Value)> = self
+            .session
+            .open_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, call)| call)
+            .collect();
+        if open.is_empty() {
+            return;
+        }
+        let mut log = self
+            .session
+            .work_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (tool, input) in open {
+            log.record_tool_use(&tool, &input);
+        }
+    }
+
+    fn work_summary(&self) -> String {
+        self.session
+            .work_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .to_summary_markdown()
+    }
 }
 
 #[async_trait::async_trait]
@@ -1307,12 +1778,20 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         };
         // The enrichment reads what the user typed (the attachments' text, without
         // references), and does not inject again the notes the user pointed at.
+        // What the user typed goes to memory, as `stream_response` records it.
+        if let Some(mm) = &self.session.memory {
+            mm.lock().await.record_user_message(&turn.memory_text);
+        }
         let prepared = match enrichment_for_turn(
             &self.graph,
             &self.enrichment_pipeline,
             session_id,
             &turn.enrichment_text,
-            TurnProtocol::default(),
+            TurnProtocol {
+                run_id: self.session.protocol_run_id,
+                state: self.session.protocol_state.clone(),
+                reasoning_path_tracker: Some(self.session.reasoning_path_tracker.clone()),
+            },
             turn.excluded_note_ids.clone(),
             &self.anchor,
         )
@@ -1320,6 +1799,15 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         {
             Some(md) => prepend_enrichment(&md, &body),
             None => body,
+        };
+        // What waits since the last compaction goes in front of this turn, whatever
+        // started it. Only read here: `after_turn` clears it once a turn carrying it
+        // was answered (`TurnOutcome::answered`), so a turn refused before it was
+        // sent, failed, or stopped before any attempt was answered keeps it.
+        let held = self.session.held.prefix();
+        let prepared = match held {
+            Some(context) => prepend_enrichment(&context, &prepared),
+            None => prepared,
         };
         // The hook of the turn only sees the length of the text: hand it the text of
         // THIS turn, whatever started it (a message, the queue, a hint, another
@@ -1337,8 +1825,13 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             Uuid::parse_str(session_id).ok(),
         )
         .await;
-        // No work log on this engine: the hint carries the task/step context alone.
-        super::post_stream::continuation_message(&self.graph, ctx.project_slug.as_deref(), "").await
+        let work_summary = self.work_summary();
+        super::post_stream::continuation_message(
+            &self.graph,
+            ctx.project_slug.as_deref(),
+            &work_summary,
+        )
+        .await
     }
 
     async fn images(
@@ -1353,6 +1846,234 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             nats.publish_chat_event(session_id, event.clone());
         }
     }
+
+    /// The work log records a tool once its input is final: a call announced before
+    /// its input was complete (Claude Code, ACP: `tool_use` with `{}`, then
+    /// `tool_use_input_resolved`) is logged when its result (or its cancel) arrives,
+    /// with the resolved input.
+    fn observe(&self, _session_id: &str, event: &ChatEvent) {
+        let mut open = self
+            .session
+            .open_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match event {
+            ChatEvent::ToolUse {
+                id, tool, input, ..
+            } => {
+                open.insert(id.clone(), (tool.clone(), input.clone()));
+            }
+            ChatEvent::ToolUseInputResolved { id, input, .. } => {
+                if let Some(call) = open.get_mut(id) {
+                    call.1 = input.clone();
+                }
+            }
+            ChatEvent::ToolResult { id, .. } | ChatEvent::ToolCancelled { id, .. } => {
+                if let Some((tool, input)) = open.remove(id) {
+                    drop(open);
+                    self.session
+                        .work_log
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_tool_use(&tool, &input);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The post-stream steps of the Claude Code engine, with the same functions:
+    /// post-compaction re-injection, objective tracking, memory / feedback /
+    /// observations. Interrupt cleanup and auto-continue are the runtime's.
+    async fn after_turn(
+        &self,
+        session_id: &str,
+        outcome: &super::agent_runtime::TurnOutcome,
+    ) -> super::agent_runtime::AfterTurn {
+        let mut after = super::agent_runtime::AfterTurn::default();
+        let uuid = Uuid::parse_str(session_id).ok();
+        // The turn carried what waited since the last compaction and was answered:
+        // dropped in memory before anything else (before the first await, so the
+        // backstop cannot skip it), a compaction of this same turn holding its own
+        // context again below. The store follows in ONE ordered write at the end.
+        let previous = if outcome.answered {
+            self.session.held.edit(std::mem::take)
+        } else {
+            HeldContext::default()
+        };
+        let dropped = !previous.is_empty();
+        // Each step under its own budget, as `PostStreamHandler`'s (`StepBudget`): a
+        // step that never answers is dropped and said, the next ones still run.
+        let ctx = self
+            .step(
+                &mut after,
+                session_id,
+                "context",
+                super::post_stream::PostStreamContext::build(&self.graph, uuid),
+            )
+            .await
+            .unwrap_or_default();
+        // 1. Post-compaction context re-injection, a Stop included: unlike the Claude
+        // Code engine, nothing is queued as a turn (a Stop would drop it), the context
+        // waits in front of the next turn. Skipping it on a Stop lost the context the
+        // turn delivered AND the one of its own compaction.
+        if outcome.compacted {
+            let snapshot = self
+                .session
+                .work_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .snapshot();
+            if let Some((hint, event)) = self
+                .step(
+                    &mut after,
+                    session_id,
+                    "post_compaction",
+                    super::post_stream::post_compaction_recovery(
+                        &self.graph,
+                        session_id,
+                        ctx.project_slug.as_deref(),
+                        Some(snapshot),
+                    ),
+                )
+                .await
+            {
+                // Kept for the next turn, never queued as a turn of its own, and
+                // no bigger than the window allows (`HeldContext::cap`).
+                if let Some(hint) = hint {
+                    let hint = HeldContext::cap(&hint, outcome.context_window);
+                    self.session.held.edit(|h| h.context = Some(hint));
+                }
+                after.events.push(event);
+            }
+            // The compaction summarized what this turn carried: when no fresh context
+            // came (the step ran out of time), what it carried waits again — the
+            // context and its reminder (a newer reminder of this turn replaces it
+            // below) — rather than nothing.
+            self.session.held.edit(|held| {
+                if held.context.is_none() {
+                    held.context = previous.context.clone();
+                    if held.reminder.is_none() {
+                        held.reminder = previous.reminder.clone();
+                    }
+                }
+            });
+        }
+        // 2. Objective tracking, as on the Claude Code engine. After a turn that
+        // compacted, its reminder waits with the re-injected context, in front of
+        // the next turn, instead of starting a turn on a history just compacted.
+        {
+            let had_conclusive = outcome
+                .tools
+                .iter()
+                .any(|(tool, input)| is_conclusive_tool(tool, input));
+            let had_productive = outcome
+                .tools
+                .iter()
+                .any(|(tool, input)| !is_conclusive_tool(tool, input));
+            let turn = super::post_stream::ObjectiveTurn {
+                had_productive_tool_use: had_productive,
+                had_conclusive_tool_use: had_conclusive,
+                auto_continue_allowed: outcome.auto_continue_allowed,
+                hit_error_max_turns: outcome.hit_turn_limit,
+                interrupted: outcome.interrupted,
+            };
+            let reminder = self
+                .step(
+                    &mut after,
+                    session_id,
+                    "objective_tracking",
+                    super::post_stream::objective_reminder(
+                        &self.graph,
+                        ctx.project_slug.as_deref(),
+                        &self.session.objectives,
+                        turn,
+                        self.work_summary(),
+                    ),
+                )
+                .await
+                .flatten();
+            if let Some(reminder) = reminder {
+                info!(session_id, "Objective tracker: injecting reminder");
+                if outcome.compacted {
+                    self.session.held.edit(|h| h.reminder = Some(reminder));
+                } else {
+                    after.hints.push(reminder);
+                }
+            }
+        }
+        // What waits for the next turn is stored with the session: ONE write of what
+        // memory holds, ordered after the session's earlier writes (`HeldSlot`), so a
+        // clear can never land after the store of this turn's compaction. Also when
+        // an earlier write failed (`unsynced`): retried until the store follows, so a
+        // restart, an idle close or a relay never reloads a context already delivered.
+        // Waited for within the step budget; past it the clients learn it is late
+        // (`persistence_delayed`) and the write goes on.
+        if outcome.compacted || dropped || self.session.held.unsynced() {
+            let (step, write) =
+                self.session
+                    .held
+                    .spawn_write(&self.graph, session_id, self.step_budget);
+            if let Some(late) =
+                super::post_stream::await_write(session_id, step, self.step_budget, write).await
+            {
+                after.events.push(late);
+            }
+        }
+        // Tools still open when the turn ended (an error, the turn limit) are
+        // logged as they stand: the work log misses none.
+        self.flush_open_tools();
+        // 3. Memory / feedback / observations (the store write runs on its own).
+        self.step(
+            &mut after,
+            session_id,
+            "feedback",
+            super::post_stream::record_turn_feedback(
+                super::post_stream::TurnFeedback {
+                    graph: &self.graph,
+                    search: &self.search,
+                    event_emitter: &self.event_emitter,
+                    session_id,
+                    session_uuid: uuid,
+                    project_id: ctx.project_id,
+                    rfc_accumulator: Some(self.session.rfc_accumulator.clone()),
+                },
+                &outcome.assistant_text,
+                &self.session.memory,
+                &self.context_injector,
+            ),
+        )
+        .await;
+        after
+    }
+}
+
+/// One end-of-turn step of the agent engine under its own `budget`: past it the step
+/// is dropped (`post_stream::bounded`) and an `error` event says which one
+/// (`post_stream_step_abandoned`, `reason` = the step), as the Claude Code engine's
+/// `StepBudget::run` reports it.
+pub(crate) async fn run_step<F: std::future::Future>(
+    after: &mut super::agent_runtime::AfterTurn,
+    session_id: &str,
+    step: &'static str,
+    budget: Duration,
+    fut: F,
+) -> Option<F::Output> {
+    let out = super::post_stream::bounded(session_id, step, budget, fut).await;
+    if out.is_none() {
+        after.events.push(ChatEvent::Error {
+            message: format!(
+                "Error: the end-of-turn step '{step}' took longer than {} s: skipped",
+                budget.as_secs()
+            ),
+            parent_tool_use_id: None,
+            code: Some(super::post_stream::STEP_ABANDONED_CODE.to_string()),
+            reason: Some(step.to_string()),
+            index: None,
+            request_id: None,
+        });
+    }
+    out
 }
 
 /// What another instance asks of a session of the agent engine this instance
@@ -1653,6 +2374,214 @@ pub(crate) fn lacks_nexus_tools(
             .is_none()
 }
 
+/// Name of the project-orchestrator MCP server in a session's spec.
+pub(crate) const PO_MCP_SERVER: &str = "project-orchestrator";
+
+/// What a session about to open lacks that the HOST knows and its provider's
+/// capabilities may not say, as `degraded_features` entries: `nexus_tools`
+/// ([`lacks_nexus_tools`]) and `project_orchestrator_tools` when the spec carries no
+/// project-orchestrator MCP server (a remote Claude Code, OpenClaw's ACP bridge).
+pub(crate) fn host_degraded(
+    kind: nexus_claude::agent::ProviderKind,
+    spec: &nexus_claude::agent::SessionSpec,
+    configured: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    if lacks_nexus_tools(kind, spec, configured) {
+        missing.push(super::agent_runtime::NEXUS_TOOLS_FEATURE.to_string());
+    }
+    if !spec.mcp_servers.contains_key(PO_MCP_SERVER) {
+        missing.push(super::agent_runtime::PO_TOOLS_FEATURE.to_string());
+    }
+    missing
+}
+
+/// Opens (or resumes) a session with `spec` through `open`. A provider that learned,
+/// between the reading of its capabilities and this opening, that it takes no MCP
+/// server per session (two first sessions opened at once on an ACP agent that refuses
+/// them: the other one taught it) answers `Unsupported { per_session_mcp }`: the
+/// session is asked ONCE more without its MCP servers. `true` beside the session: it
+/// was opened without them (it lacks the PO tools, [`PO_TOOLS_FEATURE`]).
+///
+/// Only an ACP agent (`kind`) is asked again: its spec holds no server but the PO one
+/// (nothing else is dropped without being said). Any other kind's refusal is returned
+/// as it is.
+///
+/// [`PO_TOOLS_FEATURE`]: super::agent_runtime::PO_TOOLS_FEATURE
+pub(crate) async fn open_dropping_refused_mcp<F, Fut>(
+    kind: nexus_claude::agent::ProviderKind,
+    spec: nexus_claude::agent::SessionSpec,
+    open: F,
+) -> std::result::Result<
+    (Arc<dyn nexus_claude::agent::AgentSession>, bool),
+    nexus_claude::agent::ProviderError,
+>
+where
+    F: Fn(nexus_claude::agent::SessionSpec) -> Fut,
+    Fut: std::future::Future<
+        Output = std::result::Result<
+            Arc<dyn nexus_claude::agent::AgentSession>,
+            nexus_claude::agent::ProviderError,
+        >,
+    >,
+{
+    let acp = kind == nexus_claude::agent::ProviderKind::Acp;
+    let without = (acp && !spec.mcp_servers.is_empty()).then(|| {
+        let mut without = spec.clone();
+        without.mcp_servers.clear();
+        without
+    });
+    match (open(spec).await, without) {
+        (Err(nexus_claude::agent::ProviderError::Unsupported { capability }), Some(without))
+            if capability == "per_session_mcp" =>
+        {
+            open(without).await.map(|session| (session, true))
+        }
+        (outcome, _) => outcome.map(|session| (session, false)),
+    }
+}
+
+/// Whether a session whose spec carried MCP servers (`requested`: the PO server,
+/// with the token minted for it) came out WITHOUT them: the host opened it again
+/// without them (`dropped`, [`open_dropping_refused_mcp`]), or the provider did on its
+/// own — an ACP agent that refuses `mcpServers` at `session/new` is asked again
+/// without them by nexus, which only says so in the session's capabilities
+/// (`per_session_mcp: false`). Those are the SESSION's (nexus #87): a concurrent opening
+/// of the same instance that was refused does not turn a session that kept its servers to
+/// `false`, so its token is not revoked. Either way the token went to the agent in the refused
+/// request and nothing will ever present it legitimately: it is revoked.
+pub(crate) fn opened_without_mcp(
+    requested: bool,
+    dropped: bool,
+    session: &nexus_claude::agent::Capabilities,
+) -> bool {
+    requested && (dropped || !session.per_session_mcp)
+}
+
+/// What an opening (or a resume) of the agent engine has set up before its session
+/// is live — the PO token minted for its spec, its per-turn router — undone when the
+/// opening stops short of [`ChatManager::finish_agent_open`]: an authorization
+/// refused, a spec that cannot be built, a provider unavailable or that refuses the
+/// session, a window too small, or the opening future dropped. [`Self::disarm`]
+/// once the session is handed over.
+///
+/// Undoes only what THIS opening set up (review of #684, finding 2): the token whose
+/// `jti` it minted ([`Self::minted`]), the router it registered when that router is
+/// still the session's ([`Self::registered`], `Arc::ptr_eq`). A concurrent resume of
+/// the same session that succeeded keeps its own. Resumes of one session are also
+/// serialised ([`SessionLocks`]): the session's `nexus-tools` token is kept per
+/// session, not per minting, and a new PO token supersedes the session's others.
+struct OpeningCleanup {
+    session_id: String,
+    turn_routing: Arc<super::agent_hooks::TurnRouting>,
+    /// The router this opening registered.
+    router: Option<Arc<super::agent_hooks::TurnRouter>>,
+    /// The `jti` of the PO token minted for this opening's spec: `None` until the spec
+    /// is built (a token minted by a build that failed is then the session's only one).
+    jti: Option<String>,
+    armed: bool,
+}
+
+impl OpeningCleanup {
+    fn new(session_id: &str, turn_routing: &Arc<super::agent_hooks::TurnRouting>) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            turn_routing: Arc::clone(turn_routing),
+            router: None,
+            jti: None,
+            armed: true,
+        }
+    }
+
+    /// The router this opening registered (`None`: routing is not configured).
+    fn registered(&mut self, router: Option<Arc<super::agent_hooks::TurnRouter>>) {
+        self.router = router;
+    }
+
+    /// The spec this opening built: the `jti` of the PO token it carries.
+    fn minted(&mut self, spec: &nexus_claude::agent::SessionSpec, secret: Option<&str>) {
+        self.jti = minted_jti(spec, secret);
+    }
+
+    /// Revokes the PO token of this opening (the session's `nexus-tools` token with
+    /// it); every token of the session when the opening never knew its own.
+    fn revoke_token(&self) {
+        match self.jti.as_deref() {
+            Some(jti) => {
+                crate::auth::agent_tokens::revoke_minted(&self.session_id, jti);
+            }
+            None => {
+                crate::auth::agent_tokens::revoke_session(&self.session_id);
+            }
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OpeningCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            // Nothing will ever use this opening's token.
+            self.revoke_token();
+            if let Some(router) = &self.router {
+                self.turn_routing.remove_if(&self.session_id, router);
+            }
+        }
+    }
+}
+
+/// The `jti` of the PO token `spec` carries (its project-orchestrator server), read
+/// with the server's signing key. `None` without a key, a server or a token.
+pub(crate) fn minted_jti(
+    spec: &nexus_claude::agent::SessionSpec,
+    secret: Option<&str>,
+) -> Option<String> {
+    let secret = secret?;
+    match spec.mcp_servers.get(PO_MCP_SERVER) {
+        Some(nexus_claude::agent::McpServerSpec::Stdio { env, .. }) => env
+            .get("PO_AUTH_TOKEN")
+            .and_then(|token| crate::auth::jwt::decode_jwt(token, secret).ok())
+            .and_then(|claims| claims.jti),
+        _ => None,
+    }
+}
+
+/// One lock per session id, held for as long as someone holds its guard: resumes of
+/// one session run one after the other. An entry whose lock nobody holds is dropped.
+#[derive(Default)]
+pub(crate) struct SessionLocks(
+    std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+);
+
+impl SessionLocks {
+    /// Waits for the session's lock.
+    pub(crate) async fn lock(&self, session_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(session_id).and_then(std::sync::Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        let mut locks = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        locks.len()
+    }
+}
+
 /// Refuses a model whose context window cannot hold the tool schemas of the
 /// session's `profile` with room to work: the schemas must take at most half of
 /// it. A window that is not known is not a refusal (nothing is invented).
@@ -1814,13 +2743,16 @@ impl ChatManager {
             nn_router: None,
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             turn_routing: Arc::new(super::agent_hooks::TurnRouting::default()),
+            resume_locks: Arc::new(SessionLocks::default()),
             refs_v1: crate::refs::flag::from_env(),
             document_store: crate::documents::store::DocumentStore::new(
                 crate::documents::store::default_storage_dir(),
             ),
             native_transcripts: None,
+            acp: Default::default(),
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
+            held_slots: Default::default(),
         }
     }
 
@@ -1898,13 +2830,16 @@ impl ChatManager {
             nn_router: None,
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             turn_routing: Arc::new(super::agent_hooks::TurnRouting::default()),
+            resume_locks: Arc::new(SessionLocks::default()),
             refs_v1: crate::refs::flag::from_env(),
             document_store: crate::documents::store::DocumentStore::new(
                 crate::documents::store::default_storage_dir(),
             ),
             native_transcripts: None,
+            acp: Default::default(),
             anchor_mode: super::anchor_resolver::AnchorContextMode::from_env(),
             anchor_cache: Arc::default(),
+            held_slots: Default::default(),
         }
     }
 
@@ -1934,6 +2869,24 @@ impl ChatManager {
     /// restart (`provider::transcripts`). Applies to the providers built afterwards.
     pub fn with_native_transcripts(mut self, root: impl Into<std::path::PathBuf>) -> Self {
         self.native_transcripts = Some(root.into());
+        self
+    }
+
+    /// Put the dedicated `HOME` of each ACP instance under `root` (`<root>/<instance>/home`)
+    /// instead of nexus' default in the user's data directory. Applies to the providers
+    /// built afterwards; the tests use it so that nothing is written in the real one.
+    pub fn with_acp_homes(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.acp.homes = Some(root.into());
+        self
+    }
+
+    /// Declare the ACP agents here instead of `CHAT_PROVIDER_ACP_COMMANDS` (the tests:
+    /// the process environment is shared by every test running at the same time).
+    pub fn with_acp_commands(
+        mut self,
+        commands: std::collections::BTreeMap<String, super::provider::settings::AcpCommand>,
+    ) -> Self {
+        self.acp.commands = Some(commands);
         self
     }
 
@@ -3725,6 +4678,16 @@ impl ChatManager {
                 }
             }
         }
+        // The agent engine's sessions are live too (their permissions and background
+        // tasks are not tracked here: P11 / P4).
+        for handle in self.agent_runtime.handles().await {
+            if let Ok(id) = handle.session_id.parse::<Uuid>() {
+                snap.live.insert(id);
+                if handle.is_streaming.load(Ordering::SeqCst) {
+                    snap.streaming.insert(id);
+                }
+            }
+        }
         for (id, pending) in inputs {
             let ids: std::collections::HashSet<String> =
                 pending.lock().await.keys().cloned().collect();
@@ -4584,10 +5547,9 @@ impl ChatManager {
         // Who the session belongs to, settled before anything is opened: a refusal (no owner
         // can be named for a delegated session) leaves nothing behind.
         let owner = self.session_owner(request.user_claims.as_ref()).await?;
-        // Check max sessions
+        // Check max sessions: both engines' live sessions count.
         {
-            let sessions = self.active_sessions.read().await;
-            if sessions.len() >= self.config.max_sessions {
+            if self.active_session_count().await >= self.config.max_sessions {
                 return Err(anyhow!(
                     "Maximum number of active sessions reached ({})",
                     self.config.max_sessions
@@ -4715,13 +5677,24 @@ impl ChatManager {
             request.access,
             super::neutral_place::is_neutral_path(&request.cwd),
         );
+        // The record both engines keep (`session_record`): the title and preview come
+        // from the opening message as typed, and the memory conversation is named
+        // here (a relayed session keeps the one it continues).
+        let title_preview = super::session_record::title_and_preview(&request.message);
+        let conversation_id = relay.and_then(|r| r.conversation_id.clone()).or_else(|| {
+            self.memory_config.as_ref().map(|cfg| {
+                ConversationMemoryManager::new(cfg.clone())
+                    .conversation_id()
+                    .to_string()
+            })
+        });
         let session_node = ChatSessionNode {
             id: session_id,
             cli_session_id: None,
             project_slug: project_slug.clone(),
             workspace_slug: request.workspace_slug.clone(),
             cwd: request.cwd.clone(),
-            title: None,
+            title: title_preview.as_ref().map(|(t, _)| t.clone()),
             model: model.clone(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -4729,9 +5702,8 @@ impl ChatManager {
             // `user_message`); every later one bumps the count.
             message_count: 1,
             total_cost_usd: None,
-            // A relayed session keeps the memory conversation of the one it continues.
-            conversation_id: relay.and_then(|r| r.conversation_id.clone()),
-            preview: None,
+            conversation_id: conversation_id.clone(),
+            preview: title_preview.map(|(_, p)| p),
             permission_mode: request.permission_mode.clone(),
             add_dirs: if resolved_add_dirs.is_empty() {
                 None
@@ -4958,37 +5930,18 @@ impl ChatManager {
         }
 
         // Create ConversationMemoryManager for message recording
-        let memory_manager = if let Some(ref mem_config) = self.memory_config {
-            // A relayed session records into the conversation it continues.
-            let mm = match relay.and_then(|r| r.conversation_id.clone()) {
-                Some(kept) => {
-                    ConversationMemoryManager::new(mem_config.clone()).with_conversation_id(kept)
-                }
-                None => ConversationMemoryManager::new(mem_config.clone()),
-            };
-            let conversation_id = mm.conversation_id().to_string();
-            debug!(
-                "Created ConversationMemoryManager for session {} with conversation_id {}",
-                session_id, conversation_id
-            );
-
-            // Persist conversation_id in Neo4j
-            let _ = self
-                .graph
-                .update_chat_session(
-                    session_id,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(conversation_id),
-                    None,
-                )
-                .await;
-
-            Some(Arc::new(Mutex::new(mm)))
-        } else {
-            None
+        // It records into the conversation named on the node at creation.
+        let memory_manager = match (&self.memory_config, &conversation_id) {
+            (Some(mem_config), Some(conversation_id)) => {
+                let mm = ConversationMemoryManager::new(mem_config.clone())
+                    .with_conversation_id(conversation_id.clone());
+                debug!(
+                    "Created ConversationMemoryManager for session {} with conversation_id {}",
+                    session_id, conversation_id
+                );
+                Some(Arc::new(Mutex::new(mm)))
+            }
+            _ => None,
         };
 
         // Clone the stdin sender BEFORE wrapping client in Arc<Mutex<>>.
@@ -5168,6 +6121,12 @@ impl ChatManager {
             self.active_sessions.clone(),
             nats_cancel.clone(),
         );
+        // cancel_task asked on another instance (request/reply).
+        self.spawn_nats_cancel_task_listener(
+            &session_id.to_string(),
+            self.active_sessions.clone(),
+            nats_cancel.clone(),
+        );
 
         // Spawn the per-session background-tasks poller (T12 of plan
         // 754a1379). Wakes up every BACKGROUND_TASKS_POLL_INTERVAL_SECS
@@ -5271,36 +6230,7 @@ impl ChatManager {
             );
         }
 
-        // Auto-generate title and preview from the first user message — what the
-        // user typed, never the `<po-refs>`/`<po-attachments>` blocks around it.
-        {
-            let typed = crate::refs::turn::visible_text(&request.message);
-            let msg = &typed;
-            let title = if msg.chars().count() > 80 {
-                let truncated: String = msg.chars().take(77).collect();
-                format!("{}...", truncated.trim_end())
-            } else {
-                msg.to_string()
-            };
-            let preview = if msg.chars().count() > 200 {
-                let truncated: String = msg.chars().take(197).collect();
-                format!("{}...", truncated.trim_end())
-            } else {
-                msg.to_string()
-            };
-            let _ = self
-                .graph
-                .update_chat_session(
-                    session_id,
-                    None,
-                    Some(title),
-                    None,
-                    None,
-                    None,
-                    Some(preview),
-                )
-                .await;
-        }
+        // The title and preview were set on the node at creation (`session_record`).
 
         // Send the initial message and start streaming in a background task
         let session_id_str = session_id.to_string();
@@ -5479,6 +6409,7 @@ impl ChatManager {
                     pid: None,
                     parent_tool_use_id: parent_tool_use_id.map(String::from),
                     pending_removal_at: None,
+                    signalled: false,
                 }
             });
 
@@ -5491,6 +6422,7 @@ impl ChatManager {
             // surprises us with a fresh ToolUse on the same id, cancel
             // the pending removal — the task is alive after all.
             entry.pending_removal_at = None;
+            entry.signalled = false;
 
             let snap = tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>();
             (snap, was_vacant)
@@ -5601,7 +6533,28 @@ impl ChatManager {
             return;
         };
 
-        // Update the task's pid and capture a fresh snapshot.
+        // Update the task's pid and capture a fresh snapshot. A task stopped
+        // before its pid was known (`cancel_task` within the claim's first
+        // second: marked `pending_removal_at`, nothing signalled) is signalled
+        // here, once: nothing else would, and a `cancel_task` asked again finds
+        // it signalled (review of #691, finding 1).
+        //
+        // Only when the claim is unambiguous (review of #694, point 2): several new
+        // processes in the same second (two tools started together) means the
+        // first candidate may be the neighbour's. The pid is still recorded, as
+        // before, but nothing is sent automatically: the task stays marked
+        // stopping and NOT signalled, so an explicit Stop asked again signals it
+        // (it is not the no-op), as before #691.
+        let unambiguous = candidates.len() == 1;
+        if !unambiguous {
+            debug!(
+                session_id = %session_id,
+                tool_use_id = %tool_use_id,
+                candidates = candidates.len(),
+                "async_pid_claim: several new processes; a stop before the claim is left to an explicit Stop"
+            );
+        }
+        let mut stop_now = false;
         let snapshot = {
             let sessions = active_sessions.read().await;
             let Some(active) = sessions.get(&session_id) else {
@@ -5618,8 +6571,23 @@ impl ChatManager {
                 return;
             };
             task.pid = Some(claimed);
+            if unambiguous && task.pending_removal_at.is_some() && !task.signalled {
+                task.signalled = true;
+                stop_now = true;
+            }
             tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>()
         };
+
+        if stop_now {
+            let killed = Self::kill_subtree(claimed);
+            info!(
+                session_id = %session_id,
+                tool_use_id = %tool_use_id,
+                root_pid = claimed,
+                killed_count = killed.len(),
+                "async_pid_claim: the task was stopped before its pid was known: SIGINT'd subtree"
+            );
+        }
 
         info!(
             session_id = %session_id,
@@ -5729,6 +6697,7 @@ impl ChatManager {
                     pid: None,
                     parent_tool_use_id: Some(correlation_id.to_string()),
                     pending_removal_at: None,
+                    signalled: false,
                 },
             );
             info!(
@@ -5856,6 +6825,10 @@ impl ChatManager {
                     cli_reports_live_tasks,
                 ) {
                     info.pending_removal_at = Some(now_inst);
+                    // Found dead: no signal may go to its pid any more (it may
+                    // name another process by now). A `cancel_task` before the
+                    // purge is the no-op (review of #694, point 1).
+                    info.signalled = true;
                     newly_marked += 1;
                 }
             }
@@ -6071,6 +7044,9 @@ impl ChatManager {
         let session_uuid = Uuid::parse_str(&session_id).ok();
         let mut assistant_text_parts: Vec<String> = Vec::new();
         let mut events_to_persist: Vec<ChatEventRecord> = Vec::new();
+        // When each tool call of the turn really ran (`tool_clock`): a `tool_timing`
+        // is stored and sent right after the result or the cancellation it times.
+        let tool_clock = super::tool_clock::ToolClock::for_session(&session_id);
 
         // What the CLI is given: the prompt as one string, or — with images — the
         // text and image blocks, checked by nexus (`agent_runtime::CliInput`). An
@@ -6209,12 +7185,18 @@ impl ChatManager {
                                      so next message triggers resume_session",
                                     session_id, err_str
                                 );
-                                active_sessions.write().await.remove(&session_id);
-                                notify_attention(
-                                    &event_emitter,
-                                    AttentionSubject::Session(session_id.to_string()),
-                                    AttentionReason::SessionInactive,
-                                );
+                                // Only the entry of THIS client: a resume that
+                                // replaced it meanwhile keeps its session and its
+                                // NATS listeners (review of #685, finding 2).
+                                if Self::forget_if_client(&active_sessions, &session_id, &client)
+                                    .await
+                                {
+                                    notify_attention(
+                                        &event_emitter,
+                                        AttentionSubject::Session(session_id.to_string()),
+                                        AttentionReason::SessionInactive,
+                                    );
+                                }
                             }
 
                             emit_chat(
@@ -6266,6 +7248,7 @@ impl ChatManager {
                                               current_parent: Option<String>|
                      -> Option<ChatEvent> {
                         let event = parse_permission_control_msg(&control_msg, current_parent)?;
+                        tool_clock.observe(&event, chrono::Utc::now());
 
                         match &event {
                             ChatEvent::PermissionRequest { id, tool, .. } => {
@@ -6751,6 +7734,8 @@ impl ChatManager {
                                         pending_tool_calls.remove(id);
                                     }
 
+                                    let timing = tool_clock.observe(&event, chrono::Utc::now());
+
                                     // Persist structured events (skip transient: stream_delta, streaming_status)
                                     if !matches!(
                                         event,
@@ -6845,6 +7830,23 @@ impl ChatManager {
                                     }
 
                                     emit_chat(event, &events_tx, &nats, &session_id);
+                                    // The timing of the call this event ended: stored in the
+                                    // turn's batch right after it, sent right after it.
+                                    if let Some(timing) = timing {
+                                        if let Some(uuid) = session_uuid {
+                                            events_to_persist.push(ChatEventRecord {
+                                                id: Uuid::new_v4(),
+                                                session_id: uuid,
+                                                seq: next_seq.fetch_add(1, Ordering::SeqCst),
+                                                event_type: timing.event_type().to_string(),
+                                                data: serde_json::to_string(&timing)
+                                                    .unwrap_or_default(),
+                                                created_at: chrono::Utc::now(),
+                                            });
+                                        }
+                                        streaming_events.lock().await.push(timing.clone());
+                                        emit_chat(timing, &events_tx, &nats, &session_id);
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -6870,12 +7872,21 @@ impl ChatManager {
                                              active_sessions so the next message resumes it",
                                             session_id
                                         );
-                                        active_sessions.write().await.remove(&session_id);
-                                        notify_attention(
-                                            &event_emitter,
-                                            AttentionSubject::Session(session_id.to_string()),
-                                            AttentionReason::SessionInactive,
-                                        );
+                                        // Only the entry of THIS client (review of
+                                        // #685, finding 2).
+                                        if Self::forget_if_client(
+                                            &active_sessions,
+                                            &session_id,
+                                            &client,
+                                        )
+                                        .await
+                                        {
+                                            notify_attention(
+                                                &event_emitter,
+                                                AttentionSubject::Session(session_id.to_string()),
+                                                AttentionReason::SessionInactive,
+                                            );
+                                        }
                                     }
                                     emit_chat(
                                         ChatEvent::Error {
@@ -7826,7 +8837,11 @@ impl ChatManager {
             "Sending permission control response to CLI (via stdin_tx, lock-free)"
         );
 
+        // On the tool clock BEFORE the CLI has it: a fast tool's result cannot overtake it.
+        let tool_clock = super::tool_clock::ToolClock::for_session(session_id);
+        let mark = tool_clock.decided(request_id, allow, chrono::Utc::now());
         if let Err(e) = stdin_tx.send(json).await {
+            tool_clock.undecided(request_id, mark);
             restore_claim(claimed).await;
             return Err(PermissionDeliveryError::Failed(anyhow!(
                 "Failed to send permission control response: {}",
@@ -7974,6 +8989,10 @@ impl ChatManager {
     /// Removes a legacy session from `active_sessions` when its CLI process is
     /// gone (stdout at EOF). A session being streamed holds the client lock and
     /// is left alone: its own stream reports a death.
+    ///
+    /// Only the entry whose CLI was found dead is removed: if a resume replaced it
+    /// meanwhile (between the read and the write lock), the new session and its
+    /// NATS listeners are left alone (review of #673, finding 4).
     pub(crate) async fn evict_if_cli_dead(&self, session_id: &str) -> bool {
         let client = match self.active_sessions.read().await.get(session_id) {
             Some(s) => s.client.clone(),
@@ -7983,14 +9002,46 @@ impl ChatManager {
             Ok(c) => !c.is_alive().await,
             Err(_) => false,
         };
-        if dead {
-            warn!(
-                session_id = %session_id,
-                "CLI process is gone, dropping the session from active_sessions so the message resumes it"
-            );
-            self.active_sessions.write().await.remove(session_id);
+        if !dead || !Self::forget_if_client(&self.active_sessions, session_id, &client).await {
+            return false;
         }
-        dead
+        warn!(
+            session_id = %session_id,
+            "CLI process is gone, dropped the session from active_sessions so the message resumes it"
+        );
+        true
+    }
+
+    /// Removes a legacy session from `active_sessions` AND ends its per-session
+    /// NATS listeners (`nats_cancel`), only while the entry is still the one of
+    /// `client` (`Arc::ptr_eq`, under the write lock): a resume that replaced it
+    /// keeps its session and its listeners (review of #673, finding 4; of #685,
+    /// finding 2). Whether it was removed.
+    ///
+    /// A removal that leaves the listeners running keeps an instance answering for
+    /// a session it no longer holds: after a resume on another instance, its `gone`
+    /// could reach a canceller before the real owner's answer (review N1 of #663).
+    /// Every removal of a dead CLI goes through here; the others cancel
+    /// `nats_cancel` themselves (`close_session`, a replaced session).
+    async fn forget_if_client(
+        active_sessions: &RwLock<HashMap<String, ActiveSession>>,
+        session_id: &str,
+        client: &Arc<Mutex<InteractiveClient>>,
+    ) -> bool {
+        let removed = {
+            let mut sessions = active_sessions.write().await;
+            match sessions.get(session_id) {
+                Some(s) if Arc::ptr_eq(&s.client, client) => sessions.remove(session_id),
+                _ => None,
+            }
+        };
+        match removed {
+            Some(session) => {
+                session.nats_cancel.cancel();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Deliver a user message: local CLI -> owning instance (NATS) ->
@@ -8746,6 +9797,12 @@ impl ChatManager {
                 }],
             );
         }
+        // PreToolUse → the session's tool clock notes when the engine takes a call up
+        // (every session, runner or not: it adds nothing to the context).
+        super::tool_clock::clock_the_table(
+            &mut hooks,
+            super::tool_clock::ToolClock::for_session(&session_id),
+        );
         hooks
     }
 
@@ -8840,6 +9897,10 @@ impl ChatManager {
         user_claims: Option<&crate::auth::jwt::Claims>,
     ) -> Result<()> {
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
+        // The live handle (if any) this resume starts from, read before anything awaits: a
+        // resume that finds ANOTHER one once it holds the session's lock was overtaken by
+        // a resume that succeeded meanwhile (review of #696, finding 1).
+        let seen = self.agent_runtime.get(session_id).await;
 
         // Load session from Neo4j
         let mut session_node = self
@@ -8896,7 +9957,7 @@ impl ChatManager {
                 ));
             }
             return self
-                .resume_agent_session(&session_node, message, user_claims)
+                .resume_agent_session(&session_node, message, user_claims, seen)
                 .await;
         }
 
@@ -9241,6 +10302,11 @@ impl ChatManager {
             self.active_sessions.clone(),
             nats_cancel.clone(),
         );
+        self.spawn_nats_cancel_task_listener(
+            session_id,
+            self.active_sessions.clone(),
+            nats_cancel.clone(),
+        );
 
         // Spawn the per-session background-tasks poller (T12 of plan
         // 754a1379). Mirror of `create_session` — without this spawn,
@@ -9296,6 +10362,11 @@ impl ChatManager {
             created_at: chrono::Utc::now(),
         };
         let _ = self.graph.store_chat_events(uuid, vec![user_event]).await;
+        // The message that resumes the session is a user message: it counts
+        // (`session_record`), as on the agent engine.
+        if let Err(e) = super::session_record::count_user_message(&self.graph, uuid).await {
+            warn!(session_id, error = %e, "Failed to count the resuming message (non-fatal)");
+        }
 
         // Emit user_message on local broadcast + NATS
         let user_msg_event = ChatEvent::UserMessage {
@@ -9523,18 +10594,11 @@ impl ChatManager {
                 .find(|m| m.role == "user")
                 .map(|m| m.content.clone());
 
-            if let Some(content) = first_user_msg {
-                let chars: Vec<char> = content.chars().collect();
-                let title = if chars.len() > 80 {
-                    format!("{}...", chars[..77].iter().collect::<String>().trim_end())
-                } else {
-                    content.clone()
-                };
-                let preview = if chars.len() > 200 {
-                    format!("{}...", chars[..197].iter().collect::<String>().trim_end())
-                } else {
-                    content
-                };
+            // The title rule of every session (`session_record`).
+            if let Some((title, preview)) = first_user_msg
+                .as_deref()
+                .and_then(super::session_record::title_and_preview)
+            {
                 let _ = self
                     .graph
                     .update_chat_session(
@@ -9552,6 +10616,130 @@ impl ChatManager {
         }
 
         Ok(count)
+    }
+
+    /// Brings the record of the sessions the agent engine served before it kept one
+    /// (P8) to what it would hold today (`session_record`), from their persisted
+    /// events: `message_count` = their `user_message` events (raised, never lowered),
+    /// `total_cost_usd` from their `result` events when the record has none, and the
+    /// title and preview of their first user message when they have none.
+    /// Idempotent: a second run changes nothing. A session of the legacy engine (no
+    /// provider snapshot) is left alone, that engine kept its record; a live one too.
+    /// Returns the number of sessions updated.
+    ///
+    /// Run it AT REST, or on the instance that holds the live sessions: it skips the
+    /// sessions live on THIS instance only. A session live on another instance
+    /// (NATS) can still be counted twice until the cluster-wide follow-up (plan
+    /// 5ad54c48-6317-4dc0-ad99-096242cc038d) lands.
+    pub async fn backfill_agent_session_records(&self) -> Result<usize> {
+        use super::session_record::{next_total_cost, title_and_preview, CostFigure};
+        const PAGE: usize = 200;
+        // Listed in full first: the list is ordered by `updated_at`, which each
+        // write below changes (paging while writing would skip sessions).
+        let mut sessions = Vec::new();
+        let mut offset = 0;
+        loop {
+            let (page, _) = self
+                .graph
+                .list_chat_sessions(None, None, PAGE, offset, true)
+                .await
+                .context("Failed to list sessions")?;
+            let fetched = page.len();
+            offset += fetched;
+            // The sessions the agent engine served: it alone stores their provider
+            // snapshot (`finish_agent_open`), Claude Code forced onto it included;
+            // and any other provider than Claude Code (only the agent engine serves
+            // one), in case that snapshot write failed.
+            sessions.extend(page.into_iter().filter(|s| {
+                s.capabilities.is_some()
+                    || s.provider_id
+                        .as_deref()
+                        .is_some_and(|p| p != super::provider::resolver::CLAUDE_CODE)
+            }));
+            if fetched < PAGE {
+                break;
+            }
+        }
+        let mut updated = 0;
+        for session in sessions {
+            // A live session keeps its own record: its handle may be between the
+            // event and the write (`user_message` stored, count not yet bumped; a
+            // `result` stored, cost not yet added), the backfill would count it twice.
+            if self.agent_runtime.owns(&session.id.to_string()).await {
+                continue;
+            }
+            let provider_id = session.provider_id.as_deref().unwrap_or_default();
+            let events = self.graph.get_chat_events(session.id, -1, 100_000).await?;
+            let parsed: Vec<ChatEvent> = events
+                .iter()
+                .filter(|e| e.event_type == "user_message" || e.event_type == "result")
+                .filter_map(|e| serde_json::from_str(&e.data).ok())
+                .collect();
+            let users: Vec<&str> = parsed
+                .iter()
+                .filter_map(|e| match e {
+                    ChatEvent::UserMessage { content } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let message_count = i64::try_from(users.len())
+                .ok()
+                .filter(|n| *n > session.message_count);
+            let total_cost_usd = if session.total_cost_usd.is_none() {
+                // A Claude Code on another machine reports the session's total.
+                let figure = match super::provider::store::instance(
+                    self.graph.as_ref(),
+                    provider_id,
+                )
+                .await
+                {
+                    Ok(Some(record))
+                        if record.kind == super::provider::settings::KIND_CLAUDE_CODE_REMOTE =>
+                    {
+                        CostFigure::SessionTotal
+                    }
+                    // Claude Code forced onto the agent engine: the CLI's total too.
+                    _ if provider_id == super::provider::resolver::CLAUDE_CODE => {
+                        CostFigure::SessionTotal
+                    }
+                    _ => CostFigure::Turn,
+                };
+                parsed
+                    .iter()
+                    .filter_map(|e| match e {
+                        ChatEvent::Result { cost_usd, .. } => Some(*cost_usd),
+                        _ => None,
+                    })
+                    .fold(None, |total, usd| {
+                        next_total_cost(total, usd, figure).or(total)
+                    })
+            } else {
+                None
+            };
+            let (title, preview) = match (&session.title, users.first()) {
+                (None, Some(first)) => match title_and_preview(first) {
+                    Some((t, p)) => (Some(t), Some(p)),
+                    None => (None, None),
+                },
+                _ => (None, None),
+            };
+            if message_count.is_none() && total_cost_usd.is_none() && title.is_none() {
+                continue;
+            }
+            self.graph
+                .update_chat_session(
+                    session.id,
+                    None,
+                    title,
+                    message_count,
+                    total_cost_usd,
+                    None,
+                    preview,
+                )
+                .await?;
+            updated += 1;
+        }
+        Ok(updated)
     }
 
     /// Search messages across all sessions via Meilisearch full-text search.
@@ -10109,10 +11297,13 @@ impl ChatManager {
     ///
     /// ## Cross-instance routing
     ///
-    /// If the session is not local, the request is propagated via NATS
-    /// `chat.{session_id}.cancel_tools` so the owning instance executes
-    /// the SIGINT. The local rate cap still applies to prevent flooding
-    /// NATS itself.
+    /// If the session is not local, the request goes over NATS
+    /// (`events.chat.{session_id}.cancel_tools`, request/reply) to the owning
+    /// instance, which applies ITS cap, stops the tools and answers what it did
+    /// or its typed refusal; no answer is a typed error (`cancel_relay`:
+    /// `owner_unreachable`, `owner_timeout`, `session_gone`, `owner_protocol`),
+    /// never a success. A session no instance holds is `owner_unreachable`, with or without NATS (one
+    /// rule for every topology, review N2).
     pub async fn cancel_running_tools(&self, session_id: &str) -> Result<CancelToolsResult> {
         // The agent engine: the session handle stops the tools through the
         // provider (`AgentSession::cancel_tools`, scope all), under the same
@@ -10144,20 +11335,25 @@ impl ChatManager {
         let (cli_pid, history, cap, window, events_tx) = match session_state {
             Some(state) => state,
             None => {
-                // Session not local — still enforce a "soft" cap by
-                // doing nothing locally; remote owner has its own cap.
-                debug!(
-                    session_id = %session_id,
-                    "cancel_running_tools: session not active locally; routing via NATS only"
-                );
+                // Session not local: the instance that holds it answers over NATS
+                // (request/reply, its cap applies) with what it did, its refusal, or
+                // the typed reason there is no answer (`cancel_relay`) — never a
+                // success it did not report.
                 if let Some(ref nats) = self.nats {
-                    nats.publish_cancel_tools(session_id);
+                    return super::cancel_relay::relay(
+                        nats,
+                        nats.cancel_tools_subject(session_id),
+                        serde_json::json!({}),
+                        super::cancel_relay::CancelKind::Tools,
+                    )
+                    .await;
                 }
-                return Ok(CancelToolsResult {
-                    cli_pid: None,
-                    killed_pids: Vec::new(),
-                    capped: false,
-                });
+                // Single instance: no instance holds it live — the same typed answer
+                // as with NATS and nobody answering (`owner_unreachable`).
+                debug!(session_id = %session_id, "cancel_running_tools: no such live session");
+                return Err(anyhow::Error::new(
+                    super::cancel_relay::CancelRelayError::OwnerUnreachable,
+                ));
             }
         };
 
@@ -10199,12 +11395,12 @@ impl ChatManager {
         };
         let _ = events_tx.send(event.clone());
 
-        // Cross-instance fan-out — both the cancel SIGNAL (so the
-        // owning instance executes the SIGINT if remote) and the
-        // ChatEvent (so remote clients of this session see the cancel
-        // in their feed).
+        // Cross-instance fan-out of the ChatEvent (so remote clients of this
+        // session see the cancel in their feed). NOT the cancel signal: this
+        // instance holds the session and just did it; publishing it reached this
+        // instance's own listener, which signalled the tools a second time and
+        // counted the cap twice (review N8).
         if let Some(ref nats) = self.nats {
-            nats.publish_cancel_tools(session_id);
             nats.publish_chat_event(session_id, event);
         }
 
@@ -10233,9 +11429,9 @@ impl ChatManager {
     /// 3. If `pid.is_none()` (claim race — `track_background_task_start`
     ///    spawned the async claim but it hasn't fired yet, OR the
     ///    subprocess crashed before pgrep saw it): logs a warning and
-    ///    falls back to V1 map-side-only cancel. `killed_pids` is empty
-    ///    in this edge case — the user can fall back to the global
-    ///    `cancel_running_tools` if needed.
+    ///    marks it only. `killed_pids` is empty in this edge case; the
+    ///    claim, when it finds the pid of a task marked stopping, sends the
+    ///    SIGINT itself (review of #691, finding 1).
     /// 4. Broadcasts a fresh `ChatEvent::ActiveTasksUpdate` so the
     ///    frontend immediately reflects the cancelled state.
     ///
@@ -10253,11 +11449,21 @@ impl ChatManager {
     ///
     /// ## NATS routing
     ///
-    /// Cross-instance: if the session is owned by another instance,
-    /// publishes a `cancel_task` event over NATS so the owning instance
-    /// performs the local map mutation. (Mirror of
-    /// `publish_cancel_tools` — added in a follow-up alongside the
-    /// listener wiring.)
+    /// Cross-instance: if no session of this instance holds it, the request
+    /// goes over NATS (`events.chat.{id}.cancel_task`, request/reply) to the
+    /// instance that does — Claude Code (`spawn_nats_cancel_task_listener`) or
+    /// agent engine (`spawn_agent_nats_listeners`) — and its answer is returned:
+    /// what it stopped, `capped`, or its refusal (the `ProviderError` back in the
+    /// `Err`). No answer at all is a typed error (`cancel_relay`: `owner_unreachable`
+    /// when nobody subscribes, `owner_timeout`, `session_gone`, `owner_protocol`),
+    /// never a success. A session no instance holds is `owner_unreachable`, with or without NATS.
+    ///
+    /// ## Agent engine
+    ///
+    /// `AgentSessionHandle::cancel_task`: the provider stops the task
+    /// (`cancel_tools(task { id })`), a provider that cannot is a typed refusal
+    /// (`Err` holding `ProviderError::Unsupported`, `error { code: cancel_refused }`
+    /// on the wire), never a success.
     ///
     /// ## Returns
     ///
@@ -10267,12 +11473,56 @@ impl ChatManager {
     ///   path described above.
     /// - `capped: true` if the rate cap was hit (no broadcast, no map
     ///   mutation, no kill).
-    /// - Returns `Ok(...)` even if the session is unknown or the
-    ///   task_id isn't in the map (idempotent — clicking Stop twice on
-    ///   the same task is fine).
+    /// - Returns `Ok(...)` when the session is held but the task_id is
+    ///   not (idempotent — clicking Stop twice on the same task is fine);
+    ///   a session no instance holds is `Err(owner_unreachable)`.
     pub async fn cancel_task(&self, session_id: &str, task_id: &str) -> Result<CancelTaskResult> {
+        // The agent engine: the session handle stops the task through its provider
+        // (`AgentSession::cancel_tools(task { id })`), under the same per-session cap,
+        // and refuses, typed, what the provider cannot do.
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return handle.cancel_task(task_id).await;
+        }
+        if let Some(result) =
+            Self::cancel_legacy_task(&self.active_sessions, &self.nats, session_id, task_id).await
+        {
+            return Ok(result);
+        }
+        // Not held here: the instance that holds the session answers over NATS
+        // (`spawn_nats_cancel_task_listener`, `spawn_agent_nats_listeners`) with what
+        // it did, or why it could not.
+        // No answer at all is a typed error (`cancel_relay`), never a success.
+        if let Some(ref nats) = self.nats {
+            return super::cancel_relay::relay(
+                nats,
+                nats.cancel_task_subject(session_id),
+                serde_json::json!({ "task_id": task_id }),
+                super::cancel_relay::CancelKind::Task,
+            )
+            .await;
+        }
+        // Single instance: no instance holds it live — the same typed answer as
+        // with NATS and nobody answering (`owner_unreachable`).
+        debug!(
+            session_id = %session_id,
+            task_id = %task_id,
+            "cancel_task: no such live session"
+        );
+        Err(anyhow::Error::new(
+            super::cancel_relay::CancelRelayError::OwnerUnreachable,
+        ))
+    }
+
+    /// [`Self::cancel_task`] on a Claude Code session of THIS instance; `None` when
+    /// it holds no such session. Callable without the manager (the NATS listener).
+    async fn cancel_legacy_task(
+        active_sessions: &RwLock<HashMap<String, ActiveSession>>,
+        nats: &Option<Arc<crate::events::NatsEmitter>>,
+        session_id: &str,
+        task_id: &str,
+    ) -> Option<CancelTaskResult> {
         let session_state = {
-            let sessions = self.active_sessions.read().await;
+            let sessions = active_sessions.read().await;
             sessions.get(session_id).map(|s| {
                 (
                     s.cancel_task_history.clone(),
@@ -10284,53 +11534,55 @@ impl ChatManager {
             })
         };
 
-        let (history, cap, window, events_tx, tasks_arc) = match session_state {
-            Some(state) => state,
-            None => {
+        let (history, cap, window, events_tx, tasks_arc) = session_state?;
+
+        let no_op = |capped: bool| CancelTaskResult {
+            task_id: task_id.to_string(),
+            killed_pids: Vec::new(),
+            capped,
+        };
+
+        // One critical section on the task map for the whole decision: whether
+        // the task was already signalled, the rate cap, the mark and the pid.
+        //
+        // - A task already SIGNALLED (by a stop that knew its pid, or by the PID
+        //   claim for a stop that came first) is a no-op, not counted in the cap:
+        //   a retry after a `session_gone` / `owner_timeout` from a real owner
+        //   that did stop it, a second click, or a concurrent cancel waiting on
+        //   this lock, never SIGINTs the same pid twice (reviews of #685,
+        //   finding 3, and of #691, findings 1 and 2).
+        // - A task marked stopping but NOT signalled (stopped before its pid was
+        //   known, or marked by the death poller) is not a no-op: it is signalled
+        //   now if its pid is known; otherwise the PID claim will do it.
+        // - Marking and reading the pid together means a concurrent claim cannot
+        //   populate the pid AFTER we read it (plan fc35b25e, T4).
+        // Lock order: tasks, then the cap history (taken nowhere else first).
+        let (snapshot, task_pid) = {
+            let mut tasks = tasks_arc.lock().await;
+            if tasks.get(task_id).is_some_and(|t| t.signalled) {
                 debug!(
                     session_id = %session_id,
                     task_id = %task_id,
-                    "cancel_task: session not active locally; idempotent no-op"
+                    "cancel_task: already signalled; idempotent no-op"
                 );
-                if let Some(ref _nats) = self.nats {
-                    // TODO follow-up: nats.publish_cancel_task(session_id, task_id)
-                    // once the cross-instance listener exists.
-                }
-                return Ok(CancelTaskResult {
-                    task_id: task_id.to_string(),
-                    killed_pids: Vec::new(),
-                    capped: false,
-                });
+                return Some(no_op(false));
             }
-        };
-
-        // Rate cap.
-        let capped = !Self::check_and_record_cancel_cap(&history, cap, window).await;
-        if capped {
-            warn!(
-                session_id = %session_id,
-                task_id = %task_id,
-                cap = cap,
-                window_secs = window.as_secs(),
-                "cancel_task: rate cap hit, refusing"
-            );
-            return Ok(CancelTaskResult {
-                task_id: task_id.to_string(),
-                killed_pids: Vec::new(),
-                capped: true,
-            });
-        }
-
-        // V2 (plan fc35b25e, T4): atomically extract the task's pid AND
-        // mark for removal under a single tasks-lock op, then capture the
-        // snapshot for broadcast. Doing both in the same critical section
-        // ensures a concurrent claim-update from `async_pid_claim` cannot
-        // populate the pid AFTER we read it.
-        let (snapshot, task_pid) = {
-            let mut tasks = tasks_arc.lock().await;
+            if !Self::check_and_record_cancel_cap(&history, cap, window).await {
+                warn!(
+                    session_id = %session_id,
+                    task_id = %task_id,
+                    cap = cap,
+                    window_secs = window.as_secs(),
+                    "cancel_task: rate cap hit, refusing"
+                );
+                return Some(no_op(true));
+            }
             let pid = if let Some(entry) = tasks.get_mut(task_id) {
-                entry.pending_removal_at = Some(std::time::Instant::now());
+                entry
+                    .pending_removal_at
+                    .get_or_insert_with(std::time::Instant::now);
                 let captured = entry.pid;
+                entry.signalled = captured.is_some();
                 info!(
                     session_id = %session_id,
                     task_id = %task_id,
@@ -10354,7 +11606,8 @@ impl ChatManager {
         };
 
         // V2: SIGINT the subtree if the async claim populated a pid;
-        // otherwise log a warning and fall back to map-side-only cancel.
+        // otherwise the claim signals it when it finds the pid (the task is
+        // marked stopping), and this answer has no pid.
         let killed_pids = match task_pid {
             Some(root_pid) => {
                 let killed = Self::kill_subtree(root_pid);
@@ -10371,7 +11624,7 @@ impl ChatManager {
                 warn!(
                     session_id = %session_id,
                     task_id = %task_id,
-                    "cancel_task: no PID stored (claim race or subprocess crashed before discovery), map-side only"
+                    "cancel_task: no PID stored yet (claim pending: it signals the task when it finds the pid; or the subprocess crashed before discovery)"
                 );
                 Vec::new()
             }
@@ -10379,12 +11632,11 @@ impl ChatManager {
 
         let event = ChatEvent::ActiveTasksUpdate { tasks: snapshot };
         let _ = events_tx.send(event.clone());
-        if let Some(ref nats) = self.nats {
+        if let Some(nats) = nats {
             nats.publish_chat_event(session_id, event);
-            // TODO follow-up: nats.publish_cancel_task(session_id, task_id);
         }
 
-        Ok(CancelTaskResult {
+        Some(CancelTaskResult {
             task_id: task_id.to_string(),
             killed_pids,
             capped: false,
@@ -10402,6 +11654,9 @@ impl ChatManager {
     /// toolbar indicator and any in-progress MonitorCards before the
     /// next `ChatEvent::ActiveTasksUpdate` lands.
     pub async fn get_active_background_tasks(&self, session_id: &str) -> Vec<BackgroundTaskInfo> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return handle.active_background_tasks().await;
+        }
         // Drop the read lock on `active_sessions` before taking the
         // per-session mutex to avoid holding two locks simultaneously
         // and keep the borrow-checker happy (the inner Arc clone moves
@@ -10488,7 +11743,11 @@ impl ChatManager {
             };
 
             loop {
+                // `biased`: a listener whose session was removed (its token
+                // cancelled) stops before reading a request it would answer
+                // `gone` (review of #673, finding 1).
                 tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => {
                         debug!(
                             "NATS cancel_tools listener cancelled for session {} (session replaced)",
@@ -10497,7 +11756,12 @@ impl ChatManager {
                         break;
                     }
                     msg = subscriber.next() => {
-                        let Some(_msg) = msg else { break; };
+                        let Some(msg) = msg else { break; };
+                        // A request (`cancel_running_tools` on another instance)
+                        // gets an answer; a plain publish (the local path's
+                        // fan-out) does not.
+                        let reply_to = msg.reply;
+                        let asker_v2 = super::cancel_relay::asker_v2(&msg.payload);
 
                         // Pull the session's cli_pid + cap state (or stop
                         // if the session was removed locally).
@@ -10517,6 +11781,16 @@ impl ChatManager {
                                 "Session {} no longer active, stopping NATS cancel_tools listener",
                                 session_id
                             );
+                            // The asker learns it at once, typed (`session_gone`).
+                            if let Some(reply_to) = reply_to {
+                                super::cancel_relay::publish(
+                                    &nats,
+                                    reply_to,
+                                    asker_v2,
+                                    &super::cancel_relay::CancelReply::<CancelToolsResult>::Gone,
+                                )
+                                .await;
+                            }
                             break;
                         };
 
@@ -10524,23 +11798,121 @@ impl ChatManager {
                         // against a remote instance flooding the NATS
                         // subject. Mirrors the cap applied by the
                         // local-path of `cancel_running_tools`.
-                        if !Self::check_and_record_cancel_cap(&history, cap, window).await {
+                        let capped = !Self::check_and_record_cancel_cap(&history, cap, window).await;
+                        let killed = if capped {
                             warn!(
                                 session_id = %session_id,
                                 cap = cap,
                                 window_secs = window.as_secs(),
                                 "NATS cancel_tools listener: rate cap hit, dropping signal"
                             );
-                            continue;
+                            Vec::new()
+                        } else {
+                            let killed = Self::kill_descendants(cli_pid);
+                            info!(
+                                session_id = %session_id,
+                                cli_pid = ?cli_pid,
+                                descendant_count = killed.len(),
+                                "NATS cancel_tools received, SIGINT sent to descendants"
+                            );
+                            killed
+                        };
+                        if let Some(reply_to) = reply_to {
+                            let result = CancelToolsResult {
+                                cli_pid,
+                                killed_pids: killed,
+                                capped,
+                            };
+                            super::cancel_relay::publish(
+                                &nats,
+                                reply_to,
+                                asker_v2,
+                                &super::cancel_relay::CancelReply::Result(result),
+                            )
+                            .await;
                         }
+                    }
+                }
+            }
+        });
+    }
 
-                        let killed = Self::kill_descendants(cli_pid);
-                        info!(
-                            session_id = %session_id,
-                            cli_pid = ?cli_pid,
-                            descendant_count = killed.len(),
-                            "NATS cancel_tools received, SIGINT sent to descendants"
+    /// Spawn the per-session NATS responder for `cancel_task` asked on another
+    /// instance (P12): request/reply on `events.chat.{id}.cancel_task`, answered
+    /// with what [`Self::cancel_legacy_task`] did here (`cancel_relay::CancelReply`) —
+    /// the cap applies on this side, as for a local call. One task per request,
+    /// bounded by `OWNER_CANCEL_BOUND`. When the session has left: `gone`, then the
+    /// listener ends.
+    fn spawn_nats_cancel_task_listener(
+        &self,
+        session_id: &str,
+        active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+        cancel: CancellationToken,
+    ) {
+        let Some(nats) = self.nats.clone() else {
+            return;
+        };
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            let mut subscriber = match nats.subscribe_cancel_task(&session_id).await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    warn!(session_id = %session_id, "Failed to subscribe to NATS cancel_task: {}", e);
+                    return;
+                }
+            };
+            let nats_opt = Some(Arc::clone(&nats));
+            loop {
+                // `biased`: see `spawn_nats_cancel_tools_listener`.
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    msg = subscriber.next() => {
+                        let Some(msg) = msg else { break };
+                        let Some(reply_to) = msg.reply else { continue };
+                        let task_id = super::cancel_relay::task_id_of(&msg.payload);
+                        let asker_v2 = super::cancel_relay::asker_v2(&msg.payload);
+                        // The session left this instance (a removal path that did not
+                        // end this listener): `gone`, which the asker only keeps if no
+                        // instance holding the session answers (`GONE_GRACE`).
+                        if !active_sessions.read().await.contains_key(&session_id) {
+                            super::cancel_relay::publish(
+                                &nats,
+                                reply_to,
+                                asker_v2,
+                                &super::cancel_relay::CancelReply::<CancelTaskResult>::Gone,
+                            )
+                            .await;
+                            break;
+                        }
+                        // One task per request, bounded: a slow cancel never holds
+                        // the next one, and the asker always gets an answer.
+                        let (nats, nats_opt, sessions, sid) = (
+                            Arc::clone(&nats),
+                            nats_opt.clone(),
+                            Arc::clone(&active_sessions),
+                            session_id.clone(),
                         );
+                        tokio::spawn(async move {
+                            super::cancel_relay::answer(
+                                &nats,
+                                reply_to,
+                                asker_v2,
+                                super::cancel_relay::CancelKind::Task,
+                                async {
+                                    Self::cancel_legacy_task(&sessions, &nats_opt, &sid, &task_id)
+                                        .await
+                                        .ok_or_else(|| {
+                                            anyhow::Error::new(
+                                                super::cancel_relay::CancelRelayError::SessionGone {
+                                                    kind: super::cancel_relay::CancelKind::Task,
+                                                },
+                                            )
+                                        })
+                                },
+                            )
+                            .await;
+                        });
                     }
                 }
             }
@@ -11390,6 +12762,7 @@ impl ChatManager {
             &record,
             self.vault.clone(),
             self.native_transcripts.as_deref(),
+            &self.acp,
         )
         .map_err(anyhow::Error::new)?;
         {
@@ -11428,6 +12801,29 @@ impl ChatManager {
                 "this remote instance has no working directory",
             ))
         })
+    }
+
+    /// Whether a session can be given MCP servers (the project-orchestrator server
+    /// among them): what its provider says NOW (`capabilities(model).per_session_mcp`:
+    /// declared for an ACP agent that takes none — `build_acp` —, or learned by nexus
+    /// at a refusal). A resumed session whose frozen snapshot says it carried none
+    /// (`snapshot`) is not given one either: a refusal learned before a restart is not
+    /// asked again. The snapshot also wins over a declaration changed since to
+    /// `per_session_mcp: true`: a declaration applies to the sessions opened after it
+    /// (docs/guides/providers.md, OpenClaw).
+    pub(crate) fn carries_per_session_mcp(
+        provider: &dyn nexus_claude::agent::AgentProvider,
+        model: &str,
+        snapshot: Option<&str>,
+    ) -> bool {
+        let refused_before = snapshot
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|caps| {
+                caps.get("per_session_mcp")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            == Some(false);
+        provider.capabilities(Some(model)).per_session_mcp && !refused_before
     }
 
     /// Everything that must hold before a session's content is sent to a
@@ -11585,6 +12981,7 @@ impl ChatManager {
             max_tokens,
             kind,
             remote_cwd,
+            per_session_mcp,
             hooks,
         } = i;
         // A neutral directory of the host is made on demand (new session or resume).
@@ -11616,17 +13013,24 @@ impl ChatManager {
         // The project is read before the hooks scope is consumed: it is what the consent of
         // the network tools is tied to (A28).
         let project_slug = hooks.as_ref().and_then(|scope| scope.project_slug.clone());
-        let env = self
-            .po_mcp_env(
-                Some(&mode),
-                user_claims,
-                Some(session_id),
-                access
-                    .tool_profile()
-                    .or_else(|| third_party_tool_profile(third_party, policy.mode)),
-                third_party,
+        // The PO server's environment holds a token bound to the session: minted only
+        // for a session that is given the server.
+        let po_env = if remote_cwd.is_none() && per_session_mcp {
+            Some(
+                self.po_mcp_env(
+                    Some(&mode),
+                    user_claims,
+                    Some(session_id),
+                    access
+                        .tool_profile()
+                        .or_else(|| third_party_tool_profile(third_party, policy.mode)),
+                    third_party,
+                )
+                .await,
             )
-            .await;
+        } else {
+            None
+        };
         // A remote session runs where `remote_cwd` says; the local path of the
         // project (and a local `~`) means nothing on that machine.
         let mut spec = SessionSpec::new(match remote_cwd {
@@ -11656,12 +13060,14 @@ impl ChatManager {
         }
         spec.policy = policy;
         // A remote Claude Code cannot carry an MCP server (its configuration holds
-        // the session token, which must not reach another machine's command line):
-        // the PO tools are NOT given to it, and `system_init.degraded_features`
-        // says so (`project_orchestrator_tools`).
-        if remote_cwd.is_none() {
+        // the session token, which must not reach another machine's command line),
+        // nor can an agent that refuses per-session MCP servers (OpenClaw's ACP
+        // bridge, `per_session_mcp`): the PO tools are NOT given to it, and
+        // `system_init.degraded_features` says so (`project_orchestrator_tools`,
+        // [`host_degraded`]).
+        if let Some(env) = po_env {
             spec.mcp_servers.insert(
-                "project-orchestrator".to_string(),
+                PO_MCP_SERVER.to_string(),
                 McpServerSpec::Stdio {
                     command: self.config.mcp_server_path.to_string_lossy().to_string(),
                     args: Vec::new(),
@@ -11811,6 +13217,7 @@ impl ChatManager {
         } = o;
         let provider = self.provider_for(provider_id).await?;
         let remote_cwd = self.remote_cwd_of(provider_id).await?;
+        let per_session_mcp = Self::carries_per_session_mcp(provider.as_ref(), model, None);
         let sid = session_id.to_string();
         // A run (an executor) on a remote machine that does not allow `Trust` runs under `ask`
         // instead (a pilot asking for it is refused in authorize_provider_use). Every other
@@ -11832,23 +13239,27 @@ impl ChatManager {
             }
             other => other,
         };
-        self.register_turn_router(
-            &sid,
-            provider_id,
-            model,
-            project_slug,
-            OpeningTurn {
-                explicit_model: request.model.is_some(),
-                provider_imposed: request.provider.is_some(),
-                moved_in: super::relay::moved_by_auto(relay),
-                routing_mode: request.routing_mode,
-                routing_pool: request.routing_pool.clone(),
-                permission_mode: request.permission_mode.as_deref(),
-                message: &crate::refs::turn::visible_text(&request.message),
-                next_turn: 0,
-            },
-        )
-        .await;
+        // From here, a failure undoes the router and the token (finding 5 of #682).
+        let mut cleanup = OpeningCleanup::new(&sid, &self.turn_routing);
+        let router = self
+            .register_turn_router(
+                &sid,
+                provider_id,
+                model,
+                project_slug,
+                OpeningTurn {
+                    explicit_model: request.model.is_some(),
+                    provider_imposed: request.provider.is_some(),
+                    moved_in: super::relay::moved_by_auto(relay),
+                    routing_mode: request.routing_mode,
+                    routing_pool: request.routing_pool.clone(),
+                    permission_mode: request.permission_mode.as_deref(),
+                    message: &crate::refs::turn::visible_text(&request.message),
+                    next_turn: 0,
+                },
+            )
+            .await;
+        cleanup.registered(router);
         let spec = self
             .build_agent_spec_with_access(
                 AgentSpecInput {
@@ -11863,6 +13274,7 @@ impl ChatManager {
                     max_tokens: request.max_tokens,
                     kind: provider.kind(),
                     remote_cwd: remote_cwd.as_deref(),
+                    per_session_mcp,
                     hooks: Some(AgentHookScope {
                         project_slug: project_slug.map(str::to_string),
                         task_id: request
@@ -11876,27 +13288,22 @@ impl ChatManager {
                 access,
             )
             .await?;
+        cleanup.minted(&spec, self.config.jwt_secret.as_deref());
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
-        if let Err(e) = self
-            .authorize_provider_use(ProviderUse {
-                provider_id,
-                model: spec.model.as_deref().unwrap_or(model),
-                mode: spec.policy.mode,
-                project_slug,
-                claims: request.user_claims.as_ref(),
-                session_id: &sid,
-            })
-            .await
-        {
-            crate::auth::agent_tokens::revoke_session(&sid);
-            return Err(e);
-        }
+        self.authorize_provider_use(ProviderUse {
+            provider_id,
+            model: spec.model.as_deref().unwrap_or(model),
+            mode: spec.policy.mode,
+            project_slug,
+            claims: request.user_claims.as_ref(),
+            session_id: &sid,
+        })
+        .await?;
         // Preflight at EVERY opening (A30), not only when the instance was saved:
         // is the provider reachable and logged in now?
         if provider_id != super::provider::resolver::CLAUDE_CODE {
             let health = provider.health().await;
             if health.status == nexus_claude::agent::HealthStatus::Unavailable {
-                crate::auth::agent_tokens::revoke_session(&sid);
                 return Err(anyhow::Error::new(health.error.unwrap_or(
                     nexus_claude::agent::ProviderError::EndpointUnreachable {
                         detail: "the provider reports itself unavailable".to_string(),
@@ -11905,7 +13312,7 @@ impl ChatManager {
             }
         }
         let tool_profile = spec_tool_profile(&spec);
-        let nexus_missing = lacks_nexus_tools(
+        let mut host_missing = host_degraded(
             provider.kind(),
             &spec,
             self.config.nexus_tools_path.as_deref(),
@@ -11913,21 +13320,25 @@ impl ChatManager {
         // The project's files are on this machine unless the instance is remote.
         let project_dir =
             (!super::provider::resolver::is_remote_instance(provider_id)).then(|| spec.cwd.clone());
-        let session = provider.open(spec).await.map_err(|e| {
-            // Nothing will ever use this session's token.
-            crate::auth::agent_tokens::revoke_session(&sid);
-            self.turn_routing.remove(&sid);
-            anyhow::Error::new(e)
-        })?;
+        let (session, dropped) =
+            open_dropping_refused_mcp(provider.kind(), spec, |spec| provider.open(spec))
+                .await
+                .map_err(anyhow::Error::new)?;
+        let without_mcp = opened_without_mcp(per_session_mcp, dropped, session.capabilities());
+        if without_mcp {
+            // The token minted for the refused spec's PO server: nothing holds it.
+            cleanup.revoke_token();
+            host_missing.push(super::agent_runtime::PO_TOOLS_FEATURE.to_string());
+        }
         // ... and does the model's window hold the tool schemas the session was
         // given, with room left to work? (known only once the provider has probed)
         if provider_id != super::provider::resolver::CLAUDE_CODE {
             if let Err(e) = window_holds_the_tools(session.capabilities(), tool_profile) {
                 let _ = session.close().await;
-                crate::auth::agent_tokens::revoke_session(&sid);
                 return Err(anyhow::Error::new(e));
             }
         }
+        cleanup.disarm();
         self.finish_agent_open(
             &sid,
             provider_id,
@@ -11935,7 +13346,8 @@ impl ChatManager {
             session,
             1,
             tool_policy,
-            nexus_missing,
+            host_missing,
+            !per_session_mcp || without_mcp,
             project_dir,
         )
         .await;
@@ -11954,12 +13366,20 @@ impl ChatManager {
                 handle.emit(relay.event(&sid, provider_id)).await;
             }
             if !request.message.is_empty() {
-                handle
+                // Counted on the node at creation (`message_count: 1`).
+                handle.opening_message_counted();
+                let sent = handle
                     .send_message_relayed(
                         &request.message,
                         &super::relay::prefixed(relay.and_then(|r| r.text()), &request.message),
                     )
-                    .await?;
+                    .await;
+                // A send that failed before its turn took the flag: the next message
+                // the user sends is counted.
+                if sent.is_err() {
+                    handle.forget_opening_count();
+                }
+                sent?;
             }
         }
         Ok(CreateSessionResponse {
@@ -11972,8 +13392,12 @@ impl ChatManager {
     }
 
     /// What a session of the agent engine gets around its turns, built from the
-    /// manager as it is configured NOW (the pipeline is replaced after construction).
-    pub(crate) fn turn_services(&self) -> Arc<dyn super::agent_runtime::TurnServices> {
+    /// manager as it is configured NOW (the pipeline is replaced after construction)
+    /// and the session's own end-of-turn state ([`Self::agent_turn_state`]).
+    fn turn_services_with(
+        &self,
+        session: AgentTurnState,
+    ) -> Arc<dyn super::agent_runtime::TurnServices> {
         Arc::new(ManagerTurnServices {
             graph: self.graph.clone(),
             enrichment_pipeline: self.enrichment_pipeline.clone(),
@@ -11981,13 +13405,82 @@ impl ChatManager {
             documents: self.document_store.clone(),
             nats: self.nats.clone(),
             anchor: self.anchor_session(),
+            session,
+            search: self.search.clone(),
+            event_emitter: self.event_emitter.clone(),
+            context_injector: self.context_injector.clone(),
+            step_budget: super::post_stream::POST_STREAM_STEP_BUDGET,
+            stall_step: None,
         })
     }
 
+    /// The held context of `session_id` ([`HeldSlot`]), as a new state of the session
+    /// starts from it: the store's (a first open in this process, a restart, another
+    /// instance that played turns since), once the writes of an earlier state of the
+    /// session in this process landed (waited for within the step budget). When
+    /// memory and store may diverge (a write failed or still runs, a turn of an
+    /// earlier handle changed memory and has not written it yet) or the store
+    /// cannot be read in time ([`HeldSlot::reopen`]), memory.
+    async fn held_slot(&self, session_id: &str) -> Arc<HeldSlot> {
+        let slot = {
+            let mut slots = self.held_slots.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(slots.entry(session_id.to_string()).or_default())
+        };
+        // Only a slot in step with the store reloads it, and only if memory did not
+        // move during the read (an earlier handle's `after_turn` still runs: `close`
+        // does not stop it, `adopt` replaces a live handle).
+        slot.reopen(
+            &self.graph,
+            session_id,
+            super::post_stream::POST_STREAM_STEP_BUDGET,
+        )
+        .await;
+        slot
+    }
+
+    /// The end-of-turn state of the agent session `session_id`, from its node: its
+    /// memory conversation, the protocol run it was spawned in. Objective tracking
+    /// is on, as for every Claude Code session.
+    async fn agent_turn_state(&self, session_id: &str) -> AgentTurnState {
+        let node = match Uuid::parse_str(session_id) {
+            Ok(uuid) => self.graph.get_chat_session(uuid).await.ok().flatten(),
+            Err(_) => None,
+        };
+        let memory = match (
+            &self.memory_config,
+            node.as_ref().and_then(|n| n.conversation_id.clone()),
+        ) {
+            (Some(config), Some(conversation_id)) => Some(Arc::new(Mutex::new(
+                ConversationMemoryManager::new(config.clone())
+                    .with_conversation_id(conversation_id),
+            ))),
+            _ => None,
+        };
+        let spawned = node
+            .as_ref()
+            .and_then(|n| n.spawned_by.as_deref())
+            .and_then(parse_spawned_by);
+        // What waited for this session's next turn before it closed or the server
+        // restarted.
+        let held = self.held_slot(session_id).await;
+        AgentTurnState {
+            memory,
+            protocol_run_id: spawned.as_ref().and_then(|s| s.protocol_run_id),
+            held,
+            protocol_state: spawned.and_then(|s| s.protocol_state),
+            objectives: super::post_stream::ObjectiveCounters {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     /// Records what the provider reported (frozen capabilities, resume token)
-    /// and registers the live session. `nexus_missing`: the session was opened without
-    /// its `nexus-tools` server ([`lacks_nexus_tools`]), which it reports as a feature it
-    /// does not have rather than leaving only a line in the server's log.
+    /// and registers the live session. `host_missing`: what the host knows the session
+    /// lacks ([`host_degraded`]: its `nexus-tools` server, the project-orchestrator
+    /// server), which it reports as features it does not have rather than leaving only
+    /// a line in the server's log.
     /// `project_dir`: the session's project directory on THIS machine (`None` for a remote
     /// session), whose `.mcp.json` decides which read-only MCP declarations hold for it
     /// (`session_grants::declarations_for_project`).
@@ -12000,14 +13493,25 @@ impl ChatManager {
         session: Arc<dyn nexus_claude::agent::AgentSession>,
         first_seq: i64,
         tool_policy: serde_json::Value,
-        nexus_missing: bool,
+        host_missing: Vec<String>,
+        without_mcp: bool,
         project_dir: Option<std::path::PathBuf>,
     ) {
         self.warn_if_forced(provider_id, session.as_ref());
         if let Some(router) = self.turn_routing.get(session_id) {
             router.set_model_live(session.capabilities().set_model_live);
         }
-        let capabilities = serde_json::to_string(session.capabilities()).unwrap_or_default();
+        // The frozen snapshot keeps what the opening FOUND: a session opened without
+        // its MCP servers (`without_mcp`: its provider takes none, it refused them, or
+        // its snapshot already said so) says `per_session_mcp: false`, whatever a
+        // provider that has learned nothing yet (a fresh one after a restart) answers.
+        // Otherwise the next resume after another restart would send them again, to be
+        // refused again ([`Self::carries_per_session_mcp`]).
+        let mut snapshot = session.capabilities().clone();
+        if without_mcp {
+            snapshot.per_session_mcp = false;
+        }
+        let capabilities = serde_json::to_string(&snapshot).unwrap_or_default();
         let token = session.resume_token().map(|t| t.to_wire());
         if let Ok(uuid) = Uuid::parse_str(session_id) {
             if let Err(e) = self
@@ -12019,11 +13523,6 @@ impl ChatManager {
             }
         }
         let kind_name = provider_kind_name(&kind);
-        let extra_degraded = if nexus_missing {
-            vec![super::agent_runtime::NEXUS_TOOLS_FEATURE.to_string()]
-        } else {
-            Vec::new()
-        };
         let handle = self
             .agent_runtime
             .adopt_declaring(
@@ -12033,15 +13532,74 @@ impl ChatManager {
                 first_seq,
                 &kind_name,
                 tool_policy,
-                Some(self.turn_services()),
-                extra_degraded,
+                Some(self.turn_services_with(self.agent_turn_state(session_id).await)),
+                host_missing,
                 super::session_grants::declarations_for_project(
                     &self.config.read_only_mcp_tools,
                     project_dir.as_deref(),
                 ),
             )
             .await;
+        // A failed turn is retried as the chat's configuration says, on both engines.
+        handle.configure_retry(self.config.retry.clone());
         self.spawn_agent_nats_listeners(handle);
+    }
+
+    /// The loop of an agent-engine cancel listener: hands each request to `on_request`
+    /// until the session closes. `biased`, the close first: once `closed` is
+    /// cancelled no request is read any more, even one already waiting, so a session
+    /// being closed (or adopted again) does not ask its provider session to cancel
+    /// (review of #685, finding 1; the legacy listeners do the same since #673).
+    async fn serve_agent_cancels<M>(
+        mut requests: impl futures::Stream<Item = M> + Unpin,
+        closed: CancellationToken,
+        mut on_request: impl FnMut(M),
+    ) {
+        loop {
+            tokio::select! {
+                biased;
+                _ = closed.cancelled() => break,
+                msg = requests.next() => {
+                    let Some(msg) = msg else { break };
+                    on_request(msg);
+                }
+            }
+        }
+    }
+
+    /// `work` (a cancel asked of an agent-engine session from another instance),
+    /// unless the session closes before it answers: then `session_gone`, which a
+    /// v2 asker reads as provisional (the real owner, if any, still answers),
+    /// instead of what a provider session being closed would say (`failed`,
+    /// `refused`: final answers that would beat the real owner's). A request read
+    /// just before the close lands here (review of #685, finding 1).
+    ///
+    /// The close is watched for the whole cancel, not only at its start (review
+    /// of #691, finding 3): a close during `work` drops it and answers `gone`, and
+    /// an outcome that comes back once the session is closed is replaced by
+    /// `gone` too. The cancel may then have reached the provider already (the
+    /// signal may have left): `gone` says nothing about that, which is what the
+    /// 410 tells the user ("may or may not have been stopped"; cancel-task is
+    /// retryable, a task signalled twice is still one stopped task).
+    async fn unless_agent_closed<T>(
+        closed: &CancellationToken,
+        kind: super::cancel_relay::CancelKind,
+        work: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let gone =
+            || anyhow::Error::new(super::cancel_relay::CancelRelayError::SessionGone { kind });
+        if closed.is_cancelled() {
+            return Err(gone());
+        }
+        let outcome = tokio::select! {
+            biased;
+            _ = closed.cancelled() => return Err(gone()),
+            outcome = work => outcome,
+        };
+        if closed.is_cancelled() {
+            return Err(gone());
+        }
+        outcome
     }
 
     /// What the other instances can ask of a session of the agent engine this
@@ -12075,26 +13633,73 @@ impl ChatManager {
         }
         {
             // `cancel_tools` asked on another instance (`cancel_running_tools`
-            // there finds no local session and publishes): the handle applies
+            // there finds no local session and asks over NATS): the handle applies
             // the cap and stops the tools, as `spawn_nats_cancel_tools_listener`
-            // does for a Claude Code session.
+            // does for a Claude Code session, and the asker gets what it did or
+            // the typed refusal. One task per request, bounded
+            // (`cancel_relay::OWNER_CANCEL_BOUND`).
             let (nats, handle, sid) = (nats.clone(), Arc::clone(&handle), sid.clone());
             tokio::spawn(async move {
-                let Ok(mut sub) = nats.subscribe_cancel_tools(&sid).await else {
+                let Ok(sub) = nats.subscribe_cancel_tools(&sid).await else {
                     warn!(session_id = %sid, "agent engine: NATS cancel_tools subscription failed");
                     return;
                 };
-                loop {
-                    tokio::select! {
-                        _ = handle.closed.cancelled() => break,
-                        msg = sub.next() => {
-                            if msg.is_none() { break; }
-                            if let Err(e) = handle.cancel_tools().await {
-                                warn!(session_id = %sid, error = %e, "agent engine: NATS cancel_tools failed");
+                let closed = handle.closed.clone();
+                Self::serve_agent_cancels(sub, closed, move |msg: async_nats::Message| {
+                    let (nats, handle) = (nats.clone(), Arc::clone(&handle));
+                    tokio::spawn(async move {
+                        let kind = super::cancel_relay::CancelKind::Tools;
+                        let work =
+                            Self::unless_agent_closed(&handle.closed, kind, handle.cancel_tools());
+                        let asker_v2 = super::cancel_relay::asker_v2(&msg.payload);
+                        match msg.reply {
+                            Some(reply_to) => {
+                                super::cancel_relay::answer(&nats, reply_to, asker_v2, kind, work)
+                                    .await
+                            }
+                            None => {
+                                if let Err(e) = work.await {
+                                    warn!(session_id = %handle.session_id, error = %e, "agent engine: NATS cancel_tools failed");
+                                }
                             }
                         }
-                    }
-                }
+                    });
+                })
+                .await;
+            });
+        }
+        {
+            // `cancel_task` asked on another instance: the handle stops the task
+            // (cap included) and the asker gets what it did, or the typed refusal.
+            // One task per request, bounded.
+            let (nats, handle, sid) = (nats.clone(), Arc::clone(&handle), sid.clone());
+            tokio::spawn(async move {
+                let Ok(sub) = nats.subscribe_cancel_task(&sid).await else {
+                    warn!(session_id = %sid, "agent engine: NATS cancel_task subscription failed");
+                    return;
+                };
+                let closed = handle.closed.clone();
+                Self::serve_agent_cancels(sub, closed, move |msg: async_nats::Message| {
+                    let Some(reply_to) = msg.reply else { return };
+                    let task_id = super::cancel_relay::task_id_of(&msg.payload);
+                    let (nats, handle) = (nats.clone(), Arc::clone(&handle));
+                    tokio::spawn(async move {
+                        let kind = super::cancel_relay::CancelKind::Task;
+                        super::cancel_relay::answer(
+                            &nats,
+                            reply_to,
+                            super::cancel_relay::asker_v2(&msg.payload),
+                            kind,
+                            Self::unless_agent_closed(
+                                &handle.closed,
+                                kind,
+                                handle.cancel_task(&task_id),
+                            ),
+                        )
+                        .await;
+                    });
+                })
+                .await;
             });
         }
         {
@@ -12153,19 +13758,42 @@ impl ChatManager {
     /// Reopens a session of the agent engine that is no longer live, from its
     /// persisted resume token (a new session when it never got one), then
     /// delivers `message`.
+    ///
+    /// `seen`: the live handle the caller started from, read before it awaited anything
+    /// (`None`: the session was not live; a dead handle: a resume after a failed send).
     async fn resume_agent_session(
         &self,
         node: &ChatSessionNode,
         message: &str,
         user_claims: Option<&crate::auth::jwt::Claims>,
+        seen: Option<Arc<super::agent_runtime::AgentSessionHandle>>,
     ) -> Result<()> {
+        let sid = node.id.to_string();
+        // One resume of a session at a time (reviews of #684, finding 2, and #696, finding
+        // 1): two messages to a session that is not live — or two failed sends on one dead
+        // handle — would each resume it, each minting a token that supersedes the other's,
+        // the second ending the first's handle, and the one that fails would undo what the
+        // other set up. Once it holds the lock, a resume that finds a live handle OTHER than
+        // the one it started from was overtaken by a resume that succeeded: its message goes
+        // to that session, through `send_message` (routing applies in `full` mode). The same
+        // handle (dead, a resume after a failed send) or none: it resumes.
+        let _resuming = self.resume_locks.lock(&sid).await;
+        if let Some(now) = self.agent_runtime.get(&sid).await {
+            if seen.as_ref().is_none_or(|seen| !Arc::ptr_eq(seen, &now)) {
+                return self.send_message(&sid, message).await;
+            }
+        }
         let provider_id = node
             .provider_id
             .clone()
             .unwrap_or_else(|| super::provider::resolver::CLAUDE_CODE.to_string());
         let provider = self.provider_for(&provider_id).await?;
         let remote_cwd = self.remote_cwd_of(&provider_id).await?;
-        let sid = node.id.to_string();
+        let per_session_mcp = Self::carries_per_session_mcp(
+            provider.as_ref(),
+            &node.model,
+            node.capabilities.as_deref(),
+        );
         let (system_prompt, _) = self
             .build_system_prompt_anchored(
                 node.execution_place,
@@ -12177,34 +13805,38 @@ impl ChatManager {
                 None,
             )
             .await;
+        // From here, a failure undoes the router and the token (finding 5 of #682).
+        let mut cleanup = OpeningCleanup::new(&sid, &self.turn_routing);
         // A resumed session starts counting its turns again; the harness is the authority
         // on the index, and nothing says whether its model was named by the request.
-        self.register_turn_router(
-            &sid,
-            &provider_id,
-            &node.model,
-            node.project_slug.as_deref(),
-            OpeningTurn {
-                // The mode the conversation was opened with stays its own across a resume.
-                routing_mode: node.routing_mode.as_deref().and_then(|m| {
-                    serde_json::from_value(serde_json::Value::String(m.to_owned())).ok()
-                }),
-                routing_pool: node
-                    .routing_pool
-                    .as_deref()
-                    .and_then(|json| serde_json::from_str(json).ok()),
-                explicit_model: false,
-                permission_mode: node.permission_mode.as_deref(),
-                // A provider the request named stays imposed across a resume (a conversation
-                // opened with ticked models names its pilot without imposing it).
-                provider_imposed: node.routed_by.as_deref() == Some("request")
-                    && node.routing_pool.is_none(),
-                moved_in: false,
-                message,
-                next_turn: 0,
-            },
-        )
-        .await;
+        let router = self
+            .register_turn_router(
+                &sid,
+                &provider_id,
+                &node.model,
+                node.project_slug.as_deref(),
+                OpeningTurn {
+                    // The mode the conversation was opened with stays its own across a resume.
+                    routing_mode: node.routing_mode.as_deref().and_then(|m| {
+                        serde_json::from_value(serde_json::Value::String(m.to_owned())).ok()
+                    }),
+                    routing_pool: node
+                        .routing_pool
+                        .as_deref()
+                        .and_then(|json| serde_json::from_str(json).ok()),
+                    explicit_model: false,
+                    permission_mode: node.permission_mode.as_deref(),
+                    // A provider the request named stays imposed across a resume (a conversation
+                    // opened with ticked models names its pilot without imposing it).
+                    provider_imposed: node.routed_by.as_deref() == Some("request")
+                        && node.routing_pool.is_none(),
+                    moved_in: false,
+                    message,
+                    next_turn: 0,
+                },
+            )
+            .await;
+        cleanup.registered(router);
         // A resume keeps the access the session was opened with and can only narrow it.
         let access = super::provider::policy::SessionAccess::for_resume(node.access, None);
         let spec = self
@@ -12221,6 +13853,7 @@ impl ChatManager {
                     max_tokens: None,
                     kind: provider.kind(),
                     remote_cwd: remote_cwd.as_deref(),
+                    per_session_mcp,
                     hooks: Some(AgentHookScope {
                         project_slug: node.project_slug.clone(),
                         task_id: node
@@ -12234,28 +13867,24 @@ impl ChatManager {
                 access,
             )
             .await?;
+        cleanup.minted(&spec, self.config.jwt_secret.as_deref());
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
         // A resume is a new sending of the project's content: consent, guard
         // and journal apply again (a consent may have been revoked meanwhile).
-        if let Err(e) = self
-            .authorize_provider_use(ProviderUse {
-                provider_id: &provider_id,
-                model: &node.model,
-                mode: spec.policy.mode,
-                project_slug: node.project_slug.as_deref(),
-                claims: user_claims,
-                session_id: &sid,
-            })
-            .await
-        {
-            crate::auth::agent_tokens::revoke_session(&sid);
-            return Err(e);
-        }
+        self.authorize_provider_use(ProviderUse {
+            provider_id: &provider_id,
+            model: &node.model,
+            mode: spec.policy.mode,
+            project_slug: node.project_slug.as_deref(),
+            claims: user_claims,
+            session_id: &sid,
+        })
+        .await?;
         let token = node
             .resume_token
             .as_deref()
             .and_then(|raw| nexus_claude::agent::ResumeToken::from_wire(raw).ok());
-        let nexus_missing = lacks_nexus_tools(
+        let mut host_missing = host_degraded(
             provider.kind(),
             &spec,
             self.config.nexus_tools_path.as_deref(),
@@ -12263,16 +13892,30 @@ impl ChatManager {
         // The project's files are on this machine unless the instance is remote.
         let project_dir = (!super::provider::resolver::is_remote_instance(&provider_id))
             .then(|| spec.cwd.clone());
-        let session = match token {
-            Some(token) => provider.resume(spec, token).await,
-            None => provider.open(spec).await,
-        }
+        let (session, dropped) = open_dropping_refused_mcp(provider.kind(), spec, |spec| {
+            let provider = Arc::clone(&provider);
+            let token = token.clone();
+            async move {
+                match token {
+                    Some(token) => provider.resume(spec, token).await,
+                    None => provider.open(spec).await,
+                }
+            }
+        })
+        .await
         .map_err(anyhow::Error::new)?;
+        let without_mcp = opened_without_mcp(per_session_mcp, dropped, session.capabilities());
+        if without_mcp {
+            // As at an opening: the token went out in the refused request.
+            cleanup.revoke_token();
+            host_missing.push(super::agent_runtime::PO_TOOLS_FEATURE.to_string());
+        }
         let latest = self
             .graph
             .get_latest_chat_event_seq(node.id)
             .await
             .unwrap_or(0);
+        cleanup.disarm();
         self.finish_agent_open(
             &sid,
             &provider_id,
@@ -12280,7 +13923,8 @@ impl ChatManager {
             session,
             latest + 1,
             tool_policy,
-            nexus_missing,
+            host_missing,
+            !per_session_mcp || without_mcp,
             project_dir,
         )
         .await;
@@ -12365,6 +14009,8 @@ impl ChatManager {
             let session = sessions
                 .remove(session_id)
                 .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
+            // Its NATS listeners end with it (review N1).
+            session.nats_cancel.cancel();
             (
                 session.client,
                 session.protocol_run_id,
@@ -12480,6 +14126,24 @@ impl ChatManager {
                         );
                     }
                 }
+                // The agent engine's sessions, by the same rule: a running turn or a
+                // background task its provider still reports running (P4) keeps it.
+                for handle in manager.agent_runtime.handles().await {
+                    let idle = handle.idle_for();
+                    let is_streaming = handle.is_streaming.load(Ordering::SeqCst);
+                    let background_tasks = handle.active_background_tasks().await.len();
+                    if session_is_expired(idle, timeout, is_streaming, background_tasks) {
+                        expired.push(handle.session_id.clone());
+                    } else if idle > timeout {
+                        debug!(
+                            session_id = %handle.session_id,
+                            idle_secs = idle.as_secs(),
+                            is_streaming,
+                            background_tasks,
+                            "Idle agent session kept alive: work still in progress"
+                        );
+                    }
+                }
 
                 for id in expired {
                     info!("Cleaning up timed-out session {}", id);
@@ -12491,9 +14155,10 @@ impl ChatManager {
         });
     }
 
-    /// Get the number of currently active sessions
+    /// Get the number of currently active sessions, on both engines.
     pub async fn active_session_count(&self) -> usize {
-        self.active_sessions.read().await.len()
+        let legacy = self.active_sessions.read().await.len();
+        legacy + self.agent_runtime.len().await
     }
 }
 
@@ -12911,6 +14576,12 @@ fn parse_permission_control_msg(
         parent_tool_use_id: current_parent,
         category: None,
         canonical: None,
+        tool_use_id: request_data
+            .get("toolUseId")
+            .or_else(|| request_data.get("tool_use_id"))
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -13187,6 +14858,7 @@ mod tests {
                             max_tokens: None,
                             kind: ProviderKind::ClaudeCode,
                             remote_cwd: None,
+                            per_session_mcp: true,
                             hooks: None,
                         },
                         access,
@@ -14094,6 +15766,7 @@ mod tests {
                         max_tokens: None,
                         kind,
                         remote_cwd: remote,
+                        per_session_mcp: true,
                         hooks,
                     })
                     .await
@@ -14133,8 +15806,9 @@ mod tests {
             keys
         };
         assert_eq!(table(true), ["PostToolUse", "PreCompact", "PreToolUse"]);
-        // A runner has its task context in the prompt: compaction guidance only.
-        assert_eq!(table(false), ["PreCompact"]);
+        // A runner has its task context in the prompt: compaction guidance, and the
+        // tool clock (PreToolUse, which adds nothing to the context).
+        assert_eq!(table(false), ["PreCompact", "PreToolUse"]);
     }
 
     #[tokio::test]
@@ -14217,6 +15891,7 @@ mod tests {
                         max_tokens: None,
                         kind: ProviderKind::ClaudeCode,
                         remote_cwd,
+                        per_session_mcp: true,
                         hooks: None,
                     })
                     .await
@@ -14235,6 +15910,51 @@ mod tests {
         let local = spec_for(None).await;
         assert!(local.mcp_servers.contains_key("project-orchestrator"));
         assert_eq!(local.extra_dirs.len(), 1);
+    }
+
+    /// An agent that takes no MCP server per session (OpenClaw's ACP bridge) is not
+    /// given the PO server, and the host reports what the session lacks.
+    #[tokio::test]
+    async fn a_provider_without_per_session_mcp_gets_no_po_server_and_it_is_reported() {
+        use nexus_claude::agent::ProviderKind;
+        let state = mock_app_state();
+        let mut config = test_config();
+        config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let claims = crate::auth::jwt::Claims::service_account("acp");
+        let spec_for = |per_session_mcp: bool| {
+            let manager = &manager;
+            let claims = &claims;
+            async move {
+                manager
+                    .build_agent_spec(AgentSpecInput {
+                        cwd: "/tmp",
+                        model: "openclaw",
+                        system_prompt: "p",
+                        permission_mode: None,
+                        add_dirs: &[],
+                        user_claims: Some(claims),
+                        session_id: "acp-s1",
+                        third_party: true,
+                        max_tokens: None,
+                        kind: ProviderKind::Acp,
+                        remote_cwd: None,
+                        per_session_mcp,
+                        hooks: None,
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        let without = spec_for(false).await;
+        assert!(without.mcp_servers.is_empty(), "{:?}", without.mcp_servers);
+        assert_eq!(
+            host_degraded(ProviderKind::Acp, &without, None),
+            vec![super::super::agent_runtime::PO_TOOLS_FEATURE.to_string()]
+        );
+        let with = spec_for(true).await;
+        assert!(with.mcp_servers.contains_key(PO_MCP_SERVER));
+        assert!(host_degraded(ProviderKind::Acp, &with, None).is_empty());
     }
 
     // ── nexus-tools on a native session (B40) ───────────────────────────────
@@ -14272,6 +15992,7 @@ mod tests {
                         max_tokens: None,
                         kind,
                         remote_cwd: None,
+                        per_session_mcp: true,
                         hooks: None,
                     })
                     .await
@@ -14396,6 +16117,7 @@ mod tests {
                 max_tokens: None,
                 kind: ProviderKind::Native,
                 remote_cwd: None,
+                per_session_mcp: true,
                 hooks: None,
             })
             .await
@@ -14432,6 +16154,7 @@ mod tests {
                 max_tokens: None,
                 kind: ProviderKind::Native,
                 remote_cwd: None,
+                per_session_mcp: true,
                 hooks: None,
             })
             .await
@@ -14475,6 +16198,7 @@ mod tests {
                 max_tokens: None,
                 kind: ProviderKind::Native,
                 remote_cwd: None,
+                per_session_mcp: true,
                 hooks: None,
             })
             .await
@@ -14811,6 +16535,7 @@ mod tests {
                 max_tokens: None,
                 kind,
                 remote_cwd,
+                per_session_mcp: true,
                 hooks: Some(AgentHookScope {
                     project_slug: Some("proj".into()),
                     task_id: None,
@@ -16287,6 +18012,110 @@ mod tests {
         assert!(!manager.is_session_active(&id).await, "evicted");
     }
 
+    /// Review N1 of #663: the CLI dies on instance A, the session resumes on B, a
+    /// cancel comes from C. The eviction on A ends A's NATS listeners (before: they
+    /// kept answering `gone` for a session A no longer holds, which a canceller
+    /// took as 410 "nothing cancelled" while B did cancel). C gets B's answer —
+    /// and, between the death on A and the resume on B, `owner_unreachable`, not
+    /// A's stale `session_gone`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancel_after_the_session_moved_gets_the_new_owners_answer() {
+        use super::super::cancel_relay::CancelRelayError;
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("fake-claude");
+        std::fs::write(
+            &cli,
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo '2.1.287 (Claude Code)'; exit 0;;\nesac\nexec cat > /dev/null\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let broker = TestBroker::start().await;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let instance = |nats: Arc<NatsEmitter>| {
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            let state = mock_app_state();
+            ChatManager::new_without_memory(dyn_graph, state.meili, test_config()).with_nats(nats)
+        };
+        let a = instance(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+        let b = instance(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+        let c = instance(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+        for m in [&a, &b] {
+            m.update_claude_cli_path(Some(cli.display().to_string()))
+                .await;
+        }
+        let mut s = test_chat_session(None);
+        s.provider_id = Some("claude-code".into());
+        s.cwd = dir.path().display().to_string();
+        graph.create_chat_session(&s).await.unwrap();
+        let id = s.id.to_string();
+        async fn pid_of(m: &ChatManager, id: &str) -> u32 {
+            let client = m
+                .active_sessions
+                .read()
+                .await
+                .get(id)
+                .unwrap()
+                .client
+                .clone();
+            let pid = client.lock().await.child_pid().await.expect("pid");
+            pid
+        }
+        // Asked again while the owner's listeners subscribe.
+        async fn ask(m: &ChatManager, id: &str) -> Result<CancelToolsResult> {
+            let mut last = None;
+            for _ in 0..30 {
+                match m.cancel_running_tools(id).await {
+                    Err(e)
+                        if e.downcast_ref::<CancelRelayError>()
+                            == Some(&CancelRelayError::OwnerUnreachable) =>
+                    {
+                        last = Some(Err(e));
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    other => return other,
+                }
+            }
+            last.unwrap()
+        }
+
+        // On A, then its CLI dies and A evicts it.
+        a.resume_session(&id, "hello", None).await.unwrap();
+        let a_pid = pid_of(&a, &id).await;
+        assert_eq!(
+            ask(&c, &id).await.unwrap().cli_pid,
+            Some(a_pid),
+            "A answers while it holds it"
+        );
+        unsafe { libc::kill(a_pid as i32, libc::SIGKILL) };
+        for _ in 0..50 {
+            if a.evict_if_cli_dead(&id).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!a.is_session_active(&id).await, "evicted on A");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Nobody holds it: not A's stale `gone`.
+        let between = c.cancel_running_tools(&id).await.unwrap_err();
+        assert_eq!(
+            between.downcast_ref::<CancelRelayError>(),
+            Some(&CancelRelayError::OwnerUnreachable),
+            "{between:#}"
+        );
+
+        // Resumed on B: C gets B's real answer.
+        b.resume_session(&id, "again", None).await.unwrap();
+        let b_pid = pid_of(&b, &id).await;
+        let answered = ask(&c, &id).await.unwrap();
+        assert_eq!(answered.cli_pid, Some(b_pid), "{answered:?}");
+        let _ = b.close_session(&id).await;
+    }
+
     #[tokio::test]
     async fn resuming_a_session_bound_to_a_non_claude_provider_is_unavailable_on_the_legacy_path() {
         let (manager, graph) = manager_with_mock();
@@ -16343,6 +18172,626 @@ mod tests {
         }
     }
 
+    /// Two first sessions opened at once on an agent that refuses MCP servers per
+    /// session: the other one taught the provider, which now answers
+    /// `Unsupported { per_session_mcp }` to a spec built while it still said yes. The
+    /// session is opened once more WITHOUT its servers, and says what it lacks.
+    #[tokio::test]
+    async fn a_refusal_learned_meanwhile_reopens_the_session_without_its_mcp_servers() {
+        use nexus_claude::agent::AgentEvent;
+        let (manager, graph, fake) = agent_manager();
+        *fake.kind.lock().unwrap() = nexus_claude::agent::ProviderKind::Acp;
+        // The session's own capabilities say it carries MCP servers: only the HOST can
+        // say it lacks the PO tools (it opened it without them).
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        *fake.fail_open.lock().unwrap() = Some(nexus_claude::agent::ProviderError::unsupported(
+            "per_session_mcp",
+        ));
+        let sid = manager
+            .create_session(&agent_request("hello"))
+            .await
+            .expect("opened again without the servers")
+            .session_id;
+        let opened = fake.state.opened_specs.lock().unwrap().clone();
+        assert_eq!(opened.len(), 1, "the refused spec never opened");
+        assert!(
+            opened[0].mcp_servers.is_empty(),
+            "{:?}",
+            opened[0].mcp_servers.keys()
+        );
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        fake.state.push(AgentEvent::SessionStarted {
+            provider_session_id: Some("p1".into()),
+            model: Some("m".into()),
+            policy_mode: None,
+            native_mode: None,
+            tools: vec![],
+            mcp_servers: vec![],
+            cwd: None,
+        });
+        let init = next_matching(&mut rx, |e| matches!(e, ChatEvent::SystemInit { .. })).await;
+        let wire = serde_json::to_value(&init).unwrap();
+        let degraded: Vec<String> =
+            serde_json::from_value(wire["degraded_features"].clone()).expect("a list");
+        assert!(
+            degraded
+                .iter()
+                .any(|f| f == super::super::agent_runtime::PO_TOOLS_FEATURE),
+            "{degraded:?}"
+        );
+        // The frozen snapshot says what the opening found, not what the session's
+        // capabilities claim: a resume after a restart does not send them again.
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!ChatManager::carries_per_session_mcp(
+            &fake,
+            "m",
+            node.capabilities.as_deref()
+        ));
+        // Only an ACP agent is asked again (its spec holds no server but the PO one):
+        // another kind's refusal is returned as it is, nothing dropped in silence.
+        let (manager, _graph, fake) = agent_manager();
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        *fake.fail_open.lock().unwrap() = Some(nexus_claude::agent::ProviderError::unsupported(
+            "per_session_mcp",
+        ));
+        assert!(manager
+            .create_session(&agent_request("hello"))
+            .await
+            .is_err());
+        assert!(fake.state.opened_specs.lock().unwrap().is_empty());
+        // Another refusal is not taken for this one: no second opening.
+        let (manager, _graph, fake) = agent_manager();
+        *fake.kind.lock().unwrap() = nexus_claude::agent::ProviderKind::Acp;
+        *fake.fail_open.lock().unwrap() =
+            Some(nexus_claude::agent::ProviderError::unsupported("images"));
+        assert!(manager
+            .create_session(&agent_request("hello"))
+            .await
+            .is_err());
+        assert!(fake.state.opened_specs.lock().unwrap().is_empty());
+    }
+
+    /// A resumed session whose frozen snapshot says it carried no MCP server is not
+    /// given one, whatever its provider says now (a refusal learned before a restart).
+    #[test]
+    fn a_snapshot_without_per_session_mcp_keeps_the_resumed_session_without_servers() {
+        let fake = super::super::agent_runtime::fake::FakeProvider::new();
+        assert!(ChatManager::carries_per_session_mcp(&fake, "m", None));
+        assert!(ChatManager::carries_per_session_mcp(
+            &fake,
+            "m",
+            Some(r#"{"per_session_mcp": true}"#)
+        ));
+        assert!(!ChatManager::carries_per_session_mcp(
+            &fake,
+            "m",
+            Some(r#"{"per_session_mcp": false}"#)
+        ));
+        assert!(ChatManager::carries_per_session_mcp(
+            &fake,
+            "m",
+            Some("not json")
+        ));
+    }
+
+    /// The agent-path manager of [`agent_manager`], with a signing key (PO tokens are
+    /// minted), a per-turn router configured, and every provider id answered by the fake.
+    fn signed_routed_agent_manager() -> (
+        ChatManager,
+        Arc<crate::neo4j::mock::MockGraphStore>,
+        super::super::agent_runtime::fake::FakeProvider,
+    ) {
+        struct AnyId(super::super::agent_runtime::fake::FakeProvider);
+        impl super::super::agent_runtime::ProviderSource for AnyId {
+            fn get(&self, _id: &str) -> Option<Arc<dyn nexus_claude::agent::AgentProvider>> {
+                Some(Arc::new(self.0.clone()))
+            }
+        }
+        struct NoDecider;
+        #[async_trait::async_trait]
+        impl crate::chat::provider::cognitive::decision::Decider for NoDecider {
+            async fn decide(
+                &self,
+                _request: &crate::chat::provider::cognitive::decision::DecideRequest,
+            ) -> anyhow::Result<crate::chat::provider::cognitive::decision::CognitiveDecision>
+            {
+                anyhow::bail!("not asked in this test")
+            }
+        }
+        struct NoPool;
+        #[async_trait::async_trait]
+        impl crate::chat::agent_hooks::PoolSource for NoPool {
+            async fn pool(
+                &self,
+                _provider_id: &str,
+            ) -> Vec<crate::chat::provider::cognitive::candidates::ModelFacts> {
+                Vec::new()
+            }
+        }
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let state = mock_app_state();
+        let mut config = test_config();
+        config.provider_path = crate::chat::config::ProviderPath::Agent;
+        config.jwt_secret = Some(SIGNING_SECRET.into());
+        let fake = super::super::agent_runtime::fake::FakeProvider::new();
+        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, config)
+            .with_provider_source(Arc::new(AnyId(fake.clone())))
+            .with_turn_decider(Arc::new(NoDecider), Arc::new(NoPool));
+        (manager, graph, fake)
+    }
+
+    const SIGNING_SECRET: &str = "test-secret-key-minimum-32-chars!!";
+
+    /// The `jti` of the PO token a spec carries.
+    fn spec_token_jti(spec: &nexus_claude::agent::SessionSpec) -> String {
+        let token = spec_po_env(spec)
+            .get("PO_AUTH_TOKEN")
+            .cloned()
+            .expect("a PO token in the spec");
+        crate::auth::jwt::decode_jwt(&token, SIGNING_SECRET)
+            .expect("a token signed by the server")
+            .jti
+            .expect("a bound token has a jti")
+    }
+
+    /// Review of #682, findings 1 and 4: an ACP agent that refuses `mcpServers` is
+    /// asked again WITHOUT them by nexus itself (OpenClaw 2026.9.x, a command the name
+    /// does not give away): the host sees no refusal, only the session's capabilities
+    /// (`per_session_mcp: false`). The PO token went to the agent in the refused
+    /// `session/new`: it is revoked, at an opening and at a resume. A session that kept
+    /// its servers keeps its token.
+    #[tokio::test]
+    async fn the_po_token_is_revoked_when_the_provider_itself_opens_the_session_without_servers() {
+        let (manager, _graph, fake) = signed_routed_agent_manager();
+        *fake.kind.lock().unwrap() = nexus_claude::agent::ProviderKind::Acp;
+        let mut req = agent_request("hello");
+        req.user_claims = Some(person_claims());
+
+        // Kept: the session carries its servers, its token stays live.
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        let kept = spec_token_jti(&fake.state.opened_specs.lock().unwrap().pop().unwrap());
+        assert!(
+            crate::auth::agent_tokens::is_live(&kept),
+            "servers kept: token live"
+        );
+
+        // Resumed after a restart of the agent that now refuses them: nexus asked
+        // `session/load` again without them. The snapshot said "takes servers", so the
+        // resume's spec carried a fresh token: revoked.
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+        fake.caps.lock().unwrap().per_session_mcp = false;
+        manager
+            .resume_session(&sid, "again", req.user_claims.as_ref())
+            .await
+            .unwrap();
+        let resumed = spec_token_jti(&fake.state.opened_specs.lock().unwrap().pop().unwrap());
+        assert!(
+            !crate::auth::agent_tokens::is_live(&resumed),
+            "the token of a resume nexus opened without servers is revoked"
+        );
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+
+        // Opened: same at a first opening.
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        let opened = spec_token_jti(&fake.state.opened_specs.lock().unwrap().pop().unwrap());
+        assert!(
+            !crate::auth::agent_tokens::is_live(&opened),
+            "the token of an opening nexus made without servers is revoked"
+        );
+        // ... and the session still runs, reporting what it lacks.
+        assert!(manager.agent_runtime.get(&sid).await.is_some());
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+
+        // The rule itself: requested and lost, by the host or by the provider.
+        let mut caps = nexus_claude::agent::Capabilities::none();
+        caps.per_session_mcp = true;
+        assert!(!opened_without_mcp(true, false, &caps));
+        assert!(opened_without_mcp(true, true, &caps));
+        assert!(!opened_without_mcp(false, false, &caps));
+        caps.per_session_mcp = false;
+        assert!(opened_without_mcp(true, false, &caps));
+        assert!(!opened_without_mcp(false, false, &caps), "nothing was sent");
+    }
+
+    /// Review of #682, finding 5: an opening or a resume that stops short — here its
+    /// authorization refused (a third-party instance the store does not know), after
+    /// its router was registered and its token minted — leaves neither behind.
+    #[tokio::test]
+    async fn a_refused_opening_or_resume_leaves_no_turn_router_nor_token() {
+        let (manager, graph, _fake) = signed_routed_agent_manager();
+        // A first opening on Claude Code (no gate): the router IS registered, so the
+        // assertions below are not vacuous.
+        let ok = manager
+            .create_session(&agent_request("hello"))
+            .await
+            .unwrap()
+            .session_id;
+        assert!(
+            manager.turn_routing.get(&ok).is_some(),
+            "routing is configured"
+        );
+
+        // Refused: a third-party instance the store does not know.
+        let req = {
+            let mut req = agent_request("");
+            req.user_claims = Some(person_claims());
+            req
+        };
+        let sid = Uuid::new_v4();
+        let refused = manager
+            .open_agent_session(AgentOpen {
+                request: &req,
+                session_id: sid,
+                provider_id: "elsewhere",
+                model: "m",
+                system_prompt: "p",
+                add_dirs: &[],
+                project_slug: None,
+                relay: None,
+                access: Default::default(),
+            })
+            .await;
+        assert!(refused.is_err());
+        let sid = sid.to_string();
+        // Not vacuous: a token WAS minted for the refused opening (review of #684, finding 3).
+        let minted = crate::auth::agent_tokens::minted_for(&sid);
+        assert_eq!(
+            minted.len(),
+            1,
+            "the opening minted its token before it was refused"
+        );
+        assert!(!crate::auth::agent_tokens::is_live(&minted[0]));
+        assert!(
+            manager.turn_routing.get(&sid).is_none(),
+            "a refused opening leaves no router"
+        );
+        assert_eq!(
+            crate::auth::agent_tokens::revoke_session(&sid),
+            0,
+            "nor a live token"
+        );
+
+        // The same at a resume.
+        let mut node = test_chat_session(None);
+        node.provider_id = Some("elsewhere".into());
+        graph.create_chat_session(&node).await.unwrap();
+        let refused = manager
+            .resume_agent_session(&node, "again", req.user_claims.as_ref(), None)
+            .await;
+        assert!(refused.is_err());
+        let sid = node.id.to_string();
+        let minted = crate::auth::agent_tokens::minted_for(&sid);
+        assert_eq!(
+            minted.len(),
+            1,
+            "the resume minted its token before it was refused"
+        );
+        assert!(!crate::auth::agent_tokens::is_live(&minted[0]));
+        assert!(
+            manager.turn_routing.get(&sid).is_none(),
+            "a refused resume leaves no router"
+        );
+        assert_eq!(crate::auth::agent_tokens::revoke_session(&sid), 0);
+        manager.close_session(&ok).await.unwrap();
+    }
+
+    /// A third-party instance (`acp`) a project consented to, played by the fake.
+    async fn consented_acp_instance(
+        graph: &crate::neo4j::mock::MockGraphStore,
+        id: &str,
+        slug: &str,
+    ) {
+        let record = crate::chat::provider::settings::InstanceRecord {
+            id: id.into(),
+            kind: "acp".into(),
+            label: "ACP".into(),
+            origin: crate::chat::provider::settings::process_origin("acp", None),
+            cost_source: "none".into(),
+            credential_ref: "none".into(),
+            ..Default::default()
+        };
+        super::super::agent_e2e_tests::store_instance(graph, &record).await;
+        super::super::agent_e2e_tests::consent(graph, slug, id, &record.origin).await;
+    }
+
+    async fn open_on(
+        manager: &ChatManager,
+        req: &ChatRequest,
+        sid: Uuid,
+        provider_id: &str,
+    ) -> Result<CreateSessionResponse> {
+        manager
+            .open_agent_session(AgentOpen {
+                request: req,
+                session_id: sid,
+                provider_id,
+                model: "m",
+                system_prompt: "p",
+                add_dirs: &[],
+                project_slug: Some("exits"),
+                relay: None,
+                access: Default::default(),
+            })
+            .await
+    }
+
+    /// What a failed opening leaves: no router, and the token it minted (when it got that
+    /// far, `minted`) is not live. `minted_for` makes the check non-vacuous: it lists the
+    /// tokens that WERE minted for the session.
+    fn left_nothing(manager: &ChatManager, sid: &str, minted: bool, exit: &str) {
+        assert!(
+            manager.turn_routing.get(sid).is_none(),
+            "{exit}: no router left"
+        );
+        let tokens = crate::auth::agent_tokens::minted_for(sid);
+        if minted {
+            assert_eq!(
+                tokens.len(),
+                1,
+                "{exit}: a token was minted before the failure"
+            );
+            assert!(
+                !crate::auth::agent_tokens::is_live(&tokens[0]),
+                "{exit}: its token is revoked"
+            );
+        } else {
+            assert!(tokens.is_empty(), "{exit}: failed before any token");
+        }
+    }
+
+    /// Review of #684, finding 3: every exit of an opening that stops short — provider
+    /// unavailable, window too small, a spec that cannot be built, the opening future
+    /// dropped — leaves neither its router nor the token it minted.
+    #[tokio::test]
+    async fn every_exit_of_a_failed_opening_leaves_no_router_nor_minted_token() {
+        use nexus_claude::agent::{
+            ContextWindow, ContextWindowSource, ProviderError, ProviderHealth,
+        };
+        let (manager, graph, fake) = signed_routed_agent_manager();
+        *fake.kind.lock().unwrap() = nexus_claude::agent::ProviderKind::Acp;
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        consented_acp_instance(&graph, "acp-exits", "exits").await;
+        let mut req = agent_request("");
+        req.user_claims = Some(person_claims());
+
+        // The setup opens: routing and token are set up, so what follows is not vacuous.
+        let sid = Uuid::new_v4();
+        open_on(&manager, &req, sid, "acp-exits")
+            .await
+            .expect("opens");
+        let ok = sid.to_string();
+        assert!(manager.turn_routing.get(&ok).is_some());
+        let tokens = crate::auth::agent_tokens::minted_for(&ok);
+        assert!(crate::auth::agent_tokens::is_live(&tokens[0]));
+        manager.close_session(&ok).await.unwrap();
+
+        // The provider says it is unavailable (the preflight, A30).
+        *fake.health.lock().unwrap() = Some(ProviderHealth::unavailable(
+            ProviderError::EndpointUnreachable {
+                detail: "down".into(),
+            },
+        ));
+        let sid = Uuid::new_v4();
+        assert!(open_on(&manager, &req, sid, "acp-exits").await.is_err());
+        left_nothing(&manager, &sid.to_string(), true, "health");
+        *fake.health.lock().unwrap() = None;
+
+        // The model's window cannot hold the tool schemas: the session opened, then closed.
+        fake.caps.lock().unwrap().context_window = Some(ContextWindow {
+            value: 10,
+            source: ContextWindowSource::Probed,
+        });
+        let sid = Uuid::new_v4();
+        let error = open_on(&manager, &req, sid, "acp-exits").await.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<ProviderError>(),
+                Some(ProviderError::ContextTooSmall { .. })
+            ),
+            "{error:#}"
+        );
+        let spec = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            crate::auth::agent_tokens::minted_for(&sid.to_string()),
+            vec![spec_token_jti(&spec)],
+            "the token that went to the provider"
+        );
+        left_nothing(&manager, &sid.to_string(), true, "window");
+        fake.caps.lock().unwrap().context_window = None;
+
+        // The spec cannot be built (an unknown permission mode): before any token.
+        let mut bad = req.clone();
+        bad.permission_mode = Some("no-such-mode".into());
+        let sid = Uuid::new_v4();
+        assert!(open_on(&manager, &bad, sid, "acp-exits").await.is_err());
+        left_nothing(&manager, &sid.to_string(), false, "spec");
+
+        // The opening future is dropped while the provider opens.
+        *fake.open_delay.lock().unwrap() = Some(Duration::from_secs(30));
+        let sid = Uuid::new_v4();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(200),
+            open_on(&manager, &req, sid, "acp-exits")
+        )
+        .await
+        .is_err());
+        left_nothing(&manager, &sid.to_string(), true, "abort");
+    }
+
+    /// Review of #684, finding 2: an opening that fails undoes only what IT set up. A
+    /// concurrent resume of the same session that succeeded (it minted after, and
+    /// registered its router over this one's) keeps its token and its router.
+    #[tokio::test]
+    async fn a_failed_opening_never_undoes_a_concurrent_one_that_succeeded() {
+        let (manager, _graph, _fake) = signed_routed_agent_manager();
+        let sid = Uuid::new_v4().to_string();
+        let turn = || OpeningTurn {
+            explicit_model: false,
+            provider_imposed: false,
+            moved_in: false,
+            routing_mode: None,
+            routing_pool: None,
+            permission_mode: None,
+            message: "hello",
+            next_turn: 0,
+        };
+        // The opening that will fail: its router, its token.
+        let mut failed = OpeningCleanup::new(&sid, &manager.turn_routing);
+        failed.registered(
+            manager
+                .register_turn_router(&sid, "claude-code", "m", None, turn())
+                .await,
+        );
+        assert!(failed.router.is_some(), "routing is configured");
+        let failed_jti = format!("jti-failed-{sid}");
+        crate::auth::agent_tokens::register(&failed_jti, Some(&sid));
+        failed.jti = Some(failed_jti.clone());
+        // The concurrent one that succeeds: a new token, a new router.
+        let won_jti = format!("jti-won-{sid}");
+        crate::auth::agent_tokens::register(&won_jti, Some(&sid));
+        let won = manager
+            .register_turn_router(&sid, "claude-code", "m", None, turn())
+            .await
+            .expect("a router");
+        drop(failed);
+        assert!(
+            crate::auth::agent_tokens::is_live(&won_jti),
+            "the token of the opening that succeeded stays live"
+        );
+        assert!(
+            manager
+                .turn_routing
+                .get(&sid)
+                .is_some_and(|router| Arc::ptr_eq(&router, &won)),
+            "its router stays"
+        );
+        // Alone, the failed opening undoes its own.
+        let mut alone = OpeningCleanup::new(&sid, &manager.turn_routing);
+        alone.registered(manager.turn_routing.get(&sid));
+        alone.jti = Some(won_jti.clone());
+        drop(alone);
+        assert!(!crate::auth::agent_tokens::is_live(&won_jti));
+        assert!(manager.turn_routing.get(&sid).is_none());
+    }
+
+    /// Review of #684, finding 2: two messages to a session that is not live resume it
+    /// ONCE. The second waits for the first and is delivered to the session it resumed:
+    /// no second token superseding the first, no second agent process.
+    #[tokio::test]
+    async fn two_messages_to_a_session_that_is_not_live_resume_it_once() {
+        let (manager, _graph, fake) = signed_routed_agent_manager();
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        let mut req = agent_request("hello");
+        req.user_claims = Some(person_claims());
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+        fake.state.opened_specs.lock().unwrap().clear();
+        // Each resume yields while the provider opens: without the lock, both resume.
+        *fake.open_delay.lock().unwrap() = Some(Duration::from_millis(100));
+        let (first, second) = tokio::join!(
+            manager.resume_session(&sid, "one", req.user_claims.as_ref()),
+            manager.resume_session(&sid, "two", req.user_claims.as_ref()),
+        );
+        first.unwrap();
+        second.unwrap();
+        let resumed = fake.state.opened_specs.lock().unwrap().clone();
+        assert_eq!(resumed.len(), 1, "the session is resumed once");
+        assert!(
+            crate::auth::agent_tokens::is_live(&spec_token_jti(&resumed[0])),
+            "its token is live"
+        );
+        assert!(manager.agent_runtime.get(&sid).await.is_some());
+        assert_eq!(manager.resume_locks.len(), 0, "no lock is kept");
+        // Both messages reached the session (review of #696, nit 4).
+        delivered(&fake, &["one", "two"]).await;
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// Waits until the fake agent has started a turn for each of `texts` (a message that
+    /// waited behind a running turn starts its own once that turn ends).
+    async fn delivered(fake: &super::super::agent_runtime::fake::FakeProvider, texts: &[&str]) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let turns = fake.state.turns_started.lock().unwrap().clone();
+            if texts
+                .iter()
+                .all(|t| turns.iter().any(|turn| turn.contains(t)))
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "not all delivered: {texts:?} in {turns:?}"
+            );
+            fake.state.end_turn();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Review of #696, finding 1: two sends that fail on ONE dead handle each fall back to
+    /// a resume (`seen` is that handle). The first resumes; the second, once it holds the
+    /// lock, finds a live handle other than the one it started from and delivers its
+    /// message there: one resume, both messages delivered. Before, both resumed (the
+    /// second minting a token that superseded the first's and ending its handle).
+    #[tokio::test]
+    async fn two_failed_sends_on_one_dead_session_resume_it_once_and_deliver_both() {
+        let (manager, graph, fake) = signed_routed_agent_manager();
+        fake.caps.lock().unwrap().per_session_mcp = true;
+        let mut req = agent_request("hello");
+        req.user_claims = Some(person_claims());
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        fake.state.end_turn();
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        // The handle both sends failed on.
+        let dead = manager.agent_runtime.get(&sid).await.expect("live");
+        fake.state.opened_specs.lock().unwrap().clear();
+        fake.state.turns_started.lock().unwrap().clear();
+        *fake.open_delay.lock().unwrap() = Some(Duration::from_millis(100));
+        let (first, second) = tokio::join!(
+            manager.resume_agent_session(
+                &node,
+                "one",
+                req.user_claims.as_ref(),
+                Some(Arc::clone(&dead))
+            ),
+            manager.resume_agent_session(
+                &node,
+                "two",
+                req.user_claims.as_ref(),
+                Some(Arc::clone(&dead))
+            ),
+        );
+        first.unwrap();
+        second.unwrap();
+        let resumed = fake.state.opened_specs.lock().unwrap().clone();
+        assert_eq!(resumed.len(), 1, "the session is resumed once");
+        let live = manager.agent_runtime.get(&sid).await.expect("live");
+        assert!(
+            !Arc::ptr_eq(&live, &dead),
+            "the resume replaced the dead handle"
+        );
+        assert!(crate::auth::agent_tokens::is_live(&spec_token_jti(
+            &resumed[0]
+        )));
+        delivered(&fake, &["one", "two"]).await;
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+    }
     #[tokio::test]
     async fn agent_path_opens_a_session_persists_the_snapshot_and_streams_a_turn() {
         use nexus_claude::agent::{AgentEvent, StopReason};
@@ -16870,6 +19319,7 @@ mod tests {
                         max_tokens: None,
                         kind: ProviderKind::Native,
                         remote_cwd: None,
+                        per_session_mcp: true,
                         hooks: None,
                     },
                     SessionAccess::ReadOnly,
@@ -17484,6 +19934,7 @@ mod tests {
                 pid: Some(1234),
                 parent_tool_use_id: None,
                 pending_removal_at: dying.then(std::time::Instant::now),
+                signalled: false,
             }
         }
 
@@ -18906,6 +21357,7 @@ mod tests {
                 parent_tool_use_id: None,
                 category: None,
                 canonical: None,
+                tool_use_id: None,
             },
             ChatEvent::Error {
                 message: "Something went wrong".into(),
@@ -19059,6 +21511,193 @@ mod tests {
         let result = manager.backfill_previews_from_meilisearch().await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
+    }
+
+    // ====================================================================
+    // backfill_agent_session_records — the record of the sessions the agent
+    // engine served before it kept one (P8)
+    // ====================================================================
+
+    fn record_event(session: Uuid, seq: i64, event: &ChatEvent) -> ChatEventRecord {
+        ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: session,
+            seq,
+            event_type: event.event_type().to_string(),
+            data: serde_json::to_string(event).unwrap(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn result_costing(usd: Option<f64>) -> ChatEvent {
+        ChatEvent::Result {
+            session_id: String::new(),
+            duration_ms: 1,
+            cost_usd: usd,
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: None,
+            result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_backfill_rebuilds_the_record_of_an_agent_session_once_and_leaves_claude_code_alone(
+    ) {
+        let state = mock_app_state();
+        let graph = state.neo4j.clone();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // A native session of before P8: three messages, three priced turns (one
+        // unknown), a record stuck at its creation.
+        let mut native = crate::test_helpers::test_chat_session(None);
+        native.provider_id = Some("local".into());
+        native.message_count = 1;
+        native.capabilities = Some("{}".into());
+        graph.create_chat_session(&native).await.unwrap();
+        let typed = crate::refs::block::encode(&"x".repeat(100), &[]);
+        let events = [
+            ChatEvent::UserMessage { content: typed },
+            result_costing(Some(0.01)),
+            ChatEvent::UserMessage {
+                content: "two".into(),
+            },
+            result_costing(None),
+            ChatEvent::UserMessage {
+                content: "three".into(),
+            },
+            result_costing(Some(0.02)),
+        ];
+        graph
+            .store_chat_events(
+                native.id,
+                events
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| record_event(native.id, i as i64 + 1, e))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        // A Claude Code session: the legacy engine kept its record.
+        let mut legacy = crate::test_helpers::test_chat_session(None);
+        legacy.provider_id = Some(crate::chat::provider::resolver::CLAUDE_CODE.into());
+        legacy.message_count = 1;
+        graph.create_chat_session(&legacy).await.unwrap();
+        graph
+            .store_chat_events(
+                legacy.id,
+                vec![
+                    record_event(
+                        legacy.id,
+                        1,
+                        &ChatEvent::UserMessage {
+                            content: "a".into(),
+                        },
+                    ),
+                    record_event(
+                        legacy.id,
+                        2,
+                        &ChatEvent::UserMessage {
+                            content: "b".into(),
+                        },
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(manager.backfill_agent_session_records().await.unwrap(), 1);
+        let node = graph.get_chat_session(native.id).await.unwrap().unwrap();
+        assert_eq!(node.message_count, 3, "{node:?}");
+        assert!(
+            (node.total_cost_usd.unwrap() - 0.03).abs() < 1e-9,
+            "{node:?}"
+        );
+        let title = node.title.clone().unwrap();
+        assert_eq!(title.chars().count(), 80, "the one title rule: {title}");
+        assert!(title.ends_with("..."));
+        assert_eq!(node.preview.as_deref(), Some("x".repeat(100).as_str()));
+
+        let untouched = graph.get_chat_session(legacy.id).await.unwrap().unwrap();
+        assert_eq!(untouched.message_count, 1);
+        assert_eq!(untouched.title, None);
+
+        // Idempotent.
+        assert_eq!(manager.backfill_agent_session_records().await.unwrap(), 0);
+        let again = graph.get_chat_session(native.id).await.unwrap().unwrap();
+        assert_eq!(again.message_count, 3);
+        assert_eq!(again.total_cost_usd, node.total_cost_usd);
+    }
+
+    /// Claude Code forced onto the agent engine has a provider snapshot: it is
+    /// backfilled, its cost being the CLI's session total (the last one). A session
+    /// live on this instance is left to its handle (it could be counted twice).
+    #[tokio::test]
+    async fn the_backfill_takes_claude_code_on_the_agent_engine_and_skips_a_live_session() {
+        let state = mock_app_state();
+        let graph = state.neo4j.clone();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let mut forced = crate::test_helpers::test_chat_session(None);
+        forced.provider_id = Some(crate::chat::provider::resolver::CLAUDE_CODE.into());
+        forced.capabilities = Some("{}".into());
+        forced.message_count = 1;
+        graph.create_chat_session(&forced).await.unwrap();
+        let mut live = crate::test_helpers::test_chat_session(None);
+        live.provider_id = Some("local".into());
+        live.capabilities = Some("{}".into());
+        live.message_count = 1;
+        graph.create_chat_session(&live).await.unwrap();
+        for id in [forced.id, live.id] {
+            let events = [
+                ChatEvent::UserMessage {
+                    content: "a".into(),
+                },
+                result_costing(Some(0.01)),
+                ChatEvent::UserMessage {
+                    content: "b".into(),
+                },
+                result_costing(Some(0.03)),
+            ];
+            graph
+                .store_chat_events(
+                    id,
+                    events
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| record_event(id, i as i64 + 1, e))
+                        .collect(),
+                )
+                .await
+                .unwrap();
+        }
+        let provider = crate::chat::agent_runtime::fake::FakeProvider::new();
+        manager
+            .agent_runtime
+            .adopt(
+                &live.id.to_string(),
+                "local",
+                provider.session(),
+                10,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+
+        assert_eq!(manager.backfill_agent_session_records().await.unwrap(), 1);
+        let node = graph.get_chat_session(forced.id).await.unwrap().unwrap();
+        assert_eq!(node.message_count, 2, "{node:?}");
+        assert_eq!(node.total_cost_usd, Some(0.03), "the CLI's total, not 0.04");
+        let untouched = graph.get_chat_session(live.id).await.unwrap().unwrap();
+        assert_eq!(untouched.message_count, 1, "a live session is its handle's");
+        assert_eq!(untouched.total_cost_usd, None);
     }
 
     // ====================================================================
@@ -22065,6 +24704,7 @@ mod tests {
                 pid: None,
                 parent_tool_use_id: Some("tool_T1".into()),
                 pending_removal_at: None,
+                signalled: false,
             },
         );
 
@@ -22132,18 +24772,583 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cancel_task_unknown_session_idempotent() {
+    /// Review N2 of #663: a session no instance holds gets the same typed answer on a
+    /// single instance as across instances (NATS, nobody answering):
+    /// `owner_unreachable` (409, not retryable), for both cancels — not a 200 here and
+    /// a 409 there.
+    async fn test_cancel_on_unknown_session_is_owner_unreachable() {
+        use super::super::cancel_relay::CancelRelayError;
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         // No session inserted at all.
-        let result = manager
-            .cancel_task("ghost-session", "tool_X")
+        for error in [
+            manager
+                .cancel_task("ghost-session", "tool_X")
+                .await
+                .unwrap_err(),
+            manager
+                .cancel_running_tools("ghost-session")
+                .await
+                .unwrap_err(),
+        ] {
+            assert_eq!(
+                error.downcast_ref::<CancelRelayError>(),
+                Some(&CancelRelayError::OwnerUnreachable)
+            );
+        }
+    }
+
+    /// Review of #673, finding 4: the eviction of a dead CLI removes only the entry
+    /// it found dead. A resume that replaced the entry meanwhile keeps its session
+    /// and its NATS listeners (before: the new session was removed and its
+    /// listeners cancelled).
+    #[tokio::test]
+    async fn evicting_a_dead_cli_leaves_a_session_that_replaced_it() {
+        let (old, _) = create_dummy_session(false, "", vec![]);
+        let (new, _) = create_dummy_session(false, "", vec![]);
+        let (old_client, old_token) = (old.client.clone(), old.nats_cancel.clone());
+        let new_token = new.nats_cancel.clone();
+        let sessions = RwLock::new(HashMap::new());
+        // A resume replaced the entry whose CLI was found dead.
+        sessions.write().await.insert("s".to_string(), new);
+        assert!(!ChatManager::forget_if_client(&sessions, "s", &old_client).await);
+        assert!(
+            sessions.read().await.contains_key("s"),
+            "the new session stays"
+        );
+        assert!(!new_token.is_cancelled(), "its listeners keep running");
+
+        // The entry is still the dead one: removed, its listeners ended.
+        sessions.write().await.insert("s".to_string(), old);
+        assert!(ChatManager::forget_if_client(&sessions, "s", &old_client).await);
+        assert!(!sessions.read().await.contains_key("s"));
+        assert!(old_token.is_cancelled());
+    }
+
+    /// Review of #685, finding 3: a task already being stopped (its grace period
+    /// runs, its pid kept) is not signalled again by a second cancel_task (a retry
+    /// after a `session_gone`, a second click), nor counted twice in the cap.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_task_already_being_stopped_is_not_signalled_again() {
+        let mut task = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let task_pid = task.id();
+        let (session, _) = create_dummy_session(false, "", vec![]);
+        let history = session.cancel_task_history.clone();
+        session.active_background_tasks.lock().await.insert(
+            "tool_Twice".into(),
+            BackgroundTaskInfo {
+                id: "tool_Twice".into(),
+                kind: BackgroundTaskKind::BashBackground,
+                description: "sleep".into(),
+                started_at: chrono::Utc::now(),
+                last_seen_at: chrono::Utc::now(),
+                pid: Some(task_pid),
+                parent_tool_use_id: Some("tool_Twice".into()),
+                pending_removal_at: None,
+                signalled: false,
+            },
+        );
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-twice".into(), session);
+
+        let first = manager.cancel_task("s-twice", "tool_Twice").await.unwrap();
+        assert!(first.killed_pids.contains(&task_pid), "{first:?}");
+        assert!(!task.wait().unwrap().success(), "signalled once");
+
+        let again = manager.cancel_task("s-twice", "tool_Twice").await.unwrap();
+        assert!(!again.capped && again.killed_pids.is_empty(), "{again:?}");
+        assert_eq!(history.lock().await.len(), 1, "counted once");
+    }
+
+    fn tracked_task(id: &str, pid: Option<u32>) -> BackgroundTaskInfo {
+        BackgroundTaskInfo {
+            id: id.into(),
+            kind: BackgroundTaskKind::BashBackground,
+            description: "sleep".into(),
+            started_at: chrono::Utc::now(),
+            last_seen_at: chrono::Utc::now(),
+            pid,
+            parent_tool_use_id: Some(id.into()),
+            pending_removal_at: None,
+            signalled: false,
+        }
+    }
+
+    /// Review of #691, finding 1: a Stop in the first second of a background task
+    /// comes before its pid is known. It signals nothing, and marks the task
+    /// stopping. The PID claim that follows signals it (before: it only filled the
+    /// pid, and the no-op of a retry left the process running, untracked). Once
+    /// signalled, asking again is the no-op.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_task_stopped_before_its_pid_is_known_is_signalled_when_it_is_found() {
+        // A fake CLI whose child is the background task.
+        let mut cli = std::process::Command::new("sh")
+            .args(["-c", "sleep 30; true"])
+            .spawn()
+            .unwrap();
+        let (mut session, _) = create_dummy_session(false, "", vec![]);
+        session.child_pid = Some(cli.id());
+        let (history, events_tx, tasks) = (
+            session.cancel_task_history.clone(),
+            session.events_tx.clone(),
+            session.active_background_tasks.clone(),
+        );
+        tasks
+            .lock()
+            .await
+            .insert("tool_Early".into(), tracked_task("tool_Early", None));
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-early".into(), session);
+
+        let early = manager.cancel_task("s-early", "tool_Early").await.unwrap();
+        assert!(!early.capped && early.killed_pids.is_empty(), "{early:?}");
+
+        ChatManager::async_pid_claim(
+            "s-early".into(),
+            manager.active_sessions.clone(),
+            events_tx,
+            None,
+            "tool_Early".into(),
+            vec![],
+        )
+        .await;
+        let pid = tasks.lock().await["tool_Early"].pid;
+        assert!(pid.is_some(), "the claim found the task's process");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_alive(pid) == Some(true) {
+            assert!(
+                Instant::now() < deadline,
+                "the task's process was signalled once its pid was found"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = cli.wait();
+
+        let again = manager.cancel_task("s-early", "tool_Early").await.unwrap();
+        assert!(!again.capped && again.killed_pids.is_empty(), "{again:?}");
+        assert_eq!(history.lock().await.len(), 1, "the no-op is not counted");
+    }
+
+    /// Review of #694, point 1: a task the death poller found dead is never
+    /// signalled: by the time a Stop comes (before the purge), its pid may name
+    /// another process. The reuse is played by pointing the entry at a live
+    /// process after the poller marked it: it must survive the Stop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_task_found_dead_is_never_signalled_even_if_its_pid_was_reused() {
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = gone.id();
+        gone.wait().unwrap();
+        let (map, events_tx) =
+            session_with_silent_background_task("s-reused", Some(dead_pid), 0).await;
+        ChatManager::tick_purge_background_tasks(
+            "s-reused",
+            &map,
+            &events_tx,
+            &None,
+            Duration::from_secs(BACKGROUND_TASK_PURGE_GRACE_SECS),
+        )
+        .await;
+        assert!(silent_task_is_marked(&map, "s-reused").await);
+
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let other_pid = other.id();
+        map.read().await["s-reused"]
+            .active_background_tasks
+            .lock()
+            .await
+            .get_mut("tool_silent")
+            .unwrap()
+            .pid = Some(other_pid);
+
+        let stop = ChatManager::cancel_legacy_task(&map, &None, "s-reused", "tool_silent")
             .await
             .unwrap();
-        assert_eq!(result.task_id, "tool_X");
-        assert!(!result.capped);
-        assert!(result.killed_pids.is_empty());
+        assert!(stop.killed_pids.is_empty(), "{stop:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            process_alive(Some(other_pid)),
+            Some(true),
+            "the process now holding the pid was left alone"
+        );
+        let _ = other.kill();
+        let _ = other.wait();
+    }
+
+    /// Review of #694, point 2: a claim that finds several new processes in the
+    /// same second (two tools started together) records the first, as before, but
+    /// does not signal a task stopped before it: the first candidate may be the
+    /// neighbour's. The task stays stopping and not signalled, so an explicit Stop
+    /// asked again signals it.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn an_ambiguous_claim_signals_nothing_and_leaves_it_to_an_explicit_stop() {
+        let mut cli = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & sleep 30; true"])
+            .spawn()
+            .unwrap();
+        let cli_pid = cli.id();
+        let (mut session, _) = create_dummy_session(false, "", vec![]);
+        session.child_pid = Some(cli_pid);
+        let (events_tx, tasks) = (
+            session.events_tx.clone(),
+            session.active_background_tasks.clone(),
+        );
+        tasks
+            .lock()
+            .await
+            .insert("tool_Two".into(), tracked_task("tool_Two", None));
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-two".into(), session);
+
+        let early = manager.cancel_task("s-two", "tool_Two").await.unwrap();
+        assert!(early.killed_pids.is_empty(), "{early:?}");
+        ChatManager::async_pid_claim(
+            "s-two".into(),
+            manager.active_sessions.clone(),
+            events_tx,
+            None,
+            "tool_Two".into(),
+            vec![],
+        )
+        .await;
+        let both = ChatManager::get_descendant_pids(cli_pid);
+        assert_eq!(both.len(), 2, "two new processes: {both:?}");
+        let claimed = {
+            let tasks = tasks.lock().await;
+            assert!(!tasks["tool_Two"].signalled);
+            tasks["tool_Two"]
+                .pid
+                .expect("the first candidate is recorded")
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for pid in &both {
+            assert_eq!(process_alive(Some(*pid)), Some(true), "{pid} signalled");
+        }
+
+        let explicit = manager.cancel_task("s-two", "tool_Two").await.unwrap();
+        assert!(explicit.killed_pids.contains(&claimed), "{explicit:?}");
+
+        for pid in both {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+        let _ = cli.kill();
+        let _ = cli.wait();
+    }
+
+    /// Review of #691, finding 2: two concurrent stops of one task signal it once
+    /// and count once in the cap (before: both passed the check and both counted).
+    /// The cap history is held so that both are in flight together.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn two_concurrent_stops_signal_a_task_once_and_count_once() {
+        let mut task = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let task_pid = task.id();
+        let (session, _) = create_dummy_session(false, "", vec![]);
+        let history = session.cancel_task_history.clone();
+        session.active_background_tasks.lock().await.insert(
+            "tool_Both".into(),
+            tracked_task("tool_Both", Some(task_pid)),
+        );
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        sessions.write().await.insert("s-both".to_string(), session);
+
+        let held = history.lock().await;
+        let stop = || {
+            let sessions = Arc::clone(&sessions);
+            tokio::spawn(async move {
+                ChatManager::cancel_legacy_task(&sessions, &None, "s-both", "tool_Both")
+                    .await
+                    .expect("a session of this instance")
+            })
+        };
+        let (a, b) = (stop(), stop());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(held);
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+
+        assert!(!a.capped && !b.capped, "{a:?} {b:?}");
+        let signalled = [&a, &b]
+            .iter()
+            .filter(|r| r.killed_pids.contains(&task_pid))
+            .count();
+        assert_eq!(signalled, 1, "signalled once: {a:?} {b:?}");
+        assert_eq!(history.lock().await.len(), 1, "counted once");
+        assert!(!task.wait().unwrap().success());
+    }
+
+    /// Review of #691, finding 3: the close of an agent-engine session is watched
+    /// for the whole cancel, not only at its start. A close during the cancel, or
+    /// one that comes with its outcome, answers `gone` (provisional), never the
+    /// provider's final answer.
+    #[tokio::test]
+    async fn a_close_during_an_agent_cancel_answers_gone() {
+        use super::super::cancel_relay::{CancelKind, CancelRelayError};
+        let gone = |outcome: Result<u32>| {
+            outcome
+                .unwrap_err()
+                .downcast_ref::<CancelRelayError>()
+                .cloned()
+                == Some(CancelRelayError::SessionGone {
+                    kind: CancelKind::Tools,
+                })
+        };
+
+        // Closed while the cancel runs.
+        let closed = CancellationToken::new();
+        let closing = closed.clone();
+        let outcome = ChatManager::unless_agent_closed(&closed, CancelKind::Tools, async move {
+            closing.cancel();
+            tokio::task::yield_now().await;
+            Ok(7)
+        })
+        .await;
+        assert!(gone(outcome));
+
+        // Closed as the cancel answers.
+        let closed = CancellationToken::new();
+        let closing = closed.clone();
+        let outcome = ChatManager::unless_agent_closed(&closed, CancelKind::Tools, async move {
+            closing.cancel();
+            Ok(7)
+        })
+        .await;
+        assert!(gone(outcome));
+
+        // Open throughout: the cancel's own answer.
+        let closed = CancellationToken::new();
+        let outcome =
+            ChatManager::unless_agent_closed(&closed, CancelKind::Tools, async { Ok(7) }).await;
+        assert_eq!(outcome.unwrap(), 7);
+    }
+
+    /// A connected CLI whose turn ends before any `Result` (it died mid-turn).
+    struct DiesMidTurn;
+
+    #[async_trait::async_trait]
+    impl nexus_claude::transport::Transport for DiesMidTurn {
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        async fn connect(&mut self) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        async fn send_message(
+            &mut self,
+            _: nexus_claude::transport::InputMessage,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        fn receive_messages(
+            &mut self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = nexus_claude::Result<nexus_claude::Message>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+        async fn send_control_request(
+            &mut self,
+            _: nexus_claude::ControlRequest,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        async fn receive_control_response(
+            &mut self,
+        ) -> nexus_claude::Result<Option<nexus_claude::ControlResponse>> {
+            Ok(None)
+        }
+        async fn send_sdk_control_request(
+            &mut self,
+            _: serde_json::Value,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        async fn send_sdk_control_response(
+            &mut self,
+            _: serde_json::Value,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        async fn disconnect(&mut self) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Review of #685, finding 2: a turn that finds its CLI dead drops the session
+    /// only while the entry is still the one of that CLI. A resume that replaced
+    /// it during the turn keeps its session and its NATS listeners (before: the
+    /// new session was removed and its listeners cancelled). The turn waits for
+    /// its CLI (held by the test) while the entry is replaced.
+    async fn a_turn_on_a_dead_cli_leaves_the_session_that_replaced_it(dead: InteractiveClient) {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let sid = Uuid::new_v4().to_string();
+        let (mut old, _) = create_dummy_session(false, "", vec![]);
+        old.client = Arc::new(Mutex::new(dead));
+        let (old_client, old_streaming) = (old.client.clone(), old.is_streaming.clone());
+        let mut events = old.events_tx.subscribe();
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(sid.clone(), old);
+
+        let held = old_client.lock().await;
+        manager.send_message(&sid, "hi").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !old_streaming.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the turn started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (new, _) = create_dummy_session(false, "", vec![]);
+        let (new_client, new_token) = (new.client.clone(), new.nats_cancel.clone());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(sid.clone(), new);
+        drop(held);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Ok(ChatEvent::Error { .. }) => break,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => panic!("no error event"),
+                }
+            }
+        })
+        .await
+        .expect("the turn reports its dead CLI");
+        let sessions = manager.active_sessions.read().await;
+        let kept = sessions
+            .get(&sid)
+            .expect("the session that replaced it stays");
+        assert!(Arc::ptr_eq(&kept.client, &new_client));
+        assert!(!new_token.is_cancelled(), "its NATS listeners keep running");
+    }
+
+    /// The write fails (`Not connected`): the "CLI appears dead" path.
+    #[tokio::test]
+    async fn a_turn_whose_write_finds_the_cli_dead_leaves_the_session_that_replaced_it() {
+        a_turn_on_a_dead_cli_leaves_the_session_that_replaced_it(create_dummy_client()).await;
+    }
+
+    /// The stream ends before a `Result`: the "CLI left before answering" path.
+    #[tokio::test]
+    async fn a_turn_whose_cli_ends_before_a_result_leaves_the_session_that_replaced_it() {
+        let mut dead = InteractiveClient::from_transport(Box::new(DiesMidTurn));
+        dead.connect().await.unwrap();
+        a_turn_on_a_dead_cli_leaves_the_session_that_replaced_it(dead).await;
+    }
+
+    /// Review of #685, finding 1: an agent-engine cancel listener reads no request
+    /// once its session closed, even one already waiting (`biased`, the close
+    /// first). Without it `select!` picks a ready branch at random: over 64 runs a
+    /// request would be read.
+    #[tokio::test]
+    async fn an_agent_cancel_listener_reads_no_request_once_the_session_closed() {
+        let closed = CancellationToken::new();
+        closed.cancel();
+        for _ in 0..64 {
+            let mut read = 0;
+            ChatManager::serve_agent_cancels(
+                futures::stream::iter([1, 2, 3]),
+                closed.clone(),
+                |_| read += 1,
+            )
+            .await;
+            assert_eq!(read, 0);
+        }
+        // Open, it serves every request until the subscription ends.
+        let mut read = 0;
+        ChatManager::serve_agent_cancels(
+            futures::stream::iter([1, 2, 3]),
+            CancellationToken::new(),
+            |_| read += 1,
+        )
+        .await;
+        assert_eq!(read, 3);
+    }
+
+    /// Review of #685, finding 1: a cancel read just before the session closed is
+    /// answered `gone` (provisional: the real owner still answers), not with what
+    /// the closing provider session says (a result, a refusal or a failure, all
+    /// final: they would beat the real owner's answer).
+    #[tokio::test]
+    async fn a_cancel_on_a_closing_agent_session_answers_gone() {
+        use super::super::cancel_relay::{CancelKind, CancelReply};
+        let (manager, _graph, _fake) = agent_manager();
+        let sid = manager
+            .create_session(&agent_request("first"))
+            .await
+            .unwrap()
+            .session_id;
+        let handle = manager.agent_runtime.get(&sid).await.expect("a handle");
+        // Open, the provider answers.
+        let open = CancelReply::of(
+            ChatManager::unless_agent_closed(
+                &handle.closed,
+                CancelKind::Tools,
+                handle.cancel_tools(),
+            )
+            .await,
+        );
+        assert!(!open.is_gone());
+
+        handle.closed.cancel();
+        let tools = CancelReply::of(
+            ChatManager::unless_agent_closed(
+                &handle.closed,
+                CancelKind::Tools,
+                handle.cancel_tools(),
+            )
+            .await,
+        );
+        assert!(tools.is_gone());
+        let task = CancelReply::of(
+            ChatManager::unless_agent_closed(
+                &handle.closed,
+                CancelKind::Task,
+                handle.cancel_task("tool_T"),
+            )
+            .await,
+        );
+        assert!(task.is_gone());
     }
 
     #[tokio::test]
@@ -22199,6 +25404,7 @@ mod tests {
                 pid: None,
                 parent_tool_use_id: Some("tool_NoPid".into()),
                 pending_removal_at: None,
+                signalled: false,
             },
         );
 
@@ -22271,6 +25477,7 @@ mod tests {
                 pid: Some(real_pid),
                 parent_tool_use_id: Some("tool_Real".into()),
                 pending_removal_at: None,
+                signalled: false,
             },
         );
 
@@ -22296,6 +25503,205 @@ mod tests {
             !exit.success(),
             "subprocess should have been signalled, not exited cleanly"
         );
+    }
+
+    /// P12 (review of #663, points 4 and 6): a Claude Code session of the legacy
+    /// engine held by ANOTHER instance. That instance's `cancel_task` and
+    /// `cancel_running_tools` ask the owner over NATS (test broker) and return what
+    /// it did: the task's process (a real `sleep`) is signalled and its pid comes
+    /// back, the running tool (a real child of a fake CLI) too. Once the session has
+    /// left the owner, the owner answers `gone` at once: a typed `session_gone`,
+    /// never the old silent success.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_legacy_session_answers_cancels_from_another_instance_over_nats() {
+        use super::super::cancel_relay::CancelRelayError;
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+
+        let mut task = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let task_pid = task.id();
+        // A fake CLI whose child is the running tool.
+        let mut cli = std::process::Command::new("sh")
+            .args(["-c", "sleep 30; true"])
+            .spawn()
+            .unwrap();
+        let cli_pid = cli.id();
+
+        let broker = TestBroker::start().await;
+        let owner_nats = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let state = mock_app_state();
+        let owner = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
+            .with_nats(Arc::clone(&owner_nats));
+        let (mut session, _) = create_dummy_session(false, "", vec![]);
+        session.child_pid = Some(cli_pid);
+        session.active_background_tasks.lock().await.insert(
+            "tool_Far".into(),
+            BackgroundTaskInfo {
+                id: "tool_Far".into(),
+                kind: BackgroundTaskKind::BashBackground,
+                description: "far sleep".into(),
+                started_at: chrono::Utc::now(),
+                last_seen_at: chrono::Utc::now(),
+                pid: Some(task_pid),
+                parent_tool_use_id: Some("tool_Far".into()),
+                pending_removal_at: None,
+                signalled: false,
+            },
+        );
+        owner
+            .active_sessions
+            .write()
+            .await
+            .insert("s-far".into(), session);
+        let token = CancellationToken::new();
+        owner.spawn_nats_cancel_task_listener(
+            "s-far",
+            owner.active_sessions.clone(),
+            token.clone(),
+        );
+        owner.spawn_nats_cancel_tools_listener(
+            "s-far",
+            owner.active_sessions.clone(),
+            token.clone(),
+        );
+
+        let state = mock_app_state();
+        // A short deadline: a `gone` alone for cancel_tools is kept until it.
+        let far = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
+            .with_nats(Arc::new(
+                NatsEmitter::new(broker.client().await, "events")
+                    .with_cancel_rpc_timeout(Duration::from_secs(3)),
+            ));
+        // The owner's listeners may still be subscribing.
+        let mut stopped = None;
+        for _ in 0..20 {
+            match far.cancel_task("s-far", "tool_Far").await {
+                Ok(result) => {
+                    stopped = Some(result);
+                    break;
+                }
+                Err(e)
+                    if e.downcast_ref::<CancelRelayError>()
+                        == Some(&CancelRelayError::OwnerUnreachable) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("{e:#}"),
+            }
+        }
+        let stopped = stopped.expect("the owner answered");
+        assert!(stopped.killed_pids.contains(&task_pid), "{stopped:?}");
+        assert!(
+            !task.wait().unwrap().success(),
+            "the task's process was signalled"
+        );
+
+        let mut tools = None;
+        for _ in 0..20 {
+            match far.cancel_running_tools("s-far").await {
+                Ok(result) => {
+                    tools = Some(result);
+                    break;
+                }
+                Err(e)
+                    if e.downcast_ref::<CancelRelayError>()
+                        == Some(&CancelRelayError::OwnerUnreachable) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("{e:#}"),
+            }
+        }
+        let tools = tools.expect("the owner answered");
+        assert!(!tools.capped && !tools.killed_pids.is_empty(), "{tools:?}");
+        assert_eq!(tools.cli_pid, Some(cli_pid));
+        let _ = cli.kill();
+        let _ = cli.wait();
+
+        // The session leaves the owner: both answer `gone`, typed. cancel_task
+        // reports it after GONE_GRACE (retryable); cancel_tools keeps listening for
+        // a real owner until its deadline, then reports it, not retryable (review
+        // of #673, finding 1).
+        owner.active_sessions.write().await.remove("s-far");
+        let started = std::time::Instant::now();
+        let gone = far.cancel_task("s-far", "tool_Far").await.unwrap_err();
+        assert_eq!(
+            gone.downcast_ref::<CancelRelayError>(),
+            Some(&CancelRelayError::SessionGone {
+                kind: super::super::cancel_relay::CancelKind::Task
+            })
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= super::super::cancel_relay::GONE_GRACE && elapsed < Duration::from_secs(3),
+            "answered after the grace, not timed out: {elapsed:?}"
+        );
+        // Measured from the cancel_tools alone (review of #685, finding 5): it waits
+        // for a real owner up to the asker's deadline (3 s here), and no longer.
+        let started = std::time::Instant::now();
+        let gone = far.cancel_running_tools("s-far").await.unwrap_err();
+        let elapsed = started.elapsed();
+        let gone = gone.downcast_ref::<CancelRelayError>().cloned();
+        assert_eq!(
+            gone,
+            Some(CancelRelayError::SessionGone {
+                kind: super::super::cancel_relay::CancelKind::Tools
+            })
+        );
+        assert!(!gone.unwrap().failure().retryable);
+        assert!(
+            elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(5),
+            "answered at the deadline, not before nor long after: {elapsed:?}"
+        );
+        token.cancel();
+    }
+
+    /// Review N8 of #663: a cancel_tools on the instance that holds the session is
+    /// done once. It used to also publish the cancel signal on NATS, which this
+    /// instance's own listener received: the tools were signalled twice and the
+    /// cap counted twice.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_local_cancel_tools_is_done_once_not_echoed_by_its_own_listener() {
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+
+        let mut cli = std::process::Command::new("sh")
+            .args(["-c", "sleep 30; true"])
+            .spawn()
+            .unwrap();
+        let broker = TestBroker::start().await;
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
+            .with_nats(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+        let (mut session, _) = create_dummy_session(false, "", vec![]);
+        session.child_pid = Some(cli.id());
+        let history = session.cancel_tools_history.clone();
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-once".into(), session);
+        let token = CancellationToken::new();
+        manager.spawn_nats_cancel_tools_listener(
+            "s-once",
+            manager.active_sessions.clone(),
+            token.clone(),
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let result = manager.cancel_running_tools("s-once").await.unwrap();
+        assert!(!result.capped);
+        // Leave the echo, if any, the time to arrive.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(history.lock().await.len(), 1, "one cancel, counted once");
+        token.cancel();
+        let _ = cli.kill();
+        let _ = cli.wait();
     }
 
     // ========================================================================
@@ -22517,6 +25923,7 @@ mod tests {
                 pid: None,
                 parent_tool_use_id: Some("toolu_existing".into()),
                 pending_removal_at: None,
+                signalled: false,
             },
         );
 
@@ -22607,6 +26014,7 @@ mod tests {
                 pid: None,
                 parent_tool_use_id: Some("tool_known".into()),
                 pending_removal_at: None,
+                signalled: false,
             },
         );
 
@@ -22695,6 +26103,7 @@ mod tests {
                 pid,
                 parent_tool_use_id: None,
                 pending_removal_at: None,
+                signalled: false,
             },
         );
         session
@@ -22841,6 +26250,7 @@ mod tests {
                     pid: None,
                     parent_tool_use_id: None,
                     pending_removal_at: Some(stale_at),
+                    signalled: false,
                 },
             );
             tasks.insert(
@@ -22854,6 +26264,7 @@ mod tests {
                     pid: None,
                     parent_tool_use_id: None,
                     pending_removal_at: None,
+                    signalled: false,
                 },
             );
         }
@@ -22922,6 +26333,7 @@ mod tests {
                     pid: None,
                     parent_tool_use_id: None,
                     pending_removal_at: None,
+                    signalled: false,
                 },
             );
             tasks.insert(
@@ -22935,6 +26347,7 @@ mod tests {
                     pid: None,
                     parent_tool_use_id: None,
                     pending_removal_at: None,
+                    signalled: false,
                 },
             );
         }
@@ -23003,6 +26416,7 @@ mod tests {
                 pid: None,
                 parent_tool_use_id: None,
                 pending_removal_at: Some(now),
+                signalled: false,
             },
         );
 
@@ -23327,6 +26741,12 @@ mod refs_turn_services_tests {
             nats: None,
             documents: crate::documents::store::DocumentStore::new(std::env::temp_dir()),
             anchor: Default::default(),
+            session: Default::default(),
+            search: crate::test_helpers::mock_app_state().meili,
+            event_emitter: None,
+            context_injector: None,
+            step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
+            stall_step: None,
         };
 
         let note = Uuid::new_v4();
@@ -23350,5 +26770,508 @@ mod refs_turn_services_tests {
             "{out}"
         );
         assert!(!out.contains("<po-refs>"), "{out}");
+    }
+}
+
+/// The end-of-turn steps of the agent engine are bounded one by one, as the Claude
+/// Code engine's (`StepBudget::run`): a step that never answers is dropped and
+/// said, the next one still runs (before, one budget held the three together, so a
+/// slow re-injection lost the memory and the feedback too).
+#[cfg(test)]
+mod agent_step_budget_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_step_past_its_budget_is_said_and_the_next_one_still_runs() {
+        let mut after = super::super::agent_runtime::AfterTurn::default();
+        let budget = Duration::from_millis(20);
+        let stuck = run_step(
+            &mut after,
+            "s",
+            "post_compaction",
+            budget,
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(stuck.is_none());
+        let next = run_step(&mut after, "s", "feedback", budget, async { 7 }).await;
+        assert_eq!(next, Some(7), "the next step ran");
+        assert!(
+            matches!(
+                after.events.as_slice(),
+                [ChatEvent::Error { code: Some(code), reason: Some(step), .. }]
+                    if code == super::super::post_stream::STEP_ABANDONED_CODE
+                        && step == "post_compaction"
+            ),
+            "{:?}",
+            after.events
+        );
+    }
+}
+
+/// What waits for a session's next turn after a compaction (`HeldContext`): kept
+/// across a restart, dropped only once a turn carrying it was sent, cut to the
+/// window; and the end-of-turn steps each under their own budget.
+#[cfg(test)]
+mod held_context_tests {
+    use super::*;
+    use crate::chat::agent_runtime::{TurnOutcome, TurnServices};
+
+    fn test_config() -> ChatConfig {
+        ChatConfig {
+            max_sessions: 10,
+            ..Default::default()
+        }
+    }
+
+    fn services(manager: &ChatManager, state: AgentTurnState) -> ManagerTurnServices {
+        ManagerTurnServices {
+            graph: manager.graph.clone(),
+            enrichment_pipeline: manager.enrichment_pipeline.clone(),
+            turn_routing: Arc::default(),
+            documents: crate::documents::store::DocumentStore::new(std::env::temp_dir()),
+            nats: None,
+            anchor: Default::default(),
+            session: state,
+            search: crate::test_helpers::mock_app_state().meili,
+            event_emitter: None,
+            context_injector: None,
+            step_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
+            stall_step: None,
+        }
+    }
+
+    async fn world() -> (ChatManager, String) {
+        world_on(Arc::new(crate::neo4j::mock::MockGraphStore::new())).await
+    }
+
+    /// [`world`] on a store the test drives (slow, failing writes).
+    async fn world_on(mock: Arc<crate::neo4j::mock::MockGraphStore>) -> (ChatManager, String) {
+        let graph: Arc<dyn GraphStore> = mock;
+        let manager = ChatManager::new_without_memory(
+            graph.clone(),
+            crate::test_helpers::mock_app_state().meili,
+            test_config(),
+        );
+        let mut project = crate::test_helpers::test_project();
+        project.slug = "held".into();
+        graph.create_project(&project).await.unwrap();
+        let session = crate::test_helpers::test_chat_session(Some("held"));
+        graph.create_chat_session(&session).await.unwrap();
+        (manager, session.id.to_string())
+    }
+
+    async fn prepared(s: &ManagerTurnServices, sid: &str, text: &str) -> String {
+        let turn = crate::refs::turn::expand_user_turn_if(&s.graph, text, false).await;
+        s.prepare(sid, text, text, &turn).await
+    }
+
+    fn compacted() -> TurnOutcome {
+        TurnOutcome {
+            compacted: true,
+            ..Default::default()
+        }
+    }
+
+    fn answered() -> TurnOutcome {
+        TurnOutcome {
+            answered: true,
+            ..Default::default()
+        }
+    }
+
+    const HELD: &str = "Post-Compaction Context";
+
+    /// The clear of a delivered context fails (the store errs): the failure is not
+    /// lost — the slot knows the store is behind, a reopen in this process does not
+    /// reload the delivered context, and the next turn, whatever it is, writes again
+    /// until the store follows (else a restart, an idle close or a relay would
+    /// re-inject it, maybe days later).
+    #[tokio::test]
+    async fn a_failed_clear_is_retried_on_the_next_turn() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_on(mock.clone()).await;
+        let s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.after_turn(&sid, &compacted()).await;
+        assert!(!HeldContext::load(&s.graph, &sid).await.unwrap().is_empty());
+        mock.fail_llm_setting_writes(HeldContext::KEY, true);
+        s.after_turn(&sid, &answered()).await;
+        assert!(!prepared(&s, &sid, "one").await.contains(HELD), "delivered");
+        assert!(
+            !HeldContext::load(&s.graph, &sid).await.unwrap().is_empty(),
+            "the store refused the clear"
+        );
+        assert!(s.session.held.unsynced(), "and the slot knows it");
+        let reopened = services(&manager, manager.agent_turn_state(&sid).await);
+        assert!(
+            !prepared(&reopened, &sid, "two").await.contains(HELD),
+            "a reopen keeps memory over a store known to be behind"
+        );
+        // Still failing: a plain turn tries again, and keeps knowing.
+        s.after_turn(&sid, &TurnOutcome::default()).await;
+        assert!(s.session.held.unsynced());
+        // The store answers again: the next turn's write lands.
+        mock.fail_llm_setting_writes(HeldContext::KEY, false);
+        s.after_turn(&sid, &TurnOutcome::default()).await;
+        assert!(
+            HeldContext::load(&s.graph, &sid).await.unwrap().is_empty(),
+            "retried"
+        );
+        assert!(!s.session.held.unsynced());
+    }
+
+    /// The clear of a delivered context is slow (the store does not answer): the
+    /// turn does not wait past the step budget and says the write is late
+    /// (`persistence_delayed`); the next turn compacts again meanwhile, and its
+    /// store is ORDERED after that clear — the newer context is what the store ends
+    /// with, not an empty one landed last, also once the stalled store answers.
+    /// The budget (1 s: the clear dropped after 2 s) leaves the stalled clear in
+    /// flight well after the newer store would land without the lock, so the test
+    /// is red without it however slow the machine.
+    #[tokio::test]
+    async fn a_slow_clear_is_said_late_and_a_newer_store_lands_after_it() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_on(mock.clone()).await;
+        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.step_budget = Duration::from_secs(1);
+        s.after_turn(&sid, &compacted()).await;
+        mock.stall_llm_setting_deletes(HeldContext::KEY);
+        let started = std::time::Instant::now();
+        let after = s.after_turn(&sid, &answered()).await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(late(&after, "clear_held_context"), "{:?}", after.events);
+        // The next turn (not carrying a context) compacts again while the clear waits.
+        s.after_turn(&sid, &compacted()).await;
+        let stored_context = || async {
+            HeldContext::load(&s.graph, &sid)
+                .await
+                .unwrap()
+                .context
+                .is_some()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !stored_context().await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the newer context was never stored"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        mock.release_llm_setting_deletes(HeldContext::KEY);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            stored_context().await,
+            "the newer context is stored, the late clear landed before it"
+        );
+    }
+
+    /// Whether `after` says the write `step` is late (`persistence_delayed`).
+    fn late(after: &crate::chat::agent_runtime::AfterTurn, step: &str) -> bool {
+        after.events.iter().any(|e| {
+            matches!(
+                e,
+                ChatEvent::Error { code: Some(code), reason: Some(reason), .. }
+                    if code == crate::chat::post_stream::PERSISTENCE_DELAYED_CODE
+                        && reason == step
+            )
+        })
+    }
+
+    /// Waits (5 s at most) until `cond` holds.
+    async fn until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "never: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The session is reopened (`close` does not stop the earlier handle's
+    /// `after_turn`, `adopt` replaces a live handle) while the earlier handle's turn
+    /// compacted and holds its new context in memory, not yet written (its steps
+    /// still run). The reopen keeps memory instead of reloading the store, which
+    /// does not have it yet: the new context is neither lost in memory nor
+    /// overwritten in the store by the reloaded one. Red without the generation:
+    /// the slot looked in step, the reopen reloaded nothing over it, and the turn's
+    /// write then stored that nothing.
+    #[tokio::test]
+    async fn a_reopen_during_an_earlier_turn_keeps_the_context_it_holds() {
+        let (manager, sid) = world().await;
+        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.step_budget = Duration::from_millis(500);
+        s.stall_step = Some("objective_tracking");
+        let s = Arc::new(s);
+        let turn = {
+            let (s, sid) = (Arc::clone(&s), sid.clone());
+            tokio::spawn(async move { s.after_turn(&sid, &compacted()).await })
+        };
+        until("the compaction's context is held", || {
+            s.session.held.held().context.is_some()
+        })
+        .await;
+        let reopened = services(&manager, manager.agent_turn_state(&sid).await);
+        turn.await.unwrap();
+        assert!(
+            prepared(&reopened, &sid, "next").await.contains(HELD),
+            "the reopened session carries the new context"
+        );
+        assert!(
+            HeldContext::load(&s.graph, &sid)
+                .await
+                .unwrap()
+                .context
+                .is_some(),
+            "and the store has it"
+        );
+    }
+
+    /// The other way round: the earlier handle's turn delivered the context and
+    /// emptied memory, its clear not written yet; a reopen meanwhile does not
+    /// reload the delivered context from the store (it would ride a second turn).
+    #[tokio::test]
+    async fn a_reopen_during_an_earlier_turn_does_not_reload_a_delivered_context() {
+        let (manager, sid) = world().await;
+        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.after_turn(&sid, &compacted()).await;
+        s.step_budget = Duration::from_millis(500);
+        s.stall_step = Some("context");
+        let s = Arc::new(s);
+        let turn = {
+            let (s, sid) = (Arc::clone(&s), sid.clone());
+            tokio::spawn(async move { s.after_turn(&sid, &answered()).await })
+        };
+        until("the delivered context is dropped in memory", || {
+            s.session.held.held().is_empty()
+        })
+        .await;
+        let reopened = services(&manager, manager.agent_turn_state(&sid).await);
+        assert!(
+            !prepared(&reopened, &sid, "next").await.contains(HELD),
+            "not reloaded from the store the clear has not reached yet"
+        );
+        turn.await.unwrap();
+        assert!(HeldContext::load(&s.graph, &sid).await.unwrap().is_empty());
+    }
+
+    /// The store cannot be read when the session is reopened: memory is kept, not
+    /// replaced by an empty context.
+    #[tokio::test]
+    async fn a_store_read_error_at_reopen_keeps_memory() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_on(mock.clone()).await;
+        let s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.after_turn(&sid, &compacted()).await;
+        assert!(!s.session.held.unsynced());
+        mock.fail_llm_setting_reads(HeldContext::KEY, true);
+        let reopened = services(&manager, manager.agent_turn_state(&sid).await);
+        assert!(
+            prepared(&reopened, &sid, "next").await.contains(HELD),
+            "a read error is not an empty context"
+        );
+        mock.fail_llm_setting_reads(HeldContext::KEY, false);
+    }
+
+    /// The store read of a reopen never answers: it is dropped after twice the step
+    /// budget, memory is kept, and the session's write lock is released — the next
+    /// writes are not stuck behind it. Red without the bound: the reopen never
+    /// returns, holding the lock.
+    #[tokio::test]
+    async fn a_store_read_that_never_answers_at_reopen_releases_the_lock() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_on(mock.clone()).await;
+        let s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.after_turn(&sid, &compacted()).await;
+        assert!(!s.session.held.unsynced());
+        mock.stall_llm_setting_reads(HeldContext::KEY);
+        let budget = Duration::from_millis(100);
+        let reopen = tokio::time::timeout(
+            Duration::from_secs(5),
+            s.session.held.reopen(&s.graph, &sid, budget),
+        )
+        .await;
+        assert!(reopen.is_ok(), "the reopen waited on the store for good");
+        assert!(
+            s.session.held.write.try_lock().is_ok(),
+            "the write lock is released"
+        );
+        assert!(
+            s.session.held.held().context.is_some(),
+            "a read that never answers is not an empty context"
+        );
+        // A write goes through meanwhile.
+        s.session.held.edit(|h| *h = HeldContext::default());
+        s.session
+            .held
+            .write_once(&s.graph, &sid, budget)
+            .await
+            .unwrap();
+        assert!(!s.session.held.unsynced());
+        mock.release_llm_setting_reads(HeldContext::KEY);
+        assert!(HeldContext::load(&s.graph, &sid).await.unwrap().is_empty());
+    }
+
+    /// A failed write is retried in the background, without waiting for a turn: a
+    /// session closed or left right after keeps no delivered context in the store
+    /// for a restart to reload.
+    #[tokio::test]
+    async fn a_failed_write_is_retried_without_a_turn() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_on(mock.clone()).await;
+        let s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.after_turn(&sid, &compacted()).await;
+        mock.fail_llm_setting_writes(HeldContext::KEY, true);
+        s.after_turn(&sid, &answered()).await;
+        assert!(s.session.held.unsynced());
+        mock.fail_llm_setting_writes(HeldContext::KEY, false);
+        // No turn from here on.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while s.session.held.unsynced() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the failed clear was never retried"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(HeldContext::load(&s.graph, &sid).await.unwrap().is_empty());
+    }
+
+    /// A store write that never answers is dropped after twice the step budget: the
+    /// session's write lock is released (later turns and reopens do not wait on
+    /// it) and the slot stays unsynced (written again later). Red without the
+    /// bound: the lock is held for as long as the store does not answer.
+    #[tokio::test]
+    async fn a_store_write_that_never_answers_releases_the_lock() {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (manager, sid) = world_on(mock.clone()).await;
+        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.step_budget = Duration::from_millis(100);
+        s.after_turn(&sid, &compacted()).await;
+        mock.stall_llm_setting_deletes(HeldContext::KEY);
+        let after = s.after_turn(&sid, &answered()).await;
+        assert!(late(&after, "clear_held_context"), "{:?}", after.events);
+        until("the write lock is released", || {
+            s.session.held.write.try_lock().is_ok()
+        })
+        .await;
+        assert!(s.session.held.unsynced(), "the clear did not land");
+        mock.release_llm_setting_deletes(HeldContext::KEY);
+    }
+
+    /// A turn carrying a context compacts and is answered, but its re-injection
+    /// gives nothing in time (the step stalls): what it carried — the context AND
+    /// its objective reminder — waits again, in memory and in the store.
+    #[tokio::test]
+    async fn a_compaction_without_a_fresh_context_holds_what_the_turn_carried() {
+        let (manager, sid) = world().await;
+        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.step_budget = Duration::from_millis(200);
+        s.stall_step = Some("post_compaction");
+        let carried = HeldContext {
+            context: Some("H1 carried context".into()),
+            reminder: Some("R1 carried reminder".into()),
+        };
+        s.session.held.edit(|h| *h = carried.clone());
+        s.after_turn(
+            &sid,
+            &TurnOutcome {
+                answered: true,
+                compacted: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(s.session.held.held(), carried);
+        assert_eq!(HeldContext::load(&s.graph, &sid).await.unwrap(), carried);
+    }
+
+    /// The server goes down between the compaction and the next turn: the session
+    /// resumed on a new state still gets the context in front of that turn.
+    #[tokio::test]
+    async fn the_held_context_survives_a_restart() {
+        let (manager, sid) = world().await;
+        let before = services(&manager, manager.agent_turn_state(&sid).await);
+        before.after_turn(&sid, &compacted()).await;
+        drop(before);
+        let after = services(&manager, manager.agent_turn_state(&sid).await);
+        let sent = prepared(&after, &sid, "next").await;
+        assert!(sent.contains("Post-Compaction Context"), "{sent}");
+    }
+
+    /// A turn that was prepared but not answered (a Stop during the enrichment, a
+    /// refused image, a provider error, a failure after `send_turn` accepted it)
+    /// leaves the context for the next one; a turn answered drops it, in memory and
+    /// in the store.
+    #[tokio::test]
+    async fn the_held_context_is_dropped_only_once_a_turn_is_answered() {
+        let (manager, sid) = world().await;
+        let s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.after_turn(&sid, &compacted()).await;
+        let first = prepared(&s, &sid, "one").await;
+        assert!(first.contains("Post-Compaction Context"));
+        // The turn failed: not answered.
+        s.after_turn(&sid, &TurnOutcome::default()).await;
+        let again = prepared(&s, &sid, "two").await;
+        assert!(again.contains("Post-Compaction Context"), "kept: {again}");
+        assert!(!HeldContext::load(&s.graph, &sid).await.unwrap().is_empty());
+        s.after_turn(
+            &sid,
+            &TurnOutcome {
+                answered: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let then = prepared(&s, &sid, "three").await;
+        assert!(!then.contains("Post-Compaction Context"), "dropped: {then}");
+        // And from the store too: written before `after_turn` returned.
+        assert!(HeldContext::load(&s.graph, &sid).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_held_context_is_cut_to_a_share_of_the_window() {
+        let long = format!(
+            "<system-reminder>\n{}\n</system-reminder>",
+            "x".repeat(20_000)
+        );
+        let small = HeldContext::cap(&long, Some(8_000));
+        assert!(small.chars().count() <= 1_600, "{}", small.chars().count());
+        assert!(small.ends_with("</system-reminder>"));
+        let unknown = HeldContext::cap(&long, None);
+        assert!(unknown.chars().count() <= 6_000);
+        let big = HeldContext::cap(&long, Some(1_000_000));
+        assert!(
+            big.chars().count() <= 6_000,
+            "never above the builder's cap"
+        );
+        assert_eq!(HeldContext::cap("short", Some(8_000)), "short");
+    }
+
+    /// One step that never answers costs that step only: the next steps run, each in
+    /// its own budget (a shared budget would drop them with it).
+    #[tokio::test]
+    async fn a_stuck_step_does_not_take_the_next_ones_with_it() {
+        let (manager, sid) = world().await;
+        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.step_budget = Duration::from_millis(100);
+        s.stall_step = Some("context");
+        let started = std::time::Instant::now();
+        let after = s.after_turn(&sid, &TurnOutcome::default()).await;
+        assert!(
+            after.events.iter().any(|e| matches!(
+                e,
+                ChatEvent::Error { reason: Some(step), .. } if step == "context"
+            )),
+            "{:?}",
+            after.events
+        );
+        assert_eq!(
+            s.session
+                .objectives
+                .turns_since
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the objective step still ran after the stuck one"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

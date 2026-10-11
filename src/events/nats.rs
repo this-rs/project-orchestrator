@@ -37,6 +37,24 @@ pub struct ChatRpcResponse {
     pub error: Option<String>,
 }
 
+/// How long a `cancel_task` asked of another instance waits for the owner's
+/// answer. Longer than the 2 s of a message RPC: stopping a task waits for the
+/// provider (the native harness calls `TaskStop` of `nexus-tools`, Claude Code
+/// may wait for the task's process to be identified).
+pub const CANCEL_TASK_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Why a cancel asked of another instance came back without an answer
+/// ([`NatsEmitter::request_cancel`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayFailure {
+    /// Nobody subscribes to the subject: no instance holds the session live.
+    NoResponders,
+    /// No answer within the timeout: the owner is there but did not answer.
+    TimedOut,
+    /// The request could not be sent or read.
+    Transport(String),
+}
+
 // ============================================================================
 // Streaming snapshot types
 // ============================================================================
@@ -64,6 +82,8 @@ pub struct StreamingSnapshot {
 pub struct NatsEmitter {
     client: async_nats::Client,
     subject_prefix: String,
+    /// How long a cancel relayed to the owner of a session waits for its answer.
+    cancel_rpc_timeout: std::time::Duration,
 }
 
 impl NatsEmitter {
@@ -74,7 +94,15 @@ impl NatsEmitter {
         Self {
             client,
             subject_prefix: subject_prefix.into(),
+            cancel_rpc_timeout: CANCEL_TASK_RPC_TIMEOUT,
         }
+    }
+
+    /// The same emitter, a relayed cancel waiting at most `timeout` for the owner
+    /// (tests: a silent owner without waiting the default 10 s).
+    pub fn with_cancel_rpc_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.cancel_rpc_timeout = timeout;
+        self
     }
 
     /// Get a reference to the underlying NATS client.
@@ -339,6 +367,98 @@ impl NatsEmitter {
             )
         })?;
         debug!(subject = %subject, "Subscribed to NATS cancel_tools");
+        Ok(subscriber)
+    }
+
+    // ========================================================================
+    // cancel_task: request/reply (the owner answers what it did, or why not)
+    // ========================================================================
+
+    /// Build the cancel-task subject for a session
+    /// (e.g. "events.chat.{session_id}.cancel_task").
+    pub fn cancel_task_subject(&self, session_id: &str) -> String {
+        format!("{}.chat.{}.cancel_task", self.subject_prefix, session_id)
+    }
+
+    /// Asks the instance that owns a session to cancel (request on `subject`,
+    /// `payload` as JSON, answers on a private inbox) and returns its raw answer, or
+    /// why there is none: nobody subscribes ([`RelayFailure::NoResponders`], what NATS
+    /// answers at once), no answer within the emitter's cancel timeout
+    /// ([`RelayFailure::TimedOut`]), or the transport failed.
+    ///
+    /// Several instances may answer (one that just lost the session, the one that
+    /// holds it now): an answer `is_provisional` says is only kept if no other
+    /// answer comes within `grace` after it (capped by the cancel timeout;
+    /// `Duration::MAX`: until it) — a real answer always wins over it.
+    pub async fn request_cancel(
+        &self,
+        subject: String,
+        payload: serde_json::Value,
+        is_provisional: &(dyn Fn(&[u8]) -> bool + Sync),
+        grace: std::time::Duration,
+    ) -> Result<Vec<u8>, RelayFailure> {
+        use futures::StreamExt;
+        let transport = |e: &dyn std::fmt::Display| RelayFailure::Transport(e.to_string());
+        let inbox = self.client.new_inbox();
+        let mut answers = self
+            .client
+            .subscribe(inbox.clone())
+            .await
+            .map_err(|e| transport(&e))?;
+        let body = serde_json::to_vec(&payload).unwrap_or_default();
+        self.client
+            .publish_with_reply(subject.clone(), inbox, body.into())
+            .await
+            .map_err(|e| transport(&e))?;
+        self.client.flush().await.map_err(|e| transport(&e))?;
+        let deadline = tokio::time::Instant::now() + self.cancel_rpc_timeout;
+        let mut until = deadline;
+        let mut provisional: Option<Vec<u8>> = None;
+        loop {
+            match tokio::time::timeout_at(until, answers.next()).await {
+                Ok(Some(msg)) => {
+                    if msg.status == Some(async_nats::StatusCode::NO_RESPONDERS) {
+                        if provisional.is_none() {
+                            debug!(subject = %subject, "cancel request: no responders");
+                            return Err(RelayFailure::NoResponders);
+                        }
+                        continue;
+                    }
+                    let bytes = msg.payload.to_vec();
+                    if is_provisional(&bytes) {
+                        if provisional.is_none() {
+                            provisional = Some(bytes);
+                            // `grace` may be `Duration::MAX` (until the deadline).
+                            until = tokio::time::Instant::now()
+                                .checked_add(grace)
+                                .map_or(deadline, |end| deadline.min(end));
+                        }
+                        continue;
+                    }
+                    return Ok(bytes);
+                }
+                Ok(None) => return Err(RelayFailure::Transport("inbox closed".to_string())),
+                Err(_) => {
+                    return provisional.ok_or_else(|| {
+                        debug!(subject = %subject, "cancel request timed out");
+                        RelayFailure::TimedOut
+                    })
+                }
+            }
+        }
+    }
+
+    /// Subscribe to cancel-task requests for a session (the owning instance
+    /// answers each on its reply subject).
+    pub async fn subscribe_cancel_task(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<async_nats::Subscriber> {
+        let subject = self.cancel_task_subject(session_id);
+        let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
+            anyhow::anyhow!("Failed to subscribe to NATS cancel_task {}: {}", subject, e)
+        })?;
+        debug!(subject = %subject, "Subscribed to NATS cancel_task");
         Ok(subscriber)
     }
 
@@ -629,6 +749,7 @@ mod tests {
                 parent_tool_use_id: None,
                 category: None,
                 canonical: None,
+                tool_use_id: None,
             },
             ChatEvent::Result {
                 session_id: "sess-1".into(),

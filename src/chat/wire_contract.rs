@@ -46,7 +46,7 @@ const UPDATE_COMMAND: &str = "UPDATE_CHAT_CONTRACT=1 cargo test --lib chat::wire
 
 /// Every `ChatEvent` tag the examples must cover. Adding a variant means
 /// adding its tag here AND its examples in [`server_examples`].
-const EXPECTED_SERVER_TAGS: [&str; 35] = [
+const EXPECTED_SERVER_TAGS: [&str; 36] = [
     "active_tasks_update",
     "ask_user_question",
     "assistant_text",
@@ -77,6 +77,7 @@ const EXPECTED_SERVER_TAGS: [&str; 35] = [
     "thinking",
     "tool_cancelled",
     "tool_result",
+    "tool_timing",
     "tool_use",
     "tool_use_input_resolved",
     "tools_cancelled",
@@ -117,6 +118,7 @@ fn variant_tag(e: &ChatEvent) -> &'static str {
         ChatEvent::ToolResult { .. } => "tool_result",
         ChatEvent::ToolUseInputResolved { .. } => "tool_use_input_resolved",
         ChatEvent::ToolCancelled { .. } => "tool_cancelled",
+        ChatEvent::ToolTiming { .. } => "tool_timing",
         ChatEvent::PermissionRequest { .. } => "permission_request",
         ChatEvent::AskUserQuestion { .. } => "ask_user_question",
         ChatEvent::Result { .. } => "result",
@@ -295,6 +297,39 @@ fn server_examples() -> Vec<ServerExample> {
                 parent_tool_use_id: None,
             },
         ),
+        // `full` sets every optional field: the fields of the contract are derived
+        // from it, and the two booleans are absent when false. Hence `cancelled`
+        // (coherent here: an allowed call interrupted while it ran) and `incomplete`
+        // together with `run_started_at`, which the clock never sends together (an
+        // incomplete timing has no run start). Field coverage, not a real frame.
+        ServerExample::new(
+            ChatEvent::ToolTiming {
+                id: s(TOOL_USE_ID),
+                called_at: Some(1760099990.012),
+                started_at: Some(1760099990.457),
+                permission_requested_at: Some(1760099990.461),
+                permission_resolved_at: Some(1760099996.208),
+                permission_outcome: Some(s("allowed")),
+                run_started_at: Some(1760099996.208),
+                ended_at: 1760099999.123,
+                cancelled: true,
+                incomplete: true,
+                parent_tool_use_id: parent(),
+            },
+            ChatEvent::ToolTiming {
+                id: s(TOOL_USE_ID),
+                called_at: None,
+                started_at: None,
+                permission_requested_at: None,
+                permission_resolved_at: None,
+                permission_outcome: None,
+                run_started_at: None,
+                ended_at: 1760099999.123,
+                cancelled: false,
+                incomplete: false,
+                parent_tool_use_id: None,
+            },
+        ),
         ServerExample::new(
             ChatEvent::PermissionRequest {
                 id: s("perm_0001"),
@@ -303,6 +338,7 @@ fn server_examples() -> Vec<ServerExample> {
                 parent_tool_use_id: parent(),
                 category: Some(s("read")),
                 canonical: Some(s("read_file")),
+                tool_use_id: Some(s(TOOL_USE_ID)),
             },
             ChatEvent::PermissionRequest {
                 id: s("perm_0001"),
@@ -311,6 +347,7 @@ fn server_examples() -> Vec<ServerExample> {
                 parent_tool_use_id: None,
                 category: None,
                 canonical: None,
+                tool_use_id: None,
             },
         ),
         ServerExample::new(
@@ -611,6 +648,7 @@ fn server_examples() -> Vec<ServerExample> {
                         parent_tool_use_id: Some(s(TOOL_USE_ID)),
                         last_seen_at: ts("2026-01-15T10:31:12Z"),
                         pending_removal_at: None,
+                        signalled: false,
                     },
                     BackgroundTaskInfo {
                         id: s("recovered-48301"),
@@ -621,6 +659,7 @@ fn server_examples() -> Vec<ServerExample> {
                         parent_tool_use_id: None,
                         last_seen_at: ts("2026-01-15T10:30:30Z"),
                         pending_removal_at: None,
+                        signalled: false,
                     },
                 ],
             },
@@ -847,12 +886,18 @@ fn control_frames() -> Vec<ControlFrame> {
 ///
 /// api::ws_chat_handler::handle_ws_chat_loop: live events get `seq: 0`
 /// (`send_chat_event!`), replayed events get their stored `seq` and
-/// `replaying: true`. The frames the handler builds itself with a `ChatEvent`
-/// tag (`error`, `streaming_status`, `pending_queue`,
-/// `permission_mode_changed`, `model_changed`) carry neither, hence both
-/// fields are optional.
+/// `replaying: true`. Both carry `created_at` (`live_frame` / `replayed_frame`):
+/// seconds since the epoch, milliseconds as the fraction — the time stored for a
+/// replayed event, the forwarding time for a live one. The events of the
+/// mid-stream snapshot carry no `created_at` (their time is not kept), and the
+/// frames the handler builds itself with a `ChatEvent` tag (`error`,
+/// `streaming_status`, `pending_queue`, `permission_mode_changed`,
+/// `model_changed`) carry none of these fields, hence all are optional.
 fn event_envelope() -> (Value, Value) {
-    (json!({ "seq": 42, "replaying": true }), json!({}))
+    (
+        json!({ "seq": 42, "replaying": true, "created_at": 1760099999.123 }),
+        json!({}),
+    )
 }
 
 // ============================================================================

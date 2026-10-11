@@ -28,18 +28,19 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `permissions.once` | une permission accordée une fois débloque l'outil | ok | ok |
 | `permissions.session` | une permission accordée pour la session n'est pas redemandée | ok | ok |
 | `permissions.always` | une permission accordée pour toujours est retenue au-delà de la session | gap (harnais, P11b) | gap (harnais, P11b) |
+| `tool_timing` | un outil qui a attendu une permission porte tool_timing persisté : prise en charge, attente, exécution, fin | ok | ok |
 | `po_tools` | les outils project-orchestrator (MCP) sont donnés et appelables | ok | ok |
 | `nexus_tools` | Read / Edit / Bash s'exécutent sur le projet | not_measured | ok |
 | `enrichment` | le contexte du graphe précède le message du tour | ok | ok |
 | `refs` | une référence #kind:id atteint le modèle en pointeur po-context | ok | ok |
 | `provider_switch.relay` | la bascule vers ce moteur relaie la conversation sur le fil (conversation_relayed) | ok | ok |
 | `images` | une image jointe atteint le provider en bloc image | ok | ok |
-| `session_record` | le dossier de session porte message_count, total_cost_usd et un titre | ok | gap (harnais, P8) |
-| `background_tasks` | une tâche d'arrière-plan est suivie (active_tasks_update) | ok | gap (harnais, P4) |
-| `cancel_task` | cancel_task arrête une tâche d'arrière-plan | ok | gap (harnais, P12) |
+| `session_record` | le dossier de session porte message_count, total_cost_usd et un titre | ok | ok |
+| `background_tasks` | une tâche d'arrière-plan est suivie (active_tasks_update) | ok | ok |
+| `cancel_task` | cancel_task arrête une tâche d'arrière-plan | ok | ok |
 | `system_init.degraded` | system_init n'annonce comme manquant qu'une limite du modèle (liste fermée) | ok | ok |
 
-`ok` : Claude Code 24/26, natif 22/26.
+`ok` : Claude Code 25/27, natif 26/27.
 
 ## Écarts déclarés
 
@@ -47,9 +48,6 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 |---|---|---|---|---|
 | Claude Code | `permissions.always` | harnais | P11b | volontaire (sécurité) : aucune approbation durable tant que les règles ne sont pas tenues par un comparateur strict du backend (revue P11 : une suggestion du CLI réécrite vers localSettings pouvait y porter setMode / addDirectories) ; always est refusé, typé |
 | natif | `permissions.always` | harnais | P11b | volontaire (sécurité) : aucune règle durable tant qu'elle n'est pas tenue par un comparateur strict du backend (revue P11 : un préfixe Bash(cat *) dans la liste allow de nexus autorisait cat x >> ~/.zshrc) ; always est refusé, typé |
-| natif | `session_record` | harnais | P8 | le moteur agent ne met pas à jour le dossier de session à la fin d'un tour (message_count / total_cost_usd) |
-| natif | `background_tasks` | harnais | P4 | le natif ne rapporte pas de tâche d'arrière-plan (capacité background_tasks = false) : rien n'est suivi |
-| natif | `cancel_task` | harnais | P12 | cancel_task n'a pas de branche moteur agent (no-op idempotent) et le natif n'a pas de tâche à annuler |
 
 ## Non mesuré
 

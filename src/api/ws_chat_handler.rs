@@ -275,25 +275,11 @@ async fn handle_ws_chat_loop(
 
                 // Normalize to flat format matching Phase 1.5 / live events.
                 // ChatEventRecord.data is a serde-serialized ChatEvent which already
-                // contains the "type" tag. We parse it, inject seq + replaying, and
-                // send it flat — so the frontend always receives the same JSON shape
-                // regardless of whether the event comes from replay, snapshot, or live.
-                let msg = match serde_json::from_str::<serde_json::Value>(&event.data) {
-                    Ok(serde_json::Value::Object(mut obj)) => {
-                        obj.insert("seq".to_string(), serde_json::json!(event.seq));
-                        obj.insert("replaying".to_string(), serde_json::json!(true));
-                        serde_json::Value::Object(obj)
-                    }
-                    _ => {
-                        // Fallback for malformed records: wrap in data field
-                        serde_json::json!({
-                            "seq": event.seq,
-                            "type": event.event_type,
-                            "data": serde_json::Value::String(event.data.clone()),
-                            "replaying": true,
-                        })
-                    }
-                };
+                // contains the "type" tag. We parse it, inject seq + replaying +
+                // created_at, and send it flat — so the frontend always receives the
+                // same JSON shape regardless of whether the event comes from replay,
+                // snapshot, or live.
+                let msg = replayed_frame(&event);
                 if ws_sender
                     .send(Message::Text(msg.to_string().into()))
                     .await
@@ -320,21 +306,7 @@ async fn handle_ws_chat_loop(
                         "Replaying message history (fallback)"
                     );
                     for event in &loaded.events {
-                        let msg = match serde_json::from_str::<serde_json::Value>(&event.data) {
-                            Ok(serde_json::Value::Object(mut obj)) => {
-                                obj.insert("seq".to_string(), serde_json::json!(event.seq));
-                                obj.insert("replaying".to_string(), serde_json::json!(true));
-                                serde_json::Value::Object(obj)
-                            }
-                            _ => {
-                                serde_json::json!({
-                                    "seq": event.seq,
-                                    "type": event.event_type,
-                                    "data": serde_json::Value::String(event.data.clone()),
-                                    "replaying": true,
-                                })
-                            }
-                        };
+                        let msg = replayed_frame(event);
                         if ws_sender
                             .send(Message::Text(msg.to_string().into()))
                             .await
@@ -625,12 +597,9 @@ async fn handle_ws_chat_loop(
     // StreamDelta/StreamingStatus have no fingerprint and always pass through.
     macro_rules! send_chat_event {
         ($event:expr, $ws:expr) => {{
-            // Serialize and send
-            match serde_json::to_value(&$event) {
-                Ok(mut val) => {
-                    if let Some(obj) = val.as_object_mut() {
-                        obj.insert("seq".to_string(), serde_json::json!(0));
-                    }
+            // Serialize (stamped with the forwarding time) and send
+            match live_frame(&$event, chrono::Utc::now()) {
+                Ok(val) => {
                     if $ws
                         .send(Message::Text(val.to_string().into()))
                         .await
@@ -649,8 +618,19 @@ async fn handle_ws_chat_loop(
         }};
     }
 
+    // Frames that tasks spawned by this connection send to its client (a
+    // cancel_tools answered after the loop moved on, review N3 of #663).
+    let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
     loop {
         tokio::select! {
+            Some(frame) = ctl_rx.recv() => {
+                if ws_sender.send(Message::Text(frame.into())).await.is_err() {
+                    debug!("WebSocket send failed (control frame), client disconnected");
+                    break;
+                }
+            }
+
             // Forward local broadcast events to the WebSocket client
             event = async {
                 match &mut event_rx {
@@ -932,23 +912,36 @@ async fn handle_ws_chat_loop(
                                         // turn. Broadcast of ChatEvent::ToolsCancelled
                                         // happens inside cancel_running_tools so
                                         // multi-tab clients see the cancel.
-                                        match chat_manager.cancel_running_tools(&session_id).await {
-                                            Ok(result) => {
-                                                debug!(
-                                                    session_id = %session_id,
-                                                    killed = result.killed_pids.len(),
-                                                    capped = result.capped,
-                                                    "WS: cancel_tools done"
-                                                );
+                                        // Spawned (review N3): a cancel relayed to another
+                                        // instance may take up to its timeout, and this loop
+                                        // forwards the session's events meanwhile. A failure
+                                        // the client was not already told of comes back as a
+                                        // typed `error { code: cancel_failed, reason }` frame.
+                                        let (manager, sid, tx) = (
+                                            std::sync::Arc::clone(chat_manager),
+                                            session_id.clone(),
+                                            ctl_tx.clone(),
+                                        );
+                                        tokio::spawn(async move {
+                                            match manager.cancel_running_tools(&sid).await {
+                                                Ok(result) => {
+                                                    debug!(
+                                                        session_id = %sid,
+                                                        killed = result.killed_pids.len(),
+                                                        capped = result.capped,
+                                                        "WS: cancel_tools done"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    warn!(session_id = %sid, error = %e, "WS: cancel_tools failed");
+                                                    if let Some(frame) = crate::chat::cancel_relay::ws_error_event(&e)
+                                                        .and_then(|event| control_frame(&event))
+                                                    {
+                                                        let _ = tx.send(frame);
+                                                    }
+                                                }
                                             }
-                                            Err(e) => {
-                                                warn!(
-                                                    session_id = %session_id,
-                                                    error = %e,
-                                                    "WS: cancel_tools failed"
-                                                );
-                                            }
-                                        }
+                                        });
                                     }
 
                                     WsChatClientMessage::PermissionResponse { id, allow, scope } => {
@@ -1158,6 +1151,52 @@ async fn handle_ws_chat_loop(
     }
 
     info!(session_id = %session_id, "Chat WebSocket connection closed");
+}
+
+/// A server time on the chat wire: seconds since the epoch, with the
+/// milliseconds as the fraction (`1760099999.123`). The REST history and every
+/// WebSocket chat event frame carry `created_at` in this unit.
+pub(crate) fn wire_seconds(at: chrono::DateTime<chrono::Utc>) -> f64 {
+    at.timestamp_millis() as f64 / 1000.0
+}
+
+/// A persisted event as a replay frame: its payload, flat, plus `seq`,
+/// `replaying` and `created_at` (the time it was stored).
+fn replayed_frame(record: &crate::neo4j::models::ChatEventRecord) -> serde_json::Value {
+    let created_at = serde_json::json!(wire_seconds(record.created_at));
+    match serde_json::from_str::<serde_json::Value>(&record.data) {
+        Ok(serde_json::Value::Object(mut obj)) => {
+            obj.insert("seq".to_string(), serde_json::json!(record.seq));
+            obj.insert("replaying".to_string(), serde_json::json!(true));
+            obj.insert("created_at".to_string(), created_at);
+            serde_json::Value::Object(obj)
+        }
+        // Malformed record: wrap the raw payload in a data field.
+        _ => serde_json::json!({
+            "seq": record.seq,
+            "type": record.event_type,
+            "data": serde_json::Value::String(record.data.clone()),
+            "replaying": true,
+            "created_at": created_at,
+        }),
+    }
+}
+
+/// A live event (local broadcast or relayed over NATS) as a frame: its payload
+/// plus `seq: 0` and `created_at`, the time this server forwards it.
+fn live_frame(
+    event: &crate::chat::types::ChatEvent,
+    now: chrono::DateTime<chrono::Utc>,
+) -> serde_json::Result<serde_json::Value> {
+    let mut val = serde_json::to_value(event)?;
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("seq".to_string(), serde_json::json!(0));
+        obj.insert(
+            "created_at".to_string(),
+            serde_json::json!(wire_seconds(now)),
+        );
+    }
+    Ok(val)
 }
 
 /// Rate-limiter for neural reinforcement via chat.
@@ -1511,6 +1550,17 @@ pub(crate) async fn neural_reinforcement(
     }
 }
 
+/// A frame a task spawned by the connection sends to its client: the event with
+/// `seq` 0, like every live event of the loop (`send_chat_event!`), so a client
+/// that orders or dedups by `seq` reads it the same way.
+fn control_frame(event: &crate::chat::types::ChatEvent) -> Option<String> {
+    let mut value = serde_json::to_value(event).ok()?;
+    value
+        .as_object_mut()?
+        .insert("seq".to_string(), serde_json::json!(0));
+    Some(value.to_string())
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1521,6 +1571,21 @@ mod tests {
     use crate::chat::types::ChatEvent;
     use std::collections::HashSet;
     use tokio::sync::broadcast;
+
+    /// Review of #673, nit 6: the `cancel_failed` frame a spawned cancel_tools
+    /// sends carries `seq` like every live frame of the loop.
+    #[test]
+    fn a_control_frame_carries_seq_like_live_events() {
+        let error =
+            anyhow::Error::new(crate::chat::cancel_relay::CancelRelayError::OwnerUnreachable);
+        let event = crate::chat::cancel_relay::ws_error_event(&error).unwrap();
+        let frame: serde_json::Value =
+            serde_json::from_str(&control_frame(&event).unwrap()).unwrap();
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["code"], "cancel_failed");
+        assert_eq!(frame["reason"], "owner_unreachable");
+        assert_eq!(frame["seq"], 0);
+    }
 
     /// Verify that dropping the broadcast sender causes RecvError::Closed.
     /// This is the mechanism that triggers the dormant transition.
