@@ -586,10 +586,13 @@ pub struct AgentSessionHandle {
     interrupted: AtomicBool,
     /// Cancelled when the session closes: ends what listens on its behalf (NATS).
     pub closed: tokio_util::sync::CancellationToken,
-    /// Continue a turn that stopped on its turn limit (`set_auto_continue`).
+    /// Continue a turn that stopped on its turn limit: set when the session opens
+    /// (always on, capped — decision 7b95342a — unless the operator's kill switch is
+    /// off); `set_auto_continue` no longer changes it.
     pub auto_continue: AtomicBool,
+    /// The current chain of continuations in a row (`post_stream::auto_continue_allowed`).
     auto_continue_count: std::sync::atomic::AtomicU32,
-    /// Continuations allowed before auto-continue switches itself off (0: no limit).
+    /// Continuations allowed in a row (0: no limit).
     max_auto_continues: std::sync::atomic::AtomicU32,
     /// The resume token (wire form) the graph holds for this session, as far as this
     /// handle knows: what the opener persisted, then each change [`Self::sync_resume_token`]

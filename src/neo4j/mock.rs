@@ -122,8 +122,6 @@ pub struct MockGraphStore {
     /// Names of the reads that must fail (see `log_read`).
     pub fail_reads: std::sync::Mutex<std::collections::HashSet<&'static str>>,
     pub chat_events: RwLock<HashMap<Uuid, Vec<ChatEventRecord>>>,
-    /// Per-session auto_continue flag (stored separately from ChatSessionNode)
-    pub session_auto_continue: RwLock<HashMap<Uuid, bool>>,
     /// The `shell_moved` flag of each chat session (absent: never written).
     pub session_shell_moved: RwLock<HashMap<Uuid, bool>>,
     /// PlanRun states (Runner)
@@ -373,7 +371,6 @@ impl MockGraphStore {
             read_log: std::sync::Mutex::new(Vec::new()),
             fail_reads: std::sync::Mutex::new(std::collections::HashSet::new()),
             chat_events: RwLock::new(HashMap::new()),
-            session_auto_continue: RwLock::new(HashMap::new()),
             session_shell_moved: RwLock::new(HashMap::new()),
             plan_runs: RwLock::new(HashMap::new()),
             frozen_active_plan_runs: std::sync::Mutex::new(None),
@@ -8158,17 +8155,6 @@ impl GraphStore for MockGraphStore {
         Ok(self.session_shell_moved.read().await.get(&id).copied())
     }
 
-    async fn set_session_auto_continue(&self, id: Uuid, enabled: bool) -> Result<()> {
-        let mut auto_continue = self.session_auto_continue.write().await;
-        auto_continue.insert(id, enabled);
-        Ok(())
-    }
-
-    async fn get_session_auto_continue(&self, id: Uuid) -> Result<bool> {
-        let auto_continue = self.session_auto_continue.read().await;
-        Ok(auto_continue.get(&id).copied().unwrap_or(false))
-    }
-
     async fn backfill_chat_session_previews(&self) -> Result<usize> {
         // Mock: no events stored, nothing to backfill
         Ok(0)
@@ -13366,49 +13352,6 @@ mod tests {
 
         // Deleting events for non-existent session should not error
         store.delete_chat_events(session_id).await.unwrap();
-    }
-
-    // ====================================================================
-    // Auto-continue tests
-    // ====================================================================
-
-    #[tokio::test]
-    async fn test_mock_auto_continue_set_and_get() {
-        let store = MockGraphStore::new();
-        let session_id = Uuid::new_v4();
-
-        // Default should be false for unknown session
-        let result = store.get_session_auto_continue(session_id).await.unwrap();
-        assert!(!result);
-
-        // Set to true
-        store
-            .set_session_auto_continue(session_id, true)
-            .await
-            .unwrap();
-        let result = store.get_session_auto_continue(session_id).await.unwrap();
-        assert!(result);
-
-        // Toggle back to false
-        store
-            .set_session_auto_continue(session_id, false)
-            .await
-            .unwrap();
-        let result = store.get_session_auto_continue(session_id).await.unwrap();
-        assert!(!result);
-    }
-
-    #[tokio::test]
-    async fn test_mock_auto_continue_multiple_sessions() {
-        let store = MockGraphStore::new();
-        let s1 = Uuid::new_v4();
-        let s2 = Uuid::new_v4();
-
-        store.set_session_auto_continue(s1, true).await.unwrap();
-        store.set_session_auto_continue(s2, false).await.unwrap();
-
-        assert!(store.get_session_auto_continue(s1).await.unwrap());
-        assert!(!store.get_session_auto_continue(s2).await.unwrap());
     }
 
     // ====================================================================

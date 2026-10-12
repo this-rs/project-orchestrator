@@ -143,7 +143,7 @@ const FUNCTIONS: &[(&str, &str)] = &[
     ),
     (
         "hooks.before_compaction",
-        "le hook PreCompact du graphe nomme le projet avant une compaction",
+        "le hook PreCompact du graphe nomme le projet dans les instructions du résumé (Claude Code : `systemMessage`, le champ que lit le CLI)",
     ),
     (
         "compaction",
@@ -256,19 +256,6 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
         Engine::ClaudeCode,
         "nexus_tools",
         Expect::NotMeasured { why: CLI_TOOLS },
-    ),
-    (
-        Engine::ClaudeCodeAgent,
-        "hooks.before_compaction",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "M2c",
-            why:
-                "la façade Claude Code de nexus consulte le hook PreCompact du graphe mais répond \
-                  `{}` au CLI (provider_notice compaction_instructions_unsupported) ; le moteur \
-                  historique répond `reason` = les instructions. Non mesuré : le vrai CLI lit-il \
-                  `reason` sur PreCompact",
-        },
     ),
     (
         Engine::ClaudeCodeAgent,
@@ -469,8 +456,29 @@ fn render(run: &Run<'_>) -> String {
             out.push_str(&format!("| {} | `{function}` | {why} |\n", engine.label()));
         }
     }
+    out.push_str("\n## À re-mesurer à chaque montée du CLI Claude Code\n\n");
+    out.push_str(
+        "`fake_claude` rejoue ce que le vrai CLI a fait à une version donnée : rien ici ne \
+         verrait un CLI qui changerait d'avis sans le dire. À chaque montée de version du CLI \
+         Claude Code, re-mesurer sur le vrai CLI :\n\n",
+    );
+    out.push_str("| Comportement | Mesuré sur | Comment | Note PO |\n|---|---|---|---|\n");
+    for (what, version, how, note) in RE_MEASURE {
+        out.push_str(&format!("| {what} | {version} | {how} | {note} |\n"));
+    }
     out
 }
+
+/// What the parity takes from the real CLI without measuring it here (the fakes replay
+/// it): to re-check on each Claude Code CLI bump. (behaviour, measured on, how, PO note)
+const RE_MEASURE: &[(&str, &str, &str, &str)] = &[(
+    "re-check PreCompact systemMessage : le CLI ajoute le `systemMessage` d'une réponse au \
+     hook PreCompact aux instructions du résumé (et l'affiche à l'utilisateur dans la ligne \
+     « Compacted… »), ignore `reason`, rejette `hookSpecificOutput.additionalContext`",
+    "Claude Code 2.1.295",
+    "`docs/parity/m2c-precompact/` (README)",
+    "172c164e (tâche M2c 79cc48df)",
+)];
 
 /// [`EXPECTED`] by engine, then in the order of the table.
 fn declared_in_table_order() -> Vec<(Engine, &'static str, Expect)> {
@@ -2089,6 +2097,17 @@ fn excerpt(s: &str) -> String {
     s.replace('\n', " ")
 }
 
+/// The compaction instructions in the answer to a `PreCompact` callback: its
+/// `systemMessage`, the one field the CLI appends to the summary's instructions. It
+/// ignores `reason` and rejects a `hookSpecificOutput` (Claude Code 2.1.295, M2c).
+fn precompact_instructions(line: &str) -> String {
+    let v: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+    v["response"]["response"]["systemMessage"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
 // ============================================================================
 // The scenario
 // ============================================================================
@@ -2234,7 +2253,7 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         "hooks.before_compaction",
         compact
             .as_deref()
-            .is_some_and(|l| l.contains(&stage.project.name)),
+            .is_some_and(|l| precompact_instructions(l).contains(&stage.project.name)),
         Cause::Harness,
         format!(
             "réponse au hook PreCompact : {:?}",
@@ -2303,8 +2322,7 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     );
     w.settle(ends, &manager).await;
 
-    // Auto-continue.
-    manager.set_auto_continue(&sid, true).await.unwrap();
+    // Auto-continue: always on (decision 7b95342a), no toggle sent.
     let ends = w.turn_ends();
     manager
         .send_message(&sid, &kc.k("TURN-FOUR"))
@@ -2326,7 +2344,6 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     );
     w.said(WAIT, "continued").await;
     w.settle(ends, &manager).await;
-    manager.set_auto_continue(&sid, false).await.unwrap();
 
     // set_model between two turns.
     manager
@@ -2896,8 +2913,7 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     );
     wn.settle(ends, &manager).await;
 
-    // Auto-continue.
-    manager.set_auto_continue(&nid, true).await.unwrap();
+    // Auto-continue: always on (decision 7b95342a), no toggle sent.
     let ends = wn.turn_ends();
     manager
         .send_message(&nid, &kn.k("TURN-FOUR"))
@@ -2922,7 +2938,6 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     );
     wn.said(WAIT, "continued").await;
     wn.settle(ends, &manager).await;
-    manager.set_auto_continue(&nid, false).await.unwrap();
 
     // `always` (P11b): offered to a person's session on a project, kept by the BACKEND (the
     // identical call is still asked by nexus, and answered from the lasting rule).

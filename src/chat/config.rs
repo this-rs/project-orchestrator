@@ -185,9 +185,11 @@ pub struct ChatConfig {
     pub max_turns: i32,
     /// Permission configuration (mode + allowed/disallowed tool patterns)
     pub permission: PermissionConfig,
-    /// Whether auto-continue is enabled by default for new sessions.
-    /// When `true`, the backend automatically sends "Continue" after error_max_turns.
-    /// Can be toggled per-session via WebSocket.
+    /// Whether an interactive session continues a turn that stopped on its turn limit
+    /// (the backend sends "Continue", at most `post_stream::MAX_AUTO_CONTINUES` times in a
+    /// row). On by default for every session, with no per-session toggle (decision
+    /// 7b95342a); `CHAT_AUTO_CONTINUE=false` (or `0`) is the operator's kill switch.
+    /// Runner sessions always continue.
     pub auto_continue: bool,
     /// Retry configuration for transient API errors (5xx)
     pub retry: RetryConfig,
@@ -353,9 +355,9 @@ impl ChatConfig {
                     })
                     .unwrap_or_default(),
             },
-            auto_continue: std::env::var("CHAT_AUTO_CONTINUE")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false),
+            auto_continue: auto_continue_from_env(
+                std::env::var("CHAT_AUTO_CONTINUE").ok().as_deref(),
+            ),
             retry: RetryConfig::from_env(),
             process_path: std::env::var("CHAT_PROCESS_PATH").ok(),
             claude_cli_path: std::env::var("CLAUDE_CLI_PATH").ok(),
@@ -477,9 +479,30 @@ impl Default for ChatConfig {
     }
 }
 
+/// `CHAT_AUTO_CONTINUE`: auto-continue is on unless the operator turns it off
+/// (`false` or `0`, any case). Unset or any other value: on.
+pub(crate) fn auto_continue_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("false" | "0")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Auto-continue is on by default; `CHAT_AUTO_CONTINUE=false|0` is the kill switch.
+    #[test]
+    fn auto_continue_is_on_unless_the_operator_turns_it_off() {
+        assert!(auto_continue_from_env(None));
+        assert!(auto_continue_from_env(Some("true")));
+        assert!(auto_continue_from_env(Some("1")));
+        assert!(auto_continue_from_env(Some("")));
+        assert!(!auto_continue_from_env(Some("false")));
+        assert!(!auto_continue_from_env(Some(" FALSE ")));
+        assert!(!auto_continue_from_env(Some("0")));
+    }
 
     /// M2: the agent engine is the default; legacy stays selectable; a value set but not
     /// understood (a typo in the opt-out) is legacy (review of #726, point 4).
