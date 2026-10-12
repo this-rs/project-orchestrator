@@ -43,7 +43,7 @@ RUN if [ -f "package.json" ] && grep -q '"build"' package.json; then \
 # Trixie (Debian 13) provides glibc 2.40, required because ort-sys prebuilt
 # ONNX Runtime binaries reference __isoc23_* symbols (glibc ≥ 2.38).
 # Bookworm (glibc 2.36) fails with "undefined symbol: __isoc23_strtoll".
-FROM rust:1.98-trixie AS builder
+FROM rust:1.99-trixie AS builder
 
 WORKDIR /app
 
@@ -123,7 +123,7 @@ RUN cargo build --release
 # =============================================================================
 # Built at the nexus revision Cargo.toml pins, with https (`--features tls`), by the same script as
 # the release archives and the CI. Its own stage: it only reruns when Cargo.toml changes.
-FROM rust:1.98-trixie AS nexus-tools-builder
+FROM rust:1.99-trixie AS nexus-tools-builder
 WORKDIR /src
 COPY Cargo.toml ./
 COPY scripts/build-nexus-tools.sh ./scripts/
