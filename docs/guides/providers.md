@@ -235,6 +235,9 @@ Two counters: *marginal* (reported or priced: real spend, the only one that can 
 | `CHAT_PROVIDER_ENV_CREDENTIALS` | empty | server variables an instance may name as `env:<VAR>` |
 | `CHAT_PROVIDER_ACP_COMMANDS` | empty | JSON object of ACP agents an instance may launch: `name: [argv]` or `name: {"argv": [...], "per_session_mcp": false}` |
 | `CHAT_CHILD_ENV_INHERIT` | empty | extra variables handed to agent processes (never the server's own secrets) |
+| `CHAT_NATIVE_TURN_TIMEOUT_SECS` (`chat.native_turn_timeout_secs`) | unset | wall-clock cap of one turn of a native session. Unset: no cap, as in Claude Code (`max_turns`, Stop and the model stream's idle deadline still bound a turn). When it fires, the UI says so (`error` frame `turn_time_limit`), the work is kept, and the model is told at the next turn |
+| `CHAT_NATIVE_SESSION_MAX_TOKENS` (`chat.native_session_max_tokens`) | unset | token budget of a native session: input not served from the cache, cache writes and output (cache reads are not counted). Unset: no budget, as in Claude Code. Once spent, every new turn stops before calling the model, and says so (`session_budget_reached`); a session resumed after a restart counts anew |
+| `CHAT_PROCESS_PATH` (`chat.process_path`) | the server's own | PATH of the Claude Code CLI and, since ISO5, of the shell of a local native session (`nexus-tools`): a server run as a service (launchd) otherwise hands it `/usr/bin:/bin:/usr/sbin:/sbin` only |
 
 ## Not verified
 

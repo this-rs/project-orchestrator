@@ -722,6 +722,8 @@ impl Stage {
             // The lasting approvals (`always`, P11b) of the data directory: they outlive a
             // restart of the backend, as the graph does.
             lasting_rules_dir: Some(self.data.path().join("permission-rules")),
+            native_turn_timeout_secs: None,
+            native_session_max_tokens: None,
             ..Default::default()
         };
         let state = mock_app_state();

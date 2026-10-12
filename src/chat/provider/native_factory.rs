@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use nexus_claude::agent::{
     AgentProvider, CostBasis, CredentialRef, CredentialResolver, EnvCredentialResolver,
-    ProviderError,
+    ProviderError, SessionLimits,
 };
 use nexus_claude::model::{EndpointQuirks, OpenAiEndpoint, OpenAiEndpointConfig};
 use nexus_claude::providers::native::{NativeConfig, NativeProvider};
@@ -186,6 +186,11 @@ fn native_provider(
     // The harness's own `AskUserQuestion` (P18): its `question { reply: turn }` becomes the
     // `ask_user_question` card (synthetic, A45) and the user's answer is the next turn.
     config.ask_user_question = true;
+    // No turn wall-clock cap and no session budget at the harness level, whatever the
+    // nexus defaults (ISO5: a 30 min cap and a 10 M-token budget, cache reads included,
+    // were nexus' defaults and cut working sessions). The operator's limits, when set,
+    // come per session (`chat.native_turn_timeout_secs`, `chat.native_session_max_tokens`).
+    config.limits = SessionLimits::default();
     // Only "free" is known without a price table; the rest stays `unknown`
     // (no amount) until a price is configured (A21: never an invented price).
     if record.cost_source == "free" {
@@ -560,6 +565,14 @@ mod tests {
         let p = build_native_provider(&record("none", Some("llama_server")), None).unwrap();
         assert_eq!(p.id(), "local");
         assert_eq!(p.kind(), nexus_claude::agent::ProviderKind::Native);
+    }
+
+    #[test]
+    fn a_native_instance_sets_no_turn_time_limit_and_no_session_budget() {
+        let p = native_provider(&record("none", Some("deepseek")), None).unwrap();
+        assert_eq!(p.config().limits, SessionLimits::default());
+        assert_eq!(p.config().limits.turn_timeout_ms, None);
+        assert_eq!(p.config().limits.max_tokens, None);
     }
 
     #[test]

@@ -76,6 +76,13 @@ pub(crate) fn mask_agent_event_with(
 /// `done.error` of an error turn, or a retryable terminal `error`.
 fn retryable_failure(event: &AgentEvent) -> Option<ProviderError> {
     match event {
+        // A turn its configured time limit stopped (`error_timeout`) is not a transient
+        // failure: running it again would hit the same limit (ISO5). A silent model
+        // stream (the endpoint's idle deadline) is `error_during_execution` and retries.
+        AgentEvent::Done {
+            subtype: Some(subtype),
+            ..
+        } if subtype == "error_timeout" => None,
         AgentEvent::Done {
             is_error: true,
             error: Some(error),
@@ -2872,6 +2879,22 @@ mod mask_tests {
             error: ProviderError::Overloaded
         })
         .is_some());
+        // A turn its configured time limit stopped is not run again (ISO5); a silent model
+        // stream (the same typed timeout, `error_during_execution`) still is.
+        let timeout = |subtype: &str| {
+            let mut event = done(
+                true,
+                Some(ProviderError::Timeout {
+                    after_ms: 1_800_000,
+                }),
+            );
+            if let AgentEvent::Done { subtype: s, .. } = &mut event {
+                *s = Some(subtype.to_string());
+            }
+            event
+        };
+        assert!(retryable_failure(&timeout("error_timeout")).is_none());
+        assert!(retryable_failure(&timeout("error_during_execution")).is_some());
     }
 }
 

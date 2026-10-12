@@ -40,3 +40,20 @@ Les champs que le harness multi-provider AJOUTERA au fil et à l'API (`category`
 sont FIXÉS pour que le frontend code contre eux ; rien n'y est encore émis sauf mention `since`.
 Ce fichier n'est pas dans `SHA256SUMS` : il n'est pas généré. Un champ livré passe dans
 `server-events.json` et sort d'ici, dans le même commit.
+
+## Fin de tour par une limite configurée (`error.code`, ISO5)
+
+Une session NATIVE n'a, par défaut, ni limite de durée par tour ni budget de jetons (comme Claude Code).
+Quand l'opérateur en pose une (`chat.native_turn_timeout_secs`, `chat.native_session_max_tokens`, ou les
+variables `CHAT_NATIVE_TURN_TIMEOUT_SECS`, `CHAT_NATIVE_SESSION_MAX_TOKENS`) et qu'elle arrête un tour, le fil
+porte, AVANT le `result`, une trame `error` dont `code` dit laquelle :
+
+- `turn_time_limit` : « Turn stopped after N by the configured turn time limit (L, …) ». Le `result` qui suit a
+  `subtype: "error_timeout"`. Le travail du tour est gardé, et le modèle lit au tour suivant une ligne
+  `[system]` qui lui dit pourquoi son tour s'est arrêté. Le tour n'est pas relancé automatiquement.
+- `session_budget_reached` : « Session token budget reached: S of L tokens (cache reads not counted; …) », ou
+  le budget USD. Le `result` qui suit a `subtype: "error_max_budget"` et `stop_reason: "budget_exceeded"`. Tant
+  que le budget n'est pas relevé, chaque nouveau tour s'arrête avant d'appeler le modèle, et redit la trame.
+
+Le `message` est bâti des seuls nombres, jamais d'un texte du provider. Un `result` `budget_exceeded` sans
+`subtype` du provider prend `error_max_budget` (plus `error_max_budget_usd` : le budget peut être en jetons).

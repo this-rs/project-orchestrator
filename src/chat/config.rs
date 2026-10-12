@@ -228,6 +228,18 @@ pub struct ChatConfig {
     /// (`lasting_rules::default_root`) on a unix host; never in the unit tests of the crate
     /// (they would write in the developer's home), which set it explicitly.
     pub lasting_rules_dir: Option<std::path::PathBuf>,
+    /// Wall-clock cap of one turn of a NATIVE session, in seconds
+    /// (`SessionLimits::turn_timeout_ms`). `None` by default: like Claude Code, a turn runs
+    /// as long as it works (bounded by `max_turns`, the Stop button and the model stream's
+    /// idle deadline). From `chat.native_turn_timeout_secs` / `CHAT_NATIVE_TURN_TIMEOUT_SECS`;
+    /// `0` means unset. ISO5: a 30 min default cut a working session.
+    pub native_turn_timeout_secs: Option<u64>,
+    /// Token budget of a NATIVE session (`SessionLimits::max_tokens`: input not served
+    /// from the cache + cache writes + output; cache reads are not counted). `None` by
+    /// default, like Claude Code. From `chat.native_session_max_tokens` /
+    /// `CHAT_NATIVE_SESSION_MAX_TOKENS`; `0` means unset. ISO5: a 10 M default, cache reads
+    /// included, stopped every later turn of a conversation.
+    pub native_session_max_tokens: Option<u64>,
 }
 
 /// Environment variable selecting the [`ProviderPath`].
@@ -239,6 +251,12 @@ pub const NEXUS_TOOLS_PATH_VAR: &str = "NEXUS_TOOLS_PATH";
 /// Variable listing the third-party MCP tools declared read-only
 /// ([`ChatConfig::read_only_mcp_tools`]).
 pub const READ_ONLY_MCP_TOOLS_VAR: &str = "CHAT_READ_ONLY_MCP_TOOLS";
+
+/// Environment variable of [`ChatConfig::native_turn_timeout_secs`].
+pub const NATIVE_TURN_TIMEOUT_VAR: &str = "CHAT_NATIVE_TURN_TIMEOUT_SECS";
+
+/// Environment variable of [`ChatConfig::native_session_max_tokens`].
+pub const NATIVE_SESSION_MAX_TOKENS_VAR: &str = "CHAT_NATIVE_SESSION_MAX_TOKENS";
 
 /// Variable naming the directory of the lasting approvals
 /// ([`ChatConfig::lasting_rules_dir`]).
@@ -378,7 +396,20 @@ impl ChatConfig {
                 std::env::var(READ_ONLY_MCP_TOOLS_VAR).ok().as_deref(),
             ),
             lasting_rules_dir: Self::lasting_rules_dir_from_env(),
+            native_turn_timeout_secs: Self::positive_from_env(NATIVE_TURN_TIMEOUT_VAR),
+            native_session_max_tokens: Self::positive_from_env(NATIVE_SESSION_MAX_TOKENS_VAR),
         }
+    }
+
+    /// A positive number from the environment variable `name`; unset, empty, `0` or not a
+    /// number: `None`.
+    pub(crate) fn positive_from_env(name: &str) -> Option<u64> {
+        Self::positive(std::env::var(name).ok().as_deref())
+    }
+
+    /// A positive number from its text; `None` for nothing, `0` or not a number.
+    pub(crate) fn positive(text: Option<&str>) -> Option<u64> {
+        text?.trim().parse::<u64>().ok().filter(|n| *n > 0)
     }
 
     /// [`ChatConfig::lasting_rules_dir`] from the environment.
@@ -536,6 +567,8 @@ mod tests {
             session_token_expiry_secs: 86400,
             read_only_mcp_tools: Vec::new(),
             lasting_rules_dir: None,
+            native_turn_timeout_secs: None,
+            native_session_max_tokens: None,
         };
 
         assert_eq!(config.default_model, "claude-sonnet-4-6");

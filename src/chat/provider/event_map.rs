@@ -356,6 +356,20 @@ impl EventMapper {
                     request_id: None,
                 }]
             }
+            // A turn its time limit or a session budget stopped: said as such, with the
+            // figures and what to do, not as an opaque failure (ISO5).
+            AgentEvent::ProviderNotice { kind, data }
+                if limit_notice_message(kind, data).is_some() =>
+            {
+                vec![ChatEvent::Error {
+                    message: limit_notice_message(kind, data).unwrap_or_default(),
+                    parent_tool_use_id: None,
+                    code: Some(kind.clone()),
+                    reason: None,
+                    index: None,
+                    request_id: None,
+                }]
+            }
             // A notice is a diagnostic: nothing in a turn.
             AgentEvent::ProviderNotice { .. } => Vec::new(),
             // `AgentEvent` is non-exhaustive: an unknown event is ignored.
@@ -406,12 +420,70 @@ fn usage_value(usage: &Usage) -> Option<Value> {
     (!map.is_empty()).then_some(Value::Object(map))
 }
 
+/// Notice of a native turn stopped by its configured time limit (nexus `loop.rs`).
+pub const TURN_TIME_LIMIT_NOTICE: &str = "turn_time_limit";
+/// Notice of a native session whose configured budget is spent (nexus `loop.rs`).
+pub const SESSION_BUDGET_NOTICE: &str = "session_budget_reached";
+
+/// A duration as a person reads it: `25 min`, `25 min 3 s`, `40 s`, `400 ms`.
+fn human_duration(ms: u64) -> String {
+    match (ms / 60_000, (ms % 60_000) / 1000) {
+        (0, 0) => format!("{ms} ms"),
+        (0, s) => format!("{s} s"),
+        (m, 0) => format!("{m} min"),
+        (m, s) => format!("{m} min {s} s"),
+    }
+}
+
+/// The text shown for a turn a configured limit stopped; `None` for any other notice.
+/// Built from numbers only: no text of the provider is copied.
+pub(crate) fn limit_notice_message(kind: &str, data: &Value) -> Option<String> {
+    match kind {
+        TURN_TIME_LIMIT_NOTICE => {
+            let limit = data.get("limit_ms").and_then(Value::as_u64)?;
+            let elapsed = data
+                .get("elapsed_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(limit);
+            Some(format!(
+                "Turn stopped after {} by the configured turn time limit ({}, \
+                 chat.native_turn_timeout_secs). The work done so far is kept; send a message to \
+                 go on: the model is told why its turn stopped.",
+                human_duration(elapsed),
+                human_duration(limit),
+            ))
+        }
+        SESSION_BUDGET_NOTICE => {
+            let limit = data.get("limit")?;
+            let spent = data.get("spent").cloned().unwrap_or(Value::Null);
+            Some(match data.get("budget").and_then(Value::as_str) {
+                Some("usd") => format!(
+                    "Session cost budget reached: {} of {} USD. Every new turn of this \
+                     conversation stops until the budget is raised or removed; start a new \
+                     conversation, or change the budget and restart the server.",
+                    spent, limit
+                ),
+                _ => format!(
+                    "Session token budget reached: {} of {} tokens (cache reads not counted; \
+                     chat.native_session_max_tokens). Every new turn of this conversation stops \
+                     until the budget is raised or removed; start a new conversation, or change \
+                     the setting and restart the server.",
+                    spent, limit
+                ),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// `subtype` of a `result` when the provider gave none.
 fn default_subtype(stop: StopReason, is_error: bool) -> &'static str {
     match stop {
         StopReason::Completed => "success",
         StopReason::MaxTurns => "error_max_turns",
-        StopReason::BudgetExceeded => "error_max_budget_usd",
+        // A token budget as much as a USD one (nexus says `error_max_budget` itself): the
+        // `_usd` of Claude Code's own subtype would name the wrong budget.
+        StopReason::BudgetExceeded => "error_max_budget",
         _ if is_error => "error_during_execution",
         _ => "success",
     }
@@ -1069,11 +1141,72 @@ mod tests {
         };
         assert_eq!(subtype(StopReason::Completed, false), "success");
         assert_eq!(subtype(StopReason::MaxTurns, true), "error_max_turns");
+        // A token budget is not a USD one: the subtype names neither wrongly.
         assert_eq!(
             subtype(StopReason::BudgetExceeded, true),
-            "error_max_budget_usd"
+            "error_max_budget"
         );
         assert_eq!(subtype(StopReason::Error, true), "error_during_execution");
+    }
+
+    /// ISO5: a turn a configured limit stopped is shown as such (an `error` frame with its
+    /// code, the figures and what to do), not as an opaque failure or nothing at all.
+    #[test]
+    fn a_turn_stopped_by_a_configured_limit_is_said_as_such() {
+        let frame = |kind: &str, data: Value| {
+            let notice = AgentEvent::ProviderNotice {
+                kind: kind.to_string(),
+                data,
+            };
+            match EventMapper::new().map(&notice).as_slice() {
+                [ChatEvent::Error { message, code, .. }] => (message.clone(), code.clone()),
+                other => panic!("one error frame expected: {other:?}"),
+            }
+        };
+        let (message, code) = frame(
+            TURN_TIME_LIMIT_NOTICE,
+            json!({"limit_ms": 1_800_000, "elapsed_ms": 1_800_005, "next_turn_note": "x"}),
+        );
+        assert_eq!(code.as_deref(), Some("turn_time_limit"));
+        assert!(
+            message
+                .starts_with("Turn stopped after 30 min by the configured turn time limit (30 min"),
+            "{message}"
+        );
+        assert!(
+            message.contains("chat.native_turn_timeout_secs"),
+            "{message}"
+        );
+        assert!(message.contains("work done so far is kept"), "{message}");
+
+        let (message, code) = frame(
+            SESSION_BUDGET_NOTICE,
+            json!({"budget": "tokens", "limit": 10_000_000, "spent": 10_026_330, "requests_this_turn": 24}),
+        );
+        assert_eq!(code.as_deref(), Some("session_budget_reached"));
+        assert!(
+            message.contains("10026330 of 10000000 tokens (cache reads not counted"),
+            "{message}"
+        );
+        assert!(message.contains("start a new conversation"), "{message}");
+        let (message, _) = frame(
+            SESSION_BUDGET_NOTICE,
+            json!({"budget": "usd", "limit": 5.0, "spent": 5.2}),
+        );
+        assert!(message.contains("5.2 of 5.0 USD"), "{message}");
+
+        // Any other notice stays a diagnostic: nothing in the turn.
+        let other = AgentEvent::ProviderNotice {
+            kind: "usage_estimated".into(),
+            data: json!({"tokens": 3}),
+        };
+        assert!(EventMapper::new().map(&other).is_empty());
+        // A limit notice without its figures is not invented into a message.
+        let bare = AgentEvent::ProviderNotice {
+            kind: TURN_TIME_LIMIT_NOTICE.into(),
+            data: Value::Null,
+        };
+        assert!(EventMapper::new().map(&bare).is_empty());
     }
 
     #[test]
