@@ -2,7 +2,7 @@
 
 Copyright (c) 2026 FFS SASU
 
-Part of this work falls under the Project Orchestrator Enterprise Edition (EE) and is licensed under the Business Source License 1.1, please refer to [LICENSE-EE](./LICENSE-EE) for details.
+Part of this work falls under the Project Orchestrator Enterprise Edition (EE) and is licensed under the Business Source License 1.1: the neural routing crates (`crates/neural-routing-*/`), any `ee/` or `enterprise_editions/` directory, and any file marked `SPDX-License-Identifier: BUSL-1.1`. Please refer to [LICENSE-EE](./LICENSE-EE) for details.
 
 The other parts of this work are licensed under the [MIT license](./LICENSE-MIT).
 

@@ -5,7 +5,7 @@ Parameters
 
 Licensor: FFS SASU
 
-Licensed Work: Any file explicitly marked as "Enterprise Edition (EE)" or "governed by the Business Source License" residing in enterprise_editions modules/folders.
+Licensed Work: the files under `crates/neural-routing-*/` (the neural routing crates), the files under any directory named `ee/` or `enterprise_editions/`, and any other file that carries the header `SPDX-License-Identifier: BUSL-1.1` or is explicitly marked "Enterprise Edition (EE)".
 
 Additional Use Grant:
 You may use, modify, and distribute the Licensed Work for non-production purposes only, such as testing, development, or evaluation.

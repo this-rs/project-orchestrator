@@ -291,7 +291,7 @@ path = "src/bin/mcp_server.rs"
 # Debian packaging (cargo-deb)
 # =============================================================================
 [package.metadata.deb]
-maintainer = "Elun <contact@ffs.holdings>"
+maintainer = "FFS SASU <contact@ffs.holdings>"
 copyright = "2026, FFS SASU"
 license-file = ["LICENSE", "0"]
 section = "net"
