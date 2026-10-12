@@ -3092,6 +3092,15 @@ pub(crate) mod remote_send_hook {
     }
 }
 
+/// The window (tokens) a Claude Code session is budgeted for when nobody knows its
+/// model's window (CTX4, `ChatManager::session_context_window`): 200K, the smallest
+/// window of the Claude models the CLI serves (some have 1M). It gives the PO prompt's
+/// dynamic context and the per-turn enrichment the 40 000-character budget Claude
+/// Code sessions had before CTX4 (`composer::compute_dynamic_budget` clamps any
+/// window from ~67K tokens up to 40 000), so an unreachable catalog (OAuth login, no
+/// API key) does not cut the main path to the unknown-window 10 000.
+pub(crate) const CLAUDE_CODE_FLOOR_WINDOW: u64 = 200_000;
+
 /// The context window (tokens) frozen in a session's capability snapshot (the
 /// `capabilities` JSON stored at its opening: `{"context_window": {"value": N, ...}}`),
 /// `None` when there is no snapshot, it is unreadable, or it states no window.
@@ -14504,19 +14513,33 @@ impl ChatManager {
     /// The window a session's system prompt is budgeted for (CTX4), resolved ONCE per
     /// opening: the window frozen in the session's capability snapshot (`snapshot`,
     /// what its provider reported when it was opened) when it holds one, else
-    /// [`Self::known_context_window`]. The prompt is built once per opening and the
+    /// [`Self::known_context_window`], else — for the Claude Code ENGINE only —
+    /// [`CLAUDE_CODE_FLOOR_WINDOW`]. The prompt is built once per opening and the
     /// composer is pure in this window, so the budget — hence the cached prefix —
     /// does not move between the turns of a session.
+    ///
+    /// Why an engine floor for Claude Code: its sessions often run on the CLI's OAuth
+    /// login with no API key, so the live Anthropic catalog can be unreachable (static
+    /// fallback, no `max_input_tokens`) and nexus declares no window for the CLI. The
+    /// CLI states no window at `system_init`; it reports one only in its `result`
+    /// (`modelUsage.*.contextWindow`), i.e. after the prompt is built, and taking it
+    /// then would move the budget mid-session. So an unknown window on that engine
+    /// keeps the budget it always had (40 000 characters, the 200K-token window it
+    /// used to assume from the model's name), decided by the engine, never the name.
+    /// A native provider with an unknown window keeps the 10 000 fallback.
     pub(crate) async fn session_context_window(
         &self,
         provider_id: &str,
         model: &str,
         snapshot: Option<&str>,
     ) -> Option<u64> {
-        match snapshot_context_window(snapshot) {
-            Some(window) => Some(window),
-            None => self.known_context_window(provider_id, model).await,
+        if let Some(window) = snapshot_context_window(snapshot) {
+            return Some(window);
         }
+        if let Some(window) = self.known_context_window(provider_id, model).await {
+            return Some(window);
+        }
+        (provider_id == super::provider::resolver::CLAUDE_CODE).then_some(CLAUDE_CODE_FLOOR_WINDOW)
     }
 
     /// The provider instance, built-in or stored. A stored instance becomes a
@@ -17834,6 +17857,82 @@ mod tests {
         let second_turn = build("deepseek-chat", w2).await;
         assert_eq!(first_turn, second_turn);
         assert_eq!(first_turn, deepseek);
+    }
+
+    /// CTX4, review of #748: a Claude Code session whose Anthropic catalog is
+    /// unreachable (OAuth login, no API key: the static fallback has no window) keeps
+    /// the 40 000-character budget, by ENGINE, never by the model's name; a native
+    /// provider with an unknown window keeps the 10 000 fallback.
+    #[tokio::test]
+    async fn a_claude_code_session_with_an_unreachable_catalog_keeps_40_000() {
+        use super::super::composer::{
+            compute_dynamic_budget, turn_enrichment_cap, DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET,
+        };
+        use super::super::provider::resolver::CLAUDE_CODE;
+        use crate::chat::model_catalog::ModelCatalogCache;
+        use crate::chat::provider::cognitive::decider::CognitiveRouting;
+        use crate::chat::provider::cognitive::store::InMemoryRoutingStore;
+        let state = mock_app_state();
+        // No key: the catalog never fetches and serves the static fallback, which
+        // knows no window.
+        let offline = ModelCatalogCache::new(None);
+        assert!(offline
+            .snapshot()
+            .await
+            .models
+            .iter()
+            .all(|m| m.max_input_tokens.is_none()));
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
+            .with_cognitive_routing(
+                CognitiveRouting::new(Arc::new(InMemoryRoutingStore::new()))
+                    .with_claude_code_catalog(offline),
+            );
+        assert_eq!(
+            manager
+                .known_context_window(CLAUDE_CODE, "claude-sonnet-4-6")
+                .await,
+            None,
+            "the window is really unknown here"
+        );
+
+        // Creation (no snapshot yet) and a reopen whose snapshot states no window.
+        for snapshot in [None, Some("{}")] {
+            let window = manager
+                .session_context_window(CLAUDE_CODE, "claude-sonnet-4-6", snapshot)
+                .await;
+            assert_eq!(window, Some(CLAUDE_CODE_FLOOR_WINDOW));
+            assert_eq!(compute_dynamic_budget(window, 0), 40_000);
+            assert_eq!(compute_dynamic_budget(window, 50_000), 40_000);
+            assert_eq!(turn_enrichment_cap(window), 40_000);
+        }
+        // Decided by the engine, not the name: any model on Claude Code.
+        assert_eq!(
+            manager
+                .session_context_window(CLAUDE_CODE, "some-future-model", None)
+                .await,
+            Some(CLAUDE_CODE_FLOOR_WINDOW)
+        );
+        // A known window still wins over the floor.
+        assert_eq!(
+            manager
+                .session_context_window(
+                    CLAUDE_CODE,
+                    "claude-sonnet-4-6",
+                    Some(r#"{"context_window":{"value":1000000,"source":"catalog"}}"#),
+                )
+                .await,
+            Some(1_000_000)
+        );
+        // A native provider with an unknown window, even with a Claude name: 10 000.
+        let native = manager
+            .session_context_window("unknown-provider", "claude-sonnet-4-6", None)
+            .await;
+        assert_eq!(native, None);
+        assert_eq!(
+            compute_dynamic_budget(native, 0),
+            DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET
+        );
+        assert_eq!(turn_enrichment_cap(native), 10_000);
     }
 
     #[tokio::test]
