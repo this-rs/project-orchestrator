@@ -1970,6 +1970,40 @@ mod provider_move_tests {
         assert!(decider.last().pool.iter().all(|f| f.provider_id == "local"));
     }
 
+    /// AUTO-L composes with a pool that spans providers (R-S2): an Auto conversation whose
+    /// own ticks name models on two providers is moved among THOSE, through the relay; the
+    /// person's list (here: only the session's provider) is not read and narrows nothing.
+    #[tokio::test]
+    async fn a_cross_provider_pool_wins_over_the_persons_list_on_a_move() {
+        let decider = Fake::picking("local2", 0.9, 0.1);
+        let mut s = spec(
+            decider.clone(),
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Full,
+            LearningStage::Auto,
+        );
+        s.allowed_models = Some(vec!["m".into()]);
+        s.routing_pool = Some(vec![entry("local", "m"), entry("local2", "m")]);
+        s.conversation_routes = true;
+        s.auto_models = Some(vec![entry("local", "m")]);
+        let router = router(s);
+        let plan = plan_provider_move(&router).await;
+        assert!(is_move_to(&plan, "local2"), "{plan:?}");
+        let asked = decider.last();
+        assert!(
+            asked.narrowed.is_empty(),
+            "the list is not read: {:?}",
+            asked.narrowed
+        );
+        let mut providers: Vec<&str> = asked.pool.iter().map(|f| f.provider_id.as_str()).collect();
+        providers.sort_unstable();
+        assert_eq!(
+            providers,
+            vec!["local", "local2"],
+            "the conversation's pool, both providers"
+        );
+    }
+
     #[tokio::test]
     async fn an_imposed_model_or_provider_is_never_moved_until_auto_is_chosen_again() {
         let decider = Fake::picking("local2", 0.9, 0.1);
