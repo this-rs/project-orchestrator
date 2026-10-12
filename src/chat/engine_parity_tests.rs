@@ -2322,8 +2322,7 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     );
     w.settle(ends, &manager).await;
 
-    // Auto-continue.
-    manager.set_auto_continue(&sid, true).await.unwrap();
+    // Auto-continue: always on (decision 7b95342a), no toggle sent.
     let ends = w.turn_ends();
     manager
         .send_message(&sid, &kc.k("TURN-FOUR"))
@@ -2345,7 +2344,6 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     );
     w.said(WAIT, "continued").await;
     w.settle(ends, &manager).await;
-    manager.set_auto_continue(&sid, false).await.unwrap();
 
     // set_model between two turns.
     manager
@@ -2915,8 +2913,7 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     );
     wn.settle(ends, &manager).await;
 
-    // Auto-continue.
-    manager.set_auto_continue(&nid, true).await.unwrap();
+    // Auto-continue: always on (decision 7b95342a), no toggle sent.
     let ends = wn.turn_ends();
     manager
         .send_message(&nid, &kn.k("TURN-FOUR"))
@@ -2941,7 +2938,6 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     );
     wn.said(WAIT, "continued").await;
     wn.settle(ends, &manager).await;
-    manager.set_auto_continue(&nid, false).await.unwrap();
 
     // `always` (P11b): offered to a person's session on a project, kept by the BACKEND (the
     // identical call is still asked by nexus, and answered from the lasting rule).

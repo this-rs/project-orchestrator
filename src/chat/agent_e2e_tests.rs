@@ -5592,14 +5592,28 @@ mod parity {
         }
     }
 
-    /// H3 auto-continue: a turn that stops on its turn limit is announced
-    /// (`auto_continue`) and continued with the "continue" hint of the Claude Code
-    /// engine when the session's toggle is on.
+    /// Waits until `n` turns were sent and the session no longer streams, then a little
+    /// longer: a further continuation would have been sent by then.
+    async fn settled_after(r: &Rig, n: usize) -> Vec<String> {
+        for _ in 0..400 {
+            if r.sent().len() >= n && !r.manager.is_session_streaming(&r.sid).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(
+            crate::chat::post_stream::AUTO_CONTINUE_DELAY_MS + 300,
+        ))
+        .await;
+        r.sent()
+    }
+
+    /// Auto-continue is always on (decision 7b95342a): a NEW session, with no toggle
+    /// message at all, announces (`auto_continue`) and continues a turn that stopped on
+    /// its turn limit with the "continue" hint of the Claude Code engine.
     #[tokio::test]
-    async fn a_turn_stopped_on_its_limit_is_continued_when_auto_continue_is_on() {
+    async fn a_new_session_continues_a_turn_stopped_on_its_limit() {
         let mut r = rig(ProviderKind::Native, vec![stopped_on_its_turn_limit()]).await;
-        assert!(!r.manager.get_auto_continue_state(&r.sid).await.unwrap());
-        r.manager.set_auto_continue(&r.sid, true).await.unwrap();
         assert!(r.manager.get_auto_continue_state(&r.sid).await.unwrap());
         r.manager.send_message(&r.sid, "go").await.unwrap();
         let events = run_events(&mut r).await;
@@ -5618,11 +5632,58 @@ mod parity {
         assert!(sent[1].contains("Continue where you left off"), "{sent:?}");
     }
 
-    /// H3 auto-continue: toggle off (the default of an interactive session), the
-    /// turn stays stopped.
+    /// The cap still stops it: `MAX_AUTO_CONTINUES` continuations in a row, then the turn
+    /// stays stopped (auto-continue stays on). The next message starts a new chain.
     #[tokio::test]
-    async fn a_turn_stopped_on_its_limit_stays_stopped_when_auto_continue_is_off() {
-        let mut r = rig(ProviderKind::Native, vec![stopped_on_its_turn_limit()]).await;
+    async fn the_cap_stops_a_chain_of_continuations_and_the_next_message_starts_a_new_one() {
+        let max = crate::chat::post_stream::MAX_AUTO_CONTINUES as usize;
+        // The message and its `max` continuations all stop on their limit; then the next
+        // message stops on it too and its continuation answers.
+        let mut turns: Vec<Vec<Step>> =
+            (0..=max + 1).map(|_| stopped_on_its_turn_limit()).collect();
+        turns.push(vec![steps::done(&caps())]);
+        let r = rig(ProviderKind::Native, turns).await;
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        let sent = settled_after(&r, max + 1).await;
+        assert_eq!(
+            sent.len(),
+            max + 1,
+            "the message, then {max} continuations: {sent:#?}"
+        );
+        assert!(
+            sent[1..]
+                .iter()
+                .all(|s| s.contains("Continue where you left off")),
+            "{sent:#?}"
+        );
+        assert!(r.manager.get_auto_continue_state(&r.sid).await.unwrap());
+
+        r.manager.send_message(&r.sid, "again").await.unwrap();
+        let sent = settled_after(&r, max + 3).await;
+        assert_eq!(sent.len(), max + 3, "a new chain: {sent:#?}");
+        assert!(sent[max + 1].ends_with("again"), "{sent:#?}");
+        assert!(
+            sent[max + 2].contains("Continue where you left off"),
+            "{sent:#?}"
+        );
+    }
+
+    /// The operator's kill switch (`CHAT_AUTO_CONTINUE=false`): the turn stays stopped.
+    #[tokio::test]
+    async fn a_turn_stopped_on_its_limit_stays_stopped_under_the_kill_switch() {
+        let mut r = rig_tweaked(
+            ProviderKind::Native,
+            vec![stopped_on_its_turn_limit()],
+            None,
+            None,
+            false,
+            |mut m| {
+                m.config.auto_continue = false;
+                m
+            },
+        )
+        .await;
+        assert!(!r.manager.get_auto_continue_state(&r.sid).await.unwrap());
         r.manager.send_message(&r.sid, "go").await.unwrap();
         let events = run_events(&mut r).await;
         assert!(
@@ -5639,12 +5700,55 @@ mod parity {
     #[tokio::test]
     async fn a_stop_cancels_a_pending_auto_continue() {
         let mut r = rig(ProviderKind::Native, vec![stopped_on_its_turn_limit()]).await;
-        r.manager.set_auto_continue(&r.sid, true).await.unwrap();
         r.manager.send_message(&r.sid, "go").await.unwrap();
         next_event(&mut r.rx, |e| matches!(e, ChatEvent::AutoContinue { .. })).await;
         r.manager.interrupt(&r.sid).await.unwrap();
         r.turn_end().await;
         assert_eq!(r.sent().len(), 1, "{:?}", r.sent());
+    }
+
+    /// An older frontend's `set_auto_continue {enabled:false}`, relayed by another
+    /// instance (NATS RPC), is accepted and IGNORED: the session still continues.
+    #[tokio::test]
+    async fn an_older_frontends_set_auto_continue_off_is_ignored() {
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+
+        let broker = TestBroker::start().await;
+        let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let mut r = rig_with(
+            ProviderKind::Native,
+            vec![stopped_on_its_turn_limit()],
+            Some(owner),
+        )
+        .await;
+        let other = NatsEmitter::new(broker.client().await, "events");
+        other.client().flush().await.unwrap();
+        // The listener may still be subscribing: ask again until it answers.
+        let mut answered = None;
+        for _ in 0..20 {
+            answered = other
+                .request_send_message(&r.sid, r#"{"enabled":false}"#, "set_auto_continue")
+                .await;
+            if answered.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            answered.as_ref().is_some_and(|a| a.success),
+            "accepted: {answered:?}"
+        );
+        assert!(r.manager.get_auto_continue_state(&r.sid).await.unwrap());
+        r.manager.send_message(&r.sid, "go").await.unwrap();
+        let events = run_events(&mut r).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ChatEvent::AutoContinue { .. })),
+            "{events:?}"
+        );
+        assert_eq!(r.sent().len(), 2, "{:?}", r.sent());
     }
 
     /// H3 NATS: another instance sees the session's events and reaches the session
@@ -11405,7 +11509,6 @@ mod post_turn {
             ],
         )
         .await;
-        r.manager.set_auto_continue(&r.sid, true).await.unwrap();
         r.manager.send_message(&r.sid, "go").await.unwrap();
         for _ in 0..400 {
             if r.sent().len() >= 2 && !r.manager.is_session_streaming(&r.sid).await {

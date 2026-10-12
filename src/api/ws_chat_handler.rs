@@ -91,7 +91,9 @@ pub enum WsChatClientMessage {
     SetPermissionMode { mode: String },
     /// Change the model of the active session
     SetModel { model: String },
-    /// Toggle auto-continue for the active session
+    /// Former toggle of auto-continue: accepted and IGNORED (auto-continue is always on,
+    /// capped; decision 7b95342a). The socket answers `auto_continue_state_changed` with
+    /// the session's real state. Kept so older frontends are not refused.
     SetAutoContinue { enabled: bool },
     /// Cancel the currently-running tool subprocess(es) WITHOUT
     /// ending the LLM turn. Mirror of `POST /api/chat/sessions/{id}
@@ -554,16 +556,17 @@ async fn handle_ws_chat_loop(
         return;
     }
 
-    // Send current auto_continue state so the frontend can initialize its toggle
+    // The session's auto-continue state. Auto-continue is always on (decision 7b95342a)
+    // and the current frontend reads nothing here; the frame is kept for older frontends
+    // that still show a toggle (it shows them the real state: on, unless the operator's
+    // CHAT_AUTO_CONTINUE=false turned it off).
     if let Ok(ac_enabled) = chat_manager.get_auto_continue_state(&session_id).await {
-        let ac_msg = serde_json::json!({
-            "type": "auto_continue_state_changed",
-            "session_id": session_id,
-            "enabled": ac_enabled,
-            "seq": 0,
-        });
         let _ = ws_sender
-            .send(Message::Text(ac_msg.to_string().into()))
+            .send(Message::Text(
+                auto_continue_state_frame(&session_id, ac_enabled)
+                    .to_string()
+                    .into(),
+            ))
             .await;
     }
 
@@ -1127,28 +1130,12 @@ async fn handle_ws_chat_loop(
                                     }
 
                                     WsChatClientMessage::SetAutoContinue { enabled } => {
-                                        info!(session_id = %session_id, enabled = %enabled, "WS: Received set_auto_continue");
-                                        // set_auto_continue works whether the session is active or idle:
-                                        // - Active: updates in-memory + Neo4j + local broadcast + NATS
-                                        // - Idle: updates Neo4j + NATS only
-                                        // No need for try_remote_send — NATS pub/sub handles cross-instance.
-                                        match chat_manager.set_auto_continue(&session_id, enabled).await {
-                                            Ok(()) => {
-                                                let confirmation = serde_json::json!({
-                                                    "type": "auto_continue_state_changed",
-                                                    "enabled": enabled,
-                                                });
-                                                let _ = ws_sender.send(Message::Text(confirmation.to_string().into())).await;
-                                            }
-                                            Err(e) => {
-                                                warn!(session_id = %session_id, error = %e, "Failed to set auto_continue");
-                                                let err = serde_json::json!({
-                                                    "type": "error",
-                                                    "message": format!("Failed to set auto_continue: {}", e),
-                                                });
-                                                let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
-                                            }
-                                        }
+                                        // Accepted and ignored, for older frontends: auto-continue is
+                                        // always on, capped (decision 7b95342a). The answer is the
+                                        // session's real state, so an old toggle snaps back to it.
+                                        debug!(session_id = %session_id, enabled = %enabled, "WS: set_auto_continue ignored (always on)");
+                                        let state = chat_manager.get_auto_continue_state(&session_id).await.unwrap_or(true);
+                                        let _ = ws_sender.send(Message::Text(auto_continue_state_frame(&session_id, state).to_string().into())).await;
                                     }
                                 }
                             }
@@ -1477,6 +1464,19 @@ pub(crate) fn writes_to_session(msg: &WsChatClientMessage) -> bool {
             | WsChatClientMessage::SetModel { .. }
             | WsChatClientMessage::SetPermissionMode { .. }
     )
+}
+
+/// The `auto_continue_state_changed` frame the socket sends on connect and in answer to a
+/// `set_auto_continue` (accepted and ignored: auto-continue is always on, decision
+/// 7b95342a). Kept for older frontends that still show a toggle; `enabled` is the
+/// session's real state.
+pub(crate) fn auto_continue_state_frame(session_id: &str, enabled: bool) -> serde_json::Value {
+    serde_json::json!({
+        "type": "auto_continue_state_changed",
+        "session_id": session_id,
+        "enabled": enabled,
+        "seq": 0,
+    })
 }
 
 /// The FLAT `error` frame refusing anything written to a read-only mirror of a Claude Code
