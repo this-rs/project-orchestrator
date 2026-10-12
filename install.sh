@@ -221,6 +221,22 @@ main() {
     fi
   done
 
+  # Our license and the third-party notices of the binaries, beside the bin directory (~/.local/bin ->
+  # ~/.local/share/doc/project-orchestrator). Best effort: absent from older archives, never fatal.
+  DOC_DIR="$(dirname "$INSTALL_DIR")/share/doc/project-orchestrator"
+  for doc in LICENSE LICENSE-MIT LICENSE-EE THIRD-PARTY-LICENSES.txt; do
+    if [ -f "${TMP_DIR}/${ARCHIVE_NAME}/${doc}" ]; then
+      if mkdir -p "$DOC_DIR" 2>/dev/null && cp "${TMP_DIR}/${ARCHIVE_NAME}/${doc}" "${DOC_DIR}/${doc}" 2>/dev/null; then
+        :
+      else
+        warn "Could not copy ${doc} to ${DOC_DIR}"
+      fi
+    fi
+  done
+  if [ -f "${DOC_DIR}/LICENSE" ]; then
+    info "License and third-party notices in ${DOC_DIR}"
+  fi
+
   # Check if install dir is in PATH
   case ":$PATH:" in
     *":${INSTALL_DIR}:"*)

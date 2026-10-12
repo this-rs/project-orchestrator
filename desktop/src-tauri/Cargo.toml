@@ -5,6 +5,8 @@ edition = "2021"
 description = "Project Orchestrator — Desktop application"
 authors = ["Elun <contact@ffs.holdings>"]
 license = "MIT AND BUSL-1.1"
+# First-party: not published, and skipped by the third-party notices (about.toml, private.ignore).
+publish = false
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

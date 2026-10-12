@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Decision Transformer + CQL policy network for neural route learning — candle-based"
 license = "MIT AND BUSL-1.1"
+# First-party: not published, and skipped by the third-party notices (about.toml, private.ignore).
+publish = false
 
 [dependencies]
 neural-routing-core = { path = "../neural-routing-core" }

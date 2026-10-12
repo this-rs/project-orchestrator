@@ -1,0 +1,1 @@
+ONNX Runtime (Microsoft, MIT): linked into the binaries by `ort` (1.24.2, statically) or shipped as libonnxruntime (1.23.2)

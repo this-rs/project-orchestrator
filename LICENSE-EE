@@ -1,16 +1,16 @@
-Business Source License 1.1 — Adapted for FFS SAS
+Business Source License 1.1 — Adapted for FFS SASU
 This license is based on the Business Source License version 1.1, as published by MariaDB Corporation Ab.
 
 Parameters
 
-Licensor: FFS SAS
+Licensor: FFS SASU
 
 Licensed Work: Any file explicitly marked as "Enterprise Edition (EE)" or "governed by the Business Source License" residing in enterprise_editions modules/folders.
 
 Additional Use Grant:
 You may use, modify, and distribute the Licensed Work for non-production purposes only, such as testing, development, or evaluation.
 
-Production use of the Licensed Work requires a commercial license agreement with FFS SAS. Contact contact@ffs.holdings for licensing.
+Production use of the Licensed Work requires a commercial license agreement with FFS SASU. Contact contact@ffs.holdings for licensing.
 
 Change License: MIT
 

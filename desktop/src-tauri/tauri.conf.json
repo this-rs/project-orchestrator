@@ -43,9 +43,13 @@
     "resources": {
       "splash.html": "splash.html",
       "../dist/": "dist/",
-      "../../target/release/mcp_server": "mcp_server"
+      "../../target/release/mcp_server": "mcp_server",
+      "../../LICENSE": "licenses/LICENSE",
+      "../../LICENSE-MIT": "licenses/LICENSE-MIT",
+      "../../LICENSE-EE": "licenses/LICENSE-EE"
     },
-    "copyright": "Copyright 2026 - Freedom From Scratch",
+    "copyright": "Copyright 2026 FFS SASU",
+    "license": "MIT AND BUSL-1.1",
     "category": "DeveloperTool",
     "homepage": "https://github.com/this-rs/project-orchestrator",
     "shortDescription": "AI Agent Orchestrator with Knowledge Graph",

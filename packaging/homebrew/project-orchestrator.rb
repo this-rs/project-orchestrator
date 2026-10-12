@@ -10,7 +10,7 @@
 class ProjectOrchestrator < Formula
   desc "AI agent orchestrator with Neo4j knowledge graph, Meilisearch, and Tree-sitter"
   homepage "https://github.com/this-rs/project-orchestrator"
-  license "MIT"
+  license all_of: ["MIT", "BUSL-1.1"]
   version "VERSION_PLACEHOLDER"
 
   on_macos do
@@ -49,6 +49,11 @@ class ProjectOrchestrator < Formula
     # because ort-sys has no prebuilt static library for macOS Intel).
     # Binaries have @executable_path/../lib in their rpath for this layout.
     lib.install Dir["libonnxruntime*"] unless Dir["libonnxruntime*"].empty?
+
+    # Our license (LICENSE, LICENSE-MIT, LICENSE-EE) and the third-party notices of the binaries.
+    # Absent from releases made before they shipped.
+    license_files = Dir["LICENSE*", "THIRD-PARTY-LICENSES.txt"]
+    prefix.install license_files unless license_files.empty?
   end
 
   def caveats

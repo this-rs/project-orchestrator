@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Core types, traits, and storage for neural route learning"
 license = "MIT AND BUSL-1.1"
+# First-party: not published, and skipped by the third-party notices (about.toml, private.ignore).
+publish = false
 
 [dependencies]
 # Workspace shared

@@ -58,6 +58,8 @@ edition = "2021"
 description = "AI agent orchestrator with Neo4j knowledge graph, Meilisearch, and Tree-sitter parsing"
 authors = ["Elun <contact@ffs.holdings>"]
 license = "MIT AND BUSL-1.1"
+# First-party: not published, and skipped by the third-party notices (about.toml, private.ignore).
+publish = false
 
 [dependencies]
 # Async runtime
@@ -290,7 +292,7 @@ path = "src/bin/mcp_server.rs"
 # =============================================================================
 [package.metadata.deb]
 maintainer = "Elun <contact@ffs.holdings>"
-copyright = "2026, Freedom From Scratch"
+copyright = "2026, FFS SASU"
 license-file = ["LICENSE", "0"]
 section = "net"
 priority = "optional"
@@ -308,6 +310,12 @@ assets = [
     ["config.yaml.example", "/etc/project-orchestrator/config.yaml.example", "644"],
     ["packaging/debian/project-orchestrator.service", "/lib/systemd/system/project-orchestrator.service", "644"],
     ["packaging/debian/docker-compose.services.yml", "/etc/project-orchestrator/docker-compose.services.yml", "644"],
+    # Our license (LICENSE is also the Debian `copyright` file, above) and the third-party notices
+    # (scripts/third-party-licenses.sh; the release puts THIRD-PARTY-LICENSES.txt next to the binaries).
+    ["LICENSE", "/usr/share/doc/project-orchestrator/LICENSE", "644"],
+    ["LICENSE-MIT", "/usr/share/doc/project-orchestrator/LICENSE-MIT", "644"],
+    ["LICENSE-EE", "/usr/share/doc/project-orchestrator/LICENSE-EE", "644"],
+    ["target/release/THIRD-PARTY-LICENSES.txt", "/usr/share/doc/project-orchestrator/THIRD-PARTY-LICENSES.txt", "644"],
 ]
 conf-files = ["/etc/project-orchestrator/config.yaml"]
 
@@ -326,6 +334,7 @@ depends = "libc6 (>= 2.35), libgcc-s1"
 # RPM packaging (cargo-generate-rpm)
 # =============================================================================
 [package.metadata.generate-rpm]
+vendor = "FFS SASU"
 assets = [
     { source = "target/release/orchestrator", dest = "/usr/bin/orchestrator", mode = "755" },
     { source = "target/release/orch", dest = "/usr/bin/orch", mode = "755" },
@@ -334,6 +343,11 @@ assets = [
     { source = "config.yaml.example", dest = "/etc/project-orchestrator/config.yaml.example", mode = "644", config = "noreplace" },
     { source = "packaging/debian/project-orchestrator.service", dest = "/lib/systemd/system/project-orchestrator.service", mode = "644" },
     { source = "packaging/debian/docker-compose.services.yml", dest = "/etc/project-orchestrator/docker-compose.services.yml", mode = "644" },
+    # Our license and the third-party notices (see the .deb assets above).
+    { source = "LICENSE", dest = "/usr/share/licenses/project-orchestrator/LICENSE", mode = "644", doc = true },
+    { source = "LICENSE-MIT", dest = "/usr/share/licenses/project-orchestrator/LICENSE-MIT", mode = "644", doc = true },
+    { source = "LICENSE-EE", dest = "/usr/share/licenses/project-orchestrator/LICENSE-EE", mode = "644", doc = true },
+    { source = "target/release/THIRD-PARTY-LICENSES.txt", dest = "/usr/share/licenses/project-orchestrator/THIRD-PARTY-LICENSES.txt", mode = "644", doc = true },
 ]
 post_install_script = "packaging/rpm/postinst.sh"
 

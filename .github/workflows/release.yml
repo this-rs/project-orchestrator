@@ -77,13 +77,72 @@ jobs:
           retention-days: 1
 
   # ==========================================================================
+  # Third-party licenses - THIRD-PARTY-LICENSES.txt, the license texts and notices
+  # of the third-party code inside the binaries (MIT/BSD/Apache-2.0 require them in
+  # a binary distribution). Generated once, then shipped with LICENSE, LICENSE-MIT
+  # and LICENSE-EE in EVERY artifact: archives (and from them Homebrew, .deb, .rpm,
+  # the desktop app) and the Docker image. scripts/third-party-licenses.sh says what
+  # goes in; cargo-about is pinned there and here.
+  # ==========================================================================
+  third-party-licenses:
+    name: Third-party licenses
+    runs-on: ubuntu-22.04
+    needs: [build-frontend]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the repository toolchain
+        run: rustup show
+
+      # Prebuilt, at the version scripts/third-party-licenses.sh requires (ABOUT_VERSION).
+      - name: Install cargo-about
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: cargo-about@0.9.2
+
+      # The web interface embedded in the full variant and the desktop app carries the
+      # notices of its npm packages (dist/third-party-licenses.txt, built by the frontend).
+      - name: Download frontend dist
+        uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: frontend-dist/
+
+      # Network only here (crates of Cargo.lock, nexus-tools resolution); the generation
+      # itself reads local files only (cargo-about does not query any web service).
+      - name: Fetch crates
+        run: cargo fetch --locked
+
+      # Another binary shipped next to the server adds its own section here: --cargo NAME=MANIFEST[:FEATURES]
+      # for a Rust binary (the LICENSE/NOTICE files at the root of its workspace are copied verbatim, then
+      # its crates and their NOTICE files), --notices NAME=PATH for what is not a crate (e.g. V8's notices).
+      - name: Generate THIRD-PARTY-LICENSES.txt
+        run: |
+          extra=()
+          if [ -f frontend-dist/third-party-licenses.txt ]; then
+            extra+=(--notices "Web interface (npm packages bundled in the full variant and the desktop app)=frontend-dist/third-party-licenses.txt")
+          else
+            echo "::error::frontend dist has no third-party-licenses.txt (the frontend build generates it)"
+            exit 1
+          fi
+          scripts/third-party-licenses.sh "${extra[@]}" licenses-out/THIRD-PARTY-LICENSES.txt
+          head -20 licenses-out/THIRD-PARTY-LICENSES.txt
+
+      - name: Upload third-party licenses
+        uses: actions/upload-artifact@v7
+        with:
+          name: third-party-licenses
+          path: licenses-out/THIRD-PARTY-LICENSES.txt
+          retention-days: 1
+
+  # ==========================================================================
   # Build backend - Compile light + full variants in a single job per target
   # (shares compiled dependencies between the two variants for ~50% faster CI)
   # ==========================================================================
   build-backend:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    needs: [build-frontend]
+    needs: [build-frontend, third-party-licenses]
     strategy:
       fail-fast: false
       matrix:
@@ -256,6 +315,20 @@ jobs:
         shell: bash
         run: scripts/build-nexus-tools.sh "$RUNNER_TEMP/nexus-tools" --target ${{ matrix.target }} --target-dir target/nexus-tools
 
+      # The license files of every archive: ours (LICENSE, LICENSE-MIT, LICENSE-EE) and the third-party
+      # notices (job third-party-licenses). From the archives they reach Homebrew, .deb, .rpm and the app.
+      - name: Download third-party licenses
+        uses: actions/download-artifact@v8
+        with:
+          name: third-party-licenses
+          path: ${{ runner.temp }}/licenses/
+
+      - name: Gather license files
+        shell: bash
+        run: |
+          cp LICENSE LICENSE-MIT LICENSE-EE "$RUNNER_TEMP/licenses/"
+          ls -la "$RUNNER_TEMP/licenses/"
+
       # --- Light variant (no embedded frontend) ---
 
       - name: Build light variant (native)
@@ -276,6 +349,7 @@ jobs:
             cp "target/${{ matrix.target }}/release/${bin}" "staging/${ARCHIVE_NAME}/"
           done
           cp "$RUNNER_TEMP/nexus-tools/bin/nexus-tools" "staging/${ARCHIVE_NAME}/"
+          cp "$RUNNER_TEMP"/licenses/* "staging/${ARCHIVE_NAME}/"
           if [ -d "queries" ]; then
             cp -r queries "staging/${ARCHIVE_NAME}/"
           fi
@@ -307,6 +381,7 @@ jobs:
             Copy-Item "target/${{ matrix.target }}/release/${bin}.exe" "staging/${archiveName}/"
           }
           Copy-Item "$env:RUNNER_TEMP/nexus-tools/bin/nexus-tools.exe" "staging/${archiveName}/"
+          Copy-Item "$env:RUNNER_TEMP/licenses/*" "staging/${archiveName}/"
           if (Test-Path "queries") {
             Copy-Item -Recurse "queries" "staging/${archiveName}/"
           }
@@ -348,6 +423,7 @@ jobs:
             cp "target/${{ matrix.target }}/release/${bin}" "staging/${ARCHIVE_NAME}/"
           done
           cp "$RUNNER_TEMP/nexus-tools/bin/nexus-tools" "staging/${ARCHIVE_NAME}/"
+          cp "$RUNNER_TEMP"/licenses/* "staging/${ARCHIVE_NAME}/"
           if [ -d "queries" ]; then
             cp -r queries "staging/${ARCHIVE_NAME}/"
           fi
@@ -386,6 +462,7 @@ jobs:
             Copy-Item "target/${{ matrix.target }}/release/${bin}.exe" "staging/${archiveName}/"
           }
           Copy-Item "$env:RUNNER_TEMP/nexus-tools/bin/nexus-tools.exe" "staging/${archiveName}/"
+          Copy-Item "$env:RUNNER_TEMP/licenses/*" "staging/${archiveName}/"
           if (Test-Path "queries") {
             Copy-Item -Recurse "queries" "staging/${archiveName}/"
           }
@@ -470,6 +547,8 @@ jobs:
             cp "artifact/${ARCHIVE_NAME}/${bin}" "target/${{ matrix.target }}/release/${bin}"
           done
           chmod +x target/${{ matrix.target }}/release/*
+          # The third-party notices, from the archive (Cargo.toml packages them from target/release/).
+          cp "artifact/${ARCHIVE_NAME}/THIRD-PARTY-LICENSES.txt" "target/${{ matrix.target }}/release/THIRD-PARTY-LICENSES.txt"
 
       - name: Build .deb package
         run: |
@@ -566,6 +645,8 @@ jobs:
             cp "artifact/${ARCHIVE_NAME}/${bin}" "target/${{ matrix.target }}/release/${bin}"
           done
           chmod +x target/${{ matrix.target }}/release/*
+          # The third-party notices, from the archive (Cargo.toml packages them from target/release/).
+          cp "artifact/${ARCHIVE_NAME}/THIRD-PARTY-LICENSES.txt" "target/${{ matrix.target }}/release/THIRD-PARTY-LICENSES.txt"
 
       - name: Build .rpm package
         run: cargo generate-rpm --target ${{ matrix.target }}
@@ -817,7 +898,9 @@ jobs:
           # the app points NEXUS_TOOLS_PATH at it (desktop/src-tauri/src/main.rs).
           cp "mcp-artifact/${ARCHIVE_NAME}/nexus-tools" target/release/nexus-tools
           chmod +x target/release/nexus-tools
-          echo '{"bundle":{"resources":{"../../target/release/nexus-tools":"nexus-tools"}}}' > desktop/src-tauri/tauri.nexus-tools.json
+          # The third-party notices ride along too (our LICENSE files are in tauri.conf.json): licenses/ in the app.
+          cp "mcp-artifact/${ARCHIVE_NAME}/THIRD-PARTY-LICENSES.txt" target/release/THIRD-PARTY-LICENSES.txt
+          echo '{"bundle":{"resources":{"../../target/release/nexus-tools":"nexus-tools","../../target/release/THIRD-PARTY-LICENSES.txt":"licenses/THIRD-PARTY-LICENSES.txt"}}}' > desktop/src-tauri/tauri.nexus-tools.json
 
       - name: Extract mcp_server to target/release (Windows)
         if: runner.os == 'Windows'
@@ -833,7 +916,9 @@ jobs:
           Write-Host "✅ mcp_server extracted to target/release/"
           # nexus-tools rides along as a resource of the app, under its .exe name (see the Unix step).
           Copy-Item "mcp-artifact/${archiveName}/nexus-tools.exe" "target/release/nexus-tools.exe"
-          Set-Content -Path "desktop/src-tauri/tauri.nexus-tools.json" -Value '{"bundle":{"resources":{"../../target/release/nexus-tools.exe":"nexus-tools.exe"}}}'
+          # The third-party notices ride along too (see the Unix step).
+          Copy-Item "mcp-artifact/${archiveName}/THIRD-PARTY-LICENSES.txt" "target/release/THIRD-PARTY-LICENSES.txt"
+          Set-Content -Path "desktop/src-tauri/tauri.nexus-tools.json" -Value '{"bundle":{"resources":{"../../target/release/nexus-tools.exe":"nexus-tools.exe","../../target/release/THIRD-PARTY-LICENSES.txt":"licenses/THIRD-PARTY-LICENSES.txt"}}}'
 
       # --- Windows: Bundle ALL MSVC Runtime DLLs + VC++ Redistributable ---
       # ort-sys (ONNX Runtime) is compiled with dynamic CRT (/MD).
@@ -1638,7 +1723,7 @@ jobs:
   docker-publish:
     name: Docker (${{ matrix.variant }})
     runs-on: ubuntu-latest
-    needs: [build-frontend]
+    needs: [build-frontend, third-party-licenses]
     if: ${{ !inputs.dry_run }}
     strategy:
       fail-fast: false
@@ -1666,6 +1751,13 @@ jobs:
         if: matrix.include_frontend == 'false'
         run: mkdir -p frontend/dist
 
+      # Into the build context, where the Dockerfile copies it to /app/licenses/ with our LICENSE files.
+      - name: Download third-party licenses
+        uses: actions/download-artifact@v8
+        with:
+          name: third-party-licenses
+          path: .
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -1684,6 +1776,11 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
+          # The action derives image.licenses from the repository's detected license, which GitHub reports
+          # as NOASSERTION (dual license): state ours, as the Dockerfile does.
+          labels: |
+            org.opencontainers.image.licenses=MIT AND BUSL-1.1
+            org.opencontainers.image.vendor=FFS SASU
           flavor: |
             suffix=${{ matrix.suffix }}
           tags: |

@@ -128,6 +128,14 @@ function Main {
             Copy-Item "$tmpDir\$archiveName\nexus-tools.exe" "$InstallDir\nexus-tools.exe" -Force
             Write-Info "Installed nexus-tools to $InstallDir\nexus-tools.exe"
         }
+        # Our license and the third-party notices of the binaries (absent from older archives).
+        $licenseFiles = @("LICENSE", "LICENSE-MIT", "LICENSE-EE", "THIRD-PARTY-LICENSES.txt") |
+            Where-Object { Test-Path "$tmpDir\$archiveName\$_" }
+        if ($licenseFiles) {
+            New-Item -ItemType Directory -Force -Path "$InstallDir\licenses" | Out-Null
+            foreach ($f in $licenseFiles) { Copy-Item "$tmpDir\$archiveName\$f" "$InstallDir\licenses\$f" -Force }
+            Write-Info "License and third-party notices in $InstallDir\licenses"
+        }
 
         Write-Info "Installed $BinaryName to $InstallDir\$BinaryName.exe"
 

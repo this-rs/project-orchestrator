@@ -149,6 +149,9 @@ diagrams:
       - "backend:packaging/**"
       - "backend:desktop/src-tauri/{tauri.conf.json,src/**}"
       - "backend:scripts/build-desktop.sh"
+      - "backend:scripts/third-party-licenses.sh"
+      - "backend:about.toml"
+      - "backend:licenses/**"
   - name: po-frontend-chat
     owner: theotime
     status: verified
