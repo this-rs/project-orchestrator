@@ -341,6 +341,9 @@ const HUMAN_ONLY_MUTATION_PREFIXES: &[&str] = &[
     "/api/chat/model-policy",
     "/api/chat/model-aliases",
     "/api/chat/routing",
+    // The models a person lets their Auto choose among (AUTO-L): the person's own choice; an
+    // agent that could write it would choose the models it runs on.
+    "/api/chat/auto-models",
     // Search engines are tool providers: declaring one decides where a session's queries go (P6).
     "/api/chat/search-engines",
     // The lasting approvals of a person (P11b): an agent that could revoke or touch them
@@ -1249,6 +1252,10 @@ mod tests {
             "/api/projects/p/llm-roles"
         ));
         assert!(is_human_only_mutation(&Method::PUT, "/api/chat/routing"));
+        assert!(is_human_only_mutation(
+            &Method::PUT,
+            "/api/chat/auto-models"
+        ));
         assert!(!is_human_only_mutation(&Method::GET, "/api/chat/routing"));
         assert!(is_human_only_mutation(
             &Method::DELETE,

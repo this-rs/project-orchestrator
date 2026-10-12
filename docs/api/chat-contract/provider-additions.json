@@ -124,6 +124,12 @@
       "response": "200 ChatSession (routing_mode, routing_pool, routed_by, model a jour)",
       "errors": "400 {error, code, retryable:false} : invalid_routing_pool (rien coche sans auto, ou une entree sans provider ou sans model) | routing_pool_other_provider (strict sur un autre provider, ou aucun modele coche sur le provider de la session : utiliser switch-provider) ; 404 session inconnue ; 403 jeton d'agent. Un refus ne change rien"
     },
+    "GET|PUT /api/chat/auto-models": {
+      "doc": "LIVRE (AUTO-L). Les modeles parmi lesquels l'Auto de la PERSONNE connectee choisit. Stocke par personne (LlmSetting scope person:<sub>, cle auto_models), JAMAIS global ni projet : la liste d'une personne n'oriente jamais l'Auto d'une autre (revue #722). Lecture et ecriture par la personne elle-meme seulement : 403 pour un jeton d'agent, MCP, coffre, compte de service ou anonyme (middleware + handler). S'applique a une conversation Auto (routing_mode full) SANS pool coche : decision d'ouverture, decision de chaque tour, et bascule de provider par le relais (la conversation deplacee reste a sa personne). Les modeles coches d'une conversation priment toujours. Un modele liste qui n'est plus disponible (instance supprimee, consentement retire, malsain) sort du pool sans erreur ; si plus rien de la liste n'est utilisable, Auto reprend TOUS les modeles disponibles et la raison de la decision le dit (narrowed: auto_models_unavailable) ; jamais un chat bloque. Une decision restreinte par la liste porte narrowed: auto_models. Un changement s'applique a l'ouverture ou la reprise suivante d'une session",
+      "body": "PUT : {models: array<{provider, model}>} (memes regles que routing_pool : blancs retires, doublons supprimes, au plus 500) ; vide = retirer la liste (tous les modeles disponibles)",
+      "response": "200 {models: array<{provider, model}>, all_available: boolean} ; all_available = true quand aucune liste n'est posee",
+      "errors": "400 {error, code: invalid_auto_models} (entree sans provider ou sans model, plus de 500) ; 422 champ inconnu ; 403 jeton non humain"
+    },
     "CreateSessionResponse": {
       "execution_place": {
         "type": "string",

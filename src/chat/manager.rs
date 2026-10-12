@@ -847,6 +847,9 @@ pub(crate) struct OpeningTurn<'a> {
     pub message: &'a str,
     /// Index of the first turn the router counts itself (legacy engine).
     pub next_turn: u32,
+    /// The person the conversation belongs to (`ChatSessionNode::owner`): their "models Auto
+    /// may use" (AUTO-L) bound an Auto conversation without a pool of its own.
+    pub owner: Option<&'a str>,
 }
 
 /// Manages chat sessions and their lifecycle
@@ -3499,6 +3502,20 @@ impl ChatManager {
                 return None;
             }
         };
+        // AUTO-L: the person's list, read once here (a change applies from the next opening or
+        // resume); the router applies it only while the conversation is Auto without a pool of
+        // its own. Unreadable = every model, never a refused turn.
+        let auto_models = match turn.owner {
+            Some(person) => {
+                super::provider::cognitive::auto_models::load(self.graph.as_ref(), person)
+                    .await
+                    .unwrap_or_else(|error| {
+                        warn!(session_id, %error, "auto_models unreadable: every model applies");
+                        None
+                    })
+            }
+            _ => None,
+        };
         let trust = turn.permission_mode.is_some_and(|mode| {
             super::provider::policy::parse_mode(mode)
                 .is_some_and(|pair| pair.neutral == nexus_claude::agent::PolicyMode::Trust)
@@ -3516,6 +3533,7 @@ impl ChatManager {
                 provider_imposed: turn.provider_imposed && !turn.moved_in,
                 allowed_models,
                 routing_pool: turn.routing_pool.clone(),
+                auto_models,
                 // Auto, or two models ticked or more: the user's choice for THIS
                 // conversation, decided at the `auto` stage (decision R-S1).
                 conversation_routes: super::provider::cognitive::conversation_routes(
@@ -5502,6 +5520,18 @@ impl ChatManager {
         }
     }
 
+    /// The owner of the session a relayed conversation leaves (`relay.from_session_id`), read
+    /// from its node. `None` without a relay, or when it cannot be read.
+    async fn relayed_owner(&self, relay: Option<&super::relay::RelayedFrom>) -> Option<String> {
+        let from = Uuid::parse_str(&relay?.from_session_id).ok()?;
+        self.graph
+            .get_chat_session(from)
+            .await
+            .ok()
+            .flatten()?
+            .owner
+    }
+
     /// The owner of the session `request` names as its parent (`spawned_by.parent_session_id`),
     /// read from the parent's node. `None` without a parent, or when it cannot be read: the
     /// child is then left as it always was without claims (P18b round 3, fix A).
@@ -6533,7 +6563,13 @@ impl ChatManager {
             // to the parent's person, not to nobody (P18b round 3, fix A). Only the owner
             // is inherited: no claims means no token is minted, so the child's MCP access
             // stays exactly as restricted as before (H6).
-            None if request.user_claims.is_none() => self.spawning_parent_owner(request).await,
+            // A conversation the router moved (no claims: nobody asked) stays its person's: the
+            // new session belongs to the owner of the one it continues, so their "models Auto
+            // may use" (AUTO-L) and their permission answers follow the conversation.
+            None if request.user_claims.is_none() => match self.relayed_owner(relay).await {
+                Some(owner) => Some(owner),
+                None => self.spawning_parent_owner(request).await,
+            },
             owner => owner,
         };
         // Check max sessions: both engines' live sessions count.
@@ -6889,6 +6925,7 @@ impl ChatManager {
                     permission_mode: request.permission_mode.as_deref(),
                     message: &crate::refs::turn::visible_text(&request.message),
                     next_turn: 1,
+                    owner: session_node.owner.as_deref(),
                 },
             )
             .await
@@ -14398,7 +14435,43 @@ impl ChatManager {
                     .any(|e| e.provider == facts.provider_id && e.model == facts.model)
             });
         }
+        // AUTO-L: an Auto pilot with no models ticked chooses among its person's list (with
+        // the fallback to every model, stated in the reason, when nothing listed can serve).
+        let person_code = if !named
+            && ticked.is_none()
+            && matches!(role, super::provider::resolver::Role::Pilot)
+            && settings.mode == super::provider::cognitive::ProviderRoutingMode::Full
+        {
+            match self
+                .session_owner(request.user_claims.as_ref())
+                .await
+                .ok()
+                .flatten()
+            {
+                Some(person) => {
+                    match super::provider::cognitive::auto_models::load(
+                        self.graph.as_ref(),
+                        &person,
+                    )
+                    .await
+                    {
+                        Ok(Some(list)) => Some(super::provider::cognitive::auto_models::restrict(
+                            &mut pool, &list, &signature,
+                        )),
+                        Ok(None) => None,
+                        Err(error) => {
+                            warn!(%error, "auto_models unreadable: every model applies");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let mut decide = DecideRequest::new(signature, settings, pool);
+        decide.narrowed.extend(person_code);
         decide.slot = if named {
             Slot::Explicit
         } else {
@@ -15093,6 +15166,7 @@ impl ChatManager {
                     permission_mode: request.permission_mode.as_deref(),
                     message: &crate::refs::turn::visible_text(&request.message),
                     next_turn: 0,
+                    owner,
                 },
             )
             .await;
@@ -15762,6 +15836,7 @@ impl ChatManager {
                     moved_in: false,
                     message,
                     next_turn: 0,
+                    owner: node.owner.as_deref(),
                 },
             )
             .await;
@@ -22254,6 +22329,7 @@ mod tests {
             permission_mode: None,
             message: "hello",
             next_turn: 0,
+            owner: None,
         };
         // The opening that will fail: its router, its token.
         let mut failed = OpeningCleanup::new(&sid, &manager.turn_routing);
@@ -31723,6 +31799,7 @@ mod image_turn_services_tests {
             provider_imposed: false,
             allowed_models: None,
             routing_pool: None,
+            auto_models: None,
             conversation_routes: false,
             current_model: "flash".into(),
             next_turn: 0,

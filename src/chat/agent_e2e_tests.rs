@@ -3141,6 +3141,7 @@ mod turn_routing {
                     permission_mode: None,
                     message: DEBUG,
                     next_turn: 0,
+                    owner: None,
                 },
             )
             .await
@@ -3188,6 +3189,7 @@ mod turn_routing {
                     permission_mode: None,
                     message: DEBUG,
                     next_turn: 0,
+                    owner: None,
                 },
             )
             .await
@@ -3270,6 +3272,7 @@ mod turn_routing {
                     permission_mode: None,
                     message: DEBUG,
                     next_turn: 0,
+                    owner: None,
                 },
             )
             .await
@@ -3577,6 +3580,7 @@ mod turn_routing {
                     permission_mode: None,
                     message: DEBUG,
                     next_turn: 0,
+                    owner: None,
                 },
             )
             .await
@@ -4812,6 +4816,123 @@ mod provider_switch {
             assert!(mover.checks().is_empty(), "mixed asks no provider question");
         }
 
+        fn pair(provider: &str) -> RoutingPoolEntry {
+            RoutingPoolEntry {
+                provider: provider.into(),
+                model: "m".into(),
+            }
+        }
+
+        /// Sends `text` and waits for the conversation to move; returns the new session.
+        async fn moved_by_auto(w: &World, old: &str, text: &str) -> (String, String) {
+            let mut old_rx = w.manager.subscribe(old).await.unwrap();
+            w.manager.send_message(old, text).await.unwrap();
+            let ChatEvent::ConversationRelayed {
+                to_session_id,
+                to_provider,
+                moved_by,
+                ..
+            } = next_event(&mut old_rx, |e| {
+                matches!(e, ChatEvent::ConversationRelayed { .. })
+            })
+            .await
+            else {
+                unreachable!()
+            };
+            assert_eq!(moved_by, "auto");
+            stored_until(w, &to_session_id, |records| {
+                records
+                    .iter()
+                    .any(|r| r.event_type == "assistant_text" && r.data.contains("the answer"))
+            })
+            .await;
+            (to_session_id, to_provider)
+        }
+
+        // ── AUTO-L: the person's "models Auto may use" ───────────────────────────────
+
+        async fn first_turn_of(w: &World, sub: &str) -> String {
+            let mut req = request(Some("local"), Some("proj"), "default");
+            req.user_claims = Some(crate::chat::agent_e2e_tests::permission_scopes::person(sub));
+            let created = w
+                .manager
+                .create_session(&req)
+                .await
+                .unwrap_or_else(|e| panic!("open failed: {e:#}"));
+            let mut rx = w.manager.subscribe(&created.session_id).await.unwrap();
+            next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+            created.session_id
+        }
+
+        async fn auto_models_of(w: &World, sub: &str, models: Vec<RoutingPoolEntry>) {
+            crate::chat::provider::cognitive::auto_models::store(w.graph.as_ref(), sub, &models)
+                .await
+                .unwrap();
+        }
+
+        /// AUTO-L: with a list, Auto never leaves it, the relay included: the decision would
+        /// move to `local2`, which the person did not list, so no provider question is even
+        /// asked and the turn is answered in place.
+        #[tokio::test]
+        async fn auto_never_moves_outside_the_persons_list() {
+            let (w, mover) = auto_world("auto", vec!["local2"], false).await;
+            auto_models_of(&w, "alice", vec![pair("local")]).await;
+            let old = first_turn_of(&w, "alice").await;
+            hand_back_to_po(&w, &old).await;
+            idle(&w, &old).await;
+            answered_in_place(&w, &old, "second question").await;
+            assert!(mover.checks().is_empty(), "{:?}", mover.checks());
+        }
+
+        /// AUTO-L: the list moves the conversation to the model it names, through the relay,
+        /// and the decision says it was narrowed; the moved conversation stays its person's.
+        #[tokio::test]
+        async fn auto_moves_within_the_persons_list_and_stays_its_persons() {
+            let (w, mover) = auto_world("auto", vec!["local2"], false).await;
+            auto_models_of(&w, "alice", vec![pair("local2")]).await;
+            let old = first_turn_of(&w, "alice").await;
+            hand_back_to_po(&w, &old).await;
+            idle(&w, &old).await;
+            let (new, provider) = moved_by_auto(&w, &old, "second question").await;
+            assert_eq!(provider, "local2");
+            let checks = mover.checks();
+            assert!(checks[0].pool.iter().all(|f| f.provider_id == "local2"));
+            assert_eq!(checks[0].narrowed, vec!["auto_models"]);
+            // The conversation stays alice's across the move (her list goes on applying).
+            let node = w
+                .graph
+                .get_chat_session(Uuid::parse_str(&new).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(node.owner.as_deref(), Some("alice"));
+        }
+
+        /// AUTO-L: one person's list never steers another's: alice listed one model, bob listed
+        /// nothing, and bob's Auto is asked among every model, not narrowed.
+        #[tokio::test]
+        async fn another_persons_list_never_steers_this_auto() {
+            let (w, mover) = auto_world("auto", vec!["local2"], false).await;
+            auto_models_of(&w, "alice", vec![pair("local2")]).await;
+            let bob = first_turn_of(&w, "bob").await;
+            hand_back_to_po(&w, &bob).await;
+            idle(&w, &bob).await;
+            w.manager
+                .send_message(&bob, "bob's question")
+                .await
+                .unwrap();
+            for _ in 0..100 {
+                if !mover.checks().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let checks = mover.checks();
+            assert_eq!(checks.len(), 1, "one provider question");
+            assert!(checks[0].pool.iter().any(|f| f.provider_id == "local"));
+            assert!(checks[0].narrowed.is_empty());
+        }
+
         #[tokio::test]
         async fn a_move_the_projects_consent_refuses_stays_and_its_decision_says_why() {
             // The fake decider ignores the consent the filter would apply: the relay's
@@ -5795,6 +5916,7 @@ mod parity {
                 current_model: "m".into(),
                 next_turn: 0,
                 routing_pool: None,
+                auto_models: None,
                 conversation_routes: false,
                 moved_in: false,
             },

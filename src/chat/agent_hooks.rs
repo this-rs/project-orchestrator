@@ -63,6 +63,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+use super::provider::cognitive::auto_models;
 use super::provider::cognitive::candidates::{self, ModelFacts, Slot};
 use super::provider::cognitive::decider::HYSTERESIS_MARGIN;
 use super::provider::cognitive::decision::{CognitiveDecision, DecideRequest, Decider, Pick};
@@ -393,6 +394,10 @@ struct RouterChoice {
     /// Every pair of the conversation's pool, whatever its provider: the candidates of a
     /// provider check in mode `full`. `None` = no pool.
     routing_pool: Option<Vec<RoutingPoolEntry>>,
+    /// The models the conversation's PERSON lets Auto choose among (AUTO-L), `None` = every
+    /// available model. Applied only to an Auto conversation without a pool of its own: a
+    /// conversation's ticked models always win ([`person_list`]).
+    auto_models: Option<Vec<RoutingPoolEntry>>,
     /// The settings' stage the session opened with. `routing.stage` is the stage in force
     /// for THIS conversation: `auto` when the user handed its routing to PO (Auto, or a
     /// pool), this one otherwise (decision R-S1, [`conversation_stage`]). Kept so that
@@ -413,6 +418,8 @@ pub(crate) struct TurnRouterSpec {
     pub provider_imposed: bool,
     pub allowed_models: Option<Vec<String>>,
     pub routing_pool: Option<Vec<RoutingPoolEntry>>,
+    /// The person's "models Auto may use" (AUTO-L), `None` = all.
+    pub auto_models: Option<Vec<RoutingPoolEntry>>,
     /// The conversation asked for Auto or a pool (decision R-S1).
     pub conversation_routes: bool,
     pub current_model: String,
@@ -448,6 +455,7 @@ impl TurnRouter {
                 provider_imposed: spec.provider_imposed,
                 allowed_models: spec.allowed_models,
                 routing_pool: spec.routing_pool,
+                auto_models: spec.auto_models,
                 settings_stage,
             }),
             provider_id: spec.provider_id,
@@ -732,13 +740,15 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
                 .any(|e| e.provider == facts.provider_id && e.model == facts.model)
         });
     }
+    let signature = router.signature();
+    // AUTO-L: an Auto conversation without a pool of its own chooses among its person's list.
+    let person = apply_person_list(&choice, &mut pool, &signature);
     if !pool
         .iter()
         .any(|facts| facts.provider_id != router.provider_id)
     {
         return ProviderPlan::Stay;
     }
-    let signature = router.signature();
     let (turn, current_model, held) = {
         let state = locked(&router.state);
         let held = held_by_class(&state, state.next_turn, &signature.arm_key());
@@ -761,6 +771,7 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
     let apply = routing.auto;
     let current = Pick::new(&router.provider_id, &current_model);
     let mut request = DecideRequest::new(signature, settings_for(&choice.routing, apply), pool);
+    request.narrowed.extend(person);
     narrow(
         &mut request,
         held,
@@ -851,9 +862,15 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
             // exploration (the hysteresis margin alone may move it); another class is routed
             // as any turn.
             let held = held_by_class(&locked(&router.state), ctx.turn_index, &class);
-            let mut pool = provider_pool(router).await;
+            let (mut pool, project) = provider_pool(router).await;
             if let Some(allowed) = &choice.allowed_models {
                 pool.retain(|facts| allowed.iter().any(|m| m == &facts.model));
+            }
+            // AUTO-L: the person's list; none of it on this provider leaves nothing to change
+            // here (a provider move is the way to it).
+            let person = apply_person_list_here(&choice, &mut pool, &project, &signature);
+            if person == Some(auto_models::NARROWED_BY_PERSON) && pool.is_empty() {
+                return TurnDirective::none();
             }
             let apply = routing.auto;
             let mut settings = settings_for(&choice.routing, apply);
@@ -865,6 +882,7 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
             request.trust = router.trust;
             request.restrict_provider = Some(router.provider_id.clone());
             request.current = Some(Pick::new(&router.provider_id, &ctx.current_model));
+            request.narrowed.extend(person);
             narrow(&mut request, held, None);
             request.session_id = router.session_id;
             request.turn_index = Some(ctx.turn_index);
@@ -901,8 +919,9 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
 /// and without a project no stored instance is allowed, so every model came back
 /// `not_allowed` and a turn decided here was `no_candidate` (the opening turn, and every
 /// turn of a conversation routed among models ticked in the menu). The project's pool,
-/// narrowed to the provider, is asked first; a source that has none answers `pool`.
-async fn provider_pool(router: &TurnRouter) -> Vec<ModelFacts> {
+/// narrowed to the provider, is asked first; a source that has none answers `pool`. Also
+/// returns the project's pool (every provider), against which the person's list is read.
+async fn provider_pool(router: &TurnRouter) -> (Vec<ModelFacts>, Vec<ModelFacts>) {
     let project = tokio::time::timeout(
         router.timeout,
         router.pool.project_pool(router.project_slug.as_deref()),
@@ -910,13 +929,14 @@ async fn provider_pool(router: &TurnRouter) -> Vec<ModelFacts> {
     .await
     .unwrap_or_default();
     let mine: Vec<ModelFacts> = project
-        .into_iter()
+        .iter()
         .filter(|facts| facts.provider_id == router.provider_id)
+        .cloned()
         .collect();
     if mine.is_empty() {
-        router.pool.pool(&router.provider_id).await
+        (router.pool.pool(&router.provider_id).await, project)
     } else {
-        mine
+        (mine, project)
     }
 }
 
@@ -981,6 +1001,60 @@ fn routing_of(router: &TurnRouter, choice: &RouterChoice) -> Routing {
     }
 }
 
+/// The conversation's own pool (two models ticked or more), when it has one.
+fn conversation_pool(choice: &RouterChoice) -> Option<&[RoutingPoolEntry]> {
+    choice.routing_pool.as_deref().filter(|pool| pool.len() > 1)
+}
+
+/// The person's "models Auto may use" (AUTO-L), when they apply to this conversation: Auto
+/// (`full`) and no pool of its own (a conversation's ticks always win).
+fn person_list(choice: &RouterChoice) -> Option<&[RoutingPoolEntry]> {
+    if choice.routing.mode != ProviderRoutingMode::Full
+        || conversation_pool(choice).is_some()
+        || choice.allowed_models.is_some()
+    {
+        return None;
+    }
+    choice
+        .auto_models
+        .as_deref()
+        .filter(|list| !list.is_empty())
+}
+
+/// Narrows `pool` (every provider's models) to the person's list when it applies, and says so
+/// on `request` (`narrowed: auto_models`, or `narrowed: auto_models_unavailable` when nothing
+/// listed can serve and every model stays a candidate).
+fn apply_person_list(
+    choice: &RouterChoice,
+    pool: &mut Vec<ModelFacts>,
+    signature: &TaskSignature,
+) -> Option<&'static str> {
+    let list = person_list(choice)?;
+    Some(auto_models::restrict(pool, list, signature))
+}
+
+/// The person's list applied to a decision on the session's provider only: `pool` is that
+/// provider's models; `project` every provider's. When the list can serve somewhere, this
+/// provider keeps only its listed models (possibly none: only a move reaches the list); when it
+/// can serve nowhere, every model stays (the fallback, stated).
+fn apply_person_list_here(
+    choice: &RouterChoice,
+    pool: &mut Vec<ModelFacts>,
+    project: &[ModelFacts],
+    signature: &TaskSignature,
+) -> Option<&'static str> {
+    let list = person_list(choice)?;
+    let mut everywhere = project.to_vec();
+    let code = auto_models::restrict(&mut everywhere, list, signature);
+    if code == auto_models::NARROWED_BY_PERSON {
+        pool.retain(|f| {
+            list.iter()
+                .any(|e| e.provider == f.provider_id && e.model == f.model)
+        });
+    }
+    Some(code)
+}
+
 /// The model of the session's provider an image turn must run on, chosen BEFORE the turn
 /// is sent (F-R4). The native harness checks the vision of its ACTIVE model when the turn is
 /// sent, before `before_turn` could change it: the host makes this model active first, and
@@ -1010,10 +1084,11 @@ pub(crate) async fn model_for_images(router: &TurnRouter) -> Option<String> {
     let pick = match predecided {
         Some(pre) => pre.pick.filter(|_| pre.apply)?,
         None => {
-            let mut pool = provider_pool(router).await;
+            let (mut pool, project) = provider_pool(router).await;
             if let Some(allowed) = &choice.allowed_models {
                 pool.retain(|facts| allowed.iter().any(|m| m == &facts.model));
             }
+            let person = apply_person_list_here(&choice, &mut pool, &project, &router.signature());
             if !cannot_read_turn(router, &pool, &router.provider_id, &current_model) {
                 return None;
             }
@@ -1026,6 +1101,7 @@ pub(crate) async fn model_for_images(router: &TurnRouter) -> Option<String> {
             // steady too: never an exploration draw among the models that read images.
             let held = held_by_class(&locked(&router.state), turn, &signature.arm_key());
             let mut request = DecideRequest::new(signature, settings, pool);
+            request.narrowed.extend(person);
             request.trust = router.trust;
             request.restrict_provider = Some(router.provider_id.clone());
             request.current = Some(Pick::new(&router.provider_id, &current_model));
@@ -1106,7 +1182,7 @@ async fn effective_images_bounded(router: &TurnRouter, snapshot: bool) -> Effect
     else {
         return EffectiveCapability::snapshot(false, EffectiveCause::PoolUnbuilt);
     };
-    let pool: Vec<ModelFacts> = project
+    let mut pool: Vec<ModelFacts> = project
         .into_iter()
         .filter(|facts| {
             if facts.provider_id == router.provider_id {
@@ -1126,6 +1202,10 @@ async fn effective_images_bounded(router: &TurnRouter, snapshot: bool) -> Effect
             }
         })
         .collect();
+    // AUTO-L: the person's list bounds what Auto may reach (with the same fallback).
+    if let Some(list) = person_list(&choice) {
+        auto_models::restrict(&mut pool, list, &router.signature());
+    }
     if pool.is_empty() {
         return EffectiveCapability::snapshot(false, EffectiveCause::PoolUnbuilt);
     }
@@ -1717,6 +1797,7 @@ mod provider_move_tests {
             provider_imposed: false,
             allowed_models: None,
             routing_pool: None,
+            auto_models: None,
             conversation_routes: false,
             current_model: "m".into(),
             next_turn: 1,
@@ -1768,6 +1849,13 @@ mod provider_move_tests {
         assert_eq!(decider.calls(), 1, "one decision per turn");
     }
 
+    fn entry(provider: &str, model: &str) -> RoutingPoolEntry {
+        RoutingPoolEntry {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+
     #[tokio::test]
     async fn mixed_never_leaves_the_sessions_provider() {
         let decider = Fake::picking("local2", 0.9, 0.1);
@@ -1784,6 +1872,100 @@ mod provider_move_tests {
         // The model decision of the turn stays restricted to the session's provider.
         directive_for_turn(&router, &TurnContext::new(1, "m")).await;
         assert_eq!(decider.last().restrict_provider.as_deref(), Some("local"));
+        assert!(decider.last().pool.iter().all(|f| f.provider_id == "local"));
+    }
+
+    /// AUTO-L: an Auto conversation chooses among its person's list only, on the provider
+    /// check (the relay) and on the model of the turn, and says so in the reason.
+    #[tokio::test]
+    async fn auto_never_chooses_outside_the_persons_list() {
+        let decider = Fake::picking("local2", 0.9, 0.1);
+        let mut s = spec(
+            decider.clone(),
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Full,
+            LearningStage::Auto,
+        );
+        s.auto_models = Some(vec![entry("local2", "m")]);
+        let router = router(s);
+        assert!(is_move_to(&plan_provider_move(&router).await, "local2"));
+        let asked = decider.last();
+        assert!(
+            asked.pool.iter().all(|f| f.provider_id == "local2"),
+            "{:?}",
+            asked.pool
+        );
+        assert_eq!(asked.narrowed, vec![auto_models::NARROWED_BY_PERSON]);
+    }
+
+    /// AUTO-L: without a list, Auto sees every model, as before.
+    #[tokio::test]
+    async fn auto_without_a_list_sees_every_available_model() {
+        let decider = Fake::picking("local2", 0.9, 0.1);
+        let router = full_auto(decider.clone());
+        plan_provider_move(&router).await;
+        assert_eq!(decider.last().pool.len(), 3);
+        assert!(decider.last().narrowed.is_empty());
+    }
+
+    /// AUTO-L: on the session's provider, the model of the turn is chosen among the listed
+    /// models of that provider; none of them here means no change of model (only a move
+    /// reaches the list).
+    #[tokio::test]
+    async fn the_model_of_a_turn_stays_within_the_persons_list() {
+        let decider = Fake::picking("local", 0.9, 0.1);
+        let mut s = spec(
+            decider.clone(),
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Full,
+            LearningStage::Auto,
+        );
+        s.auto_models = Some(vec![entry("local2", "m")]);
+        let router = router(s);
+        let directive = directive_for_turn(&router, &TurnContext::new(1, "m")).await;
+        assert_eq!(directive.model, None);
+        assert_eq!(decider.calls(), 0, "nothing listed here: nothing to ask");
+    }
+
+    /// AUTO-L: a list none of whose models can serve (gone, consent withdrawn) falls back to
+    /// every available model, with a notice in the reason, never a blocked turn.
+    #[tokio::test]
+    async fn a_list_with_nothing_usable_falls_back_to_every_model_and_says_so() {
+        let decider = Fake::picking("local2", 0.9, 0.1);
+        let mut s = spec(
+            decider.clone(),
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Full,
+            LearningStage::Auto,
+        );
+        // `gone` was deleted; `local3` lost the project's consent.
+        s.auto_models = Some(vec![entry("gone", "x"), entry("local3", "m")]);
+        let router = router(s);
+        assert!(is_move_to(&plan_provider_move(&router).await, "local2"));
+        let asked = decider.last();
+        assert_eq!(asked.pool.len(), 3, "every available model again");
+        assert_eq!(asked.narrowed, vec![auto_models::PERSON_LIST_UNAVAILABLE]);
+    }
+
+    /// AUTO-L: the conversation's own ticks win over the person's list: a pool's turn is
+    /// decided among the pool, the list is not read.
+    #[tokio::test]
+    async fn a_conversations_pool_wins_over_the_persons_list() {
+        let decider = Fake::picking("local", 0.9, 0.1);
+        let mut s = spec(
+            decider.clone(),
+            Arc::new(ThreeProviders),
+            ConversationRoutingMode::Mixed.pilot_mode(),
+            LearningStage::Auto,
+        );
+        s.allowed_models = Some(vec!["m".into()]);
+        s.routing_pool = Some(vec![entry("local", "m"), entry("local", "big")]);
+        s.conversation_routes = true;
+        s.auto_models = Some(vec![entry("local2", "m")]);
+        let router = router(s);
+        directive_for_turn(&router, &TurnContext::new(1, "m")).await;
+        assert_eq!(decider.calls(), 1, "the pool's turn is decided");
+        assert!(decider.last().narrowed.is_empty(), "the list is not read");
         assert!(decider.last().pool.iter().all(|f| f.provider_id == "local"));
     }
 
@@ -2255,6 +2437,7 @@ mod image_routing_tests {
             provider_imposed: false,
             allowed_models,
             routing_pool: None,
+            auto_models: None,
             conversation_routes: false,
             current_model: "flash".into(),
             next_turn: 1,

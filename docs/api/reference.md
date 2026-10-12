@@ -303,6 +303,30 @@ curl -X PUT -H "Authorization: Bearer <JWT>" -H "Content-Type: application/json"
   -d '{"auto": true}' http://localhost:8080/api/chat/sessions/{id}/routing
 ```
 
+### GET /api/chat/auto-models -- Protected (the person only)
+### PUT /api/chat/auto-models -- Protected (the person only)
+
+The models the signed-in person's Auto may choose among (AUTO-L). Stored per person (`LlmSetting` scope
+`person:<sub>`), never globally: one person's list never steers anybody else's Auto. Read and written by that
+person's own session only (403 for an agent session, MCP, vault, service or anonymous token).
+
+- `GET` answers `{"models": [{"provider", "model"}], "all_available": bool}`; `all_available: true` (and
+  `models: []`) when no list is set: Auto chooses among every available model, as before.
+- `PUT {"models": [...]}` replaces the list (blanks trimmed, duplicates dropped, 500 at most); `[]` removes it.
+  400 `invalid_auto_models`, 422 unknown field.
+
+The list bounds an Auto conversation (`routing_mode: full`) with no models ticked: the opening decision, every
+per-turn decision and a provider move through the relay. A conversation's own ticked models always win. A listed
+model no longer available (instance deleted, consent withdrawn, unhealthy) silently leaves the pool; when nothing
+listed can serve, Auto uses every available model and the decision's reason says so
+(`narrowed: auto_models_unavailable`), never a blocked chat. A change applies from the next opening or resume.
+
+```bash
+curl -X PUT -H "Authorization: Bearer <JWT>" -H "Content-Type: application/json" 
+  -d '{"models": [{"provider": "claude-code", "model": "claude-opus-5"}, {"provider": "deepseek", "model": "deepseek-chat"}]}' 
+  http://localhost:8080/api/chat/auto-models
+```
+
 ### DELETE /api/chat/sessions/{id} -- Protected
 
 Delete a session.

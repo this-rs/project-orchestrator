@@ -8,6 +8,7 @@
 //! later slices. Whatever the settings say, the resolver (`resolver.rs`) is
 //! unchanged until then.
 
+pub mod auto_models;
 pub mod candidates;
 pub mod decider;
 pub mod decision;

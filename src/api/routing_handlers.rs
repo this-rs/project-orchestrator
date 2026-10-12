@@ -160,6 +160,105 @@ pub async fn delete_project_routing(
     }
 }
 
+/// Most pairs a person's Auto list may hold.
+pub const MAX_AUTO_MODELS: usize = 500;
+
+/// The person whose "models Auto may use" these claims read or write (AUTO-L): a person
+/// signed in with their own session token, never an agent session's, an MCP token, a vault
+/// token, the server's account or the anonymous user (as for the lasting approvals). A
+/// global or shared scope would let one person steer everybody's Auto (review of #722).
+fn auto_models_person(claims: &Claims) -> Result<String, AppError> {
+    if claims.may_keep_lasting_approvals() {
+        Ok(claims.sub.clone())
+    } else {
+        Err(AppError::Forbidden(
+            "the models Auto may use are set by their person only, signed in".to_string(),
+        ))
+    }
+}
+
+/// Body of `PUT /api/chat/auto-models`; also what `GET` answers.
+#[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoModelsBody {
+    /// The pairs Auto may choose among. Empty (or absent) = every available model.
+    #[serde(default)]
+    pub models: Vec<crate::chat::types::RoutingPoolEntry>,
+}
+
+/// What `GET`/`PUT /api/chat/auto-models` answer.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AutoModelsView {
+    /// The person's list, in the order given; empty when unset.
+    pub models: Vec<crate::chat::types::RoutingPoolEntry>,
+    /// `true` when no list is set: Auto chooses among every available model.
+    pub all_available: bool,
+}
+
+impl AutoModelsView {
+    fn of(models: Vec<crate::chat::types::RoutingPoolEntry>) -> Self {
+        Self {
+            all_available: models.is_empty(),
+            models,
+        }
+    }
+}
+
+fn invalid_auto_models(message: String) -> AppError {
+    AppError::Provider(Box::new(OpenFailure {
+        status: StatusCode::BAD_REQUEST.as_u16(),
+        code: "invalid_auto_models",
+        message,
+        provider_id: None,
+        action: None,
+        retryable: false,
+        retry_after_ms: None,
+        fallbacks: None,
+        consent_scope: None,
+        candidates: None,
+    }))
+}
+
+/// GET /api/chat/auto-models — the models the caller's Auto may use (AUTO-L). Their own
+/// list only; `all_available: true` when none is set.
+pub async fn get_auto_models(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<AutoModelsView>, AppError> {
+    let person = auto_models_person(&claims)?;
+    let graph = state.orchestrator.neo4j_arc();
+    let models = cognitive::auto_models::load(graph.as_ref(), &person)
+        .await
+        .map_err(AppError::Internal)?
+        .unwrap_or_default();
+    Ok(Json(AutoModelsView::of(models)))
+}
+
+/// PUT /api/chat/auto-models `{ "models": [{provider, model}] }` — replaces the caller's own
+/// list (human only). An empty list removes it: Auto uses every available model again. A
+/// listed model need not exist now: one that is not available is simply not a candidate.
+pub async fn put_auto_models(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<AutoModelsBody>,
+) -> Result<Json<AutoModelsView>, AppError> {
+    require_human(&state, &claims)?;
+    let person = auto_models_person(&claims)?;
+    if body.models.len() > MAX_AUTO_MODELS {
+        return Err(invalid_auto_models(format!(
+            "at most {MAX_AUTO_MODELS} models"
+        )));
+    }
+    let models = crate::chat::types::settle_routing_pool(&body.models).map_err(|index| {
+        invalid_auto_models(format!("models[{index}] needs a provider and a model"))
+    })?;
+    let graph = state.orchestrator.neo4j_arc();
+    cognitive::auto_models::store(graph.as_ref(), &person, &models)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(AutoModelsView::of(models)))
+}
+
 static ROUTING_STORE: RwLock<Option<Arc<dyn RoutingArmStore>>> = RwLock::new(None);
 
 /// Installs the store the decision log and the report read (at boot).
@@ -921,5 +1020,100 @@ mod tests {
         assert!(lookup.price(&Pick::new("cloud", "unknown")).is_none());
         assert!(lookup.price(&Pick::new("cloud", "absent")).is_none());
         assert!(lookup.price(&Pick::new("other", "big")).is_none());
+    }
+
+    // ── AUTO-L: the models a person lets their Auto choose among ─────────────
+
+    /// A signed-in person with a fixed identity (`test_bearer_token` draws a new one per call).
+    fn person_bearer(sub: Uuid) -> String {
+        let token = crate::auth::jwt::encode_jwt(
+            sub,
+            "person@ffs.holdings",
+            "A Person",
+            &crate::test_helpers::test_auth_config().jwt_secret,
+            3600,
+        )
+        .unwrap();
+        format!("Bearer {token}")
+    }
+
+    #[tokio::test]
+    async fn auto_models_are_the_persons_own_and_unset_means_every_model() {
+        let app = app().await;
+        let (a, b) = (person_bearer(Uuid::new_v4()), person_bearer(Uuid::new_v4()));
+        let uri = "/api/chat/auto-models";
+        // Unset: every available model.
+        let (status, body) = call(&app, req(&a, "GET", uri, None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, json!({"models": [], "all_available": true}));
+        // A sets a list (blanks trimmed, duplicates dropped).
+        let list = json!({"models": [
+            {"provider": "claude-code", "model": "opus"},
+            {"provider": " deepseek ", "model": "flash"},
+            {"provider": "claude-code", "model": "opus"},
+        ]});
+        let (status, body) = call(&app, req(&a, "PUT", uri, Some(list))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let expected = json!({"models": [
+            {"provider": "claude-code", "model": "opus"},
+            {"provider": "deepseek", "model": "flash"},
+        ], "all_available": false});
+        assert_eq!(body, expected);
+        let (_, body) = call(&app, req(&a, "GET", uri, None)).await;
+        assert_eq!(body, expected);
+        // B's Auto is untouched by A's list.
+        let (_, body) = call(&app, req(&b, "GET", uri, None)).await;
+        assert_eq!(body, json!({"models": [], "all_available": true}));
+        // An empty list returns A to every model.
+        let (status, body) = call(&app, req(&a, "PUT", uri, Some(json!({"models": []})))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["all_available"], true);
+        let (_, body) = call(&app, req(&a, "GET", uri, None)).await;
+        assert_eq!(body, json!({"models": [], "all_available": true}));
+    }
+
+    #[tokio::test]
+    async fn auto_models_are_never_read_nor_written_by_an_agent_token() {
+        let app = app().await;
+        let person = person_bearer(Uuid::new_v4());
+        let agent = agent_bearer();
+        let uri = "/api/chat/auto-models";
+        let list = json!({"models": [{"provider": "local", "model": "m"}]});
+        let (status, got) = call(&app, req(&agent, "PUT", uri, Some(list))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{got}");
+        let (status, got) = call(&app, req(&agent, "GET", uri, None)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{got}");
+        // Nothing was stored anywhere a person reads.
+        let (_, body) = call(&app, req(&person, "GET", uri, None)).await;
+        assert_eq!(body["all_available"], true);
+    }
+
+    #[tokio::test]
+    async fn a_blank_auto_models_entry_is_refused_with_a_typed_code() {
+        let app = app().await;
+        let person = person_bearer(Uuid::new_v4());
+        let uri = "/api/chat/auto-models";
+        for body in [
+            json!({"models": [{"provider": "local", "model": " "}]}),
+            json!({"models": [], "scope": "global"}),
+        ] {
+            let (status, got) = call(&app, req(&person, "PUT", uri, Some(body.clone()))).await;
+            assert!(
+                status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY,
+                "{body} -> {status} {got}"
+            );
+        }
+        let (status, got) = call(
+            &app,
+            req(
+                &person,
+                "PUT",
+                uri,
+                Some(json!({"models": [{"provider": "", "model": "m"}]})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(got["code"], "invalid_auto_models");
     }
 }

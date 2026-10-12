@@ -2068,6 +2068,11 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/search-engines/{id}",
             delete(network_tools_handlers::delete_search_engine),
         )
+        // The models a person lets their Auto choose among (AUTO-L): per person, human only.
+        .route(
+            "/api/chat/auto-models",
+            get(routing_handlers::get_auto_models).put(routing_handlers::put_auto_models),
+        )
         // Routing mode and learning stage (R2): global, with a per-project override.
         .route(
             "/api/chat/routing",
