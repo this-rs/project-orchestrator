@@ -13,9 +13,11 @@ you register, allow per project, and (when it needs a key) grant a key to.
 Since M2 the agent engine is the default for Claude Code too: the parity matrix
 (`docs/parity/engines.md`) measures it on the same transcript as the historical engine.
 `CHAT_PROVIDER_PATH=legacy` keeps Claude Code on the historical engine.
-One difference is measured: on the agent engine, the compaction instructions the knowledge
-graph builds (`PreCompact`) are not handed to the CLI (the nexus façade has no slot for them;
-task M2c checks whether the CLI reads them at all).
+The compaction instructions the knowledge graph builds (`PreCompact`) reach the CLI on both
+engines, as the hook answer's `systemMessage`: the CLI appends it to the summary's
+instructions and **also shows it to the user** in its "Compacted…" line. It ignores `reason`
+(measured on Claude Code 2.1.295, task M2c; re-checked on each CLI bump, see
+`docs/parity/engines.md`).
 The agent engine ports hooks, message queue, auto-continue, retry, compaction and NATS.
 Every `system_init` of an agent session carries `engine: "agent"` and `degraded_features`,
 the list of what that session does not do, for instance:
