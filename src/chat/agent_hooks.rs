@@ -20,7 +20,7 @@
 //! |---|---|---|
 //! | `before_tool` | `PreToolUse` | `additionalContext` → `AddContext`; `decision: block` or `permissionDecision: deny` → `Deny`; `updatedInput` → `ReplaceInput` |
 //! | `after_tool` | `PostToolUse` | `additionalContext` |
-//! | `before_compaction` | `PreCompact` | the callbacks' `reason` (where the notifier puts the instructions it built) |
+//! | `before_compaction` | `PreCompact` | the callbacks' `systemMessage` (where the notifier puts the instructions it built: the field the CLI appends to the summary's instructions and also shows to the user in its "Compacted…" line; it ignores `reason`, M2c) |
 //!
 //! The tool is named as Claude Code names it (`canonical`, else the provider's
 //! name) and its input is given as is: that is the vocabulary the hooks were
@@ -164,7 +164,8 @@ struct Said {
     context: Option<String>,
     deny: Option<String>,
     replaced: Option<Value>,
-    reason: Option<String>,
+    /// Compaction instructions: a `PreCompact` callback's `systemMessage`.
+    instructions: Option<String>,
 }
 
 fn read(output: HookJSONOutput) -> Said {
@@ -173,7 +174,7 @@ fn read(output: HookJSONOutput) -> Said {
         return Said::default();
     };
     let mut said = Said {
-        reason: sync.reason.clone(),
+        instructions: sync.system_message.clone(),
         ..Said::default()
     };
     if sync.decision.as_deref() == Some("block") {
@@ -286,13 +287,13 @@ impl SessionHooks for GraphSessionHooks {
             trigger: info.trigger.clone(),
             custom_instructions: info.custom_instructions.clone(),
         });
-        let mut reasons = Vec::new();
+        let mut instructions = Vec::new();
         for hook in self.callbacks(PRE_COMPACT, None) {
             if let Some(output) = self.run(hook, &input, None, PRE_COMPACT).await {
-                reasons.extend(read(output).reason);
+                instructions.extend(read(output).instructions);
             }
         }
-        joined(reasons)
+        joined(instructions)
     }
 
     async fn before_turn(&self, ctx: &TurnContext) -> TurnDirective {
@@ -1535,10 +1536,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn before_compaction_returns_the_reason_the_notifier_builds() {
+    async fn before_compaction_returns_the_system_message_the_notifier_builds() {
         let notifier = Scripted::answering(SyncHookJSONOutput {
             continue_: Some(true),
-            reason: Some("Preserve: decision on the hot bridge".into()),
+            system_message: Some("Preserve: decision on the hot bridge".into()),
             ..Default::default()
         });
         let reset = Scripted::answering(SyncHookJSONOutput {

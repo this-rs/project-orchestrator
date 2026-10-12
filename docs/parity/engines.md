@@ -15,7 +15,7 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 |---|---|---|---|---|
 | `hooks.before_tool` | le hook PreToolUse du graphe est consulté avant un outil | ok | ok | ok |
 | `hooks.after_tool` | le hook PostToolUse du graphe répond après un Grep bruyant (find_references) | ok | ok | ok |
-| `hooks.before_compaction` | le hook PreCompact du graphe nomme le projet avant une compaction | ok | gap (harnais, M2c) | ok |
+| `hooks.before_compaction` | le hook PreCompact du graphe nomme le projet dans les instructions du résumé (Claude Code : `systemMessage`, le champ que lit le CLI) | ok | ok | ok |
 | `compaction` | compaction_started et compact_boundary sur le fil | ok | ok | ok |
 | `message_queue` | un message envoyé pendant un tour l'interrompt et passe ensuite | ok | ok | ok |
 | `auto_continue` | un tour arrêté sur sa limite est continué (auto_continue) | ok | ok | ok |
@@ -43,13 +43,12 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `subagents` | un sous-agent (Agent / Task) travaille et sa réponse revient en résultat ; sur le natif, une session enfant qui ne peut pas re-déléguer | ok | ok | ok |
 | `system_init.degraded` | system_init n'annonce comme manquant qu'une limite du modèle (liste fermée) | ok | ok | ok |
 
-`ok` : Claude Code 28/29, Claude Code (moteur agent) 27/29, natif 29/29.
+`ok` : Claude Code 28/29, Claude Code (moteur agent) 28/29, natif 29/29.
 
 ## Écarts déclarés
 
 | Moteur | Fonction | Cause | Tâche | Ce qui manque |
 |---|---|---|---|---|
-| Claude Code (moteur agent) | `hooks.before_compaction` | harnais | M2c | la façade Claude Code de nexus consulte le hook PreCompact du graphe mais répond `{}` au CLI (provider_notice compaction_instructions_unsupported) ; le moteur historique répond `reason` = les instructions. Non mesuré : le vrai CLI lit-il `reason` sur PreCompact |
 
 ## Non mesuré
 
@@ -57,3 +56,11 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 |---|---|---|
 | Claude Code | `nexus_tools` | Read / Edit / Bash sont les outils internes du CLI Claude : fake_claude rejoue un transcript et n'exécute aucun outil |
 | Claude Code (moteur agent) | `nexus_tools` | Read / Edit / Bash sont les outils internes du CLI Claude : fake_claude rejoue un transcript et n'exécute aucun outil |
+
+## À re-mesurer à chaque montée du CLI Claude Code
+
+`fake_claude` rejoue ce que le vrai CLI a fait à une version donnée : rien ici ne verrait un CLI qui changerait d'avis sans le dire. À chaque montée de version du CLI Claude Code, re-mesurer sur le vrai CLI :
+
+| Comportement | Mesuré sur | Comment | Note PO |
+|---|---|---|---|
+| re-check PreCompact systemMessage : le CLI ajoute le `systemMessage` d'une réponse au hook PreCompact aux instructions du résumé (et l'affiche à l'utilisateur dans la ligne « Compacted… »), ignore `reason`, rejette `hookSpecificOutput.additionalContext` | Claude Code 2.1.295 | `docs/parity/m2c-precompact/` (README) | 172c164e (tâche M2c 79cc48df) |

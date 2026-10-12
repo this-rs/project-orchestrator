@@ -270,6 +270,29 @@ behind the caller) a session that has an owner is refused on both.
 {"type": "input_response", "id": "ir_1", "content": "option B"}
 ```
 
+#### `set_auto_continue` -- accepted and ignored (compatibility)
+
+```json
+{"type": "set_auto_continue", "enabled": false}
+```
+
+Auto-continue is **always on**, with a cap (PO decision 7b95342a, 12/10/2026): when a turn
+stops on its `max_turns` limit (`error_max_turns`), the backend announces `auto_continue`
+(`session_id`, `delay_ms`) and sends a "Continue" hint after the delay, on both engines. At most
+5 continuations in a row (`post_stream::MAX_AUTO_CONTINUES`, for interactive and runner sessions
+alike); past the cap the turn stays stopped, and the next chain starts from the next turn
+somebody asks for (a turn that ends within its limit also ends the chain). A Stop during the
+delay cancels the continuation.
+
+There is no per-session toggle any more. `set_auto_continue` is still accepted, for older
+frontends, but ignored (logged at debug, also when relayed over NATS): the socket answers
+with `auto_continue_state_changed` carrying the session's **real** state, so an old toggle
+snaps back to it. The same frame (`session_id`, `enabled`, `seq: 0`) is still sent once after
+`replay_complete` on connect; the current frontend reads neither. `enabled` is `true` unless
+the operator turned auto-continue off with `CHAT_AUTO_CONTINUE=false` (runner sessions always
+continue). The `auto_continue` flag older versions persisted on `ChatSession` nodes is no
+longer read.
+
 ### Server Event Types (12 types)
 
 Events sent from the server to the client. Each event includes a `type` field and optionally a `seq` (sequence number) for replay ordering.
@@ -532,6 +555,7 @@ The chat system is configured via environment variables:
 | `CHAT_MAX_SESSIONS` | Maximum concurrent active sessions | `10` |
 | `CHAT_SESSION_TIMEOUT_SECS` | Idle timeout before subprocess is freed | `1800` (30 min) |
 | `CHAT_MAX_TURNS` | Maximum agentic turns (tool calls) per message | `50` |
+| `CHAT_AUTO_CONTINUE` | Operator kill switch of auto-continue: `false` or `0` stops interactive sessions from continuing a turn that stopped on its `max_turns` limit (runner sessions always continue). Any other value, or unset: on, capped at 5 continuations in a row | on |
 | `PROMPT_BUILDER_MODEL` | Model for oneshot prompt builder (context refinement) | `claude-opus-4-6` |
 | `MCP_SERVER_PATH` | Path to the MCP server binary | Auto-detected |
 
