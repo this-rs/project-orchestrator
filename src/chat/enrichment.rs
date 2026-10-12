@@ -329,6 +329,53 @@ impl EnrichmentContext {
         output.trim_end().to_string()
     }
 
+    /// [`Self::to_system_prompt_markdown`] held to `cap` characters (bytes, so never
+    /// more characters either): the global cap of the block put in front of one turn
+    /// (`composer::turn_enrichment_cap`). Each stage caps its own section; this caps
+    /// their sum.
+    ///
+    /// Sections are kept or left out WHOLE, in the pipeline's order (a section that
+    /// does not fit is skipped, a smaller one after it may still fit): cutting inside
+    /// one could leave an untrusted-data container without its closing tag. What was
+    /// left out is said at the end of the block, never dropped in silence.
+    pub fn to_system_prompt_markdown_capped(&self, cap: usize) -> String {
+        let full = self.to_system_prompt_markdown();
+        if full.len() <= cap {
+            return full;
+        }
+        let preamble_room = crate::chat::untrusted::UNTRUSTED_PREAMBLE.len() + 2;
+        let note = |omitted: usize| {
+            format!(
+                "_[{omitted} enrichment section(s) left out: per-turn budget of {cap} characters]_"
+            )
+        };
+        // Room for the preamble and the omission note, whatever is kept.
+        let reserve = preamble_room + note(self.sections.len()).len() + 2;
+        let mut room = cap.saturating_sub(reserve);
+        let mut kept: Vec<&EnrichmentSection> = Vec::new();
+        for section in &self.sections {
+            let size = section.title.len() + section.content.len() + 6;
+            if size <= room {
+                room -= size;
+                kept.push(section);
+            }
+        }
+        let omitted = self.sections.len() - kept.len();
+        let mut output = String::new();
+        if kept
+            .iter()
+            .any(|s| crate::chat::untrusted::contains_container(&s.content))
+        {
+            output.push_str(crate::chat::untrusted::UNTRUSTED_PREAMBLE);
+            output.push_str("\n\n");
+        }
+        for section in kept {
+            output.push_str(&format!("## {}\n{}\n\n", section.title, section.content));
+        }
+        output.push_str(&note(omitted));
+        output
+    }
+
     /// True when a section holds a graph-content container (see
     /// [`crate::chat::untrusted`]); the prompt then carries the rule for reading it.
     fn has_untrusted_container(&self) -> bool {
@@ -1102,6 +1149,58 @@ mod tests {
         assert!(md.starts_with("## Untrusted data"), "{md}");
         assert!(md.contains("DATA"));
         assert!(ctx.render().contains("## Untrusted data"));
+    }
+
+    #[tokio::test]
+    async fn test_global_turn_cap_holds_and_keeps_sections_whole() {
+        let cap = crate::chat::composer::turn_enrichment_cap(None);
+        let mut ctx = EnrichmentContext::default();
+        // Each section within its stage cap (up to 5 000 notes, 1 500 per skill), many.
+        for i in 0..6 {
+            ctx.add_section(
+                format!("Notes {i}"),
+                crate::chat::untrusted::wrap_random(
+                    &"n".repeat(3_500),
+                    crate::chat::untrusted::Origin::new("note", None),
+                ),
+                "test",
+                EnrichmentSource::KnowledgeInjection,
+            );
+        }
+        for i in 0..3 {
+            ctx.add_section(
+                format!("Skill {i}"),
+                "s".repeat(1_400),
+                "test",
+                EnrichmentSource::SkillActivation,
+            );
+        }
+        assert!(ctx.to_system_prompt_markdown().len() > cap);
+
+        let md = ctx.to_system_prompt_markdown_capped(cap);
+        assert!(md.len() <= cap, "{} > {cap}", md.len());
+        // Every container kept is closed: sections are never cut.
+        assert_eq!(
+            md.matches("<untrusted_data id=").count(),
+            md.matches("</untrusted_data id=").count()
+        );
+        assert!(md.starts_with("## Untrusted data"));
+        // A smaller section after one that did not fit is still kept.
+        assert!(md.contains("## Skill 0"), "{md}");
+        // The omission is said.
+        assert!(md.ends_with("characters]_"), "{md}");
+        assert!(md.contains("left out: per-turn budget of 10000 characters"));
+
+        // Under the cap: byte for byte the uncapped block.
+        assert_eq!(
+            ctx.to_system_prompt_markdown_capped(usize::MAX),
+            ctx.to_system_prompt_markdown()
+        );
+        // A large window lets more through, still capped.
+        let big = crate::chat::composer::turn_enrichment_cap(Some(1_000_000));
+        let md_big = ctx.to_system_prompt_markdown_capped(big);
+        assert!(md_big.len() <= big);
+        assert!(md_big.len() > md.len());
     }
 
     // ── Parallel pipeline benchmark ───────────────────────────────────

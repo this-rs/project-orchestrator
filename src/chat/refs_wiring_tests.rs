@@ -315,7 +315,7 @@ async fn the_system_prompt_teaches_citations_only_when_refs_v1_is_on() {
 
     let on = manager_over(graph.clone()).with_refs_v1(true);
     let (prompt_on, _) = on
-        .build_system_prompt(None, "bonjour", None, None, None)
+        .build_system_prompt(None, "bonjour", None, None, None, None)
         .await;
     assert!(
         prompt_on.contains(&section),
@@ -324,7 +324,7 @@ async fn the_system_prompt_teaches_citations_only_when_refs_v1_is_on() {
 
     let off = manager_over(graph).with_refs_v1(false);
     let (prompt_off, _) = off
-        .build_system_prompt(None, "bonjour", None, None, None)
+        .build_system_prompt(None, "bonjour", None, None, None, None)
         .await;
     assert!(
         !prompt_off.contains("#kind:uuid"),

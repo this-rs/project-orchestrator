@@ -5444,6 +5444,7 @@ mod parity {
             Default::default(),
             Default::default(),
             &r.manager.anchor_session(),
+            None,
         )
         .await
         .expect("the graph has context for this message");
@@ -5842,6 +5843,7 @@ mod parity {
             Default::default(),
             Default::default(),
             &r.manager.anchor_session(),
+            None,
         )
         .await
         .expect("the graph has context for this message");
@@ -5938,6 +5940,7 @@ mod parity {
                 &node.cwd,
                 node.project_slug.as_deref(),
                 "hello",
+                None,
                 None,
                 &r.sid,
                 None,

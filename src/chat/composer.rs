@@ -79,8 +79,13 @@ pub struct ComposerInput<'a> {
     pub has_active_plan: bool,
     /// Number of tasks across active plans.
     pub task_count: usize,
-    /// Model name (e.g., "claude-sonnet-4-20250514"). Used for adaptive context budgeting.
+    /// Model name (e.g., "claude-sonnet-4-20250514"). Informative only: the budget
+    /// reads [`Self::context_window`], never the name.
     pub model: &'a str,
+    /// The model's context window in tokens, as the catalog knows it (`None`:
+    /// unknown). Sizes the dynamic context ([`compute_dynamic_budget`]). Resolved once
+    /// when the session opens, so every prompt of a session gets the same budget.
+    pub context_window: Option<u64>,
     /// Pre-computed embedding of the user message (for DualTrackRouter).
     /// `None` if embeddings are unavailable → routing falls back to heuristics.
     pub message_embedding: Option<&'a Vec<f32>>,
@@ -94,41 +99,70 @@ pub struct ComposerInput<'a> {
 // Default is derived — all numeric fields default to 0, bools to false,
 // &str to "", Option to None, &[] to empty slice.
 
-/// Fallback character budget when the model is unknown (~2500 tokens at 4 chars/token).
-const DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET: usize = 10_000;
+/// Fallback character budget when the model's context window is unknown (~2500 tokens
+/// at 4 chars/token). Only an UNKNOWN window gets it: a known window, whatever the
+/// model's family, is budgeted from its size ([`compute_dynamic_budget`]).
+pub(crate) const DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET: usize = 10_000;
+/// Share of the context window (after the base prompt) given to the dynamic context.
+const DYNAMIC_CONTEXT_WINDOW_PERCENT: usize = 15;
+/// Smallest dynamic budget for a known window.
+const MIN_DYNAMIC_CONTEXT_CHAR_BUDGET: usize = 5_000;
+/// Largest dynamic budget, whatever the window.
+const MAX_DYNAMIC_CONTEXT_CHAR_BUDGET: usize = 40_000;
 
-/// Compute the dynamic context character budget based on the model's context window
-/// and the current system prompt length.
+/// Compute the dynamic context character budget from the model's context window
+/// (`window_tokens`, `None` = unknown) and the current system prompt length.
 ///
-/// Strategy: allocate up to 15% of the model's remaining context window (after base prompt)
-/// for dynamic context, clamped between 5K and 40K chars.
+/// Strategy: allocate 15% of the window's remaining room (after the base prompt) to
+/// the dynamic context, at about four characters a token, clamped between 5K and
+/// 40K chars. The window is the one the catalog knows (nexus capabilities, the
+/// Anthropic Models API for Claude Code: `ChatManager::known_context_window`), for
+/// every model: a 128K DeepSeek is budgeted like a 128K Claude. An unknown window
+/// gets [`DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET`]; nothing is guessed from the name.
 ///
-/// Known context windows (in tokens):
-/// - claude-opus-4 / claude-sonnet-4: 200K
-/// - claude-haiku-3-5: 200K
-/// - claude-3-opus: 200K
-/// - Smaller/unknown models: fallback to 10K chars
-fn compute_dynamic_budget(model: &str, base_prompt_chars: usize) -> usize {
-    // Estimate model context window in tokens
-    let context_window_tokens: usize =
-        if model.contains("opus") || model.contains("sonnet") || model.contains("haiku") {
-            200_000
-        } else {
-            // Unknown model → use conservative fallback
-            return DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET;
-        };
-
-    // Convert to chars (~4 chars per token)
-    let context_window_chars = context_window_tokens * 4;
-
-    // Remaining space after base prompt
+/// Pure in its inputs: a session's prompt is built from the window resolved once at
+/// its opening, so the budget, hence the prefix, does not move between its turns.
+pub(crate) fn compute_dynamic_budget(
+    window_tokens: Option<u64>,
+    base_prompt_chars: usize,
+) -> usize {
+    let Some(window_tokens) = window_tokens else {
+        return DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET;
+    };
+    // Convert to chars (~4 chars per token); a window too large for usize is capped
+    // by the clamp below anyway.
+    let context_window_chars =
+        usize::try_from(window_tokens.saturating_mul(4)).unwrap_or(usize::MAX);
     let remaining = context_window_chars.saturating_sub(base_prompt_chars);
+    let budget = remaining.saturating_mul(DYNAMIC_CONTEXT_WINDOW_PERCENT) / 100;
+    budget.clamp(
+        MIN_DYNAMIC_CONTEXT_CHAR_BUDGET,
+        MAX_DYNAMIC_CONTEXT_CHAR_BUDGET,
+    )
+}
 
-    // Allocate 15% of remaining space for dynamic context
-    let budget = remaining * 15 / 100;
-
-    // Clamp between 5K and 40K chars
-    budget.clamp(5_000, 40_000)
+/// Global cap, in characters, of the enrichment block put in front of ONE turn (the
+/// knowledge notes, propagated notes, activated skills, file context... of
+/// `enrichment_for_turn`). Each stage caps itself (3 000 for the notes, 1 500 per
+/// skill, three skills...) but nothing capped their sum.
+///
+/// It is the window's dynamic budget with no base prompt subtracted, i.e. the same
+/// figure the system prompt's dynamic section gets: 10 000 when the window is
+/// unknown, 15% of a small window (5 000 at least), 40 000 at most (reached from a
+/// ~67K-token window). Why this figure:
+/// - one ceiling for "graph context a turn carries": the system prompt's dynamic
+///   section and the per-turn block together take at most 30% of any window above
+///   ~8K tokens, so a turn keeps ≥ 70% for the history, the tools and the answer,
+///   and alone they cannot push a fresh conversation past nexus' compaction
+///   threshold (80%);
+/// - this block stays in the history after its turn, so it must scale DOWN with a
+///   small window (a 16K-token window gets 9 600, not a fixed 15 000+);
+/// - with a known window of 67K tokens or more (the usual 128K to 1M windows of
+///   Claude, DeepSeek, GLM, Qwen) it is above what the stages produce together in practice
+///   (≈ 5 000 notes + 3 × 1 500 skills + a few small sections): it only bites when
+///   a stage misbehaves, which is what a global cap is for.
+pub(crate) fn turn_enrichment_cap(window_tokens: Option<u64>) -> usize {
+    compute_dynamic_budget(window_tokens, 0)
 }
 
 /// The FsmPromptComposer assembles the full system prompt from modular sections.
@@ -227,7 +261,7 @@ impl FsmPromptComposer {
         let base_prompt = if !merged_hints.is_empty() {
             // Weighted assembly: truncate low-weight base sections when over budget.
             // Use 60% of the model's context window (in chars) as the base section budget.
-            let model_budget = compute_dynamic_budget(input.model, 0) * 6;
+            let model_budget = compute_dynamic_budget(input.context_window, 0) * 6;
             assemble_sections_weighted(&decision.sections, &merged_hints, model_budget)
         } else {
             assemble_sections(&decision.sections)
@@ -242,7 +276,7 @@ impl FsmPromptComposer {
         // ── Step 6: Build dynamic context (truncated) ─────────────────
         // Compute adaptive budget based on model context window and current prompt size
         let base_prompt_len = base_prompt.len() + fsm_section.len() + tool_ref.len();
-        let char_budget = compute_dynamic_budget(input.model, base_prompt_len);
+        let char_budget = compute_dynamic_budget(input.context_window, base_prompt_len);
         let dynamic = Self::build_dynamic_section(
             input.continuity_markdown,
             input.project_context_markdown,
@@ -1262,68 +1296,115 @@ mod tests {
     // ── compute_dynamic_budget tests ─────────────────────────────────
 
     #[test]
-    fn test_budget_known_model_sonnet() {
-        let budget = compute_dynamic_budget("claude-sonnet-4-20250514", 50_000);
+    fn test_budget_200k_window() {
         // 200K tokens × 4 chars = 800K chars; remaining = 750K; 15% = 112.5K → clamped to 40K
-        assert_eq!(budget, 40_000);
+        assert_eq!(compute_dynamic_budget(Some(200_000), 50_000), 40_000);
     }
 
     #[test]
-    fn test_budget_known_model_haiku() {
-        let budget = compute_dynamic_budget("claude-haiku-3-5-20241022", 50_000);
-        assert_eq!(budget, 40_000);
+    fn test_budget_deepseek_128k_matches_claude_128k() {
+        // The budget reads the window, never the name: a 128K DeepSeek on the native
+        // harness gets what a 128K Claude gets (it used to fall to 10 000).
+        let deepseek = ComposerInput {
+            model: "deepseek-chat",
+            context_window: Some(128_000),
+            ..Default::default()
+        };
+        let claude = ComposerInput {
+            model: "claude-sonnet-4-6",
+            context_window: Some(128_000),
+            ..Default::default()
+        };
+        let budget =
+            |input: &ComposerInput<'_>| compute_dynamic_budget(input.context_window, 50_000);
+        assert_eq!(budget(&deepseek), budget(&claude));
+        // 128K × 4 = 512K; remaining 462K; 15% = 69.3K → clamped to 40K
+        assert_eq!(budget(&deepseek), 40_000);
+
+        // And the composed prompts are the same: same window, same dynamic context.
+        let long_context: String = (0..2_000)
+            .map(|i| format!("- [Medium] item {i} with some words to fill the line\n"))
+            .collect();
+        let long_context = format!("## Context\n{long_context}");
+        let with = |model: &'static str| ComposerInput {
+            model,
+            context_window: Some(128_000),
+            project_context_markdown: &long_context,
+            ..Default::default()
+        };
+        let deepseek_prompt = FsmPromptComposer::compose(&with("deepseek-chat"));
+        let claude_prompt = FsmPromptComposer::compose(&with("claude-sonnet-4-6"));
+        assert_eq!(deepseek_prompt, claude_prompt);
+        // Bigger than what the unknown-window fallback lets through.
+        let unknown_prompt = FsmPromptComposer::compose(&ComposerInput {
+            model: "deepseek-chat",
+            context_window: None,
+            project_context_markdown: &long_context,
+            ..Default::default()
+        });
+        assert!(deepseek_prompt.len() > unknown_prompt.len() + 20_000);
     }
 
     #[test]
-    fn test_budget_known_model_opus() {
-        let budget = compute_dynamic_budget("claude-opus-4-20250514", 50_000);
-        assert_eq!(budget, 40_000);
+    fn test_budget_unknown_window_uses_default() {
+        assert_eq!(
+            compute_dynamic_budget(None, 50_000),
+            DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET
+        );
+        assert_eq!(compute_dynamic_budget(None, 0), 10_000);
+        // Whatever the name: a Claude model whose window is unknown is not guessed.
+        let input = ComposerInput {
+            model: "claude-opus-4-20250514",
+            ..Default::default()
+        };
+        assert_eq!(compute_dynamic_budget(input.context_window, 50_000), 10_000);
     }
 
     #[test]
-    fn test_budget_unknown_model_uses_default() {
-        let budget = compute_dynamic_budget("gpt-4o", 50_000);
-        assert_eq!(budget, DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET);
-    }
-
-    #[test]
-    fn test_budget_empty_model_uses_default() {
-        let budget = compute_dynamic_budget("", 50_000);
-        assert_eq!(budget, DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET);
+    fn test_budget_small_window_scales_down() {
+        // 16K tokens × 4 = 64K chars; 15% = 9 600
+        assert_eq!(compute_dynamic_budget(Some(16_000), 0), 9_600);
+        // A tiny window still gets the floor.
+        assert_eq!(compute_dynamic_budget(Some(4_000), 0), 5_000);
+        // An absurd window does not overflow.
+        assert_eq!(compute_dynamic_budget(Some(u64::MAX), 0), 40_000);
     }
 
     #[test]
     fn test_budget_large_base_prompt_reduces_budget() {
         // Base prompt nearly fills the context window
         // 200K tokens × 4 = 800K chars; remaining = 800K - 780K = 20K; 15% = 3K → clamped to 5K
-        let budget = compute_dynamic_budget("claude-sonnet-4-20250514", 780_000);
-        assert_eq!(budget, 5_000);
+        assert_eq!(compute_dynamic_budget(Some(200_000), 780_000), 5_000);
     }
 
     #[test]
     fn test_budget_small_base_prompt_gets_max() {
         // Tiny base prompt → 15% of ~800K = ~120K → clamped to 40K
-        let budget = compute_dynamic_budget("claude-sonnet-4-20250514", 1_000);
-        assert_eq!(budget, 40_000);
+        assert_eq!(compute_dynamic_budget(Some(200_000), 1_000), 40_000);
     }
 
     #[test]
-    fn test_budget_adapts_via_compose() {
-        // Verify that compose() with a model name produces a different budget than without
-        let input_with_model = ComposerInput {
-            model: "claude-sonnet-4-20250514",
+    fn test_turn_enrichment_cap_follows_the_window_budget() {
+        assert_eq!(turn_enrichment_cap(None), 10_000);
+        assert_eq!(turn_enrichment_cap(Some(16_000)), 9_600);
+        assert_eq!(turn_enrichment_cap(Some(128_000)), 40_000);
+        assert_eq!(turn_enrichment_cap(Some(1_000_000)), 40_000);
+    }
+
+    #[test]
+    fn test_same_inputs_same_prompt() {
+        // The prompt of a session is a pure function of its inputs: the same session
+        // (same window, same context) composes the same prompt byte for byte.
+        let input = ComposerInput {
+            model: "deepseek-chat",
+            context_window: Some(128_000),
             project_context_markdown: "## Context\n- item",
+            continuity_markdown: "## Previous\n- done",
             ..Default::default()
         };
-        let input_no_model = ComposerInput {
-            model: "",
-            project_context_markdown: "## Context\n- item",
-            ..Default::default()
-        };
-        // Both should produce valid prompts (just with different internal budgets)
-        let prompt_with = FsmPromptComposer::compose(&input_with_model);
-        let prompt_without = FsmPromptComposer::compose(&input_no_model);
-        assert!(!prompt_with.is_empty());
-        assert!(!prompt_without.is_empty());
+        assert_eq!(
+            FsmPromptComposer::compose(&input),
+            FsmPromptComposer::compose(&input)
+        );
     }
 }

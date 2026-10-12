@@ -1489,6 +1489,7 @@ mod integration_tests {
             let client = nexus_claude::InteractiveClient::from_transport(Box::new(NoopTransport));
 
             let session = ActiveSession {
+                context_window: None,
                 anchor: Default::default(),
                 mirror_tap: None,
                 events_tx: events_tx.clone(),
