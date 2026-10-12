@@ -426,16 +426,17 @@ pub struct ActiveSession {
     /// answers itself the later requests of THIS session they cover; never handed to
     /// the CLI as a rule.
     pub session_grants: Arc<std::sync::Mutex<super::session_grants::SessionGrants>>,
-    /// Whether auto-continue is enabled for this session.
-    /// When `true`, the backend automatically sends "Continue" after error_max_turns.
-    /// Toggled via WebSocket `set_auto_continue` message.
+    /// Whether auto-continue is on for this session: the backend sends "Continue" after
+    /// a turn stopped on its turn limit (error_max_turns). Always on (decision 7b95342a),
+    /// unless the operator's `CHAT_AUTO_CONTINUE=false` turned interactive sessions off;
+    /// the WebSocket `set_auto_continue` message no longer changes it.
     pub auto_continue: Arc<AtomicBool>,
-    /// Number of auto-continue cycles consumed so far. Incremented each time
-    /// `stream_response` auto-continues after error_max_turns. When this reaches
-    /// `max_auto_continues`, auto_continue is disabled to prevent infinite loops.
+    /// The current chain of auto-continues (continuations in a row). Past
+    /// `max_auto_continues` the turn stays stopped and the chain starts again from zero
+    /// (`post_stream::auto_continue_allowed`).
     pub auto_continue_count: Arc<AtomicU32>,
-    /// Maximum number of auto-continue cycles allowed. 0 = unlimited.
-    /// Set to `RunnerConfig.max_auto_continues` for runner sessions, 0 for interactive.
+    /// Maximum number of auto-continues in a row (0 = unlimited):
+    /// `post_stream::MAX_AUTO_CONTINUES` for every session.
     pub max_auto_continues: u32,
     /// RFC accumulator for detecting sustained architectural discussions.
     /// Persists across messages in a session — when 2+ consecutive responses
@@ -2378,7 +2379,6 @@ pub(crate) async fn run_step<F: std::future::Future>(
 /// listener (`spawn_nats_rpc_listener`) answers, served by the session handle.
 pub(crate) async fn agent_rpc(
     handle: &Arc<super::agent_runtime::AgentSessionHandle>,
-    graph: &Arc<dyn GraphStore>,
     request: &crate::events::ChatRpcRequest,
 ) -> crate::events::ChatRpcResponse {
     let message = &request.message;
@@ -2432,11 +2432,8 @@ pub(crate) async fn agent_rpc(
             };
         }
         "set_auto_continue" => {
-            let enabled = field("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
-            handle.auto_continue.store(enabled, Ordering::Relaxed);
-            if let Ok(uuid) = Uuid::parse_str(&handle.session_id) {
-                let _ = graph.set_session_auto_continue(uuid, enabled).await;
-            }
+            // Accepted and ignored: auto-continue is always on (decision 7b95342a).
+            debug!(session_id = %handle.session_id, "NATS RPC: set_auto_continue ignored (always on)");
             Ok(())
         }
         "queue_op" => match serde_json::from_str::<super::pending_queue::QueueOp>(message) {
@@ -4602,40 +4599,12 @@ impl ChatManager {
                                 }
                             }
                         } else if request.message_type == "set_auto_continue" {
-                            // Toggle auto-continue for this session (no CLI interaction needed)
-                            let enabled: bool = serde_json::from_str::<serde_json::Value>(message)
-                                .ok()
-                                .and_then(|v| v.get("enabled").and_then(|e| e.as_bool()))
-                                .unwrap_or(false);
-
-                            auto_continue.store(enabled, Ordering::Relaxed);
-
-                            // Persist to Neo4j
-                            if let Ok(uuid) = Uuid::parse_str(&session_id) {
-                                if let Err(e) = graph.set_session_auto_continue(uuid, enabled).await
-                                {
-                                    warn!(
-                                        session_id = %session_id,
-                                        error = %e,
-                                        "Failed to persist auto_continue via NATS RPC (non-fatal)"
-                                    );
-                                }
-                            }
-
-                            info!(
+                            // Accepted and ignored, for older frontends: auto-continue is
+                            // always on (decision 7b95342a).
+                            debug!(
                                 session_id = %session_id,
-                                enabled = %enabled,
-                                "NATS RPC: Auto-continue toggled"
+                                "NATS RPC: set_auto_continue ignored (always on)"
                             );
-
-                            // Broadcast state change event (local + NATS for other instances)
-                            let event = ChatEvent::AutoContinueStateChanged {
-                                session_id: session_id.clone(),
-                                enabled,
-                            };
-                            let _ = events_tx.send(event.clone());
-                            nats.publish_chat_event(&session_id, event);
-
                             crate::events::ChatRpcResponse {
                                 success: true,
                                 error: None,
@@ -7027,17 +6996,13 @@ impl ChatManager {
         // Register active session — cancel old NATS listeners if session key already exists
         let nats_cancel = CancellationToken::new();
         let interrupt_token = CancellationToken::new();
-        // Runner sessions always get auto_continue=true; interactive sessions use config default.
+        // Auto-continue is always on, capped (decision 7b95342a): a runner session always
+        // continues; an interactive one unless the operator's kill switch is off.
         let is_runner_session = request.runner_context.is_some();
-        let auto_continue = Arc::new(AtomicBool::new(if is_runner_session {
-            true
-        } else {
-            self.config.auto_continue
-        }));
+        let (auto_continue_on, max_auto_continues) =
+            super::post_stream::session_auto_continue(is_runner_session, self.config.auto_continue);
+        let auto_continue = Arc::new(AtomicBool::new(auto_continue_on));
         let auto_continue_count = Arc::new(AtomicU32::new(0));
-        // Runner sessions: limit to 5 auto-continues to prevent infinite loops.
-        // Interactive sessions: unlimited (0) — user can always interrupt manually.
-        let max_auto_continues: u32 = if is_runner_session { 5 } else { 0 };
         // OOB-trigger cap (T7 of plan 9a1684b2): conservative for runner
         // sessions, generous for interactive (user can always interrupt).
         let oob_trigger_cap: u32 = if is_runner_session {
@@ -10912,96 +10877,21 @@ impl ChatManager {
         }
     }
 
-    /// Toggle auto-continue for an active session.
+    /// The auto-continue state of a session, as `auto_continue_state_changed` reports it.
     ///
-    /// Updates the in-memory `ActiveSession.auto_continue` AtomicBool,
-    /// persists the change to Neo4j, and broadcasts a `ChatEvent::AutoContinueStateChanged`
-    /// so that all connected frontends can sync their toggle UI.
-    ///
-    /// Unlike `set_session_permission_mode`, this does NOT send a control request to the
-    /// CLI subprocess — auto-continue is purely a backend-side concern.
-    ///
-    /// Works whether the session is active (CLI spawned) or idle (just viewing).
-    /// - Active: updates in-memory AtomicBool + broadcasts locally + NATS
-    /// - Idle: persists to Neo4j + broadcasts via NATS only (no local broadcast channel)
-    pub async fn set_auto_continue(&self, session_id: &str, enabled: bool) -> Result<()> {
-        // Try to update in-memory state if session is active
-        let maybe_events_tx = {
-            if let Some(handle) = self.agent_runtime.get(session_id).await {
-                handle.auto_continue.store(enabled, Ordering::Relaxed);
-                Some(handle.events_tx.clone())
-            } else {
-                let sessions = self.active_sessions.read().await;
-                if let Some(session) = sessions.get(session_id) {
-                    session
-                        .auto_continue
-                        .store(enabled, std::sync::atomic::Ordering::Relaxed);
-                    Some(session.events_tx.clone())
-                } else {
-                    None
-                }
-            }
-        };
-
-        // Persist to Neo4j (always — whether active or idle)
-        if let Ok(uuid) = Uuid::parse_str(session_id) {
-            if let Err(e) = self.graph.set_session_auto_continue(uuid, enabled).await {
-                warn!(
-                    session_id = %session_id,
-                    error = %e,
-                    "Failed to persist auto_continue change to Neo4j (non-fatal)"
-                );
-            }
-        }
-
-        let is_local = maybe_events_tx.is_some();
-        info!(
-            session_id = %session_id,
-            enabled = %enabled,
-            is_local = %is_local,
-            "Auto-continue toggled for session"
-        );
-
-        // Broadcast event to WebSocket clients
-        let event = ChatEvent::AutoContinueStateChanged {
-            session_id: session_id.to_string(),
-            enabled,
-        };
-
-        // Local broadcast (only if session is active on this instance)
-        if let Some(events_tx) = maybe_events_tx {
-            let _ = events_tx.send(event.clone());
-        }
-
-        // NATS broadcast (always — for cross-instance AND idle-session propagation)
-        if let Some(ref nats) = self.nats {
-            nats.publish_chat_event(session_id, event);
-        }
-
-        Ok(())
-    }
-
-    /// Get the current auto-continue state for a session.
-    ///
-    /// Reads from the in-memory ActiveSession if local, otherwise falls back to Neo4j.
+    /// Auto-continue is always on (decision 7b95342a): there is no per-session toggle any
+    /// more, and the WebSocket / NATS `set_auto_continue` message is accepted and ignored.
+    /// A live session answers its own flag (a runner always continues); any other session
+    /// answers the operator's `CHAT_AUTO_CONTINUE` (on unless turned off). The flag an
+    /// older version persisted on the session node is not read.
     pub async fn get_auto_continue_state(&self, session_id: &str) -> Result<bool> {
         if let Some(handle) = self.agent_runtime.get(session_id).await {
             return Ok(handle.auto_continue.load(Ordering::Relaxed));
         }
-        // Try local active session first
         let sessions = self.active_sessions.read().await;
         if let Some(session) = sessions.get(session_id) {
-            return Ok(session
-                .auto_continue
-                .load(std::sync::atomic::Ordering::Relaxed));
+            return Ok(session.auto_continue.load(Ordering::Relaxed));
         }
-        drop(sessions);
-
-        // Fallback to Neo4j
-        if let Ok(uuid) = Uuid::parse_str(session_id) {
-            return self.graph.get_session_auto_continue(uuid).await;
-        }
-
         Ok(self.config.auto_continue)
     }
 
@@ -11454,12 +11344,11 @@ impl ChatManager {
         // Register as active — cancel old NATS listeners if session was previously active
         let nats_cancel = CancellationToken::new();
         let interrupt_token = CancellationToken::new();
-        let auto_continue = Arc::new(AtomicBool::new(
-            self.graph
-                .get_session_auto_continue(uuid)
-                .await
-                .unwrap_or(self.config.auto_continue),
-        ));
+        // Auto-continue is always on (decision 7b95342a): the flag an older version
+        // persisted on the session node is no longer read; only the kill switch counts.
+        let (auto_continue_on, max_auto_continues) =
+            super::post_stream::session_auto_continue(false, self.config.auto_continue);
+        let auto_continue = Arc::new(AtomicBool::new(auto_continue_on));
         // Resolved before the sessions are locked (it reads the project's record).
         // Boxed: the opening's future is already large.
         let lasting = Box::pin(self.lasting_scope(
@@ -11531,7 +11420,7 @@ impl ChatManager {
                     )),
                     auto_continue: auto_continue.clone(),
                     auto_continue_count: Arc::new(AtomicU32::new(0)),
-                    max_auto_continues: 0, // resumed sessions = interactive, unlimited
+                    max_auto_continues,
                     rfc_accumulator: Arc::new(Mutex::new(
                         super::observation_detector::RfcAccumulator::new(),
                     )),
@@ -15241,13 +15130,13 @@ impl ChatManager {
         // #364: a client that saw the end before the start counted the child running).
         self.emit_session_created(session_id, request, project_slug);
         if let Some(handle) = self.agent_runtime.get(&sid).await {
-            // As on Claude Code: a runner always continues, at most five times; an
-            // interactive session follows the configuration, with no limit.
-            let runner = request.runner_context.is_some();
-            handle.configure_auto_continue(
-                runner || self.config.auto_continue,
-                if runner { 5 } else { 0 },
+            // As on Claude Code: always on, capped (decision 7b95342a); a runner always
+            // continues, an interactive session unless the operator's kill switch is off.
+            let (on, max) = super::post_stream::session_auto_continue(
+                request.runner_context.is_some(),
+                self.config.auto_continue,
             );
+            handle.configure_auto_continue(on, max);
         }
         if let Some(handle) = self.agent_runtime.get(&sid).await {
             // A relayed conversation says so first, on the thread.
@@ -15654,7 +15543,6 @@ impl ChatManager {
                 }
             });
         }
-        let graph = self.graph.clone();
         tokio::spawn(async move {
             let Ok(mut sub) = nats.subscribe_rpc_send(&sid).await else {
                 warn!(session_id = %sid, "agent engine: NATS RPC subscription failed");
@@ -15666,7 +15554,7 @@ impl ChatManager {
                     msg = sub.next() => {
                         let Some(msg) = msg else { break };
                         let response = match serde_json::from_slice::<crate::events::ChatRpcRequest>(&msg.payload) {
-                            Ok(request) => agent_rpc(&handle, &graph, &request).await,
+                            Ok(request) => agent_rpc(&handle, &request).await,
                             Err(e) => crate::events::ChatRpcResponse {
                                 success: false,
                                 error: Some(format!("Invalid request: {e}")),
@@ -15914,13 +15802,10 @@ impl ChatManager {
             .get(&sid)
             .await
             .ok_or_else(|| anyhow!("Session {sid} vanished while resuming"))?;
-        // A resumed session is interactive: its persisted toggle, no limit (as on Claude Code).
-        let auto_continue = self
-            .graph
-            .get_session_auto_continue(node.id)
-            .await
-            .unwrap_or(self.config.auto_continue);
-        handle.configure_auto_continue(auto_continue, 0);
+        // A resumed session is interactive: on unless the operator's kill switch is off,
+        // capped (as on Claude Code; the flag an older version persisted is not read).
+        let (on, max) = super::post_stream::session_auto_continue(false, self.config.auto_continue);
+        handle.configure_auto_continue(on, max);
         handle.send_message(message).await
     }
 

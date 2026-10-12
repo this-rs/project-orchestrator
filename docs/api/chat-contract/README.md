@@ -27,6 +27,20 @@ Toute évolution du fil (variante, champ, attribut serde, trame de contrôle) pa
 **dans le même commit**, sinon le test échoue. Les trames de contrôle sont des copies statiques : si le
 handler change, mettez à jour `control_frames()` dans le module.
 
+## Trames gardées pour compatibilité
+
+- `set_auto_continue` (client) : accepté et **ignoré** depuis la décision 7b95342a (12/10/2026) —
+  l'auto-continue est toujours actif, plafonné à 5 continuations d'affilée, sur les deux moteurs.
+  Le handler journalise en debug et répond `auto_continue_state_changed` avec l'état réel. Un
+  frontend à jour ne l'envoie plus ; il reste au contrat pour ne pas refuser les anciens.
+- `auto_continue_state_changed` (serveur) : toujours envoyé une fois à la connexion (après
+  `replay_complete`, `seq: 0`) et en réponse à `set_auto_continue`, pour les anciens frontends
+  qui affichent encore un interrupteur. `enabled` vaut `true` sauf si l'opérateur a coupé
+  l'auto-continue (`CHAT_AUTO_CONTINUE=false`). Un frontend à jour peut l'ignorer.
+- `auto_continue` (serveur) : inchangé, annonce une continuation automatique (`delay_ms`).
+
+Le format de ces trames ne change pas : les fichiers JSON et `SHA256SUMS` sont inchangés.
+
 ## Côté frontend
 
 Copiez le dossier tel quel, puis vérifiez la copie depuis le dossier copié : `shasum -a 256 -c SHA256SUMS`.

@@ -1044,9 +1044,27 @@ pub(crate) fn check_objective_reminder(input: &ObjectiveCheckInput) -> Option<St
 /// Pause between a turn that stopped on its turn limit and its continuation.
 pub(crate) const AUTO_CONTINUE_DELAY_MS: u64 = 500;
 
+/// How many times in a row a turn stopped on its turn limit is continued, for every
+/// session (interactive and runner, both engines). Auto-continue is always on, with
+/// this cap (decision 7b95342a).
+pub(crate) const MAX_AUTO_CONTINUES: u32 = 5;
+
+/// The auto-continue of a session as it opens or resumes, on either engine: `(on, cap)`.
+/// A runner session always continues; any other session unless the operator's kill
+/// switch (`ChatConfig::auto_continue`, `CHAT_AUTO_CONTINUE=false`) is off. Always
+/// capped at [`MAX_AUTO_CONTINUES`] in a row. No per-session toggle is read.
+pub(crate) fn session_auto_continue(runner: bool, configured_on: bool) -> (bool, u32) {
+    (runner || configured_on, MAX_AUTO_CONTINUES)
+}
+
 /// Whether a turn that just ended is continued automatically: it stopped on its
-/// turn limit, the session's auto-continue is on and nobody stopped it. Counts
-/// the continuation; past `max` (0: no limit) auto-continue is switched off.
+/// turn limit, the session's auto-continue is on (it is, unless the operator's
+/// `CHAT_AUTO_CONTINUE=false` turned it off) and nobody stopped it.
+///
+/// `count` is the current chain of continuations: past `max` (0: no limit) the chain
+/// stops — the turn stays stopped — and starts again from zero, as it does when a
+/// turn ends without hitting its limit. The next chain therefore starts from a turn
+/// somebody asked for, never from the capped one.
 /// The Claude Code engine (`PostStreamHandler::handle_auto_continue`) and the
 /// agent engine (`AgentSessionHandle`) decide with this one function.
 pub(crate) fn auto_continue_allowed(
@@ -1054,19 +1072,20 @@ pub(crate) fn auto_continue_allowed(
     hit_turn_limit: bool,
     enabled: &AtomicBool,
     interrupted: bool,
-    count: &std::sync::atomic::AtomicU32,
+    chain: &std::sync::atomic::AtomicU32,
     max: u32,
 ) -> bool {
     if !hit_turn_limit || !enabled.load(Ordering::Relaxed) || interrupted {
+        chain.store(0, Ordering::Relaxed);
         return false;
     }
-    let count = count.fetch_add(1, Ordering::Relaxed) + 1;
+    let count = chain.fetch_add(1, Ordering::Relaxed) + 1;
     if max > 0 && count > max {
         warn!(
-            "Auto-continue limit reached for session {} ({}/{}), disabling",
-            session_id, count, max
+            "Auto-continue cap reached for session {} ({} in a row): the turn stays stopped",
+            session_id, max
         );
-        enabled.store(false, Ordering::Relaxed);
+        chain.store(0, Ordering::Relaxed);
         return false;
     }
     if max > 0 {
@@ -1780,6 +1799,76 @@ mod integration_tests {
             handler.pending_messages.lock().await.len(),
             1,
             "after real work, a new stall gets a reminder again"
+        );
+    }
+
+    /// The cap bounds a CHAIN of continuations: the turn past it stays stopped, auto-continue
+    /// stays on (no toggle can switch it back on), and the next chain gets the full cap again.
+    #[test]
+    fn the_cap_stops_a_chain_and_the_next_chain_starts_from_zero() {
+        let on = AtomicBool::new(true);
+        let chain = AtomicU32::new(0);
+        let max = MAX_AUTO_CONTINUES;
+        for _ in 0..max {
+            assert!(auto_continue_allowed("s", true, &on, false, &chain, max));
+        }
+        assert!(!auto_continue_allowed("s", true, &on, false, &chain, max));
+        assert!(on.load(Ordering::Relaxed), "the cap never switches it off");
+        // The next turn (somebody asked for it) starts a new chain.
+        for _ in 0..max {
+            assert!(auto_continue_allowed("s", true, &on, false, &chain, max));
+        }
+        // A turn that ends within its limit ends the chain too.
+        assert!(!auto_continue_allowed("s", false, &on, false, &chain, max));
+        assert!(auto_continue_allowed("s", true, &on, false, &chain, max));
+        // Off (the operator's kill switch) or stopped: never.
+        assert!(!auto_continue_allowed("s", true, &on, true, &chain, max));
+        assert!(!auto_continue_allowed(
+            "s",
+            true,
+            &AtomicBool::new(false),
+            false,
+            &chain,
+            max
+        ));
+    }
+
+    /// Claude Code engine: a NEW interactive session, configured as the manager opens it
+    /// under the default configuration (no toggle), continues a turn stopped on its limit,
+    /// `MAX_AUTO_CONTINUES` times in a row, then the cap stops it.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_legacy_session_continues_up_to_the_cap() {
+        let graph = Arc::new(MockGraphStore::new());
+        let mut handler = build_handler(graph, None, "legacy-new", false).await;
+        let (on, max) =
+            session_auto_continue(false, crate::chat::config::auto_continue_from_env(None));
+        assert!(on, "on by default, without any toggle");
+        assert_eq!(max, MAX_AUTO_CONTINUES);
+        let flag = Arc::new(AtomicBool::new(on));
+        handler.auto_continue = flag.clone();
+        {
+            let mut sessions = handler.active_sessions.write().await;
+            let session = sessions.get_mut("legacy-new").unwrap();
+            session.auto_continue = flag;
+            session.max_auto_continues = max;
+        }
+        for i in 0..max {
+            assert!(handler.handle_auto_continue(true).await, "continuation {i}");
+        }
+        assert!(
+            !handler.handle_auto_continue(true).await,
+            "the cap stops the chain"
+        );
+        assert_eq!(handler.pending_messages.lock().await.len(), max as usize);
+        // A runner session continues even under the operator's kill switch; an
+        // interactive one does not.
+        assert_eq!(
+            session_auto_continue(true, false),
+            (true, MAX_AUTO_CONTINUES)
+        );
+        assert_eq!(
+            session_auto_continue(false, false),
+            (false, MAX_AUTO_CONTINUES)
         );
     }
 

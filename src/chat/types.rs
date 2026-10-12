@@ -922,15 +922,18 @@ pub enum ChatEvent {
         /// Full event payload as emitted by the CLI (passed through verbatim).
         data: serde_json::Value,
     },
-    /// Backend auto-continue: emitted when the backend detects error_max_turns
-    /// and auto_continue is enabled. Signals that a "Continue" will be sent
-    /// automatically after the delay.
+    /// Backend auto-continue: emitted when a turn stopped on its turn limit
+    /// (error_max_turns) and is continued — always, within the cap of continuations in
+    /// a row (decision 7b95342a). Signals that a "Continue" will be sent automatically
+    /// after the delay (a Stop during the delay cancels it).
     AutoContinue {
         session_id: String,
         /// Delay in milliseconds before the auto-continue message is sent
         delay_ms: u64,
     },
-    /// Auto-continue state changed for a session (broadcast to sync all frontends)
+    /// The session's auto-continue state. Auto-continue is always on (decision
+    /// 7b95342a): the WebSocket sends this frame on connect and in answer to the ignored
+    /// `set_auto_continue`, for older frontends that still show a toggle.
     AutoContinueStateChanged { session_id: String, enabled: bool },
     /// Backend is retrying after a transient API error (5xx).
     /// Emitted before each retry attempt so the frontend can show a "Retrying..." indicator.
