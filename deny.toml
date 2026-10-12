@@ -46,6 +46,12 @@ ignore = [
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — transitive via tokio-rustls 0.24 in fastembed. Newer rustls 0.23 stack uses pki-types directly; will land when fastembed updates." },
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained — bincode 2.x is the maintained version but is a breaking change; transitive via fastembed/ort. Out of scope for this PR." },
     { id = "RUSTSEC-2026-0097", reason = "rand unsound (custom logger via rand::rng()) — transitive in build deps. We don't call rand::rng() with a custom logger anywhere in our codebase." },
+    # unsafe-libyaml unmaintained (archived 2024-03-25, advisory published 2026-10): pulled by
+    # serde_yaml 0.9 (itself deprecated), a DIRECT dependency (config.yaml, runner models,
+    # skill packages, docker-compose files read by the architecture module). Not a known
+    # vulnerability: no fix will come upstream. Migration to a safe-Rust parser (serde-saphyr)
+    # is tracked as a PO task; remove this ignore with it.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained (no fix upstream) — via serde_yaml, a direct dependency; migration to serde-saphyr tracked as a PO task." },
     # ttf-parser unmaintained — author declared it so; the advisory names `skrifa`
     # as the successor, and pdf_oxide already pulls skrifa alongside it, so the
     # migration is underway upstream. Transitive via pdf_oxide, which is behind
