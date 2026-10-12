@@ -59,7 +59,7 @@ tauri-plugin-websocket = "2"
 
 # macOS native rounded corners
 [target.'cfg(target_os = "macos")'.dependencies]
-cocoa = "0.26"
+cocoa = "0.27"
 objc = "0.2"
 
 [features]
