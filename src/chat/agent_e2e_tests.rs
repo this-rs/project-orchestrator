@@ -14023,4 +14023,197 @@ mod claude_code_mirror {
         assert_eq!(stored_down, stored_off, "the stored thread");
         assert!(mirrors_of(graph.as_ref(), parent).await.is_empty());
     }
+
+    /// A BACKGROUND sub-agent on the agent engine, from the CLI itself (`fake_claude`, the
+    /// real nexus façade), as Claude Code 2.1.296 prints it: the `Agent` call with
+    /// `run_in_background`, its `task_started`, the immediate "launched" result, the end of
+    /// the parent's turn; THEN, out of turn, the sub-agent's tool call and words (with
+    /// `parent_tool_use_id`) and the `task_notification` that names the call. The mirror
+    /// follows it past the turn (in the form a turn shows it) and is closed by the
+    /// notification, with its summary; the parent keeps showing the out-of-turn activity
+    /// flattened, as before. Before P18c-suite the mirror ended at the turn's end on "runs in
+    /// the background", without anything the sub-agent did after it.
+    #[tokio::test]
+    async fn a_background_sub_agent_is_mirrored_out_of_turn_until_its_notification() {
+        use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
+        const BG: &str = "toolu_bg_agent";
+        let dir = tempfile::tempdir().unwrap();
+        let assistant = |content: Value, parent: Option<&str>| {
+            json!({"op": "emit_json", "json": {
+                "type": "assistant", "message": {"id": "msg_fake", "type": "message",
+                "role": "assistant", "model": "fake-claude", "content": content,
+                "stop_reason": "end_turn"}, "parent_tool_use_id": parent}})
+        };
+        let tool_result = |id: &str, text: &str, parent: Option<&str>| {
+            json!({"op": "emit_json", "json": {
+                "type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": id, "content": text, "is_error": false}
+                ]}, "parent_tool_use_id": parent}})
+        };
+        let system = |subtype: &str, uuid: &str, mut data: Value| {
+            data["type"] = json!("system");
+            data["subtype"] = json!(subtype);
+            data["uuid"] = json!(uuid);
+            data["session_id"] = json!("cli-bg-1");
+            json!({"op": "emit_json", "json": data})
+        };
+        let lines = [
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 15000}),
+            system(
+                "init",
+                "u-init",
+                json!({"model": "fake-claude", "cwd": ".", "tools": ["Agent", "Bash"],
+                    "permissionMode": "default", "apiKeySource": "none"}),
+            ),
+            assistant(
+                json!([{"type": "tool_use", "id": BG, "name": "Agent", "input": {
+                    "description": "probe in the background", "prompt": "Run the probe",
+                    "subagent_type": "general-purpose", "run_in_background": true}}]),
+                None,
+            ),
+            system(
+                "task_started",
+                "u-started",
+                json!({"task_id": "a0bg", "tool_use_id": BG, "description": "probe in the background",
+                    "is_backgrounded": true, "task_type": "local_agent"}),
+            ),
+            tool_result(BG, "Async agent launched successfully.", None),
+            assistant(json!([{"type": "text", "text": "launched"}]), None),
+            json!({"op": "emit_json", "json": {
+                "type": "result", "subtype": "success", "duration_ms": 12,
+                "duration_api_ms": 7, "is_error": false, "num_turns": 1,
+                "session_id": "cli-bg-1", "total_cost_usd": 0.0001,
+                "usage": {"input_tokens": 3, "output_tokens": 5}, "result": "launched"}}),
+            // The parent's turn is over: what follows is printed out of turn.
+            json!({"op": "sleep", "ms": 400}),
+            assistant(
+                json!([{"type": "tool_use", "id": "t-bg-bash", "name": "Bash",
+                    "input": {"command": "echo hello-from-bg"}}]),
+                Some(BG),
+            ),
+            system(
+                "task_progress",
+                "u-progress",
+                json!({"task_id": "a0bg", "tool_use_id": BG, "description": "Running echo",
+                    "last_tool_name": "Bash"}),
+            ),
+            tool_result("t-bg-bash", "hello-from-bg", Some(BG)),
+            assistant(
+                json!([{"type": "text", "text": "it printed hello-from-bg"}]),
+                Some(BG),
+            ),
+            system(
+                "task_notification",
+                "u-notified",
+                json!({"task_id": "a0bg", "tool_use_id": BG, "status": "completed",
+                    "output_file": "/nonexistent/a0bg.output",
+                    "summary": "The probe printed hello-from-bg."}),
+            ),
+            json!({"op": "wait_eof", "timeout_ms": 15000, "optional": true}),
+        ];
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let mut config = ClaudeCodeConfig::default();
+        config.cli_path = Some(fake_bin("fake_claude"));
+        let provider = super::claude_code_resume_token::FakeCli {
+            inner: Arc::new(ClaudeCodeProvider::new(config)),
+            env: vec![
+                (
+                    "FAKE_CLAUDE_TRANSCRIPT".into(),
+                    transcript.display().to_string(),
+                ),
+                ("FAKE_CLAUDE_MAX_RUNTIME_MS".into(), "60000".into()),
+            ],
+        };
+        let graph = Arc::new(MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let emitter = Arc::new(RecordingEmitter::default());
+        let chat_config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager =
+            ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, chat_config)
+                .with_provider_source(Arc::new(provider))
+                .with_event_emitter(emitter.clone());
+        let mut req = request(None, None, "default");
+        req.message = "probe it in the background".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        let parent = Uuid::parse_str(&sid).unwrap();
+
+        let mirror = closed_mirrors(graph.as_ref(), parent, 1).await[0].clone();
+        assert_eq!(mirror.title.as_deref(), Some("probe in the background"));
+        let events = thread(graph.as_ref(), mirror.id).await;
+        assert!(
+            matches!(&events[0], ChatEvent::UserMessage { content } if content == "Run the probe"),
+            "{events:?}"
+        );
+        // What the sub-agent did after the parent's turn, at the mirror's top level.
+        assert!(
+            events.iter().any(|e| matches!(e,
+                ChatEvent::ToolUse { id, tool, parent_tool_use_id: None, .. }
+                    if id == "t-bg-bash" && tool == "Bash")),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e,
+                ChatEvent::ToolResult { id, parent_tool_use_id: None, .. } if id == "t-bg-bash")),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e,
+                ChatEvent::AssistantText { content, parent_tool_use_id: None }
+                    if content == "it printed hello-from-bg")),
+            "{events:?}"
+        );
+        // Closed by the notification, with its summary, as a success.
+        assert!(
+            matches!(events.last(), Some(ChatEvent::Result {
+                is_error: false, result_text: Some(t), stop_reason: Some(r), .. })
+                if t == "The probe printed hello-from-bg." && r == "completed"),
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ChatEvent::Result { .. }))
+                .count(),
+            1,
+            "one end: {events:?}"
+        );
+        // The CRUD bus: created, streaming, then not streaming once — at the notification.
+        let crud = emitter.of(&mirror.id.to_string());
+        assert_eq!(
+            crud.iter()
+                .filter(|(_, p)| *p == json!({"is_streaming": false}))
+                .count(),
+            1,
+            "{crud:?}"
+        );
+        let node = graph.get_chat_session(mirror.id).await.unwrap().unwrap();
+        assert!(node.updated_at > node.created_at, "the end is stamped");
+
+        // The parent: its turn as before, the out-of-turn activity flattened under the call.
+        let own = thread(graph.as_ref(), parent).await;
+        assert!(
+            own.iter().any(|e| matches!(e,
+                ChatEvent::BackgroundOutput { correlation_id: Some(c), content, .. }
+                    if c == BG && content.contains("hello-from-bg"))),
+            "{own:?}"
+        );
+        assert!(
+            !own.iter().any(|e| matches!(e,
+                ChatEvent::ToolUse { id, .. } if id == "t-bg-bash")),
+            "the parent's own thread is unchanged: {own:?}"
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
 }
