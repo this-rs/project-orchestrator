@@ -2197,6 +2197,18 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         }
     }
 
+    /// What a Claude Code sub-agent still running in the background prints between the
+    /// parent's turns reaches its mirror in the form a turn shows it (P18c); the parent
+    /// itself shows it flattened, as before, and its work log is not touched.
+    fn observe_out_of_turn(&self, _session_id: &str, events: &[nexus_claude::agent::AgentEvent]) {
+        let Some(tap) = &self.mirror else { return };
+        for event in events {
+            for structured in super::provider::event_map::structured_out_of_turn(event) {
+                tap.observe(&structured);
+            }
+        }
+    }
+
     /// The post-stream steps of the Claude Code engine, with the same functions:
     /// post-compaction re-injection, objective tracking, memory / feedback /
     /// observations. Interrupt cleanup and auto-continue are the runtime's.
@@ -6391,8 +6403,28 @@ impl ChatManager {
     }
 
     /// The passive observer that mirrors the sub-agents of the Claude Code session
-    /// `session_id` into read-only child conversations (`chat::mirror`, P18c).
+    /// `session_id` into read-only child conversations (`chat::mirror`, P18c), on the
+    /// historical engine: what the CLI prints out of turn goes through `oob_listener`, which
+    /// the tap does not see.
     pub(crate) fn mirror_tap(&self, session_id: &str) -> Option<Arc<super::mirror::MirrorTap>> {
+        self.spawn_mirror_tap(session_id, false)
+    }
+
+    /// The same on the agent engine, whose out-of-turn pump shows the tap what the CLI
+    /// prints between turns (`TurnServices::observe_out_of_turn`): a background
+    /// sub-agent's mirror follows it until the CLI notifies its end.
+    pub(crate) fn agent_mirror_tap(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<super::mirror::MirrorTap>> {
+        self.spawn_mirror_tap(session_id, true)
+    }
+
+    fn spawn_mirror_tap(
+        &self,
+        session_id: &str,
+        follows_out_of_turn: bool,
+    ) -> Option<Arc<super::mirror::MirrorTap>> {
         if !self.subagent_mirrors {
             return None;
         }
@@ -6404,6 +6436,7 @@ impl ChatManager {
                 nats: self.nats.clone(),
                 registry: Arc::clone(&self.mirrors),
             },
+            follows_out_of_turn,
         ))
     }
 
@@ -15450,7 +15483,7 @@ impl ChatManager {
                         // Claude Code runs its sub-agents itself: they get read-only mirrors
                         // (P18c). A native session's sub-agents are real children already.
                         matches!(kind, nexus_claude::agent::ProviderKind::ClaudeCode)
-                            .then(|| self.mirror_tap(session_id))
+                            .then(|| self.agent_mirror_tap(session_id))
                             .flatten(),
                     ),
                 ),

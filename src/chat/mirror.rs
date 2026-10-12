@@ -49,15 +49,34 @@
 //! Closed — its `result` written (the call's `tool_result` text, `is_error` kept), then
 //! `updated {is_streaming: false}` — when the call's `tool_result` (or its cancel) reaches
 //! the parent, else when the parent's turn ends, else when the parent session closes (its
-//! tap is dropped). Events of X arriving after the close are dropped.
+//! tap is dropped). Events of X arriving after the close are dropped. The close also stamps
+//! the node's `updated_at` (one write: a session listing shows when the mirror last moved;
+//! its `message_count` stays 1, the prompt, as it counts the user's messages).
 //!
 //! A BACKGROUND call (`run_in_background: true`) answers its `tool_result` at once ("launched"):
-//! that result does not close its mirror. It is closed by the CLI's `task_notification` when
-//! that names the call (`tool_use_id`), else when the parent's turn ends — at the latest. Not
-//! later: what a background sub-agent does after the turn reaches the parent out of turn, on
-//! the historical engine through a path no tap sees (`oob_listener`), and nothing ties its
-//! notification to its call on every CLI version; a mirror kept open past the turn could stay
-//! "streaming" for good. Such a mirror ends `success`, saying the rest shows in the parent.
+//! that result does not close its mirror. The sub-agent goes on after the parent's turn, and
+//! Claude Code keeps printing what it does on the SAME stream (CLI 2.1.296, measured with
+//! `claude -p --output-format stream-json`): its messages with `parent_tool_use_id` = the call,
+//! between the parent's turns, then `system/task_notification {tool_use_id, task_id, status,
+//! summary, output_file}` when it ends. That stream is the mirror's source, not the
+//! transcript or the `output_file` the notification names: it is already ordered, already
+//! masked, already read by one task per session, and it carries the sub-agent's structure
+//! (tool calls, results) that the output file flattens; a file would also mean reading the
+//! CLI's temporary directory from the backend.
+//!
+//! - Agent engine: what the CLI prints between turns comes through the runtime's
+//!   out-of-turn pump, which shows it to the parent flattened (`background_output`); the
+//!   pump hands the tap the same events in their structured form
+//!   (`TurnServices::observe_out_of_turn`, `event_map::structured_out_of_turn`), never
+//!   emitted. The mirror stays open across the parent's turns and is closed by the
+//!   notification that names its call (its `tool_use_id`, else the `task_id` its
+//!   `task_started` gave): `completed` closes it as a success, `killed` / `stopped` as
+//!   interrupted, anything else as a failure, with the notification's `summary` as its
+//!   result. At the latest it closes when its parent session closes (the tap is dropped),
+//!   and a restart closes it (`manager::recovery`).
+//! - Historical engine: what comes out of turn goes through `oob_listener`, which no tap
+//!   sees: the mirror is closed at the end of the parent's turn, saying the rest shows in
+//!   the parent.
 //!
 //! Only FIRST-LEVEL calls of a session are mirrored: a sub-agent's own `Task` call (an
 //! event whose parent is a call made inside a mirror) goes into its first-level mirror's
@@ -462,11 +481,19 @@ pub struct MirrorTap {
 
 impl MirrorTap {
     /// Starts the tap of `parent_session_id` (its worker runs on the current runtime).
-    pub(crate) fn spawn(parent_session_id: &str, deps: MirrorDeps) -> Arc<Self> {
+    /// `follows_out_of_turn`: the tap is also shown what the CLI prints between the
+    /// parent's turns (agent engine), so a background sub-agent's mirror stays open past
+    /// the turn until the CLI notifies its end ([module documentation](self)).
+    pub(crate) fn spawn(
+        parent_session_id: &str,
+        deps: MirrorDeps,
+        follows_out_of_turn: bool,
+    ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         let worker = Worker {
             parent: parent_session_id.to_string(),
             owner: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
+            follows_out_of_turn,
             deps,
             calls: HashMap::new(),
             nested: HashMap::new(),
@@ -494,8 +521,10 @@ impl MirrorTap {
             ChatEvent::ToolResult { id, .. } | ChatEvent::ToolCancelled { id, .. } => {
                 self.watch().remove(id)
             }
-            // A background sub-agent's end, as the CLI notifies it.
-            ChatEvent::Workflow { subtype, .. } => subtype == "task_notification",
+            // A background sub-agent's start (its task id) and end, as the CLI notifies them.
+            ChatEvent::Workflow { subtype, .. } => {
+                matches!(subtype.as_str(), "task_started" | "task_notification")
+            }
             ChatEvent::Result { .. }
             | ChatEvent::StreamingStatus {
                 is_streaming: false,
@@ -543,6 +572,9 @@ struct Call {
     input: serde_json::Value,
     /// Its immediate `tool_result` (a background launch) was seen.
     launched: bool,
+    /// The CLI's id of its task (`task_started`): what names it in a notification that
+    /// carries no `tool_use_id`.
+    task_id: Option<String>,
 }
 
 impl Call {
@@ -560,6 +592,8 @@ struct Worker {
     parent: String,
     /// This tap's token in the registry.
     owner: u64,
+    /// It sees what the CLI prints between the parent's turns (agent engine).
+    follows_out_of_turn: bool,
     deps: MirrorDeps,
     /// Top-level sub-agent calls of the parent not yet over.
     calls: HashMap<String, Call>,
@@ -602,6 +636,7 @@ impl Worker {
                         Call {
                             input: input.clone(),
                             launched: false,
+                            task_id: None,
                         },
                     );
                 }
@@ -633,26 +668,54 @@ impl Worker {
                     self.close(&id, "The sub-agent was cancelled.".to_string(), true, true)
                         .await;
                 }
+                ChatEvent::Workflow { subtype, data } if subtype == "task_started" => {
+                    // A background sub-agent's task id: what a notification without a
+                    // `tool_use_id` names it by.
+                    let (Some(call), Some(task)) = (
+                        data.get("tool_use_id").and_then(|v| v.as_str()),
+                        data.get("task_id").and_then(|v| v.as_str()),
+                    ) else {
+                        return;
+                    };
+                    if let Some(call) = self.calls.get_mut(call) {
+                        call.task_id = Some(task.to_string());
+                    }
+                }
                 ChatEvent::Workflow { data, .. } => {
-                    // The end of a background sub-agent, when the notification names its call.
-                    let Some(id) = data
+                    // The end of a background sub-agent, when the notification names its
+                    // call: by its id, else by the task its `task_started` gave. A
+                    // notification of a call the sub-agent made itself names neither.
+                    let by_call = data
                         .get("tool_use_id")
                         .and_then(|v| v.as_str())
                         .filter(|id| self.calls.get(*id).is_some_and(|c| c.launched))
-                        .map(str::to_string)
-                    else {
+                        .map(str::to_string);
+                    let by_task = || {
+                        let task = data.get("task_id").and_then(|v| v.as_str())?;
+                        self.calls
+                            .iter()
+                            .find(|(_, c)| c.launched && c.task_id.as_deref() == Some(task))
+                            .map(|(id, _)| id.clone())
+                    };
+                    let Some(id) = by_call.or_else(by_task) else {
                         return;
                     };
                     let text = ["summary", "result", "output"]
                         .iter()
-                        .find_map(|k| data.get(*k).and_then(|v| v.as_str()))
+                        .find_map(|k| {
+                            data.get(*k)
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.trim().is_empty())
+                        })
                         .unwrap_or("The background sub-agent ended.")
                         .to_string();
-                    let failed = data
-                        .get("status")
-                        .and_then(|s| s.as_str())
-                        .is_some_and(|s| s != "completed");
-                    self.close(&id, text, failed, false).await;
+                    let (is_error, interrupted) = match data.get("status").and_then(|s| s.as_str())
+                    {
+                        None | Some("completed") => (false, false),
+                        Some("killed" | "stopped" | "cancelled") => (true, true),
+                        Some(_) => (true, false),
+                    };
+                    self.close(&id, text, is_error, interrupted).await;
                 }
                 _ => {}
             },
@@ -686,37 +749,45 @@ impl Worker {
         }
     }
 
-    /// The parent's turn ended: every mirror still open is closed. A background sub-agent
-    /// whose end was not notified is closed too (decision M3): what it does after the turn
-    /// reaches the parent out of turn — on the historical engine through a path no tap
-    /// sees (`oob_listener`) — and nothing ties its notification to its call reliably on
-    /// every CLI version; a mirror left open past the turn could stay "streaming" for good.
+    /// The parent's turn ended: every mirror still open is closed, but a launched
+    /// background sub-agent's when this tap follows what the CLI prints out of turn (agent
+    /// engine): that one goes on, fed by the out-of-turn stream, until the CLI notifies its
+    /// end (or the parent session closes). On the historical engine its later events go
+    /// through `oob_listener`, which no tap sees: it is closed here, saying the rest shows
+    /// in the parent.
     async fn turn_ended(&mut self) {
+        let follows = self.follows_out_of_turn;
         let open: Vec<String> = self.mirrors.keys().cloned().collect();
         for call in open {
-            if self.calls.get(&call).is_some_and(|c| c.launched) {
-                self.close(
-                    &call,
-                    "The sub-agent runs in the background: what it does after this turn shows in the parent conversation."
-                        .to_string(),
-                    false,
-                    true,
-                )
-                .await;
-            } else {
-                self.close(
-                    &call,
-                    "The parent turn ended before the sub-agent answered.".to_string(),
-                    true,
-                    true,
-                )
-                .await;
+            match self.calls.get(&call).map(|c| c.launched) {
+                Some(true) if follows => {}
+                Some(true) => {
+                    self.close(
+                        &call,
+                        "The sub-agent runs in the background: what it does after this turn shows in the parent conversation."
+                            .to_string(),
+                        false,
+                        true,
+                    )
+                    .await;
+                }
+                _ => {
+                    self.close(
+                        &call,
+                        "The parent turn ended before the sub-agent answered.".to_string(),
+                        true,
+                        true,
+                    )
+                    .await;
+                }
             }
         }
-        // A call of the ended turn that never got a mirror is over too.
-        self.calls.clear();
-        self.nested.clear();
-        self.closed.clear();
+        // A call of the ended turn that never got a mirror is over too, but a background
+        // sub-agent that goes on (its mirror may open on its first out-of-turn event).
+        self.calls.retain(|_, c| follows && c.launched);
+        let calls = &self.calls;
+        self.nested.retain(|_, first| calls.contains_key(first));
+        self.closed.retain(|call| calls.contains_key(call));
     }
 
     /// The parent's node (read once).
@@ -1028,6 +1099,15 @@ impl Worker {
             .closed(&self.parent, call, self.owner, id);
         self.forget_call(call);
         self.streaming(id, false);
+        // When it last moved, for a listing (its events do not touch the node).
+        if let Err(e) = self
+            .deps
+            .graph
+            .update_chat_session(id, None, None, None, None, None, None)
+            .await
+        {
+            tracing::warn!(mirror = %id, error = %e, "the end of a mirror was not stamped on its node");
+        }
         tracing::info!(parent = %self.parent, call, mirror = %id, "mirror of a Claude Code sub-agent closed");
     }
 
@@ -1097,7 +1177,17 @@ mod tests {
     }
 
     impl World {
+        /// The tap of the agent engine (it follows what the CLI prints out of turn).
         fn tap(&self) -> Arc<MirrorTap> {
+            self.tap_of(true)
+        }
+
+        /// The tap of the historical engine (out of turn goes through `oob_listener`).
+        fn legacy_tap(&self) -> Arc<MirrorTap> {
+            self.tap_of(false)
+        }
+
+        fn tap_of(&self, follows_out_of_turn: bool) -> Arc<MirrorTap> {
             MirrorTap::spawn(
                 &self.parent.id.to_string(),
                 MirrorDeps {
@@ -1106,6 +1196,7 @@ mod tests {
                     nats: None,
                     registry: Arc::clone(&self.registry),
                 },
+                follows_out_of_turn,
             )
         }
     }
@@ -1560,8 +1651,8 @@ mod tests {
 
     /// A background call (`run_in_background`): its immediate result (the launch) does not
     /// close the mirror; the sub-agent's later events still go in; the CLI's notification
-    /// naming the call closes it with its summary. Without one, the turn's end closes it as a
-    /// success that says the rest shows in the parent.
+    /// naming the call closes it with its summary. On the historical engine (no out-of-turn
+    /// view), the turn's end closes it as a success that says the rest shows in the parent.
     #[tokio::test]
     async fn a_background_agent_call_keeps_its_mirror_open_past_its_launch() {
         let w = world().await;
@@ -1588,13 +1679,13 @@ mod tests {
             |e| matches!(e, ChatEvent::AssistantText { content, .. } if content == "still working")
         ));
         assert!(
-            matches!(events.last(), Some(ChatEvent::Result { is_error: false, result_text: Some(t), .. }) if t == "bg done"),
+            matches!(events.last(), Some(ChatEvent::Result { is_error: false, result_text: Some(t), stop_reason: Some(r), .. }) if t == "bg done" && r == "completed"),
             "{events:?}"
         );
 
-        // No notification: the end of the turn closes it, as a success.
+        // Historical engine, no notification: the end of the turn closes it, as a success.
         let w = world().await;
-        let tap = w.tap();
+        let tap = w.legacy_tap();
         tap.observe(&call(CALL, "Agent", input, None));
         tap.observe(&said("started", Some(CALL)));
         tap.observe(&answered(CALL, "Async agent launched successfully", None));
@@ -1606,6 +1697,96 @@ mod tests {
             thread(w.graph.as_ref(), mirror.id).await.last(),
             Some(ChatEvent::Result { is_error: false, result_text: Some(t), .. }) if t.contains("background")
         ));
+    }
+
+    /// Agent engine: a background sub-agent outlives the parent's turn. Its mirror stays
+    /// open across the turn's end (and the next turn's), takes what the CLI prints out of
+    /// turn, and is closed by the notification that names its task (`task_started` gave the
+    /// task id; this notification carries no `tool_use_id`), as a failure when the task
+    /// failed; the node's `updated_at` moves. A notification of a call the sub-agent made
+    /// itself closes nothing.
+    #[tokio::test]
+    async fn a_background_sub_agent_is_followed_past_the_turn_until_its_notification() {
+        let w = world().await;
+        let tap = w.tap();
+        let input =
+            serde_json::json!({"description": "bg", "prompt": "go", "run_in_background": true});
+        tap.observe(&call(CALL, "Agent", input, None));
+        tap.observe(&ChatEvent::Workflow {
+            subtype: "task_started".into(),
+            data: serde_json::json!({"task_id": "a1b2", "tool_use_id": CALL, "is_backgrounded": true}),
+        });
+        tap.observe(&answered(CALL, "Async agent launched successfully", None));
+        tap.observe(&said("launched", None));
+        tap.observe(&said("started", Some(CALL)));
+        tap.observe(&ChatEvent::StreamingStatus {
+            is_streaming: false,
+        });
+        tap.flushed().await;
+        let mirror = mirrors_of(w.graph.as_ref(), w.parent.id).await[0].clone();
+        assert!(
+            w.registry.is_open(&mirror.id.to_string()),
+            "open past the parent's turn"
+        );
+
+        // Out of turn: the sub-agent works, and the parent may even play another turn.
+        tap.observe(&call(
+            "toolu_bash",
+            "Bash",
+            serde_json::json!({"command": "sleep 6"}),
+            Some(CALL),
+        ));
+        tap.observe(&ChatEvent::Workflow {
+            subtype: "task_notification".into(),
+            data: serde_json::json!({"task_id": "b9", "tool_use_id": "toolu_bash", "status": "completed", "summary": "Sleep"}),
+        });
+        tap.observe(&answered("toolu_bash", "slept", Some(CALL)));
+        tap.observe(&ChatEvent::Result {
+            session_id: w.parent.id.to_string(),
+            duration_ms: 1,
+            cost_usd: None,
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: None,
+            result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
+        });
+        tap.observe(&said("it broke", Some(CALL)));
+        tap.flushed().await;
+        assert!(
+            w.registry.is_open(&mirror.id.to_string()),
+            "still open: its own notification has not come"
+        );
+        tap.observe(&ChatEvent::Workflow {
+            subtype: "task_notification".into(),
+            data: serde_json::json!({"task_id": "a1b2", "status": "failed", "summary": "could not finish"}),
+        });
+        tap.observe(&said("late", Some(CALL)));
+        tap.flushed().await;
+        assert!(!w.registry.is_open(&mirror.id.to_string()));
+
+        let events = thread(w.graph.as_ref(), mirror.id).await;
+        let words: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::AssistantText { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(words, ["started", "it broke"], "{events:?}");
+        assert!(events.iter().any(|e| matches!(e,
+            ChatEvent::ToolResult { id, parent_tool_use_id: None, .. } if id == "toolu_bash")));
+        assert!(
+            matches!(events.last(), Some(ChatEvent::Result { is_error: true, result_text: Some(t), stop_reason: Some(r), .. })
+                if t == "could not finish" && r == "error"),
+            "{events:?}"
+        );
+        let node = w.graph.get_chat_session(mirror.id).await.unwrap().unwrap();
+        assert!(node.updated_at > node.created_at, "the close is stamped");
+        assert_eq!(node.message_count, 1, "the prompt is its only user message");
     }
 
     /// Two live taps of one parent (an old turn's tap still finishing after a resume): only

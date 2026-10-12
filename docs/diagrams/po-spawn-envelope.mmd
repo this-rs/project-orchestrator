@@ -1,6 +1,6 @@
 %% name: po-spawn-envelope
 %% covers: backend:src/chat/{envelope,subagents,mirror}.rs backend:src/auth/{agent_tokens,jwt,tool_profile}.rs
-%% verified: b54410c8
+%% verified: 8de079c6
 %% ---
 %% PROUVE : ce qu'une session ouverte PAR UN AGENT a le droit d'être (décisions A17, A25, A34),
 %%   tel que le code le fait sur la branche integration/harness-multi-provider (base 84804df0,
@@ -15,8 +15,9 @@
 %%                              allows_action, route_forbidden) ; src/mcp/server.rs — profile_refusal
 %%   src/auth/middleware.rs   — require_auth, enforce_token_policy, is_human_only_mutation (po-api)
 %%   src/chat/subagents.rs    — SubagentHooks (outil Agent du harnais natif, P18), ChatManager::run_subagent
-%%   src/chat/mirror.rs       — MirrorTap (observe, turn_ended), MirrorRegistry (claim, bind, closed, forget_owner,
-%%                              deleted), MirrorReadOnly ; ChatManager::refuse_if_mirror, mirror_tap (P18c)
+%%   src/chat/mirror.rs       — MirrorTap (spawn follows_out_of_turn, observe, turn_ended), MirrorRegistry (claim, bind, closed,
+%%                              forget_owner, deleted), MirrorReadOnly ; ChatManager::refuse_if_mirror, mirror_tap,
+%%                              agent_mirror_tap ; ManagerTurnServices::observe_out_of_turn (P18c, P18c-suite)
 %%   src/chat/envelope.rs     — identify_caller, resolve_envelope, ParentEnvelope::apply,
 %%                              restrict_permission_mode, is_within, ensure_child_of
 %%   src/api/chat_handlers.rs — create_session ; src/api/handlers.rs — delegate_task,
@@ -142,8 +143,10 @@ flowchart TD
     subgraph mirror["Sous-agent de Claude Code (P18c, mirror.rs) — miroir en lecture seule"]
         MTAP["✅ MirrorTap::observe : PASSIF, après émission (moteur agent : ManagerTurnServices::observe, kind claude_code seulement ;<br/>moteur historique : emit_chat de stream_response + turn_ended) ; ne clone que les événements des appels Task/Agent suivis<br/>test : the_parents_stream_is_the_same_with_and_without_the_tap, a_native_session_gets_no_mirror"]
         MCLAIM["✅ MirrorRegistry::claim (parent, tool_use_id) atomique, jeton du tap : un seul écrivain, jamais deux miroirs ;<br/>graphe consulté avant d'écrire ; un tap ne ferme / n'oublie que ce qu'il possède (forget_owner à sa fin)<br/>test : a_second_live_tap_never_writes_into_a_mirror_the_first_holds, a_replay_never_writes_a_second_mirror"]
-        MNODE["✅ nœud enfant : spawned_by = SpawnedBy::Conversation{parent, tool_use_id}, mirror_of = claude_code,<br/>provider / modèle / cwd / projet / propriétaire du parent ; created (payload commun) puis is_streaming true/false ;<br/>fermé au tool_result de l'appel (sauf lancement run_in_background), à la fin du tour ou du parent<br/>test : a_task_call_gets_one_mirror_holding_its_events_closed_by_its_result, a_background_agent_call_keeps_its_mirror_open_past_its_launch"]
+        MNODE["✅ nœud enfant : spawned_by = SpawnedBy::Conversation{parent, tool_use_id}, mirror_of = claude_code,<br/>provider / modèle / cwd / projet / propriétaire du parent ; created (payload commun) puis is_streaming true/false ;<br/>fermé au tool_result de l'appel (sauf lancement run_in_background), à la fin du tour ou du parent ; updated_at tamponné à la fermeture<br/>test : a_task_call_gets_one_mirror_holding_its_events_closed_by_its_result, a_background_agent_call_keeps_its_mirror_open_past_its_launch"]
+        MBG["✅ sous-agent EN ARRIÈRE-PLAN (moteur agent) : suivi au-delà du tour ; pump_out_of_band → TurnServices::observe_out_of_turn<br/>→ event_map::structured_out_of_turn (forme d'un tour, jamais émise : le parent garde background_output) ;<br/>fermé par task_notification (tool_use_id, sinon task_id de task_started) : completed = succès, killed/stopped = interrompu, sinon échec, summary = résultat ;<br/>au plus tard à la fermeture du parent ou au redémarrage ; moteur historique : fermé en fin de tour (oob_listener non observé)<br/>test : a_background_sub_agent_is_mirrored_out_of_turn_until_its_notification (fake_claude), a_background_sub_agent_is_followed_past_the_turn_until_its_notification"]
         MRO["✅ lecture seule : 409 mirror_read_only (message, reprise, switch-provider, modèle, mode, permission ; trame WS plate) ;<br/>jamais repris par la recovery ; supprimé ouvert → abandonné par son tap<br/>test : a_mirror_refuses_every_rest_write_with_409_mirror_read_only, a_cut_mirror_of_a_claude_code_sub_agent_is_closed_at_boot_never_resumed, deleting_an_open_mirror_stops_its_tap"]
         MTAP --> MCLAIM --> MNODE --> MRO
+        MNODE --> MBG
     end
     MNODE -.pas d'enveloppe : aucun processus.-> LATER

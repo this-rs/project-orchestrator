@@ -1,6 +1,6 @@
 %% name: po-chat-agent-runtime
 %% covers: backend:src/chat/{agent_runtime,agent_hooks,cancel_relay,session_grants,lasting_rules}.rs backend:src/chat/provider/transcripts.rs
-%% verified: c15efef6
+%% verified: 8de079c6
 %% ---
 %% PROUVE : le moteur « agent » du chat (tâche B13) : comment un AgentSession nexus est piloté, ce qu'il
 %%   diffuse et persiste, ce qu'il ne fait PAS encore. Le routage entre moteurs est dans po-chat-manager.
@@ -52,7 +52,7 @@ flowchart TD
     end
 
     subgraph oob["Hors tour"]
-        OOB["✅ pump_out_of_band : regroupe par numéro de message du provider, masque, émet background_output, puis sync_resume_token<br/>test : agent_path_resumes_from_the_persisted_token_and_out_of_turn_output_regroups"]
+        OOB["✅ pump_out_of_band : regroupe par numéro de message du provider, masque, montre d'abord le lot à TurnServices::observe_out_of_turn<br/>(miroir d'un sous-agent Claude Code en arrière-plan, P18c-suite ; rien n'est émis de là), émet background_output, puis sync_resume_token<br/>test : agent_path_resumes_from_the_persisted_token_and_out_of_turn_output_regroups, a_background_sub_agent_is_mirrored_out_of_turn_until_its_notification"]
     end
 
     subgraph ctl["Commandes de session"]

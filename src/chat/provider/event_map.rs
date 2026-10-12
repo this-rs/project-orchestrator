@@ -499,6 +499,24 @@ fn result_line(output: Option<&ToolOutput>) -> String {
     }
 }
 
+/// An event received out of turn in its structured form, as a turn shows it: a text, a
+/// thought, a complete tool call, a tool result (with its `parent_tool_use_id`). Nothing
+/// for any other event. [`out_of_band_to_chat_events`] flattens these for the session;
+/// this form is what follows a sub-agent still running after the turn (`chat::mirror`).
+/// Pure: a fresh mapper each time (a complete call is a `tool_use`, never a resolution).
+pub fn structured_out_of_turn(event: &AgentEvent) -> Vec<ChatEvent> {
+    match event {
+        AgentEvent::Text { .. }
+        | AgentEvent::Thinking { .. }
+        | AgentEvent::ToolResult { .. }
+        | AgentEvent::ToolCall {
+            input_complete: true,
+            ..
+        } => EventMapper::new().map(event),
+        _ => Vec::new(),
+    }
+}
+
 /// One text-like out-of-turn event: (seq, parent, line, is_user, is_result).
 type TextLine = (Option<u64>, Option<String>, String, bool, bool);
 
@@ -1226,6 +1244,55 @@ mod tests {
         assert!(
             matches!(mapper.map(&other).as_slice(), [ChatEvent::Workflow { subtype, .. }] if subtype == "task_progress")
         );
+    }
+
+    /// What a sub-agent prints out of turn, in the form a turn shows it (its mirror's
+    /// source): a complete call is a `tool_use` with its parent, a result keeps its parent;
+    /// an announced-but-incomplete call, a delta, a task update or a notice give nothing.
+    #[test]
+    fn structured_out_of_turn_keeps_the_sub_agents_structure() {
+        let call = |input_complete| AgentEvent::ToolCall {
+            id: "t-bash".into(),
+            name: "Bash".into(),
+            input: json!({"command": "ls"}),
+            category: Default::default(),
+            canonical: None,
+            input_complete,
+            seq: Some(4),
+            parent: Some("toolu_bg".into()),
+        };
+        assert!(matches!(
+            structured_out_of_turn(&call(true)).as_slice(),
+            [ChatEvent::ToolUse { id, tool, parent_tool_use_id: Some(p), .. }]
+                if id == "t-bash" && tool == "Bash" && p == "toolu_bg"
+        ));
+        assert!(structured_out_of_turn(&call(false)).is_empty());
+        let result = AgentEvent::ToolResult {
+            id: "t-bash".into(),
+            output: Some(ToolOutput::Text("a.md".into())),
+            is_error: false,
+            seq: Some(5),
+            parent: Some("toolu_bg".into()),
+        };
+        assert!(matches!(
+            structured_out_of_turn(&result).as_slice(),
+            [ChatEvent::ToolResult { id, parent_tool_use_id: Some(p), .. }]
+                if id == "t-bash" && p == "toolu_bg"
+        ));
+        let text = AgentEvent::Text {
+            text: "done".into(),
+            seq: Some(6),
+            parent: Some("toolu_bg".into()),
+        };
+        assert!(matches!(
+            structured_out_of_turn(&text).as_slice(),
+            [ChatEvent::AssistantText { content, parent_tool_use_id: Some(_) }] if content == "done"
+        ));
+        assert!(structured_out_of_turn(&AgentEvent::ProviderNotice {
+            kind: "status".into(),
+            data: json!({}),
+        })
+        .is_empty());
     }
 
     #[test]
