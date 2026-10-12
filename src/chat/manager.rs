@@ -1147,15 +1147,17 @@ impl nexus_claude::HookCallback for CompactionNotifier {
                 "PreCompact hook fired — emitted CompactionStarted event"
             );
         }
-        // Always allow compaction to proceed.
-        // custom_instructions is passed via `reason` field — the CLI uses this as
-        // feedback context for the compaction summary. The SDK's SyncHookJSONOutput
-        // does not have a dedicated `custom_instructions` output field (it's input-only
-        // on PreCompactHookInput), so `reason` is the semantic equivalent for output.
+        // Always allow compaction to proceed. The instructions go out as
+        // `systemMessage`: the CLI appends a PreCompact callback's systemMessage to
+        // the summary's custom instructions, ignores `reason`, and rejects a
+        // `hookSpecificOutput` (no PreCompact variant). Measured on Claude Code
+        // 2.1.295 (task M2c); the nexus Claude Code facade answers the same way.
+        // The CLI ALSO shows this text to the user, in its "Compacted…" line: it is
+        // not a hidden channel. Re-check on each CLI bump (docs/parity/engines.md).
         Ok(nexus_claude::HookJSONOutput::Sync(
             nexus_claude::SyncHookJSONOutput {
                 continue_: Some(true),
-                reason: custom_instructions,
+                system_message: custom_instructions,
                 ..Default::default()
             },
         ))
@@ -27391,19 +27393,23 @@ mod tests {
         let context = HookContext { signal: None };
         let result = notifier.execute(&input, None, &context).await.unwrap();
 
-        // 4. Verify: output should have custom_instructions (via reason field)
+        // 4. Verify: the custom instructions go out as systemMessage (M2c)
         if let nexus_claude::HookJSONOutput::Sync(sync) = result {
             assert_eq!(sync.continue_, Some(true), "Must always continue");
-            let reason = sync
-                .reason
-                .expect("reason (custom_instructions) should be set");
+            let instructions = sync
+                .system_message
+                .expect("systemMessage (custom_instructions) should be set");
             assert!(
-                reason.contains("src/chat/manager.rs"),
-                "Should mention affected files, got: {reason}"
+                sync.reason.is_none(),
+                "the CLI ignores reason on PreCompact"
             );
             assert!(
-                reason.contains("Implement compaction context"),
-                "Should mention task title, got: {reason}"
+                instructions.contains("src/chat/manager.rs"),
+                "Should mention affected files, got: {instructions}"
+            );
+            assert!(
+                instructions.contains("Implement compaction context"),
+                "Should mention task title, got: {instructions}"
             );
         } else {
             panic!("Expected Sync output");
@@ -27433,7 +27439,7 @@ mod tests {
         if let nexus_claude::HookJSONOutput::Sync(sync) = result {
             assert_eq!(sync.continue_, Some(true));
             assert!(
-                sync.reason.is_none(),
+                sync.system_message.is_none() && sync.reason.is_none(),
                 "No context source → no custom instructions"
             );
         } else {

@@ -1,6 +1,6 @@
 %% name: po-chat-agent-runtime
 %% covers: backend:src/chat/{agent_runtime,agent_hooks,cancel_relay,session_grants,lasting_rules}.rs backend:src/chat/provider/transcripts.rs
-%% verified: 9d820504
+%% verified: c15efef6
 %% ---
 %% PROUVE : le moteur « agent » du chat (tâche B13) : comment un AgentSession nexus est piloté, ce qu'il
 %%   diffuse et persiste, ce qu'il ne fait PAS encore. Le routage entre moteurs est dans po-chat-manager.
@@ -65,7 +65,7 @@ flowchart TD
     LOST["🟠 restent : la mémoire n’enregistre que si memory_config est posé (comme le moteur hérité) ; jamais contre un vrai fournisseur"]
     EMIT --> AFTER
     AFTER --> DRAIN
-    GHOOKS["✅ GraphSessionHooks (agent_hooks.rs) : SessionHooks sur la MÊME table que le chemin Claude (graph_hook_table) :<br/>before_tool = PreToolUse (contexte → AddContext, block / permissionDecision deny → Deny, updatedInput → ReplaceInput) ; after_tool = PostToolUse ; before_compaction = le `reason` du CompactionNotifier ; outil nommé comme Claude Code (canonical), entrée intacte ; hook en échec ignoré ; matcher honoré<br/>remis par build_agent_spec à Native et Claude Code seulement (ni Codex/ACP, ni session distante) ; runner : guidage de compaction seul ; le notifier de l'agent n'annonce pas la compaction (le provider émet la sienne)<br/><i>test : chat::agent_hooks::tests (9), the_agent_engine_gives_the_graph_hooks_only_to_providers_that_run_hooks, the_hook_table_has_the_per_tool_hooks_unless_the_session_is_a_runner, an_agent_engine_compaction_is_not_announced_twice, the_graph_hooks_answer_after_a_tool_and_before_a_compaction (provider scripté, natif ET Claude Code). Rejoué SANS le correctif : spec.hooks jamais posé → 1 rouge ; contexte et refus ignorés → 4 rouges<br/>🟠 aucun hôte ni modèle réel</i>"]
+    GHOOKS["✅ GraphSessionHooks (agent_hooks.rs) : SessionHooks sur la MÊME table que le chemin Claude (graph_hook_table) :<br/>before_tool = PreToolUse (contexte → AddContext, block / permissionDecision deny → Deny, updatedInput → ReplaceInput) ; after_tool = PostToolUse ; before_compaction = le `systemMessage` du CompactionNotifier (le champ que le CLI ajoute aux instructions du résumé ET affiche à l utilisateur dans sa ligne « Compacted… » ; `reason` ignoré, mesuré sur Claude Code 2.1.295, M2c) ; outil nommé comme Claude Code (canonical), entrée intacte ; hook en échec ignoré ; matcher honoré<br/>remis par build_agent_spec à Native et Claude Code seulement (ni Codex/ACP, ni session distante) ; runner : guidage de compaction seul ; le notifier de l'agent n'annonce pas la compaction (le provider émet la sienne)<br/><i>test : chat::agent_hooks::tests (9), the_agent_engine_gives_the_graph_hooks_only_to_providers_that_run_hooks, the_hook_table_has_the_per_tool_hooks_unless_the_session_is_a_runner, an_agent_engine_compaction_is_not_announced_twice, the_graph_hooks_answer_after_a_tool_and_before_a_compaction (provider scripté, natif ET Claude Code). Rejoué SANS le correctif : spec.hooks jamais posé → 1 rouge ; contexte et refus ignorés → 4 rouges<br/>🟠 aucun hôte ni modèle réel</i>"]
     MGR --> GHOOKS
 
     subgraph pert["Modèle par tour — mode full + étape auto (before_turn)"]
