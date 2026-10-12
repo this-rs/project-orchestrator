@@ -42,8 +42,9 @@ Un seul scénario, joué sur les deux moteurs, même assertion par fonction :
 | `ask_user_question` | une question du modèle s'affiche (ask_user_question) et la réponse de l'utilisateur lui revient au tour suivant | ok | ok | ok |
 | `subagents` | un sous-agent (Agent / Task) travaille et sa réponse revient en résultat ; sur le natif, une session enfant qui ne peut pas re-déléguer | ok | ok | ok |
 | `system_init.degraded` | system_init n'annonce comme manquant qu'une limite du modèle (liste fermée) | ok | ok | ok |
+| `session_limits` | sans réglage, aucune limite de durée par tour ni budget de session (ISO5) : le CLI ne reçoit pas --max-budget-usd, une session du moteur agent s'ouvre et reprend sans turn_timeout_ms ni max_tokens | ok | ok | ok |
 
-`ok` : Claude Code 28/29, Claude Code (moteur agent) 28/29, natif 29/29.
+`ok` : Claude Code 29/30, Claude Code (moteur agent) 29/30, natif 30/30.
 
 ## Écarts déclarés
 

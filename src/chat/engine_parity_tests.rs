@@ -40,8 +40,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use nexus_claude::agent::{
     AgentProvider, AgentSession, Capabilities, CompactionInfo, HookVerdict, ModelInfo,
-    ProviderError, ProviderHealth, ProviderKind, ResumeToken, SessionHooks, SessionSpec,
-    SubagentRequest, ToolCallInfo, ToolResultInfo, TurnContext, TurnDirective,
+    ProviderError, ProviderHealth, ProviderKind, ResumeToken, SessionHooks, SessionLimits,
+    SessionSpec, SubagentRequest, ToolCallInfo, ToolResultInfo, TurnContext, TurnDirective,
 };
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -245,6 +245,10 @@ const FUNCTIONS: &[(&str, &str)] = &[
     (
         "system_init.degraded",
         "system_init n'annonce comme manquant qu'une limite du modèle (liste fermée)",
+    ),
+    (
+        "session_limits",
+        "sans réglage, aucune limite de durée par tour ni budget de session (ISO5) : le CLI ne reçoit pas --max-budget-usd, une session du moteur agent s'ouvre et reprend sans turn_timeout_ms ni max_tokens",
     ),
 ];
 
@@ -1495,6 +1499,8 @@ struct Answers {
     before_tool: StdMutex<Vec<(String, HookVerdict)>>,
     after_tool: StdMutex<Vec<Option<String>>>,
     before_compaction: StdMutex<Vec<Option<String>>>,
+    /// The limits every session was opened or resumed with, by provider kind (ISO5).
+    limits: StdMutex<Vec<(ProviderKind, SessionLimits)>>,
 }
 
 /// The hooks the engine gave the session, every answer recorded.
@@ -1548,6 +1554,11 @@ struct Tap {
 
 impl Tap {
     fn tap(&self, mut spec: SessionSpec) -> SessionSpec {
+        self.answers
+            .limits
+            .lock()
+            .unwrap()
+            .push((self.inner.kind(), spec.limits));
         if let Some(inner) = spec.hooks.take() {
             spec.hooks = Some(Arc::new(Recording {
                 inner,
@@ -1604,6 +1615,34 @@ impl ProviderSource for Taps {
             _ => None,
         }
     }
+}
+
+/// ISO5: whether every session of `kind` (one at least) was opened and resumed with neither a
+/// turn time limit nor a session budget (tokens or USD), and what was seen.
+fn no_session_limits(answers: &Answers, kind: ProviderKind) -> (bool, String) {
+    let seen: Vec<SessionLimits> = answers
+        .limits
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(k, _)| *k == kind)
+        .map(|(_, limits)| *limits)
+        .collect();
+    let ok = !seen.is_empty()
+        && seen.iter().all(|l| {
+            l.turn_timeout_ms.is_none() && l.max_tokens.is_none() && l.max_cost_usd.is_none()
+        });
+    let what: Vec<_> = seen
+        .iter()
+        .map(|l| (l.turn_timeout_ms, l.max_tokens, l.max_cost_usd))
+        .collect();
+    (
+        ok,
+        format!(
+            "{} session(s), (turn_timeout_ms, max_tokens, max_cost_usd)={what:?}",
+            seen.len()
+        ),
+    )
 }
 
 fn stop(usage_prompt: u64) -> Vec<Value> {
@@ -2795,6 +2834,26 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         Cause::Harness,
         format!("--resume {on:?}, message lu={resumed}"),
     );
+    // ISO5: nothing configured, no turn time limit and no session budget: the CLI is never
+    // given --max-budget-usd, and on the agent engine the session specs carry no limit.
+    let budget_flags = (0..2)
+        .flat_map(|n| cli.args(n))
+        .filter(|a| a.starts_with("--max-budget"))
+        .count();
+    let spawned = !cli.args(0).is_empty() && !cli.args(1).is_empty();
+    let (specs_ok, specs_seen) = if matches!(path, ProviderPath::Agent) {
+        no_session_limits(&answers, ProviderKind::ClaudeCode)
+    } else {
+        (true, "moteur historique : aucune SessionSpec".to_string())
+    };
+    cc.check(
+        "session_limits",
+        spawned && budget_flags == 0 && specs_ok,
+        Cause::Harness,
+        format!(
+            "CLI lancé deux fois={spawned}, --max-budget* dans argv={budget_flags}, {specs_seen}"
+        ),
+    );
     w.settle(0, &manager).await;
 
     // ===================================================================
@@ -3581,6 +3640,10 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
             format!("reprise refusée : {e:#}"),
         ),
     }
+    // ISO5: nothing configured, the native sessions (opened, then resumed after the
+    // restart) carry no turn time limit and no session budget.
+    let (limits_ok, limits_seen) = no_session_limits(&answers, ProviderKind::Native);
+    na.check("session_limits", limits_ok, Cause::Harness, limits_seen);
 
     // ===================================================================
     // native → Claude Code: the conversation relayed back (process #3)
