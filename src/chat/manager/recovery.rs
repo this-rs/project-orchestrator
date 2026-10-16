@@ -101,6 +101,8 @@ fn is_bookkeeping(event_type: &str) -> bool {
             | "compaction_recovery"
             | "compact_boundary"
             | "refs_resolved"
+            // The citations of the answer: announced after the turn's own result.
+            | "cites_resolved"
             // The agent engine stores a background task's notification out of turn as a
             // `workflow` (`task_notification`, follow-up review of #711).
             | "workflow"

@@ -1399,6 +1399,11 @@ impl Neo4jClient {
         let mut structs: Vec<String> = Vec::new();
         let mut traits: Vec<String> = Vec::new();
         let mut enums: Vec<String> = Vec::new();
+        // Work entities a session CITES (`#kind:uuid`): matched on their `id`.
+        let mut plans: Vec<String> = Vec::new();
+        let mut tasks: Vec<String> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        let mut decisions: Vec<String> = Vec::new();
 
         for (etype, eid) in entities {
             match etype.as_str() {
@@ -1407,6 +1412,10 @@ impl Neo4jClient {
                 "Struct" => structs.push(eid.clone()),
                 "Trait" => traits.push(eid.clone()),
                 "Enum" => enums.push(eid.clone()),
+                "Plan" => plans.push(eid.clone()),
+                "Task" => tasks.push(eid.clone()),
+                "Note" => notes.push(eid.clone()),
+                "Decision" => decisions.push(eid.clone()),
                 _ => {} // skip unknown types
             }
         }
@@ -1475,6 +1484,42 @@ impl Neo4jClient {
                 .param("session_id", sid.clone())
                 .param("ids", ids.clone());
 
+            let mut result = self.graph.execute(q).await?;
+            if let Some(row) = result.next().await? {
+                total += row.get::<i64>("cnt").unwrap_or(0) as usize;
+            }
+        }
+
+        // Entities a session CITES (`#kind:uuid`): each is matched on the node's
+        // `id` (a uuid string). A citation of something the graph does not hold
+        // links nothing — never a phantom node.
+        let cited_types: &[(&str, &[String])] = &[
+            ("Plan", &plans),
+            ("Task", &tasks),
+            ("Note", &notes),
+            ("Decision", &decisions),
+        ];
+        for (label, ids) in cited_types {
+            if ids.is_empty() {
+                continue;
+            }
+            let cypher = format!(
+                r#"
+                MATCH (s:ChatSession {{id: $session_id}})
+                UNWIND $ids AS cited_id
+                MATCH (e:{label} {{id: cited_id}})
+                MERGE (s)-[r:DISCUSSED]->(e)
+                ON CREATE SET r.mention_count = 1,
+                             r.first_mentioned_at = datetime(),
+                             r.last_mentioned_at = datetime()
+                ON MATCH SET r.mention_count = r.mention_count + 1,
+                            r.last_mentioned_at = datetime()
+                RETURN count(r) AS cnt
+                "#
+            );
+            let q = query(&cypher)
+                .param("session_id", sid.clone())
+                .param("ids", ids.to_vec());
             let mut result = self.graph.execute(q).await?;
             if let Some(row) = result.next().await? {
                 total += row.get::<i64>("cnt").unwrap_or(0) as usize;

@@ -1,0 +1,76 @@
+{
+  "_contract_version": 1,
+  "_description": "The agent to user citation token, read back from the text an agent wrote: `#kind:uuid` — a data kind and a canonical 36-character id that stands on its own. The two readers must agree: the backend's `refs::cite::cited_refs` and the frontend's `findRefTokens` (`src/utils/messageRefs.ts`), which also feeds `remarkCiteRefs`. A token keeps its power only in the agent's prose: not inside an inline code span or a fenced block, not glued to a word, never an actor kind ('@' is the actor sigil), never a malformed id — and a token the server has made inert (a U+2060 WORD JOINER before the sigil) is nobody's citation. This file is a byte-for-byte copy on both sides (`backend/tests/fixtures/refs/cited_tokens.json` and `frontend/src/refs/__fixtures__/cited_tokens.json`); both sides test against it.",
+  "cited": [
+    {
+      "why": "the agent names a plan inside a sentence",
+      "text": "Voir #plan:57cf05c9-25b6-495d-ab07-de4b11d64736 pour le détail.",
+      "tokens": [{ "kind": "plan", "id": "57cf05c9-25b6-495d-ab07-de4b11d64736" }]
+    },
+    {
+      "why": "two kinds, in order of appearance",
+      "text": "#plan:57cf05c9-25b6-495d-ab07-de4b11d64736 et #task:3adeffc9-c8b0-4e2f-a674-55bfcb293433 sont liés",
+      "tokens": [
+        { "kind": "plan", "id": "57cf05c9-25b6-495d-ab07-de4b11d64736" },
+        { "kind": "task", "id": "3adeffc9-c8b0-4e2f-a674-55bfcb293433" }
+      ]
+    },
+    {
+      "why": "a token opened by a bracket is still a token",
+      "text": "cf. (#note:9f1c2b7e-4d3a-4e58-8a61-0b2c7d9e1a10) pour la note",
+      "tokens": [{ "kind": "note", "id": "9f1c2b7e-4d3a-4e58-8a61-0b2c7d9e1a10" }]
+    },
+    {
+      "why": "a closed inline span does not reach further",
+      "text": "`a` puis #plan:57cf05c9-25b6-495d-ab07-de4b11d64736",
+      "tokens": [{ "kind": "plan", "id": "57cf05c9-25b6-495d-ab07-de4b11d64736" }]
+    },
+    {
+      "why": "a closed fence does not reach further",
+      "text": "```\nx\n```\n#plan:57cf05c9-25b6-495d-ab07-de4b11d64736",
+      "tokens": [{ "kind": "plan", "id": "57cf05c9-25b6-495d-ab07-de4b11d64736" }]
+    }
+  ],
+  "not_cited": [
+    {
+      "why": "inline code is not prose",
+      "text": "regarde `#plan:57cf05c9-25b6-495d-ab07-de4b11d64736`"
+    },
+    {
+      "why": "a fenced block is not prose",
+      "text": "```\n#plan:57cf05c9-25b6-495d-ab07-de4b11d64736\n```"
+    },
+    {
+      "why": "a sigil glued to a word is prose",
+      "text": "numéroa#plan:57cf05c9-25b6-495d-ab07-de4b11d64736"
+    },
+    {
+      "why": "an actor is cited with '@'",
+      "text": "#persona:57cf05c9-25b6-495d-ab07-de4b11d64736"
+    },
+    {
+      "why": "a kind the server does not list",
+      "text": "#nope:57cf05c9-25b6-495d-ab07-de4b11d64736"
+    },
+    {
+      "why": "a kind in capitals",
+      "text": "#PLAN:57cf05c9-25b6-495d-ab07-de4b11d64736"
+    },
+    {
+      "why": "no sigil at all",
+      "text": "plan:57cf05c9-25b6-495d-ab07-de4b11d64736"
+    },
+    {
+      "why": "a malformed id",
+      "text": "#plan:not-a-uuid"
+    },
+    {
+      "why": "the nil id is not an entity",
+      "text": "#plan:00000000-0000-0000-0000-000000000000"
+    },
+    {
+      "why": "a token the server made inert is nobody's citation",
+      "text": "sortie d'outil : \u2060#plan:57cf05c9-25b6-495d-ab07-de4b11d64736"
+    }
+  ]
+}

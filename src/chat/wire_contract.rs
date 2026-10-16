@@ -46,13 +46,14 @@ const UPDATE_COMMAND: &str = "UPDATE_CHAT_CONTRACT=1 cargo test --lib chat::wire
 
 /// Every `ChatEvent` tag the examples must cover. Adding a variant means
 /// adding its tag here AND its examples in [`server_examples`].
-const EXPECTED_SERVER_TAGS: [&str; 37] = [
+const EXPECTED_SERVER_TAGS: [&str; 38] = [
     "active_tasks_update",
     "ask_user_question",
     "assistant_text",
     "auto_continue",
     "auto_continue_state_changed",
     "background_output",
+    "cites_resolved",
     "compact_boundary",
     "compaction_recovery",
     "compaction_started",
@@ -112,6 +113,7 @@ fn variant_tag(e: &ChatEvent) -> &'static str {
     match e {
         ChatEvent::UserMessage { .. } => "user_message",
         ChatEvent::RefsResolved { .. } => "refs_resolved",
+        ChatEvent::CitesResolved { .. } => "cites_resolved",
         ChatEvent::SystemHint { .. } => "system_hint",
         ChatEvent::AssistantText { .. } => "assistant_text",
         ChatEvent::Thinking { .. } => "thinking",
@@ -474,6 +476,50 @@ fn server_examples() -> Vec<ServerExample> {
                 reason: None,
                 index: None,
                 request_id: None,
+            },
+        ),
+        ServerExample::new(
+            ChatEvent::CitesResolved {
+                refs: vec![
+                    RefResolution {
+                        kind: RefKind::Task,
+                        id: fixed_uuid("3adeffc9-c8b0-4e2f-a674-55bfcb293433").into(),
+                        status: RefStatus::Ok,
+                        label: Some(s("PR 1 — backend")),
+                        subtitle: Some(s("in_progress")),
+                        project: Some(ScopeLabel {
+                            id: fixed_uuid(PROJECT_ID),
+                            slug: s("project-orchestrator"),
+                            name: s("Project Orchestrator"),
+                        }),
+                        workspace: None,
+                        entity_status: Some(s("in_progress")),
+                    },
+                    // An id that names nothing, or an entity of another
+                    // project: the interface draws it as plain text.
+                    RefResolution {
+                        kind: RefKind::Plan,
+                        id: fixed_uuid("9f1e0a10-0000-4000-8000-00000000dead").into(),
+                        status: RefStatus::NotFound,
+                        label: None,
+                        subtitle: None,
+                        project: None,
+                        workspace: None,
+                        entity_status: None,
+                    },
+                ],
+            },
+            ChatEvent::CitesResolved {
+                refs: vec![RefResolution {
+                    kind: RefKind::Plan,
+                    id: fixed_uuid("9f1e0a10-0000-4000-8000-00000000dead").into(),
+                    status: RefStatus::NotFound,
+                    label: None,
+                    subtitle: None,
+                    project: None,
+                    workspace: None,
+                    entity_status: None,
+                }],
             },
         ),
         ServerExample::new(

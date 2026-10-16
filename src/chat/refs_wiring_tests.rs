@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nexus_claude::transport::mock::MockTransportHandle;
-use nexus_claude::Message;
+use nexus_claude::{AssistantMessage, ContentBlock, Message, TextContent};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -335,4 +335,96 @@ async fn the_system_prompt_teaches_citations_only_when_refs_v1_is_on() {
         prompt_off,
         "flag off is the prompt as it was, byte for byte"
     );
+}
+
+/// The CLI's own words, as the stream delivers them: one assistant text block.
+fn answers(text: &str) -> Message {
+    Message::Assistant {
+        message: AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent { text: text.into() })],
+        },
+        parent_tool_use_id: None,
+    }
+}
+
+/// The wire tag of an event, whatever it is: read from its OWN serialization,
+/// so this test names a tag the compiler does not know yet.
+fn tag_of(event: &ChatEvent) -> String {
+    serde_json::to_value(event)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// The citations of the ANSWER, validated and announced (`cites_resolved`).
+///
+/// The user's references are announced by `refs_resolved` BEFORE the model
+/// answers; the citations the model writes in its own answer are a different
+/// event, announced after it. Without it the interface has no way to know that
+/// `#plan:<uuid>` names nothing: it draws a chip, and a link to an entity that
+/// does not exist.
+#[tokio::test]
+async fn the_citations_of_the_answer_are_validated_and_announced() {
+    let w = world().await;
+    let manager = manager_over(w.graph.clone());
+    let sid = Uuid::new_v4().to_string();
+    let mut cli = mock_session(&manager, &sid).await;
+    let mut rx = manager.subscribe(&sid).await.unwrap();
+
+    manager.send_message(&sid, "bonjour").await.unwrap();
+    let _ = prompt_sent(&mut cli).await;
+
+    // The answer cites one entity the session may read, and one id that names
+    // nothing at all: the second is the one that must read as plain text.
+    let ghost = Uuid::new_v4();
+    let answer = format!("Voir #task:{} et #plan:{ghost}.", w.task_a.id);
+    cli.inbound_message_tx.send(answers(&answer)).unwrap();
+    cli.inbound_message_tx.send(turn_over()).unwrap();
+
+    let announced = next_event(&mut rx, |e| tag_of(e) == "cites_resolved").await;
+    let json = serde_json::to_value(&announced).unwrap();
+    let refs = json["refs"].as_array().expect("refs is an array");
+    assert_eq!(refs.len(), 2, "one entry per citation, in order: {json}");
+    assert_eq!(refs[0]["kind"], "task");
+    assert_eq!(refs[0]["id"], w.task_a.id.to_string());
+    assert_eq!(refs[0]["status"], "ok");
+    assert_eq!(refs[0]["label"], "Tâche alpha refs");
+    assert_eq!(refs[1]["kind"], "plan");
+    assert_eq!(refs[1]["id"], ghost.to_string());
+    assert_eq!(refs[1]["status"], "not_found");
+    assert!(
+        refs[1].get("label").is_none(),
+        "an entry the session may not read carries no label: {json}"
+    );
+
+    // Persisted, and after the answer it belongs to, so a reloaded thread draws
+    // the same text instead of a chip pointing at nothing.
+    let events = persisted(&w.graph, &sid).await;
+    let seq_of = |ty: &str| events.iter().find(|e| e.1 == ty).map(|e| e.0);
+    assert!(
+        seq_of("assistant_text").unwrap() < seq_of("cites_resolved").unwrap(),
+        "{events:?}"
+    );
+}
+
+/// An answer that cites nothing announces nothing: the event only exists when
+/// there is a resolution to key a chip on.
+#[tokio::test]
+async fn an_answer_without_citations_announces_nothing() {
+    let w = world().await;
+    let manager = manager_over(w.graph.clone());
+    let sid = Uuid::new_v4().to_string();
+    let mut cli = mock_session(&manager, &sid).await;
+    let mut rx = manager.subscribe(&sid).await.unwrap();
+
+    manager.send_message(&sid, "bonjour").await.unwrap();
+    let _ = prompt_sent(&mut cli).await;
+    cli.inbound_message_tx
+        .send(answers("aucun jeton ici"))
+        .unwrap();
+    cli.inbound_message_tx.send(turn_over()).unwrap();
+    next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+
+    let events = persisted(&w.graph, &sid).await;
+    assert!(events.iter().all(|e| e.1 != "cites_resolved"), "{events:?}");
 }

@@ -198,12 +198,18 @@ impl EventMapper {
                 is_error,
                 parent,
                 ..
-            } => vec![ChatEvent::ToolResult {
-                id: id.clone(),
-                result: tool_output_value(output.as_ref()),
-                is_error: *is_error,
-                parent_tool_use_id: parent.clone(),
-            }],
+            } => {
+                // A tool result is not the agent's words: a `#kind:uuid` inside
+                // it is data, and is never read as a citation of the agent.
+                let mut result = tool_output_value(output.as_ref());
+                crate::refs::cite::neutralize_value(&mut result);
+                vec![ChatEvent::ToolResult {
+                    id: id.clone(),
+                    result,
+                    is_error: *is_error,
+                    parent_tool_use_id: parent.clone(),
+                }]
+            }
             AgentEvent::PermissionAsk {
                 request_id,
                 tool_name,
@@ -1768,5 +1774,32 @@ mod tests {
             panic!("ModelChanged maps to one model_changed: {mapped:?}");
         };
         assert_eq!(model, "example-model-large");
+    }
+
+    #[test]
+    fn a_tool_result_never_carries_a_live_citation() {
+        const ID: &str = "57cf05c9-25b6-495d-ab04-000000000000";
+        let result = AgentEvent::ToolResult {
+            id: "t-mcp".into(),
+            output: Some(ToolOutput::Text(format!(
+                "{{\"entity\": \"#plan:57cf05c9-25b6-495d-ab07-de4b11d64736\"}} et #note:{ID}"
+            ))),
+            is_error: false,
+            seq: Some(5),
+            parent: None,
+        };
+        let mapped = structured_out_of_turn(&result);
+        let ChatEvent::ToolResult { result, .. } = &mapped[0] else {
+            panic!("a tool result");
+        };
+        let text = result.as_str().expect("the text of the result");
+        assert!(
+            text.contains("#plan:57cf05c9-25b6-495d-ab07-de4b11d64736"),
+            "the person still reads the token: {text:?}"
+        );
+        assert!(
+            crate::refs::cite::cited_refs(text).is_empty(),
+            "a tool result is data, never a citation of the agent: {text:?}"
+        );
     }
 }

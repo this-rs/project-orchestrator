@@ -650,8 +650,20 @@ pub fn spawn_feedback(
 ) {
     tokio::spawn(async move {
         let start = tokio::time::Instant::now();
-        let count =
-            process_response_entities(graph, session_id, project_id, &response_text, &cache).await;
+        let count = process_response_entities(
+            graph.clone(),
+            session_id,
+            project_id,
+            &response_text,
+            &cache,
+        )
+        .await;
+        // The entities the answer CITES (`#kind:uuid`) feed the session's
+        // DISCUSSED set too, without the agent calling `add_discussed`: the
+        // agent→user direction of references, behind the same switch.
+        if crate::refs::flag::from_env() {
+            process_cited_refs(graph, session_id, &response_text, &cache).await;
+        }
         let elapsed = start.elapsed().as_millis();
         if count > 0 {
             debug!(
@@ -781,6 +793,125 @@ pub fn spawn_rfc_processing(
 // ============================================================================
 // Tests
 // ============================================================================
+
+// ============================================================================
+// Auto add_discussed — the entities an answer CITES (`#kind:uuid`)
+// ============================================================================
+
+/// The node label a cited kind is stored under, as `add_discussed` groups it.
+/// `None` for a kind whose node the DISCUSSED set does not hold (a commit, a
+/// file, a workspace...) — nothing to link, and nothing invented.
+fn cited_label(kind: crate::refs::RefKind) -> Option<&'static str> {
+    use crate::refs::RefKind;
+    match kind {
+        RefKind::Plan => Some("Plan"),
+        RefKind::Task => Some("Task"),
+        RefKind::Note | RefKind::Rfc => Some("Note"),
+        RefKind::Decision => Some("Decision"),
+        _ => None,
+    }
+}
+
+/// Record the entities an answer CITES (`#kind:uuid`) as DISCUSSED in the
+/// session, so a citation feeds the knowledge graph without the agent calling
+/// `add_discussed` itself.
+///
+/// A citation is validated exactly as the interface would draw it: the tokens
+/// are read by [`crate::refs::cite::cited_refs`] (one reader, and a token in
+/// code is not a citation) and each is resolved through
+/// [`AccessPolicy::resolve_checked`](crate::refs::access::AccessPolicy::resolve_checked)
+/// — the same door a reference of the user goes through. Only what the session
+/// may actually read is recorded: a forged token, an id that names nothing or
+/// an entity of another project never reaches the graph. Each cited kind is
+/// mapped to its node label and deduplicated through the session cache.
+pub async fn process_cited_refs(
+    graph: Arc<dyn GraphStore>,
+    session_id: Uuid,
+    response_text: &str,
+    cache: &SessionDiscussedCache,
+) -> usize {
+    // Nothing to validate, and no reason to read the store, without a token.
+    if crate::refs::cite::cited_refs(response_text).is_empty() {
+        return 0;
+    }
+    let source = crate::refs::resolvers::GraphRefSource::new(graph.clone());
+    let principal =
+        crate::refs::turn::session_principal(graph.as_ref(), &session_id.to_string()).await;
+    let guarded = crate::refs::cite::guard_cites(
+        &source,
+        &crate::refs::access::AccessPolicy::open_instance(),
+        &principal,
+        response_text,
+    )
+    .await;
+
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for r in guarded
+        .iter()
+        .filter(|r| r.status == crate::refs::wire::RefStatus::Ok)
+    {
+        let Some(label) = cited_label(r.kind) else {
+            continue;
+        };
+        if cache.check_and_mark(label, r.id.as_str()).await {
+            pairs.push((label.to_string(), r.id.as_str().to_string()));
+        }
+    }
+    if pairs.is_empty() {
+        return 0;
+    }
+    match graph.add_discussed(session_id, &pairs).await {
+        Ok(added) => {
+            debug!("[feedback] Cited {} entities recorded as DISCUSSED", added);
+            added
+        }
+        Err(e) => {
+            warn!(
+                "[feedback] Failed to record cited entities: {} — non-blocking",
+                e
+            );
+            0
+        }
+    }
+}
+/// The `cites_resolved` event of one answer, or `None` when it cites nothing.
+///
+/// The citations of the ANSWER, read with the one reader
+/// ([`crate::refs::cite::cited_refs`]: a token in code is not a citation) and
+/// each handed to the one door
+/// ([`crate::refs::cite::guard_cites`] over
+/// [`AccessPolicy::resolve_checked`](crate::refs::access::AccessPolicy::resolve_checked)),
+/// so what the interface is told is exactly what the guard decided: an id that
+/// names nothing, an entity of another project or an unreadable one comes back
+/// `not_found` and carries no label. The caller announces the result; the
+/// client draws a chip for an `ok` entry and plain text for anything else —
+/// never a link to an entity nobody resolved.
+///
+/// `None` when the answer cites nothing: an empty event would key nothing.
+///
+/// A second read of the same citations, next to [`process_cited_refs`]: that one
+/// records the DISCUSSED set from a background task that only runs with a memory
+/// manager, while this event has to reach the thread whatever the session holds.
+/// Both use the same reader and the same door, so the two cannot disagree.
+pub async fn cited_refs_event(
+    graph: &Arc<dyn GraphStore>,
+    session_id: &str,
+    answer: &str,
+) -> Option<crate::chat::types::ChatEvent> {
+    if crate::refs::cite::cited_refs(answer).is_empty() {
+        return None;
+    }
+    let source = crate::refs::resolvers::GraphRefSource::new(graph.clone());
+    let principal = crate::refs::turn::session_principal(graph.as_ref(), session_id).await;
+    let refs = crate::refs::cite::guard_cites(
+        &source,
+        &crate::refs::access::AccessPolicy::open_instance(),
+        &principal,
+        answer,
+    )
+    .await;
+    (!refs.is_empty()).then_some(crate::chat::types::ChatEvent::CitesResolved { refs })
+}
 
 #[cfg(test)]
 mod tests {
@@ -1340,5 +1471,91 @@ mod tests {
         assert_eq!(count, 6);
         // Tracker should be drained after reinforcement
         assert!(tracker.is_empty().await);
+    }
+}
+
+#[cfg(test)]
+mod cited_tests {
+    use super::*;
+    use crate::refs::test_support::world;
+
+    #[tokio::test]
+    async fn a_cited_entity_is_recorded_without_the_agent_asking() {
+        let w = world().await;
+        let cache = SessionDiscussedCache::new();
+        let text = format!(
+            "Le plan #plan:{} et la tâche #task:{} sont liés.",
+            w.plan_a.id, w.task_a.id
+        );
+        let n = process_cited_refs(w.graph.clone(), Uuid::new_v4(), &text, &cache).await;
+        assert_eq!(n, 2, "the agent asked for nothing");
+        assert_eq!(
+            w.graph.discussed_calls.read().await.len(),
+            1,
+            "one batch write"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_without_a_citation_writes_nothing() {
+        let w = world().await;
+        let cache = SessionDiscussedCache::new();
+        let n =
+            process_cited_refs(w.graph.clone(), Uuid::new_v4(), "aucun jeton ici", &cache).await;
+        assert_eq!(n, 0);
+        assert!(w.graph.discussed_calls.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_forged_token_never_reaches_the_graph() {
+        let w = world().await;
+        let cache = SessionDiscussedCache::new();
+        let n = process_cited_refs(
+            w.graph.clone(),
+            Uuid::new_v4(),
+            "#plan:not-a-uuid et #persona:57cf05c9-25b6-495d-ab07-de4b11d64736",
+            &cache,
+        )
+        .await;
+        assert_eq!(n, 0);
+        assert!(w.graph.discussed_calls.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_citation_of_nothing_never_reaches_the_graph() {
+        let w = world().await;
+        let cache = SessionDiscussedCache::new();
+        let n = process_cited_refs(
+            w.graph.clone(),
+            Uuid::new_v4(),
+            "#plan:57cf05c9-25b6-495d-ab07-de4b11d64736",
+            &cache,
+        )
+        .await;
+        assert_eq!(n, 0, "well formed and naming nothing");
+        assert!(w.graph.discussed_calls.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_token_in_code_never_reaches_the_graph() {
+        let w = world().await;
+        let cache = SessionDiscussedCache::new();
+        let text = format!("`#plan:{}`", w.plan_a.id);
+        let n = process_cited_refs(w.graph.clone(), Uuid::new_v4(), &text, &cache).await;
+        assert_eq!(n, 0, "the interface draws no chip there either");
+    }
+
+    #[tokio::test]
+    async fn the_same_citation_twice_is_recorded_once() {
+        let w = world().await;
+        let cache = SessionDiscussedCache::new();
+        let text = format!("#note:{}", w.note_a.id);
+        process_cited_refs(w.graph.clone(), Uuid::new_v4(), &text, &cache).await;
+        process_cited_refs(w.graph.clone(), Uuid::new_v4(), &text, &cache).await;
+        assert_eq!(
+            w.graph.discussed_calls.read().await.len(),
+            1,
+            "the session cache holds the second back"
+        );
     }
 }

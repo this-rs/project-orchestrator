@@ -43,6 +43,7 @@ fn every_fixture_declares_the_contract_version_first() {
         "auth_ok_features.json",
         "kinds_response.json",
         "kind_ids.json",
+        "cited_tokens.json",
     ] {
         let path = format!("{}/tests/fixtures/refs/{name}", env!("CARGO_MANIFEST_DIR"));
         let text = std::fs::read_to_string(path).unwrap();
@@ -421,4 +422,59 @@ fn kind_ids_fixture() {
         serde_json::to_value(validate_token(&token).unwrap_err()).unwrap(),
         long["reason"]
     );
+}
+
+/// The agent→user citation token, as both readers must read it.
+///
+/// `tests/fixtures/refs/cited_tokens.json` is copied byte for byte into the
+/// frontend (`src/refs/__fixtures__/cited_tokens.json`) and read there by a
+/// test of `findRefTokens`; here it is read by `refs::cite::cited_refs`. The
+/// two must agree on every vector, or the interface would draw a chip the
+/// server never saw (or the opposite).
+#[test]
+fn the_citation_reader_agrees_with_the_shared_golden_vectors() {
+    use project_orchestrator::refs::cite::cited_refs;
+
+    let v = fixture("cited_tokens.json");
+
+    let cited = v["cited"].as_array().expect("cited");
+    assert!(!cited.is_empty(), "the fixture must carry vectors");
+    for case in cited {
+        let why = case["why"].as_str().expect("why");
+        let text = case["text"].as_str().expect("text");
+        let want: Vec<(String, String)> = case["tokens"]
+            .as_array()
+            .expect("tokens")
+            .iter()
+            .map(|t| {
+                (
+                    t["kind"].as_str().expect("kind").to_string(),
+                    t["id"].as_str().expect("id").to_string(),
+                )
+            })
+            .collect();
+        let got: Vec<(String, String)> = cited_refs(text)
+            .into_iter()
+            .map(|r| (r.kind.as_str().to_string(), r.id.as_str().to_string()))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{why}: {text:?} → {got:?}");
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(
+                (g.0.as_str(), g.1.as_str()),
+                (w.0.as_str(), w.1.as_str()),
+                "{why} #{i}"
+            );
+        }
+    }
+
+    let not_cited = v["not_cited"].as_array().expect("not_cited");
+    assert!(!not_cited.is_empty(), "the fixture must carry refusals");
+    for case in not_cited {
+        let why = case["why"].as_str().expect("why");
+        let text = case["text"].as_str().expect("text");
+        assert!(
+            cited_refs(text).is_empty(),
+            "{why}: {text:?} must not be a citation"
+        );
+    }
 }

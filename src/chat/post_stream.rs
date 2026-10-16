@@ -653,6 +653,7 @@ impl PostStreamHandler {
                 .get(&self.session_id)
                 .map(|s| s.rfc_accumulator.clone())
         };
+        let answer = assistant_text_parts.join("");
         record_turn_feedback(
             TurnFeedback {
                 graph: &self.graph,
@@ -663,11 +664,45 @@ impl PostStreamHandler {
                 project_id: self.ctx.project_id,
                 rfc_accumulator,
             },
-            &assistant_text_parts.join(""),
+            &answer,
             memory_manager,
             context_injector,
         )
         .await;
+        // What the answer CITES, validated and announced (`cites_resolved`):
+        // the other direction from the `refs_resolved` of the user's message.
+        self.announce_answer_cites(&answer).await;
+    }
+
+    /// Validate the citations of the answer and announce what they resolved to
+    /// (`cites_resolved`), persisted like `refs_resolved` so a replay has it.
+    ///
+    /// The interface needs it to draw a citation the session may NOT read as
+    /// plain text: without the event, `#plan:<uuid>` reads as a chip whose link
+    /// points at an entity that does not exist. Additive: nothing of the chat
+    /// contract changes, and a client that does not know the event ignores it.
+    /// Behind `refs_v1`, like the rest of the feature.
+    async fn announce_answer_cites(&self, answer: &str) {
+        if !crate::refs::flag::from_env() {
+            return;
+        }
+        let Some(event) =
+            super::feedback::cited_refs_event(&self.graph, &self.session_id, answer).await
+        else {
+            return;
+        };
+        self.emit_chat(event.clone());
+        if let Some(uuid) = self.session_uuid {
+            let record = ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id: uuid,
+                seq: self.next_seq.fetch_add(1, Ordering::SeqCst),
+                event_type: event.event_type().to_string(),
+                data: serde_json::to_string(&event).unwrap_or_default(),
+                created_at: chrono::Utc::now(),
+            };
+            let _ = self.graph.store_chat_events(uuid, vec![record]).await;
+        }
     }
 }
 

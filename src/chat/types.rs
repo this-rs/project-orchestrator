@@ -615,6 +615,18 @@ pub enum ChatEvent {
     RefsResolved {
         refs: Vec<crate::refs::wire::RefResolution>,
     },
+    /// What the citations of the ANSWER resolved to, sent once per turn whose
+    /// answer cites at least one entity, after the answer. The same entries as
+    /// `refs_resolved` — one per citation, in order of appearance, `not_found`
+    /// for an id that names nothing or that the session may not read — but the
+    /// other direction: it describes what the AGENT wrote, not the user's
+    /// message above. The interface draws a chip for an `ok` entry and plain
+    /// text for anything else: never a link to an entity nobody resolved.
+    /// Persisted like any event, so a replay has it. `cites_resolved` is the
+    /// wire name. Additive: a client that does not know it ignores it.
+    CitesResolved {
+        refs: Vec<crate::refs::wire::RefResolution>,
+    },
     /// A system-generated hint (post-compaction context, guard hints, auto-continue).
     /// NOT a user message — frontends should render this differently (or hide it).
     /// Does NOT increment the session's message_count.
@@ -1150,6 +1162,7 @@ impl ChatEvent {
         match self {
             ChatEvent::UserMessage { .. } => "user_message",
             ChatEvent::RefsResolved { .. } => "refs_resolved",
+            ChatEvent::CitesResolved { .. } => "cites_resolved",
             ChatEvent::SystemHint { .. } => "system_hint",
             ChatEvent::AssistantText { .. } => "assistant_text",
             ChatEvent::Thinking { .. } => "thinking",
@@ -1250,6 +1263,14 @@ impl ChatEvent {
                     .unwrap_or_default()
                     .hash(&mut hasher);
                 Some(format!("refs_resolved:{}", hasher.finish()))
+            }
+            ChatEvent::CitesResolved { refs } => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                serde_json::to_string(refs)
+                    .unwrap_or_default()
+                    .hash(&mut hasher);
+                Some(format!("cites_resolved:{}", hasher.finish()))
             }
             ChatEvent::SystemHint { content } => {
                 use std::hash::{Hash, Hasher};

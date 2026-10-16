@@ -2469,6 +2469,22 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             ),
         )
         .await;
+        // The citations of the answer, validated and announced on the thread,
+        // as the Claude Code engine's `handle_feedback` does: the runtime emits
+        // what comes back, and persists it (its own sequence), so a replay has
+        // it. Readable citations draw a chip, the others stay plain text.
+        if let Some(event) = self
+            .step(
+                &mut after,
+                session_id,
+                "cites",
+                super::feedback::cited_refs_event(&self.graph, session_id, &outcome.assistant_text),
+            )
+            .await
+            .flatten()
+        {
+            after.events.push(event);
+        }
         after
     }
 }
@@ -6491,13 +6507,16 @@ impl ChatManager {
                             });
                         }
                         ContentBlock::ToolResult(t) => {
-                            let result = match &t.content {
+                            let mut result = match &t.content {
                                 Some(ContentValue::Text(s)) => serde_json::Value::String(s.clone()),
                                 Some(ContentValue::Structured(v)) => {
                                     serde_json::Value::Array(v.clone())
                                 }
                                 None => serde_json::Value::Null,
                             };
+                            // A tool result is not the agent's words: a `#kind:uuid`
+                            // inside it is data, and is never a citation of the agent.
+                            crate::refs::cite::neutralize_value(&mut result);
                             events.push(ChatEvent::ToolResult {
                                 id: t.tool_use_id.clone(),
                                 result,
@@ -20842,6 +20861,31 @@ mod tests {
         let events = ChatManager::message_to_events(&msg);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], ChatEvent::ToolResult { is_error, .. } if *is_error));
+    }
+
+    #[test]
+    fn test_message_to_events_tool_result_never_carries_a_live_citation() {
+        const ID: &str = "57cf05c9-25b6-495d-ab07-de4b11d64736";
+        let msg = Message::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::ToolResult(ToolResultContent {
+                    tool_use_id: "tool-1".into(),
+                    content: Some(ContentValue::Text(format!("voir #plan:{ID}\n"))),
+                    is_error: Some(false),
+                })],
+            },
+            parent_tool_use_id: None,
+        };
+        let events = ChatManager::message_to_events(&msg);
+        let ChatEvent::ToolResult { result, .. } = &events[0] else {
+            panic!("a tool result");
+        };
+        let text = result.as_str().expect("the text of the result");
+        assert!(text.contains(&format!("#plan:{ID}")), "visible: {text:?}");
+        assert!(
+            crate::refs::cite::cited_refs(text).is_empty(),
+            "a tool result is never a citation of the agent: {text:?}"
+        );
     }
 
     #[test]

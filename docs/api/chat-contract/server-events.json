@@ -248,6 +248,53 @@
         }
       }
     },
+    "cites_resolved": {
+      "examples": {
+        "full": {
+          "refs": [
+            {
+              "entity_status": "in_progress",
+              "id": "3adeffc9-c8b0-4e2f-a674-55bfcb293433",
+              "kind": "task",
+              "label": "PR 1 — backend",
+              "project": {
+                "id": "00333b5f-2d0a-4467-9c98-155e55d2b7e5",
+                "name": "Project Orchestrator",
+                "slug": "project-orchestrator"
+              },
+              "status": "ok",
+              "subtitle": "in_progress"
+            },
+            {
+              "id": "9f1e0a10-0000-4000-8000-00000000dead",
+              "kind": "plan",
+              "status": "not_found"
+            }
+          ],
+          "type": "cites_resolved"
+        },
+        "minimal": {
+          "refs": [
+            {
+              "id": "9f1e0a10-0000-4000-8000-00000000dead",
+              "kind": "plan",
+              "status": "not_found"
+            }
+          ],
+          "type": "cites_resolved"
+        }
+      },
+      "fields": {
+        "refs": {
+          "required": true,
+          "type": "array"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
     "compact_boundary": {
       "examples": {
         "full": {
