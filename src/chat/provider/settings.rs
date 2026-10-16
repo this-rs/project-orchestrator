@@ -195,6 +195,10 @@ pub struct InstanceDraft {
     /// `claude_code_remote`: allow the no-confirmation mode on that machine.
     #[serde(default)]
     pub allow_trust: Option<bool>,
+    /// OPTIONAL limits of the instance (RL1). Absent or empty = no limit at all:
+    /// the behaviour is then exactly what it was before this field existed.
+    #[serde(default)]
+    pub rate_limit: Vec<RateLimit>,
 }
 
 /// Body of `PUT|PATCH /chat/providers/{id}`: the id and the kind never change.
@@ -237,6 +241,10 @@ pub struct InstancePatch {
     /// `claude_code_remote`: allow the no-confirmation mode on that machine.
     #[serde(default)]
     pub allow_trust: Option<bool>,
+    /// OPTIONAL limits (RL1). `None` = leave the stored list untouched; `Some([])`
+    /// = remove every limit. The field is never a secret.
+    #[serde(default)]
+    pub rate_limit: Option<Vec<RateLimit>>,
 }
 
 /// A stored provider instance.
@@ -280,6 +288,11 @@ pub struct InstanceRecord {
     /// `claude_code_remote`: the no-confirmation mode is allowed on that machine.
     #[serde(default)]
     pub allow_trust: bool,
+    /// The configured limits (RL1). Empty = no limit: the instance behaves exactly
+    /// as it did before this field existed. A record stored before the field
+    /// existed reads back with an empty list, without any migration.
+    #[serde(default)]
+    pub rate_limit: Vec<RateLimit>,
 }
 
 impl InstanceRecord {
@@ -291,6 +304,434 @@ impl InstanceRecord {
 
 /// The kind of an instance that runs Claude Code on another machine over SSH.
 pub const KIND_CLAUDE_CODE_REMOTE: &str = "claude_code_remote";
+
+// ============================================================================
+// Rate limits (RL1)
+// ============================================================================
+//
+// An instance may carry an OPTIONAL list of limits: a number of requests or
+// tokens per window, or a budget in US dollars per calendar window (day, week,
+// month). Each limit applies to the whole instance, to one credential REFERENCE
+// or to one model.
+//
+// Two families, and they are not the same question (see the plan): a RATE limit
+// answers "how much may go out per window", a BUDGET limit answers "how much may
+// this cost per day/week/month". A budget window is a CALENDAR window, so it
+// carries its time zone: midnight is not the same instant everywhere.
+//
+// Nothing here holds a secret. A credential scope names a credential REFERENCE
+// (`vault:<name>`, `env:<VAR>`) and the validation runs it through the very same
+// parser the instance uses, so a bare key (`sk-...`) is refused like anywhere
+// else. Absence of the field is not a default limit: it means NO limit, and the
+// behaviour stays exactly what it was before the field existed.
+
+/// Upper bound on how many limits one instance may carry. A bound exists so a
+/// body cannot make the settings document unbounded.
+pub const MAX_RATE_LIMITS: usize = 32;
+
+/// What a limit counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitKind {
+    /// Requests sent to the provider.
+    Requests,
+    /// Tokens consumed.
+    Tokens,
+    /// Money spent, in US dollars.
+    BudgetUsd,
+}
+
+/// A unit window of a limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RateLimitUnit {
+    /// A rolling minute, aligned on the clock's minute.
+    Minute,
+    /// An hour.
+    Hour,
+    /// A calendar day (needs a time zone).
+    Day,
+    /// A calendar week (needs a time zone).
+    Week,
+    /// A calendar month (needs a time zone).
+    Month,
+}
+
+impl RateLimitUnit {
+    /// Whether the window is a CALENDAR window: its boundaries are midnight in a
+    /// time zone, so the limit must say which one.
+    pub fn is_calendar(self) -> bool {
+        matches!(self, Self::Day | Self::Week | Self::Month)
+    }
+
+    /// The word the interface shows ("minute", "hour"...).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minute => "minute",
+            Self::Hour => "hour",
+            Self::Day => "day",
+            Self::Week => "week",
+            Self::Month => "month",
+        }
+    }
+}
+
+/// The object form of a rolling window: `{"rolling": 3600}`, in seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollingWindow {
+    /// Window length in seconds.
+    pub rolling: u64,
+}
+
+/// A limit's window: a unit window (`"minute"`) or a rolling one
+/// (`{"rolling": 3600}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RateLimitWindow {
+    /// A named window.
+    Unit(RateLimitUnit),
+    /// A window that slides.
+    Rolling(RollingWindow),
+}
+
+impl RateLimitWindow {
+    /// The unit, when the window is a named one.
+    pub fn unit(self) -> Option<RateLimitUnit> {
+        match self {
+            Self::Unit(u) => Some(u),
+            Self::Rolling(_) => None,
+        }
+    }
+
+    /// Whether the window is a CALENDAR one (day, week, month).
+    pub fn is_calendar(self) -> bool {
+        self.unit().is_some_and(RateLimitUnit::is_calendar)
+    }
+}
+
+/// The `"instance"` scope, as a bare string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InstanceScope {
+    /// The whole instance.
+    Instance,
+}
+
+/// `{"credential": "vault:<name>"}`: one credential REFERENCE, never a value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialScope {
+    /// The credential reference (`vault:<name>`, `env:<VAR>`).
+    pub credential: String,
+}
+
+/// `{"model": "<id>"}`: one model of the instance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelScope {
+    /// Model identifier, as the instance knows it.
+    pub model: String,
+}
+
+/// Whom a limit applies to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RateLimitScope {
+    /// The whole instance (`"instance"`).
+    Instance(InstanceScope),
+    /// One credential reference.
+    Credential(CredentialScope),
+    /// One model.
+    Model(ModelScope),
+}
+
+impl RateLimitScope {
+    /// The credential REFERENCE this scope names, if any. Never a value.
+    pub fn credential(&self) -> Option<&str> {
+        match self {
+            Self::Credential(CredentialScope { credential }) => Some(credential),
+            _ => None,
+        }
+    }
+
+    /// A short label for a status line or a reason ("instance", "vault:deepseek",
+    /// "model deepseek-chat"). Never a secret: it echoes a reference or an id.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Instance(_) => "instance".to_string(),
+            Self::Credential(CredentialScope { credential }) => credential.clone(),
+            Self::Model(ModelScope { model }) => format!("model {model}"),
+        }
+    }
+}
+
+/// One configured limit on an instance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimit {
+    /// What it counts.
+    pub kind: RateLimitKind,
+    /// Over which window.
+    pub window: RateLimitWindow,
+    /// Time zone of a calendar window: `"utc"` or an IANA name. Absent (null) for
+    /// `minute`, `hour` and rolling windows.
+    #[serde(default)]
+    pub calendar: Option<String>,
+    /// The ceiling: strictly positive, and a whole number for requests and tokens.
+    pub max: f64,
+    /// Whom it applies to.
+    pub scope: RateLimitScope,
+}
+
+/// Whether a time zone is known: `utc` in any case, or an IANA zone name.
+pub fn known_timezone(raw: &str) -> bool {
+    let name = raw.trim();
+    if name.eq_ignore_ascii_case("utc") {
+        return true;
+    }
+    name.parse::<chrono_tz::Tz>().is_ok()
+}
+
+/// Validates ONE limit. Messages say which rule, never echo a value.
+fn validate_rate_limit(limit: &RateLimit, env_allow: &[String]) -> Result<(), SettingsError> {
+    if !limit.max.is_finite() || limit.max <= 0.0 {
+        return Err(invalid("rate_limit.max: strictly positive"));
+    }
+    match limit.kind {
+        // A COUNT is a whole number: half a request means nothing.
+        RateLimitKind::Requests | RateLimitKind::Tokens => {
+            if limit.max.fract() != 0.0 {
+                return Err(invalid(
+                    "rate_limit.max: a whole number of requests or tokens",
+                ));
+            }
+        }
+        // A budget is money: a fraction of a dollar is fine.
+        RateLimitKind::BudgetUsd => {
+            let unit = limit.window.unit();
+            if !matches!(
+                unit,
+                Some(RateLimitUnit::Day) | Some(RateLimitUnit::Week) | Some(RateLimitUnit::Month)
+            ) {
+                return Err(invalid(
+                    "rate_limit.window: a budget is per day, week or month",
+                ));
+            }
+        }
+    }
+    match (limit.calendar.as_deref(), limit.window.is_calendar()) {
+        (Some(tz), true) => {
+            if !known_timezone(tz) {
+                return Err(invalid(
+                    "rate_limit.calendar: utc or an IANA time-zone name",
+                ));
+            }
+        }
+        (None, true) => {
+            return Err(invalid(
+                "rate_limit.calendar: a day, week or month window needs its time zone",
+            ));
+        }
+        (Some(_), false) => {
+            return Err(invalid(
+                "rate_limit.calendar: only a day, week or month window has one",
+            ));
+        }
+        (None, false) => {}
+    }
+    if let RateLimitWindow::Rolling(RollingWindow { rolling }) = limit.window {
+        if rolling == 0 {
+            return Err(invalid("rate_limit.window.rolling: at least one second"));
+        }
+    }
+    match &limit.scope {
+        RateLimitScope::Instance(_) => {}
+        RateLimitScope::Credential(CredentialScope { credential }) => {
+            if credential.trim().is_empty() || credential.trim() == "none" {
+                return Err(invalid(
+                    "rate_limit.scope.credential: names a credential reference",
+                ));
+            }
+            // The same parser the instance uses: `env:` must be declared, and a
+            // bare key is refused — a limit never stores a secret.
+            parse_credential_ref(credential, env_allow)?;
+        }
+        RateLimitScope::Model(ModelScope { model }) => {
+            let model = model.trim();
+            if model.is_empty() || model.len() > 200 || model.contains(['\0', '\n', '\r']) {
+                return Err(invalid("rate_limit.scope.model: a model identifier"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates a whole list: each limit, the ceiling on how many, and no duplicate
+/// (kind + window + scope).
+pub fn validate_rate_limits(
+    limits: &[RateLimit],
+    env_allow: &[String],
+) -> Result<(), SettingsError> {
+    if limits.len() > MAX_RATE_LIMITS {
+        return Err(invalid("rate_limit: at most 32 limits per instance"));
+    }
+    for (i, limit) in limits.iter().enumerate() {
+        validate_rate_limit(limit, env_allow)?;
+        let duplicate = limits[..i].iter().any(|seen| {
+            seen.kind == limit.kind && seen.window == limit.window && seen.scope == limit.scope
+        });
+        if duplicate {
+            return Err(invalid(
+                "rate_limit: two limits share the same kind, window and scope",
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// The state of those limits (RL7)
+// ----------------------------------------------------------------------------
+//
+// `GET /chat/providers/{id}/limits` answers one entry per configured limit, with
+// its current state. Nothing measures anything yet: RL2 (counters) and RL4
+// (breaker) are not built, so every limit reports `unknown` with null numbers.
+// What is settled here is the SHAPE — adding the numbers later will not change a
+// key. No field of it is ever a secret.
+
+/// The current state of one limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitStatus {
+    /// Under the limit. Nothing to report.
+    Ok,
+    /// OUR limit is reached (or the provider confirmed a quota): nothing is sent
+    /// until `resets_at`.
+    Limited,
+    /// The provider is overloaded or intermittent while our own count is under
+    /// the limit: retry later, the key is NOT exhausted. RL3 draws that line.
+    Overloaded,
+    /// Nothing is measured yet. Never confused with `limited`.
+    Unknown,
+}
+
+/// One limit and its current state, as the status route answers it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitState {
+    /// What the limit counts.
+    pub kind: RateLimitKind,
+    /// Its window.
+    pub window: RateLimitWindow,
+    /// Time zone of a calendar window (null otherwise).
+    pub calendar: Option<String>,
+    /// Its ceiling.
+    pub max: f64,
+    /// Whom it applies to.
+    pub scope: RateLimitScope,
+    /// The credential REFERENCE this limit is scoped to, when it is scoped to one
+    /// (else null). A reference, never a value.
+    pub credential: Option<String>,
+    /// How much was used in the current window. Null while nothing is counted.
+    pub used: Option<f64>,
+    /// What is left. Null while nothing is counted.
+    pub remaining: Option<f64>,
+    /// When the window (or the quota) resets, RFC 3339. Null when unknown.
+    pub resets_at: Option<String>,
+    /// `ok | limited | overloaded | unknown`.
+    pub status: RateLimitStatus,
+    /// Since when the current state holds, RFC 3339. Null when none holds.
+    pub since: Option<String>,
+    /// When the next attempt may be made, RFC 3339. Null when none is planned.
+    pub next_retry_at: Option<String>,
+}
+
+/// The whole answer of `GET /chat/providers/{id}/limits`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitReport {
+    /// The instance the limits belong to.
+    pub provider_id: String,
+    /// The worst state among the limits (`ok` when there is no limit at all).
+    pub status: RateLimitStatus,
+    /// One entry per configured limit.
+    pub limits: Vec<RateLimitState>,
+}
+
+/// Builds the CURRENT state of an instance's limits.
+///
+/// No counter exists yet (RL2) and no breaker either (RL4), so every limit is
+/// `unknown` with null usage, and an instance without limits is `ok` (nothing can
+/// limit it). RL2/RL4 fill `used`, `remaining`, `resets_at` and the status without
+/// touching a single key of this shape.
+pub fn rate_limit_report(record: &InstanceRecord) -> RateLimitReport {
+    let limits: Vec<RateLimitState> = record
+        .rate_limit
+        .iter()
+        .map(|limit| RateLimitState {
+            kind: limit.kind,
+            window: limit.window,
+            calendar: limit.calendar.clone(),
+            max: limit.max,
+            scope: limit.scope.clone(),
+            credential: limit.scope.credential().map(str::to_string),
+            used: None,
+            remaining: None,
+            resets_at: None,
+            status: RateLimitStatus::Unknown,
+            since: None,
+            next_retry_at: None,
+        })
+        .collect();
+    RateLimitReport {
+        provider_id: record.id.clone(),
+        // Nothing configured = nothing that can be limited.
+        status: if limits.is_empty() {
+            RateLimitStatus::Ok
+        } else {
+            RateLimitStatus::Unknown
+        },
+        limits,
+    }
+}
+
+/// Wire name of the event that announces a change of a provider's limit state.
+pub const RATE_LIMIT_EVENT: &str = "provider_rate_limit";
+
+/// The event that announces a change of a provider's limit state (RL7).
+///
+/// SHAPE ONLY: nothing emits it yet — RL2 (counters) and RL4 (breaker) will — but
+/// the shape is settled here and in `tests/fixtures/rate_limit/event.json`, so the
+/// interface and the chat contract can be built against it. It carries no secret:
+/// `credential` and `scope` name a credential REFERENCE.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderRateLimitEvent {
+    /// Event name on the wire (`provider_rate_limit`).
+    #[serde(rename = "type")]
+    pub event_type: String,
+    /// The instance whose state changed.
+    pub provider_id: String,
+    /// The credential REFERENCE the changed limit is scoped to, when it is scoped
+    /// to one. Never a value.
+    pub credential: Option<String>,
+    /// Whom the changed limit applies to.
+    pub scope: RateLimitScope,
+    /// What it counts.
+    pub kind: RateLimitKind,
+    /// Its window.
+    pub window: RateLimitWindow,
+    /// The new state.
+    pub status: RateLimitStatus,
+    /// `quota` when the limit (ours or the provider's) is reached, `overload` for
+    /// an intermittent provider: this is the distinction RL3 exists to make.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// When the limit resets, RFC 3339.
+    #[serde(default)]
+    pub resets_at: Option<String>,
+    /// When the next attempt may be made, RFC 3339.
+    #[serde(default)]
+    pub next_retry_at: Option<String>,
+}
 
 /// OpenSSH fingerprint of a `<type> <base64>` public key: `SHA256:` and the
 /// unpadded base64 of the SHA-256 of the decoded key blob (what `ssh-keygen -lf`
@@ -877,6 +1318,9 @@ pub fn record_from_draft(
             "cost_source: reported, priced, free, subscription or unknown",
         ));
     }
+    // RL1: the limits are optional, but when they are given they are checked
+    // here — an instance never stores a limit it would refuse to apply.
+    validate_rate_limits(&draft.rate_limit, env_allow)?;
     Ok(InstanceRecord {
         label: draft
             .label
@@ -899,6 +1343,7 @@ pub fn record_from_draft(
             .flatten(),
         remote_cwd: remote.then(|| draft.remote_cwd.clone()).flatten(),
         allow_trust: remote && draft.allow_trust.unwrap_or(false),
+        rate_limit: draft.rate_limit.clone(),
     })
 }
 
@@ -1026,6 +1471,12 @@ pub fn apply_patch(
             parse_credential_ref(cred, env_allow)?;
         }
         next.credential_ref = cred.clone();
+    }
+    // RL1: `Some([])` clears every limit, `None` leaves them untouched. A limit
+    // never changes where content goes or with what, so it touches no consent.
+    if let Some(limits) = patch.rate_limit.as_ref() {
+        validate_rate_limits(limits, env_allow)?;
+        next.rate_limit = limits.clone();
     }
     // A consent is tied to the origin AND to the credential reference: changing
     // either sends the project's content somewhere or with something it did not
@@ -2041,5 +2492,600 @@ mod tests {
         let r: InstanceRecord = serde_json::from_str(raw).unwrap();
         assert!(r.host.is_none() && !r.allow_trust);
         assert_eq!(r.host_key_fingerprint(), None);
+    }
+
+    // ========================================================================
+    // RL1 — rate limits
+    // ========================================================================
+
+    fn fixture(name: &str) -> serde_json::Value {
+        let path = format!(
+            "{}/tests/fixtures/rate_limit/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    fn golden_limits() -> Vec<RateLimit> {
+        serde_json::from_value(fixture("limits.json")["limits"].clone()).expect("the golden limits")
+    }
+
+    fn instance_scope() -> RateLimitScope {
+        RateLimitScope::Instance(InstanceScope::Instance)
+    }
+
+    fn limit(
+        kind: RateLimitKind,
+        window: RateLimitWindow,
+        calendar: Option<&str>,
+        max: f64,
+        scope: RateLimitScope,
+    ) -> RateLimit {
+        RateLimit {
+            kind,
+            window,
+            calendar: calendar.map(str::to_string),
+            max,
+            scope,
+        }
+    }
+
+    fn unit(u: RateLimitUnit) -> RateLimitWindow {
+        RateLimitWindow::Unit(u)
+    }
+
+    fn with_limits(limits: Vec<RateLimit>) -> InstanceRecord {
+        let mut d = draft();
+        d.rate_limit = limits;
+        record_from_draft(&d, &EndpointPolicy::default(), &[]).unwrap()
+    }
+
+    /// An instance with NO limit is not "an instance with a default limit": it is
+    /// exactly the instance of before this field existed.
+    #[test]
+    fn an_instance_without_any_limit_is_strictly_unchanged() {
+        let record = record_from_draft(&draft(), &EndpointPolicy::default(), &[]).unwrap();
+        assert!(record.rate_limit.is_empty());
+
+        // A patch that never mentions the field leaves the list alone.
+        let (next, changed) = apply_patch(
+            &record,
+            &InstancePatch::default(),
+            &EndpointPolicy::default(),
+            &[],
+        )
+        .unwrap();
+        assert!(next.rate_limit.is_empty());
+        assert!(!changed);
+
+        // A record stored BEFORE the field existed reads back with an empty list:
+        // no migration, and nothing to limit.
+        let old = r#"{"id":"x","kind":"openai_compatible","label":"x","base_url":"https://a.example.com","origin":"https://a.example.com","cost_source":"unknown","credential_ref":"none"}"#;
+        let read: InstanceRecord = serde_json::from_str(old).unwrap();
+        assert!(read.rate_limit.is_empty(), "no migration, no limit");
+
+        let report = rate_limit_report(&read);
+        assert!(report.limits.is_empty());
+        assert_eq!(
+            report.status,
+            RateLimitStatus::Ok,
+            "nothing configured = nothing that can be limited"
+        );
+    }
+
+    /// The three fixtures are the contract with the frontend: the first field of
+    /// each is the version, like the refs and attention fixtures.
+    #[test]
+    fn every_rate_limit_fixture_declares_the_contract_version_first() {
+        for name in ["limits.json", "report.json", "event.json"] {
+            let path = format!(
+                "{}/tests/fixtures/rate_limit/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let text = std::fs::read_to_string(&path).unwrap();
+            let first = text.lines().nth(1).unwrap().trim();
+            assert!(
+                first.starts_with("\"_contract_version\": 1"),
+                "{name}: {first}"
+            );
+        }
+    }
+
+    /// The fixture is valid, and serializing the parsed limits gives it back
+    /// exactly: a renamed key or a dropped `calendar` makes this red.
+    #[test]
+    fn the_golden_limits_fixture_is_valid_and_round_trips() {
+        let v = fixture("limits.json");
+        let limits = golden_limits();
+        validate_rate_limits(&limits, &[]).expect("the golden limits must be valid");
+        assert_eq!(
+            serde_json::to_value(&limits).unwrap(),
+            v["limits"].clone(),
+            "the wire shape is pinned by the fixture"
+        );
+        // The five cases the fixture exists for.
+        assert_eq!(limits.len(), 5);
+        assert!(limits
+            .iter()
+            .any(|l| l.window == RateLimitWindow::Rolling(RollingWindow { rolling: 60 })));
+        assert!(limits
+            .iter()
+            .any(|l| l.scope.credential() == Some("vault:nvidia-nim")));
+        assert!(limits
+            .iter()
+            .any(|l| l.calendar.as_deref() == Some("Europe/Paris")));
+    }
+
+    /// The status route's shape, byte for byte.
+    #[test]
+    fn the_report_shape_is_the_golden_one() {
+        let record = with_limits(golden_limits());
+        let report = serde_json::to_value(rate_limit_report(&record)).unwrap();
+        assert_eq!(report, fixture("report.json")["report"].clone());
+    }
+
+    /// The event shape, byte for byte, and it parses back.
+    #[test]
+    fn the_event_shape_is_the_golden_one_and_parses_back() {
+        let v = fixture("event.json");
+        let event: ProviderRateLimitEvent =
+            serde_json::from_value(v["event"].clone()).expect("the golden event");
+        assert_eq!(event.event_type, RATE_LIMIT_EVENT);
+        assert_eq!(event.status, RateLimitStatus::Limited);
+        assert_eq!(event.reason.as_deref(), Some("quota"));
+        assert_eq!(
+            event.credential.as_deref(),
+            Some("vault:deepseek"),
+            "a reference, never a value"
+        );
+        assert_eq!(serde_json::to_value(&event).unwrap(), v["event"].clone());
+    }
+
+    /// Every rule the interface must mirror, refused with its own reason.
+    #[test]
+    fn an_invalid_limit_is_refused_with_a_precise_reason() {
+        let cases: Vec<(&str, RateLimit)> = vec![
+            (
+                "zero",
+                limit(
+                    RateLimitKind::Requests,
+                    unit(RateLimitUnit::Minute),
+                    None,
+                    0.0,
+                    instance_scope(),
+                ),
+            ),
+            (
+                "negative",
+                limit(
+                    RateLimitKind::Requests,
+                    unit(RateLimitUnit::Minute),
+                    None,
+                    -1.0,
+                    instance_scope(),
+                ),
+            ),
+            (
+                "half a request",
+                limit(
+                    RateLimitKind::Requests,
+                    unit(RateLimitUnit::Minute),
+                    None,
+                    1.5,
+                    instance_scope(),
+                ),
+            ),
+            (
+                "half a token",
+                limit(
+                    RateLimitKind::Tokens,
+                    unit(RateLimitUnit::Hour),
+                    None,
+                    0.5,
+                    instance_scope(),
+                ),
+            ),
+            (
+                "a budget per minute",
+                limit(
+                    RateLimitKind::BudgetUsd,
+                    unit(RateLimitUnit::Minute),
+                    None,
+                    10.0,
+                    instance_scope(),
+                ),
+            ),
+            (
+                "a budget over a rolling window",
+                limit(
+                    RateLimitKind::BudgetUsd,
+                    RateLimitWindow::Rolling(RollingWindow { rolling: 3600 }),
+                    None,
+                    10.0,
+                    instance_scope(),
+                ),
+            ),
+            (
+                "a calendar window without a time zone",
+                limit(
+                    RateLimitKind::Requests,
+                    unit(RateLimitUnit::Day),
+                    None,
+                    100.0,
+                    instance_scope(),
+                ),
+            ),
+            (
+                "a time zone on a window that has none",
+                limit(
+                    RateLimitKind::Requests,
+                    unit(RateLimitUnit::Minute),
+                    Some("Europe/Paris"),
+                    100.0,
+                    instance_scope(),
+                ),
+            ),
+            (
+                "an unknown time zone",
+                limit(
+                    RateLimitKind::Requests,
+                    unit(RateLimitUnit::Day),
+                    Some("Mars/Olympus"),
+                    100.0,
+                    instance_scope(),
+                ),
+            ),
+            (
+                "a rolling window of zero seconds",
+                limit(
+                    RateLimitKind::Requests,
+                    RateLimitWindow::Rolling(RollingWindow { rolling: 0 }),
+                    None,
+                    3.0,
+                    instance_scope(),
+                ),
+            ),
+            (
+                "an empty credential scope",
+                limit(
+                    RateLimitKind::Requests,
+                    unit(RateLimitUnit::Minute),
+                    None,
+                    3.0,
+                    RateLimitScope::Credential(CredentialScope {
+                        credential: String::new(),
+                    }),
+                ),
+            ),
+            (
+                "a credential scope that names no credential",
+                limit(
+                    RateLimitKind::Requests,
+                    unit(RateLimitUnit::Minute),
+                    None,
+                    3.0,
+                    RateLimitScope::Credential(CredentialScope {
+                        credential: "none".into(),
+                    }),
+                ),
+            ),
+            (
+                "an empty model scope",
+                limit(
+                    RateLimitKind::Requests,
+                    unit(RateLimitUnit::Minute),
+                    None,
+                    3.0,
+                    RateLimitScope::Model(ModelScope { model: "  ".into() }),
+                ),
+            ),
+        ];
+        for (why, l) in &cases {
+            let err = validate_rate_limits(std::slice::from_ref(l), &[])
+                .unwrap_err()
+                .to_string();
+            assert!(!err.is_empty(), "{why} must be refused with a reason");
+            assert!(
+                err.contains("rate_limit") || err.contains("credential_ref"),
+                "{why}: {err}"
+            );
+        }
+        // Two precise messages, so the interface can say the same thing.
+        let missing_tz = validate_rate_limits(
+            &[limit(
+                RateLimitKind::Requests,
+                unit(RateLimitUnit::Day),
+                None,
+                100.0,
+                instance_scope(),
+            )],
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing_tz.contains("time zone"), "{missing_tz}");
+        let bad_tz = validate_rate_limits(
+            &[limit(
+                RateLimitKind::Requests,
+                unit(RateLimitUnit::Day),
+                Some("Mars/Olympus"),
+                100.0,
+                instance_scope(),
+            )],
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(bad_tz.contains("IANA"), "{bad_tz}");
+
+        // And the valid neighbours are accepted: the rules draw a line, not a net.
+        validate_rate_limits(
+            &[
+                limit(
+                    RateLimitKind::Requests,
+                    unit(RateLimitUnit::Minute),
+                    None,
+                    40.0,
+                    instance_scope(),
+                ),
+                limit(
+                    RateLimitKind::Tokens,
+                    unit(RateLimitUnit::Day),
+                    Some("UTC"),
+                    1000.0,
+                    instance_scope(),
+                ),
+                limit(
+                    RateLimitKind::BudgetUsd,
+                    unit(RateLimitUnit::Week),
+                    Some("utc"),
+                    5.5,
+                    instance_scope(),
+                ),
+                limit(
+                    RateLimitKind::Requests,
+                    RateLimitWindow::Rolling(RollingWindow { rolling: 60 }),
+                    None,
+                    20.0,
+                    RateLimitScope::Model(ModelScope {
+                        model: "deepseek-chat".into(),
+                    }),
+                ),
+            ],
+            &[],
+        )
+        .expect("valid limits are accepted");
+    }
+
+    /// A limit never stores a secret: a credential scope goes through the very
+    /// same parser as an instance's `credential_ref`.
+    #[test]
+    fn a_limit_never_stores_a_secret() {
+        let bare_key = limit(
+            RateLimitKind::Requests,
+            unit(RateLimitUnit::Minute),
+            None,
+            5.0,
+            RateLimitScope::Credential(CredentialScope {
+                credential: "sk-live-abcdef".into(),
+            }),
+        );
+        let err = validate_rate_limits(&[bare_key], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("sk-live"),
+            "the reason never echoes what was sent: {err}"
+        );
+
+        // An `env:` reference must be declared, exactly like an instance's.
+        let env = limit(
+            RateLimitKind::Requests,
+            unit(RateLimitUnit::Minute),
+            None,
+            5.0,
+            RateLimitScope::Credential(CredentialScope {
+                credential: "env:DEEPSEEK_API_KEY".into(),
+            }),
+        );
+        assert!(
+            validate_rate_limits(std::slice::from_ref(&env), &[]).is_err(),
+            "an undeclared variable is refused (deny by default)"
+        );
+        validate_rate_limits(&[env], &["DEEPSEEK_API_KEY".to_string()])
+            .expect("a declared variable is accepted");
+    }
+
+    /// Kind + window + scope is the identity of a limit.
+    #[test]
+    fn two_limits_with_the_same_kind_window_and_scope_are_refused() {
+        let a = limit(
+            RateLimitKind::Requests,
+            unit(RateLimitUnit::Minute),
+            None,
+            40.0,
+            instance_scope(),
+        );
+        let mut b = a.clone();
+        b.max = 60.0;
+        let err = validate_rate_limits(&[a.clone(), b], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rate_limit"), "{err}");
+
+        // Another scope, another window, another kind: all fine.
+        let other_scope = limit(
+            RateLimitKind::Requests,
+            unit(RateLimitUnit::Minute),
+            None,
+            40.0,
+            RateLimitScope::Credential(CredentialScope {
+                credential: "vault:x".into(),
+            }),
+        );
+        validate_rate_limits(&[a.clone(), other_scope], &[]).expect("another scope");
+        validate_rate_limits(
+            &[
+                a.clone(),
+                limit(
+                    RateLimitKind::Requests,
+                    unit(RateLimitUnit::Hour),
+                    None,
+                    40.0,
+                    instance_scope(),
+                ),
+            ],
+            &[],
+        )
+        .expect("another window");
+        let mut other_kind = a.clone();
+        other_kind.kind = RateLimitKind::Tokens;
+        validate_rate_limits(&[a, other_kind], &[]).expect("another kind");
+    }
+
+    #[test]
+    fn too_many_limits_are_refused() {
+        let one = limit(
+            RateLimitKind::Requests,
+            unit(RateLimitUnit::Minute),
+            None,
+            1.0,
+            instance_scope(),
+        );
+        let many = vec![one; MAX_RATE_LIMITS + 1];
+        assert!(validate_rate_limits(&many, &[]).is_err());
+    }
+
+    /// A limit does not move the content, nor the key: no consent is touched.
+    #[test]
+    fn a_patch_replaces_or_clears_the_limits_without_touching_a_consent() {
+        let record = with_limits(vec![limit(
+            RateLimitKind::Requests,
+            unit(RateLimitUnit::Minute),
+            None,
+            40.0,
+            instance_scope(),
+        )]);
+        let consent = ConsentRecord {
+            provider_id: record.id.clone(),
+            origin: record.origin.clone(),
+            consented_by: "me@example.com".into(),
+            consented_at: "2026-10-08T10:00:00Z".into(),
+            credential_ref: Some(record.credential_ref.clone()),
+            ..Default::default()
+        };
+
+        let patch = InstancePatch {
+            rate_limit: Some(vec![limit(
+                RateLimitKind::Requests,
+                unit(RateLimitUnit::Hour),
+                None,
+                400.0,
+                instance_scope(),
+            )]),
+            ..Default::default()
+        };
+        let (next, changed) =
+            apply_patch(&record, &patch, &EndpointPolicy::default(), &[]).unwrap();
+        assert_eq!(next.rate_limit.len(), 1);
+        assert_eq!(next.rate_limit[0].window, unit(RateLimitUnit::Hour));
+        assert!(!changed, "a limit moves neither the content nor the key");
+        assert!(consent_view(&consent, Some(&next)).valid);
+
+        // `Some([])` clears every limit.
+        let patch = InstancePatch {
+            rate_limit: Some(vec![]),
+            ..Default::default()
+        };
+        let (next, _) = apply_patch(&next, &patch, &EndpointPolicy::default(), &[]).unwrap();
+        assert!(next.rate_limit.is_empty());
+
+        // An invalid list is refused and nothing is written.
+        let patch = InstancePatch {
+            rate_limit: Some(vec![limit(
+                RateLimitKind::Requests,
+                unit(RateLimitUnit::Minute),
+                None,
+                0.0,
+                instance_scope(),
+            )]),
+            ..Default::default()
+        };
+        assert!(apply_patch(&record, &patch, &EndpointPolicy::default(), &[]).is_err());
+    }
+
+    /// Unknown fields are refused on the limit itself, like everywhere else in a
+    /// settings body: a field nobody knows is not silently stored.
+    #[test]
+    fn a_limit_with_an_unknown_field_is_refused() {
+        let body = serde_json::json!({"rate_limit": [
+            {"kind": "requests", "window": "minute", "max": 10.0, "scope": "instance", "api_key": "sk-1"}
+        ]});
+        assert!(serde_json::from_value::<InstanceDraft>(body).is_err());
+        let body = serde_json::json!({"kind": "requests", "window": "minute", "max": 10.0, "scope": "instance", "secret": "x"});
+        assert!(serde_json::from_value::<RateLimit>(body).is_err());
+        // A malformed window or scope is refused too, rather than defaulted.
+        let body = serde_json::json!({"kind": "requests", "window": "fortnight", "max": 10.0, "scope": "instance"});
+        assert!(serde_json::from_value::<RateLimit>(body).is_err());
+        let body = serde_json::json!({"kind": "requests", "window": "minute", "max": 10.0, "scope": {"credential": "vault:x", "extra": 1}});
+        assert!(serde_json::from_value::<RateLimit>(body).is_err());
+    }
+
+    /// Neither the settings document, nor the status answer, nor the event ever
+    /// carries a secret: only the credential REFERENCE appears.
+    #[test]
+    fn neither_the_report_nor_the_event_echoes_a_secret() {
+        let record = with_limits(vec![limit(
+            RateLimitKind::Requests,
+            unit(RateLimitUnit::Minute),
+            None,
+            40.0,
+            RateLimitScope::Credential(CredentialScope {
+                credential: "vault:deepseek".into(),
+            }),
+        )]);
+        let document = serde_json::to_string(&record).unwrap();
+        assert!(document.contains("vault:deepseek"), "the reference is kept");
+        assert!(!document.contains("sk-"), "never a value");
+
+        let report = serde_json::to_string(&rate_limit_report(&record)).unwrap();
+        assert!(report.contains("vault:deepseek"));
+        assert!(!report.contains("sk-"));
+
+        let event = ProviderRateLimitEvent {
+            event_type: RATE_LIMIT_EVENT.into(),
+            provider_id: record.id.clone(),
+            credential: Some("vault:deepseek".into()),
+            scope: RateLimitScope::Credential(CredentialScope {
+                credential: "vault:deepseek".into(),
+            }),
+            kind: RateLimitKind::Requests,
+            window: unit(RateLimitUnit::Minute),
+            status: RateLimitStatus::Limited,
+            reason: Some("quota".into()),
+            resets_at: Some("2026-10-08T12:34:00Z".into()),
+            next_retry_at: None,
+        };
+        let wire = serde_json::to_string(&event).unwrap();
+        assert!(wire.contains("vault:deepseek") && !wire.contains("sk-"));
+        assert!(wire.contains("\"type\":\"provider_rate_limit\""));
+    }
+
+    #[test]
+    fn a_known_timezone_is_utc_in_any_case_or_an_iana_name() {
+        for good in [
+            "utc",
+            "UTC",
+            "Utc",
+            "Europe/Paris",
+            "America/New_York",
+            "Asia/Tokyo",
+        ] {
+            assert!(known_timezone(good), "{good}");
+        }
+        for bad in ["Mars/Olympus", "GMT+2", "fr", "europe/paris"] {
+            assert!(!known_timezone(bad), "{bad}");
+        }
     }
 }
