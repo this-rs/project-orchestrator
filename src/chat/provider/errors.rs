@@ -266,6 +266,19 @@ fn unreachable_message(provider_id: Option<&str>, detail: &str) -> String {
     message
 }
 
+/// The masked cause of a provider error, when the error names one and it survives
+/// [`safe_cause`] — the very gate the user-facing message goes through, so an
+/// outage event can never carry more than that message already shows.
+///
+/// `None` when the error names no cause, or when the one it names is not safe to
+/// show: an outage is still an outage without it.
+pub fn cause_of(err: &ProviderError) -> Option<String> {
+    match err {
+        ProviderError::EndpointUnreachable { detail } => safe_cause(detail).map(str::to_owned),
+        _ => None,
+    }
+}
+
 /// Maps a provider error met while opening (or resuming) a session.
 ///
 /// `unauthorized` answers 502, not 401: a 401 would log the user out of the
@@ -729,6 +742,28 @@ mod tests {
         assert_eq!(safe_cause("boom\nsecond line"), None);
         assert_eq!(safe_cause("Bearer sk-abcdef0123456789abcdef"), None);
         assert_eq!(safe_cause(""), None);
+    }
+
+    #[test]
+    fn cause_of_names_a_plain_cause_and_drops_anything_leaky() {
+        // The outage event takes its `cause` from here, so it can never carry more
+        // than the message the user already reads.
+        assert_eq!(
+            cause_of(&ProviderError::EndpointUnreachable {
+                detail: "connection failed: Connection refused (os error 61)".to_string(),
+            })
+            .as_deref(),
+            Some("connection failed: Connection refused (os error 61)")
+        );
+        assert_eq!(
+            cause_of(&ProviderError::EndpointUnreachable {
+                detail: "GET https://api.example.com/v1 failed".to_string(),
+            }),
+            None,
+            "a URL is not a cause we show"
+        );
+        // An error that names no endpoint names no cause either.
+        assert_eq!(cause_of(&ProviderError::Overloaded), None);
     }
 
     #[test]

@@ -1,6 +1,7 @@
-//! Provider outage detection: from a stream of call outcomes, decide when an
-//! instance is **down** — a service interruption to persist and attribute —
-//! rather than merely having blipped.
+//! Provider outage handling, both halves: from a stream of call outcomes, decide
+//! when an instance is **down** — a service interruption to persist and attribute
+//! rather than merely having blipped — and decide what that state means for the
+//! turn in flight: **held**, not closed, and resumed when the instance answers.
 //!
 //! # What this is, and what it is not
 //!
@@ -35,7 +36,10 @@
 //! - `cognitive::candidates::HealthCache` decides the **current health** fed to
 //!   `ModelFacts.healthy`, from an *active* probe cached for 60 s.
 //! - This detector decides **what to announce** (observability): it produces a
-//!   persisted, attributable event and no control signal at all.
+//!   persisted, attributable event. [`TurnHold`], which wraps it, is the *control*
+//!   that this state implies — hold a turn whose retry budget is spent for a down
+//!   instance, resume it when the instance answers — and nothing else: it never
+//!   refuses a call, and never writes `ModelFacts.healthy`.
 //!
 //! Those are three different outputs. They may all be fed from the same outcome
 //! (the caller maps one `ProviderError` to one [`Outcome`] in one place), but
@@ -62,14 +66,16 @@
 //! facts. [`ChatEvent::ProviderOutage`] is an additive variant of that existing
 //! channel: no second channel is created, and a client that does not know it
 //! ignores it. Wiring is a deliberate follow-up — a self-contained primitive
-//! first, its wiring next, matching how [`super::circuit_breaker`] was landed —
-//! because the two call sites it needs are the two transient-retry loops that
-//! already emit [`ChatEvent::Retrying`] (`agent_runtime.rs` for the agent
-//! engine, `manager.rs` for the legacy one), which are hot and in flight. The
-//! move is the same in both: hold one [`ProviderOutage`] per `provider_id` beside
-//! the retry state, feed each *final* call's [`Outcome`] to
-//! [`ProviderOutage::record`], and emit `notice.to_chat_event(chrono::Utc::now())`
-//! whenever it returns one.
+//! first, its wiring next. The **agent engine** is wired (`agent_runtime.rs`): one
+//! [`TurnHold`] per session beside its `RetryConfig`; a *final* call's [`Outcome`]
+//! is fed in one place, a `down`/`up` transition emits
+//! `notice.to_chat_event(chrono::Utc::now())`, and a failure whose ordinary retry
+//! budget is spent is **held** — probed at the hold's cadence, bounded by
+//! `max_hold` — instead of closing the turn. The legacy loop (`manager.rs`) is the
+//! remaining call site: it classifies its failures from provider *text*
+//! (`classify_api_error`), not the typed `ProviderError` this module takes, so it
+//! needs a mapping of that taxonomy to [`Outcome`] first — a deliberate follow-up,
+//! tracked, not silently skipped.
 
 use std::time::{Duration, Instant};
 
@@ -82,6 +88,12 @@ pub const DEFAULT_FAILURE_THRESHOLD: u32 = 3;
 /// How long a run of failures may last before it is an outage on its own,
 /// however few failures it holds.
 pub const DEFAULT_DEGRADE_WINDOW: Duration = Duration::from_secs(30);
+
+/// `CHAT_PROVIDER_OUTAGE_FAILURES`: consecutive failures that declare an outage.
+pub const ENV_FAILURE_THRESHOLD: &str = "CHAT_PROVIDER_OUTAGE_FAILURES";
+
+/// `CHAT_PROVIDER_OUTAGE_WINDOW_SECS`: a run of failures this long is an outage.
+pub const ENV_DEGRADE_WINDOW_SECS: &str = "CHAT_PROVIDER_OUTAGE_WINDOW_SECS";
 
 /// When an instance counts as down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +120,24 @@ impl OutagePolicy {
         Self {
             failure_threshold,
             degrade_window,
+        }
+    }
+
+    /// The policy the operator configured ([`ENV_FAILURE_THRESHOLD`],
+    /// [`ENV_DEGRADE_WINDOW_SECS`]), else [`Default`]. An unreadable value keeps the
+    /// default rather than refusing to serve chat.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let default = Self::default();
+        Self {
+            // A 0 is read as 1 by `ProviderOutage::record` — an outage on the first
+            // failure — which is a usable kill switch: detect at once, or never.
+            failure_threshold: env_u64(ENV_FAILURE_THRESHOLD)
+                .map(|v| v as u32)
+                .unwrap_or(default.failure_threshold),
+            degrade_window: env_u64(ENV_DEGRADE_WINDOW_SECS)
+                .map(Duration::from_secs)
+                .unwrap_or(default.degrade_window),
         }
     }
 }
@@ -225,6 +255,11 @@ impl ProviderOutage {
         self.consecutive_failures
     }
 
+    /// Replaces the policy (a configuration change; the run and the state stand).
+    pub fn set_policy(&mut self, policy: OutagePolicy) {
+        self.policy = policy;
+    }
+
     /// Records the outcome of one call and returns the notice **only** when this
     /// outcome flipped the state. Feed it one [`Outcome`] per *final* call — the
     /// caller maps a `ProviderError` through `ProviderError::retryable()` once the
@@ -283,6 +318,189 @@ impl ProviderOutage {
                 })
             }
         }
+    }
+}
+
+/// Longest a turn is held for a down instance before the failure stands: long
+/// enough to ride out a provider restart, short enough that a turn never hangs for
+/// good.
+pub const DEFAULT_MAX_HOLD: Duration = Duration::from_secs(15 * 60);
+
+/// How often a held turn probes the instance again.
+pub const DEFAULT_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a turn may be held for a down instance, and how often it is probed.
+///
+/// The hold is what keeps a *down* provider from closing a turn. The ordinary retry
+/// budget covers a blip; once it is spent the failure would otherwise end the turn,
+/// and the user would read "the provider endpoint could not be reached" for a
+/// service that is merely away. While the instance is known down the turn is held
+/// instead — probed every `probe_interval` (each probe is one more call, whose
+/// outcome is what tells the detector the instance is back) — and bounded by
+/// `max_hold`, so an instance that never comes back still ends the turn on the real
+/// cause rather than holding it for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoldPolicy {
+    /// Longest a turn waits for the instance to answer again, in total.
+    pub max_hold: Duration,
+    /// Delay between two probes of a held turn.
+    pub probe_interval: Duration,
+}
+
+impl Default for HoldPolicy {
+    fn default() -> Self {
+        Self {
+            max_hold: DEFAULT_MAX_HOLD,
+            probe_interval: DEFAULT_PROBE_INTERVAL,
+        }
+    }
+}
+
+impl HoldPolicy {
+    /// A checked policy.
+    #[must_use]
+    pub fn new(max_hold: Duration, probe_interval: Duration) -> Self {
+        Self {
+            max_hold,
+            probe_interval,
+        }
+    }
+
+    /// The policy the operator configured (`CHAT_PROVIDER_HOLD_MAX_SECS`,
+    /// `CHAT_PROVIDER_HOLD_PROBE_MS`), else [`Default`]. `CHAT_PROVIDER_HOLD_MAX_SECS=0`
+    /// is the kill switch: a spent retry budget is never held, as before this feature.
+    /// The probe interval has a floor of 50 ms — a held turn must not spin.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let default = Self::default();
+        Self {
+            max_hold: env_u64("CHAT_PROVIDER_HOLD_MAX_SECS")
+                .map(Duration::from_secs)
+                .unwrap_or(default.max_hold),
+            probe_interval: env_u64("CHAT_PROVIDER_HOLD_PROBE_MS")
+                .map(|ms| Duration::from_millis(ms.max(50)))
+                .unwrap_or(default.probe_interval),
+        }
+    }
+}
+
+/// A `u64` from the environment, or `None` when the variable is unset or is not a
+/// number. Never refuses to start over a typo: the caller falls back to its default.
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
+}
+
+/// The **control** half of outage handling, on top of the detection of
+/// [`ProviderOutage`]: it decides whether a turn whose retry budget is spent is
+/// **held** (the instance is down) or closed.
+///
+/// The two halves share one state machine, hence one value and one lock: they must
+/// see the same sequence of outcomes. The detector declares the instance down, and
+/// the hold is exactly what that state means for the turn in flight — feed one
+/// without the other and a hold outlives its outage, or an outage closes a turn it
+/// should have held.
+///
+/// **No tool is ever replayed.** The hold only extends a retry the caller had
+/// already allowed on a turn that showed nothing (`retryable_failure`), or one that
+/// showed text but called no tool (`mid_generation_retryable`): a turn that already
+/// ran a tool never reaches the hold, exactly as it never reaches the ordinary
+/// retry. The guarantee of the restart recovery holds here too — an executed tool
+/// is never run twice.
+#[derive(Debug, Clone)]
+pub struct TurnHold {
+    outage: ProviderOutage,
+    hold: HoldPolicy,
+    /// When the current hold began — the start of the outage that declared it.
+    /// Cleared when the instance is up again, or when the budget is given up.
+    held_since: Option<Instant>,
+}
+
+impl TurnHold {
+    /// A hold for one instance, with the default policies.
+    #[must_use]
+    pub fn new(provider_id: impl Into<String>) -> Self {
+        Self::with_policies(provider_id, OutagePolicy::default(), HoldPolicy::default())
+    }
+
+    /// A hold with explicit policies.
+    #[must_use]
+    pub fn with_policies(
+        provider_id: impl Into<String>,
+        outage: OutagePolicy,
+        hold: HoldPolicy,
+    ) -> Self {
+        Self {
+            outage: ProviderOutage::new(provider_id, outage),
+            hold,
+            held_since: None,
+        }
+    }
+
+    /// Replaces both policies (a configuration change; the state stands).
+    pub fn set_policies(&mut self, outage: OutagePolicy, hold: HoldPolicy) {
+        self.outage.set_policy(outage);
+        self.hold = hold;
+    }
+
+    /// Whether the instance is currently declared down.
+    #[must_use]
+    pub fn is_down(&self) -> bool {
+        self.outage.is_down()
+    }
+
+    /// Whether a turn is being held right now.
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        self.held_since.is_some()
+    }
+
+    /// Consecutive failures seen so far in the current run.
+    #[must_use]
+    pub fn consecutive_failures(&self) -> u32 {
+        self.outage.consecutive_failures()
+    }
+
+    /// Records one final call outcome and returns the notice **only** on a
+    /// transition (see [`ProviderOutage::record`]). The hold follows the state: it
+    /// begins with the outage and ends with the recovery.
+    pub fn record(
+        &mut self,
+        outcome: Outcome,
+        now: Instant,
+        cause: Option<&str>,
+    ) -> Option<OutageNotice> {
+        let notice = self.outage.record(outcome, now, cause);
+        match (notice.as_ref(), outcome) {
+            // The instance just went down: the hold begins at the outage.
+            (Some(notice), Outcome::Failure) => self.held_since = Some(notice.since),
+            // It answered again: the hold is over, and so is the outage.
+            (Some(_), Outcome::Success) => self.held_since = None,
+            _ => {}
+        }
+        notice
+    }
+
+    /// Whether a turn whose retry budget is spent may go on: `Some(wait)` while the
+    /// instance is down and the hold budget still allows — wait `wait`, then probe
+    /// the instance again (send the turn once more, or read the next attempt's
+    /// stream). `None` when the failure must stand: the instance is not down, or
+    /// `max_hold` is spent.
+    pub fn hold_on(&mut self, now: Instant) -> Option<Duration> {
+        let since = self.held_since.filter(|_| self.outage.is_down())?;
+        if now.saturating_duration_since(since) >= self.hold.max_hold {
+            // The budget is spent: the failure stands. The state is cleared, so a
+            // later outage is held on its own clock.
+            self.held_since = None;
+            return None;
+        }
+        Some(self.hold.probe_interval)
+    }
+
+    /// How long the current hold has lasted (`None`: not held).
+    #[must_use]
+    pub fn held_for(&self, now: Instant) -> Option<Duration> {
+        self.held_since
+            .map(|since| now.saturating_duration_since(since))
     }
 }
 
@@ -432,5 +650,96 @@ mod tests {
             .expect("the third failure declares the outage, cause or not");
         assert_eq!(notice.phase, OutagePhase::Down);
         assert!(notice.cause.is_none());
+    }
+
+    /// A hold with a threshold/window easy to reason about in a test.
+    fn hold_of(threshold: u32, max_hold_secs: u64, probe_ms: u64) -> TurnHold {
+        TurnHold::with_policies(
+            "deepseek",
+            OutagePolicy::new(threshold, Duration::from_secs(30)),
+            HoldPolicy::new(
+                Duration::from_secs(max_hold_secs),
+                Duration::from_millis(probe_ms),
+            ),
+        )
+    }
+
+    #[test]
+    fn a_turn_past_its_retry_budget_is_held_for_a_down_instance() {
+        let base = Instant::now();
+        let mut hold = hold_of(1, 60, 10);
+        // One failure declares the instance down: the hold begins with the outage.
+        assert!(hold
+            .record(Outcome::Failure, base, Some("conn refused"))
+            .is_some());
+        assert!(hold.is_down());
+        assert!(hold.is_held());
+        assert_eq!(hold.hold_on(base), Some(Duration::from_millis(10)));
+        // A further failure of the same outage is not a transition, and the hold
+        // still stands: the turn goes on being probed.
+        assert!(hold
+            .record(Outcome::Failure, at(base, 1), Some("conn refused"))
+            .is_none());
+        assert_eq!(hold.hold_on(at(base, 1)), Some(Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn the_hold_is_bounded_and_gives_up_when_its_budget_is_spent() {
+        let base = Instant::now();
+        let mut hold = hold_of(1, 5, 10);
+        hold.record(Outcome::Failure, base, None);
+        assert_eq!(hold.hold_on(at(base, 4)), Some(Duration::from_millis(10)));
+        // Past `max_hold`: the failure stands, and the hold is over.
+        assert_eq!(hold.hold_on(at(base, 5)), None);
+        assert!(!hold.is_held());
+        // The instance is still down, but a hold that gave up is not restarted on
+        // its own: the failure it produced stands.
+        assert_eq!(hold.hold_on(at(base, 6)), None);
+    }
+
+    #[test]
+    fn the_recovery_ends_the_hold_and_carries_the_outage() {
+        let base = Instant::now();
+        let mut hold = hold_of(1, 60, 10);
+        hold.record(Outcome::Failure, base, Some("conn refused"));
+        let notice = hold
+            .record(Outcome::Success, at(base, 12), None)
+            .expect("the instance answered again");
+        assert_eq!(notice.phase, OutagePhase::Up);
+        assert_eq!(notice.duration, Some(Duration::from_secs(12)));
+        assert_eq!(notice.cause.as_deref(), Some("conn refused"));
+        assert!(!hold.is_down());
+        assert!(!hold.is_held());
+        assert_eq!(hold.hold_on(at(base, 12)), None);
+    }
+
+    #[test]
+    fn an_up_instance_is_never_held() {
+        let base = Instant::now();
+        let mut hold = hold_of(3, 60, 10);
+        assert!(hold.record(Outcome::Failure, base, None).is_none());
+        assert!(!hold.is_held(), "two failures short of the threshold");
+        assert_eq!(hold.hold_on(base), None);
+    }
+
+    #[test]
+    fn a_blip_does_not_start_a_hold() {
+        let base = Instant::now();
+        let mut hold = hold_of(3, 60, 10);
+        hold.record(Outcome::Failure, base, None);
+        hold.record(Outcome::Failure, at(base, 1), None);
+        hold.record(Outcome::Success, at(base, 2), None);
+        assert!(!hold.is_held());
+        hold.record(Outcome::Failure, at(base, 3), None);
+        assert!(!hold.is_held(), "the count restarted: still short of three");
+    }
+
+    #[test]
+    fn the_hold_reports_how_long_it_has_lasted() {
+        let base = Instant::now();
+        let mut hold = hold_of(1, 60, 10);
+        assert_eq!(hold.held_for(base), None);
+        hold.record(Outcome::Failure, base, None);
+        assert_eq!(hold.held_for(at(base, 7)), Some(Duration::from_secs(7)));
     }
 }

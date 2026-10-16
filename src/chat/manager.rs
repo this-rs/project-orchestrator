@@ -16446,6 +16446,14 @@ impl ChatManager {
             .await;
         // A failed turn is retried as the chat's configuration says, on both engines.
         handle.configure_retry(self.config.retry.clone());
+        // A provider instance the detector declares DOWN holds the turn instead of
+        // closing it, as the operator configured (`CHAT_PROVIDER_OUTAGE_*`,
+        // `CHAT_PROVIDER_HOLD_*`): the agent engine's control half of outage
+        // detection (`chat::provider::outage`).
+        handle.configure_outage(
+            super::provider::outage::OutagePolicy::from_env(),
+            super::provider::outage::HoldPolicy::from_env(),
+        );
         self.spawn_agent_nats_listeners(handle);
     }
 

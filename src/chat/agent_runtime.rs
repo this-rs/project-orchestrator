@@ -31,7 +31,9 @@ use super::manager::{
     CancelTaskResult, CancelToolsResult, ChatManager, CANCEL_TASK_CAP, CANCEL_TASK_WINDOW_SECS,
     CANCEL_TOOLS_CAP, CANCEL_TOOLS_WINDOW_SECS,
 };
+use super::provider::circuit_breaker::Outcome;
 use super::provider::event_map::{out_of_band_to_chat_events, EventMapper};
+use super::provider::outage::{HoldPolicy, OutageNotice, OutagePolicy, TurnHold};
 use super::spill::SpillConfig;
 use super::types::{
     BackgroundTaskInfo, ChatEvent, PendingMessage, PendingMessageKind, PermissionAnswerScope,
@@ -718,6 +720,11 @@ pub struct AgentSessionHandle {
     /// How a turn that failed before showing anything is retried: the chat's
     /// `RetryConfig` (`configure_retry`), as on the Claude Code engine.
     retry: std::sync::RwLock<RetryConfig>,
+    /// When this session's instance counts as down, and how long a turn whose retry
+    /// budget is spent is held for it (`configure_outage`): the outage detector and
+    /// the hold policy of one instance, in one state machine
+    /// (`chat::provider::outage::TurnHold`).
+    outage: std::sync::Mutex<TurnHold>,
     /// Whether an oversized tool result is spilled out of the transcript
     /// (`super::spill`): the budget and preview sizes this session keeps.
     spill: SpillConfig,
@@ -994,6 +1001,55 @@ impl AgentSessionHandle {
 
     pub(crate) fn retry_config(&self) -> RetryConfig {
         self.retry.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Sets the outage policies of this session: when its instance is declared down,
+    /// and how long a turn is held for it (`configure_retry`'s twin).
+    pub fn configure_outage(&self, outage: OutagePolicy, hold: HoldPolicy) {
+        self.outage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_policies(outage, hold);
+    }
+
+    /// Feeds one final failed call of this session to the outage detector and emits
+    /// the notice when this outcome flipped the instance — the `down` transition
+    /// only: a further failure of an instance already down is part of the same
+    /// outage and says nothing new.
+    async fn record_outage_failure(&self, error: &ProviderError) {
+        let cause = super::provider::errors::cause_of(error);
+        let notice = {
+            let mut hold = self.outage.lock().unwrap_or_else(|e| e.into_inner());
+            hold.record(Outcome::Failure, Instant::now(), cause.as_deref())
+        };
+        if let Some(notice) = notice {
+            self.emit_outage(notice).await;
+        }
+    }
+
+    /// The first success after an outage: the instance is back, the hold is over.
+    async fn record_outage_success(&self) {
+        let notice = {
+            let mut hold = self.outage.lock().unwrap_or_else(|e| e.into_inner());
+            hold.record(Outcome::Success, Instant::now(), None)
+        };
+        if let Some(notice) = notice {
+            self.emit_outage(notice).await;
+        }
+    }
+
+    /// Whether a turn whose retry budget is spent may go on: `Some(wait)` while the
+    /// instance is down and the hold budget allows, `None` when the failure stands.
+    fn hold_a_failed_turn(&self) -> Option<Duration> {
+        self.outage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hold_on(Instant::now())
+    }
+
+    /// Emits the persisted, attributable event of an outage transition.
+    async fn emit_outage(&self, notice: OutageNotice) {
+        self.emit(notice.to_chat_event(chrono::Utc::now())).await;
     }
 
     /// The session did something now.
@@ -1381,7 +1437,7 @@ impl AgentSessionHandle {
     /// (id, parent).
     async fn play(
         &self,
-        mut stream: nexus_claude::agent::EventStream,
+        stream: nexus_claude::agent::EventStream,
         input: TurnInput,
     ) -> (TurnOutcome, Vec<(String, Option<String>)>) {
         let mut attempt = 0u32;
@@ -1399,7 +1455,44 @@ impl AgentSessionHandle {
         // over the handle is removed from the runtime, so the next message resumes
         // the session instead of re-failing on a closed process.
         let mut exited = false;
+        // The stream of the attempt in flight. `None` means the attempt has still to
+        // be sent: the first is already open, and a held turn whose probe the
+        // provider refused goes back through `send_turn` at the top of the loop.
+        let mut stream: Option<nexus_claude::agent::EventStream> = Some(stream);
         loop {
+            let Some(mut current) = stream.take() else {
+                // The probe of a held turn: one more call of the same input. A
+                // refusal is one more failed call — the detector sees it, and the
+                // hold decides whether the turn goes on (its own budget bounds the
+                // loop) or ends here on the real cause.
+                match self.session.send_turn(input.clone()).await {
+                    Ok(next) => {
+                        stream = Some(next);
+                        continue;
+                    }
+                    Err(error) => {
+                        exited |= matches!(&error, ProviderError::ProcessExited { .. });
+                        self.record_outage_failure(&error).await;
+                        let Some(wait) = self.hold_a_failed_turn() else {
+                            let event = AgentEvent::Error { error };
+                            let chat_events = self.mapper.lock().await.map(&event);
+                            for chat_event in chat_events {
+                                self.emit(chat_event).await;
+                            }
+                            break;
+                        };
+                        if self.pause_unless_stopped(wait).await {
+                            let stopped = interrupted_done();
+                            let chat_events = self.mapper.lock().await.map(&stopped);
+                            for chat_event in chat_events {
+                                self.emit(chat_event).await;
+                            }
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            };
             // Did the turn already show the user anything? A turn that showed
             // nothing is retried on any retryable failure; a turn that showed
             // text but no tool is retried on a transient mid-generation failure
@@ -1407,7 +1500,14 @@ impl AgentSessionHandle {
             // tool is never replayed: the tool may have had a side effect.
             let mut shown = false;
             let mut retry: Option<ProviderError> = None;
-            while let Some(event) = stream.next().await {
+            // Set when the attempt goes on past its retry budget, held: how long to
+            // wait before the next probe.
+            let mut held_for: Option<Duration> = None;
+            // Whether this attempt saw a retryable failure at all: an attempt that
+            // did, and is not retried, must not read as the instance answering (that
+            // would reset the detector and hide the outage).
+            let mut failed = false;
+            while let Some(event) = current.next().await {
                 // Terminal-ness is read on the original: a withheld terminal event
                 // still ends the turn.
                 let terminal = event.is_terminal();
@@ -1425,7 +1525,19 @@ impl AgentSessionHandle {
                 } else {
                     None
                 };
-                retry = failure.filter(|_| attempt < max_attempts);
+                // The outage detector sees this final call's outcome, in exactly one
+                // place, and the hold follows from it: a failure whose ordinary retry
+                // budget is spent goes on while the instance is down (a held turn)
+                // instead of closing the turn on an error the user would read as
+                // theirs.
+                if let Some(error) = failure.as_ref() {
+                    failed = true;
+                    self.record_outage_failure(error).await;
+                    if attempt >= max_attempts {
+                        held_for = self.hold_a_failed_turn();
+                    }
+                }
+                retry = failure.filter(|_| attempt < max_attempts || held_for.is_some());
                 if retry.is_some() {
                     break;
                 }
@@ -1466,9 +1578,22 @@ impl AgentSessionHandle {
                     break;
                 }
             }
-            let Some(error) = retry else { break };
+            let Some(error) = retry else {
+                // The attempt answered without a retryable failure: the instance is
+                // up as far as this session knows. An error of its own that is not
+                // retryable is not a health failure either (`Outcome`).
+                if !failed {
+                    self.record_outage_success().await;
+                }
+                break;
+            };
             attempt += 1;
-            let delay = retry_delay_ms(&error, attempt, &retry_config);
+            let delay = match held_for {
+                // A held turn probes at the hold's cadence, not on the retry curve
+                // the ordinary budget follows.
+                Some(probe) => probe.as_millis() as u64,
+                None => retry_delay_ms(&error, attempt, &retry_config),
+            };
             self.emit(ChatEvent::Retrying {
                 attempt,
                 max_attempts,
@@ -1492,18 +1617,9 @@ impl AgentSessionHandle {
                 }
                 break;
             }
-            match self.session.send_turn(input.clone()).await {
-                Ok(next) => stream = next,
-                Err(e) => {
-                    exited |= matches!(&e, ProviderError::ProcessExited { .. });
-                    let ev = AgentEvent::Error { error: e };
-                    let chat_events = self.mapper.lock().await.map(&ev);
-                    for chat_event in chat_events {
-                        self.emit(chat_event).await;
-                    }
-                    break;
-                }
-            }
+            // The next attempt is sent at the top of the loop, so a held turn whose
+            // probe the provider refuses is simply probed again — the hold's own
+            // budget is what bounds it.
         }
         // The record carries the turn's cost before the session is seen idle.
         self.add_turn_cost(turn_cost).await;
@@ -2327,6 +2443,7 @@ impl AgentRuntime {
             record: Mutex::new(()),
             opening_counted: AtomicBool::new(false),
             retry: std::sync::RwLock::new(RetryConfig::default()),
+            outage: std::sync::Mutex::new(TurnHold::new(provider_id)),
             spill: self.spill,
             last_activity: std::sync::Mutex::new(Instant::now()),
             registry: Arc::downgrade(&self.sessions),
@@ -4149,6 +4266,198 @@ mod retry_config_tests {
             }
         }
         assert_eq!(retrying, [(1, 1, 7)]);
+    }
+}
+
+/// A provider instance that goes down and comes back: the turn that touches it is
+/// held (never closed on "the endpoint could not be reached"), and it resumes when
+/// the instance answers — without replaying anything the turn had already run.
+#[cfg(test)]
+mod outage_hold_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+
+    fn unreachable() -> ProviderError {
+        ProviderError::EndpointUnreachable {
+            detail: "connection failed: Connection refused (os error 61)".to_string(),
+        }
+    }
+
+    fn outage_event() -> AgentEvent {
+        AgentEvent::Error {
+            error: unreachable(),
+        }
+    }
+
+    fn done(error: Option<ProviderError>) -> AgentEvent {
+        AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Completed,
+            subtype: None,
+            is_error: error.is_some(),
+            result_text: None,
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error,
+        }
+    }
+
+    fn tool_call() -> AgentEvent {
+        AgentEvent::ToolCall {
+            id: "t1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": "true" }),
+            category: nexus_claude::agent::ToolCategory::Other,
+            canonical: None,
+            input_complete: true,
+            seq: None,
+            parent: None,
+        }
+    }
+
+    /// A session on the fake provider whose ordinary retry budget is spent at once —
+    /// so the HOLD is what keeps the turn alive — with one failure declaring the
+    /// instance down and a short hold window.
+    async fn rig() -> (FakeProvider, Arc<AgentSessionHandle>) {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = runtime
+            .adopt(
+                "not-a-uuid",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        handle.configure_retry(RetryConfig {
+            max_attempts: 0,
+            initial_delay_ms: 1,
+            backoff_multiplier: 1.0,
+        });
+        handle.configure_outage(
+            OutagePolicy::new(1, Duration::from_secs(30)),
+            HoldPolicy::new(Duration::from_secs(30), Duration::from_millis(5)),
+        );
+        (provider, handle)
+    }
+
+    /// The phases of the `ProviderOutage` events emitted so far, in order.
+    fn transitions(rx: &mut broadcast::Receiver<ChatEvent>) -> Vec<String> {
+        let mut phases = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ChatEvent::ProviderOutage { phase, .. } = event {
+                phases.push(phase);
+            }
+        }
+        phases
+    }
+
+    /// The instance fails every attempt until the test lets it answer: the turn is
+    /// held across the failures and resumes when it does.
+    #[tokio::test]
+    async fn a_down_instance_holds_the_turn_until_it_answers() {
+        let (provider, handle) = rig().await;
+        let mut rx = handle.events_tx.subscribe();
+        handle.send_message("hello").await.unwrap();
+        const FAILURES: usize = 2;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = 0usize;
+        loop {
+            let turns = provider.state.turns_started.lock().unwrap().len();
+            if turns > seen {
+                seen = turns;
+                if seen <= FAILURES {
+                    provider.state.push(outage_event());
+                } else {
+                    provider.state.push(done(None));
+                }
+            }
+            if !handle.is_streaming.load(Ordering::SeqCst) && seen > 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the turn never ended");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            seen,
+            FAILURES + 1,
+            "the held turn was probed until the instance answered"
+        );
+        assert_eq!(
+            transitions(&mut rx),
+            ["down", "up"],
+            "one notice per transition, never per failed call"
+        );
+    }
+
+    /// A probe the provider *refuses at the send* does not close a held turn: it is
+    /// probed again — the hold's own budget is what bounds it.
+    #[tokio::test]
+    async fn a_refused_probe_does_not_close_a_held_turn() {
+        let (provider, handle) = rig().await;
+        let mut rx = handle.events_tx.subscribe();
+        handle.send_message("hello").await.unwrap();
+        // The turn is open; its first probe is refused before any stream exists.
+        *provider.state.fail_next_turn.lock().unwrap() = Some(unreachable());
+        provider.state.push(outage_event());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = 0usize;
+        loop {
+            let turns = provider.state.turns_started.lock().unwrap().len();
+            if turns > seen {
+                seen = turns;
+                if seen >= 2 {
+                    provider.state.push(done(None));
+                }
+            }
+            if !handle.is_streaming.load(Ordering::SeqCst) && seen >= 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the turn never ended");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(seen, 2, "the refused probe was retried, not dropped");
+        assert_eq!(transitions(&mut rx), ["down", "up"]);
+    }
+
+    /// A turn that already called a tool is closed by its failure like any other: the
+    /// hold never extends to it, so no tool is ever replayed.
+    #[tokio::test]
+    async fn a_turn_that_ran_a_tool_is_never_held() {
+        let (provider, handle) = rig().await;
+        let mut rx = handle.events_tx.subscribe();
+        handle.send_message("hello").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while provider.state.turns_started.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the turn never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        provider.state.push(tool_call());
+        provider.state.push(outage_event());
+        provider.state.push(done(Some(unreachable())));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while handle.is_streaming.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the turn never ended");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap().len(),
+            1,
+            "a turn that ran a tool is never replayed"
+        );
+        assert!(
+            transitions(&mut rx).is_empty(),
+            "a turn that already ran a tool is not even a retryable call"
+        );
     }
 }
 
