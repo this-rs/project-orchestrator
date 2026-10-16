@@ -13,7 +13,12 @@
 //!   exhausted quota or an overload";
 //! * [`profiles`] — the DATA of RL3: which headers and codes each endpoint family
 //!   uses, and how solid that knowledge is;
-//! * [`store`] — where a budget's calendar cumul survives a restart.
+//! * [`store`] — where a budget's calendar cumul survives a restart;
+//! * [`breaker`] — RL4: the state machine per (instance, credential REFERENCE).
+//!   A spent quota opens it until its reset and never earlier; an overload opens
+//!   it for a short, jittered, capped backoff and never marks the key as spent;
+//!   half-open lets exactly ONE probe through. It retries nothing itself: the
+//!   count of a retry belongs to [`ledger`].
 //!
 //! # What is NOT here
 //!
@@ -24,11 +29,16 @@
 //! this module exposes exactly what that slice needs ([`Ledger::try_reserve`],
 //! [`Ledger::settle`], [`Ledger::standing`]) without touching it today.
 
+pub mod breaker;
 pub mod classify;
 pub mod ledger;
 pub mod profiles;
 pub mod store;
 
+pub use breaker::{
+    Breaker, Decision, FixedJitter, Jitter, Key, Phase, Policy, Reason, SeededJitter, State,
+    SystemJitter, Transition,
+};
 pub use classify::{
     apply_verdict, classify, from_provider_error, Classification, ErrorBody, OurStanding, Signal,
     Signals, Verdict, NEAR_RATIO,
