@@ -20,21 +20,28 @@
 //!   half-open lets exactly ONE probe through. It retries nothing itself: the
 //!   count of a retry belongs to [`ledger`].
 //!
+//! * [`admission`] — RL5: the ONE door a call goes through before it costs
+//!   anything. It reserves in the ledger, consults the breaker, and answers a
+//!   NAMED refusal (with `retry_at` / `reset_at`) instead of an exception. This is
+//!   the module every path that reaches a provider is wired through.
+//!
 //! # What is NOT here
 //!
 //! Nothing in this module talks to a provider, opens a session, emits an event or
 //! reads a secret: it is the decision, kept pure and testable (see the coverage
 //! gate on the pure files). The call site that reserves before a turn and settles
-//! after it belongs to the chat path, and lands with the slice that wires it —
-//! this module exposes exactly what that slice needs ([`Ledger::try_reserve`],
-//! [`Ledger::settle`], [`Ledger::standing`]) without touching it today.
+//! after it belongs to the chat path; [`admission::Gate`] is exactly what that
+//! slice needs ([`admission::Gate::admit`], [`admission::Gate::settle`],
+//! [`admission::Gate::report`]).
 
+pub mod admission;
 pub mod breaker;
 pub mod classify;
 pub mod ledger;
 pub mod profiles;
 pub mod store;
 
+pub use admission::{ask_for, key_for, Admission, Aftermath, Gate, Refusal, RefusalKind};
 pub use breaker::{
     Breaker, Decision, FixedJitter, Jitter, Key, Phase, Policy, Reason, SeededJitter, State,
     SystemJitter, Transition,
@@ -43,7 +50,9 @@ pub use classify::{
     apply_verdict, classify, from_provider_error, Classification, ErrorBody, OurStanding, Signal,
     Signals, Verdict, NEAR_RATIO,
 };
-pub use ledger::{Ask, Clock, Ledger, ManualClock, Note, Outcome, Reservation, SystemClock};
+pub use ledger::{
+    applies_to, Ask, Clock, Ledger, ManualClock, Note, Outcome, Reservation, SystemClock,
+};
 pub use profiles::{preset_for_base_url, profile, Evidence, ProviderProfile};
 pub use store::{FileStore, LedgerStore, MemoryStore};
 

@@ -877,6 +877,33 @@ impl Ledger {
         standing
     }
 
+    /// The EARLIEST reset among the limits a call is subject to: the instant our
+    /// own counting frees room again, used when a provider declares a quota spent
+    /// without saying when it resets. `None` when no applicable limit has one.
+    ///
+    /// Nothing is reserved and no counter moves: this is a reading, for the
+    /// admission gate (RL5) to date a pause it would otherwise have to guess.
+    pub fn reset_at_of(
+        &self,
+        instance: &str,
+        limits: &[RateLimit],
+        ask: &Ask,
+    ) -> Option<DateTime<Utc>> {
+        let now = self.clock.now();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut earliest: Option<DateTime<Utc>> = None;
+        for limit in limits.iter().filter(|l| applies(&l.scope, ask)) {
+            let tracked = self.ensure(&mut guard, instance, limit, now);
+            if let Some(at) = tracked.counter.resets_at(now) {
+                earliest = Some(match earliest {
+                    Some(current) if current <= at => current,
+                    _ => at,
+                });
+            }
+        }
+        earliest
+    }
+
     /// RL1's report shape, with RL2's numbers in it.
     pub fn report(&self, record: &InstanceRecord) -> RateLimitReport {
         let now = self.clock.now();
@@ -930,6 +957,14 @@ impl Ledger {
 
 /// Whether a limit applies to the call being made.
 fn applies(scope: &RateLimitScope, ask: &Ask) -> bool {
+    applies_to(scope, ask)
+}
+
+/// [`applies`], exposed so the admission gate (RL5) names the SAME limits the
+/// ledger counts — the breaker and the counter must never disagree about which
+/// limits a call is subject to. Additive: [`applies`] delegates here, so there is
+/// one predicate and no second reading to keep in step.
+pub fn applies_to(scope: &RateLimitScope, ask: &Ask) -> bool {
     match scope {
         RateLimitScope::Instance(_) => true,
         RateLimitScope::Credential(credential) => {
