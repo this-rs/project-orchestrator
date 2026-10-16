@@ -1176,6 +1176,41 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_gives_back_what_the_other_limits_already_reserved() {
+        // The reservation is ALL-OR-NOTHING: here the request limit has room and
+        // the token limit does not. The slot the first one took must be handed back
+        // before the refusal is answered — otherwise every refused call would eat a
+        // request of the instance's allowance, and a burst of refused calls would
+        // exhaust a ceiling nothing was ever sent against.
+        let (_clock, ledger) = ledger(Arc::new(MemoryStore::new()));
+        let limits = vec![
+            requests(rolling(60), 2.0),
+            tokens(unit(RateLimitUnit::Hour), 10.0),
+        ];
+        let refusing = Ask {
+            tokens: Some(100.0),
+            ..Default::default()
+        };
+        assert!(!ledger
+            .try_reserve("deepseek", &limits, &refusing)
+            .is_granted());
+        // Both slots are still free: the refused call kept neither of them. (Had
+        // the take of the request limit survived the refusal, only one would be
+        // left here.)
+        let requests_only = vec![requests(rolling(60), 2.0)];
+        let plain = Ask::default();
+        assert!(ledger
+            .try_reserve("deepseek", &requests_only, &plain)
+            .is_granted());
+        assert!(ledger
+            .try_reserve("deepseek", &requests_only, &plain)
+            .is_granted());
+        assert!(!ledger
+            .try_reserve("deepseek", &requests_only, &plain)
+            .is_granted());
+    }
+
+    #[test]
     fn settling_a_denial_is_a_no_op() {
         let (_clock, ledger) = ledger(Arc::new(MemoryStore::new()));
         let limits = vec![requests(rolling(60), 1.0)];
@@ -1192,6 +1227,17 @@ mod tests {
                 }
             )
             .is_empty());
+    }
+
+    #[test]
+    fn a_granted_reservation_carries_no_refusal() {
+        let (_clock, ledger) = ledger(Arc::new(MemoryStore::new()));
+        let limits = vec![requests(rolling(60), 1.0)];
+        let granted = ledger.try_reserve("nim", &limits, &Ask::default());
+        assert!(granted.is_granted());
+        // Exactly one of the two: a reservation that may go out has nothing to
+        // explain, and that is what a caller reads before choosing to branch.
+        assert!(granted.denial().is_none());
     }
 
     // ---- the windows ---------------------------------------------------------
@@ -1374,6 +1420,21 @@ mod tests {
     }
 
     #[test]
+    fn a_month_window_rolls_to_the_first_of_the_next_month() {
+        // 2026-10-08: the month window ends on the first of November of the SAME
+        // year. (The December case, where the year turns, has its own test above;
+        // this is the ordinary month, and it is the one a budget spends most of its
+        // life in.)
+        let (_clock, ledger) = ledger(Arc::new(MemoryStore::new()));
+        let month = vec![budget("utc", RateLimitUnit::Month, 10.0)];
+        let report = ledger.report(&record(month));
+        assert_eq!(
+            report.limits[0].resets_at.as_deref(),
+            Some("2026-11-01T00:00:00Z")
+        );
+    }
+
+    #[test]
     fn an_unpriced_budget_counts_a_request_and_never_blocks() {
         let (_clock, ledger) = ledger(Arc::new(MemoryStore::new()));
         let limits = vec![budget("utc", RateLimitUnit::Day, 10.0)];
@@ -1415,6 +1476,30 @@ mod tests {
         assert_eq!(report.limits[0].used, Some(0.0));
         assert_eq!(report.limits[0].remaining, Some(10.0));
         assert!(ledger.try_reserve("deepseek", &limits, &ask).is_granted());
+    }
+
+    #[test]
+    fn a_call_known_to_be_free_is_admitted_until_the_budget_is_full() {
+        // A known cost of zero reserves nothing — and still has to pass the ceiling
+        // check. What the ceiling refuses when the window is full is the CALL, not
+        // a price: an exhausted budget does not admit even a call that would cost
+        // nothing, because the allowance is spent and nobody re-reads the price
+        // afterwards.
+        let (_clock, ledger) = ledger(Arc::new(MemoryStore::new()));
+        let limits = vec![budget("utc", RateLimitUnit::Day, 1.0)];
+        let free = Ask {
+            cost_usd: Some(0.0),
+            ..Default::default()
+        };
+        assert!(ledger.try_reserve("deepseek", &limits, &free).is_granted());
+        // The whole allowance goes out on a call whose price is known.
+        let paid = Ask {
+            cost_usd: Some(1.0),
+            ..Default::default()
+        };
+        assert!(ledger.try_reserve("deepseek", &limits, &paid).is_granted());
+        // The window is full: the free call is refused too.
+        assert!(!ledger.try_reserve("deepseek", &limits, &free).is_granted());
     }
 
     // ---- persistence ---------------------------------------------------------
@@ -1501,6 +1586,29 @@ mod tests {
         let report = ledger.report(&record(limits));
         assert_eq!(report.limits[0].used, Some(6.0));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_settlement_never_invents_the_counter_it_speaks_of() {
+        // A grant belongs to the ledger that took it: its takes name keys, and only
+        // that ledger holds the counters behind them. Handed to another one, the
+        // settlement is DROPPED — no panic, and no counter conjured up for a call
+        // this ledger never admitted.
+        let store: Arc<dyn LedgerStore> = Arc::new(MemoryStore::new());
+        let (_clock, granting) = ledger(Arc::clone(&store));
+        let (_other_clock, other) = ledger(Arc::clone(&store));
+        let limits = vec![requests(rolling(60), 5.0)];
+        let grant = granting.try_reserve("nim", &limits, &Ask::default());
+        assert!(grant.is_granted());
+        assert!(
+            other.settle(grant, Outcome::NeverSent).is_empty(),
+            "nothing to settle, nothing to warn about"
+        );
+        // And the other ledger's view is still untouched: it never saw the call.
+        assert_eq!(
+            other.standing("nim", &limits, &Ask::default()),
+            OurStanding::Under
+        );
     }
 
     // ---- scope ---------------------------------------------------------------
@@ -1778,6 +1886,31 @@ mod tests {
             Counter::new(&budget("utc", RateLimitUnit::Week, 5.0), now),
             Counter::Calendar(_)
         ));
+    }
+
+    #[test]
+    fn a_bucket_with_no_window_cannot_refill() {
+        // A GUARD, not a configuration: a unit window is 60 or 3 600 seconds and RL1
+        // refuses a rolling window of zero, so `Counter::new` never builds this
+        // bucket today. The guard is what keeps a zero-length window from dividing
+        // by zero, and what it must do then is refuse to refill: a ceiling that
+        // gives nothing back, with no reset to wait for.
+        let now = instant(T0);
+        let mut frozen = TokenBucket::new(10.0, 0, now);
+        assert_eq!(frozen.used(now), 0.0);
+        frozen.take_unchecked(now, 4.0);
+        assert_eq!(frozen.used(now), 4.0);
+        let much_later = now + chrono::Duration::hours(100);
+        assert_eq!(
+            frozen.used(much_later),
+            4.0,
+            "no amount of time brings the tokens back"
+        );
+        assert_eq!(
+            frozen.resets_at(much_later),
+            None,
+            "and so there is no reset to wait for"
+        );
     }
 
     #[test]
