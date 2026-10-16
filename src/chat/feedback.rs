@@ -902,8 +902,7 @@ pub async fn cited_refs_event(
         return None;
     }
     let source = crate::refs::resolvers::GraphRefSource::new(graph.clone());
-    let principal =
-        crate::refs::turn::session_principal(graph.as_ref(), session_id).await;
+    let principal = crate::refs::turn::session_principal(graph.as_ref(), session_id).await;
     let refs = crate::refs::cite::guard_cites(
         &source,
         &crate::refs::access::AccessPolicy::open_instance(),
