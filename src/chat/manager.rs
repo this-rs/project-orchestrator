@@ -277,6 +277,21 @@ pub(crate) const BACKGROUND_TASKS_POLL_INTERVAL_SECS: u64 = 5;
 /// Users who want immediate cleanup can `cancel_task` directly.
 pub(crate) const BACKGROUND_TASK_IDLE_DEATH_SECS: u64 = 1800;
 
+/// How long the background-task PID claim (`async_pid_claim`) keeps re-reading
+/// the CLI's descendants before giving up. The process it looks for is forked
+/// by the tool the CLI is about to run, and its birth is not synchronised with
+/// the `ToolUse` we announce: a single reading misses it as soon as the fork
+/// lands after that reading (measured under llvm-cov on task `FLAKY-PARITE`,
+/// where `cancel_task` then had no PID to signal). Bounded on purpose: the claim
+/// is a detached task per background task, and an unbounded poller would spin
+/// for the whole session after any process that dies before it is observed.
+pub(crate) const PID_CLAIM_WINDOW: Duration = Duration::from_secs(10);
+
+/// Interval between two readings inside [`PID_CLAIM_WINDOW`]: five looks per
+/// second, cheap (one `pgrep -P`) and fine-grained enough to catch a fork
+/// anywhere in a multi-second window.
+pub(crate) const PID_CLAIM_POLL: Duration = Duration::from_millis(500);
+
 /// In-memory facts about the running CLIs (see
 /// [`ChatManager::live_session_snapshot`]).
 #[derive(Debug, Default, Clone)]
@@ -7780,8 +7795,9 @@ impl ChatManager {
 
         // Capture the descendant snapshot BEFORE the subprocess forks.
         // This must run lock-free because `pgrep -P` may take 10-50 ms.
-        // Plan fc35b25e (T2): the async claim spawned below will compare
-        // this snapshot to one taken ~1 s later to discover the new PID.
+        // Plan fc35b25e (T2): the async claim spawned below compares this
+        // snapshot to readings taken every PID_CLAIM_POLL (up to
+        // PID_CLAIM_WINDOW) to discover the new PID.
         let before_pids: Vec<u32> = child_pid_for_before
             .map(Self::get_descendant_pids)
             .unwrap_or_default();
@@ -7869,8 +7885,8 @@ impl ChatManager {
     /// async PID claim) or if the session has no CLI subprocess yet.
     ///
     /// Plan fc35b25e (T2): companion to `async_pid_claim`. Re-resolves the
-    /// PID at sleep wake-up so a `resume_session` that races with the
-    /// claim window doesn't silently associate the new tool with an
+    /// PID at every reading so a `resume_session` that races with the
+    /// claim window does not silently associate the new tool with an
     /// obsolete CLI.
     async fn lookup_child_pid(
         session_id: &str,
@@ -7880,22 +7896,40 @@ impl ChatManager {
         sessions.get(session_id).and_then(|s| s.child_pid)
     }
 
-    /// Async PID claim for a freshly-tracked background task. Sleeps 1 s
-    /// to let the subprocess fork, then snapshots descendants again,
-    /// computes the diff against `before_pids`, and assigns the newest
-    /// new PID to the task entry. Broadcasts a fresh `ActiveTasksUpdate`
-    /// so the frontend can surface the PID (useful for debugging).
+    /// Async PID claim for a freshly-tracked background task. Returns as soon as
+    /// the subprocess it looks for is visible, and gives up after
+    /// [`PID_CLAIM_WINDOW`]. On success it assigns the newest new PID to the
+    /// task entry and broadcasts a fresh `ActiveTasksUpdate` so the frontend can
+    /// surface the PID (useful for debugging).
+    ///
+    /// The process is forked by the tool the CLI is about to run, and its birth
+    /// is NOT synchronised with the `ToolUse` we announce: how long the fork
+    /// takes depends on the load of the machine. A single reading taken 1 s
+    /// later therefore missed it whenever the fork landed after that reading,
+    /// and `cancel_task` then had no PID to signal at all (task
+    /// `FLAKY-PARITE`: `cancel_task` red once, green on a rerun of the SAME
+    /// head, under llvm-cov). So the claim re-reads the CLI's descendants every
+    /// [`PID_CLAIM_POLL`] and stops at the first reading whose diff against
+    /// `before_pids` is not empty — the first new PID found is the claim.
     ///
     /// Race-safety:
-    /// - No locks are held during the `tokio::time::sleep`.
-    /// - If the entry was removed during the sleep (rapid cancel) the
+    /// - No locks are held during the sleeps.
+    /// - If the entry was removed before the claim lands (rapid cancel) the
     ///   claim no-ops silently.
-    /// - If `pid_discovery_diff` returns empty (subprocess crashed before
-    ///   the snapshot, or two ToolUses raced and the first claim won
+    /// - If the diff stays empty until the deadline (the subprocess crashed
+    ///   before the first reading, or two ToolUses raced and the first claim won
     ///   both candidates), we log a warning and leave `pid: None`. The
     ///   `cancel_task` fallback (T4) handles this case.
     ///
-    /// Plan fc35b25e (T2). Tested in `tests::test_pid_claim_*`.
+    /// The window is BOUNDED, deliberately: this is a detached task per
+    /// background task, so an unbounded poller would spin for the whole life of
+    /// the session each time a background process dies before it is ever
+    /// observed. Ten seconds is far past every measured fork latency and stays
+    /// negligible next to `BACKGROUND_TASK_IDLE_DEATH_SECS`. Widening the single
+    /// sleep instead would delay every claim without making it deterministic.
+    ///
+    /// Plan fc35b25e (T2). Tested in `tests::test_pid_claim_*` and in
+    /// `tests::a_pid_born_late_in_the_claim_window_is_still_claimed`.
     async fn async_pid_claim(
         session_id: String,
         active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
@@ -7904,32 +7938,47 @@ impl ChatManager {
         tool_use_id: String,
         before_pids: Vec<u32>,
     ) {
-        // Wait for the subprocess to fork and be visible via pgrep.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        let deadline = tokio::time::Instant::now() + PID_CLAIM_WINDOW;
+        let mut reads: u32 = 0;
+        let candidates = loop {
+            // Let the subprocess fork; the loop comes back until it is visible
+            // (or the window closes).
+            tokio::time::sleep(PID_CLAIM_POLL).await;
+            reads += 1;
 
-        // Re-resolve child_pid (a `resume_session` between the callsite
-        // and now would have replaced the CLI).
-        let Some(child_pid) = Self::lookup_child_pid(&session_id, &active_sessions).await else {
-            debug!(
-                session_id = %session_id,
-                tool_use_id = %tool_use_id,
-                "async_pid_claim: session gone, skipping"
-            );
-            return;
+            // Re-resolve child_pid on every reading (a `resume_session` between
+            // the callsite and now would have replaced the CLI).
+            let Some(child_pid) = Self::lookup_child_pid(&session_id, &active_sessions).await
+            else {
+                debug!(
+                    session_id = %session_id,
+                    tool_use_id = %tool_use_id,
+                    "async_pid_claim: session gone, skipping"
+                );
+                return;
+            };
+
+            let after_pids = Self::get_descendant_pids(child_pid);
+            let candidates = Self::pid_discovery_diff(&before_pids, &after_pids);
+            if !candidates.is_empty() {
+                break candidates;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    session_id = %session_id,
+                    tool_use_id = %tool_use_id,
+                    before_count = before_pids.len(),
+                    after_count = after_pids.len(),
+                    reads = reads,
+                    window_ms = PID_CLAIM_WINDOW.as_millis() as u64,
+                    "async_pid_claim: no new PID in the whole window (subprocess crashed or claim raced)"
+                );
+                return;
+            }
         };
 
-        let after_pids = Self::get_descendant_pids(child_pid);
-        let candidates = Self::pid_discovery_diff(&before_pids, &after_pids);
-        let Some(claimed) = candidates.first().copied() else {
-            warn!(
-                session_id = %session_id,
-                tool_use_id = %tool_use_id,
-                before_count = before_pids.len(),
-                after_count = after_pids.len(),
-                "async_pid_claim: no new PID in diff (subprocess crashed or claim raced)"
-            );
-            return;
-        };
+        // The loop only breaks on a non-empty diff.
+        let claimed = candidates[0];
 
         // Update the task's pid and capture a fresh snapshot. A task stopped
         // before its pid was known (`cancel_task` within the claim's first
@@ -30914,6 +30963,89 @@ mod tests {
         }
         let _ = cli.kill();
         let _ = cli.wait();
+    }
+
+    /// `FLAKY-PARITE`, the deterministic half of the proof: a process forked
+    /// LATE in the claim window is still claimed.
+    ///
+    /// The CLI here is a `bash` blocked in `read` on its stdin (a builtin: no
+    /// descendant while it waits), so the "before" snapshot taken at the
+    /// callsite is empty and the child really is born when the test says so —
+    /// 2.5 s after the claim started, i.e. well past the single reading at 1 s
+    /// the claim used to make. The claim must keep looking inside
+    /// [`PID_CLAIM_WINDOW`] and find it; with one reading it would come back
+    /// empty and the task would keep `pid: None` (exactly what the parity test
+    /// saw as `pid réclamé=false, killed_pids=[]` under llvm-cov).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_pid_born_late_in_the_claim_window_is_still_claimed() {
+        use std::io::Write as _;
+        use std::process::Stdio;
+
+        // A "CLI" that forks nothing until it is told to: `read` is a builtin,
+        // so the shell has no descendant while it waits.
+        let mut cli = std::process::Command::new("bash")
+            .args(["-c", "read line; sleep 30 & wait"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let cli_pid = cli.id();
+        let mut stdin = cli.stdin.take().expect("stdin is piped");
+        assert!(
+            ChatManager::get_descendant_pids(cli_pid).is_empty(),
+            "the CLI forked nothing yet: the before snapshot of the callsite is empty"
+        );
+
+        let (mut session, _) = create_dummy_session(false, "", vec![]);
+        session.child_pid = Some(cli_pid);
+        let (events_tx, tasks) = (
+            session.events_tx.clone(),
+            session.active_background_tasks.clone(),
+        );
+        tasks
+            .lock()
+            .await
+            .insert("tool_Late".into(), tracked_task("tool_Late", None));
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-late".into(), session);
+
+        // The fork, 2.5 s in: past the single reading the claim used to take.
+        let forker = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            stdin.write_all(b"go\n").unwrap();
+            stdin.flush().unwrap();
+        });
+
+        ChatManager::async_pid_claim(
+            "s-late".into(),
+            manager.active_sessions.clone(),
+            events_tx,
+            None,
+            "tool_Late".into(),
+            vec![],
+        )
+        .await;
+        forker.await.unwrap();
+
+        let pid = tasks.lock().await["tool_Late"].pid;
+        // Cleanup before asserting, so a failure does not leak the processes.
+        if let Some(pid) = pid {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+        let _ = cli.kill();
+        let _ = cli.wait();
+        assert!(
+            pid.is_some(),
+            "the process forked 2.5 s into the window was claimed (a single reading \
+             at 1 s would have missed it)"
+        );
     }
 
     /// Review of #691, finding 2: two concurrent stops of one task signal it once

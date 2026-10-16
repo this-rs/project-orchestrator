@@ -575,6 +575,18 @@ const PLAN_TITLE: &str = "Port the enrichment";
 const TASK_TITLE: &str = "Measure the parity";
 const WAIT: Duration = Duration::from_secs(20);
 
+/// The end of a turn AFTER an interruption gets its own, wider deadline than
+/// `WAIT`. The interruption travels three hops (the other instance publishing
+/// over NATS, the CLI's `interrupt` control_request, the CLI closing the
+/// aborted turn) and every hop is slow when the binary is instrumented: under
+/// the Code Coverage job (llvm-cov, ~976 s for the lib alone) the closing turn
+/// passed the global 20 s deadline, and the `nats.interrupt` cell fell on a
+/// verdict that was in fact fine — same head, red then green on a rerun (task
+/// `FLAKY-PARITE`). `WAIT` itself is NOT widened: the other cells measured
+/// against it are stable, and a wider global deadline would only hide their own
+/// lateness.
+const INTERRUPT_TURN_END_WAIT: Duration = Duration::from_secs(60);
+
 /// The 30-line Grep result the after_tool hook redirects (`post_tool_hook`).
 fn noisy_grep() -> String {
     (0..30)
@@ -932,7 +944,14 @@ impl Watch {
 
     /// Waits until more than `n` turns ended (live `streaming_status: false`).
     async fn turn_end_after(&self, n: usize) -> bool {
-        let deadline = tokio::time::Instant::now() + WAIT;
+        self.turn_end_after_within(n, WAIT).await
+    }
+
+    /// `turn_end_after` with an explicit deadline, for the turns that close
+    /// legitimately slower than the global `WAIT` (see
+    /// [`INTERRUPT_TURN_END_WAIT`]).
+    async fn turn_end_after_within(&self, n: usize, within: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
         loop {
             if self.turn_ends() > n {
                 return true;
@@ -2635,11 +2654,14 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     let before = cli.count(0, "\"interrupt\"");
     stage.other.publish_interrupt(&sid);
     let stopped_there = cli.wait_count(0, "\"interrupt\"", before, WAIT).await;
+    // The turn the interruption closes is the slowest step of the scenario under
+    // instrumentation: waited on with its own, wider deadline, not the global WAIT.
+    let turn_closed = w.turn_end_after_within(ends, INTERRUPT_TURN_END_WAIT).await;
     cc.check(
         "nats.interrupt",
-        stopped_there && w.turn_end_after(ends).await,
+        stopped_there && turn_closed,
         Cause::Harness,
-        format!("interrupt écrit au CLI={stopped_there}"),
+        format!("interrupt écrit au CLI={stopped_there}, tour clos={turn_closed}"),
     );
     w.settle(ends, &manager).await;
     // A permission answered from the other instance.
