@@ -623,6 +623,19 @@ jobs:
             --exact src/refs/validate.rs \
             --exact src/refs/registry.rs
 
+      # Same blocking contract for the rate-limit decision (RL2/RL3). The three
+      # files named `--exact` are the DECISION — the counters, the classifier and
+      # the provider table — and a line of them that no test executes is a rule
+      # nobody proved. `store.rs` writes a file and `mod.rs` only re-exports, so
+      # the directory minimum covers them. No `ignore` entry.
+      - name: Blocking coverage gate - src/chat/provider/limits
+        run: |
+          rustc -O scripts/lcov_gate.rs -o "$RUNNER_TEMP/lcov_gate_limits"
+          "$RUNNER_TEMP/lcov_gate_limits" lcov.info --dir src/chat/provider/limits --min 90 \
+            --exact src/chat/provider/limits/ledger.rs \
+            --exact src/chat/provider/limits/classify.rs \
+            --exact src/chat/provider/limits/profiles.rs
+
       # Guard: the merged report must actually contain the Neo4j lines. Without
       # it, a silently skipped integration suite (backends_available() returning
       # false) would upload a report that looks fine while covering nothing.
