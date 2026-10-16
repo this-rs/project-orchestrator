@@ -534,9 +534,10 @@ pub async fn provider_status(
 /// configured limits (RL7): one entry per limit, with its usage, what is left,
 /// when it resets and its status (`ok | limited | overloaded | unknown`).
 ///
-/// Nothing is counted yet (RL2) and no breaker exists (RL4), so every limit
-/// answers `unknown` with null numbers: this route settles the SHAPE the
-/// interface is built against, and RL2/RL4 will fill it without changing a key.
+/// The numbers are the MEASURED ones (RL5): RL2's counters fill `used`,
+/// `remaining` and `resets_at`, and RL4's breaker fills `status` — `limited` for a
+/// spent quota, `overloaded` for a provider having a bad minute — with the instant
+/// of the next attempt. Without a configured limit the answer is unchanged.
 ///
 /// Never a secret — not in this response, not in any other: a limit scoped to a
 /// credential names the credential REFERENCE (`vault:<name>`, `env:<VAR>`), which
@@ -558,7 +559,12 @@ pub async fn provider_limits(
         .await
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("unknown provider instance '{id}'")))?;
-    Ok(Json(st::rate_limit_report(&record)))
+    // The measured state comes from the ONE gate the chat sessions use. With no chat
+    // manager nothing is counting, so the answer stays the settled shape.
+    Ok(Json(match state.chat_manager.as_ref() {
+        Some(manager) => manager.provider_limits().report(&record),
+        None => st::rate_limit_report(&record),
+    }))
 }
 
 // ============================================================================

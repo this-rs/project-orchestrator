@@ -1234,6 +1234,38 @@ impl AppState {
     }
 }
 
+/// Where RL5's long cumuls live.
+///
+/// A daily, weekly or monthly budget must survive a restart: a counter that
+/// silently forgets would hand out an allowance already spent. So the store sits
+/// beside the configuration when its path is known. With no known place the
+/// counters stay in memory and the process SAYS SO, rather than pretending to
+/// persist.
+fn provider_limits_store(config: &Config) -> Arc<dyn chat::provider::limits::LedgerStore> {
+    let path = config
+        .config_yaml_path
+        .as_ref()
+        .and_then(|path| path.parent())
+        .map(|dir| dir.join("provider-limits.json"));
+    let Some(path) = path else {
+        tracing::info!(
+            "no configuration path: rate-limit counters stay in memory for this process"
+        );
+        return Arc::new(chat::provider::limits::MemoryStore::new());
+    };
+    match chat::provider::limits::FileStore::open(&path) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "rate-limit store unavailable: counters stay in memory for this process"
+            );
+            Arc::new(chat::provider::limits::MemoryStore::new())
+        }
+    }
+}
+
 // ============================================================================
 // Server entry point (for embedding in Tauri or other hosts)
 // ============================================================================
@@ -1764,6 +1796,14 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         if let Some(ref yaml_path) = config.config_yaml_path {
             cm = cm.with_config_yaml_path(yaml_path.clone());
         }
+        // RL5: ONE admission gate for the whole process — every session counts against
+        // the same counters and breakers. Built from the configuration path so a
+        // daily/weekly/monthly budget survives a restart; an instance with no
+        // configured limit pays nothing for it.
+        cm = cm.with_provider_limits(Arc::new(chat::provider::limits::Gate::from_store(
+            Arc::new(chat::provider::limits::SystemClock),
+            provider_limits_store(&config),
+        )));
         if let Some(ref nats) = nats_emitter {
             cm = cm.with_nats(nats.clone());
         }

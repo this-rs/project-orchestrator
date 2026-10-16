@@ -1016,6 +1016,12 @@ pub struct ChatManager {
     pub(crate) mirrors: Arc<super::mirror::MirrorRegistry>,
     /// Whether the Claude Code sessions opened here get a mirror tap (always, but in tests).
     pub(crate) subagent_mirrors: bool,
+    /// RL5: the ONE door a provider call goes through — RL2's counters and RL4's
+    /// breakers behind a single gate. Shared by every session: the boot injects the
+    /// process-wide instance with [`ChatManager::with_provider_limits`]. The default
+    /// here is an in-memory, unlimited one, so a session a test builds keeps the path
+    /// it had — and no test shares another one's counters.
+    pub(crate) provider_limits: Arc<super::provider::limits::Gate>,
 }
 
 // ============================================================================
@@ -3415,6 +3421,7 @@ impl ChatManager {
             subagent_slots: Default::default(),
             mirrors: Default::default(),
             subagent_mirrors: true,
+            provider_limits: Arc::new(super::provider::limits::Gate::unlimited()),
         }
     }
 
@@ -3514,6 +3521,7 @@ impl ChatManager {
             subagent_slots: Default::default(),
             mirrors: Default::default(),
             subagent_mirrors: true,
+            provider_limits: Arc::new(super::provider::limits::Gate::unlimited()),
         }
     }
 
@@ -4072,6 +4080,22 @@ impl ChatManager {
     pub fn with_config_yaml_path(mut self, path: std::path::PathBuf) -> Self {
         self.config_yaml_path = Some(path);
         self
+    }
+
+    /// Hand the ADMISSION GATE (RL5) the process-wide instance built at boot.
+    ///
+    /// Every session counts against the SAME counters and breakers: a per-session
+    /// gate would hand out the configured allowance once per session, which is
+    /// exactly the waste RL5 exists to prevent.
+    pub fn with_provider_limits(mut self, gate: Arc<super::provider::limits::Gate>) -> Self {
+        self.provider_limits = gate;
+        self
+    }
+
+    /// The admission gate (RL5): what a caller consults BEFORE a provider call, and
+    /// what `GET /api/chat/providers/{id}/limits` reads its measured numbers from.
+    pub fn provider_limits(&self) -> &Arc<super::provider::limits::Gate> {
+        &self.provider_limits
     }
 
     /// Attach the secrets vault (per-session vault token + output masking).
