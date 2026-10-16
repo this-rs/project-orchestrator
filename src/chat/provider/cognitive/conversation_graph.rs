@@ -553,3 +553,168 @@ mod spectral_tests {
         assert!(g.fiedler_cut(1e-9).is_none());
     }
 }
+
+impl ConversationGraph {
+    /// Newman–Girvan modularity of a partition (undirected):
+    /// `Q = Σ_c [ L_c/m − (K_c/(2m))² ]`, where `L_c` is the number of edges
+    /// inside community `c`, `K_c` the sum of its members' degrees, and `m` the
+    /// total number of edges. A graph with no edge scores 0.
+    pub fn modularity(&self, communities: &[Vec<u32>]) -> f64 {
+        let m: f64 = self
+            .turns
+            .iter()
+            .map(|t| self.adjacency[t].len())
+            .sum::<usize>() as f64
+            / 2.0;
+        if m == 0.0 {
+            return 0.0;
+        }
+        let mut q = 0.0;
+        for community in communities {
+            let members: BTreeSet<u32> = community.iter().copied().collect();
+            let mut internal = 0usize;
+            let mut degree_sum = 0usize;
+            for &t in community {
+                degree_sum += self.adjacency[&t].len();
+                internal += self.adjacency[&t]
+                    .iter()
+                    .filter(|nb| members.contains(*nb))
+                    .count();
+            }
+            let l_c = internal as f64 / 2.0;
+            let k_c = degree_sum as f64;
+            q += l_c / m - (k_c / (2.0 * m)).powi(2);
+        }
+        q
+    }
+
+    /// Split `nodes` by the sign of the Fiedler vector of their induced
+    /// subgraph. `None` when the subgraph is already split (λ₂ ≈ 0) or has
+    /// fewer than two nodes.
+    fn bisect(&self, nodes: &[u32], tolerance: f64) -> Option<(Vec<u32>, Vec<u32>)> {
+        if nodes.len() < 2 {
+            return None;
+        }
+        let n = nodes.len();
+        let index: BTreeMap<u32, usize> = nodes.iter().enumerate().map(|(i, &t)| (t, i)).collect();
+        let mut l = vec![vec![0.0; n]; n];
+        for (i, &t) in nodes.iter().enumerate() {
+            let degree = self.adjacency[&t]
+                .iter()
+                .filter(|nb| index.contains_key(*nb))
+                .count();
+            l[i][i] = degree as f64;
+            for nb in &self.adjacency[&t] {
+                if let Some(&j) = index.get(nb) {
+                    l[i][j] = -1.0;
+                }
+            }
+        }
+        let (values, vectors) = jacobi_eigen(l, tolerance, 100);
+        let lambda2 = *values.get(1)?;
+        if lambda2.abs() < tolerance {
+            return None;
+        }
+        let fiedler = &vectors[1];
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        for (i, &x) in fiedler.iter().enumerate() {
+            if x >= 0.0 {
+                left.push(nodes[i]);
+            } else {
+                right.push(nodes[i]);
+            }
+        }
+        if left.is_empty() || right.is_empty() {
+            return None;
+        }
+        Some((left, right))
+    }
+
+    /// Recursive spectral bisection with a modularity stopping rule: a
+    /// community is split further only while it strictly improves `Q` by more
+    /// than `improvement`. Deterministic; one turn list per segment.
+    pub fn spectral_segments(&self, improvement: f64) -> Vec<Vec<u32>> {
+        if self.turns.is_empty() {
+            return Vec::new();
+        }
+        let mut communities: Vec<Vec<u32>> = vec![self.turns.clone()];
+        loop {
+            let base_q = self.modularity(&communities);
+            let mut best: Option<(f64, Vec<Vec<u32>>)> = None;
+            for (idx, community) in communities.iter().enumerate() {
+                if let Some((left, right)) = self.bisect(community, 1e-9) {
+                    let mut candidate = communities.clone();
+                    candidate.splice(idx..=idx, [left, right]);
+                    let q = self.modularity(&candidate);
+                    let improves = q > base_q + improvement;
+                    let is_best = best.as_ref().is_none_or(|(best_q, _)| q > *best_q);
+                    if improves && is_best {
+                        best = Some((q, candidate));
+                    }
+                }
+            }
+            match best {
+                Some((_, next)) => communities = next,
+                None => break,
+            }
+        }
+        communities.sort_by_key(|c| c.first().copied().unwrap_or(u32::MAX));
+        communities
+    }
+}
+
+#[cfg(test)]
+mod partition_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn t(turn: u32, labels: &[&str]) -> TurnNode {
+        TurnNode {
+            turn,
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            tools: BTreeSet::new(),
+        }
+    }
+
+    /// Two label-cliques (0,1,2 routing / 3,4,5 auth) joined by the single
+    /// consecutive edge 2—3: a barbell with 7 edges.
+    fn barbell() -> ConversationGraph {
+        ConversationGraph::build(&[
+            t(0, &["routing"]),
+            t(1, &["routing"]),
+            t(2, &["routing"]),
+            t(3, &["auth"]),
+            t(4, &["auth"]),
+            t(5, &["auth"]),
+        ])
+    }
+
+    #[test]
+    fn modularity_rewards_the_two_themes_and_zeros_the_single_block() {
+        let g = barbell();
+        let split = g.modularity(&[vec![0, 1, 2], vec![3, 4, 5]]);
+        let whole = g.modularity(&[vec![0, 1, 2, 3, 4, 5]]);
+        assert!(split > 0.3, "the barbell split scores ~0.357, got {split}");
+        assert!(
+            whole.abs() < 1e-9,
+            "one community always scores 0, got {whole}"
+        );
+    }
+
+    #[test]
+    fn spectral_segments_finds_the_two_themes() {
+        let g = barbell();
+        let segments = g.spectral_segments(1e-9);
+        assert_eq!(segments.len(), 2, "two themes, two segments: {segments:?}");
+        assert_eq!(segments[0], vec![0, 1, 2]);
+        assert_eq!(segments[1], vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn spectral_segments_is_deterministic() {
+        let a = barbell().spectral_segments(1e-9);
+        let b = barbell().spectral_segments(1e-9);
+        assert_eq!(a, b);
+    }
+}
