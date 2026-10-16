@@ -1770,6 +1770,11 @@ mod integration_tests {
                 stream_task: Arc::new(std::sync::Mutex::new(None)),
                 post_stream_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
                 pending_permission_inputs: Arc::new(Mutex::new(HashMap::new())),
+                provider_outage: Arc::new(std::sync::Mutex::new(
+                    crate::chat::provider::outage::TurnHold::new(
+                        crate::chat::provider::resolver::CLAUDE_CODE,
+                    ),
+                )),
                 session_grants: Arc::default(),
                 auto_continue: Arc::new(AtomicBool::new(false)),
                 auto_continue_count: Arc::new(AtomicU32::new(0)),

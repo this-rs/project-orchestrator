@@ -445,6 +445,14 @@ pub struct ActiveSession {
     /// so the CLI doesn't lose the original command/parameters.
     pub pending_permission_inputs:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingPermission>>>,
+    /// The outage state of the provider instance this session runs on
+    /// (`chat::provider::outage`): the legacy (Claude Code) loop's half of
+    /// hold/resume. One [`super::provider::outage::TurnHold`] per session, beside
+    /// the retry configuration the whole chat shares — fed from the loop's own text
+    /// taxonomy (`outage::outcome_of_legacy_failure`), it lets a turn whose retry
+    /// budget is spent be **held** while the instance is down instead of being
+    /// closed on an error the user would read as theirs.
+    pub provider_outage: Arc<std::sync::Mutex<super::provider::outage::TurnHold>>,
     /// What the user granted "for the session" (`chat::session_grants`): the backend
     /// answers itself the later requests of THIS session they cover; never handed to
     /// the CLI as a rule.
@@ -539,6 +547,50 @@ pub struct ActiveSession {
     pub cancel_task_cap: u32,
     /// Rolling window for the cancel_task rate cap. Defaults to 300s (5 min).
     pub cancel_task_window: Duration,
+}
+
+/// What the legacy (Claude Code) loop needs to persist and broadcast an outage
+/// notice (`chat::provider::outage`), gathered once per `stream_response` call.
+///
+/// The notice travels on the **same** channel as every other session fact — the
+/// persisted event stream (`ChatEvent::ProviderOutage`) and the live broadcast —
+/// exactly as the agent engine emits it (`AgentSessionHandle::emit_outage`), so a
+/// client that does not know the variant ignores it and no second channel exists.
+struct OutageSink<'a> {
+    graph: &'a Arc<dyn GraphStore>,
+    session_uuid: Option<Uuid>,
+    next_seq: &'a Arc<AtomicI64>,
+    events_tx: &'a broadcast::Sender<ChatEvent>,
+    nats: &'a Option<Arc<crate::events::NatsEmitter>>,
+    session_id: &'a str,
+}
+
+impl OutageSink<'_> {
+    /// Persists then broadcasts one transition of the instance's state. Persisted
+    /// directly (not through the per-attempt `events_to_persist` buffer, which a
+    /// retry clears): a `down` that opens a hold must not be dropped by the very
+    /// retry it announces.
+    async fn emit(&self, notice: super::provider::outage::OutageNotice) {
+        let event = notice.to_chat_event(chrono::Utc::now());
+        let _ = self.events_tx.send(event.clone());
+        if let Some(ref nats) = self.nats {
+            nats.publish_chat_event(self.session_id, event.clone());
+        }
+        if let Some(uuid) = self.session_uuid {
+            let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+            let record = ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id: uuid,
+                seq,
+                event_type: event.event_type().to_string(),
+                data: serde_json::to_string(&event).unwrap_or_default(),
+                created_at: chrono::Utc::now(),
+            };
+            if let Err(e) = self.graph.store_chat_events(uuid, vec![record]).await {
+                warn!(error = %e, "Failed to persist a provider outage notice (non-fatal)");
+            }
+        }
+    }
 }
 
 /// Where a message or permission answer ended up.
@@ -7507,6 +7559,13 @@ impl ChatManager {
                     objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
                     work_log: work_log.clone(),
                     oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
+                    provider_outage: Arc::new(std::sync::Mutex::new(
+                        super::provider::outage::TurnHold::with_policies(
+                            super::provider::resolver::CLAUDE_CODE,
+                            super::provider::outage::OutagePolicy::from_env(),
+                            super::provider::outage::HoldPolicy::from_env(),
+                        ),
+                    )),
                     session_grants: Arc::new(std::sync::Mutex::new(session_grants)),
                     oob_trigger_cap,
                     oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
@@ -8395,6 +8454,65 @@ impl ChatManager {
         }
     }
 
+    /// Feeds one **final** failed call of the legacy (Claude Code) loop to its
+    /// session's `TurnHold`, in the loop's own text taxonomy
+    /// (`outage::outcome_of_legacy_failure`) — the same detector the agent engine
+    /// feeds from a typed `ProviderError`. Emits the notice when this outcome
+    /// flipped the instance (a fresh outage announces `down`).
+    ///
+    /// Returns `true` when the text was a *health* failure — the outcome that
+    /// counts against the instance — which is what tells the caller a spent retry
+    /// budget may be **held** for a down instance rather than closing the turn.
+    async fn record_legacy_outage(
+        outage: &Arc<std::sync::Mutex<super::provider::outage::TurnHold>>,
+        text: &str,
+        sink: &OutageSink<'_>,
+    ) -> bool {
+        let Some((outcome, cause)) = super::provider::outage::outcome_of_legacy_failure(text)
+        else {
+            return false;
+        };
+        let notice = outage.lock().unwrap_or_else(|e| e.into_inner()).record(
+            outcome,
+            Instant::now(),
+            Some(cause),
+        );
+        if let Some(notice) = notice {
+            sink.emit(notice).await;
+        }
+        true
+    }
+
+    /// The attempt that answered: the first success after an outage ends the hold
+    /// (`TurnHold::record` clears the held state) and announces `up`.
+    async fn record_legacy_outage_up(
+        outage: &Arc<std::sync::Mutex<super::provider::outage::TurnHold>>,
+        sink: &OutageSink<'_>,
+    ) {
+        let notice = outage.lock().unwrap_or_else(|e| e.into_inner()).record(
+            super::provider::circuit_breaker::Outcome::Success,
+            Instant::now(),
+            None,
+        );
+        if let Some(notice) = notice {
+            sink.emit(notice).await;
+        }
+    }
+
+    /// Whether a turn whose ordinary retry budget is spent may go on
+    /// (`TurnHold::hold_on`): `Some(wait)` while the instance is down and the hold
+    /// budget still allows — wait `wait`, then probe the instance again. `None`
+    /// when the failure must stand (the instance is not down, or the hold budget
+    /// is spent). No second state machine: this is the agent engine's own hold.
+    fn hold_legacy_turn(
+        outage: &Arc<std::sync::Mutex<super::provider::outage::TurnHold>>,
+    ) -> Option<Duration> {
+        outage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hold_on(Instant::now())
+    }
+
     /// Internal: send a message to the client and stream the response to broadcast
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn stream_response(
@@ -8646,7 +8764,13 @@ impl ChatManager {
         //
         // Also clone the stdin_tx sender for auto-allowing AskUserQuestion control
         // requests inline (without going through send_permission_response).
-        let (pending_perm_inputs, stdin_tx_for_auto_allow, work_log, session_grants) = {
+        let (
+            pending_perm_inputs,
+            stdin_tx_for_auto_allow,
+            work_log,
+            session_grants,
+            provider_outage,
+        ) = {
             let guard = active_sessions.read().await;
             match guard.get(&session_id) {
                 Some(s) => (
@@ -8654,12 +8778,18 @@ impl ChatManager {
                     s.stdin_tx.clone(),
                     s.work_log.clone(),
                     s.session_grants.clone(),
+                    s.provider_outage.clone(),
                 ),
                 None => (
                     Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
                     None,
                     Arc::new(Mutex::new(SessionWorkLog::default())),
                     Arc::default(),
+                    Arc::new(std::sync::Mutex::new(
+                        super::provider::outage::TurnHold::new(
+                            super::provider::resolver::CLAUDE_CODE,
+                        ),
+                    )),
                 ),
             }
         };
@@ -8677,6 +8807,17 @@ impl ChatManager {
         // 0 tokens emitted, we retry with exponential backoff instead of propagating.
         let mut retry_attempt = 0u32;
 
+        // What a transition of the instance's state needs to be persisted and
+        // broadcast: built once, used by every failure site below.
+        let outage_sink = OutageSink {
+            graph: &graph,
+            session_uuid,
+            next_seq: &next_seq,
+            events_tx: &events_tx,
+            nats: &nats,
+            session_id: &session_id,
+        };
+
         'retry_loop: loop {
             // A refused turn is never sent (and so never retried).
             let Some(input) = cli_input.clone() else {
@@ -8685,6 +8826,13 @@ impl ChatManager {
             // Per-attempt state — reset on each retry iteration
             let mut should_retry = false;
             let mut last_retry_error = String::new();
+            // Outage state of this attempt: did it feed the detector a *health*
+            // failure, and did it get a stream at all (`OutageSink`/`TurnHold`)?
+            let mut outage_failed = false;
+            let mut attempt_answered = false;
+            // Set when the retry budget is spent and the instance is down: how long
+            // to wait before probing it again (`TurnHold::hold_on`).
+            let mut held_for: Option<Duration> = None;
 
             // Reset per-attempt accumulators (they may have partial data from a failed attempt)
             if retry_attempt > 0 {
@@ -8709,12 +8857,40 @@ impl ChatManager {
                     Err(e) => {
                         let err_str = format!("{}", e);
                         let kind = classify_api_error(&err_str);
+                        // The outage detector sees this failed call, in the loop's
+                        // own text taxonomy: a 5xx, an overload, a rate limit, a
+                        // timeout or an unreachable endpoint counts against the
+                        // instance (`OutageSink`).
+                        outage_failed =
+                            Self::record_legacy_outage(&provider_outage, &err_str, &outage_sink)
+                                .await;
+                        // A health failure whose retry budget is spent is **held**
+                        // while the instance is down (`TurnHold::hold_on`), probed at
+                        // the hold's cadence: a turn that never started showed
+                        // nothing, so nothing is replayed.
+                        if outage_failed
+                            && !interrupt_flag.load(Ordering::SeqCst)
+                            && retry_attempt >= retry_config.max_attempts
+                        {
+                            held_for = Self::hold_legacy_turn(&provider_outage);
+                        }
 
                         if kind.is_retryable()
                             && retry_attempt < retry_config.max_attempts
                             && !interrupt_flag.load(Ordering::SeqCst)
                         {
                             // Retryable — set flag, will handle after client lock release
+                            should_retry = true;
+                            last_retry_error = err_str;
+                        } else if let Some(probe) = held_for {
+                            // The instance is down and the hold still allows: the
+                            // turn goes on instead of being closed on an error the
+                            // user would read as theirs.
+                            warn!(
+                                session_id = %session_id,
+                                probe_ms = probe.as_millis() as u64,
+                                "Provider instance is down: holding the turn instead of closing it"
+                            );
                             should_retry = true;
                             last_retry_error = err_str;
                         } else {
@@ -8774,6 +8950,7 @@ impl ChatManager {
                 };
 
                 if let Some(s) = stream_ok {
+                    attempt_answered = true;
                     let mut stream = std::pin::pin!(s);
 
                     // Track the current parent_tool_use_id from stream events.
@@ -9181,6 +9358,14 @@ impl ChatManager {
                                 {
                                     let kind = classify_api_error(text);
                                     let text_empty = streaming_text.lock().await.is_empty();
+                                    // One final call of the legacy loop fed to the
+                                    // outage detector, in its own text taxonomy.
+                                    outage_failed = Self::record_legacy_outage(
+                                        &provider_outage,
+                                        text,
+                                        &outage_sink,
+                                    )
+                                    .await;
                                     if kind.is_retryable()
                                         && text_empty
                                         && retry_attempt < retry_config.max_attempts
@@ -9189,6 +9374,27 @@ impl ChatManager {
                                         should_retry = true;
                                         last_retry_error = text.clone();
                                         break; // break inner stream loop
+                                    }
+                                    // A turn that showed nothing but its error is held
+                                    // for a down instance rather than closed: `text_empty`
+                                    // is the very guard the ordinary retry uses, so an
+                                    // executed tool is never replayed by the hold either.
+                                    if outage_failed
+                                        && text_empty
+                                        && retry_attempt >= retry_config.max_attempts
+                                        && !interrupt_flag.load(Ordering::SeqCst)
+                                    {
+                                        held_for = Self::hold_legacy_turn(&provider_outage);
+                                        if let Some(probe) = held_for {
+                                            warn!(
+                                                session_id = %session_id,
+                                                probe_ms = probe.as_millis() as u64,
+                                                "Provider instance is down: holding the turn instead of closing it"
+                                            );
+                                            should_retry = true;
+                                            last_retry_error = text.clone();
+                                            break; // break inner stream loop
+                                        }
                                     }
                                     // A non-retryable refusal: a 402 (out of credit)
                                     // must cool the instance down via the router, not
@@ -9439,6 +9645,24 @@ impl ChatManager {
                                 let err_str = format!("{}", e);
                                 let kind = classify_api_error(&err_str);
                                 let text_empty = streaming_text.lock().await.is_empty();
+                                // The outage detector sees this failed call, in the
+                                // loop's own text taxonomy (`OutageSink`).
+                                outage_failed = Self::record_legacy_outage(
+                                    &provider_outage,
+                                    &err_str,
+                                    &outage_sink,
+                                )
+                                .await;
+                                // A health failure whose retry budget is spent is held
+                                // while the instance is down: `text_empty` is the same
+                                // guard the ordinary retry uses — nothing is replayed.
+                                if outage_failed
+                                    && text_empty
+                                    && retry_attempt >= retry_config.max_attempts
+                                    && !interrupt_flag.load(Ordering::SeqCst)
+                                {
+                                    held_for = Self::hold_legacy_turn(&provider_outage);
+                                }
 
                                 if kind.is_retryable()
                                     && text_empty
@@ -9446,6 +9670,14 @@ impl ChatManager {
                                     && !interrupt_flag.load(Ordering::SeqCst)
                                 {
                                     // Retryable stream error with 0 tokens — will retry
+                                    should_retry = true;
+                                    last_retry_error = err_str;
+                                } else if let Some(probe) = held_for {
+                                    warn!(
+                                        session_id = %session_id,
+                                        probe_ms = probe.as_millis() as u64,
+                                        "Provider instance is down: holding the turn instead of closing it"
+                                    );
                                     should_retry = true;
                                     last_retry_error = err_str;
                                 } else {
@@ -9556,12 +9788,25 @@ impl ChatManager {
                 } // end if let Some(s) = stream_ok
             } // client lock released here
 
+            // The attempt answered, with no health failure of its own: the instance
+            // is up as far as this session knows (a refusal it answered is not a
+            // health failure — `outage::outcome_of_legacy_failure`). The first
+            // success after an outage ends the hold and announces `up`.
+            if attempt_answered && !outage_failed {
+                Self::record_legacy_outage_up(&provider_outage, &outage_sink).await;
+            }
+
             // ===== RETRY DECISION =====
             // If should_retry is set (from stream item error or Result is_error),
             // emit Retrying event, sleep with backoff, and continue the retry loop.
             if should_retry {
                 retry_attempt += 1;
-                let delay = retry_config.delay_for_attempt(retry_attempt);
+                // A held turn probes the instance at the hold's cadence, not on the
+                // retry curve the ordinary budget follows.
+                let delay = match held_for {
+                    Some(probe) => probe.as_millis() as u64,
+                    None => retry_config.delay_for_attempt(retry_attempt),
+                };
                 warn!(
                     session_id = %session_id,
                     attempt = retry_attempt,
@@ -12139,6 +12384,13 @@ impl ChatManager {
                     // Resumed sessions = interactive: use the generous cap (50/5min).
                     // T7 of plan 9a1684b2.
                     oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
+                    provider_outage: Arc::new(std::sync::Mutex::new(
+                        super::provider::outage::TurnHold::with_policies(
+                            super::provider::resolver::CLAUDE_CODE,
+                            super::provider::outage::OutagePolicy::from_env(),
+                            super::provider::outage::HoldPolicy::from_env(),
+                        ),
+                    )),
                     session_grants: Arc::new(std::sync::Mutex::new(session_grants)),
                     oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
                     oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
@@ -26563,6 +26815,11 @@ mod tests {
             objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
             objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
             work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
+            provider_outage: Arc::new(std::sync::Mutex::new(
+                crate::chat::provider::outage::TurnHold::new(
+                    crate::chat::provider::resolver::CLAUDE_CODE,
+                ),
+            )),
             session_grants: Arc::default(),
             oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
             oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
@@ -28322,6 +28579,11 @@ mod tests {
             objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
             objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
             work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
+            provider_outage: Arc::new(std::sync::Mutex::new(
+                crate::chat::provider::outage::TurnHold::new(
+                    crate::chat::provider::resolver::CLAUDE_CODE,
+                ),
+            )),
             session_grants: Arc::default(),
             oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
             oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
@@ -32839,6 +33101,11 @@ pub(crate) mod test_support {
             stream_task: Arc::new(std::sync::Mutex::new(None)),
             post_stream_budget: crate::chat::post_stream::POST_STREAM_STEP_BUDGET,
             pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(pending)),
+            provider_outage: Arc::new(std::sync::Mutex::new(
+                crate::chat::provider::outage::TurnHold::new(
+                    crate::chat::provider::resolver::CLAUDE_CODE,
+                ),
+            )),
             session_grants: Arc::default(),
             auto_continue: Arc::new(AtomicBool::new(false)),
             auto_continue_count: Arc::new(AtomicU32::new(0)),
