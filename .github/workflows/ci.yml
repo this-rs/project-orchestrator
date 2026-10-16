@@ -117,9 +117,12 @@ jobs:
         with:
           tool: cargo-audit,cargo-deny
 
-      - name: Clean stale lockfile entries
-        run: cargo generate-lockfile
-
+      # The committed Cargo.lock is audited as-is: it is what we ship. This step
+      # used to run `cargo generate-lockfile` ("Clean stale lockfile entries"),
+      # which re-resolves the whole dependency graph - impossible since the whole
+      # zip 8.x line was yanked (office_oxide pulls zip ^8.6, via pdf_oxide; see
+      # Cargo.toml). Audit the pinned set; restore a re-resolve once pdf_oxide
+      # ships a build against office_oxide 0.1.15 (zip ^9).
       - name: Run cargo audit (fails on known vulnerabilities)
         run: |
           cargo audit \

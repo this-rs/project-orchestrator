@@ -238,6 +238,12 @@ pdf_oxide = { version = "0.3.78", default-features = false, optional = true }
 # default and `cargo update` would re-break a lockfile pin. Stating the bound
 # here makes it a constraint rather than an accident. Remove once pdf_oxide
 # ships a release that builds against office_oxide 0.1.12.
+#
+# Separately, the whole zip 8.x line was yanked on crates.io; office_oxide
+# 0.1.9-0.1.12 need zip ^8.6 (unresolvable), and only 0.1.15 uses zip ^9, which
+# pdf_oxide 0.3.78 does not compile against. So a fresh `cargo generate-lockfile`
+# cannot resolve; ci.yml audits the committed Cargo.lock as-is. Lift both once
+# pdf_oxide builds against office_oxide 0.1.15.
 office_oxide = { version = ">=0.1.9, <0.1.12", default-features = false, optional = true }
 
 # Unix process signaling (SIGINT to process group for interrupt)
