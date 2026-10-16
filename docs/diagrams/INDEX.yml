@@ -75,6 +75,7 @@ diagrams:
     # Arbitrage : src/chat/provider/cognitive/** (routage cognitif, R2) appartient a po-cognitive-routing.
     covers:
       - "backend:src/chat/provider/{catalog,circuit_breaker,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,nexus_tools,policy,resolver,settings,store}.rs"
+      - "backend:src/chat/provider/limits/**"
   - name: po-cognitive-routing
     owner: theotime
     status: verified

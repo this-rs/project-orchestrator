@@ -1,6 +1,6 @@
 %% name: po-chat-provider
-%% covers: backend:src/chat/provider/{catalog,circuit_breaker,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,nexus_tools,policy,resolver,settings,store}.rs
-%% verified: 4983fbcd
+%% covers: backend:src/chat/provider/{catalog,circuit_breaker,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,nexus_tools,policy,resolver,settings,store}.rs backend:src/chat/provider/limits/**
+%% verified: 2916abbf
 %% ---
 %% PROUVE : le RÉSOLVEUR backend de provider (décisions A1, A16, A18, A29, A43) : quel
 %%   provider/modèle pour une demande, comment une erreur d'ouverture devient un statut HTTP
@@ -135,6 +135,14 @@ flowchart TD
     NXATT --> NXOBS
     NXREV --> NXCONS
     NXCONS -.-> NXTODO
+    subgraph ratelimits["limits/ — RL2 compteurs et RL3 classifieur (schema RL1, route RL7)"]
+        LIMLED["✅ ledger.rs — fenêtre GLISSANTE (rolling), JETON-SEAU (minute/heure), CUMUL CALENDAIRE (jour/semaine/mois + fuseau, le seul PERSISTÉ) ; horloge INJECTÉE (aucun sleep) ; RÉSERVATION ATOMIQUE avant l'envoi, tout-ou-rien sur toutes les limites applicables (10 accordées sur 40 tentatives concurrentes) ; settle : estimation ajustée au réel, un coût INCONNU ne bloque JAMAIS (compté en requête + Note::UnpricedBudget)<br/>test : a_requests_limit_admits_exactly_max_then_denies, two_simultaneous_reservations_never_exceed_the_limit, a_rolling_window_frees_its_slot_when_it_slides, a_unit_window_is_a_bucket_that_refills_continuously, a_calendar_budget_resets_at_midnight_in_its_time_zone, a_long_cumul_survives_a_restart_and_a_short_window_does_not, an_unpriced_budget_counts_a_request_and_never_blocks"]
+        LIMCLS["✅ classify.rs — remaining=0 ou code de quota/facturation = ÉPUISEMENT (le mot du provider l'emporte) ; 429/503/5xx SANS preuve de quota ET notre comptage SOUS la limite = SURCHARGE (règle de contradiction : ne jamais marquer une clé épuisée quand c'est le provider qui vacille) ; ambigu = unknown, JAMAIS quota ; Retry-After = signal FAIBLE (il confirme NOTRE limite si le comptage est proche, sinon c'est un backoff de surcharge — le brief et la fixture RL1 se contredisaient, le choix est écrit dans le module)<br/>test : a_zero_remaining_header_is_the_providers_own_quota, a_quota_code_is_the_providers_own_quota, our_own_limit_reached_is_our_exhaustion, a_refusal_while_under_our_limit_is_an_overload_not_an_exhaustion, retry_after_while_near_our_limit_is_our_quota, an_unreadable_answer_is_unknown_and_never_a_quota"]
+        LIMPRF["✅ profiles.rs — table de DONNÉES (openai_compatible, deepseek, nim) : préfixes d'en-têtes, codes quota/surcharge, backoff par défaut, et Evidence = Proven | Documented | Unproven ; NIM et DeepSeek sont Unproven (RL9 n'a pas encore capturé un refus réel) et l'ÉCRIVENT dans leur profil<br/>test : nim_and_deepseek_say_they_are_unproven_and_the_generic_one_says_what_it_rests_on, the_preset_of_a_base_url_is_the_endpoint_family_and_never_a_lookalike"]
+        LIMSTO["✅ store.rs — cumuls longs : MemoryStore et FileStore (JSON, écriture par fichier temporaire + renommage) ; une fenêtre courte ne survit PAS au redémarrage (elle ne prétend pas à une précision que le processus n'a plus)<br/>test : the_file_store_survives_a_new_process_and_reads_what_it_wrote, a_file_that_does_not_decode_is_empty_rather_than_guessed"]
+        LIMTODO["🟠 NON BRANCHÉ : aucun appelant de production — le tour de chat ne réserve pas encore avant l'envoi ni ne règle après (RL5) ; couture prête : limits::report(record, Some(&ledger)) remplit used/remaining/resets_at/status de la route RL7 sans changer une clé, Ledger::standing alimente le classifieur ; CONTRAT NEXUS : ProviderError::Overloaded et RateLimited{retry_after_ms} existent DÉJÀ (agent/error.rs) — rien à ajouter côté nexus ; le repli from_provider_error lit un rate_limited sans quota comme une surcharge, jamais comme un épuisement"]
+    end
+    NEXUS -.-> LIMTODO
     TODO["🟠 non branché : create_session / resume_session / runner n'appellent pas encore resolve ;<br/>system_init ne porte pas tool_policy ; VaultCredentialResolver n'est passé à aucun registre"]
     BUILTIN -.-> TODO
     OPEN -.-> TODO
