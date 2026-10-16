@@ -96,6 +96,7 @@ fn is_bookkeeping(event_type: &str) -> bool {
             | "stream_delta"
             | "streaming_status"
             | "retrying"
+            | "provider_outage"
             | "auto_continue"
             | "compaction_started"
             | "compaction_recovery"
