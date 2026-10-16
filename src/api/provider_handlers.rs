@@ -216,6 +216,11 @@ fn instance_view(i: &InstanceRecord) -> Value {
         "base_url": i.base_url, "origin": i.origin, "default_model": i.default_model,
         "cost_source": i.cost_source, "credential_ref": i.credential_ref, "builtin": false,
     });
+    // RL1: additive — the limits travel with the instance they belong to, so the
+    // edit form loads them with the rest. An empty list is what an instance
+    // without limits has always had; nothing here is a secret (a credential
+    // scope names a reference).
+    view["rate_limit"] = serde_json::to_value(&i.rate_limit).unwrap_or_else(|_| json!([]));
     // Additive: only a remote instance carries the machine fields. The pinned key
     // is public; its fingerprint is what a human compares. The SSH private key is
     // only ever referenced (`credential_ref`), never present.
@@ -523,6 +528,37 @@ pub async fn provider_status(
         Err(_) => HealthEntry::unknown(),
     };
     Ok(Json(health))
+}
+
+/// GET /api/chat/providers/{id}/limits — the CURRENT state of one instance's
+/// configured limits (RL7): one entry per limit, with its usage, what is left,
+/// when it resets and its status (`ok | limited | overloaded | unknown`).
+///
+/// Nothing is counted yet (RL2) and no breaker exists (RL4), so every limit
+/// answers `unknown` with null numbers: this route settles the SHAPE the
+/// interface is built against, and RL2/RL4 will fill it without changing a key.
+///
+/// Never a secret — not in this response, not in any other: a limit scoped to a
+/// credential names the credential REFERENCE (`vault:<name>`, `env:<VAR>`), which
+/// is what the instance already carries.
+pub async fn provider_limits(
+    State(state): State<OrchestratorState>,
+    Path(id): Path<String>,
+) -> Result<Json<st::RateLimitReport>, AppError> {
+    if id == CLAUDE_CODE {
+        // The built-in instance is not a stored one: it carries no configured
+        // limit, and there is nothing to report.
+        return Ok(Json(st::RateLimitReport {
+            provider_id: id,
+            status: st::RateLimitStatus::Ok,
+            limits: Vec::new(),
+        }));
+    }
+    let record = crate::chat::provider::store::instance(graph(&state).as_ref(), &id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("unknown provider instance '{id}'")))?;
+    Ok(Json(st::rate_limit_report(&record)))
 }
 
 // ============================================================================
@@ -1234,5 +1270,70 @@ mod tests {
     async fn a_missing_program_is_not_available() {
         let r = run_keyscan("/nonexistent/ssh-keyscan", &[], Duration::from_secs(1)).await;
         assert_eq!(r, Err(KeyScanError::NotAvailable));
+    }
+
+    // ---- RL7: the limits travel with the instance, and never as a value ------
+
+    #[test]
+    fn the_instance_view_carries_the_limits_and_never_a_value() {
+        let draft = st::InstanceDraft {
+            id: Some("nim".into()),
+            kind: Some("openai_compatible".into()),
+            base_url: Some("https://integrate.api.nvidia.com/v1".into()),
+            credential_ref: Some("vault:nvidia-nim".into()),
+            rate_limit: serde_json::from_value(serde_json::json!([
+                {"kind": "requests", "window": "minute", "max": 40.0,
+                 "scope": {"credential": "vault:nvidia-nim"}}
+            ]))
+            .expect("the golden limit"),
+            ..Default::default()
+        };
+        let record = st::record_from_draft(&draft, &EndpointPolicy::default(), &[]).unwrap();
+        let view = instance_view(&record);
+        assert_eq!(view["rate_limit"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            view["rate_limit"][0]["scope"]["credential"], "vault:nvidia-nim",
+            "the reference is what the response names"
+        );
+        let text = view.to_string();
+        assert!(text.contains("vault:nvidia-nim"), "{text}");
+        assert!(!text.contains("sk-"), "never a value: {text}");
+        // And an instance that never configured a limit carries an EMPTY list: no
+        // default limit is invented for it.
+        let plain = InstanceRecord {
+            id: "plain".into(),
+            ..Default::default()
+        };
+        assert_eq!(instance_view(&plain)["rate_limit"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn the_limits_report_of_an_instance_is_the_golden_shape() {
+        let path = format!(
+            "{}/tests/fixtures/rate_limit/limits.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let limits: Vec<st::RateLimit> = serde_json::from_value(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()["limits"].clone(),
+        )
+        .expect("the golden limits");
+        let draft = st::InstanceDraft {
+            id: Some("deepseek".into()),
+            kind: Some("openai_compatible".into()),
+            base_url: Some("https://api.deepseek.com/v1".into()),
+            credential_ref: Some("vault:deepseek".into()),
+            rate_limit: limits,
+            ..Default::default()
+        };
+        let record = st::record_from_draft(&draft, &EndpointPolicy::default(), &[]).unwrap();
+        let report = serde_json::to_value(st::rate_limit_report(&record)).unwrap();
+        // The very shape the status route answers and the frontend reads.
+        assert_eq!(report["provider_id"], "deepseek");
+        assert_eq!(report["status"], "unknown");
+        assert_eq!(report["limits"].as_array().unwrap().len(), 5);
+        assert_eq!(report["limits"][3]["credential"], "vault:nvidia-nim");
+        assert!(report["limits"][0]["used"].is_null());
+        assert!(!report.to_string().contains("sk-"));
     }
 }

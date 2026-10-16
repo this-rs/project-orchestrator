@@ -10,6 +10,7 @@
 
 pub mod auto_models;
 pub mod candidates;
+pub mod conversation_graph;
 pub mod decider;
 pub mod decision;
 pub mod demotion;

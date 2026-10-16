@@ -1,0 +1,16 @@
+{
+  "_contract_version": 1,
+  "_description": "The WebSocket event that announces a change of a provider's limit state (RL7). SHAPE ONLY: no producer exists yet — RL2 (counters) and RL4 (breaker) will raise it — but the shape is settled here, in the backend type `ProviderRateLimitEvent` and in the frontend types, so the interface and the chat contract can be built against it. `status` is ok | limited | overloaded | unknown; `reason` carries `quota` when the limit (ours or the provider's) is reached and distinguishes it from an overload (`retry after`), which is the line RL3 draws. `credential` is the credential REFERENCE, never a value.",
+  "event": {
+    "type": "provider_rate_limit",
+    "provider_id": "deepseek",
+    "credential": "vault:deepseek",
+    "scope": { "credential": "vault:deepseek" },
+    "kind": "requests",
+    "window": "minute",
+    "status": "limited",
+    "reason": "quota",
+    "resets_at": "2026-10-08T12:34:00Z",
+    "next_retry_at": "2026-10-08T12:34:00Z"
+  }
+}
