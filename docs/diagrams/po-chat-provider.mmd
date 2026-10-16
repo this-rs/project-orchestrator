@@ -1,6 +1,6 @@
 %% name: po-chat-provider
-%% covers: backend:src/chat/provider/{catalog,circuit_breaker,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,nexus_tools,policy,resolver,settings,store}.rs backend:src/chat/provider/limits/**
-%% verified: 2916abbf
+%% covers: backend:src/chat/provider/{catalog,circuit_breaker,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,nexus_tools,outage,policy,resolver,settings,store}.rs backend:src/chat/provider/limits/**
+%% verified: 594da532
 %% ---
 %% PROUVE : le RÉSOLVEUR backend de provider (décisions A1, A16, A18, A29, A43) : quel
 %%   provider/modèle pour une demande, comment une erreur d'ouverture devient un statut HTTP
@@ -15,6 +15,8 @@
 %%   src/chat/provider/settings.rs — InstanceDraft, InstanceRecord, ConsentRecord, RoleAssignments, ModelAlias, ModelPolicy, parse_credential_ref ; src/api/provider_handlers.rs
 %%   src/chat/provider/{catalog,store,native_factory}.rs — StoreCatalog, resolve_input, lectures LlmSetting, build_native_provider
 %%   src/chat/provider/errors.rs   — OpenFailure, open_failure, resolve_failure, classify_open_error (ProviderError et ResolveError)
+%%   src/chat/provider/outage.rs   — OutagePolicy, OutagePhase, OutageNotice, ProviderOutage, record ; la cause
+%%                                   masquée qu'il attend est celle qu'errors::safe_cause a acceptée (privée aujourd'hui)
 %%   src/api/chat_handlers.rs — switch_error (refus de switch-provider) ; src/chat/types.rs — SwitchProviderError::code
 %%   src/chat/provider/event_map.rs — EventMapper, out_of_band_to_chat_events ; listing.rs — ProviderListing, assemble
 %%   src/chat/provider/credentials.rs — VaultCredentialResolver ; src/vault/service.rs — read_for_provider
@@ -28,7 +30,9 @@
 %%   tool_policy / VaultCredentialResolver / EventMapper / endpoint_guard n'ont AUCUN appelant de
 %%   production (tâches B13a, B32, B33, B25) ; open_failure, resolve_for_open (BuiltinCatalog) et
 %%   listing sont branchés ; InstanceCatalog n'a pas d'autre implémentation que BuiltinCatalog
-%%   (attend le registre nexus + B25).
+%%   (attend le registre nexus + B25) ; outage.rs n'a lui aussi AUCUN appelant de production :
+%%   posé en primitif autonome (comme circuit_breaker en son temps), son câblage est un suivi
+%%   délibéré, sur les deux boucles de reprise qui émettent ChatEvent::Retrying.
 %% ---
 %% LEGENDE
 %%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans test / décidé non écrit
@@ -89,6 +93,11 @@ flowchart TD
     FROZEN -.-> RFAIL
     EXPLICIT -.-> RFAIL
     OPEN -.-> SWFAIL
+
+    subgraph outage["outage.rs — panne d'une INSTANCE (observabilité : rien n'est refusé)"]
+        OUT["✅ ProviderOutage — un état par instance, comme le disjoncteur : pas de verrou interne (à envelopper dans un Mutex, ou une entrée de table par provider_id)<br/>record(Outcome, now: Instant, cause masquée) rend UN SEUL OutageNotice par transition, None sinon ;<br/>deux déclencheurs OU : failure_threshold défauts CONSÉCUTIFS (défaut 3) OU un run de pannes ouvert depuis degrade_window (défaut 30 s) — le compte attrape un provider qui échoue vite, la fenêtre un qui échoue lentement ;<br/>un succès remet le compteur à zéro et rend l'avis Up (durée écoulée et cause de la panne close, pour que l'avis se suffise) ; une panne alors qu'on est déjà Down ne rend rien ; un succès sans panne ne rend rien ;<br/>OutagePolicy { failure_threshold, degrade_window } (new, Default) ; OutagePhase { Down, Up }.as_str ;<br/>OutageNotice { provider_id, phase, failures, since, at, cause, duration }.to_chat_event(now_wall) → ChatEvent::ProviderOutage : le canal PERSISTÉ de la session (celui d'ERR-1 pour un Result typé, de ProviderSwitched/ConversationRelayed) — variante additive, sans second canal, qu'un client qui l'ignore ne casse pas ;<br/>temps en Instant (monotone : déterministe et testable sans horloge), converti en horloge murale au seul to_chat_event<br/>⚪ FRONTIÈRE — trois mécanismes « instance indisponible », trois sorties, aucun double comptage : circuit_breaker::CircuitBreaker décide s'il faut TENTER (contrôle), cognitive::HealthCache dit la santé COURANTE (ModelFacts.healthy), ce détecteur ANNONCE ; il n'écrit pas ModelFacts.healthy et ne refuse aucun appel<br/>test : three_consecutive_failures_flip_down_once, the_degrade_window_flips_down_below_the_threshold, a_success_ends_the_outage_and_reports_its_length, a_blip_is_not_an_outage, fewer_than_threshold_failures_stay_up, the_notice_becomes_a_persisted_attributable_event, dropping_a_leaky_cause_does_not_change_the_transition (7 tests)<br/>🟠 aucun appelant de production : ce détecteur est posé en primitif autonome, comme circuit_breaker l'a été ; les deux points d'appel du câblage sont les deux boucles de reprise transitoire qui émettent ChatEvent::Retrying — agent_runtime.rs (moteur agent) et manager.rs (moteur hérité) ; c'est par là que la cause masquée devra sortir, or errors::safe_cause est PRIVÉE aujourd'hui"]
+    end
+    OPEN -.-> OUT
 
     subgraph policy["policy.rs — modes neutres EN PLUS des chaînes héritées"]
         PARSE["✅ parse_mode : default, acceptEdits, plan, bypassPermissions, auto, dontAsk, manual<br/>+ ask, auto_edits, plan_only, trust ; inconnu → None<br/>test : the_eleven_values_parse_and_round_trip"]

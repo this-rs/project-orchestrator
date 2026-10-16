@@ -1,9 +1,12 @@
 //! Typed opening errors (decisions A10, A29).
 //!
 //! Maps a nexus [`ProviderError`] or a [`ResolveError`] to an HTTP status, a
-//! stable `code` and a short user-facing message. The message is written here:
-//! the free-text fields of the source error (`detail`, `program`, `model`) are
-//! never copied, so no file path, URL or credential can reach the client.
+//! stable `code` and a short user-facing message. The message is written here,
+//! not copied from the source error: the free-text fields (`detail`, `program`,
+//! `model`) are never echoed raw, so no file path, URL or credential can reach
+//! the client. The one exception is the cause of an unreachable endpoint, which
+//! is echoed **only** when `safe_cause` proves it is a short, URL- and
+//! credential-free line (ERR-1: the cause is data, but a leak is not).
 
 use nexus_claude::agent::ProviderError;
 use serde::Serialize;
@@ -169,6 +172,100 @@ fn is_plain_identifier(text: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// Longest `detail` this module will echo back to a client.
+const MAX_CAUSE_BYTES: usize = 200;
+
+/// A `detail` from a provider error, but only when it is plainly a short cause
+/// and carries no URL, no host, no path and no credential-shaped token.
+///
+/// The detail is redacted upstream by nexus (`agent::credentials::redact_with`),
+/// which masks registered secrets, `Bearer`/`Basic` tokens and known fields and
+/// truncates to 512 bytes. It does **not** strip an arbitrary URL or a file path,
+/// so echoing it verbatim could still hand a client a host, a path or a stray
+/// key. This gate is the second lock: a detail that fails any test below is
+/// dropped (the generic message stands) rather than sanitised — a half-masked
+/// URL is still a URL.
+///
+/// `None` means "not safe to show".
+fn safe_cause(detail: &str) -> Option<&str> {
+    let cause = detail.trim();
+    if cause.is_empty() || cause.len() > MAX_CAUSE_BYTES {
+        return None;
+    }
+    // A scheme, an absolute path or userinfo is never part of a cause we show.
+    if cause.contains("://") || cause.contains('/') || cause.contains('\\') {
+        return None;
+    }
+    // A control character (CR, LF, ESC) could forge a log line or a header.
+    if cause.chars().any(char::is_control) {
+        return None;
+    }
+    // One credential-shaped token in the whole detail disqualifies it: the line
+    // as a whole must be quotable, not merely free of the exact secret.
+    if cause
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '[' | ']'))
+        .any(looks_like_a_secret)
+    {
+        return None;
+    }
+    Some(cause)
+}
+
+/// Whether one whitespace-delimited token is shaped like a credential. Errs on
+/// the side of caution: a false positive just hides a cause, a false negative
+/// leaks a key.
+fn looks_like_a_secret(token: &str) -> bool {
+    let token = token
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_' && c != '.');
+    if token.len() < 12 {
+        return false;
+    }
+    let lower = token.to_ascii_lowercase();
+    for prefix in [
+        "sk-",
+        "sk_",
+        "pk-",
+        "pk_",
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+        "aiza",
+        "akia",
+        "bearer",
+        "token=",
+        "api_key=",
+        "apikey=",
+        "password=",
+        "secret=",
+    ] {
+        if lower.starts_with(prefix) {
+            return true;
+        }
+    }
+    // A long run mixing letters and digits and no separator is key-shaped.
+    let has_alpha = token.chars().any(|c| c.is_ascii_alphabetic());
+    let has_digit = token.chars().any(|c| c.is_ascii_digit());
+    has_alpha && has_digit && token.len() >= 24
+}
+
+/// The message of an unreachable endpoint: the generic line, the instance when
+/// one is known, and the masked cause when the detail survives `safe_cause`.
+/// Never the raw detail, never a URL or a credential.
+fn unreachable_message(provider_id: Option<&str>, detail: &str) -> String {
+    let mut message = String::from("The provider endpoint could not be reached");
+    if let Some(id) = provider_id {
+        message.push_str(&format!(" ({id})"));
+    }
+    if let Some(cause) = safe_cause(detail) {
+        message.push_str(&format!(": {cause}"));
+    }
+    message.push('.');
+    message
+}
+
 /// Maps a provider error met while opening (or resuming) a session.
 ///
 /// `unauthorized` answers 502, not 401: a 401 would log the user out of the
@@ -200,11 +297,9 @@ pub fn open_failure(err: &ProviderError, provider_id: Option<&str>) -> OpenFailu
             err.kind(),
             "The provider rejected the configured credential.".to_string(),
         ),
-        ProviderError::EndpointUnreachable { .. } => (
-            502,
-            err.kind(),
-            "The provider endpoint could not be reached.".to_string(),
-        ),
+        ProviderError::EndpointUnreachable { detail } => {
+            (502, err.kind(), unreachable_message(provider_id, detail))
+        }
         ProviderError::ModelNoTools { .. } => (
             422,
             err.kind(),
@@ -563,7 +658,10 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_unreachable_is_502_generic_and_retryable() {
+    fn endpoint_unreachable_is_502_retryable_and_names_the_instance_only() {
+        // `leaky()` carries a URL, a userinfo secret and a path: none may reach
+        // the message, so the cause is dropped whole — the instance is named,
+        // the raw detail never is.
         let failure = assert_mapped(
             ProviderError::EndpointUnreachable { detail: leaky() },
             502,
@@ -572,8 +670,65 @@ mod tests {
         assert!(failure.retryable);
         assert_eq!(
             failure.message,
-            "The provider endpoint could not be reached."
+            "The provider endpoint could not be reached (deepseek-prod)."
         );
+    }
+
+    #[test]
+    fn endpoint_unreachable_names_the_masked_cause() {
+        // A plain cause — the shape nexus produces once redaction has run — is
+        // echoed, so a user can tell a DNS failure from a refused connection.
+        let failure = open_failure(
+            &ProviderError::EndpointUnreachable {
+                detail: "connection failed: Connection refused (os error 61)".to_string(),
+            },
+            Some("deepseek-prod"),
+        );
+        assert_eq!(
+            (failure.status, failure.code),
+            (502, "endpoint_unreachable")
+        );
+        assert!(
+            failure.message.contains("connection failed"),
+            "the cause must be named, got {:?}",
+            failure.message
+        );
+        assert!(failure.message.contains("deepseek-prod"));
+    }
+
+    #[test]
+    fn endpoint_unreachable_never_shows_a_secret_in_the_detail() {
+        // A secret-shaped token with no URL and no path: the detail is not
+        // "safe" either, so it is dropped rather than trimmed around.
+        const API_KEY: &str = "sk-live-9f3a2b7c1d4e6f8a0b2c4d6e";
+        let failure = assert_mapped(
+            ProviderError::EndpointUnreachable {
+                detail: format!("authentication failed for key {API_KEY}"),
+            },
+            502,
+            "endpoint_unreachable",
+        );
+        let body = failure.to_json().to_string();
+        assert!(!failure.message.contains(API_KEY), "secret leaked: {body}");
+        assert!(!body.contains(API_KEY), "secret leaked: {body}");
+        assert_eq!(
+            failure.message,
+            "The provider endpoint could not be reached (deepseek-prod)."
+        );
+    }
+
+    #[test]
+    fn safe_cause_keeps_a_plain_cause_and_drops_anything_leaky() {
+        assert_eq!(
+            safe_cause("dns resolution failed for the api host"),
+            Some("dns resolution failed for the api host")
+        );
+        // A scheme, a path, a control character or a key-shaped token each drop it.
+        assert_eq!(safe_cause("GET https://api.example.com/v1 failed"), None);
+        assert_eq!(safe_cause("see /Users/x/.config/provider.json"), None);
+        assert_eq!(safe_cause("boom\nsecond line"), None);
+        assert_eq!(safe_cause("Bearer sk-abcdef0123456789abcdef"), None);
+        assert_eq!(safe_cause(""), None);
     }
 
     #[test]

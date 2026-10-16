@@ -17,6 +17,7 @@ pub mod limits;
 pub mod listing;
 pub mod native_factory;
 pub mod nexus_tools;
+pub mod outage;
 pub mod policy;
 pub mod resolver;
 pub mod settings;

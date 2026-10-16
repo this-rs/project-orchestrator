@@ -1154,6 +1154,30 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         omitted_entries: Option<u64>,
     },
+    /// A provider instance went out of service, or came back (outage detection,
+    /// `chat::provider::outage`). Persisted and attributable: the instance, the
+    /// masked cause and the start of the outage on the way down, the duration on
+    /// the way up. Emitted once per transition, never per failed call — a blip is
+    /// covered by [`ChatEvent::Retrying`], an outage is what this explains.
+    ProviderOutage {
+        /// The provider instance that went down or came back.
+        provider_id: String,
+        /// `down` when the instance was declared out of service, `up` when it returned.
+        phase: String,
+        /// Short masked cause of the outage: present on `down`, and carried on `up`
+        /// (the outage the instance recovered from). Never a URL, a path or a
+        /// credential: it comes from `errors.rs` (`safe_cause`), not the raw provider text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<String>,
+        /// Consecutive failures observed when the outage was declared (0 on `up`).
+        #[serde(default)]
+        failures: u32,
+        /// When the outage began: the first failure of the run that became an outage.
+        started_at: chrono::DateTime<chrono::Utc>,
+        /// How long the outage lasted, in milliseconds (`up` only).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+    },
 }
 
 impl ChatEvent {
@@ -1198,6 +1222,7 @@ impl ChatEvent {
             ChatEvent::SessionClosed { .. } => "session_closed",
             ChatEvent::ConversationRelayed { .. } => "conversation_relayed",
             ChatEvent::ProviderSwitched { .. } => "provider_switched",
+            ChatEvent::ProviderOutage { .. } => "provider_outage",
         }
     }
 
@@ -1392,7 +1417,8 @@ impl ChatEvent {
             | ChatEvent::SecretRequest { .. }
             | ChatEvent::SecretRequestResolved { .. }
             | ChatEvent::SessionClosed { .. }
-            | ChatEvent::ProviderSwitched { .. } => None,
+            | ChatEvent::ProviderSwitched { .. }
+            | ChatEvent::ProviderOutage { .. } => None,
         }
     }
 }

@@ -679,6 +679,56 @@
         }
       }
     },
+    "provider_outage": {
+      "examples": {
+        "full": {
+          "cause": "connection failed: Connection refused (os error 61)",
+          "duration_ms": 4200,
+          "failures": 0,
+          "phase": "up",
+          "provider_id": "deepseek-prod",
+          "started_at": "2026-10-16T14:05:29Z",
+          "type": "provider_outage"
+        },
+        "minimal": {
+          "failures": 3,
+          "phase": "down",
+          "provider_id": "deepseek-prod",
+          "started_at": "2026-10-16T14:05:29Z",
+          "type": "provider_outage"
+        }
+      },
+      "fields": {
+        "cause": {
+          "required": false,
+          "type": "string"
+        },
+        "duration_ms": {
+          "required": false,
+          "type": "number"
+        },
+        "failures": {
+          "required": true,
+          "type": "number"
+        },
+        "phase": {
+          "required": true,
+          "type": "string"
+        },
+        "provider_id": {
+          "required": true,
+          "type": "string"
+        },
+        "started_at": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
     "provider_switched": {
       "examples": {
         "full": {

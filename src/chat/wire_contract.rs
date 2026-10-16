@@ -46,7 +46,7 @@ const UPDATE_COMMAND: &str = "UPDATE_CHAT_CONTRACT=1 cargo test --lib chat::wire
 
 /// Every `ChatEvent` tag the examples must cover. Adding a variant means
 /// adding its tag here AND its examples in [`server_examples`].
-const EXPECTED_SERVER_TAGS: [&str; 38] = [
+const EXPECTED_SERVER_TAGS: [&str; 39] = [
     "active_tasks_update",
     "ask_user_question",
     "assistant_text",
@@ -64,6 +64,7 @@ const EXPECTED_SERVER_TAGS: [&str; 38] = [
     "permission_decision",
     "permission_mode_changed",
     "permission_request",
+    "provider_outage",
     "provider_switched",
     "refs_resolved",
     "result",
@@ -149,6 +150,7 @@ fn variant_tag(e: &ChatEvent) -> &'static str {
         ChatEvent::SessionClosed { .. } => "session_closed",
         ChatEvent::ConversationRelayed { .. } => "conversation_relayed",
         ChatEvent::ProviderSwitched { .. } => "provider_switched",
+        ChatEvent::ProviderOutage { .. } => "provider_outage",
     }
 }
 
@@ -777,6 +779,26 @@ fn server_examples() -> Vec<ServerExample> {
                 model: s("example-model-large"),
                 relayed_entries: None,
                 omitted_entries: None,
+            },
+        ),
+        ServerExample::new(
+            // `full`: the instance came back after a 4.2 s outage (cause carried,
+            // duration set). `minimal`: it went down, no duration yet.
+            ChatEvent::ProviderOutage {
+                provider_id: s("deepseek-prod"),
+                phase: s("up"),
+                cause: Some(s("connection failed: Connection refused (os error 61)")),
+                failures: 0,
+                started_at: ts("2026-10-16T14:05:29Z"),
+                duration_ms: Some(4200),
+            },
+            ChatEvent::ProviderOutage {
+                provider_id: s("deepseek-prod"),
+                phase: s("down"),
+                cause: None,
+                failures: 3,
+                started_at: ts("2026-10-16T14:05:29Z"),
+                duration_ms: None,
             },
         ),
     ]
