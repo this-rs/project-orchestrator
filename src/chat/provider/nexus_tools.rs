@@ -451,6 +451,26 @@ pub type TrustProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 pub type TrustNotice =
     Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
 
+/// A person's answer to an origin request (N23b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginAnswer {
+    /// This call only, in memory.
+    Once,
+    /// This session, in memory: later calls to the origin are not asked again.
+    Session,
+    /// Recorded as the project's consent — the SAME document the settings route writes — then
+    /// allowed. An act of a person, never of the model.
+    Always,
+    /// Refused, or nobody answered.
+    Refused,
+}
+
+/// Asks the person whether the project's agents may reach `origin` (already in its `reached`
+/// form, `https://`). Returns `None` when nobody can be asked — a session without a person in
+/// front of it: the caller refuses, it never fabricates a person.
+pub type OriginAsker =
+    Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, Option<OriginAnswer>> + Send + Sync>;
+
 /// Whether Rock'n roll opens the network of a session: the session's access is normal AND a
 /// PERSON put it in trust (and it has not left it). Never the mode alone: the runner, a protocol
 /// executor and a delegated task run in `bypassPermissions` with nobody in front of them, and a
@@ -514,6 +534,13 @@ pub struct ToolAccessHooks {
     /// The directories the session was launched with (cwd, then extra ones): what its file
     /// tools are held to when a session launched `--unscoped` left trust.
     scope_dirs: Option<(PathBuf, Vec<PathBuf>)>,
+    /// Where an origin without the project's consent is asked of a person ([`Self::with_asker`]).
+    /// `None`: refused, the default — and the only path for a session nobody is in front of.
+    asker: Option<OriginAsker>,
+    /// Origins allowed for THIS session in memory by a `session` answer, as nexus reaches them
+    /// (`https://`). Never persisted: an `always` is the project's consent document, written by
+    /// the asker, so a later call finds it through [`ToolConsents::origin_consented`].
+    allowed: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl ToolAccessHooks {
@@ -535,6 +562,8 @@ impl ToolAccessHooks {
             notice: None,
             announced: Default::default(),
             scope_dirs: None,
+            asker: None,
+            allowed: Default::default(),
         }
     }
 
@@ -545,6 +574,40 @@ impl ToolAccessHooks {
         self.trust = Some(in_trust);
         self.notice = Some(notice);
         self
+    }
+
+    /// Lets a person answer an origin the project has not consented to, in the chat (N23b).
+    /// Without it, such a call is refused — the behaviour that existed before, kept as the
+    /// default for any session nobody is in front of.
+    #[must_use]
+    pub fn with_asker(mut self, asker: OriginAsker) -> Self {
+        self.asker = Some(asker);
+        self
+    }
+
+    /// Asks the person about the origin of `refusal`, when it is an origin without consent, the
+    /// session belongs to a project, and someone can be asked. `None` = refuse (never a person
+    /// fabricated for a session nobody is in front of).
+    async fn ask_the_person(&self, refusal: &ToolAccessError) -> Option<OriginAnswer> {
+        let ToolAccessError::OriginNotConsented { origin } = refusal else {
+            return None;
+        };
+        if self.project.is_none() {
+            return None;
+        }
+        let Some(asker) = &self.asker else {
+            return None;
+        };
+        asker(reached(origin)).await
+    }
+
+    /// The origin of a refusal in its `reached` (`https://`) form, what the asker is asked about
+    /// and what a `once`/`session` covers. The caller only reaches here for an origin refusal.
+    fn reached_of(refusal: &ToolAccessError) -> String {
+        match refusal {
+            ToolAccessError::OriginNotConsented { origin } => reached(origin),
+            _ => unreachable!("only an origin refusal is asked"),
+        }
     }
 
     /// What trust makes of a refusal: the origin to let through when the session is in Rock'n roll
@@ -695,7 +758,14 @@ impl SessionHooks for ToolAccessHooks {
         // needs `https://X` too, a search needs every engine of the session): each is checked
         // again with the ones already let through, and each is announced. The loop ends: it adds
         // a new origin at every turn or returns.
-        let mut let_through = BTreeSet::new();
+        // Origins this session already allowed in memory (a `session` answer to an earlier call).
+        let mut let_through: BTreeSet<String> = self
+            .allowed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect();
         loop {
             match check_call_with(
                 self.consents.as_ref(),
@@ -712,14 +782,33 @@ impl SessionHooks for ToolAccessHooks {
                         self.announce(&origin).await;
                     }
                     _ => {
-                        tracing::warn!(
-                            session_id = %self.session_id,
-                            code = refusal.code(),
-                            "network tool refused"
-                        );
-                        return HookVerdict::Deny {
-                            reason: refusal.reason(),
-                        };
+                        // N23b: an origin the project has not consented to is asked of a person,
+                        // when one can be asked. Once / session / always, the same vocabulary as
+                        // a tool permission; `always` is the project's consent, written by the
+                        // asker. Nobody to ask, or a refusal, keeps the refusal of today.
+                        match self.ask_the_person(&refusal).await {
+                            Some(OriginAnswer::Session) => {
+                                let origin = Self::reached_of(&refusal);
+                                self.allowed
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .insert(origin.clone());
+                                let_through.insert(origin);
+                            }
+                            Some(OriginAnswer::Once | OriginAnswer::Always) => {
+                                let_through.insert(Self::reached_of(&refusal));
+                            }
+                            Some(OriginAnswer::Refused) | None => {
+                                tracing::warn!(
+                                    session_id = %self.session_id,
+                                    code = refusal.code(),
+                                    "network tool refused"
+                                );
+                                return HookVerdict::Deny {
+                                    reason: refusal.reason(),
+                                };
+                            }
+                        }
                     }
                 },
             }
@@ -1705,6 +1794,122 @@ mod tests {
             HookVerdict::AddContext("inner".into())
         );
         crate::auth::agent_tokens::revoke_session("hook-s1");
+    }
+
+    // ---- (0a-bis) N23b: an origin without consent is asked of a person ------------------
+
+    fn asker_with(asked: Arc<std::sync::Mutex<Vec<String>>>, answer: OriginAnswer) -> OriginAsker {
+        Arc::new(move |origin: String| {
+            let asked = asked.clone();
+            Box::pin(async move {
+                asked
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(origin);
+                Some(answer)
+            })
+        })
+    }
+
+    async fn gate_with_asker(session: &str, asker: Option<OriginAsker>) -> ToolAccessHooks {
+        let graph = Arc::new(MockGraphStore::new());
+        crate::auth::agent_tokens::register_tools(session);
+        let hooks = ToolAccessHooks::new(
+            None,
+            Arc::new(GraphConsents(graph)),
+            session,
+            Some("proj".into()),
+            Vec::new(),
+        );
+        match asker {
+            Some(asker) => hooks.with_asker(asker),
+            None => hooks,
+        }
+    }
+
+    #[tokio::test]
+    async fn without_an_asker_an_origin_without_consent_is_refused_as_before() {
+        let hooks = gate_with_asker("n23b-no-asker", None).await;
+        let HookVerdict::Deny { reason } = hooks.before_tool(&fetch("https://docs.rs/")).await
+        else {
+            panic!("a denial was expected");
+        };
+        assert!(reason.starts_with("tool_origin_not_allowed:"));
+    }
+
+    #[tokio::test]
+    async fn a_person_may_allow_the_origin_once_for_this_call_only() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hooks = gate_with_asker(
+            "n23b-once",
+            Some(asker_with(asked.clone(), OriginAnswer::Once)),
+        )
+        .await;
+        assert_eq!(
+            hooks.before_tool(&fetch("https://docs.rs/")).await,
+            HookVerdict::Continue
+        );
+        // `once` covers THIS call only: a later call asks again.
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        hooks.before_tool(&fetch("https://docs.rs/")).await;
+        assert_eq!(asked.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_session_answer_covers_later_calls_without_asking_again() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hooks = gate_with_asker(
+            "n23b-session",
+            Some(asker_with(asked.clone(), OriginAnswer::Session)),
+        )
+        .await;
+        assert_eq!(
+            hooks.before_tool(&fetch("https://docs.rs/")).await,
+            HookVerdict::Continue
+        );
+        assert_eq!(
+            hooks.before_tool(&fetch("https://docs.rs/")).await,
+            HookVerdict::Continue
+        );
+        assert_eq!(asked.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn always_lets_the_call_through() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hooks = gate_with_asker(
+            "n23b-always",
+            Some(asker_with(asked, OriginAnswer::Always)),
+        )
+        .await;
+        assert_eq!(
+            hooks.before_tool(&fetch("https://docs.rs/")).await,
+            HookVerdict::Continue
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_or_no_person_keeps_the_refusal() {
+        let hooks = gate_with_asker(
+            "n23b-refused",
+            Some(asker_with(
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+                OriginAnswer::Refused,
+            )),
+        )
+        .await;
+        let HookVerdict::Deny { reason } = hooks.before_tool(&fetch("https://docs.rs/")).await
+        else {
+            panic!("a denial was expected");
+        };
+        assert!(reason.starts_with("tool_origin_not_allowed:"));
+        // A person who cannot be asked (None) is a refusal too, never a fabricated one.
+        let no_person: OriginAsker = Arc::new(|_origin| Box::pin(async { None }));
+        let hooks = gate_with_asker("n23b-no-person", Some(no_person)).await;
+        assert!(matches!(
+            hooks.before_tool(&fetch("https://docs.rs/")).await,
+            HookVerdict::Deny { .. }
+        ));
     }
 
     // ---- (0b) trust (Rock'n roll): public origins without a consent, and the person is told ----
