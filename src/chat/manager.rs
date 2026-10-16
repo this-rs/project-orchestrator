@@ -2463,11 +2463,7 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
                 &mut after,
                 session_id,
                 "cites",
-                super::feedback::cited_refs_event(
-                    &self.graph,
-                    session_id,
-                    &outcome.assistant_text,
-                ),
+                super::feedback::cited_refs_event(&self.graph, session_id, &outcome.assistant_text),
             )
             .await
             .flatten()
