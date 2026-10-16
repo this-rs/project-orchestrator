@@ -3893,3 +3893,134 @@ fn only_a_limit_of_the_model_may_be_announced_missing() {
         vec!["hooks", nexus]
     );
 }
+
+// ============================================================================
+// Outage of the provider instance, on the historical engine (A5)
+// ============================================================================
+
+/// The refusal the CLI prints when the provider answers 502: the historical loop
+/// has only this TEXT (`classify_api_error`), not the typed `ProviderError` the
+/// agent engine feeds its detector with.
+const LEGACY_PROVIDER_DOWN: &str = "API Error: 502 Bad Gateway";
+
+/// A turn the provider refuses four times, then answers. Four refusals are what it
+/// takes with the default retry budget (`max_attempts = 3`): the first three spend
+/// it (and the third declares the outage), the fourth finds the instance down and
+/// is **held**. Every refusal is followed by `await_stdin` for the same message —
+/// the loop re-sends it whole on each attempt, hold included.
+fn transcript_down_then_up(turn: &str) -> Vec<Value> {
+    let mut t: Vec<Value> = vec![capture_hooks(), await_in(turn)];
+    for _ in 0..4 {
+        t.push(result("error_during_execution", LEGACY_PROVIDER_DOWN, true));
+        t.push(await_in(turn));
+    }
+    t.push(text("answered after the outage"));
+    t.push(result_ok("answered after the outage"));
+    t.push(wait_eof());
+    t
+}
+
+/// A5 — the historical (Claude Code) loop against a **down** provider.
+///
+/// The ordinary retry budget covers a blip; once it is spent, a healthy loop would
+/// close the turn on the refusal and the user would read "API Error: 502" for a
+/// service that is merely away. With the outage detector wired in, the fourth
+/// failure — the one the retry budget no longer covers — is **held** for the down
+/// instance and probed, so the turn ends on the answer the instance gives when it
+/// comes back.
+///
+/// The `down`/`up` pair goes to the session's own event stream
+/// (`ChatEvent::ProviderOutage`, persisted and broadcast), the very channel the
+/// agent engine announces its own outages on.
+#[tokio::test]
+async fn the_historical_loop_holds_a_turn_for_a_down_provider() {
+    let stage = Stage::new().await;
+    let cwd = stage.cwd();
+    let k = Keys("CC");
+
+    let cli = FakeClaude::new();
+    cli.transcript(0, &transcript_down_then_up(&k.k("TURN-ONE")));
+    // The backends build a provider source over the local instance, whether or not
+    // the session ends up on the historical engine.
+    // The local instance is only there for the provider source to build (this run
+    // never reaches it): an empty script is a valid one (a JSON list).
+    let fake = FakeOpenAi::start_for(json!([]), 900_000);
+    let _dump = OpenAiDump(&fake);
+    store_instance(&stage.graph, &instance(&fake, "none")).await;
+    consent(&stage.graph, "proj", "local", &fake.origin()).await;
+    let answers: Arc<Answers> = Arc::default();
+
+    let manager = stage.backend(&cli, &answers, ProviderPath::Legacy).await;
+    let mut req = request(None, Some("proj"), "default");
+    req.cwd = cwd.clone();
+    req.message = format!("{}: are you there?", k.k("TURN-ONE"));
+    req.user_claims = Some(parity_person());
+    let sid = manager
+        .create_session(&req)
+        .await
+        .unwrap_or_else(|e| panic!("opening the Claude Code session: {e:#}"))
+        .session_id;
+    assert!(
+        !manager.agent_runtime.owns(&sid).await,
+        "the session runs on the historical engine"
+    );
+    let w = Watch::start(
+        stage.graph.clone(),
+        &sid,
+        manager.subscribe(&sid).await.unwrap(),
+    );
+
+    // 1. The turn is not closed on the refusal: it answers once the instance is back.
+    assert!(
+        w.said(Duration::from_secs(60), "answered after the outage")
+            .await,
+        "the held turn ends on the answer of the instance that came back"
+    );
+
+    // 2. The hold is what bought the extra attempt: the message was re-sent once
+    //    more than the ordinary budget alone allows (3 retries → 4 sends).
+    let resends = cli
+        .stdin_lines(0)
+        .iter()
+        .filter(|l| l.contains(&k.k("TURN-ONE")))
+        .count();
+    assert!(
+        resends >= 5,
+        "the spent budget was held for the down instance (sends: {resends}, ordinary budget: 4)"
+    );
+
+    // 3. The outage is announced, both ways, on the session's own channel — the
+    //    `down` one naming the instance and its masked cause (our token, never the
+    //    raw provider text).
+    let notices = w.all().await;
+    assert!(
+        notices.iter().any(|e| matches!(
+            e,
+            ChatEvent::ProviderOutage { provider_id, phase, cause, failures, .. }
+                if provider_id.as_str() == "claude-code"
+                    && phase.as_str() == "down"
+                    && cause.as_deref() == Some("http_5xx")
+                    && *failures == 3
+        )),
+        "a `down` notice names the instance, its failures and its masked cause: {notices:#?}"
+    );
+    assert!(
+        notices.iter().any(
+            |e| matches!(e, ChatEvent::ProviderOutage { phase, .. } if phase.as_str() == "up")
+        ),
+        "the recovery is announced too: {notices:#?}"
+    );
+
+    // 4. A held turn is not a failed one: the user never reads the refusal.
+    let errors: Vec<String> = notices
+        .iter()
+        .filter_map(|e| match e {
+            ChatEvent::Error { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !errors.iter().any(|m| m.contains("502")),
+        "the held turn was never closed on the refusal: {errors:?}"
+    );
+}

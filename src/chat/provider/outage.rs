@@ -65,22 +65,27 @@
 //! one `ProviderSwitched`/`ConversationRelayed` already use for provider-level
 //! facts. [`ChatEvent::ProviderOutage`] is an additive variant of that existing
 //! channel: no second channel is created, and a client that does not know it
-//! ignores it. Wiring is a deliberate follow-up — a self-contained primitive
-//! first, its wiring next. The **agent engine** is wired (`agent_runtime.rs`): one
-//! [`TurnHold`] per session beside its `RetryConfig`; a *final* call's [`Outcome`]
-//! is fed in one place, a `down`/`up` transition emits
-//! `notice.to_chat_event(chrono::Utc::now())`, and a failure whose ordinary retry
-//! budget is spent is **held** — probed at the hold's cadence, bounded by
-//! `max_hold` — instead of closing the turn. The legacy loop (`manager.rs`) is the
-//! remaining call site: it classifies its failures from provider *text*
-//! (`classify_api_error`), not the typed `ProviderError` this module takes, so it
-//! needs a mapping of that taxonomy to [`Outcome`] first — a deliberate follow-up,
-//! tracked, not silently skipped.
+//! ignores it.
+//!
+//! Both engines are wired, each feeding the same detector where it can:
+//!
+//! - the **agent engine** (`agent_runtime.rs`) from the typed `ProviderError` it
+//!   already has: one [`TurnHold`] per session beside its `RetryConfig`; a *final*
+//!   call's [`Outcome`] is fed in one place, a `down`/`up` transition emits
+//!   `notice.to_chat_event(chrono::Utc::now())`, and a failure whose ordinary retry
+//!   budget is spent is **held** — probed at the hold's cadence, bounded by
+//!   `max_hold` — instead of closing the turn;
+//! - the **legacy Claude Code loop** (`manager.rs`) from the provider *text* it is
+//!   given (`classify_api_error`), through [`outcome_of_legacy_failure`] — the one
+//!   place that maps that taxonomy to [`Outcome`]. Its hold reuses [`TurnHold`] and
+//!   `hold_on` exactly as the agent engine does, and re-sends the turn only where the
+//!   ordinary retry already would (a turn that showed nothing, or text but no tool):
+//!   an executed tool is never replayed.
 
 use std::time::{Duration, Instant};
 
 use super::circuit_breaker::Outcome;
-use crate::chat::types::ChatEvent;
+use crate::chat::types::{classify_api_error, is_out_of_credit_message, ApiErrorKind, ChatEvent};
 
 /// Consecutive failures that declare an outage, when no success interrupts them.
 pub const DEFAULT_FAILURE_THRESHOLD: u32 = 3;
@@ -504,12 +509,176 @@ impl TurnHold {
     }
 }
 
+/// The **legacy** engine's bridge to [`Outcome`].
+///
+/// The Claude Code loop (`manager.rs`) reads its failures from provider *text*
+/// (`crate::chat::types::classify_api_error`), not from a typed `ProviderError`,
+/// so it cannot hand a result to [`TurnHold`] / [`ProviderOutage`] the way the
+/// agent engine does. This is the one place that maps that text taxonomy to the
+/// health [`Outcome`] they consume, so the legacy loop feeds the **same**
+/// detector as the native one instead of growing a second state machine.
+///
+/// `None` means "this is not a health failure": the instance answered, with a
+/// refusal or a bad request of its own. That is what `ProviderError::retryable()`
+/// decides on the typed path — a client error does not count against the
+/// instance. A 402 (out of credit) is excluded on purpose: it is the cognitive
+/// router's signal, not an outage.
+///
+/// The cause returned alongside is our own short token, never the raw provider
+/// text, so an outage notice can never carry more than the user-facing message
+/// already shows (the guarantee `errors::cause_of` gives on the typed path).
+pub fn outcome_of_legacy_failure(text: &str) -> Option<(Outcome, &'static str)> {
+    // A 402 (out of credit) is a refusal, not a health failure: the router cools
+    // the instance down from the text the CLI prints, and the detector must not
+    // also read it as an outage.
+    if is_out_of_credit_message(text) {
+        return None;
+    }
+    match classify_api_error(text) {
+        ApiErrorKind::Retryable(reason) => {
+            return Some((Outcome::Failure, retry_reason_token(&reason)));
+        }
+        ApiErrorKind::NonRetryable(_) => {}
+    }
+    // `classify_api_error` matches "timed out" case-sensitively; a client that
+    // says "Timeout waiting for response after 30 seconds" is transient too.
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("timeout") || lower.contains("timed out") {
+        return Some((Outcome::Failure, LEGACY_TIMEOUT));
+    }
+    if UNREACHABLE_TEXT.iter().any(|token| lower.contains(token)) {
+        return Some((Outcome::Failure, LEGACY_UNREACHABLE));
+    }
+    None
+}
+
+/// The token reported for a retryable failure, from `classify_api_error`'s own
+/// vocabulary. An unknown reason falls back to a generic token rather than
+/// echoing the raw text.
+fn retry_reason_token(reason: &str) -> &'static str {
+    match reason {
+        "api_error" => LEGACY_API_ERROR,
+        "overloaded_error" => LEGACY_OVERLOADED,
+        "rate_limit_error" => LEGACY_RATE_LIMIT,
+        "http_5xx" => LEGACY_HTTP_5XX,
+        "timeout" => LEGACY_TIMEOUT,
+        _ => LEGACY_UNKNOWN,
+    }
+}
+
+/// Substrings that mean the endpoint could not be reached at all: the
+/// network-level refusals a client prints when it cannot open a connection to the
+/// API (a Bun/Node `fetch` failure, a DNS failure, a refused socket). Deliberately
+/// narrow — a *locally* dead CLI ("Failed to connect to Claude CLI") is the resume
+/// path's business, not an outage of the provider instance.
+const UNREACHABLE_TEXT: &[&str] = &[
+    "unable to connect to api",
+    "connection refused",
+    "econnrefused",
+    "connection reset",
+    "no route to host",
+    "network is unreachable",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "nodename nor servname",
+    "getaddrinfo",
+    "fetch failed",
+];
+
+/// Cause tokens of the legacy taxonomy: short, stable, ours.
+const LEGACY_API_ERROR: &str = "api_error";
+const LEGACY_OVERLOADED: &str = "overloaded_error";
+const LEGACY_RATE_LIMIT: &str = "rate_limit_error";
+const LEGACY_HTTP_5XX: &str = "http_5xx";
+const LEGACY_TIMEOUT: &str = "timeout";
+const LEGACY_UNREACHABLE: &str = "endpoint_unreachable";
+const LEGACY_UNKNOWN: &str = "provider_error";
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn at(base: Instant, secs: u64) -> Instant {
         base + Duration::from_secs(secs)
+    }
+
+    /// The legacy loop's health failures: 5xx, overloaded, rate limit and timeout
+    /// all count against the instance (they are `classify_api_error`'s retryable
+    /// set), each with its own short token.
+    #[test]
+    fn a_legacy_retryable_failure_counts_against_the_instance() {
+        let cases: &[(&str, &str)] = &[
+            (
+                r#"API Error: 500 {"type":"error","error":{"type":"api_error","message":"Internal server error"}}"#,
+                "api_error",
+            ),
+            (
+                r#"API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+                "overloaded_error",
+            ),
+            (
+                r#"API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}"#,
+                "rate_limit_error",
+            ),
+            ("API Error: 502 Bad Gateway", "http_5xx"),
+            ("API Error: 503 Service Unavailable", "http_5xx"),
+            ("Request timed out", "timeout"),
+            // The CLI reports a stalled request this way; the case-sensitive
+            // "timed out" of `classify_api_error` alone would miss it.
+            ("Timeout waiting for response after 30 seconds", "timeout"),
+        ];
+        for (text, token) in cases {
+            assert_eq!(
+                outcome_of_legacy_failure(text),
+                Some((Outcome::Failure, *token)),
+                "text: {text}"
+            );
+        }
+    }
+
+    /// An endpoint that cannot be reached is a health failure however the client
+    /// spells it (the CLI's own line, or a Bun/Node `fetch` failure).
+    #[test]
+    fn an_unreachable_endpoint_counts_against_the_instance() {
+        let cases = [
+            "API Error: Unable to connect to API (ConnectionRefused)",
+            "Error: connect ECONNREFUSED 127.0.0.1:443",
+            "TypeError: fetch failed",
+            "getaddrinfo ENOTFOUND api.anthropic.com",
+            "connect: network is unreachable",
+        ];
+        for text in cases {
+            assert_eq!(
+                outcome_of_legacy_failure(text),
+                Some((Outcome::Failure, "endpoint_unreachable")),
+                "text: {text}"
+            );
+        }
+    }
+
+    /// What the instance *answered* is not its health: a client error and a 402
+    /// must not feed the detector (the router owns the 402).
+    #[test]
+    fn an_answered_client_error_is_not_a_health_failure() {
+        let cases = [
+            r#"API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Bad request"}}"#,
+            r#"API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"Unauthorized"}}"#,
+            r#"API Error: 402 {"type":"error","error":{"type":"invalid_request_error","message":"Insufficient credits"}}"#,
+            // A locally dead CLI is the resume path's business, not an outage.
+            "Failed to connect to Claude CLI: No such file or directory",
+            "stream ended before a Result",
+        ];
+        for text in cases {
+            assert_eq!(outcome_of_legacy_failure(text), None, "text: {text}");
+        }
+    }
+
+    /// The cause is our token, never the provider's raw text.
+    #[test]
+    fn a_legacy_cause_is_our_token_not_the_raw_text() {
+        let (_, cause) = outcome_of_legacy_failure("API Error: 502 Bad Gateway").unwrap();
+        assert_eq!(cause, "http_5xx");
+        assert!(!cause.contains("API Error"), "leaked the raw text: {cause}");
     }
 
     #[test]
