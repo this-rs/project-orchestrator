@@ -163,13 +163,20 @@ jobs:
             arch: arm64
             use_cross: false
 
-          # macOS Intel (cross-compiled on Apple Silicon runner)
+          # macOS Intel — built NATIVELY on an Intel runner (`macos-15-intel`, the standard Intel
+          # label that replaced the retired `macos-13`), NOT cross-compiled on the Apple Silicon
+          # one. Reason (REL-1): nexus-tools embeds Obscura, and Obscura links V8 whose
+          # startup snapshot is ARCHITECTURE-SPECIFIC. Cross-compiling arm64 -> x64 makes
+          # obscura-js/build.rs (its `is_cross` branch) fall back to a HOST snapshot, because the
+          # cross-mksnapshot it looks for (gn_out/clang_arm64_v8_x64/mksnapshot) is never built;
+          # the x86_64 binary then carries an arm64 blob and the embedded browser crashes at
+          # runtime. Building ON x86_64 makes host == target, so the snapshot is right.
           # ort-sys has NO prebuilt ONNX Runtime for this target. We download
           # the official Microsoft release and use dynamic linking via
           # ORT_LIB_LOCATION + ORT_PREFER_DYNAMIC_LINK (see step below).
           # The resulting binaries need libonnxruntime.dylib at runtime.
           - target: x86_64-apple-darwin
-            runner: macos-14
+            runner: macos-15-intel
             os: macos
             arch: x86_64
             use_cross: false
@@ -727,8 +734,11 @@ jobs:
             artifact_os: macos
             artifact_arch: arm64
 
+          # Native Intel runner (`macos-15-intel`), like build-backend: the desktop bundle rides
+          # nexus-tools (with Obscura/V8) along as a resource, so the V8 snapshot must be the
+          # target's (REL-1).
           - target: x86_64-apple-darwin
-            runner: macos-14
+            runner: macos-15-intel
             tauri_target: x86_64-apple-darwin
             artifact_os: macos
             artifact_arch: x86_64
