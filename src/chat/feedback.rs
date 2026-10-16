@@ -903,7 +903,7 @@ pub async fn cited_refs_event(
     }
     let source = crate::refs::resolvers::GraphRefSource::new(graph.clone());
     let principal =
-        crate::refs::turn::session_principal(graph.as_ref(), &session_id.to_string()).await;
+        crate::refs::turn::session_principal(graph.as_ref(), session_id).await;
     let refs = crate::refs::cite::guard_cites(
         &source,
         &crate::refs::access::AccessPolicy::open_instance(),
@@ -911,7 +911,7 @@ pub async fn cited_refs_event(
         answer,
     )
     .await;
-    (!refs.is_empty()).then(|| crate::chat::types::ChatEvent::CitesResolved { refs })
+    (!refs.is_empty()).then_some(crate::chat::types::ChatEvent::CitesResolved { refs })
 }
 
 #[cfg(test)]

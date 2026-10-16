@@ -627,9 +627,8 @@ mod neutralize_value_tests {
         let dump = v.to_string();
         assert!(dump.contains(&format!("#plan:{ID}")), "visible: {dump}");
         assert!(dump.contains(&format!("#task:{ID}")), "visible: {dump}");
-        for s in [v["text"].as_str().unwrap()] {
-            assert!(cited_refs(s).is_empty(), "{s:?}");
-        }
+        let s = v["text"].as_str().unwrap();
+        assert!(cited_refs(s).is_empty(), "{s:?}");
         assert!(cited_refs(v["nested"][0].as_str().unwrap()).is_empty());
         assert!(cited_refs(v["nested"][1]["deep"].as_str().unwrap()).is_empty());
         assert_eq!(v["n"], 3);
