@@ -80,6 +80,9 @@ diagrams:
     owner: theotime
     status: verified
     file: docs/diagrams/po-cognitive-routing.mmd
+    # Arbitrage : src/evaluation/** appartient ici (le banc hors ligne des cinq classifieurs) : ses chiffres
+    # sortent par le champ additif du rapport (classifiers) et par le heartbeat classifier_bench ; les
+    # cartes des domaines mesures (po-skills-reasoning, po-neurons-embeddings, po-autonomic) sont planned.
     # Routage cognitif (RFC v2, decision R2) : reglages mode/stage (B-R1), puis signature, candidats,
     # scorer, decisions, feedback, rapport (B-R2..). Les routes /api/chat/routing vivent dans routing_handlers.rs.
     covers:
@@ -89,6 +92,7 @@ diagrams:
       - "backend:src/neo4j/routing.rs"
       - "backend:src/neo4j/segment.rs"
       - "backend:src/runner/routing.rs"
+      - "backend:src/evaluation/**"
   - name: po-chat-transport
     owner: theotime
     status: verified

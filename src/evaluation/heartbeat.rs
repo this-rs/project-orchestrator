@@ -1,9 +1,16 @@
-//! ClassifierBenchCheck — re-scores the backend classifiers on their fixtures.
+//! The heartbeat publication of the classifier bench.
 //!
-//! Pure computation: the fixtures are embedded in the binary and the classifiers
-//! run in memory (no graph, no network). The result goes to the log: one line
-//! per classifier, with a warning when it falls under the majority baseline.
-//! The same figures are served by `GET /api/chat/routing/report`.
+//! `ClassifierBenchCheck` re-scores the five classifiers on their embedded
+//! fixtures and logs one line per classifier, warning when one falls under the
+//! majority baseline. It is pure computation — no graph, no network — so it is
+//! cheap enough for a six-hour heartbeat. The same figures are served by
+//! `GET /api/chat/routing/report` (`RoutingReport.classifiers`).
+//!
+//! It lives here rather than in `src/heartbeat/checks/` because the bench and
+//! everything that publishes it are one subject, and because `src/heartbeat/**`
+//! is reserved by the `po-autonomic` entry of `docs/diagrams/INDEX.yml`: a new
+//! file there would be a source file no *verified* diagram could own without a
+//! shared-ownership collision.
 
 use std::time::Duration;
 
@@ -11,8 +18,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tracing::{info, warn};
 
-use crate::evaluation;
 use crate::heartbeat::{HeartbeatCheck, HeartbeatContext};
+
+use super::run_embedded;
 
 /// Re-scores the classifiers every six hours.
 pub struct ClassifierBenchCheck;
@@ -28,7 +36,7 @@ impl HeartbeatCheck for ClassifierBenchCheck {
     }
 
     async fn run(&self, _ctx: &HeartbeatContext) -> Result<()> {
-        for score in evaluation::run_embedded()? {
+        for score in run_embedded()? {
             if score.above_baseline {
                 info!(
                     classifier = %score.classifier,

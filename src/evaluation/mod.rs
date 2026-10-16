@@ -10,7 +10,8 @@
 //!
 //! The bench is offline, deterministic and fast: no network, no Neo4j, no clock
 //! in the predictions. Its figures are published in the shadow routing report
-//! (`classifiers` field) and by the heartbeat check `classifier_bench`.
+//! (`classifiers` field) and by the heartbeat check `classifier_bench` (see the
+//! `heartbeat` submodule).
 //!
 //! Language invariance is measured where the fixture pairs a French case and an
 //! English case under the same `pair` id: the share of pairs on which the
@@ -18,6 +19,7 @@
 //! `tests/routing_metamorphic.rs`, but on labelled data).
 
 pub mod classifiers;
+pub mod heartbeat;
 
 use std::collections::{BTreeMap, BTreeSet};
 

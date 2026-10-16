@@ -2083,9 +2083,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Runs independently of chat sessions (like ScheduleProvider).
     {
         use heartbeat::checks::{
-            architecture_drift::ArchitectureDriftCheck, classifier_bench::ClassifierBenchCheck,
-            consolidation::ConsolidationCheck, convention_guard::ConventionGuardCheck,
-            git_drift::GitDriftCheck, homeostasis::HomeostasisCheck, maintenance::MaintenanceCheck,
+            architecture_drift::ArchitectureDriftCheck, consolidation::ConsolidationCheck,
+            convention_guard::ConventionGuardCheck, git_drift::GitDriftCheck,
+            homeostasis::HomeostasisCheck, maintenance::MaintenanceCheck,
             staleness::StalenessCheck, synapse_decay::SynapseDecayCheck,
             synapse_replenish::SynapseReplenishCheck,
         };
@@ -2105,7 +2105,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             Box::new(ConsolidationCheck),
             Box::new(HomeostasisCheck::new()),
             // Pure in-memory re-scoring of the classifiers on their fixtures.
-            Box::new(ClassifierBenchCheck),
+            // It lives with the bench it runs (src/evaluation), which also
+            // publishes the figures (po-cognitive-routing diagram).
+            Box::new(evaluation::heartbeat::ClassifierBenchCheck),
             // Derives the architecture of ONE workspace per tick, rotating. It
             // touches nothing the synapse checks care about, so its position here
             // is free — but its per-run bound is not: the engine awaits each
