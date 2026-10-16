@@ -718,3 +718,97 @@ mod partition_tests {
         assert_eq!(a, b);
     }
 }
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    use crate::chat::provider::cognitive::segment::{
+        Dimension, Fingerprint, Observation, SegmentPolicy, Segmenter,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn topic_observation(turn: u32, label: &str) -> Observation {
+        let mut prints = BTreeMap::new();
+        prints.insert(Dimension::Topic, Fingerprint::new([label]));
+        Observation { turn, prints }
+    }
+
+    fn graph_of(labels: &[&str]) -> ConversationGraph {
+        let turns: Vec<TurnNode> = labels
+            .iter()
+            .enumerate()
+            .map(|(turn, label)| TurnNode {
+                turn: turn as u32,
+                labels: BTreeSet::from([(*label).to_string()]),
+                tools: BTreeSet::new(),
+            })
+            .collect();
+        ConversationGraph::build(&turns)
+    }
+
+    fn topic_starts(labels: &[&str]) -> Vec<u32> {
+        let observations: Vec<Observation> = labels
+            .iter()
+            .enumerate()
+            .map(|(turn, label)| topic_observation(turn as u32, label))
+            .collect();
+        let segmenter =
+            Segmenter::replay(SegmentPolicy::default(), 0, &observations).expect("replay");
+        let mut starts: Vec<u32> = segmenter
+            .segments()
+            .iter()
+            .filter(|s| s.dimension == Dimension::Topic)
+            .map(|s| s.start_turn)
+            .collect();
+        starts.sort_unstable();
+        starts
+    }
+
+    #[test]
+    fn the_graph_merges_a_theme_that_returns_where_the_linear_segmenter_cannot() {
+        // 0-3 "routing", 4-6 "reviewer", 7-9 "routing": the topic RETURNS.
+        let labels = [
+            "routing", "routing", "routing", "routing", "reviewer", "reviewer", "reviewer",
+            "routing", "routing", "routing",
+        ];
+
+        // The linear, threshold-based segmenter opens three contiguous stretches:
+        // it is a state machine in time and cannot join turn 0 with turn 7.
+        assert_eq!(
+            topic_starts(&labels),
+            vec![0, 4, 7],
+            "the segmenter opens three stretches"
+        );
+
+        // The graph groups by shared label, so the two "routing" stretches merge.
+        let segments = graph_of(&labels).spectral_segments(1e-9);
+        assert_eq!(
+            segments.len(),
+            2,
+            "two themes, not three stretches: {segments:?}"
+        );
+        let home_of_zero = segments
+            .iter()
+            .find(|c| c.contains(&0))
+            .expect("turn 0 has a community");
+        assert!(
+            home_of_zero.contains(&7),
+            "the returned theme rejoins turn 0's community"
+        );
+        assert!(!home_of_zero.contains(&4), "the other theme stays apart");
+    }
+
+    #[test]
+    fn both_agree_when_a_theme_never_returns() {
+        // 0-3 "routing", 4-7 "reviewer": a single linear drift — no disagreement.
+        let labels = [
+            "routing", "routing", "routing", "routing", "reviewer", "reviewer", "reviewer",
+            "reviewer",
+        ];
+        assert_eq!(topic_starts(&labels), vec![0, 4]);
+        let segments = graph_of(&labels).spectral_segments(1e-9);
+        assert_eq!(segments.len(), 2, "one drift, two themes: {segments:?}");
+        let home_of_zero = segments.iter().find(|c| c.contains(&0)).expect("turn 0");
+        assert!(!home_of_zero.contains(&4));
+    }
+}
