@@ -1189,6 +1189,22 @@ impl AppState {
             .await?,
         );
         let nr_store = Arc::new(neural_routing_runtime::Neo4jTrajectoryStore::new(nr_graph));
+
+        // The NN router answers with `CALL db.index.vector.queryNodes(
+        // 'trajectory_query_embedding_idx', …)`; a Neo4j VECTOR index is not
+        // implicit. This is the only place it is created: without it the call
+        // throws `There is no such vector schema index`, `NNRouter::route_internal`
+        // returns early, and the dashboard reads `hits: 0` while `total_queries`
+        // climbs — the state measured on 17/10/2026 (290 trajectories, no index).
+        // `IF NOT EXISTS` makes it idempotent and back-fills what is already stored.
+        if let Err(e) = nr_store.ensure_indexes().await {
+            tracing::warn!(
+                error = %e,
+                "neural-routing vector indexes not ensured — the NN router will miss on \
+                 every query (hits stays 0)"
+            );
+        }
+
         let trajectory_store: Arc<dyn neural_routing_runtime::TrajectoryStore> = nr_store.clone();
         let trajectory_store_api: Arc<dyn neural_routing_runtime::TrajectoryStore> =
             nr_store.clone();
