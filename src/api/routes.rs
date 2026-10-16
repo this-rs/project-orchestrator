@@ -2073,6 +2073,13 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/providers/{id}/status",
             get(provider_handlers::provider_status),
         )
+        // RL7: the state of the instance's configured rate limits (usage,
+        // remaining, resets_at, status). Never a secret: only a credential
+        // REFERENCE is ever echoed.
+        .route(
+            "/api/chat/providers/{id}/limits",
+            get(provider_handlers::provider_limits),
+        )
         .route(
             "/api/chat/providers/{id}/models",
             get(provider_handlers::provider_models),

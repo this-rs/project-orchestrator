@@ -1,0 +1,41 @@
+{
+  "_contract_version": 1,
+  "_description": "The `rate_limit` list of one provider instance, exactly as the settings document stores it and as `GET /chat/providers/{id}` returns it. Each entry is one limit: `kind` (requests | tokens | budget_usd), `window` (a unit name, or {\"rolling\": seconds}), `calendar` (the time zone of a day/week/month window: \"utc\" or an IANA name; null otherwise), `max` (strictly positive, a whole number for requests and tokens) and `scope` (\"instance\", {\"credential\": \"<credential_ref>\"} or {\"model\": \"<id>\"}). A credential is named by its REFERENCE (vault:<name>, env:<VAR>) and never by a value. The list is optional: an instance without it behaves exactly as before the field existed.",
+  "limits": [
+    {
+      "kind": "requests",
+      "window": "minute",
+      "calendar": null,
+      "max": 40.0,
+      "scope": "instance"
+    },
+    {
+      "kind": "tokens",
+      "window": "hour",
+      "calendar": null,
+      "max": 200000.0,
+      "scope": "instance"
+    },
+    {
+      "kind": "budget_usd",
+      "window": "day",
+      "calendar": "Europe/Paris",
+      "max": 10.0,
+      "scope": "instance"
+    },
+    {
+      "kind": "requests",
+      "window": { "rolling": 60 },
+      "calendar": null,
+      "max": 20.0,
+      "scope": { "credential": "vault:nvidia-nim" }
+    },
+    {
+      "kind": "budget_usd",
+      "window": "month",
+      "calendar": "utc",
+      "max": 50.0,
+      "scope": { "model": "deepseek-reasoner" }
+    }
+  ]
+}

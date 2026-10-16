@@ -1,0 +1,80 @@
+{
+  "_contract_version": 1,
+  "_description": "The answer of `GET /chat/providers/{id}/limits` for the very limits of `limits.json`: one entry per configured limit, with the current state of that limit. `credential` is the credential REFERENCE the limit is scoped to (never a value). No counter exists yet (RL2/RL4 are not built), so `used`, `remaining`, `resets_at`, `since` and `next_retry_at` are null and every status is `unknown`: this file settles the SHAPE that RL2/RL4 will fill, and the interface is built against it. `status` is one of ok | limited | overloaded | unknown.",
+  "report": {
+    "provider_id": "deepseek",
+    "status": "unknown",
+    "limits": [
+      {
+        "kind": "requests",
+        "window": "minute",
+        "calendar": null,
+        "max": 40.0,
+        "scope": "instance",
+        "credential": null,
+        "used": null,
+        "remaining": null,
+        "resets_at": null,
+        "status": "unknown",
+        "since": null,
+        "next_retry_at": null
+      },
+      {
+        "kind": "tokens",
+        "window": "hour",
+        "calendar": null,
+        "max": 200000.0,
+        "scope": "instance",
+        "credential": null,
+        "used": null,
+        "remaining": null,
+        "resets_at": null,
+        "status": "unknown",
+        "since": null,
+        "next_retry_at": null
+      },
+      {
+        "kind": "budget_usd",
+        "window": "day",
+        "calendar": "Europe/Paris",
+        "max": 10.0,
+        "scope": "instance",
+        "credential": null,
+        "used": null,
+        "remaining": null,
+        "resets_at": null,
+        "status": "unknown",
+        "since": null,
+        "next_retry_at": null
+      },
+      {
+        "kind": "requests",
+        "window": { "rolling": 60 },
+        "calendar": null,
+        "max": 20.0,
+        "scope": { "credential": "vault:nvidia-nim" },
+        "credential": "vault:nvidia-nim",
+        "used": null,
+        "remaining": null,
+        "resets_at": null,
+        "status": "unknown",
+        "since": null,
+        "next_retry_at": null
+      },
+      {
+        "kind": "budget_usd",
+        "window": "month",
+        "calendar": "utc",
+        "max": 50.0,
+        "scope": { "model": "deepseek-reasoner" },
+        "credential": null,
+        "used": null,
+        "remaining": null,
+        "resets_at": null,
+        "status": "unknown",
+        "since": null,
+        "next_retry_at": null
+      }
+    ]
+  }
+}

@@ -1696,6 +1696,7 @@ mod tests {
             host_key: None,
             remote_cwd: None,
             allow_trust: false,
+            rate_limit: Vec::new(),
         };
         let graph = crate::neo4j::mock::MockGraphStore::new();
         graph
