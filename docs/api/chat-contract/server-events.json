@@ -1249,6 +1249,40 @@
         }
       }
     },
+    "team_message": {
+      "examples": {
+        "full": {
+          "content": "task complete — ready for review",
+          "from_name": "agent-alpha",
+          "from_session_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+          "type": "team_message"
+        },
+        "minimal": {
+          "content": "task complete — ready for review",
+          "from_name": "agent-alpha",
+          "from_session_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+          "type": "team_message"
+        }
+      },
+      "fields": {
+        "content": {
+          "required": true,
+          "type": "string"
+        },
+        "from_name": {
+          "required": true,
+          "type": "string"
+        },
+        "from_session_id": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
     "thinking": {
       "examples": {
         "full": {
