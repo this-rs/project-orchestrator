@@ -5,7 +5,8 @@
 //! of the Claude `InteractiveClient`. This module owns what that needs and
 //! nothing Claude specific: the live sessions, the turn driver that turns the
 //! provider's event stream into `ChatEvent`s (through [`EventMapper`]), the
-//! out-of-turn pump, persistence of the events for replay, and the answers to
+//! out-of-turn pump (spawned via [`super::oob_listener::pump_out_of_band`]),
+//! persistence of the events for replay, and the answers to
 //! permission requests, interrupts, model and mode changes.
 //!
 //! The legacy path stays as it was; the manager decides which one serves a
@@ -42,9 +43,6 @@ use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::GraphStore;
 
 const BROADCAST_BUFFER: usize = 1024;
-/// How long the out-of-turn pump waits for the rest of a provider message
-/// before it flushes what it has.
-const OOB_FLUSH: Duration = Duration::from_millis(50);
 
 /// Replaces every secret value delivered by the vault inside an event of the
 /// provider, before anything stores or broadcasts it (same rule as the Claude
@@ -2571,7 +2569,7 @@ impl AgentRuntime {
         });
         if let Some(oob) = session.out_of_band() {
             let pump = Arc::clone(&handle);
-            tokio::spawn(async move { pump_out_of_band(pump, oob).await });
+            tokio::spawn(async move { super::oob_listener::pump_out_of_band(pump, oob).await });
         }
         let replaced = self
             .sessions
@@ -2630,47 +2628,17 @@ impl AgentRuntime {
     }
 }
 
-/// Reads the out-of-turn stream, regroups what belongs to one provider
-/// message and emits it: the batch is flushed when the provider pauses, when
-/// it grows large, and when the stream ends.
-async fn pump_out_of_band(
-    handle: Arc<AgentSessionHandle>,
-    mut stream: nexus_claude::agent::EventStream,
-) {
-    let mut batch = Vec::new();
-    loop {
-        let item = if batch.is_empty() {
-            Some(stream.next().await)
-        } else {
-            tokio::time::timeout(OOB_FLUSH, stream.next()).await.ok()
-        };
-        match item {
-            Some(Some(event)) => {
-                batch.push(event);
-                if batch.len() >= 64 {
-                    flush(&handle, &mut batch).await;
-                }
-            }
-            Some(None) => {
-                flush(&handle, &mut batch).await;
-                break;
-            }
-            None => flush(&handle, &mut batch).await,
-        }
-    }
-}
-
-async fn flush(handle: &AgentSessionHandle, batch: &mut Vec<nexus_claude::agent::AgentEvent>) {
-    if batch.is_empty() {
+/// Maps a batch of out-of-turn events to chat events and emits them: masked,
+/// mirrored (a sub-agent still running in the background is seen first, in the
+/// form a turn shows it), persisted and broadcast. Then the resume token is
+/// synced — an out-of-turn `init` (the CLI repeats it) may carry a new session
+/// id. The out-of-turn pump (`super::oob_listener::pump_out_of_band`) calls
+/// this once per batch, so each event is emitted exactly once.
+pub(crate) async fn emit_out_of_band(handle: &AgentSessionHandle, events: Vec<AgentEvent>) {
+    if events.is_empty() {
         return;
     }
-    let events: Vec<AgentEvent> = std::mem::take(batch)
-        .into_iter()
-        .map(mask_agent_event)
-        .collect();
-    // Seen first by whoever follows a sub-agent still running in the background (its
-    // mirror): the batch as emitted, a notification of its end among it, comes after it, as
-    // the provider sent them.
+    let events: Vec<AgentEvent> = events.into_iter().map(mask_agent_event).collect();
     if let Some(services) = &handle.services {
         services.observe_out_of_turn(&handle.session_id, &events);
     }
@@ -2681,7 +2649,6 @@ async fn flush(handle: &AgentSessionHandle, batch: &mut Vec<nexus_claude::agent:
     for event in chat_events {
         handle.emit(event).await;
     }
-    // An out-of-turn `init` (the CLI repeats it) may carry a new session id.
     handle.sync_resume_token().await;
 }
 

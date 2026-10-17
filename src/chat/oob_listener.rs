@@ -66,6 +66,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use super::agent_runtime::AgentSessionHandle;
 use super::manager::{ActiveSession, ChatManager};
 use super::types::{ChatEvent, PendingMessage};
 use crate::meilisearch::SearchStore;
@@ -846,6 +847,47 @@ async fn check_and_record_trigger_cap(
 /// Minimum interval between two `last_activity` refreshes from background
 /// traffic — far below the idle timeout (minutes), far above message rate.
 const ACTIVITY_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long the out-of-turn pump of the agent engine waits for the rest of a
+/// provider message before it flushes what it has.
+const OOB_FLUSH: Duration = Duration::from_millis(50);
+
+/// The out-of-turn pump of the agent engine: reads
+/// `AgentSession::out_of_band()` — the events the provider emits between turns
+/// (out-of-turn permissions, background tasks, background output) — regroups
+/// what belongs to one provider message and emits it as `ChatEvent`s through
+/// [`super::agent_runtime::emit_out_of_band`]. The batch is flushed when the
+/// provider pauses, when it grows large, and when the stream ends, so each
+/// event is emitted exactly once: nothing is lost, nothing is duplicated.
+pub(crate) async fn pump_out_of_band(
+    handle: Arc<AgentSessionHandle>,
+    mut stream: nexus_claude::agent::EventStream,
+) {
+    let mut batch: Vec<nexus_claude::agent::AgentEvent> = Vec::new();
+    loop {
+        let item = if batch.is_empty() {
+            Some(stream.next().await)
+        } else {
+            tokio::time::timeout(OOB_FLUSH, stream.next()).await.ok()
+        };
+        match item {
+            Some(Some(event)) => {
+                batch.push(event);
+                if batch.len() >= 64 {
+                    super::agent_runtime::emit_out_of_band(&handle, std::mem::take(&mut batch))
+                        .await;
+                }
+            }
+            Some(None) => {
+                super::agent_runtime::emit_out_of_band(&handle, std::mem::take(&mut batch)).await;
+                break;
+            }
+            None => {
+                super::agent_runtime::emit_out_of_band(&handle, std::mem::take(&mut batch)).await;
+            }
+        }
+    }
+}
 
 /// Tests only: a delay the OOB listener of a session takes before handling each
 /// message, to play a listener that lags behind the turn (a loaded machine).
@@ -1782,5 +1824,176 @@ mod tests {
         let other = crate::neo4j::mock::MockGraphStore::new();
         emit_subprocess_death("not-a-uuid", None, &events_tx, &next_seq, &other).await;
         assert_eq!(next_seq.load(Ordering::SeqCst), 8);
+    }
+}
+
+/// The agent engine's out-of-turn pump (`pump_out_of_band`): the events the
+/// provider emits between turns (out-of-turn permissions, background tasks,
+/// background output) become `ChatEvent`s, drained exactly once.
+#[cfg(test)]
+mod agent_path_tests {
+    use super::super::agent_runtime::fake::FakeProvider;
+    use super::super::agent_runtime::{AgentRuntime, AgentSessionHandle};
+    use super::super::types::ChatEvent;
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::GraphStore;
+    use nexus_claude::agent::{
+        AgentEvent, BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::broadcast;
+
+    /// A live agent session on the fake provider: `adopt` takes the provider's
+    /// `out_of_band()` stream and spawns the pump (`pump_out_of_band`).
+    async fn rig() -> (FakeProvider, Arc<AgentSessionHandle>) {
+        let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = runtime
+            .adopt(
+                "not-a-uuid",
+                "claude-code",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        (provider, handle)
+    }
+
+    /// The first event matching `pred`, within a hard deadline.
+    async fn next_matching(
+        rx: &mut broadcast::Receiver<ChatEvent>,
+        pred: impl Fn(&ChatEvent) -> bool,
+    ) -> ChatEvent {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(event)) if pred(&event) => return event,
+                Ok(Ok(_)) => continue,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    panic!("broadcast closed before the event arrived")
+                }
+                Err(_) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for an event"
+                ),
+            }
+        }
+    }
+
+    /// A provider background task WITHOUT a pid (what the agent engine holds:
+    /// the pid, when there is one, belongs to the Claude Code adapter).
+    fn bg_task(id: &str, tool_call: Option<&str>) -> BackgroundTask {
+        BackgroundTask {
+            id: id.into(),
+            kind: BackgroundTaskKind::Shell,
+            description: "sleep 30".into(),
+            status: BackgroundTaskStatus::Running,
+            started_at_ms: Some(1_700_000_000_000),
+            tool_call_id: tool_call.map(str::to_string),
+            parent: None,
+            pid: None,
+        }
+    }
+
+    /// Criterion 1 + 3: an out-of-band event scripted by the fake provider is
+    /// received by the pump and emitted as a `ChatEvent`; a typed
+    /// `BackgroundTasks` snapshot becomes an `ActiveTasksUpdate` WITHOUT any pid.
+    #[tokio::test]
+    async fn an_out_of_band_background_tasks_snapshot_is_an_active_tasks_update_without_pid() {
+        let (provider, handle) = rig().await;
+        let mut rx = handle.events_tx.subscribe();
+        provider.state.push_oob(AgentEvent::BackgroundTasks {
+            tasks: vec![bg_task("nt-1", Some("c7"))],
+        });
+        let event = next_matching(&mut rx, |e| {
+            matches!(e, ChatEvent::ActiveTasksUpdate { .. })
+        })
+        .await;
+        let ChatEvent::ActiveTasksUpdate { tasks } = event else {
+            unreachable!()
+        };
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "c7", "keyed by its tool_use");
+        assert_eq!(tasks[0].pid, None, "no PID on the agent path");
+    }
+
+    /// Criterion 1: an out-of-band `Text` becomes a `BackgroundOutput`.
+    #[tokio::test]
+    async fn an_out_of_band_text_is_emitted_as_background_output() {
+        let (provider, handle) = rig().await;
+        let mut rx = handle.events_tx.subscribe();
+        provider.state.push_oob(AgentEvent::Text {
+            text: "a background line".into(),
+            seq: Some(1),
+            parent: None,
+        });
+        let event =
+            next_matching(&mut rx, |e| matches!(e, ChatEvent::BackgroundOutput { .. })).await;
+        assert!(
+            matches!(
+                event,
+                ChatEvent::BackgroundOutput {
+                    ref source,
+                    ref content,
+                    correlation_id: None,
+                    ..
+                } if source == "assistant" && content == "a background line"
+            ),
+            "{event:?}"
+        );
+    }
+
+    /// Criterion 2: `drain` empties the out-of-band stream at the end — every
+    /// event is emitted exactly once, nothing lost, nothing duplicated.
+    #[tokio::test]
+    async fn the_out_of_band_stream_is_drained_without_loss_or_duplication() {
+        let (provider, handle) = rig().await;
+        let mut rx = handle.events_tx.subscribe();
+        // Three events of three distinct provider messages: each becomes its own
+        // `background_output` group. Pushed synchronously so the pump batches
+        // them, then the stream ends.
+        for (i, seq) in [(1u32, 7u64), (2, 8), (3, 9)] {
+            provider.state.push_oob(AgentEvent::Text {
+                text: format!("line {i}"),
+                seq: Some(seq),
+                parent: None,
+            });
+        }
+        // End the stream: the pump flushes the tail and stops.
+        provider.state.oob_tx.lock().unwrap().take();
+
+        let mut received: Vec<String> = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while received.len() < 3 {
+            match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                Ok(Ok(ChatEvent::BackgroundOutput { content, .. })) => received.push(content),
+                Ok(Ok(_)) => continue,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                Err(_) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out; received {received:?}"
+                ),
+            }
+        }
+        assert_eq!(
+            received,
+            vec!["line 1", "line 2", "line 3"],
+            "each event once, in order"
+        );
+
+        // No duplication: nothing further arrives after a short settle.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        while let Ok(event) = rx.try_recv() {
+            if let ChatEvent::BackgroundOutput { content, .. } = event {
+                panic!("unexpected extra background output: {content}");
+            }
+        }
     }
 }

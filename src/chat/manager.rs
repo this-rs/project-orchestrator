@@ -25644,6 +25644,46 @@ mod tests {
         );
     }
 
+    /// A typed `BackgroundTasks` snapshot scripted by the fake provider (out of
+    /// turn) becomes an `ActiveTasksUpdate` WITHOUT any PID: the agent engine
+    /// tracks no process — the pid, when there is one, belongs to the adapter.
+    #[tokio::test]
+    async fn agent_path_background_tasks_are_typed_and_carry_no_pid() {
+        use nexus_claude::agent::{
+            AgentEvent, BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus,
+        };
+        let (manager, _graph, fake) = agent_manager();
+        let sid = manager
+            .create_session(&agent_request("go"))
+            .await
+            .unwrap()
+            .session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        fake.state.push_oob(AgentEvent::BackgroundTasks {
+            tasks: vec![BackgroundTask {
+                id: "nt-1".into(),
+                kind: BackgroundTaskKind::Shell,
+                description: "tail -F deploy.log".into(),
+                status: BackgroundTaskStatus::Running,
+                started_at_ms: None,
+                tool_call_id: Some("b1".into()),
+                parent: None,
+                pid: None,
+            }],
+        });
+        let event = next_matching(&mut rx, |e| {
+            matches!(e, ChatEvent::ActiveTasksUpdate { .. })
+        })
+        .await;
+        let ChatEvent::ActiveTasksUpdate { tasks } = event else {
+            unreachable!()
+        };
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "b1", "keyed by its tool_use");
+        assert_eq!(tasks[0].pid, None, "the agent engine tracks no PID");
+        manager.close_session(&sid).await.unwrap();
+    }
+
     #[tokio::test]
     async fn claude_code_stays_on_the_legacy_engine_when_the_operator_says_legacy() {
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
