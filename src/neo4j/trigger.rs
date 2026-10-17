@@ -252,6 +252,39 @@ impl Neo4jClient {
         }
     }
 
+    /// Disable every schedule or event trigger that has no author (written
+    /// before authors were recorded: it would otherwise start its run as
+    /// nobody). Run at every startup, idempotent; returns how many it disabled.
+    ///
+    /// The first `SET` takes the write lock on each candidate BEFORE the
+    /// decision is made. Under read committed, Neo4j evaluates a `WHERE`, then
+    /// waits for the node's lock, then applies the `SET` without reading the
+    /// node again: a trigger whose author is being written at that very
+    /// moment would end up with an author AND disabled as `no_author` (the race
+    /// that made `test_trigger_without_author_is_disabled_at_startup` flaky in
+    /// CI). Re-reading after the lock sees the committed author and leaves it.
+    pub async fn disable_authorless_triggers_impl(&self) -> Result<u64> {
+        let q = query(
+            r#"
+            MATCH (t:Trigger)
+            WHERE t.trigger_type IN ['schedule', 'event']
+              AND coalesce(t.author, '') = '' AND t.enabled = true
+            SET t.migration_lock = true
+            WITH t, (coalesce(t.author, '') = '' AND t.enabled = true) AS still_authorless
+            FOREACH (_ IN CASE WHEN still_authorless THEN [1] ELSE [] END |
+                SET t.enabled = false, t.disabled_reason = 'no_author')
+            REMOVE t.migration_lock
+            RETURN count(CASE WHEN still_authorless THEN 1 END) AS disabled
+            "#,
+        );
+        let mut result = self.graph.execute(q).await?;
+        let disabled: i64 = match result.next().await? {
+            Some(row) => row.get("disabled")?,
+            None => 0,
+        };
+        Ok(disabled.max(0) as u64)
+    }
+
     /// Reserve the signal `key` of a trigger: one `TriggerSignal` per
     /// `(trigger_id, key)` (unique constraint `trigger_signal_key`), and the
     /// cooldown read and `last_fired` written in the same statement.
