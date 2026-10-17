@@ -1,6 +1,6 @@
 %% name: po-provider-settings
 %% covers: backend:src/api/provider_handlers.rs backend:src/api/network_tools_handlers.rs
-%% verified: c165f221
+%% verified: 459cab6f
 %% ---
 %% PROUVE : les routes de réglages des providers (A15, A19, A24, A25, A28, A32, A37) : instances, test de
 %%   connexion, consentement, rôles, alias, politique de modèle, journal d'envoi. La logique pure est dans
@@ -67,7 +67,7 @@ flowchart TD
     end
 
     subgraph nettools["Outils réseau d'une session native (P6) — network_tools_handlers.rs"]
-        NTORIG["✅ PUT/DELETE /api/projects/{slug}/network-tools/origins : tool_origin:&lt;origine&gt; sous project:&lt;slug&gt;, lu par GraphConsents (B40) ; une URL est réduite à son origine (origin_of) ; http(s) sans identifiants, sinon 400 invalid_tool_origin ; projet inconnu 404 project_not_found<br/>test : network_origin_consent_is_stored_where_the_gate_reads_it_and_revoked, network_origin_refuses_what_is_not_an_http_origin_with_a_typed_400_and_stores_nothing, network_tools_of_an_unknown_project_are_a_404"]
+        NTORIG["✅ PUT/DELETE /api/projects/{slug}/network-tools/origins : tool_origin:&lt;origine&gt; sous project:&lt;slug&gt;, lu par GraphConsents (B40) ; une URL est réduite à son origine (origin_of) ; http(s) sans identifiants, sinon 400 invalid_tool_origin ; projet inconnu 404 project_not_found ; N23b : l écriture est nexus_tools::record_origin_consent, l UNIQUE écrivain du document — la route ET la réponse always donnée dans le chat (agent_runtime::keep_origin_consents) passent par lui, un seul magasin, une seule clé ; la route reste réservée à un humain (require_human), la réponse always nomme la personne qui a répondu (propriétaire de la session)<br/>test : network_origin_consent_is_stored_where_the_gate_reads_it_and_revoked, network_origin_refuses_what_is_not_an_http_origin_with_a_typed_400_and_stores_nothing, network_tools_of_an_unknown_project_are_a_404"]
         NTBROW["✅ PUT /api/projects/{slug}/network-tools/browser {allowed} : document browser ; attaché si l'exécutable est trouvé (obscura sur le PATH, ou dsh-obscura-nav avec chat.obscura_browser: true)<br/>test : network_browser_authorisation_is_stored_read_by_the_gate_and_withdrawn"]
         NTSE["✅ GET/POST /api/chat/search-engines, DELETE /{id} : search_provider:&lt;id&gt; (global), clé par référence vault: seulement (secret_value_refused) ; grant Provider du tool &lt;id&gt; par POST /api/vault/grants nommant exactement la référence ; supprimer révoque ses grants<br/>test : search_engine_is_declared_by_vault_reference_listed_and_removed, search_engine_refuses_a_raw_key_and_invalid_drafts_with_typed_codes, search_engine_key_is_granted_under_tool_id_only_by_its_reference_and_revoked_with_it"]
         NTOBS["✅ moteur obscura (sans clé) : credential_ref none, PAS de base_url ni de chemin dans le corps (l'exécutable est la configuration du serveur : chat.obscura_path / OBSCURA_BIN, sinon PATH) ; origine consentie = https://html.duckduckgo.com ; MOTEUR INTÉGRÉ : si le nexus-tools du serveur embarque Obscura et qu'aucun moteur obscura n'est déclaré, la liste ajoute obscura-builtin (builtin: true, non stocké, non supprimable)<br/>test : an_obscura_engine_is_declared_keyless_and_gives_websearch_once_duckduckgo_is_consented, search_engine_refuses_a_raw_key_and_invalid_drafts_with_typed_codes"]

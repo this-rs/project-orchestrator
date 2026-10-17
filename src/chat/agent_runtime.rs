@@ -1880,11 +1880,64 @@ impl AgentSessionHandle {
             .unwrap_or_else(|p| p.into_inner())
             .get(request_id)
             .cloned();
+        // Is this ask about a DESTINATION (N23b)? The gate of the session
+        // (`nexus_tools::ToolAccessHooks`) raised a `HookVerdict::RequireConsent` about the page
+        // this call would reach, and names the subject with the very function read here: the
+        // answer is then about an ORIGIN, and its durable place is the project's network-tools
+        // consent — the same document the settings route writes — never a lasting rule about a
+        // tool call, which the gate does not read.
+        let destinations: Vec<String> = asked
+            .as_ref()
+            .map(|call| {
+                super::provider::nexus_tools::destinations_of(
+                    &call.tool,
+                    call.canonical.as_deref(),
+                    &call.input,
+                )
+            })
+            .unwrap_or_default();
+        let destination = asked.as_ref().and_then(|call| {
+            super::provider::nexus_tools::consent_subject(
+                &call.tool,
+                call.canonical.as_deref(),
+                &call.input,
+            )
+        });
         // `always` kept as a lasting rule (`false`: as a session grant, the shell having
         // possibly left the project's root; review of #714, A).
         let mut for_good = false;
         let grant = match (allow, scope) {
             (false, _) | (true, PermissionAnswerScope::Once) => None,
+            // An origin, for this session: the harness keeps `tool\u{0}origin` itself when it is
+            // answered `session` (nexus `providers::native::session::answer_permission`), and its
+            // matching is exactly the subject the person was shown. No grant of this backend: an
+            // exact-call grant would cover one URL of the origin, not the origin.
+            (true, PermissionAnswerScope::Session) if destination.is_some() => {
+                if !self
+                    .offered_capabilities()
+                    .permission_scopes
+                    .contains(&PermissionScope::Session)
+                {
+                    return Err(PermissionDeliveryError::ScopeUnsupported(scope));
+                }
+                None
+            }
+            // An origin, for good: the project's consent, by the person who answered, in the one
+            // store `PUT /api/projects/{slug}/network-tools/origins` writes. Written BEFORE the
+            // provider is answered, so an `always` that could not be kept is never reported as
+            // kept.
+            (true, PermissionAnswerScope::Always) if destination.is_some() => {
+                if !self
+                    .offered_capabilities()
+                    .permission_scopes
+                    .contains(&PermissionScope::Always)
+                {
+                    return Err(PermissionDeliveryError::ScopeUnsupported(scope));
+                }
+                self.keep_origin_consents(&destinations).await?;
+                for_good = true;
+                None
+            }
             (true, PermissionAnswerScope::Session) => {
                 if !self
                     .offered_capabilities()
@@ -1921,10 +1974,20 @@ impl AgentSessionHandle {
                 Some(grant)
             }
         };
-        let decision = if allow {
-            PermissionDecision::allow_once()
-        } else {
+        let decision = if !allow {
             PermissionDecision::deny()
+        } else if destination.is_some() && scope == PermissionAnswerScope::Session {
+            // `session` on a destination is remembered by the harness against the SUBJECT (N23b):
+            // answering `once` would make the answer cover this call only, and the next page of
+            // the same origin would be asked again.
+            PermissionDecision::Allow {
+                scope: PermissionScope::Session,
+                updated_input: None,
+            }
+        } else {
+            // Everything else, an `always` about an origin included: the durable part is now in
+            // the project's consent document, and this session approves no more than the call.
+            PermissionDecision::allow_once()
         };
         // On the tool clock BEFORE the provider has it: a fast tool's result cannot
         // overtake it.
@@ -2014,9 +2077,63 @@ impl AgentSessionHandle {
             scope: kept.lasting(allow),
             rule: grant
                 .as_ref()
-                .map(super::session_grants::SessionGrant::describe),
+                .map(super::session_grants::SessionGrant::describe)
+                // An answer about a destination covers an ORIGIN, not a call (N23b): the client
+                // says so, and never reads it as the identical call (P11b).
+                .or_else(|| {
+                    destination
+                        .as_ref()
+                        .map(|subject| format!("origin {subject}"))
+                }),
         })
         .await;
+        Ok(())
+    }
+
+    /// Records the person's `always` about a DESTINATION (N23b) where the settings route records
+    /// it: the project's network-tools consent, one document per origin, written by
+    /// [`nexus_tools::record_origin_consent`](super::provider::nexus_tools::record_origin_consent).
+    /// Same store, same key, same writer as `PUT /api/projects/{slug}/network-tools/origins` —
+    /// there is no second store, so a consent given in the chat is listed, revocable and honoured
+    /// exactly like one given in Settings.
+    ///
+    /// Every form the gate judges is written ([`destinations_of`]), so a consent just given does
+    /// not ask again for the `http://` twin of the `https://` endpoint it was about.
+    ///
+    /// Typed `ScopeUnsupported` when the session keeps no lasting rule — no owner, no project, or
+    /// a session that does not run in its project's root: there is nobody whose `always` this is,
+    /// and no name to write next to the consent.
+    ///
+    /// [`destinations_of`]: super::provider::nexus_tools::destinations_of
+    async fn keep_origin_consents(
+        &self,
+        destinations: &[String],
+    ) -> std::result::Result<(), PermissionDeliveryError> {
+        let place = {
+            let grants = self
+                .session_grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            grants
+                .keeps_lasting(self.asker)
+                .then(|| grants.lasting_scope())
+                .flatten()
+        };
+        let Some(place) = place else {
+            return Err(PermissionDeliveryError::ScopeUnsupported(
+                PermissionAnswerScope::Always,
+            ));
+        };
+        for origin in destinations {
+            super::provider::nexus_tools::record_origin_consent(
+                self.graph.as_ref(),
+                &place.project,
+                origin,
+                &place.owner,
+            )
+            .await
+            .map_err(|e| PermissionDeliveryError::Failed(anyhow::Error::new(e)))?;
+        }
         Ok(())
     }
 
@@ -3519,6 +3636,210 @@ mod adopt_tests {
             }
         }
         assert!(decided_by_backend, "permission_decision with its rule");
+    }
+
+    /// The lasting scope of a session of `proj`, owned by `me@example.com`: the shape in which
+    /// this backend's `always` is offered at all.
+    fn lasting_scope_of(root: &std::path::Path) -> super::super::lasting_rules::LastingScope {
+        let store = super::super::lasting_rules::LastingRuleStore::new(root.join("rules"));
+        std::fs::create_dir_all(store.root()).unwrap();
+        super::super::lasting_rules::LastingScope::of_session(
+            Some(&store),
+            Some("me@example.com"),
+            Some("proj"),
+            Some(root),
+            root,
+        )
+        .expect("the session keeps a lasting rule")
+    }
+
+    /// The permission request the harness raises about a DESTINATION (N23b): the tool call names
+    /// the page it would reach.
+    fn fetch_request(id: &str, url: &str) -> ChatEvent {
+        ChatEvent::PermissionRequest {
+            id: id.to_string(),
+            tool: "mcp__nexus__WebFetch".into(),
+            input: serde_json::json!({ "url": url }),
+            parent_tool_use_id: None,
+            category: Some("web".into()),
+            canonical: Some("WebFetch".into()),
+            tool_use_id: None,
+            always: None,
+        }
+    }
+
+    fn consent_key(origin: &str) -> (String, String) {
+        (
+            super::super::provider::settings::project_scope("proj"),
+            format!(
+                "{}{origin}",
+                super::super::provider::nexus_tools::TOOL_ORIGIN_PREFIX
+            ),
+        )
+    }
+
+    /// N23b: an `always` answer to a question about a DESTINATION records the project's consent,
+    /// in the very store `PUT /api/projects/{slug}/network-tools/origins` writes — never a lasting
+    /// rule about a tool call, which the gate of the next session would not read (one store of
+    /// truth, and the same writer).
+    #[tokio::test]
+    async fn an_always_answer_to_an_origin_question_writes_the_projects_consent() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(Arc::clone(&graph));
+        let provider = FakeProvider::new();
+        provider.caps.lock().unwrap().permission_scopes = vec![
+            PermissionScope::Once,
+            PermissionScope::Session,
+            PermissionScope::Always,
+        ];
+        let root = tempfile::tempdir().unwrap();
+        let handle = runtime
+            .adopt_declaring(
+                "n23b-always",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+                Vec::new(),
+                super::super::session_grants::SessionGrants::declaring(Vec::new())
+                    .with_lasting(Some(lasting_scope_of(root.path()))),
+            )
+            .await;
+        handle.emit(fetch_request("p1", "https://docs.rs/x")).await;
+        handle
+            .answer_permission_scoped("p1", true, PermissionAnswerScope::Always)
+            .await
+            .expect("the answer is delivered");
+        // THE STORE, not a mock of it: the document the settings route reads back.
+        let (scope, key) = consent_key("https://docs.rs");
+        let stored = graph
+            .get_llm_setting(&scope, &key)
+            .await
+            .unwrap()
+            .expect("the project's consent to the origin");
+        let consent: super::super::provider::nexus_tools::ToolOriginConsent =
+            serde_json::from_str(&stored).unwrap();
+        assert_eq!(consent.origin, "https://docs.rs");
+        assert_eq!(
+            consent.consented_by, "me@example.com",
+            "the person who answered, never the model"
+        );
+        // The provider is answered `once`: the durable part is the project's, not this session's.
+        let answers = provider.state.permission_answers.lock().unwrap();
+        assert!(
+            matches!(
+                answers.last(),
+                Some((
+                    _,
+                    PermissionDecision::Allow {
+                        scope: PermissionScope::Once,
+                        ..
+                    }
+                ))
+            ),
+            "the session approves the call only: {:?}",
+            answers.last()
+        );
+    }
+
+    /// N23b: a `session` answer to a question about a DESTINATION is kept by the harness against
+    /// the SUBJECT (`tool\u{0}origin`, nexus `providers::native::session`), so approving one
+    /// origin says nothing about the next; and it writes NOTHING durable — the project's store
+    /// stays empty, which is what makes `always` the only act that grants an origin for good.
+    #[tokio::test]
+    async fn a_session_answer_to_an_origin_question_is_per_origin_and_writes_no_consent() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(Arc::clone(&graph));
+        let provider = FakeProvider::new();
+        provider.caps.lock().unwrap().permission_scopes =
+            vec![PermissionScope::Once, PermissionScope::Session];
+        let root = tempfile::tempdir().unwrap();
+        let handle = runtime
+            .adopt_declaring(
+                "n23b-session",
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+                Vec::new(),
+                super::super::session_grants::SessionGrants::declaring(Vec::new())
+                    .with_lasting(Some(lasting_scope_of(root.path()))),
+            )
+            .await;
+        let mut rx = handle.events_tx.subscribe();
+        handle.emit(fetch_request("p1", "https://docs.rs/x")).await;
+        handle
+            .answer_permission_scoped("p1", true, PermissionAnswerScope::Session)
+            .await
+            .expect("the answer is delivered");
+        // The harness is answered `session`, and its key is the tool AND the subject: a later
+        // request about ANOTHER origin is a different key, so it is asked again (nexus's own
+        // tests pin that rule; this asserts the backend does not answer `once` and lose it).
+        let answered = {
+            let answers = provider.state.permission_answers.lock().unwrap();
+            answers.last().cloned()
+        };
+        assert!(
+            matches!(
+                answered,
+                Some((
+                    _,
+                    PermissionDecision::Allow {
+                        scope: PermissionScope::Session,
+                        ..
+                    }
+                ))
+            ),
+            "a destination is remembered against its subject, not this call only: {answered:?}"
+        );
+        // This backend keeps NO grant of its own for it: a grant would be a second memory of the
+        // same approval, matching the identical CALL (`WebFetch {url}`) where the person's answer
+        // covers an ORIGIN — and the client is told what it covers (P11b says a `rule` is a call).
+        assert!(
+            handle
+                .session_grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .covering(&super::super::session_grants::AskedCall {
+                    asker: super::super::session_grants::Asker::Native,
+                    tool: "mcp__nexus__WebFetch".into(),
+                    canonical: Some("WebFetch".into()),
+                    input: serde_json::json!({ "url": "https://docs.rs/x" }),
+                })
+                .is_none(),
+            "the origin is the harness's memory, not a grant of this backend"
+        );
+        let mut said = None;
+        while let Ok(event) = rx.try_recv() {
+            if let ChatEvent::PermissionDecision {
+                id,
+                rule,
+                scope,
+                allow: true,
+            } = &event
+            {
+                if id == "p1" {
+                    said = Some((rule.clone(), scope.map(|s| s.as_str())));
+                }
+            }
+        }
+        assert_eq!(
+            said,
+            Some((Some("origin https://docs.rs".to_string()), Some("session"))),
+            "the client reads an ORIGIN, not a call"
+        );
+        // Nothing durable for either origin.
+        for origin in ["https://docs.rs", "https://evil.example"] {
+            let (scope, key) = consent_key(origin);
+            assert!(
+                graph.get_llm_setting(&scope, &key).await.unwrap().is_none(),
+                "{origin} must not be consented to by a `session` answer"
+            );
+        }
     }
 
     /// Follow-up review of #726, point 1: the request carrying a `session` answer is

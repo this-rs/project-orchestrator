@@ -174,6 +174,12 @@ pub enum ToolAccessError {
     /// The consent could not be read: refused (never an allow on an ignorance).
     #[error("the project's consents cannot be read")]
     ConsentUnavailable,
+    /// The consent could not be written: the answer `always` is not kept.
+    #[error("the project's consent to {origin} cannot be written")]
+    ConsentNotWritable {
+        /// The origin the consent was about.
+        origin: String,
+    },
     /// The engine's executable is not configured or not found on this server.
     #[error("the executable of search engine {engine} is not installed on this server")]
     EngineNotInstalled {
@@ -194,6 +200,7 @@ impl ToolAccessError {
             Self::CredentialsLocked { .. } => "credentials_locked",
             Self::CredentialRequired { .. } => "tool_credential_required",
             Self::ConsentUnavailable => "tool_consent_unavailable",
+            Self::ConsentNotWritable { .. } => "tool_consent_not_writable",
             Self::EngineNotInstalled { .. } => "tool_engine_not_installed",
         }
     }
@@ -218,6 +225,46 @@ pub struct ToolOriginConsent {
     pub consented_by: String,
     /// RFC 3339 time.
     pub consented_at: String,
+}
+
+/// Records the project's consent to `origin` — the ONE durable place a destination is consented
+/// to, whoever the person answered through (N23b).
+///
+/// This is the very document `PUT /api/projects/{slug}/network-tools/origins` writes, under the
+/// very key [`TOOL_ORIGIN_PREFIX`] + origin, and the only writer of it: the settings route and an
+/// `always` answered in the chat both come here. There is no second store, so a consent given in
+/// the chat is one the route reads back, revokes, and lists — and one a later session's gate finds
+/// through [`ToolConsents::origin_consented`].
+///
+/// `origin` must already be normalised (`scheme://host:port`) and `consented_by` names the PERSON
+/// who answered: the HTTP route takes it from the human-only session it refuses agents on, the
+/// answer path from the session's owner. Never a model, never a tool.
+pub async fn record_origin_consent(
+    graph: &dyn GraphStore,
+    project: &str,
+    origin: &str,
+    consented_by: &str,
+) -> Result<ToolOriginConsent, ToolAccessError> {
+    let consent = ToolOriginConsent {
+        origin: origin.to_owned(),
+        consented_by: consented_by.to_owned(),
+        consented_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let document =
+        serde_json::to_string(&consent).map_err(|_| ToolAccessError::ConsentNotWritable {
+            origin: origin.to_owned(),
+        })?;
+    graph
+        .put_llm_setting(
+            &project_scope(project),
+            &format!("{TOOL_ORIGIN_PREFIX}{origin}"),
+            &document,
+        )
+        .await
+        .map_err(|_| ToolAccessError::ConsentNotWritable {
+            origin: origin.to_owned(),
+        })?;
+    Ok(consent)
 }
 
 /// An operator's authorisation of the browser for a project.
@@ -451,6 +498,48 @@ pub type TrustProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 pub type TrustNotice =
     Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
 
+/// The origins a call names, as the gate judges them (N23b): the page a fetch loads or a browser
+/// opens. The SUBJECT of a consent question, and what an `always` answer records.
+///
+/// Asserted by the harness: computed from the CALL, by this one function, on both sides of the
+/// question (the gate that asks and the answer path that records). Never read from what the
+/// model says about what it wants — a model does not formulate its own request for access.
+///
+/// Empty for a call that names no destination: a search, whose engines come from the server's
+/// configuration, or a call without a usable `url`. Such a refusal stays the flat one it was: a
+/// person asked about it could decide nothing about THIS call.
+///
+/// nexus-tools upgrades `http://` to `https://` before it connects and the gate judges both
+/// forms, so both are returned: a consent that covered only one of them would ask again for the
+/// other the moment it was given.
+pub fn destinations_of(name: &str, canonical: Option<&str>, input: &Value) -> Vec<String> {
+    let names_a_page = canonical == Some("WebFetch")
+        || browser_tool_of(name).is_some_and(|tool| BROWSER_NAVIGATION.contains(&tool));
+    if !names_a_page {
+        return Vec::new();
+    }
+    let Some(url) = input.get("url").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let Some(origin) = origin_of(url) else {
+        return Vec::new();
+    };
+    let secure = reached(&origin);
+    if secure == origin {
+        vec![origin]
+    } else {
+        vec![origin, secure]
+    }
+}
+
+/// The origin a consent question about this call is about: the endpoint nexus-tools really
+/// connects to ([`destinations_of`], `https://`), which is also the subject the harness remembers
+/// a `session` answer against (`tool\u{0}subject`). `None`: the call names no destination.
+pub fn consent_subject(name: &str, canonical: Option<&str>, input: &Value) -> Option<String> {
+    let first = destinations_of(name, canonical, input).into_iter().next()?;
+    Some(reached(&first))
+}
+
 /// Whether Rock'n roll opens the network of a session: the session's access is normal AND a
 /// PERSON put it in trust (and it has not left it). Never the mode alone: the runner, a protocol
 /// executor and a delegated task run in `bypassPermissions` with nobody in front of them, and a
@@ -514,6 +603,15 @@ pub struct ToolAccessHooks {
     /// The directories the session was launched with (cwd, then extra ones): what its file
     /// tools are held to when a session launched `--unscoped` left trust.
     scope_dirs: Option<(PathBuf, Vec<PathBuf>)>,
+    /// Whether a PERSON is in front of this session ([`Self::with_person_in_front`]): the only
+    /// condition under which a destination the project has not consented to becomes a QUESTION
+    /// instead of a refusal (N23b).
+    ///
+    /// `false`, the default, and the truth for every session nobody is in front of — an agent
+    /// token, a runner, `delegate_task`, a protocol executor, a sub-agent: those refuse, exactly
+    /// as before, and no question is even emitted. So a model can never be the one that answers
+    /// its own request for network access.
+    person_in_front: bool,
 }
 
 impl ToolAccessHooks {
@@ -535,6 +633,7 @@ impl ToolAccessHooks {
             notice: None,
             announced: Default::default(),
             scope_dirs: None,
+            person_in_front: false,
         }
     }
 
@@ -545,6 +644,37 @@ impl ToolAccessHooks {
         self.trust = Some(in_trust);
         self.notice = Some(notice);
         self
+    }
+
+    /// States that a PERSON is in front of this session (N23b): a destination the project has not
+    /// consented to becomes a QUESTION, through the harness's own permission channel
+    /// (`HookVerdict::RequireConsent`), instead of a refusal.
+    ///
+    /// The caller decides from what it knows of the session — a signed-in person, no runner, no
+    /// parent session — and never from anything the model says. Without this call the gate refuses
+    /// as it always did, so forgetting it fails closed.
+    #[must_use]
+    pub fn with_person_in_front(mut self, person_in_front: bool) -> Self {
+        self.person_in_front = person_in_front;
+        self
+    }
+
+    /// What the gate asks a person about `refusal`, or the refusal to keep (N23b).
+    ///
+    /// A question only when ALL of these hold: the refusal is a destination without the project's
+    /// consent, the call NAMES that destination ([`destinations_of`]: a search names none), and a
+    /// person is in front of the session. Everything else keeps the flat refusal of before.
+    fn consent_question(&self, refusal: &ToolAccessError, named: &[String]) -> Option<HookVerdict> {
+        let ToolAccessError::OriginNotConsented { origin } = refusal else {
+            return None;
+        };
+        if !self.person_in_front || !named.iter().any(|destination| destination == origin) {
+            return None;
+        }
+        Some(HookVerdict::RequireConsent {
+            subject: reached(origin),
+            reason: refusal.reason(),
+        })
     }
 
     /// What trust makes of a refusal: the origin to let through when the session is in Rock'n roll
@@ -695,6 +825,9 @@ impl SessionHooks for ToolAccessHooks {
         // needs `https://X` too, a search needs every engine of the session): each is checked
         // again with the ones already let through, and each is announced. The loop ends: it adds
         // a new origin at every turn or returns.
+        // The destinations THIS call names, computed once, before any I/O: what a person may be
+        // asked about, and what an `always` answer will record (N23b).
+        let named = destinations_of(&call.name, call.canonical.as_deref(), &call.input);
         let mut let_through = BTreeSet::new();
         loop {
             match check_call_with(
@@ -712,9 +845,18 @@ impl SessionHooks for ToolAccessHooks {
                         self.announce(&origin).await;
                     }
                     _ => {
+                        // N23b: the hook does not decide in a person's place. A destination the
+                        // project has not consented to becomes a QUESTION — the harness asks
+                        // through its `permission_ask` channel and remembers the answer against
+                        // THIS origin. Every other case (no person in front, a refusal that names
+                        // no destination) keeps the flat refusal of before.
+                        if let Some(question) = self.consent_question(&refusal, &named) {
+                            return question;
+                        }
                         tracing::warn!(
                             session_id = %self.session_id,
                             code = refusal.code(),
+                            person_in_front = self.person_in_front,
                             "network tool refused"
                         );
                         return HookVerdict::Deny {
@@ -1705,6 +1847,161 @@ mod tests {
             HookVerdict::AddContext("inner".into())
         );
         crate::auth::agent_tokens::revoke_session("hook-s1");
+    }
+
+    // ---- (0a-bis) N23b: a destination without consent is a QUESTION, when a person is there --
+
+    /// The gate of a person's own session: the shape in which the harness asks.
+    fn person_gate(session: &str, graph: &Arc<MockGraphStore>) -> ToolAccessHooks {
+        crate::auth::agent_tokens::register_tools(session);
+        ToolAccessHooks::new(
+            None,
+            Arc::new(GraphConsents(graph.clone())),
+            session,
+            Some("proj".into()),
+            Vec::new(),
+        )
+        .with_person_in_front(true)
+    }
+
+    /// The gate of a session nobody is in front of (an agent token, a runner, a delegation, a
+    /// protocol executor): `with_person_in_front` is not called, which is the default.
+    fn agent_gate(session: &str, graph: &Arc<MockGraphStore>) -> ToolAccessHooks {
+        crate::auth::agent_tokens::register_tools(session);
+        ToolAccessHooks::new(
+            None,
+            Arc::new(GraphConsents(graph.clone())),
+            session,
+            Some("proj".into()),
+            Vec::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_unknown_origin_is_a_question_for_a_person_and_a_refusal_for_an_agent() {
+        let graph = Arc::new(MockGraphStore::new());
+        // A person in front: the hook does not decide in their place, it names the SUBJECT.
+        let asked = person_gate("n23b-person", &graph)
+            .before_tool(&fetch("https://docs.rs/x"))
+            .await;
+        let HookVerdict::RequireConsent { subject, reason } = asked else {
+            panic!("a consent question was expected, got {asked:?}");
+        };
+        assert_eq!(subject, "https://docs.rs", "scheme+host+port, never a path");
+        assert!(reason.starts_with("tool_origin_not_allowed:"), "{reason}");
+        // Nobody in front: refused exactly as before, and no question is raised at all.
+        let refused = agent_gate("n23b-agent", &graph)
+            .before_tool(&fetch("https://docs.rs/x"))
+            .await;
+        let HookVerdict::Deny { reason } = refused else {
+            panic!("a denial was expected for an agent session, got {refused:?}");
+        };
+        assert!(reason.starts_with("tool_origin_not_allowed:"));
+        crate::auth::agent_tokens::revoke_session("n23b-person");
+        crate::auth::agent_tokens::revoke_session("n23b-agent");
+    }
+
+    #[tokio::test]
+    async fn a_call_that_names_no_destination_stays_a_flat_refusal_even_for_a_person() {
+        let graph = Arc::new(MockGraphStore::new());
+        // A search: its engines are the server's configuration, not a destination of THIS call.
+        let search = call(
+            "mcp__nexus__WebSearch",
+            Some("WebSearch"),
+            json!({"query": "rust"}),
+        );
+        assert!(destinations_of(&search.name, Some("WebSearch"), &search.input).is_empty());
+        let verdict = person_gate("n23b-search", &graph)
+            .before_tool(&search)
+            .await;
+        assert!(
+            matches!(verdict, HookVerdict::Deny { .. }),
+            "nothing to consent to about this call, so no question: {verdict:?}"
+        );
+        crate::auth::agent_tokens::revoke_session("n23b-search");
+    }
+
+    #[tokio::test]
+    async fn the_subject_is_the_endpoint_nexus_tools_reaches() {
+        let graph = Arc::new(MockGraphStore::new());
+        // nexus-tools upgrades `http://` before it connects, and the gate judges BOTH forms: the
+        // question is about the secure one, and both are what an `always` records.
+        assert_eq!(
+            destinations_of(
+                "mcp__nexus__WebFetch",
+                Some("WebFetch"),
+                &json!({"url": "http://docs.rs/x"})
+            ),
+            vec!["http://docs.rs".to_owned(), "https://docs.rs".to_owned()]
+        );
+        let verdict = person_gate("n23b-http", &graph)
+            .before_tool(&fetch("http://docs.rs/x"))
+            .await;
+        let HookVerdict::RequireConsent { subject, .. } = verdict else {
+            panic!("a consent question was expected, got {verdict:?}");
+        };
+        assert_eq!(subject, "https://docs.rs");
+        crate::auth::agent_tokens::revoke_session("n23b-http");
+    }
+
+    #[tokio::test]
+    async fn an_always_answer_records_the_same_document_the_settings_route_writes() {
+        let graph = Arc::new(MockGraphStore::new());
+        let fetch_call = fetch("https://docs.rs/x");
+        // What the answer path does for `always`: the SAME writer, the SAME store, the SAME key
+        // as `PUT /api/projects/{slug}/network-tools/origins`, once per destination the gate judges.
+        for origin in destinations_of(
+            &fetch_call.name,
+            fetch_call.canonical.as_deref(),
+            &fetch_call.input,
+        ) {
+            record_origin_consent(graph.as_ref(), "proj", &origin, "me@example.com")
+                .await
+                .unwrap();
+        }
+        // The store itself, not a mock of it: the document the settings route reads back.
+        let stored = graph
+            .get_llm_setting(
+                &project_scope("proj"),
+                &format!("{TOOL_ORIGIN_PREFIX}https://docs.rs"),
+            )
+            .await
+            .unwrap()
+            .expect("the consent document");
+        let consent: ToolOriginConsent = serde_json::from_str(&stored).unwrap();
+        assert_eq!(consent.origin, "https://docs.rs");
+        assert_eq!(consent.consented_by, "me@example.com");
+        // ...and the gate of a LATER session finds it: no question, the call runs.
+        assert_eq!(
+            person_gate("n23b-always", &graph)
+                .before_tool(&fetch_call)
+                .await,
+            HookVerdict::Continue
+        );
+        crate::auth::agent_tokens::revoke_session("n23b-always");
+    }
+
+    #[tokio::test]
+    async fn a_session_answer_writes_no_consent_and_covers_one_origin_only() {
+        let graph = Arc::new(MockGraphStore::new());
+        let a = fetch("https://docs.rs/x");
+        let b = fetch("https://evil.example/");
+        // A `session` answer is the harness's own memory (`tool\u{0}subject`), never a durable
+        // consent: the project's store still holds nothing.
+        assert!(graph
+            .get_llm_setting(
+                &project_scope("proj"),
+                &format!("{TOOL_ORIGIN_PREFIX}https://docs.rs")
+            )
+            .await
+            .unwrap()
+            .is_none());
+        // Two origins are two questions and two subjects: approving one says nothing about the
+        // other, and the second is not even among the destinations the first covered.
+        let subject_a = consent_subject(&a.name, a.canonical.as_deref(), &a.input).unwrap();
+        let subject_b = consent_subject(&b.name, b.canonical.as_deref(), &b.input).unwrap();
+        assert_ne!(subject_a, subject_b);
+        assert!(!destinations_of(&b.name, b.canonical.as_deref(), &b.input).contains(&subject_a));
     }
 
     // ---- (0b) trust (Rock'n roll): public origins without a consent, and the person is told ----

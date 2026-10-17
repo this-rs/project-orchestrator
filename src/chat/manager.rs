@@ -16134,6 +16134,9 @@ impl ChatManager {
                 );
             }
         }
+        // A runner session (`plan run`, a protocol executor) is read here, before `hooks` moves:
+        // nobody watches it, so it is not a person a question can be put to (N23b).
+        let runner = hooks.as_ref().is_some_and(|scope| scope.runner);
         // The knowledge graph's hooks, for the providers that run hooks in their loop. A
         // remote session has no local project to resolve a file against.
         let runs_hooks = remote_cwd.is_none()
@@ -16165,13 +16168,25 @@ impl ChatManager {
                 .with_turn_router(self.turn_routing.get(session_id)),
             ));
         }
+        // Whether a PERSON is in front of this session (N23b): the only case in which a
+        // destination the project has not consented to becomes a QUESTION instead of a refusal.
+        // The same predicate the answer paths use for a durable decision
+        // (`Claims::may_keep_lasting_approvals`: never an agent token, an MCP token, a vault token
+        // or the server's account), and never a session somebody else runs — a runner has nobody
+        // watching it, and a spawned session's user is its parent session (`delegate_task`, the
+        // `Agent` tool), not a person in front of a dialog. Read from the session's own shape,
+        // never from anything the model says.
+        let spawned_lineage = self.spawned_lineage(session_id).await;
+        let person_in_front = user_claims.is_some_and(|c| c.may_keep_lasting_approvals())
+            && !runner
+            && spawned_lineage.is_none();
         // The `Agent` tool of the native harness (P18): its calls run as child sessions of this
         // one (A18). Only for a local session nothing spawned (depth 1, A17), once the manager
         // can hand itself over (`enable_subagents`).
         if kind == nexus_claude::agent::ProviderKind::Native && remote_cwd.is_none() {
             // A spawned native session: the harness's own depth guard applies (`lineage`), and
             // it asks no question nobody would see (its user is a parent session, not a person).
-            if let Some(lineage) = self.spawned_lineage(session_id).await {
+            if let Some(lineage) = spawned_lineage {
                 spec.lineage = Some(lineage);
                 spec.policy
                     .deny
@@ -16209,7 +16224,10 @@ impl ChatManager {
                     .cloned()
                     .chain(gate_temp_dir)
                     .collect(),
-            );
+            )
+            // N23b: a destination the project has not consented to is ASKED about in the chat,
+            // when a person is in front of this session; refused as before otherwise.
+            .with_person_in_front(person_in_front);
             // Rock'n roll is autonomy: a public origin lacking the project's consent is opened
             // and the person is told. It opens the network of a session only when a PERSON put
             // it in trust, with a normal access (the rule of the file-scope lift, decision
