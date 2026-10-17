@@ -16547,8 +16547,9 @@ impl ChatManager {
     }
 
     /// The end-of-turn state of the agent session `session_id`, from its node: its
-    /// memory conversation, the protocol run it was spawned in. Objective tracking
-    /// is on, as for every Claude Code session.
+    /// memory conversation, the protocol run it was spawned in. Objective tracking is
+    /// on, as for every Claude Code session, EXCEPT for a child of a conversation: a
+    /// sub-agent's objective is the prompt it was given, never the project's backlog.
     async fn agent_turn_state(&self, session_id: &str) -> AgentTurnState {
         let node = match Uuid::parse_str(session_id) {
             Ok(uuid) => self.graph.get_chat_session(uuid).await.ok().flatten(),
@@ -16568,6 +16569,15 @@ impl ChatManager {
             .as_ref()
             .and_then(|n| n.spawned_by.as_deref())
             .and_then(parse_spawned_by);
+        // A child of a conversation is a sub-agent: its objective is the prompt it was
+        // given. The objective reminder reads the PROJECT's pending tasks
+        // (`post_stream::objective_reminder`), so on a child it nags about work the child
+        // never took — and the child pays a whole extra billed turn to answer it.
+        // Measured 17/10/2026 on a throwaway child: 9 413 cache-creation tokens, 600
+        // output tokens, $0.0094, for a task list that was never its own.
+        let subagent = spawned
+            .as_ref()
+            .is_some_and(|ctx| ctx.spawn_type == "conversation");
         // What waited for this session's next turn before it closed or the server
         // restarted.
         let held = self.held_slot(session_id).await;
@@ -16594,7 +16604,7 @@ impl ChatManager {
             held,
             protocol_state: spawned.and_then(|s| s.protocol_state),
             objectives: super::post_stream::ObjectiveCounters {
-                enabled: true,
+                enabled: !subagent,
                 ..Default::default()
             },
             ..Default::default()
