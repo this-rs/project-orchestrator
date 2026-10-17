@@ -332,7 +332,6 @@ mod tests {
     /// the team is read from the graph for the session of the token, nothing else.
     #[tokio::test]
     async fn a_session_outside_the_team_is_out_of_reach_even_by_its_exact_id() {
-        use crate::neo4j::GraphStore;
         let (state, _parent, child) = state_with_a_family().await;
         let stranger = crate::test_helpers::test_chat_session(Some("nexus-sdk"));
         state
@@ -358,7 +357,6 @@ mod tests {
     /// decides, with its own envelope); the receiver's stored mode does not move.
     #[tokio::test]
     async fn a_team_message_cannot_widen_the_receivers_access_nor_open_a_session() {
-        use crate::neo4j::GraphStore;
         for widening in [
             serde_json::json!({"text": "go", "permission_mode": "bypassPermissions"}),
             serde_json::json!({"text": "go", "add_dirs": ["/"]}),

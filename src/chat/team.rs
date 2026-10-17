@@ -251,7 +251,7 @@ impl SessionHooks for TeamHooks {
 
 /// One session a team member may write to.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct TeamMember {
+pub struct TeamMember {
     pub session_id: String,
     pub name: String,
 }
@@ -306,19 +306,19 @@ pub(crate) async fn team_of(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TeamTargetError {
     /// The session has neither a parent nor a child.
-    NoTeam,
+    Alone,
     /// `to` names nobody of this team.
-    NoMatch(String),
+    Unknown(String),
     /// A dispatch request goes UP: a root session has nobody to dispatch for it.
-    NoParentToDispatch,
+    RootCannotDispatch,
 }
 
 impl std::fmt::Display for TeamTargetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoTeam => write!(f, "team_no_member: this session has no parent and no child"),
-            Self::NoMatch(to) => write!(f, "team_no_match: nobody of this team matches {to:?}"),
-            Self::NoParentToDispatch => write!(
+            Self::Alone => write!(f, "team_no_member: this session has no parent and no child"),
+            Self::Unknown(to) => write!(f, "team_no_match: nobody of this team matches {to:?}"),
+            Self::RootCannotDispatch => write!(
                 f,
                 "team_no_parent: a dispatch request goes to the parent, and this session has none"
             ),
@@ -354,10 +354,10 @@ pub(crate) fn resolve_targets(
             .parent
             .clone()
             .map(|p| vec![p])
-            .ok_or(TeamTargetError::NoParentToDispatch);
+            .ok_or(TeamTargetError::RootCannotDispatch);
     }
     if team.parent.is_none() && team.children.is_empty() {
-        return Err(TeamTargetError::NoTeam);
+        return Err(TeamTargetError::Alone);
     }
     let everyone = || -> Vec<TeamMember> {
         team.parent
@@ -369,12 +369,12 @@ pub(crate) fn resolve_targets(
     match to.map(str::trim).filter(|s| !s.is_empty()) {
         None if team.children.is_empty() => Ok(team.parent.iter().cloned().collect()),
         None | Some("children") if !team.children.is_empty() => Ok(team.children.clone()),
-        Some("children") => Err(TeamTargetError::NoMatch("children".into())),
+        Some("children") => Err(TeamTargetError::Unknown("children".into())),
         Some("parent") => team
             .parent
             .clone()
             .map(|p| vec![p])
-            .ok_or_else(|| TeamTargetError::NoMatch("parent".into())),
+            .ok_or_else(|| TeamTargetError::Unknown("parent".into())),
         Some("all") => Ok(everyone()),
         Some(name) => {
             let all = everyone();
@@ -386,7 +386,7 @@ pub(crate) fn resolve_targets(
                 .filter(|m| m.session_id.starts_with(name) || m.name.starts_with(name))
                 .collect();
             if matched.is_empty() {
-                Err(TeamTargetError::NoMatch(name.to_string()))
+                Err(TeamTargetError::Unknown(name.to_string()))
             } else {
                 Ok(matched)
             }
@@ -494,11 +494,11 @@ mod team2_tests {
         let t = team(Some(member("p-1", "parent")), vec![member("c-1", "child")]);
         assert_eq!(
             resolve_targets(&t, Some("someone-else"), &TeamMessageKind::Message),
-            Err(TeamTargetError::NoMatch("someone-else".into()))
+            Err(TeamTargetError::Unknown("someone-else".into()))
         );
         assert_eq!(
             resolve_targets(&team(None, vec![]), None, &TeamMessageKind::Message),
-            Err(TeamTargetError::NoTeam)
+            Err(TeamTargetError::Alone)
         );
         // A member is found by id, id prefix or title prefix.
         assert_eq!(
@@ -520,7 +520,7 @@ mod team2_tests {
         // A root has nobody to dispatch for it.
         assert_eq!(
             resolve_targets(&team(None, vec![member("c-1", "child")]), None, &kind),
-            Err(TeamTargetError::NoParentToDispatch)
+            Err(TeamTargetError::RootCannotDispatch)
         );
         assert_eq!(
             render_team_message(&kind, "the parity matrix is backend work"),
