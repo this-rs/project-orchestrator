@@ -66,6 +66,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use super::agent_runtime::AgentSessionHandle;
 use super::manager::{ActiveSession, ChatManager};
 use super::types::{ChatEvent, PendingMessage};
 use crate::meilisearch::SearchStore;
@@ -846,6 +847,47 @@ async fn check_and_record_trigger_cap(
 /// Minimum interval between two `last_activity` refreshes from background
 /// traffic — far below the idle timeout (minutes), far above message rate.
 const ACTIVITY_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long the out-of-turn pump of the agent engine waits for the rest of a
+/// provider message before it flushes what it has.
+const OOB_FLUSH: Duration = Duration::from_millis(50);
+
+/// The out-of-turn pump of the agent engine: reads
+/// `AgentSession::out_of_band()` — the events the provider emits between turns
+/// (out-of-turn permissions, background tasks, background output) — regroups
+/// what belongs to one provider message and emits it as `ChatEvent`s through
+/// [`super::agent_runtime::emit_out_of_band`]. The batch is flushed when the
+/// provider pauses, when it grows large, and when the stream ends, so each
+/// event is emitted exactly once: nothing is lost, nothing is duplicated.
+pub(crate) async fn pump_out_of_band(
+    handle: Arc<AgentSessionHandle>,
+    mut stream: nexus_claude::agent::EventStream,
+) {
+    let mut batch: Vec<nexus_claude::agent::AgentEvent> = Vec::new();
+    loop {
+        let item = if batch.is_empty() {
+            Some(stream.next().await)
+        } else {
+            tokio::time::timeout(OOB_FLUSH, stream.next()).await.ok()
+        };
+        match item {
+            Some(Some(event)) => {
+                batch.push(event);
+                if batch.len() >= 64 {
+                    super::agent_runtime::emit_out_of_band(&handle, std::mem::take(&mut batch))
+                        .await;
+                }
+            }
+            Some(None) => {
+                super::agent_runtime::emit_out_of_band(&handle, std::mem::take(&mut batch)).await;
+                break;
+            }
+            None => {
+                super::agent_runtime::emit_out_of_band(&handle, std::mem::take(&mut batch)).await;
+            }
+        }
+    }
+}
 
 /// Tests only: a delay the OOB listener of a session takes before handling each
 /// message, to play a listener that lags behind the turn (a loaded machine).
