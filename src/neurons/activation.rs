@@ -415,7 +415,7 @@ mod pure_rule_tests {
         hood.edges.insert(b, vec![edge(target, 0.5)]);
 
         let first = apply_hop(
-            &vec![(b, 1.0), (a, 1.0)],
+            &[(b, 1.0), (a, 1.0)],
             &hood,
             &HashSet::new(),
             &rule(),
@@ -425,7 +425,7 @@ mod pure_rule_tests {
         );
         for _ in 0..20 {
             let again = apply_hop(
-                &vec![(a, 1.0), (b, 1.0)],
+                &[(a, 1.0), (b, 1.0)],
                 &hood,
                 &HashSet::new(),
                 &rule(),
