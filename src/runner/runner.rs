@@ -10339,6 +10339,7 @@ mod tests {
             server_port: 0,
             session_token_expiry_secs: 3600,
             read_only_mcp_tools: Vec::new(),
+            max_live_children: 4,
             lasting_rules_dir: None,
             native_turn_timeout_secs: None,
             native_session_max_tokens: None,

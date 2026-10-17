@@ -1004,6 +1004,19 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
     },
+    /// A message relayed from a peer session in the same team (TEAM-1).
+    ///
+    /// Persisted as `team_message` and broadcast to all session subscribers.
+    /// Does NOT increment `message_count`.
+    ///
+    /// `from_session_id` is asserted by the backend — it cannot be forged by
+    /// model text. Clients should render this with an agent badge distinct
+    /// from human `user_message` events.
+    TeamMessage {
+        from_session_id: Uuid,
+        from_name: String,
+        content: String,
+    },
     /// User-initiated cancellation of running tool subprocess(es) for a
     /// session (T4 of plan 28e9afe3). Emitted when `cancel_running_tools`
     /// successfully sent SIGINT to descendants.
@@ -1214,6 +1227,7 @@ impl ChatEvent {
             ChatEvent::AutoContinueStateChanged { .. } => "auto_continue_state_changed",
             ChatEvent::Retrying { .. } => "retrying",
             ChatEvent::BackgroundOutput { .. } => "background_output",
+            ChatEvent::TeamMessage { .. } => "team_message",
             ChatEvent::SessionError { .. } => "session_error",
             ChatEvent::ToolsCancelled { .. } => "tools_cancelled",
             ChatEvent::ActiveTasksUpdate { .. } => "active_tasks_update",
@@ -1418,7 +1432,8 @@ impl ChatEvent {
             | ChatEvent::SecretRequestResolved { .. }
             | ChatEvent::SessionClosed { .. }
             | ChatEvent::ProviderSwitched { .. }
-            | ChatEvent::ProviderOutage { .. } => None,
+            | ChatEvent::ProviderOutage { .. }
+            | ChatEvent::TeamMessage { .. } => None,
         }
     }
 }
@@ -1981,6 +1996,14 @@ pub enum PendingMessageKind {
     /// `ChatEvent::BackgroundOutput` before pushing this entry — `stream_response`
     /// must therefore NOT re-persist it (dedup via this kind).
     BackgroundOutput,
+    /// A message relayed from a peer session in the same team (TEAM-1).
+    /// Persisted as `team_message`, does NOT increment message_count.
+    /// Delivered to the model as `[team {from_name}] {content}` so the
+    /// model can distinguish team messages from human messages.
+    TeamMessage {
+        from_session_id: Uuid,
+        from_name: String,
+    },
 }
 
 /// A typed entry in the pending_messages queue.
@@ -2062,6 +2085,22 @@ impl PendingMessage {
     /// `stream_response` must be triggered to surface it to the LLM.
     pub fn background_output(content: String) -> Self {
         Self::new(PendingMessageKind::BackgroundOutput, content)
+    }
+
+    /// Construct a `TeamMessage` pending entry.  Called by
+    /// `ChatManager::inject_team_message` to relay a message from a peer
+    /// session into this session's queue.
+    ///
+    /// The stored `content` is the raw text; `drain` prefixes it with
+    /// `[team {from_name}]` when building the prompt sent to the model.
+    pub fn team_message(content: String, from_session_id: Uuid, from_name: String) -> Self {
+        Self::new(
+            PendingMessageKind::TeamMessage {
+                from_session_id,
+                from_name,
+            },
+            content,
+        )
     }
 }
 
