@@ -287,22 +287,23 @@ fn determine_trigger_from_transitions(
     }
 }
 
-/// Execute the slow path: spawn a Claude agent session, send the prompt, monitor events,
-/// and extract the trigger from the agent's response.
-#[allow(clippy::too_many_arguments)]
-async fn execute_via_agent(
-    chat_manager: &ChatManager,
-    prompt: String,
+/// The session request of a protocol state run by an agent (B18).
+///
+/// The request names no provider and no model at any level (`provider`, `run_provider`,
+/// aliases): the project's rules decide, through the resolver — the project's executor
+/// rule, else the global one, else the configured default, else the built-in Claude Code.
+/// That is why the project's slug is on the request: without it the resolver read no
+/// project rule and no project consent, and a protocol opened on the global default
+/// whatever the project had chosen. It is an executor (`spawned_by`), so an unhealthy
+/// rule is skipped with the reason recorded, never refused silently.
+fn agent_session_request(
     run: &ProtocolRun,
     protocol: &Protocol,
     state: &ProtocolState,
-    transitions: &[ProtocolTransition],
-    project_root: Option<&str>,
-    cancel: &CancellationToken,
-) -> Result<ExecutionResult> {
-    // 1. Create a chat session
-    let cwd = project_root.unwrap_or(".");
-    let request = ChatRequest {
+    cwd: &str,
+    project_slug: Option<&str>,
+) -> ChatRequest {
+    ChatRequest {
         file_scope_lifted: false,
         access: None,
         routing_pool: None,
@@ -312,7 +313,7 @@ async fn execute_via_agent(
         message: String::new(), // sent separately via send_message
         session_id: None,
         cwd: cwd.to_string(),
-        project_slug: None,
+        project_slug: project_slug.map(str::to_string),
         model: None,
         provider: None,
         task_alias: None,
@@ -346,7 +347,26 @@ async fn execute_via_agent(
         scaffolding_override: None,
         runner_context: None,
         routing_decision_id: None,
-    };
+    }
+}
+
+/// Execute the slow path: spawn a Claude agent session, send the prompt, monitor events,
+/// and extract the trigger from the agent's response.
+#[allow(clippy::too_many_arguments)]
+async fn execute_via_agent(
+    chat_manager: &ChatManager,
+    prompt: String,
+    run: &ProtocolRun,
+    protocol: &Protocol,
+    state: &ProtocolState,
+    transitions: &[ProtocolTransition],
+    project_root: Option<&str>,
+    project_slug: Option<&str>,
+    cancel: &CancellationToken,
+) -> Result<ExecutionResult> {
+    // 1. Create a chat session on the provider the project's rules pick (B18).
+    let cwd = project_root.unwrap_or(".");
+    let request = agent_session_request(run, protocol, state, cwd, project_slug);
 
     let session = chat_manager
         .create_session(&request)
@@ -581,6 +601,7 @@ impl Executor for AgentExecutor {
         let transitions = store.get_protocol_transitions(run.protocol_id).await?;
         let project = store.get_project(protocol.project_id).await?;
         let project_root = project.as_ref().and_then(|p| p.root_path_opt());
+        let project_slug = project.as_ref().map(|p| p.slug.as_str());
 
         // Build the agent prompt
         let prompt = build_agent_prompt(state, run, protocol, &transitions, project_root);
@@ -602,6 +623,7 @@ impl Executor for AgentExecutor {
             state,
             &transitions,
             project_root,
+            project_slug,
             &self.cancel,
         )
         .await
@@ -867,6 +889,44 @@ mod tests {
         assert!(prompt.contains("Possible Triggers"));
         assert!(prompt.contains("`pass`"));
         assert!(prompt.contains("guard: all_tests_green"));
+    }
+
+    /// B18: the session of a protocol state names no provider at any level and carries the
+    /// project's slug, so the resolver applies THAT project's executor rule (and consent),
+    /// not the global default whatever the project chose.
+    #[test]
+    fn a_protocol_agent_session_takes_the_projects_default_through_the_resolver() {
+        let state_id = uuid::Uuid::new_v4();
+        let protocol_id = uuid::Uuid::new_v4();
+        let protocol = Protocol::new(uuid::Uuid::new_v4(), "Review", state_id);
+        let state = ProtocolState::new(protocol_id, "REVIEW");
+        let run = ProtocolRun::new(protocol_id, state_id, "REVIEW");
+
+        let request = agent_session_request(&run, &protocol, &state, "/work/repo", Some("demo"));
+        assert_eq!(request.project_slug.as_deref(), Some("demo"));
+        assert!(
+            request.provider.is_none()
+                && request.model.is_none()
+                && request.run_provider.is_none()
+                && request.run_model.is_none()
+                && request.task_alias.is_none()
+                && request.persona_alias.is_none(),
+            "nothing named: the project's rules decide"
+        );
+        assert!(
+            request
+                .spawned_by
+                .as_deref()
+                .is_some_and(|s| s.contains("protocol_runner")),
+            "an executor, not a pilot: {:?}",
+            request.spawned_by
+        );
+        assert_eq!(request.cwd, "/work/repo");
+
+        // A project nobody can read any more: no slug, the request still opens (outside any
+        // project: the global rules and the no-project consents).
+        let orphan = agent_session_request(&run, &protocol, &state, ".", None);
+        assert_eq!(orphan.project_slug, None);
     }
 
     #[test]
