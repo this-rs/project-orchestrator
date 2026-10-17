@@ -5613,6 +5613,19 @@ mod parity {
         neutral: bool,
         tweak: impl FnOnce(ChatManager) -> ChatManager,
     ) -> Rig {
+        rig_caps(kind, caps(), turns, nats, anchor_mode, neutral, tweak).await
+    }
+
+    /// [`rig_tweaked`], the provider declaring `capabilities`.
+    pub(super) async fn rig_caps(
+        kind: ProviderKind,
+        capabilities: Capabilities,
+        turns: Vec<Vec<Step>>,
+        nats: Option<Arc<crate::events::NatsEmitter>>,
+        anchor_mode: Option<crate::chat::anchor_resolver::AnchorContextMode>,
+        neutral: bool,
+        tweak: impl FnOnce(ChatManager) -> ChatManager,
+    ) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let graph = Arc::new(MockGraphStore::new());
         let mut project = crate::test_helpers::test_project();
@@ -5629,7 +5642,7 @@ mod parity {
             max_sessions: 10,
             ..Default::default()
         };
-        let mut builder = Script::builder().capabilities(caps());
+        let mut builder = Script::builder().capabilities(capabilities);
         for turn in turns {
             builder = builder.turn(turn);
         }
@@ -5765,6 +5778,154 @@ mod parity {
                 "{kind:?}: the compaction is told what the session works on: {guidance}"
             );
         }
+    }
+
+    /// B14: a provider that runs no hook gets the graph through the host's door — the
+    /// skill context with each turn (the per-tool injection it cannot take), the
+    /// redirect advice after a noisy tool as a system hint, carried in front of the
+    /// next turn.
+    #[tokio::test]
+    async fn a_provider_without_hooks_gets_the_skill_per_turn_and_the_redirect_as_a_system_hint() {
+        let mut hookless = caps();
+        hookless.hooks = HookSupport::None;
+        let noisy: String = (0..30)
+            .map(|i| format!("src/chat/manager.rs:{i}: build_agent_spec(input)\n"))
+            .collect();
+        let mut r = rig_caps(
+            ProviderKind::Codex,
+            hookless,
+            vec![
+                vec![
+                    steps::tool_call(
+                        "t1",
+                        "Grep",
+                        json!({ "pattern": "build_agent_spec", "path": "." }),
+                    ),
+                    steps::tool_result("t1", noisy),
+                    steps::done(&caps()),
+                ],
+                vec![steps::done(&caps())],
+            ],
+            None,
+            None,
+            false,
+            |m| m,
+        )
+        .await;
+        let mut skill = crate::skills::models::SkillNode::new(r.project.id, "Widget Porting B14");
+        skill.status = crate::skills::models::SkillStatus::Active;
+        skill.energy = 0.9;
+        skill.trigger_patterns = vec![crate::skills::models::SkillTrigger {
+            pattern_type: crate::skills::models::TriggerType::Regex,
+            pattern_value: "port the widget".into(),
+            confidence_threshold: 0.7,
+            quality_score: Some(0.9),
+        }];
+        r.graph.skills.write().await.insert(skill.id, skill);
+
+        r.manager
+            .send_message(&r.sid, "please port the widget")
+            .await
+            .unwrap();
+        let hint = match next_event(&mut r.rx, |e| matches!(e, ChatEvent::SystemHint { .. })).await
+        {
+            ChatEvent::SystemHint { content } => content,
+            _ => unreachable!(),
+        };
+        r.turn_end().await;
+        assert!(
+            hint.contains("find_references") && hint.contains("build_agent_spec"),
+            "the redirect advice, as a system hint: {hint}"
+        );
+        assert!(
+            r.provider.answers.after_tool.lock().unwrap().is_empty(),
+            "no hook was handed to a provider that runs none"
+        );
+        let sent = r.sent();
+        assert!(
+            sent[0].contains("Widget Porting B14"),
+            "the skill context arrives with the turn: {}",
+            sent[0]
+        );
+
+        r.manager.send_message(&r.sid, "and now?").await.unwrap();
+        r.turn_end().await;
+        let sent = r.sent();
+        assert_eq!(sent.len(), 2, "the advice plays no turn of its own");
+        assert!(
+            sent[1].contains("find_references") && sent[1].ends_with("and now?"),
+            "the advice is carried in front of the next turn: {}",
+            sent[1]
+        );
+    }
+
+    /// B14 (review of #814): on a provider without hooks, the redirect advice is given
+    /// once (the ledger), and again after a compaction — the compaction signal resets
+    /// the ledger the advice is deduplicated by.
+    #[tokio::test]
+    async fn without_hooks_the_redirect_advice_is_given_again_after_a_compaction() {
+        let mut hookless = caps();
+        hookless.hooks = HookSupport::None;
+        let noisy: String = (0..30)
+            .map(|i| format!("src/chat/manager.rs:{i}: build_agent_spec(input)\n"))
+            .collect();
+        let grep = |id: &str| {
+            vec![
+                steps::tool_call(
+                    id,
+                    "Grep",
+                    json!({ "pattern": "build_agent_spec", "path": "." }),
+                ),
+                steps::tool_result(id, noisy.clone()),
+            ]
+        };
+        let mut third = vec![compaction_started()];
+        third.extend(grep("t3"));
+        third.push(steps::done(&caps()));
+        let mut first = grep("t1");
+        first.push(steps::done(&caps()));
+        let mut second = grep("t2");
+        second.push(steps::done(&caps()));
+        let mut r = rig_caps(
+            ProviderKind::Codex,
+            hookless,
+            vec![first, second, third],
+            None,
+            None,
+            false,
+            |m| m,
+        )
+        .await;
+        let mut hints = Vec::new();
+        for text in ["one", "two", "three"] {
+            r.manager.send_message(&r.sid, text).await.unwrap();
+            let mut n = 0;
+            loop {
+                match next_event(&mut r.rx, |e| {
+                    matches!(
+                        e,
+                        ChatEvent::SystemHint { .. }
+                            | ChatEvent::StreamingStatus {
+                                is_streaming: false
+                            }
+                    )
+                })
+                .await
+                {
+                    ChatEvent::SystemHint { content } if content.contains("find_references") => {
+                        n += 1
+                    }
+                    ChatEvent::SystemHint { .. } => {}
+                    _ => break,
+                }
+            }
+            hints.push(n);
+        }
+        assert_eq!(
+            hints,
+            vec![1, 0, 1],
+            "once, not repeated, given again after the compaction"
+        );
     }
 
     /// H3 enrichment: a turn of the agent engine receives, in front of the message,
