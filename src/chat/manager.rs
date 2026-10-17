@@ -17583,11 +17583,62 @@ impl ChatManager {
     /// disconnect with a 5s timeout — if the CLI hangs, drop the client to
     /// trigger SIGKILL via the Drop impl.
     pub async fn close_session(&self, session_id: &str) -> Result<()> {
-        let closed = self.close_session_inner(session_id).await;
+        self.close_session_with_cascade(session_id, false).await
+    }
+
+    /// Close a session and, when `cascade` is set, every session that descends
+    /// from it (its delegated children and their children, through SPAWNED_BY).
+    /// Descendants are closed before the parent, so a parent never starts a new
+    /// child while its subtree is stopping (B36). A descendant that cannot be
+    /// closed does not stop the rest: the first error is reported.
+    pub async fn close_session_with_cascade(&self, session_id: &str, cascade: bool) -> Result<()> {
+        let mut result = Ok(());
+        if cascade {
+            for child in self.descendant_sessions(session_id).await {
+                if let Err(e) = self.close_session_inner(&child).await {
+                    tracing::warn!(session_id = %child, error = %e, "cascade: closing a descendant failed");
+                    if result.is_ok() {
+                        result = Err(e);
+                    }
+                }
+            }
+        }
+        if let Err(e) = self.close_session_inner(session_id).await {
+            if result.is_ok() {
+                result = Err(e);
+            }
+        }
         // The neutral directory (if the session had one) goes with the session; a resume
         // makes it again.
         super::neutral_place::remove_for(session_id);
-        closed
+        result
+    }
+
+    /// Every session that descends from `session_id` through SPAWNED_BY,
+    /// deepest first (children before grandchildren are discovered, so the
+    /// list is reversed to close leaves before parents). A graph read that
+    /// fails just stops that branch: nothing is invented.
+    async fn descendant_sessions(&self, session_id: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut frontier = vec![session_id.to_string()];
+        let mut seen = std::collections::HashSet::from([session_id.to_string()]);
+        while let Some(parent) = frontier.pop() {
+            let Ok(parent_id) = Uuid::parse_str(&parent) else {
+                continue;
+            };
+            let Ok(children) = self.graph.get_session_children(parent_id).await else {
+                continue;
+            };
+            for child in children {
+                let id = child.id.to_string();
+                if seen.insert(id.clone()) {
+                    out.push(id.clone());
+                    frontier.push(id);
+                }
+            }
+        }
+        out.reverse();
+        out
     }
 
     /// Delete a session: close it if it is live, remove what it keeps on disk (the
@@ -22102,6 +22153,41 @@ mod tests {
 
         let result = manager.send_message("nonexistent", "hello").await;
         assert!(result.is_err());
+    }
+
+    /// B36 — closing a parent with cascade closes its delegated children (and
+    /// their children), leaving nothing live under it.
+    #[tokio::test]
+    async fn closing_a_parent_with_cascade_closes_its_delegated_children() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let parent = crate::test_helpers::test_chat_session(None);
+        let mut child = crate::test_helpers::test_chat_session(None);
+        child.spawned_by = Some(
+            serde_json::json!({"type": "delegation", "parent_session_id": parent.id.to_string()})
+                .to_string(),
+        );
+        for node in [&parent, &child] {
+            manager.graph.create_chat_session(node).await.unwrap();
+        }
+        test_support::insert_live_session_without_cli(&manager, &parent.id.to_string()).await;
+        test_support::insert_live_session_without_cli(&manager, &child.id.to_string()).await;
+        assert!(manager.is_session_active(&child.id.to_string()).await);
+
+        manager
+            .close_session_with_cascade(&parent.id.to_string(), true)
+            .await
+            .unwrap();
+
+        assert!(
+            !manager.is_session_active(&parent.id.to_string()).await,
+            "the parent is closed"
+        );
+        assert!(
+            !manager.is_session_active(&child.id.to_string()).await,
+            "the delegated child is closed by the cascade"
+        );
     }
 
     #[tokio::test]
