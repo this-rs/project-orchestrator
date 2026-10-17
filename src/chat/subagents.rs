@@ -173,10 +173,10 @@ pub(crate) struct SubagentSlot {
 
 impl SubagentSlot {
     /// A slot of `parent`, or `None` when `max_live_children` slots are taken.
-    /// The cap comes from [`ChatConfig::max_live_children`] (env `CHAT_MAX_LIVE_CHILDREN`,
-    /// default [`super::envelope::MAX_LIVE_CHILDREN`]).
+    /// The cap is [`ChatManager::max_live_children`]: the stored setting (PLAFOND-RT), default
+    /// [`super::envelope::MAX_LIVE_CHILDREN`].
     pub(crate) fn take(manager: &Arc<ChatManager>, parent: &str) -> Option<Self> {
-        let cap = manager.config.max_live_children;
+        let cap = manager.max_live_children();
         let mut slots = manager
             .subagent_slots
             .lock()
@@ -419,11 +419,11 @@ impl ChatManager {
         // lifetime, NOT in this frame — a drop of this future (the parent's turn
         // interrupted) must not free the slot before the spawned task has actually
         // closed the child (P18b round 2, fix 2).
-        let max = self.config.max_live_children;
+        let max = self.max_live_children();
         let slot = SubagentSlot::take(&self, parent_session_id).ok_or_else(|| {
             refused(format!(
                 "envelope_too_many_children ({max} sub-agents of one session are already running; \
-                 raise CHAT_MAX_LIVE_CHILDREN to allow more)"
+                 raise it in Settings or with PUT /api/chat/delegation-limits)"
             ))
         })?;
         let env = envelope::resolve_envelope(
@@ -431,7 +431,7 @@ impl ChatManager {
             self.as_ref(),
             parent_session_id,
             None,
-            self.config.max_live_children,
+            max,
         )
         .await
         .map_err(|e| refused(e.code().to_owned()))?;

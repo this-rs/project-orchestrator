@@ -13164,11 +13164,11 @@ mod native_subagents {
             .is_none());
     }
 
-    /// B2b: CHAT_MAX_LIVE_CHILDREN is configurable — a cap of N accepts N children and
-    /// refuses the N+1-th with the stable code and the env var name in the message
+    /// B2b: the live-children cap is a runtime setting — a cap of N accepts N children and
+    /// refuses the N+1-th with the stable code and where to raise it in the message
     /// (PLAFOND-4). Test with cap = 2 to keep the rig lightweight.
     #[tokio::test]
-    async fn the_live_children_cap_is_configurable_and_names_the_env_var() {
+    async fn the_live_children_cap_is_set_at_runtime_and_names_where_to_raise_it() {
         // Build a rig manually so we can set max_live_children = 2.
         let cap: usize = 2;
         let dir = tempfile::tempdir().unwrap();
@@ -13185,7 +13185,6 @@ mod native_subagents {
             provider_path: ProviderPath::Agent,
             mcp_server_path: PathBuf::from("/nonexistent/mcp"),
             max_sessions: 20,
-            max_live_children: cap,
             ..Default::default()
         };
         let mut child_caps = caps();
@@ -13215,6 +13214,11 @@ mod native_subagents {
                 .with_event_emitter(bus.clone()),
         );
         manager.enable_subagents();
+        manager
+            .set_max_live_children(cap)
+            .await
+            .expect("the cap is within bounds")
+            .expect("the cap is stored");
         let mut req = request(None, Some(&project.slug), "default");
         req.message = String::new();
         req.cwd = project.root_path.clone();
@@ -13257,8 +13261,7 @@ mod native_subagents {
                 let out = handle.await.unwrap();
                 assert!(
                     out.as_ref().is_err_and(|e| {
-                        e.contains("envelope_too_many_children")
-                            && e.contains("CHAT_MAX_LIVE_CHILDREN")
+                        e.contains("envelope_too_many_children") && e.contains("delegation-limits")
                     }),
                     "unexpected: {out:?}"
                 );

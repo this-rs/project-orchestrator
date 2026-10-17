@@ -1058,7 +1058,7 @@ pub async fn delegate_task(
         graph.as_ref(),
         chat_manager.as_ref(),
         &caller,
-        chat_manager.config.max_live_children,
+        chat_manager.max_live_children(),
     )
     .await?;
     let default_mode = chat_manager.default_permission_mode().await;
@@ -7237,12 +7237,11 @@ mod tests {
     }
 
     /// The handler itself, not just `envelope::` below it: `delegate_task` identifies
-    /// the caller from the request and resolves the spawn envelope from the LIVE chat
-    /// config (`chat_manager.config.max_live_children`), not from a constant.
+    /// the caller from the request and resolves the spawn envelope from the LIVE
+    /// cap (`chat_manager.max_live_children()`), not from a constant.
     ///
     /// The cap is set to 0 on the manager — a server that allows no live child at all
-    /// (the environment refuses 0, `positive_from_env`, so it is set on the struct
-    /// directly). With a parent session and 0 live children, the FIRST child is already
+    ///     /// directly). With a parent session and 0 live children, the FIRST child is already
     /// over budget, so the refusal can only be the cap. If the handler passed a constant
     /// instead of the config, the same call would fall through to the envelope's
     /// directories and be refused with `envelope_cwd_outside_parent` — the request's cwd
@@ -7264,15 +7263,16 @@ mod tests {
         mock.create_chat_session(&parent).await.unwrap();
 
         let dyn_graph: Arc<dyn GraphStore> = mock.clone();
-        let config = crate::chat::config::ChatConfig {
-            max_live_children: 0,
-            ..Default::default()
-        };
-        let manager = Arc::new(crate::chat::manager::ChatManager::new_without_memory(
+        let manager = crate::chat::manager::ChatManager::new_without_memory(
             dyn_graph,
             crate::test_helpers::mock_app_state().meili,
-            config,
-        ));
+            Default::default(),
+        );
+        // Set on the counter directly: the public setter refuses 0.
+        manager
+            .live_children_cap
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let manager = Arc::new(manager);
         let state = crate::test_helpers::server_state_with_chat(manager, mock.clone()).await;
 
         // No auth on this state: the `X-Session-Id` header is what makes the caller an
@@ -7309,7 +7309,7 @@ mod tests {
                 );
                 assert!(
                     message.contains("maximum 0"),
-                    "the cap comes from chat_manager.config.max_live_children: {message}"
+                    "the cap comes from chat_manager.max_live_children(): {message}"
                 );
             }
             other => panic!("expected the configured cap to refuse, got {other:?}"),

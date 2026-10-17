@@ -1794,6 +1794,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             cm = cm.with_reasoning_engine(re.clone());
         }
         let cm = Arc::new(cm);
+        // The cap on a parent's live children is a runtime setting (PLAFOND-RT): read the stored value.
+        cm.load_delegation_limits().await;
         // Native sessions run their `Agent` calls as child sessions through the manager (P18).
         cm.enable_subagents();
         // The learning side: the per-turn router, the runner's routing handle, and the

@@ -94,7 +94,7 @@ pub async fn create_session(
                     graph.as_ref(),
                     chat_manager.as_ref(),
                     &caller,
-                    chat_manager.config.max_live_children,
+                    chat_manager.max_live_children(),
                 )
                 .await?
                 .expect("an agent caller always has an envelope");
@@ -631,7 +631,13 @@ pub async fn get_session_tree(
             }
         }
     }
-    crate::chat::tree::annotate(&mut tree, &info);
+    let cap = state
+        .chat_manager
+        .as_ref()
+        .map_or(crate::chat::envelope::MAX_LIVE_CHILDREN, |manager| {
+            manager.max_live_children()
+        });
+    crate::chat::tree::annotate(&mut tree, &info, cap);
     Ok(Json(tree))
 }
 
