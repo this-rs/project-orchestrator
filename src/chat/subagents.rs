@@ -221,6 +221,25 @@ struct Reuse {
 }
 
 impl Reuse {
+    /// What becomes of the child once its delegation ended. A child that ANSWERED goes back
+    /// to the pool warm. One that did not — the call was cancelled, the child errored, could
+    /// not be followed — is never offered again: its thread ends on a turn nobody finished,
+    /// and resuming it would hand the next delegation that unfinished state (CACHE-POOL,
+    /// "a contaminated session is never reused"). It is dropped from the pool instead.
+    fn finish(
+        self,
+        pool: &super::session_pool::SessionPool,
+        session_id: &str,
+        answered: bool,
+        now: std::time::Instant,
+    ) {
+        if answered {
+            self.release(pool, session_id, now);
+        } else {
+            pool.abandon(session_id);
+        }
+    }
+
     /// Gives the child back to the pool, warm, once it is closed: the next delegation of the
     /// same conversation, on the same engine and model, with the same facts, resumes it.
     fn release(
@@ -663,7 +682,12 @@ impl ChatManager {
         // Closed: the backstop is not needed any more, and the session becomes the
         // conversation's warm prefix for its next delegation of the same engine and model.
         if let Some(reuse) = reuse {
-            reuse.release(&self.session_pool, &child_id, std::time::Instant::now());
+            reuse.finish(
+                &self.session_pool,
+                &child_id,
+                answer.is_ok(),
+                std::time::Instant::now(),
+            );
         }
         // Dropping the guard gives the slot back — after the close, as on every other path.
         guard.disarm();
@@ -1738,6 +1762,36 @@ mod tests {
             warm.uses, 2,
             "two delegations have already run in this session"
         );
+    }
+
+    /// CACHE-POOL, "a contaminated session is never reused": a child whose delegation did NOT
+    /// answer (cancelled, errored) is dropped, not given back warm — the next delegation
+    /// opens a fresh session. A child that answered still goes back. Red if `finish`
+    /// releases whatever the outcome.
+    #[tokio::test]
+    async fn a_child_that_did_not_answer_is_never_given_back_warm() {
+        let (_graph, manager) = bare_manager();
+        let child = delegation("proj", "opus");
+        let now = std::time::Instant::now();
+
+        // A delegation resumes a warm session, then fails: nothing goes back.
+        claim_for(&manager, &child).finish(&manager.session_pool, "warm-1", true, now);
+        assert_eq!(manager.session_pool.held(), vec!["warm-1".to_owned()]);
+        let resumed = claim_for(&manager, &child);
+        assert!(resumed.warm.is_some(), "it resumes the warm session");
+        resumed.finish(&manager.session_pool, "warm-1", false, now);
+        assert!(
+            manager.session_pool.is_empty(),
+            "a failed child is not given back"
+        );
+        assert!(
+            claim_for(&manager, &child).warm.is_none(),
+            "the next delegation opens a fresh session"
+        );
+
+        // A fresh child that fails never enters the pool either.
+        claim_for(&manager, &child).finish(&manager.session_pool, "fresh-1", false, now);
+        assert!(manager.session_pool.is_empty());
     }
 
     /// Another model (or another engine) is another warm session: the pool is keyed on the
