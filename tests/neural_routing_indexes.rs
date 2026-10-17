@@ -12,13 +12,15 @@
 //!    source-reading idiom as `src/boot.rs`'s phase test);
 //! 2. against a real Neo4j, a stored trajectory is found above the 0.7
 //!    threshold once the indexes exist. Skipped when no Neo4j answers, like
-//!    `tests/harness_neo4j.rs`; `NEURAL_NEO4J_REQUIRED=1` turns the skip into
-//!    a failure.
+//!    `tests/harness_neo4j.rs`; `HARNESS_NEO4J_REQUIRED=1` — the switch the
+//!    integration-tests CI job already exports for every Neo4j suite — turns
+//!    that skip into a failure.
 //!
 //!   docker run -d --rm --name po-nn -p 17687:7687 -e NEO4J_AUTH=neo4j/testpassword neo4j:5
 //!   NEO4J_URI=bolt://localhost:17687 NEO4J_PASSWORD=testpassword cargo test --test neural_routing_indexes
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use neural_routing_runtime::{Neo4jTrajectoryStore, Trajectory, TrajectoryNode, TrajectoryStore};
 use uuid::Uuid;
@@ -50,22 +52,57 @@ fn startup_creates_the_vector_index_the_nn_router_queries() {
 // Behavioural test against a real Neo4j
 // ===========================================================================
 
+/// Whether something is listening on the Bolt port of `uri`.
+///
+/// Deliberately a socket connect and NOT a Cypher round-trip: every query of
+/// `neo4rs` is wrapped in a retrying backoff (`Graph::run` / `Graph::execute`
+/// read "Retries happen with an exponential backoff until a retry delay exceeds
+/// 60s"), so a probe that asks the DATABASE does not fail fast when nothing
+/// answers — it sits in the retry loop. Measured on 17/10/2026 with the port
+/// closed: still retrying after 444 s, where this socket probe decides in
+/// milliseconds. A gate that costs minutes to say "skip" is not a gate.
+/// The socket answers the only question this helper asks: is anyone there?
+async fn bolt_reachable(uri: &str) -> bool {
+    let authority = uri
+        .split_once("://")
+        .map_or(uri, |(_, rest)| rest)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or_default();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::net::TcpStream::connect(authority),
+    )
+    .await
+    .is_ok_and(|connected| connected.is_ok())
+}
+
+/// Connect to the throwaway Neo4j named by the environment, or `None` when none
+/// answers — the same contract as `tests/harness_neo4j.rs` (skip by default,
+/// hard failure under `HARNESS_NEO4J_REQUIRED`, the switch the integration-tests
+/// CI job exports for every Neo4j suite).
 async fn store() -> Option<Arc<Neo4jTrajectoryStore>> {
     let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:17687".into());
     let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
     let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
 
-    match neo4rs::Graph::new(&uri, &user, &password).await {
-        Ok(graph) => Some(Arc::new(Neo4jTrajectoryStore::new(Arc::new(graph)))),
-        Err(err) => {
-            assert!(
-                std::env::var("NEURAL_NEO4J_REQUIRED").is_err(),
-                "NEURAL_NEO4J_REQUIRED is set but no Neo4j answers at {uri}: {err}"
-            );
-            eprintln!("Skipping neural-routing index tests: no Neo4j at {uri}");
-            None
-        }
+    let connected = if bolt_reachable(&uri).await {
+        neo4rs::Graph::new(&uri, &user, &password)
+            .await
+            .ok()
+            .map(|graph| Arc::new(Neo4jTrajectoryStore::new(Arc::new(graph))))
+    } else {
+        None
+    };
+
+    if connected.is_none() {
+        assert!(
+            std::env::var("HARNESS_NEO4J_REQUIRED").is_err(),
+            "HARNESS_NEO4J_REQUIRED is set but no Neo4j answers at {uri}"
+        );
+        eprintln!("Skipping neural-routing index tests: no Neo4j at {uri}");
     }
+    connected
 }
 
 /// A 256d unit vector (the index is declared with `vector.dimensions: 256`).
