@@ -74,10 +74,26 @@ enum Engine {
     /// same `fake_claude`, the same transcript (M2).
     ClaudeCodeAgent,
     Native,
+    /// Codex provider (harness `codex`). `fake_codex` does not exist in the nexus
+    /// repository; all functions are declared `not_measured` (YARDSTICK, task 87eb345e).
+    Codex,
+    /// opencode harness. `fake_opencode` does not exist; all functions declared
+    /// `not_measured` (YARDSTICK, task 87eb345e).
+    OpenCode,
+    /// ACP harness. `fake_acp` exists but the full scenario has not yet been adapted to
+    /// this harness; all functions declared `not_measured` (YARDSTICK, task 87eb345e).
+    Acp,
 }
 
 /// The columns of the table, in order.
-const ENGINES: [Engine; 3] = [Engine::ClaudeCode, Engine::ClaudeCodeAgent, Engine::Native];
+const ENGINES: [Engine; 6] = [
+    Engine::ClaudeCode,
+    Engine::ClaudeCodeAgent,
+    Engine::Native,
+    Engine::Codex,
+    Engine::OpenCode,
+    Engine::Acp,
+];
 
 impl Engine {
     fn label(self) -> &'static str {
@@ -85,6 +101,9 @@ impl Engine {
             Engine::ClaudeCode => "Claude Code",
             Engine::ClaudeCodeAgent => "Claude Code (moteur agent)",
             Engine::Native => "natif",
+            Engine::Codex => "Codex",
+            Engine::OpenCode => "opencode",
+            Engine::Acp => "ACP",
         }
     }
 }
@@ -272,6 +291,21 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
 const CLI_TOOLS: &str = "Read / Edit / Bash sont les outils internes du CLI Claude : fake_claude \
                          rejoue un transcript et n'exécute aucun outil";
 
+/// Why every function is `not_measured` on Codex (YARDSTICK, task 87eb345e).
+const CODEX_NOT_MEASURED: &str =
+    "fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire \
+     faux déterministe (YARDSTICK, tâche 87eb345e)";
+
+/// Why every function is `not_measured` on opencode (YARDSTICK, task 87eb345e).
+const OPENCODE_NOT_MEASURED: &str =
+    "fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans \
+     binaire faux déterministe (YARDSTICK, tâche 87eb345e)";
+
+/// Why every function is `not_measured` on ACP (YARDSTICK, task 87eb345e).
+const ACP_NOT_MEASURED: &str =
+    "fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; \
+     chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e)";
+
 /// The verdicts of one engine, with what was seen (diagnostics, not in the table).
 #[derive(Default)]
 struct Measures {
@@ -311,10 +345,28 @@ impl Measures {
 }
 
 fn expected(engine: Engine, function: &str) -> Option<Expect> {
-    EXPECTED
+    // Explicit overrides (EXPECTED const) take priority.
+    if let Some(x) = EXPECTED
         .iter()
         .find(|(e, f, _)| *e == engine && *f == function)
         .map(|(_, _, x)| *x)
+    {
+        return Some(x);
+    }
+    // New harnesses for which the scenario has not yet been adapted: every function is
+    // declared `not_measured` rather than listing 30 × 3 identical entries in EXPECTED.
+    match engine {
+        Engine::Codex => Some(Expect::NotMeasured {
+            why: CODEX_NOT_MEASURED,
+        }),
+        Engine::OpenCode => Some(Expect::NotMeasured {
+            why: OPENCODE_NOT_MEASURED,
+        }),
+        Engine::Acp => Some(Expect::NotMeasured {
+            why: ACP_NOT_MEASURED,
+        }),
+        Engine::ClaudeCode | Engine::ClaudeCodeAgent | Engine::Native => None,
+    }
 }
 
 /// What is wrong with the measures against [`EXPECTED`]: empty when the table is
@@ -407,13 +459,19 @@ fn render(run: &Run<'_>) -> String {
          {UPDATE_COMMAND} -->\n\n"
     ));
     out.push_str(
-        "Un seul scénario, joué sur les deux moteurs, même assertion par fonction :\n\n\
+        "Un seul scénario, joué sur les moteurs mesurables, même assertion par fonction :\n\n\
          - **Claude Code** : moteur historique (`CHAT_PROVIDER_PATH=legacy`) sur \
          `fake_claude`, le faux CLI du dépôt nexus ;\n\
          - **Claude Code (moteur agent)** : le même CLI et le même transcript, piloté par le \
          moteur agent à travers la façade Claude Code de nexus (`CHAT_PROVIDER_PATH=agent`) ;\n\
          - **natif** : moteur agent, instance OpenAI-compatible sur `fake_openai`, outils \
-         project-orchestrator sur `fake_mcp`, outils de base sur le vrai `nexus-tools`.\n\n\
+         project-orchestrator sur `fake_mcp`, outils de base sur le vrai `nexus-tools` ;\n\
+         - **Codex** : harnais Codex — `fake_codex` absent du dépôt nexus, toutes les \
+         fonctions `not_measured` (YARDSTICK, tâche 87eb345e) ;\n\
+         - **opencode** : harnais opencode — `fake_opencode` absent, toutes les fonctions \
+         `not_measured` (YARDSTICK, tâche 87eb345e) ;\n\
+         - **ACP** : harnais ACP — `fake_acp` présent mais le scénario complet n'a pas encore \
+         été adapté, toutes les fonctions `not_measured` (YARDSTICK, tâche 87eb345e).\n\n\
          `ok` : mesuré et conforme. `gap (cause, tâche)` : mesuré absent, cause `harnais` \
          (le backend ou le harnais nexus ne le fait pas) ou `modèle` (le modèle ne le peut pas), \
          fermé par la tâche PO nommée (plan 5ad54c48 « Parité totale », ou e87abcc2 « Claude Code devient optionnel » pour une tâche M…). `not_measured` : les faux binaires ne \
@@ -2211,10 +2269,17 @@ fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
                 .block_on(async {
                     let (cc, na) = run_naming_the_column(ProviderPath::Legacy).await;
                     let (cca, _) = run_naming_the_column(ProviderPath::Agent).await;
+                    // New harnesses: all functions declared not_measured (YARDSTICK).
+                    let codex = as_declared(Engine::Codex);
+                    let opencode = as_declared(Engine::OpenCode);
+                    let acp = as_declared(Engine::Acp);
                     gate(&[
                         (Engine::ClaudeCode, &cc),
                         (Engine::ClaudeCodeAgent, &cca),
                         (Engine::Native, &na),
+                        (Engine::Codex, &codex),
+                        (Engine::OpenCode, &opencode),
+                        (Engine::Acp, &acp),
                     ]);
                 })
         })
