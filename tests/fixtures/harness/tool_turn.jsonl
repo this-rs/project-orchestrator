@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","data":{"session_id":"golden-cli-session","model":"claude-sonnet-4-5","tools":["Bash","Read","Edit"],"mcp_servers":[{"name":"po","status":"connected"}],"permissionMode":"acceptEdits","cwd":"/workspace/project"}}
+{"type":"assistant","message":{"content":[{"thinking":"I should list the crate.","signature":"sig-golden"},{"text":"Let me look."},{"id":"toolu_bash","name":"Bash","input":{"command":"ls"}}]}}
+{"type":"user","message":{"content":"","content_blocks":[{"tool_use_id":"toolu_bash","content":"Cargo.toml\nsrc\n","is_error":false}]}}
+{"type":"assistant","message":{"content":[{"text":"One crate."}]}}
+{"type":"result","subtype":"success","duration_ms":5000,"duration_api_ms":4500,"is_error":false,"num_turns":1,"session_id":"golden-cli-session","total_cost_usd":0.021,"result":"One crate."}

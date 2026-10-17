@@ -1,0 +1,6 @@
+{"type":"system","subtype":"status","data":{"status":"compacting"}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hm"}}}
+{"type":"stream_event","event":{"type":"message_stop"}}
+{"type":"user","message":{"content":"please continue"}}
+{"type":"system","subtype":"po_masking_failed","data":{}}
+{"type":"assistant","message":{"content":[{"tool_use_id":"toolu_cite","content":"see #note:6f2b8f1c-4d3e-4a5b-8c9d-0e1f2a3b4c5d","is_error":false}]}}
