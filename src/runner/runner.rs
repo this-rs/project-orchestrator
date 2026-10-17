@@ -10483,7 +10483,7 @@ mod tests {
         assert!(
             matches!(
                 outcomes[1],
-                TaskResult::BudgetExceeded { cumulated_cost_usd, limit_usd }
+                TaskResult::BudgetExceeded { cumulated_cost_usd, limit_usd, .. }
                     if cumulated_cost_usd > 1.0 && limit_usd == 1.0
             ),
             "second attempt: {:?}",
