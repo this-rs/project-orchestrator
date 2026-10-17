@@ -358,6 +358,19 @@ pub struct SessionTreeNode {
     /// Live children limit per session (root node only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_children: Option<u32>,
+    /// Whether the session is still live: `active` (in the chat manager) or
+    /// `closed`. Filled by the API, never by the graph read.
+    #[serde(default = "default_session_status")]
+    pub status: String,
+    /// Precedence level that chose the provider/model (A16), the serialised
+    /// name of `chat::provider::RoutedBy`. Filled by the API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed_by: Option<String>,
+}
+
+/// A session that is not live in the chat manager is `closed`.
+fn default_session_status() -> String {
+    "closed".to_string()
 }
 
 /// Lightweight session info for run-scoped queries.

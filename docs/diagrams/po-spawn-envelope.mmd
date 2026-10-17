@@ -25,12 +25,16 @@
 %%                              restrict_permission_mode, is_within, ensure_child_of
 %%   src/api/chat_handlers.rs — create_session ; src/api/handlers.rs — delegate_task,
 %%                              delegation_chat_request
-%%   src/chat/manager.rs      — build_options (frappe du jeton), close_session (révocation)
+%%   src/chat/manager.rs      — build_options (frappe du jeton), close_session (révocation),
+%%                              close_session_with_cascade (B36)
+%%   src/api/handlers.rs      — listen_delegation_result, DelegationExecution, DelegationEnd,
+%%                              run_of_session ; src/runner/state.rs — RunnerState::owns_delegation (B36)
 %% ---
 %% NON ETABLI :
 %%   aucun test de bout en bout avec un vrai CLI : la règle est testée sur ses fonctions et sur
 %%   le middleware (MockGraphStore, routeur de test) ;
-%%   budget de l'enfant = reste du parent, annulation en cascade, coût des descendants : tâche B36 ;
+%%   budget de l'enfant = reste du parent : tâche B36 (non écrit) ; la cascade et le coût d'une
+%%   délégation au run de son exécuteur sont écrits (nœud B36_TREE), testés sur MockGraphStore ;
 %%   sans authentification (auth_config absent) le parent vient de l'en-tête X-Session-Id : indice,
 %%   pas frontière ;
 %%   CACHE-POOL : le gain de cache_creation (environ 30 500 jetons réécrits par ouverture) est
@@ -133,8 +137,10 @@ flowchart TD
     RESUME["✅ agent + session_id (envoi à une session existante) :<br/>ensure_child_of — seulement une session qu'il a ouverte<br/>test : an_agent_only_reaches_sessions_it_spawned"]
     C1 --> RESUME
 
-    LATER["🟠 B36 : budget = reste du parent, annulation en cascade,<br/>coût des descendants — non écrit"]
+    LATER["🟠 B36 : budget de l'enfant = reste du parent — non écrit"]
     SPAWN_DEL -.-> LATER
+    B36_TREE["✅ B36 arbre de sessions :<br/>close_session_with_cascade DE HAUT EN BAS : une session est fermée AVANT que ses enfants soient lus (elle ne peut plus déléguer),<br/>puis l'arbre est relu jusqu'à ce qu'une passe ne trouve rien de neuf (délégation en vol qui atterrit après la lecture) ;<br/>un descendant déjà inactif n'est pas refermé (ses enfants vivants sont atteints) ; chaque session fermée perd son répertoire neutre ;<br/>annuler un run ferme en cascade les enfants de ses exécuteurs<br/>coût : la délégation n'est imputée au RUNNER_STATE que si son parent est un exécuteur de CE run (run lu au lancement, run_of_session,<br/>ou parent dans active_agents) — une délégation manuelle ou d'un run précédent ne débite pas le run ; tokens entrée+sortie imputés<br/>AgentExecution de la délégation fermée UNE fois (garde DelegationExecution, après l'écriture du nœud ouvert) : Result → statut, coût,<br/>cost_basis (base du provider, sinon reported si montant, sinon unknown — jamais un reported 0), tokens, modèle, tours ;<br/>sans Result (prompt non envoyé, canal fermé, filet d'1 h, panique) → failed, coût unknown<br/>tests : cascade_closes_a_child_that_lands_after_the_listing, cascade_skips_a_closed_descendant_and_reaches_its_children,<br/>cascade_removes_each_closed_descendants_neutral_directory, closing_a_parent_with_cascade_closes_its_delegated_children,<br/>cancelling_a_run_closes_the_executors_delegated_children, a_manual_delegation_during_a_run_does_not_charge_it,<br/>a_delegation_of_an_earlier_run_does_not_charge_the_next_one, a_delegation_of_the_runs_executor_charges_cost_and_tokens,<br/>delegation_execution_closed_with_cost_basis_tokens_and_model, a_delegation_without_a_price_is_closed_unknown_not_reported_zero,<br/>a_delegation_whose_channel_closes_without_result_is_closed_failed, a_delegation_past_the_safety_net_is_closed_failed,<br/>a_delegation_dropped_before_listening_is_closed_failed<br/>🟠 seul l'enfant DIRECT d'un exécuteur est imputé au run (un petit-enfant ne l'est pas) ; parent_session_id d'un corps humain non vérifié<br/>contre un propriétaire ; run_id de l'AgentExecution d'une délégation = nil"]
+    SPAWN_DEL --> B36_TREE
 
     subgraph sub["Sous-agent d'une session native (P18, subagents.rs) — repli A18"]
         SUBHOST["✅ build_agent_spec_with_access : SubagentHooks (runs_subagents) seulement pour une session native locale<br/>dont le nœud n'a pas de spawned_by, et si enable_subagents a été appelé ; le harnais nexus offre alors Agent.<br/>Session native ENGENDRÉE : SessionSpec::lineage profondeur 1 (garde du harnais armée) et deny AskUserQuestion ;<br/>un enfant garde son spawned_by quand il change de provider (relais)<br/>tests : only_a_native_session_nothing_spawned_runs_subagents (rouge sans la garde spawned_by), a_child_session_stays_a_child_when_it_moves"]

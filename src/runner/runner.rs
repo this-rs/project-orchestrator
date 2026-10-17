@@ -1638,13 +1638,18 @@ impl PlanRunner {
         }
     }
 
-    /// Close all active agent sessions, killing their Claude Code subprocesses.
-    /// Errors are logged but not propagated (best-effort cleanup).
+    /// Close all active agent sessions, killing their Claude Code subprocesses,
+    /// and every session that descends from them (a delegated child of an
+    /// executor is closed with its parent, B36). Errors are logged but not
+    /// propagated (best-effort cleanup).
     async fn close_agent_sessions(chat_manager: &ChatManager, session_ids: &[Uuid]) {
         for sid in session_ids {
             let sid_str = sid.to_string();
             info!("Closing agent session {} on cancel", sid_str);
-            if let Err(e) = chat_manager.close_session(&sid_str).await {
+            if let Err(e) = chat_manager
+                .close_session_with_cascade(&sid_str, true)
+                .await
+            {
                 warn!("Failed to close agent session {} on cancel: {}", sid_str, e);
             }
         }
@@ -5944,6 +5949,72 @@ mod tests {
         let result = PlanRunner::cancel(run_id, None).await;
         assert!(result.is_ok());
         assert!(RUNNER_CANCEL.load(Ordering::SeqCst));
+        reset_globals().await;
+    }
+
+    /// B36 — cancelling a run closes the delegated children of its executors,
+    /// not just the executors themselves (the cascade reaches the leaves).
+    #[tokio::test]
+    async fn cancelling_a_run_closes_the_executors_delegated_children() {
+        use crate::neo4j::GraphStore;
+
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
+        let run_id = Uuid::new_v4();
+        let plan_id = Uuid::new_v4();
+
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = mock.clone();
+        let manager = Arc::new(crate::chat::manager::ChatManager::new_without_memory(
+            dyn_graph,
+            crate::test_helpers::mock_app_state().meili,
+            crate::chat::config::ChatConfig::default(),
+        ));
+
+        let executor = crate::test_helpers::test_chat_session(None);
+        let mut child = crate::test_helpers::test_chat_session(None);
+        child.spawned_by = Some(
+            serde_json::json!({"type": "delegation", "parent_session_id": executor.id.to_string()})
+                .to_string(),
+        );
+        for node in [&executor, &child] {
+            manager.graph.create_chat_session(node).await.unwrap();
+        }
+        crate::chat::manager::test_support::insert_live_session_without_cli(
+            &manager,
+            &executor.id.to_string(),
+        )
+        .await;
+        crate::chat::manager::test_support::insert_live_session_without_cli(
+            &manager,
+            &child.id.to_string(),
+        )
+        .await;
+
+        let task_id = Uuid::new_v4();
+        let mut state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
+        let mut agent = ActiveAgent::new(task_id, "executor".to_string());
+        agent.session_id = Some(executor.id);
+        agent.status = TaskRunStatus::Running;
+        state.add_agent(agent);
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = Some(state);
+        }
+
+        PlanRunner::cancel(run_id, Some(manager.clone()))
+            .await
+            .unwrap();
+
+        assert!(
+            !manager.is_session_active(&executor.id.to_string()).await,
+            "the executor is closed"
+        );
+        assert!(
+            !manager.is_session_active(&child.id.to_string()).await,
+            "the delegated child is closed by the cascade"
+        );
         reset_globals().await;
     }
 

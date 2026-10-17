@@ -17,6 +17,11 @@ pub struct NodeInfo {
     pub model: Option<String>,
     /// Own cost; `None` = unknown.
     pub cost_usd: Option<f64>,
+    /// Live status: `Some("active")` when the session is live, `None` otherwise
+    /// (which reads as `closed`).
+    pub status: Option<String>,
+    /// Precedence level that chose the provider/model (A16).
+    pub routed_by: Option<String>,
 }
 
 /// Fills `provider_id`, `model`, `cost_usd`, `subtree_cost_usd` and, on the
@@ -31,6 +36,8 @@ pub fn annotate(
             node.provider_id = i.provider_id.clone();
             node.model = i.model.clone();
             node.cost_usd = i.cost_usd;
+            node.status = i.status.clone().unwrap_or_else(|| "closed".to_string());
+            node.routed_by = i.routed_by.clone();
         }
     }
     // Subtree cost: the node itself plus every descendant, all known.
@@ -94,6 +101,8 @@ mod tests {
             subtree_cost_usd: None,
             max_depth: None,
             max_children: None,
+            status: "closed".to_string(),
+            routed_by: None,
         }
     }
 
@@ -102,6 +111,8 @@ mod tests {
             provider_id: provider.map(str::to_string),
             model: Some("m".into()),
             cost_usd: cost,
+            status: None,
+            routed_by: None,
         }
     }
 
@@ -149,5 +160,27 @@ mod tests {
         annotate(&mut tree, &HashMap::new(), 4);
         assert_eq!(tree[0].cost_usd, None);
         assert_eq!(tree[0].model, None);
+        // A node nobody annotated is not live, and nothing routed it.
+        assert_eq!(tree[0].status, "closed");
+        assert_eq!(tree[0].routed_by, None);
+    }
+
+    /// B36: `status` and `routed_by` ride on each node, filled by the API.
+    #[test]
+    fn status_and_routed_by_are_copied_to_the_node() {
+        let mut tree = vec![node("root", None)];
+        let infos = HashMap::from([(
+            "root".to_string(),
+            NodeInfo {
+                provider_id: None,
+                model: Some("m".into()),
+                cost_usd: Some(1.0),
+                status: Some("active".into()),
+                routed_by: Some("task".into()),
+            },
+        )]);
+        annotate(&mut tree, &infos, 4);
+        assert_eq!(tree[0].status, "active");
+        assert_eq!(tree[0].routed_by.as_deref(), Some("task"));
     }
 }

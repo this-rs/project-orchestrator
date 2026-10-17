@@ -207,6 +207,22 @@ impl RunnerState {
         }
     }
 
+    /// Whether one of this run's executors runs `session_id` right now.
+    pub fn runs_session(&self, session_id: Uuid) -> bool {
+        self.active_agents
+            .iter()
+            .any(|a| a.session_id == Some(session_id))
+    }
+
+    /// Whether a delegation belongs to this run (B36): it was spawned by one of
+    /// this run's executors — `owner_run` is the run whose executor was its
+    /// parent when it started, `parent_session` the session that delegated. A
+    /// manual delegation, or one of an earlier run, is not this run's spend,
+    /// whatever its plan.
+    pub fn owns_delegation(&self, owner_run: Option<Uuid>, parent_session: Option<Uuid>) -> bool {
+        owner_run == Some(self.run_id) || parent_session.is_some_and(|p| self.runs_session(p))
+    }
+
     /// Check if the USD budget has been exceeded (marginal counter only).
     pub fn is_budget_exceeded(&self, max_cost_usd: f64) -> bool {
         self.cost_usd > max_cost_usd
@@ -504,6 +520,31 @@ mod tests {
             max_tokens: None,
         };
         assert_eq!(state.budget_breach(&unlimited), None);
+    }
+
+    /// B36: the run's budget holds the SUM of its own attempts and the costs
+    /// of the delegations its executor spawned. A parent that is under budget
+    /// on its own exceeds it once a child's cost lands on the same counter.
+    #[test]
+    fn a_childs_cost_can_push_the_run_over_the_parents_budget() {
+        let mut state = RunnerState::new(Uuid::new_v4(), Uuid::new_v4(), 3, TriggerSource::Manual);
+        let budget = RunBudget {
+            max_cost_usd: 2.0,
+            max_tokens: None,
+        };
+        // The parent's own attempt: still under budget.
+        state.add_attempt_cost(&attempt(Some(1.2), Some("reported"), None));
+        assert_eq!(state.budget_breach(&budget), None);
+        // The delegated child's real spend is the run's spend too.
+        state.add_attempt_cost(&attempt(Some(0.9), Some("reported"), None));
+        assert_eq!(
+            state.budget_breach(&budget),
+            Some(BudgetBreach::Usd {
+                cumulated_usd: 2.1,
+                limit_usd: 2.0,
+            }),
+            "parent + children exceeds the budget"
+        );
     }
 
     #[test]
