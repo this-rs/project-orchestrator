@@ -6007,6 +6007,95 @@ pub async fn update_run_budget(
     })))
 }
 
+/// Query of `GET /api/runner/cost-breakdown`.
+#[derive(Debug, Default, Deserialize)]
+pub struct CostBreakdownQuery {
+    /// `model` (default), `provider`, `task_class` or `routed_by`.
+    #[serde(default)]
+    pub group_by: Option<String>,
+    /// Start of the window (RFC 3339, inclusive). Default: `to` minus 30 days.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// End of the window (RFC 3339, exclusive). Default: now.
+    #[serde(default)]
+    pub to: Option<String>,
+}
+
+/// Default span of the breakdown window when `from` is not given.
+const COST_BREAKDOWN_DEFAULT_DAYS: i64 = 30;
+
+/// Body of `GET /api/runner/cost-breakdown`.
+#[derive(Debug, Serialize)]
+pub struct CostBreakdownResponse {
+    pub group_by: crate::neo4j::agent_execution::CostGroupBy,
+    pub from: chrono::DateTime<chrono::Utc>,
+    pub to: chrono::DateTime<chrono::Utc>,
+    /// One row per key, sorted by key.
+    pub groups: Vec<crate::neo4j::agent_execution::CostBreakdownRow>,
+}
+
+/// The window a breakdown query names: `[from, to)`, `to` defaulting to now
+/// and `from` to thirty days before it; 400 on a malformed or empty window.
+fn cost_breakdown_window(
+    query: &CostBreakdownQuery,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>), AppError> {
+    let parse = |name: &str, value: &str| {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .map_err(|e| AppError::BadRequest(format!("'{name}' is not an RFC 3339 date: {e}")))
+    };
+    let to = match query.to.as_deref().filter(|s| !s.is_empty()) {
+        Some(raw) => parse("to", raw)?,
+        None => now,
+    };
+    let from = match query.from.as_deref().filter(|s| !s.is_empty()) {
+        Some(raw) => parse("from", raw)?,
+        None => to - chrono::Duration::days(COST_BREAKDOWN_DEFAULT_DAYS),
+    };
+    if from >= to {
+        return Err(AppError::BadRequest(format!(
+            "'from' ({from}) must be before 'to' ({to})"
+        )));
+    }
+    Ok((from, to))
+}
+
+/// GET /api/runner/cost-breakdown?group_by=model|provider|task_class|routed_by&from=&to=
+///
+/// Cost aggregates of the agent executions started in the window (B35): per
+/// group, the executions, the marginal and notional counters and the unknown
+/// count (never summed together, A21), the tokens, the share of first attempts
+/// that passed verification and the median duration.
+pub async fn get_runner_cost_breakdown(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<CostBreakdownQuery>,
+) -> Result<Json<CostBreakdownResponse>, AppError> {
+    use crate::neo4j::agent_execution::CostGroupBy;
+    let group_by = match query.group_by.as_deref().filter(|s| !s.is_empty()) {
+        None => CostGroupBy::Model,
+        Some(raw) => CostGroupBy::parse(raw).ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "unknown group_by '{raw}' (expected one of: {})",
+                CostGroupBy::ALL.join(", ")
+            ))
+        })?,
+    };
+    let (from, to) = cost_breakdown_window(&query, chrono::Utc::now())?;
+    let groups = state
+        .orchestrator
+        .neo4j()
+        .agent_execution_cost_breakdown(group_by, from, to)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(CostBreakdownResponse {
+        group_by,
+        from,
+        to,
+        groups,
+    }))
+}
+
 /// POST /api/plans/:id/run/auto-pr — Create a PR from a completed plan.
 ///
 /// Verifies the plan is completed, collects commits, generates a PR body,
@@ -9216,6 +9305,244 @@ mod tests {
         *crate::runner::RUNNER_STATE.write().await = None;
         crate::runner::RUNNER_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
         crate::runner::runner::RUNNER_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // ── GET /api/runner/cost-breakdown (B35) ───────────────────────────────
+
+    fn breakdown_execution(
+        started_at: chrono::DateTime<chrono::Utc>,
+        provider: &str,
+        model: Option<&str>,
+        class: Option<&str>,
+        routed_by: &str,
+        usd: f64,
+        basis: Option<&str>,
+    ) -> crate::neo4j::agent_execution::AgentExecutionNode {
+        use crate::neo4j::agent_execution::{AgentExecutionNode, AgentExecutionStatus};
+        let mut ae = AgentExecutionNode::new(Uuid::new_v4(), Uuid::new_v4());
+        ae.started_at = started_at;
+        ae.status = AgentExecutionStatus::Completed;
+        ae.provider_id = provider.into();
+        ae.model = model.map(str::to_string);
+        ae.task_class = class.map(str::to_string);
+        ae.routed_by = routed_by.into();
+        ae.cost_usd = usd;
+        ae.cost_basis = basis.map(str::to_string);
+        ae.tokens_in = Some(100);
+        ae.tokens_out = Some(10);
+        ae.verification_passed = Some(true);
+        ae.duration_secs = 12.0;
+        ae
+    }
+
+    fn breakdown_query(group_by: &str, from: Option<&str>, to: Option<&str>) -> CostBreakdownQuery {
+        CostBreakdownQuery {
+            group_by: Some(group_by.to_string()),
+            from: from.map(str::to_string),
+            to: to.map(str::to_string),
+        }
+    }
+
+    /// (B35) The four group_by over the mock, bounded by from/to: two counters
+    /// never summed together, old nodes (no model) under `unknown`, the rest of
+    /// the cells (tokens, first-attempt rate, median) carried through.
+    #[tokio::test]
+    async fn the_cost_breakdown_groups_the_window_by_each_key_without_mixing_bases() {
+        use chrono::TimeZone;
+        let state = mock_server_state().await;
+        let graph = state.orchestrator.neo4j();
+        let day = |d: u32| chrono::Utc.with_ymd_and_hms(2026, 3, d, 12, 0, 0).unwrap();
+        let rows = [
+            breakdown_execution(
+                day(2),
+                "claude-code",
+                Some("opus"),
+                Some("complex"),
+                "default",
+                2.0,
+                Some("reported"),
+            ),
+            breakdown_execution(
+                day(3),
+                "deepseek",
+                Some("ds-chat"),
+                Some("simple"),
+                "project_rule",
+                0.5,
+                Some("priced"),
+            ),
+            breakdown_execution(
+                day(4),
+                "claude-code",
+                Some("opus"),
+                Some("simple"),
+                "default",
+                3.0,
+                Some("subscription"),
+            ),
+            breakdown_execution(
+                day(5),
+                "local",
+                Some("llama"),
+                None,
+                "run",
+                99.0,
+                Some("unknown"),
+            ),
+            // An old node: no model, no basis, no class.
+            breakdown_execution(day(6), "claude-code", None, None, "default", 0.25, None),
+            // Outside the window.
+            breakdown_execution(
+                day(20),
+                "claude-code",
+                Some("opus"),
+                Some("simple"),
+                "default",
+                1_000.0,
+                Some("reported"),
+            ),
+        ];
+        for ae in &rows {
+            graph.create_agent_execution(ae).await.unwrap();
+        }
+        let (from, to) = (Some("2026-03-01T00:00:00Z"), Some("2026-03-10T00:00:00Z"));
+        let call = |group_by: &str| {
+            let state = state.clone();
+            let q = breakdown_query(group_by, from, to);
+            async move { get_runner_cost_breakdown(State(state), Query(q)).await }
+        };
+
+        let by_model = call("model").await.unwrap().0;
+        assert_eq!(
+            by_model.from,
+            chrono::Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap()
+        );
+        let keys: Vec<_> = by_model.groups.iter().map(|g| g.key.as_str()).collect();
+        assert_eq!(keys, ["ds-chat", "llama", "opus", "unknown"]);
+        let opus = &by_model.groups[2];
+        assert_eq!(
+            opus.executions, 2,
+            "the 1 000 USD attempt of day 20 is outside the window"
+        );
+        assert_eq!(
+            (
+                opus.cost.marginal_usd,
+                opus.cost.notional_usd,
+                opus.cost.unknown_count
+            ),
+            (2.0, 3.0, 0)
+        );
+        assert_eq!(
+            (opus.tokens.input, opus.tokens.output),
+            (Some(200), Some(20))
+        );
+        assert_eq!(opus.verified_first_attempt_rate, Some(1.0));
+        assert_eq!(opus.median_duration_secs, Some(12.0));
+        let llama = &by_model.groups[1];
+        assert_eq!(
+            (
+                llama.cost.marginal_usd,
+                llama.cost.notional_usd,
+                llama.cost.unknown_count
+            ),
+            (0.0, 0.0, 1),
+            "an unknown cost is counted, never summed"
+        );
+        let old = &by_model.groups[3];
+        assert_eq!(
+            (old.executions, old.cost.marginal_usd),
+            (1, 0.25),
+            "an old node: model unknown, cost reported"
+        );
+
+        let by_provider = call("provider").await.unwrap().0;
+        assert_eq!(
+            by_provider
+                .groups
+                .iter()
+                .map(|g| g.key.as_str())
+                .collect::<Vec<_>>(),
+            ["claude-code", "deepseek", "local"]
+        );
+        assert_eq!(
+            (
+                by_provider.groups[0].cost.marginal_usd,
+                by_provider.groups[0].cost.notional_usd
+            ),
+            (2.25, 3.0)
+        );
+
+        let by_class = call("task_class").await.unwrap().0;
+        assert_eq!(
+            by_class
+                .groups
+                .iter()
+                .map(|g| (g.key.as_str(), g.executions))
+                .collect::<Vec<_>>(),
+            [("complex", 1), ("simple", 2), ("unclassified", 2)]
+        );
+
+        let by_route = call("routed_by").await.unwrap().0;
+        assert_eq!(
+            by_route
+                .groups
+                .iter()
+                .map(|g| (g.key.as_str(), g.executions))
+                .collect::<Vec<_>>(),
+            [("default", 3), ("project_rule", 1), ("run", 1)]
+        );
+
+        // Without a group_by: by model. Without a window: the last 30 days (empty here).
+        let default =
+            get_runner_cost_breakdown(State(state.clone()), Query(CostBreakdownQuery::default()))
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(
+            default.group_by,
+            crate::neo4j::agent_execution::CostGroupBy::Model
+        );
+        assert!(default.groups.is_empty());
+        assert_eq!(default.to - default.from, chrono::Duration::days(30));
+    }
+
+    #[tokio::test]
+    async fn the_cost_breakdown_refuses_an_unknown_group_and_a_bad_window() {
+        let state = mock_server_state().await;
+        let bad_group = get_runner_cost_breakdown(
+            State(state.clone()),
+            Query(breakdown_query("session", None, None)),
+        )
+        .await;
+        match bad_group {
+            Err(AppError::BadRequest(msg)) => assert!(
+                msg.contains("model, provider, task_class, routed_by"),
+                "{msg}"
+            ),
+            other => panic!("expected 400, got {:?}", other.map(|r| r.0.groups.len())),
+        }
+        let bad_date = get_runner_cost_breakdown(
+            State(state.clone()),
+            Query(breakdown_query("model", Some("yesterday"), None)),
+        )
+        .await;
+        assert!(
+            matches!(bad_date, Err(AppError::BadRequest(_))),
+            "a malformed date is a 400"
+        );
+        let empty_window = get_runner_cost_breakdown(
+            State(state.clone()),
+            Query(breakdown_query(
+                "model",
+                Some("2026-03-10T00:00:00Z"),
+                Some("2026-03-01T00:00:00Z"),
+            )),
+        )
+        .await;
+        assert!(
+            matches!(empty_window, Err(AppError::BadRequest(_))),
+            "from after to is a 400"
+        );
     }
 
     /// The run endpoints must refuse to act on a run that belongs to another plan.

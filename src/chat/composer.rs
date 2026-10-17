@@ -1383,6 +1383,29 @@ mod tests {
         assert_eq!(compute_dynamic_budget(Some(u64::MAX), 0), 40_000);
     }
 
+    /// (B16-3) The runner's sessions get the same budget as a chat's: from the
+    /// window the catalog knows, never from the model's name. A 32K window is
+    /// budgeted at 15% of its room; a 1M window hits the 40K ceiling.
+    #[test]
+    fn test_budget_32k_and_1m_windows_follow_the_window_not_the_name() {
+        // 32K × 4 = 128K chars; 15% = 19 200 (no base prompt).
+        assert_eq!(compute_dynamic_budget(Some(32_000), 0), 19_200);
+        // With a 50K base prompt: (128K − 50K) × 15% = 11 700.
+        assert_eq!(compute_dynamic_budget(Some(32_000), 50_000), 11_700);
+        // 1M × 4 = 4M chars; 15% ≫ 40K → the ceiling, base prompt or not.
+        assert_eq!(compute_dynamic_budget(Some(1_000_000), 0), 40_000);
+        assert_eq!(compute_dynamic_budget(Some(1_000_000), 50_000), 40_000);
+        // Same window, any name: same budget.
+        for model in ["claude-opus-4-20250514", "deepseek-chat", "qwen3-coder"] {
+            let input = ComposerInput {
+                model,
+                context_window: Some(32_000),
+                ..Default::default()
+            };
+            assert_eq!(compute_dynamic_budget(input.context_window, 0), 19_200);
+        }
+    }
+
     #[test]
     fn test_budget_large_base_prompt_reduces_budget() {
         // Base prompt nearly fills the context window

@@ -44,6 +44,8 @@ impl Neo4jClient {
                 started_at: datetime($started_at),
                 status: $status,
                 cost_usd: $cost_usd,
+                notional_usd: $notional_usd,
+                tokens_used: $tokens_used,
                 triggered_by: $triggered_by,
                 completed_tasks: $completed_tasks,
                 failed_tasks: $failed_tasks,
@@ -60,6 +62,8 @@ impl Neo4jClient {
         .param("started_at", state.started_at.to_rfc3339())
         .param("status", state.status.to_string())
         .param("cost_usd", state.cost_usd)
+        .param("notional_usd", state.notional_usd)
+        .param("tokens_used", state.tokens_used as i64)
         .param(
             "triggered_by",
             serde_json::to_string(&state.triggered_by).unwrap_or_default(),
@@ -100,6 +104,8 @@ impl Neo4jClient {
             SET r.current_wave = $current_wave,
                 r.status = $status,
                 r.cost_usd = $cost_usd,
+                r.notional_usd = $notional_usd,
+                r.tokens_used = $tokens_used,
                 r.total_tasks = $total_tasks,
                 r.completed_tasks = $completed_tasks,
                 r.failed_tasks = $failed_tasks,
@@ -123,6 +129,8 @@ impl Neo4jClient {
             .param("current_wave", state.current_wave as i64)
             .param("status", state.status.to_string())
             .param("cost_usd", state.cost_usd)
+            .param("notional_usd", state.notional_usd)
+            .param("tokens_used", state.tokens_used as i64)
             .param("total_tasks", state.total_tasks as i64)
             .param(
                 "completed_tasks",
@@ -312,6 +320,16 @@ impl Neo4jClient {
             completed_at: completed_at.and_then(|s| s.parse().ok()),
             status: plan_run_status,
             cost_usd: node.get("cost_usd").unwrap_or(0.0),
+            // Two counters (A21), flat on the node since they exist; a node
+            // written before reads as zero. The unknown count only lives in
+            // `state_json`.
+            notional_usd: node.get("notional_usd").unwrap_or(0.0),
+            tokens_used: node
+                .get::<i64>("tokens_used")
+                .ok()
+                .and_then(|v| u64::try_from(v).ok())
+                .unwrap_or(0),
+            unknown_cost_attempts: 0,
             triggered_by: serde_json::from_str(&triggered_by).unwrap_or(TriggerSource::Manual),
             project_id: node
                 .get::<String>("project_id")

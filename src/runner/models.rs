@@ -33,8 +33,18 @@ pub struct RunnerConfig {
     pub build_check: bool,
     /// Run tests after each task (language-dependent). Default: false.
     pub test_runner: bool,
-    /// Maximum total cost (USD) for the entire plan run. Abort if exceeded. Default: 10.0.
+    /// Maximum total cost (USD) for the entire plan run. Abort if exceeded. Default: 50.0.
+    /// Only the MARGINAL counter (costs `reported` or `priced`) is held against it;
+    /// a subscription or a free endpoint never exhausts it (A21).
     pub max_cost_usd: f64,
+    /// Maximum tokens (input + output of every attempt) for the entire plan run.
+    /// The only budget a run on a provider without a price can have: without it,
+    /// a budgeted run on such a provider is refused at start. Default: none.
+    pub max_tokens: Option<u64>,
+    /// What to do when one task costs more than its profile's `max_cost_usd`
+    /// (marginal only): `warn` (default) emits an event and goes on; `enforce`
+    /// fails the attempt.
+    pub per_task_cap: PerTaskCap,
     /// Spawning timeout (seconds) — max time to wait for create_session() before aborting.
     /// Prevents indefinite hangs when ChatManager/Neo4j is unresponsive. Default: 120 (2 min).
     pub spawning_timeout_secs: u64,
@@ -60,6 +70,17 @@ pub struct RunnerConfig {
     pub max_parallel_tasks: usize,
 }
 
+/// What the runner does with a task whose marginal cost went past its profile's cap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerTaskCap {
+    /// Emit `RunnerEvent::TaskCostCapExceeded` and a log, keep the result.
+    #[default]
+    Warn,
+    /// Fail the attempt.
+    Enforce,
+}
+
 /// CWD validation mode for the runner.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -81,6 +102,8 @@ impl Default for RunnerConfig {
             build_check: true,
             test_runner: false,
             max_cost_usd: 50.0,
+            max_tokens: None,
+            per_task_cap: PerTaskCap::default(),
             spawning_timeout_secs: 480,
             cwd_validation: CwdValidation::default(),
             completion_loop_threshold: 5,
@@ -217,10 +240,17 @@ pub enum TaskResult {
     },
     /// Plan budget exceeded during this task
     BudgetExceeded {
-        /// Cumulative cost at the point of exceeding
+        /// Cumulative MARGINAL cost at the point of exceeding
         cumulated_cost_usd: f64,
-        /// Configured limit
+        /// Configured USD limit
         limit_usd: f64,
+        /// Tokens of the run at the point of exceeding, when the run is cut
+        /// on its token budget (a provider without a price).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cumulated_tokens: Option<u64>,
+        /// Configured token limit, when the run is cut on it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit_tokens: Option<u64>,
     },
 }
 
@@ -387,8 +417,26 @@ pub enum RunnerEvent {
         run_id: Uuid,
         task_id: Uuid,
         task_title: String,
+        /// What the provider stated; meaningful with `cost_basis` (0 when the
+        /// provider stated no amount).
         cost_usd: f64,
         duration_secs: f64,
+        /// Basis of `cost_usd`: `reported`, `priced`, `free`, `subscription` or
+        /// `unknown` (absent when the provider stated none).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_basis: Option<String>,
+    },
+    /// One task's MARGINAL cost went past its profile's `max_cost_usd`. Emitted
+    /// whatever `RunnerConfig::per_task_cap` says; `enforced` tells whether the
+    /// attempt was failed for it.
+    TaskCostCapExceeded {
+        run_id: Uuid,
+        task_id: Uuid,
+        cost_usd: f64,
+        cap_usd: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_basis: Option<String>,
+        enforced: bool,
     },
     /// A task has failed
     TaskFailed {
@@ -451,8 +499,14 @@ pub enum RunnerEvent {
     BudgetExceeded {
         run_id: Uuid,
         plan_id: Uuid,
+        /// Marginal counter of the run.
         cumulated_cost_usd: f64,
         limit_usd: f64,
+        /// Tokens of the run and the token limit, when the run has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cumulated_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit_tokens: Option<u64>,
     },
     /// Worktree commits were recovered after a wave
     WorktreeRecovery {
@@ -908,9 +962,75 @@ mod tests {
         let result = TaskResult::BudgetExceeded {
             cumulated_cost_usd: 10.5,
             limit_usd: 10.0,
+            cumulated_tokens: None,
+            limit_tokens: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"type\":\"budget_exceeded\""));
+        assert!(
+            !json.contains("cumulated_tokens"),
+            "a USD cut carries no token figure: {json}"
+        );
+
+        // A run cut on its tokens says so, and reads back.
+        let result = TaskResult::BudgetExceeded {
+            cumulated_cost_usd: 0.0,
+            limit_usd: 50.0,
+            cumulated_tokens: Some(1_200),
+            limit_tokens: Some(1_000),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"cumulated_tokens\":1200"), "{json}");
+        let back: TaskResult = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            TaskResult::BudgetExceeded {
+                limit_tokens: Some(1_000),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_completed_task_event_carries_the_basis_of_its_cost() {
+        let event = RunnerEvent::TaskCompleted {
+            run_id: Uuid::nil(),
+            task_id: Uuid::nil(),
+            task_title: "t".into(),
+            cost_usd: 0.3,
+            duration_secs: 1.0,
+            cost_basis: Some("subscription".into()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"cost_basis\":\"subscription\""), "{json}");
+        // The pre-A21 shape (no basis) still reads.
+        let old = serde_json::json!({"event": "task_completed", "run_id": Uuid::nil(),
+            "task_id": Uuid::nil(), "task_title": "t", "cost_usd": 0.3, "duration_secs": 1.0});
+        let back: RunnerEvent = serde_json::from_value(old).unwrap();
+        assert!(matches!(
+            back,
+            RunnerEvent::TaskCompleted {
+                cost_basis: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_per_task_cap_is_warn_unless_configured_and_a_token_budget_is_optional() {
+        let config = RunnerConfig::default();
+        assert_eq!(config.per_task_cap, PerTaskCap::Warn);
+        assert_eq!(config.max_tokens, None);
+        let config: RunnerConfig = serde_yaml::from_str(
+            r#"
+            max_tokens: 250000
+            per_task_cap: enforce
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.max_tokens, Some(250_000));
+        assert_eq!(config.per_task_cap, PerTaskCap::Enforce);
+        assert!(serde_yaml::from_str::<RunnerConfig>("per_task_cap: abort").is_err());
     }
 
     #[test]

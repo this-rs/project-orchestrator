@@ -3858,6 +3858,17 @@ pub trait GraphStore: Send + Sync {
         &self,
     ) -> Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>>;
 
+    /// Cost, tokens, first-attempt verification and median duration of the
+    /// executions started in `[from, to)`, one row per `group_by` key (B35).
+    /// Marginal and notional amounts are summed apart and an unknown cost is
+    /// counted, never summed (A21). Sorted by key.
+    async fn agent_execution_cost_breakdown(
+        &self,
+        group_by: crate::neo4j::agent_execution::CostGroupBy,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<crate::neo4j::agent_execution::CostBreakdownRow>>;
+
     /// Create a USED_SKILL relationship from AgentExecution to Skill.
     async fn create_used_skill_relation(
         &self,

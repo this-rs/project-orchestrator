@@ -16,15 +16,15 @@ use crate::runner::git;
 use crate::runner::guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict};
 use crate::runner::lifecycle;
 use crate::runner::models::{
-    ActiveAgent, ActiveAgentSnapshot, CwdValidation, PlanRunStatus, RunnerConfig, RunnerEvent,
-    StepBreakdown, TaskExecutionReport, TaskResult, TaskRunStatus, TriggerSource,
+    ActiveAgent, ActiveAgentSnapshot, CwdValidation, PerTaskCap, PlanRunStatus, RunnerConfig,
+    RunnerEvent, StepBreakdown, TaskExecutionReport, TaskResult, TaskRunStatus, TriggerSource,
 };
 use crate::runner::persona::{
     activate_skills_for_task, complexity_directive, profile_task, record_skill_feedback, Complexity,
 };
 #[cfg(test)]
 use crate::runner::prompt::{build_runner_constraints, RunnerPromptContext};
-use crate::runner::state::RunnerState;
+use crate::runner::state::{AttemptCost, BudgetBreach, RunBudget, RunnerState};
 use crate::runner::vector::VectorCollector;
 use crate::runner::verifier::TaskVerifier;
 
@@ -242,6 +242,11 @@ pub(crate) static RUNNER_GLOBALS_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
 /// Stores f64 bits in an AtomicU64 (0 = no override, use config default).
 /// Set via PATCH /api/plans/{plan_id}/run/budget.
 pub static RUNNER_BUDGET: LazyLock<Arc<std::sync::atomic::AtomicU64>> =
+    LazyLock::new(|| Arc::new(std::sync::atomic::AtomicU64::new(0)));
+
+/// Token budget of the running execution (`RunnerConfig::max_tokens`), for the
+/// status snapshot; 0 = none. Set at start.
+pub static RUNNER_MAX_TOKENS: LazyLock<Arc<std::sync::atomic::AtomicU64>> =
     LazyLock::new(|| Arc::new(std::sync::atomic::AtomicU64::new(0)));
 
 /// Vector collector — accumulates drift/knowledge metrics during execution.
@@ -694,9 +699,16 @@ pub struct RunStatus {
     pub tasks_completed: usize,
     pub tasks_total: usize,
     pub elapsed_secs: f64,
+    /// Marginal counter: the real spend of the run (A21).
     pub cost_usd: f64,
     /// Current effective budget limit (from override or config).
     pub max_cost_usd: f64,
+    /// Notional counter: subscription / free usage at its stated amount (A21).
+    pub notional_usd: f64,
+    /// Tokens (input + output) of every attempt of the run.
+    pub tokens_used: u64,
+    /// Token budget of the run, when it has one.
+    pub max_tokens: Option<u64>,
 }
 
 impl PlanRunner {
@@ -708,6 +720,40 @@ impl PlanRunner {
         } else {
             f64::from_bits(bits)
         }
+    }
+
+    /// The limits of the run: the effective USD ceiling on the marginal counter
+    /// and the token ceiling of the configuration (A21).
+    pub fn run_budget(&self) -> RunBudget {
+        RunBudget {
+            max_cost_usd: self.effective_budget(),
+            max_tokens: self.config.max_tokens,
+        }
+    }
+
+    /// Why this run cannot be budgeted, when it cannot (A21): the provider named
+    /// at the run level states no price, so the USD budget would never move, and
+    /// nothing bounds the run in tokens (neither `runner.max_tokens` nor the
+    /// run's per-session `max_tokens`). `None` when the run can start. A
+    /// provider the rules pick per task cannot be judged here.
+    async fn unbudgetable_run_refusal(&self) -> Option<String> {
+        let provider = self.run_provider.as_deref()?;
+        if self.config.max_cost_usd <= 0.0
+            || self.config.max_tokens.is_some()
+            || self.run_max_tokens.is_some()
+            || provider == crate::chat::provider::resolver::CLAUDE_CODE
+        {
+            return None;
+        }
+        let record =
+            match crate::chat::provider::store::instance(self.graph.as_ref(), provider).await {
+                Ok(record) => record?,
+                Err(e) => {
+                    warn!(provider, "Provider instance unreadable at run start: {e:#}");
+                    return None;
+                }
+            };
+        budget_refusal_for_cost_source(provider, &record.cost_source, self.config.max_cost_usd)
     }
 
     /// Update the budget override for the currently running execution.
@@ -730,6 +776,14 @@ impl PlanRunner {
                 state.status
             )),
             None => Err(anyhow!("No active run")),
+        }
+    }
+
+    /// The token budget of the running execution (static, no &self needed).
+    pub fn current_max_tokens() -> Option<u64> {
+        match RUNNER_MAX_TOKENS.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
         }
     }
 
@@ -945,6 +999,9 @@ impl PlanRunner {
                     (run_id.to_string(), CrudAction::Updated)
                 }
                 RunnerEvent::BudgetExceeded { run_id, .. } => {
+                    (run_id.to_string(), CrudAction::Updated)
+                }
+                RunnerEvent::TaskCostCapExceeded { run_id, .. } => {
                     (run_id.to_string(), CrudAction::Updated)
                 }
                 RunnerEvent::RunnerError { run_id, .. } => {
@@ -1212,6 +1269,11 @@ impl PlanRunner {
         if let Some(refusal) = active_run_refusal(RUNNER_STATE.read().await.as_ref(), plan_id) {
             return Err(anyhow!(refusal));
         }
+        // A budgeted run on a provider without a price has nothing to hold its
+        // USD budget against: refused unless it is bounded in tokens (A21).
+        if let Some(refusal) = self.unbudgetable_run_refusal().await {
+            return Err(anyhow!(refusal));
+        }
 
         // 1. Check no active run exists for this plan
         let active_runs = self.graph.list_active_plan_runs().await?;
@@ -1267,6 +1329,10 @@ impl PlanRunner {
         RUNNER_CANCEL.store(false, Ordering::SeqCst);
         RUNNER_BUDGET.store(
             self.config.max_cost_usd.to_bits(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        RUNNER_MAX_TOKENS.store(
+            self.config.max_tokens.unwrap_or(0),
             std::sync::atomic::Ordering::Relaxed,
         );
         {
@@ -1557,6 +1623,9 @@ impl PlanRunner {
                     elapsed_secs: state.elapsed_secs(),
                     cost_usd: state.cost_usd,
                     max_cost_usd: Self::current_budget(),
+                    notional_usd: state.notional_usd,
+                    tokens_used: state.tokens_used,
+                    max_tokens: Self::current_max_tokens(),
                 }
             }
             None => RunStatus {
@@ -1574,6 +1643,9 @@ impl PlanRunner {
                 elapsed_secs: 0.0,
                 cost_usd: 0.0,
                 max_cost_usd: 0.0,
+                notional_usd: 0.0,
+                tokens_used: 0,
+                max_tokens: None,
             },
         }
     }
@@ -1773,18 +1845,20 @@ impl PlanRunner {
                         .await?;
                 } else {
                     // Budget exceeded
-                    let (cumulated, limit) = {
+                    let (cumulated, limit, tokens) = {
                         let global = RUNNER_STATE.read().await;
                         global
                             .as_ref()
-                            .map(|s| (s.cost_usd, self.effective_budget()))
-                            .unwrap_or((0.0, 0.0))
+                            .map(|s| (s.cost_usd, self.effective_budget(), s.tokens_used))
+                            .unwrap_or((0.0, 0.0, 0))
                     };
                     self.emit_event(RunnerEvent::BudgetExceeded {
                         run_id,
                         plan_id,
                         cumulated_cost_usd: cumulated,
                         limit_usd: limit,
+                        cumulated_tokens: self.config.max_tokens.map(|_| tokens),
+                        limit_tokens: self.config.max_tokens,
                     });
                     self.finalize_run(run_id, PlanRunStatus::BudgetExceeded, Some(&cwd))
                         .await?;
@@ -2171,8 +2245,15 @@ impl PlanRunner {
                     duration_secs,
                     cost_usd,
                 }) => {
-                    self.on_task_completed(run_id, task_id, duration_secs, cost_usd, Some(cwd))
-                        .await?;
+                    self.on_task_completed(
+                        run_id,
+                        task_id,
+                        duration_secs,
+                        cost_usd,
+                        cost_basis_of(task_agent_execution.as_ref()),
+                        Some(cwd),
+                    )
+                    .await?;
                     wave_result.tasks_completed.push(task_id);
                     wave_result.wave_cost_usd += cost_usd;
 
@@ -2265,8 +2346,15 @@ impl PlanRunner {
                             "Task {} failed ({}) but all steps are completed — auto-completing",
                             task_id, reason
                         );
-                        self.on_task_completed(run_id, task_id, 0.0, cost_usd, Some(cwd))
-                            .await?;
+                        self.on_task_completed(
+                            run_id,
+                            task_id,
+                            0.0,
+                            cost_usd,
+                            cost_basis_of(task_agent_execution.as_ref()),
+                            Some(cwd),
+                        )
+                        .await?;
                         wave_result.tasks_completed.push(task_id);
                         wave_result.wave_cost_usd += cost_usd;
 
@@ -2344,8 +2432,15 @@ impl PlanRunner {
                             "Task {} timed out but all steps are completed — auto-completing",
                             task_id
                         );
-                        self.on_task_completed(run_id, task_id, duration_secs, cost_usd, Some(cwd))
-                            .await?;
+                        self.on_task_completed(
+                            run_id,
+                            task_id,
+                            duration_secs,
+                            cost_usd,
+                            cost_basis_of(task_agent_execution.as_ref()),
+                            Some(cwd),
+                        )
+                        .await?;
                         wave_result.tasks_completed.push(task_id);
                         wave_result.wave_cost_usd += cost_usd;
 
@@ -2430,12 +2525,16 @@ impl PlanRunner {
                 Ok(TaskResult::BudgetExceeded {
                     cumulated_cost_usd,
                     limit_usd,
+                    cumulated_tokens,
+                    limit_tokens,
                 }) => {
                     self.emit_event(RunnerEvent::BudgetExceeded {
                         run_id,
                         plan_id,
                         cumulated_cost_usd,
                         limit_usd,
+                        cumulated_tokens,
+                        limit_tokens,
                     });
                     // The agent returned but the run is cut before its work is
                     // judged: neither completed nor failed. The attempt's own
@@ -2511,7 +2610,7 @@ impl PlanRunner {
             {
                 let global = RUNNER_STATE.read().await;
                 if let Some(ref s) = *global {
-                    if s.is_budget_exceeded(self.effective_budget()) {
+                    if s.budget_breach(&self.run_budget()).is_some() {
                         wave_result.aborted = true;
                         drop(global);
                         join_set.abort_all();
@@ -2614,7 +2713,7 @@ impl PlanRunner {
                 {
                     let global = RUNNER_STATE.read().await;
                     if let Some(ref s) = *global {
-                        if s.is_budget_exceeded(self.effective_budget()) {
+                        if s.budget_breach(&self.run_budget()).is_some() {
                             info!("Budget exceeded, skipping remaining retries");
                             break;
                         }
@@ -2691,6 +2790,7 @@ impl PlanRunner {
                                 *task_id,
                                 duration_secs,
                                 cost_usd,
+                                cost_basis_of(exec_result.agent_execution.as_ref()),
                                 Some(cwd),
                             )
                             .await?;
@@ -2835,7 +2935,7 @@ impl PlanRunner {
                         "Post-wave watchdog: task {} ({}) has all steps completed but agent still active — auto-completing",
                         orphan_id, orphan_title
                     );
-                    self.on_task_completed(run_id, *orphan_id, 0.0, 0.0, Some(cwd))
+                    self.on_task_completed(run_id, *orphan_id, 0.0, 0.0, None, Some(cwd))
                         .await?;
                     wave_result.tasks_completed.push(*orphan_id);
                 } else {
@@ -3714,7 +3814,7 @@ impl PlanRunner {
                                         // No Result but agent said it's done — treat as success
                                         info!("No Result event but agent signaled completion — treating as success");
                                         (EventListenResult::Completed {
-                                            cost_usd: 0.0,
+                                            cost: AttemptCost::default(),
                                             is_error: false,
                                             error_text: String::new(),
                                             subtype: "completion_loop".to_string(),
@@ -3742,7 +3842,6 @@ impl PlanRunner {
         let cost_reported = event_metrics.cost_reported;
         let effective_model = event_metrics.model.clone();
         let cost_basis = event_metrics.cost_basis.clone();
-        let basis_for_budget = event_metrics.cost_basis.clone();
         let tokens = (
             event_metrics.tokens_in,
             event_metrics.tokens_out,
@@ -3777,13 +3876,13 @@ impl PlanRunner {
         };
 
         // Process the event listener result
-        let (cost_usd, is_error, error_text, _subtype, _timed_out) = match event_result {
+        let (attempt_cost, is_error, error_text, _subtype, _timed_out) = match event_result {
             EventListenResult::Completed {
-                cost_usd,
+                cost,
                 is_error,
                 error_text,
                 subtype,
-            } => (cost_usd, is_error, error_text, subtype, false),
+            } => (cost, is_error, error_text, subtype, false),
             EventListenResult::ChannelClosed { cost_usd } => {
                 // Channel closed without Result — check guard verdict
                 let result = if let GuardVerdict::Timeout { elapsed_secs } = guard_verdict {
@@ -3812,6 +3911,10 @@ impl PlanRunner {
             }
         };
 
+        // The figure the `TaskResult` variants carry: 0 when the provider stated
+        // no amount (the basis on the node says so; the counters never read it).
+        let cost_usd = attempt_cost.usd.unwrap_or(0.0);
+
         // Only honor guard timeout if we did NOT get a successful Result
         // (the select! already gave priority to Results, but double-check)
         if is_error {
@@ -3827,20 +3930,35 @@ impl PlanRunner {
 
         let duration_secs = start.elapsed().as_secs_f64();
 
-        // Check budget AFTER this task's cost
+        // Account this attempt's cost on the counter its basis names, then hold
+        // the run against its limits (A21): the marginal counter against the
+        // USD budget, the tokens of every attempt against the token budget.
         // Note: agent cost is already updated in listen_for_result for real-time tracking
         {
             let mut global = RUNNER_STATE.write().await;
             if let Some(ref mut s) = *global {
-                // Two counters (A21): only a real spend (reported / priced) goes
-                // toward the budget; a subscription or a free endpoint does not.
-                if crate::chat::cost::counts_toward_budget(basis_for_budget.as_deref()) {
-                    s.add_cost(cost_usd);
-                }
-                if s.is_budget_exceeded(self.effective_budget()) {
-                    let result = TaskResult::BudgetExceeded {
-                        cumulated_cost_usd: s.cost_usd,
-                        limit_usd: self.effective_budget(),
+                s.add_attempt_cost(&attempt_cost);
+                let budget = self.run_budget();
+                if let Some(breach) = s.budget_breach(&budget) {
+                    let result = match breach {
+                        BudgetBreach::Usd {
+                            cumulated_usd,
+                            limit_usd,
+                        } => TaskResult::BudgetExceeded {
+                            cumulated_cost_usd: cumulated_usd,
+                            limit_usd,
+                            cumulated_tokens: None,
+                            limit_tokens: None,
+                        },
+                        BudgetBreach::Tokens {
+                            cumulated_tokens,
+                            limit_tokens,
+                        } => TaskResult::BudgetExceeded {
+                            cumulated_cost_usd: s.cost_usd,
+                            limit_usd: budget.max_cost_usd,
+                            cumulated_tokens: Some(cumulated_tokens),
+                            limit_tokens: Some(limit_tokens),
+                        },
                     };
                     self.finalize_steps(task_id, &result, cwd).await;
                     // BudgetExceeded carries the run total, not this attempt's
@@ -3851,6 +3969,42 @@ impl PlanRunner {
                     }
                     return Ok(exec);
                 }
+            }
+        }
+
+        // Per-task cap (`warn` by default): only a real spend is held against
+        // the profile's `max_cost_usd`; a notional or unknown cost never is.
+        if let Some(spent) = attempt_cost
+            .marginal_usd()
+            .filter(|usd| *usd > task_profile.max_cost_usd)
+        {
+            let enforced = self.config.per_task_cap == PerTaskCap::Enforce;
+            warn!(
+                task_id = %task_id,
+                cost_usd = spent,
+                cap_usd = task_profile.max_cost_usd,
+                enforced,
+                "Task cost above its profile cap"
+            );
+            self.emit_event(RunnerEvent::TaskCostCapExceeded {
+                run_id,
+                task_id,
+                cost_usd: spent,
+                cap_usd: task_profile.max_cost_usd,
+                cost_basis: attempt_cost.basis.clone(),
+                enforced,
+            });
+            if enforced {
+                let result = TaskResult::Failed {
+                    reason: format!(
+                        "Task cost {spent:.4} USD above its {:.2} USD cap (per_task_cap: enforce)",
+                        task_profile.max_cost_usd
+                    ),
+                    attempts: 0,
+                    cost_usd,
+                };
+                self.finalize_steps(task_id, &result, cwd).await;
+                return Ok(wrap(result));
             }
         }
 
@@ -4092,6 +4246,7 @@ impl PlanRunner {
         task_id: Uuid,
         duration_secs: f64,
         cost_usd: f64,
+        cost_basis: Option<String>,
         cwd: Option<&str>,
     ) -> Result<()> {
         // Extract session_id BEFORE mark_task_completed removes the agent
@@ -4156,6 +4311,7 @@ impl PlanRunner {
             task_title: String::new(), // Title already logged
             cost_usd,
             duration_secs,
+            cost_basis,
         });
 
         info!(
@@ -5104,7 +5260,8 @@ impl PlanRunner {
         // Use a generous timeout here — the guard handles the actual task_timeout
         // with soft hints before hard stop. This is just a safety net.
         let safety_timeout = std::time::Duration::from_secs(self.config.task_timeout_secs + 60);
-        let mut cost_usd = 0.0_f64;
+        // A turn that ends without a `Result` event stated no cost.
+        let cost_usd = 0.0_f64;
         let mut metrics = EventMetrics::default();
 
         loop {
@@ -5112,7 +5269,7 @@ impl PlanRunner {
             if remaining.is_zero() {
                 return (
                     EventListenResult::Completed {
-                        cost_usd,
+                        cost: AttemptCost::default(),
                         is_error: true,
                         error_text: "Safety timeout exceeded".to_string(),
                         subtype: "timeout".to_string(),
@@ -5190,7 +5347,6 @@ impl PlanRunner {
                             metrics.tokens_cache_read = token("cache_read_tokens");
                             metrics.tokens_cache_write = token("cache_creation_tokens");
                             if let Some(c) = event_cost {
-                                cost_usd = *c;
                                 metrics.cost_reported = true;
                                 // Update agent cost in real-time for run_status
                                 if let Some(tid) = task_id {
@@ -5200,9 +5356,14 @@ impl PlanRunner {
                                     }
                                 }
                             }
+                            let cost = AttemptCost {
+                                usd: *event_cost,
+                                basis: metrics.cost_basis.clone(),
+                                tokens: metrics.turn_tokens(),
+                            };
                             return (
                                 EventListenResult::Completed {
-                                    cost_usd,
+                                    cost,
                                     is_error: *is_error,
                                     error_text: result_text.clone().unwrap_or_default(),
                                     subtype: subtype.clone(),
@@ -5227,6 +5388,31 @@ impl PlanRunner {
     }
 }
 
+/// The cost basis the provider stated on an attempt, read from its open node.
+fn cost_basis_of(ae: Option<&AgentExecutionNode>) -> Option<String> {
+    ae.and_then(|ae| ae.cost_basis.clone())
+}
+
+/// The refusal a run budgeted at `max_cost_usd` gets for a provider whose
+/// `cost_source` states no price (`unknown`, `none`, or anything this version
+/// does not know); `None` for a `reported`, `priced`, `free` or `subscription`
+/// one, whose basis is known even when it never spends (A21).
+fn budget_refusal_for_cost_source(
+    provider: &str,
+    cost_source: &str,
+    max_cost_usd: f64,
+) -> Option<String> {
+    if matches!(cost_source, "reported" | "priced" | "free" | "subscription") {
+        return None;
+    }
+    Some(format!(
+        "Run refused: provider '{provider}' states no price (cost_source: '{cost_source}'), \
+         so the {max_cost_usd:.2} USD budget could never be held against it. Set a token \
+         budget (`runner.max_tokens` in the configuration, or `max_tokens` on the run) \
+         or start the run without a USD budget."
+    ))
+}
+
 // ============================================================================
 // EventListenResult — internal result type for listen_for_result
 // ============================================================================
@@ -5235,7 +5421,9 @@ impl PlanRunner {
 enum EventListenResult {
     /// A Result event was received from the agent.
     Completed {
-        cost_usd: f64,
+        /// What the provider stated for the turn: amount (`None` without a
+        /// price), basis and tokens.
+        cost: AttemptCost,
         is_error: bool,
         error_text: String,
         subtype: String,
@@ -5272,6 +5460,16 @@ struct EventMetrics {
     tokens_out: Option<u64>,
     tokens_cache_read: Option<u64>,
     tokens_cache_write: Option<u64>,
+}
+
+impl EventMetrics {
+    /// Input + output tokens of the turn, `None` when the provider reported neither.
+    fn turn_tokens(&self) -> Option<u64> {
+        match (self.tokens_in, self.tokens_out) {
+            (None, None) => None,
+            (input, output) => Some(input.unwrap_or(0).saturating_add(output.unwrap_or(0))),
+        }
+    }
 }
 
 // ============================================================================
@@ -5396,6 +5594,7 @@ mod tests {
         }
         RUNNER_CANCEL.store(false, Ordering::SeqCst);
         RUNNER_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
+        RUNNER_MAX_TOKENS.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[tokio::test]
@@ -5721,6 +5920,9 @@ mod tests {
             elapsed_secs: 0.0,
             cost_usd: 0.0,
             max_cost_usd: 0.0,
+            notional_usd: 0.0,
+            tokens_used: 0,
+            max_tokens: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"running\":false"));
@@ -5905,12 +6107,12 @@ mod tests {
 
         match result {
             EventListenResult::Completed {
-                cost_usd,
+                cost,
                 is_error,
                 subtype,
                 ..
             } => {
-                assert!((cost_usd - 0.05).abs() < f64::EPSILON);
+                assert_eq!(cost.usd, Some(0.05));
                 assert!(!is_error);
                 assert_eq!(subtype, "success");
             }
@@ -6532,6 +6734,8 @@ mod tests {
         let result = TaskResult::BudgetExceeded {
             cumulated_cost_usd: 10.0,
             limit_usd: 5.0,
+            cumulated_tokens: None,
+            limit_tokens: None,
         };
         runner.finalize_steps(task_id, &result, "/tmp").await;
 
@@ -7162,7 +7366,7 @@ mod tests {
 
         // Call on_task_completed
         runner
-            .on_task_completed(run_id, task_id, 10.0, 0.5, None)
+            .on_task_completed(run_id, task_id, 10.0, 0.5, None, None)
             .await
             .unwrap();
 
@@ -7392,7 +7596,7 @@ mod tests {
         // Call with cwd = this project (cargo fmt will run and succeed)
         let cwd = env!("CARGO_MANIFEST_DIR");
         runner
-            .on_task_completed(run_id, task_id, 10.0, 0.5, Some(cwd))
+            .on_task_completed(run_id, task_id, 10.0, 0.5, None, Some(cwd))
             .await
             .unwrap();
 
@@ -7967,6 +8171,8 @@ mod tests {
         let outcome = TaskResult::BudgetExceeded {
             cumulated_cost_usd: 100.0,
             limit_usd: 50.0,
+            cumulated_tokens: None,
+            limit_tokens: None,
         };
         let cwd = env!("CARGO_MANIFEST_DIR");
         let breakdown = runner.finalize_steps(task_id, &outcome, cwd).await;
@@ -8202,7 +8408,7 @@ mod tests {
 
         // Call with cwd=None — should skip cargo fmt and still succeed
         runner
-            .on_task_completed(run_id, task_id, 5.0, 0.3, None)
+            .on_task_completed(run_id, task_id, 5.0, 0.3, None, None)
             .await
             .unwrap();
 
@@ -8441,7 +8647,7 @@ mod tests {
 
         // Pass None for cwd — this test verifies session close, not cargo fmt
         runner
-            .on_task_completed(run_id, task_id, 10.0, 0.5, None)
+            .on_task_completed(run_id, task_id, 10.0, 0.5, None, None)
             .await
             .unwrap();
 
@@ -8574,7 +8780,7 @@ mod tests {
         }
 
         runner
-            .on_task_completed(run_id, task_id, 42.0, 1.23, None)
+            .on_task_completed(run_id, task_id, 42.0, 1.23, None, None)
             .await
             .unwrap();
 
@@ -8743,7 +8949,7 @@ mod tests {
         }
 
         runner
-            .on_task_completed(run_id, task_id, 5.0, 0.3, None)
+            .on_task_completed(run_id, task_id, 5.0, 0.3, None, None)
             .await
             .unwrap();
 
@@ -8978,6 +9184,8 @@ mod tests {
         let (status, cost, _) = attempt_outcome(&TaskResult::BudgetExceeded {
             cumulated_cost_usd: 60.0,
             limit_usd: 50.0,
+            cumulated_tokens: None,
+            limit_tokens: None,
         });
         assert_eq!(status, AgentExecutionStatus::Interrupted);
         assert_eq!(cost, None, "the run total is not this attempt's cost");
@@ -9279,6 +9487,25 @@ mod tests {
         Arc<dyn GraphStore>,
         crate::chat::agent_runtime::fake::FakeProvider,
     ) {
+        let config = RunnerConfig {
+            max_cost_usd: 10.0,
+            ..RunnerConfig::default()
+        };
+        let (runner, graph, fake, _rx) = fake_runner(config, routing).await;
+        (runner, graph, fake)
+    }
+
+    /// A runner on the fake provider with `config`, with a receiver of its
+    /// RunnerEvents.
+    async fn fake_runner(
+        config: RunnerConfig,
+        routing: Option<Arc<crate::runner::routing::RoutingHandle>>,
+    ) -> (
+        PlanRunner,
+        Arc<dyn GraphStore>,
+        crate::chat::agent_runtime::fake::FakeProvider,
+        broadcast::Receiver<RunnerEvent>,
+    ) {
         use crate::chat::config::{ChatConfig, ProviderPath};
         use crate::chat::manager::ChatManager;
         use crate::meilisearch::mock::MockSearchStore;
@@ -9334,11 +9561,7 @@ mod tests {
             plan_manager,
             note_manager,
         ));
-        let (event_tx, _) = broadcast::channel(16);
-        let config = RunnerConfig {
-            max_cost_usd: 10.0,
-            ..RunnerConfig::default()
-        };
+        let (event_tx, rx) = broadcast::channel(64);
         let runner = PlanRunner::new(
             chat_manager,
             graph.clone(),
@@ -9347,7 +9570,7 @@ mod tests {
             event_tx,
         )
         .with_routing(routing);
-        (runner, graph, fake)
+        (runner, graph, fake, rx)
     }
 
     /// Runs one attempt of `task` to its `Done` event (cost basis `basis`).
@@ -9360,7 +9583,26 @@ mod tests {
         attempt: u32,
         basis: nexus_claude::agent::CostBasis,
     ) -> TaskExecutionResult {
-        use nexus_claude::agent::{AgentEvent, Cost, StopReason};
+        let cost = nexus_claude::agent::Cost {
+            usd: Some(0.25),
+            basis,
+        };
+        run_attempt_with(runner, fake, plan_id, run_id, task, attempt, cost, None).await
+    }
+
+    /// Runs one attempt of `task` to a `Done` event stating `cost` and `usage`.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_attempt_with(
+        runner: &PlanRunner,
+        fake: &crate::chat::agent_runtime::fake::FakeProvider,
+        plan_id: Uuid,
+        run_id: Uuid,
+        task: &crate::neo4j::models::TaskNode,
+        attempt: u32,
+        cost: nexus_claude::agent::Cost,
+        usage: Option<nexus_claude::agent::Usage>,
+    ) -> TaskExecutionResult {
+        use nexus_claude::agent::{AgentEvent, StopReason};
         let already = fake.state.turns_started.lock().unwrap().len();
         let pusher = fake.clone();
         tokio::spawn(async move {
@@ -9373,11 +9615,8 @@ mod tests {
                 subtype: Some("success".into()),
                 is_error: false,
                 result_text: Some("done".into()),
-                usage: Default::default(),
-                cost: Cost {
-                    usd: Some(0.25),
-                    basis,
-                },
+                usage: usage.unwrap_or_default(),
+                cost,
                 duration_ms: 5,
                 duration_api_ms: None,
                 num_turns: 1,
@@ -9413,6 +9652,432 @@ mod tests {
             *global = Some(RunnerState::new(run_id, plan.id, 1, TriggerSource::Manual));
         }
         (plan.id, run_id)
+    }
+
+    /// The RunnerEvents a receiver holds right now.
+    fn drain_events(rx: &mut broadcast::Receiver<RunnerEvent>) -> Vec<RunnerEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn usage(input: u64, output: u64) -> nexus_claude::agent::Usage {
+        nexus_claude::agent::Usage {
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            ..Default::default()
+        }
+    }
+
+    async fn counters() -> (f64, f64, u64, u32) {
+        let global = RUNNER_STATE.read().await;
+        let s = global.as_ref().expect("a run");
+        (
+            s.marginal_usd(),
+            s.notional_usd,
+            s.tokens_used,
+            s.unknown_cost_attempts,
+        )
+    }
+
+    // ---- Budget by basis, in tokens, per task (B16 / A21) ----------------
+
+    /// (B16-1) A provider that states no price: the USD budget never moves, the
+    /// run is cut on its tokens. The cut says so (tokens, not dollars) and the
+    /// attempt's node keeps the `unknown` basis.
+    #[tokio::test]
+    async fn a_run_on_a_provider_without_a_price_is_cut_on_its_token_budget() {
+        use nexus_claude::agent::{Cost, CostBasis};
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let config = RunnerConfig {
+            max_cost_usd: 10.0,
+            max_tokens: Some(100),
+            ..RunnerConfig::default()
+        };
+        let (runner, graph, fake, _rx) = fake_runner(config, None).await;
+        let (plan_id, run_id) = seed_run(&graph).await;
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let out = run_attempt_with(
+            &runner,
+            &fake,
+            plan_id,
+            run_id,
+            &task,
+            1,
+            Cost {
+                usd: None,
+                basis: CostBasis::Unknown,
+            },
+            Some(usage(80, 40)),
+        )
+        .await;
+        let (marginal, notional, tokens, unknown) = counters().await;
+        reset_globals().await;
+
+        assert!(
+            matches!(
+                out.result,
+                TaskResult::BudgetExceeded {
+                    cumulated_tokens: Some(120),
+                    limit_tokens: Some(100),
+                    ..
+                }
+            ),
+            "cut on tokens, not on dollars: {:?}",
+            out.result
+        );
+        assert_eq!((marginal, notional, tokens, unknown), (0.0, 0.0, 120, 1));
+        assert_eq!(
+            out.agent_execution
+                .as_ref()
+                .and_then(|ae| ae.cost_basis.as_deref()),
+            Some("unknown")
+        );
+    }
+
+    /// (B16-9) A cost the provider cannot price is `None`: no counter moves,
+    /// the attempt is counted apart, and the run goes on when nothing bounds
+    /// its tokens.
+    #[tokio::test]
+    async fn a_cost_without_a_price_is_none_and_counted_apart() {
+        use nexus_claude::agent::{Cost, CostBasis};
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (runner, graph, fake) = routed_runner(None).await;
+        let (plan_id, run_id) = seed_run(&graph).await;
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let out = run_attempt_with(
+            &runner,
+            &fake,
+            plan_id,
+            run_id,
+            &task,
+            1,
+            Cost {
+                usd: None,
+                basis: CostBasis::Unknown,
+            },
+            Some(usage(30, 5)),
+        )
+        .await;
+        let (marginal, notional, tokens, unknown) = counters().await;
+        reset_globals().await;
+
+        assert!(
+            matches!(out.result, TaskResult::Success { .. }),
+            "{:?}",
+            out.result
+        );
+        assert_eq!((marginal, notional, tokens, unknown), (0.0, 0.0, 35, 1));
+    }
+
+    /// (B16-8) A fictitious amount on a free endpoint: the marginal counter
+    /// does not move, the notional one does, a 1 USD budget is not exhausted,
+    /// and the attempt's node carries the basis.
+    #[tokio::test]
+    async fn a_free_cost_moves_the_notional_counter_only() {
+        use nexus_claude::agent::{Cost, CostBasis};
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let config = RunnerConfig {
+            max_cost_usd: 1.0,
+            ..RunnerConfig::default()
+        };
+        let (runner, graph, fake, _rx) = fake_runner(config, None).await;
+        let (plan_id, run_id) = seed_run(&graph).await;
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let out = run_attempt_with(
+            &runner,
+            &fake,
+            plan_id,
+            run_id,
+            &task,
+            1,
+            Cost {
+                usd: Some(5.0),
+                basis: CostBasis::Free,
+            },
+            Some(usage(10, 10)),
+        )
+        .await;
+        let (marginal, notional, tokens, unknown) = counters().await;
+        reset_globals().await;
+
+        assert!(
+            matches!(out.result, TaskResult::Success { .. }),
+            "{:?}",
+            out.result
+        );
+        assert_eq!((marginal, notional, tokens, unknown), (0.0, 5.0, 20, 0));
+        assert_eq!(
+            out.agent_execution
+                .as_ref()
+                .and_then(|ae| ae.cost_basis.as_deref()),
+            Some("free")
+        );
+    }
+
+    /// (B16-10) A task that costs more than its profile's cap (0.5 USD for a
+    /// simple task) is reported — event and log — and NOT stopped under the
+    /// default `warn`; `enforce` fails the attempt.
+    #[tokio::test]
+    async fn a_task_above_its_profile_cap_warns_by_default_and_fails_only_when_enforced() {
+        use nexus_claude::agent::{Cost, CostBasis};
+        let _lock = TEST_MUTEX.lock().await;
+        for (mode, enforced) in [(PerTaskCap::Warn, false), (PerTaskCap::Enforce, true)] {
+            reset_globals().await;
+            let config = RunnerConfig {
+                max_cost_usd: 10.0,
+                per_task_cap: mode,
+                ..RunnerConfig::default()
+            };
+            let (runner, graph, fake, mut rx) = fake_runner(config, None).await;
+            let (plan_id, run_id) = seed_run(&graph).await;
+            let task = crate::test_helpers::test_task();
+            graph.create_task(plan_id, &task).await.unwrap();
+
+            let out = run_attempt_with(
+                &runner,
+                &fake,
+                plan_id,
+                run_id,
+                &task,
+                1,
+                Cost {
+                    usd: Some(5.0),
+                    basis: CostBasis::Reported,
+                },
+                None,
+            )
+            .await;
+            let (marginal, ..) = counters().await;
+            let events = drain_events(&mut rx);
+            reset_globals().await;
+
+            let cap_event = events
+                .iter()
+                .find(|e| matches!(e, RunnerEvent::TaskCostCapExceeded { .. }))
+                .unwrap_or_else(|| panic!("{mode:?}: no cap event in {events:?}"));
+            match cap_event {
+                RunnerEvent::TaskCostCapExceeded {
+                    cost_usd,
+                    cap_usd,
+                    cost_basis,
+                    enforced: said,
+                    ..
+                } => {
+                    assert_eq!((*cost_usd, *cap_usd, *said), (5.0, 0.5, enforced));
+                    assert_eq!(cost_basis.as_deref(), Some("reported"));
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(marginal, 5.0, "{mode:?}: the spend is counted either way");
+            match (mode, &out.result) {
+                (PerTaskCap::Warn, TaskResult::Success { .. }) => {}
+                (PerTaskCap::Enforce, TaskResult::Failed { reason, .. }) => {
+                    assert!(reason.contains("cap"), "{reason}")
+                }
+                other => panic!("unexpected outcome for {mode:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// (B16-10 bis) A notional amount above the cap is not a spend: no cap event.
+    #[tokio::test]
+    async fn a_notional_amount_above_the_task_cap_raises_nothing() {
+        use nexus_claude::agent::{Cost, CostBasis};
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let config = RunnerConfig {
+            max_cost_usd: 10.0,
+            per_task_cap: PerTaskCap::Enforce,
+            ..RunnerConfig::default()
+        };
+        let (runner, graph, fake, mut rx) = fake_runner(config, None).await;
+        let (plan_id, run_id) = seed_run(&graph).await;
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan_id, &task).await.unwrap();
+        let out = run_attempt_with(
+            &runner,
+            &fake,
+            plan_id,
+            run_id,
+            &task,
+            1,
+            Cost {
+                usd: Some(5.0),
+                basis: CostBasis::Subscription,
+            },
+            None,
+        )
+        .await;
+        let events = drain_events(&mut rx);
+        reset_globals().await;
+        assert!(
+            matches!(out.result, TaskResult::Success { .. }),
+            "{:?}",
+            out.result
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RunnerEvent::TaskCostCapExceeded { .. })),
+            "{events:?}"
+        );
+    }
+
+    /// (B16-4) The completion event of a task carries the basis of its cost.
+    #[tokio::test]
+    async fn a_task_completed_event_carries_the_cost_basis() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (runner, graph, _fake, mut rx) = fake_runner(RunnerConfig::default(), None).await;
+        let (plan_id, run_id) = seed_run(&graph).await;
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan_id, &task).await.unwrap();
+        runner
+            .on_task_completed(
+                run_id,
+                task.id,
+                3.0,
+                0.4,
+                Some("subscription".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+        let events = drain_events(&mut rx);
+        reset_globals().await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RunnerEvent::TaskCompleted { cost_basis: Some(b), cost_usd, .. }
+                    if b == "subscription" && *cost_usd == 0.4
+            )),
+            "{events:?}"
+        );
+    }
+
+    /// (B16-2) A run budgeted in USD on a provider that states no price, with
+    /// nothing to bound it in tokens, is refused at start with a message that
+    /// names the way out. A token budget (configuration or run), a priced,
+    /// free or subscription provider, or no provider named: the run starts.
+    #[tokio::test]
+    async fn a_budgeted_run_on_an_unpriced_provider_without_a_token_budget_is_refused_at_start() {
+        use crate::chat::provider::settings::{InstanceRecord, GLOBAL, INSTANCE_PREFIX};
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (runner, graph, _fake, _rx) = fake_runner(RunnerConfig::default(), None).await;
+        for (id, cost_source) in [
+            ("unpriced", "unknown"),
+            ("gratis", "free"),
+            ("metered", "reported"),
+        ] {
+            let record = InstanceRecord {
+                id: id.into(),
+                kind: "openai_compatible".into(),
+                label: id.into(),
+                base_url: "http://127.0.0.1:1".into(),
+                origin: "http://127.0.0.1:1".into(),
+                cost_source: cost_source.into(),
+                credential_ref: "none".into(),
+                ..Default::default()
+            };
+            graph
+                .put_llm_setting(
+                    GLOBAL,
+                    &format!("{INSTANCE_PREFIX}{id}"),
+                    &serde_json::to_string(&record).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let plan = crate::test_helpers::test_plan();
+        graph.create_plan(&plan).await.unwrap();
+        let runner = Arc::new(runner.with_run_routing(Some("unpriced".into()), None, None));
+        let err = runner
+            .clone()
+            .start(plan.id, TriggerSource::Manual, "/tmp".into(), None)
+            .await
+            .expect_err("refused")
+            .to_string();
+        assert!(err.contains("unpriced") && err.contains("unknown"), "{err}");
+        assert!(err.contains("max_tokens"), "names the way out: {err}");
+        assert!(
+            RUNNER_STATE.read().await.is_none(),
+            "nothing was registered for a refused run"
+        );
+        assert!(
+            graph.list_active_plan_runs().await.unwrap().is_empty(),
+            "no PlanRun was created"
+        );
+
+        // The ways out.
+        let runner = Arc::try_unwrap(runner).ok().expect("sole owner");
+        let runner = runner.with_run_routing(Some("unpriced".into()), None, Some(4_000));
+        assert_eq!(
+            runner.unbudgetable_run_refusal().await,
+            None,
+            "a per-session token budget bounds the run"
+        );
+        let mut runner = runner.with_run_routing(Some("unpriced".into()), None, None);
+        runner.config.max_tokens = Some(100_000);
+        assert_eq!(runner.unbudgetable_run_refusal().await, None);
+        runner.config.max_tokens = None;
+        runner.config.max_cost_usd = 0.0;
+        assert_eq!(
+            runner.unbudgetable_run_refusal().await,
+            None,
+            "no USD budget, nothing to hold"
+        );
+        runner.config.max_cost_usd = 50.0;
+        let runner = runner.with_run_routing(Some("gratis".into()), None, None);
+        assert_eq!(
+            runner.unbudgetable_run_refusal().await,
+            None,
+            "free is a known basis"
+        );
+        let runner = runner.with_run_routing(Some("metered".into()), None, None);
+        assert_eq!(runner.unbudgetable_run_refusal().await, None);
+        let runner = runner.with_run_routing(Some("claude-code".into()), None, None);
+        assert_eq!(runner.unbudgetable_run_refusal().await, None);
+        let runner = runner.with_run_routing(None, None, None);
+        assert_eq!(
+            runner.unbudgetable_run_refusal().await,
+            None,
+            "the rules decide per task: nothing to judge at start"
+        );
+        let runner = runner.with_run_routing(Some("missing".into()), None, None);
+        assert_eq!(
+            runner.unbudgetable_run_refusal().await,
+            None,
+            "an unknown instance is refused elsewhere, not here"
+        );
+        reset_globals().await;
+    }
+
+    #[test]
+    fn the_budget_refusal_names_only_a_provider_without_a_price() {
+        for known in ["reported", "priced", "free", "subscription"] {
+            assert_eq!(budget_refusal_for_cost_source("p", known, 50.0), None);
+        }
+        for unpriced in ["unknown", "none", "", "whatever"] {
+            let msg = budget_refusal_for_cost_source("p", unpriced, 50.0).expect(unpriced);
+            assert!(
+                msg.contains("50.00 USD") && msg.contains("max_tokens"),
+                "{msg}"
+            );
+        }
     }
 
     /// (Round 3, finding 1) A person's run starts at full privilege; a

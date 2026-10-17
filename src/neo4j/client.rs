@@ -515,6 +515,11 @@ impl Neo4jClient {
             // order (index-backed ORDER BY + LIMIT), instead of gathering every
             // event of the conversation via HAS_EVENT and sorting in memory.
             "CREATE INDEX chat_event_session_seq IF NOT EXISTS FOR (e:ChatEvent) ON (e.session_id, e.seq)",
+            // AgentExecution: the cost breakdown (B35) scans a time window of
+            // closed attempts; the per-run and reconciliation reads seek by run / status.
+            "CREATE INDEX agent_execution_started_at IF NOT EXISTS FOR (ae:AgentExecution) ON (ae.started_at)",
+            "CREATE INDEX agent_execution_run IF NOT EXISTS FOR (ae:AgentExecution) ON (ae.run_id)",
+            "CREATE INDEX agent_execution_status IF NOT EXISTS FOR (ae:AgentExecution) ON (ae.status)",
             // Anchor indexes: reverse query "sessions anchored on X", and per-session reads/journal
             "CREATE INDEX anchor_target IF NOT EXISTS FOR (a:Anchor) ON (a.target_type, a.target_id)",
             "CREATE INDEX anchor_session IF NOT EXISTS FOR (a:Anchor) ON (a.session_id)",
