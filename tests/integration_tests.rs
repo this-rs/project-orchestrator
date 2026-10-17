@@ -1553,6 +1553,48 @@ async fn test_trigger_without_author_is_disabled_at_startup() {
     }
 }
 
+/// The startup migration decides AFTER it holds the trigger's lock: a trigger
+/// whose author is being written at that very moment keeps its author and
+/// stays enabled. Without the lock, Neo4j (read committed) evaluates the
+/// migration's `WHERE`, waits for the enabling to commit, then applies its
+/// `SET` without reading the node again — an authored trigger disabled as
+/// `no_author`. That is the race `test_trigger_without_author_is_disabled_at_startup`
+/// lost in CI whenever another test opened a client (and so ran the migration)
+/// between the creation of its trigger and its enabling.
+#[tokio::test]
+async fn test_trigger_migration_does_not_disable_a_trigger_being_enabled() {
+    use project_orchestrator::runner::{TriggerAuthor, TriggerType};
+    let Some((client, raw)) = trigger_test_graph().await else {
+        return;
+    };
+    let author = TriggerAuthor::from_claims(
+        &project_orchestrator::auth::jwt::Claims::service_account("integration-author"),
+    );
+    for round in 0..60 {
+        let trigger = trigger_on_new_plan(&client, &raw, TriggerType::Event, 0).await;
+        let migration = {
+            let client = client.clone();
+            tokio::spawn(async move { client.disable_authorless_triggers_impl().await })
+        };
+        let enabling = {
+            let client = client.clone();
+            let author = author.clone();
+            let id = trigger.id;
+            tokio::spawn(async move { client.enable_trigger_as_impl(id, &author).await })
+        };
+        migration.await.unwrap().unwrap();
+        enabling.await.unwrap().unwrap().unwrap();
+        let after = client.get_trigger_impl(trigger.id).await.unwrap().unwrap();
+        drop_trigger_and_plan(&client, &raw, &trigger).await;
+        assert_eq!(after.author.as_ref(), Some(&author), "round {round}");
+        assert!(
+            after.enabled,
+            "round {round}: enabled with its author, the migration must not undo it"
+        );
+        assert_eq!(after.disabled_reason, None, "round {round}");
+    }
+}
+
 /// (Round 3, nit) The approval records the plan's mark in the approving write
 /// itself (create, enable), from the database: what the dispatcher compares
 /// is two values the database wrote, never two clocks.
