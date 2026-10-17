@@ -71,6 +71,7 @@ fn node(id: Uuid) -> ChatSessionNode {
         engine: None,
         resume_token: None,
         execution_place: Default::default(),
+        project_inferred: false,
         access: Default::default(),
         owner: None,
     }

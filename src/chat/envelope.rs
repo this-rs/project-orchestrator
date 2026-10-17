@@ -231,6 +231,11 @@ pub struct ParentEnvelope {
     pub roots: Vec<String>,
     pub project_slug: Option<String>,
     pub workspace_slug: Option<String>,
+    /// ENV-WS: the projects of the parent's workspace, when the parent's project was
+    /// DEDUCED from its cwd (opened in all-projects mode). A child may then name any of
+    /// them. `None` (a chosen project, or no workspace): the child keeps the parent's project.
+    /// Directories and the permission ceiling are checked as always.
+    pub workspace_projects: Option<Vec<String>>,
 }
 
 /// The git directory of the repository that `dir` is a linked WORKTREE of, as git records it.
@@ -349,9 +354,18 @@ impl ParentEnvelope {
             _ => {}
         }
 
-        // Project: the parent's. A request may omit it; it may not differ.
+        // Project: the parent's. A request may omit it; it may not differ — unless the
+        // parent's project was deduced in a workspace (ENV-WS): then any project of that
+        // workspace, and only those.
+        let in_parent_workspace = |requested: &String| {
+            self.workspace_projects
+                .as_ref()
+                .is_some_and(|projects| projects.iter().any(|p| p == requested))
+        };
         match (&request.project_slug, &self.project_slug) {
-            (Some(requested), Some(parent)) if requested != parent => {
+            (Some(requested), Some(parent))
+                if requested != parent && !in_parent_workspace(requested) =>
+            {
                 return Err(EnvelopeError::ProjectMismatch {
                     requested: requested.clone(),
                     parent: parent.clone(),
@@ -508,13 +522,34 @@ pub async fn resolve_envelope(
     let mut roots = vec![parent.cwd.clone()];
     roots.extend(parent.add_dirs.clone().unwrap_or_default());
 
+    // ENV-WS: a deduced project is context, not a boundary. Only for a parent that was
+    // opened in a workspace; read from the graph, never from the request.
+    let workspace_projects = match (parent.project_inferred, parent.workspace_slug.as_deref()) {
+        (true, Some(ws)) => Some(workspace_project_slugs(graph, ws).await),
+        _ => None,
+    };
+
     Ok(ParentEnvelope {
         parent_session_id: parent_uuid,
         ceiling,
         roots,
         project_slug: parent.project_slug.clone(),
         workspace_slug: parent.workspace_slug.clone(),
+        workspace_projects,
     })
+}
+
+/// The slugs of the projects of a workspace. A read error or an unknown workspace gives an
+/// empty list: the child then keeps the parent's project (fail closed).
+async fn workspace_project_slugs(graph: &dyn GraphStore, workspace_slug: &str) -> Vec<String> {
+    let Ok(Some(ws)) = graph.get_workspace_by_slug(workspace_slug).await else {
+        return Vec::new();
+    };
+    graph
+        .list_workspace_projects(ws.id)
+        .await
+        .map(|projects| projects.into_iter().map(|p| p.slug).collect())
+        .unwrap_or_default()
 }
 
 /// Identify the caller of a spawn request and, for an agent, resolve its
@@ -656,6 +691,7 @@ mod tests {
             roots: vec!["/work/repo".into(), "/work/shared".into()],
             project_slug: Some("demo".into()),
             workspace_slug: None,
+            workspace_projects: None,
         }
     }
 
@@ -1194,6 +1230,153 @@ mod tests {
         resolve_envelope(&graph, &l, &parent.to_string(), None, MAX_LIVE_CHILDREN)
             .await
             .unwrap();
+    }
+
+    // ── ENV-WS: a project deduced in a workspace is context, not a boundary ────
+
+    /// A parent in workspace `ws` (projects `demo` and `backend`) whose project is `demo`,
+    /// `inferred` saying whether it was deduced from its cwd or chosen.
+    async fn workspace_parent(inferred: bool) -> (MockGraphStore, Uuid) {
+        let graph = MockGraphStore::new();
+        let mut ws = crate::test_helpers::test_workspace();
+        ws.slug = "ws".into();
+        graph.create_workspace(&ws).await.unwrap();
+        for slug in ["demo", "backend"] {
+            let mut p = crate::test_helpers::test_project();
+            p.slug = slug.into();
+            graph.create_project(&p).await.unwrap();
+            graph.add_project_to_workspace(ws.id, p.id).await.unwrap();
+        }
+        let mut parent = test_chat_session(Some("demo"));
+        parent.cwd = "/work/repo".into();
+        parent.workspace_slug = Some("ws".into());
+        parent.project_inferred = inferred;
+        let id = parent.id;
+        graph.create_chat_session(&parent).await.unwrap();
+        (graph, id)
+    }
+
+    async fn open(graph: &MockGraphStore, parent: Uuid) -> ParentEnvelope {
+        resolve_envelope(
+            graph,
+            &live("default"),
+            &parent.to_string(),
+            None,
+            MAX_LIVE_CHILDREN,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_deduced_project_lets_a_child_reach_another_project_of_the_same_workspace() {
+        let (graph, parent) = workspace_parent(true).await;
+        let env = open(&graph, parent).await;
+
+        let mut req = request("/work/repo", None);
+        req.project_slug = Some("backend".into());
+        env.apply(&mut req, "default").unwrap();
+        assert_eq!(req.project_slug.as_deref(), Some("backend"), "kept");
+        assert_eq!(req.workspace_slug.as_deref(), Some("ws"), "inherited");
+
+        // Never a project outside the parent's workspace.
+        let mut req = request("/work/repo", None);
+        req.project_slug = Some("elsewhere".into());
+        assert_eq!(
+            env.apply(&mut req, "default").unwrap_err().code(),
+            "envelope_project_mismatch"
+        );
+        // Nor another workspace.
+        let mut req = request("/work/repo", None);
+        req.workspace_slug = Some("other-ws".into());
+        req.project_slug = Some("backend".into());
+        assert_eq!(
+            env.apply(&mut req, "default").unwrap_err(),
+            EnvelopeError::WorkspaceMismatch
+        );
+    }
+
+    /// The project bound is the only thing that moves: the directories and the permission
+    /// ceiling stay the parent's.
+    #[tokio::test]
+    async fn a_deduced_project_widens_neither_the_directories_nor_the_mode() {
+        let (graph, parent) = workspace_parent(true).await;
+        let env = open(&graph, parent).await;
+
+        let mut req = request("/somewhere/else", None);
+        req.project_slug = Some("backend".into());
+        assert!(matches!(
+            env.apply(&mut req, "default"),
+            Err(EnvelopeError::CwdOutsideParent { .. })
+        ));
+
+        let mut req = request("/work/repo", Some("bypassPermissions"));
+        req.project_slug = Some("backend".into());
+        env.apply(&mut req, "default").unwrap();
+        assert_eq!(
+            req.permission_mode.as_deref(),
+            Some("default"),
+            "capped at the parent's mode"
+        );
+    }
+
+    /// A project the person CHOSE keeps the strict rule; so does every session stored
+    /// before the mark existed (it reads back as chosen).
+    #[tokio::test]
+    async fn a_chosen_project_still_bounds_the_child() {
+        let (graph, parent) = workspace_parent(false).await;
+        let env = open(&graph, parent).await;
+        assert_eq!(env.workspace_projects, None);
+
+        let mut req = request("/work/repo", None);
+        req.project_slug = Some("backend".into());
+        assert_eq!(
+            env.apply(&mut req, "default").unwrap_err().code(),
+            "envelope_project_mismatch"
+        );
+
+        let stored_before: crate::neo4j::models::ChatSessionNode = serde_json::from_value({
+            let mut v = serde_json::to_value(test_chat_session(Some("demo"))).unwrap();
+            v.as_object_mut().unwrap().remove("project_inferred");
+            v
+        })
+        .unwrap();
+        assert!(!stored_before.project_inferred, "absent = chosen");
+    }
+
+    /// Only the server marks a project as deduced, and only from the ABSENCE of a project in
+    /// the request: a caller that writes the mark into its request changes nothing.
+    #[test]
+    fn no_caller_can_mark_its_project_as_deduced() {
+        use crate::chat::manager::project_was_inferred;
+        assert!(
+            project_was_inferred(None, Some("demo")),
+            "none asked, one found"
+        );
+        assert!(!project_was_inferred(Some("demo"), Some("demo")), "chosen");
+        assert!(!project_was_inferred(None, None), "no project at all");
+
+        let req: ChatRequest = serde_json::from_value(serde_json::json!({
+            "message": "hi", "cwd": "/work/repo",
+            "project_inferred": true, "workspace_projects": ["backend"]
+        }))
+        .unwrap();
+        let back = serde_json::to_value(&req).unwrap();
+        assert!(back.get("project_inferred").is_none());
+        assert!(back.get("workspace_projects").is_none());
+    }
+
+    /// A deduced project with no workspace gives nothing more: there is no wider bound to
+    /// fall back to, so the child keeps the parent's project.
+    #[tokio::test]
+    async fn a_deduced_project_without_a_workspace_keeps_the_strict_rule() {
+        let graph = MockGraphStore::new();
+        let mut parent = test_chat_session(Some("demo"));
+        parent.cwd = "/work/repo".into();
+        parent.project_inferred = true;
+        graph.create_chat_session(&parent).await.unwrap();
+        let env = open(&graph, parent.id).await;
+        assert_eq!(env.workspace_projects, None);
     }
 
     #[tokio::test]

@@ -946,6 +946,7 @@ impl Worker {
             engine: parent.engine.clone(),
             resume_token: None,
             execution_place: parent.execution_place,
+            project_inferred: false,
             access: parent.access,
             owner: parent.owner.clone(),
             mirror_of: Some(MIRROR_OF_CLAUDE_CODE.to_string()),
