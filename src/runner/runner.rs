@@ -26,7 +26,7 @@ use crate::runner::persona::{
 use crate::runner::prompt::{build_runner_constraints, RunnerPromptContext};
 use crate::runner::state::RunnerState;
 use crate::runner::vector::VectorCollector;
-use crate::runner::verifier::{TaskVerifier, VerifyResult};
+use crate::runner::verifier::TaskVerifier;
 
 use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -547,6 +547,21 @@ struct WaveResult {
     pub wave_cost_usd: f64,
     /// Whether the wave was aborted due to budget or cancellation
     pub aborted: bool,
+}
+
+/// Which side of the retry loop a verification pass runs on.
+///
+/// The pass decides nothing by itself — it decides what a *failure* means: a
+/// retry opportunity before the loop, a final verdict after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifyPass {
+    /// Between the JoinSet and the retry loop: a task whose work does not
+    /// verify is retried, exactly like a task whose agent failed.
+    BeforeRetry,
+    /// After the retries: they already happened, so a task that still does not
+    /// verify is `Failed` — never back to Pending, where no retry loop is left
+    /// to pick it up.
+    AfterRetry,
 }
 
 /// Summary of a completed task, used for inter-task continuity in a PlanRun.
@@ -1734,12 +1749,11 @@ impl PlanRunner {
                 task_count: wave.task_count,
             });
 
-            // Capture HEAD SHA before the wave — used to verify agents produced commits
-            let wave_base_sha = git::head_sha(&cwd).await.unwrap_or_default();
-
             // Execute all tasks in this wave in parallel via JoinSet
+            // (the wave's base SHA is captured by execute_wave, which verifies
+            // each task's work before the retry loop)
             let continuity_context = run_memory.to_markdown();
-            let mut wave_result = self
+            let wave_result = self
                 .execute_wave(
                     run_id,
                     plan_id,
@@ -1818,51 +1832,6 @@ impl PlanRunner {
                             warn!("Worktree collection failed (non-fatal): {}", e);
                         }
                     }
-                }
-            }
-
-            // Post-wave verification: run TaskVerifier ONCE for all completed tasks.
-            // Step completion is checked for every task, but build/git checks run
-            // only once (on the last task) since they verify the whole project.
-            // The base_commit check runs on the last task to detect ghost completions.
-            if !wave_result.tasks_completed.is_empty() {
-                let mut verification_failures: Vec<(Uuid, String)> = Vec::new();
-                for (idx, &task_id) in wave_result.tasks_completed.iter().enumerate() {
-                    let is_last = idx == wave_result.tasks_completed.len() - 1;
-                    // Use with_base_commit on the LAST task to verify the wave
-                    // produced at least one commit (prevents ghost completions)
-                    let wave_verifier = if is_last && !wave_base_sha.is_empty() {
-                        TaskVerifier::with_base_commit(
-                            self.graph.clone(),
-                            is_last && self.config.build_check,
-                            is_last && self.config.test_runner,
-                            wave_base_sha.clone(),
-                        )
-                    } else {
-                        TaskVerifier::new(
-                            self.graph.clone(),
-                            is_last && self.config.build_check,
-                            is_last && self.config.test_runner,
-                        )
-                    };
-                    let verify_result = wave_verifier.verify(task_id, &cwd).await;
-                    if let VerifyResult::Fail { reasons } = verify_result {
-                        let reason =
-                            format!("Post-wave verification failed:\n- {}", reasons.join("\n- "));
-                        warn!("Task {} verification failed: {}", task_id, reason);
-                        // Definitive: the wave's retry loop has already run, so
-                        // routing this through on_task_failed() would only flip
-                        // the task back to Pending and strand it there (while
-                        // still counted as completed in RunnerState).
-                        self.fail_task_definitively(run_id, task_id, &reason, 0)
-                            .await?;
-                        verification_failures.push((task_id, reason));
-                    }
-                }
-                // Keep RunMemory truthful for the next waves.
-                for (task_id, reason) in verification_failures {
-                    wave_result.tasks_completed.retain(|t| *t != task_id);
-                    wave_result.tasks_failed.push((task_id, reason));
                 }
             }
 
@@ -2033,6 +2002,11 @@ impl PlanRunner {
             wave_result.aborted = true;
             return Ok(wave_result);
         }
+
+        // HEAD before any agent of this wave writes. The last completed task is
+        // checked against it, so "the wave produced a commit" survives parallel
+        // tasks sharing one branch.
+        let wave_base_sha = git::head_sha(cwd).await.unwrap_or_default();
 
         // Build a map of task_id -> start_time for enricher
         let mut task_start_times: std::collections::HashMap<Uuid, chrono::DateTime<chrono::Utc>> =
@@ -2574,6 +2548,23 @@ impl PlanRunner {
         }
 
         // =====================================================================
+        // Verification — before the retry loop, so a failure is retried
+        // =====================================================================
+        // A task whose agent reported success is not done until its work is
+        // checked. Verifying here (and not after the retries, as before) means
+        // a failed verification takes the same path as a failed agent run: one
+        // retry with the reasons as context, then `Failed`.
+        self.verify_wave_tasks(
+            run_id,
+            plan_id,
+            cwd,
+            &wave_base_sha,
+            &mut wave_result,
+            VerifyPass::BeforeRetry,
+        )
+        .await?;
+
+        // =====================================================================
         // Retry loop — sequentially retry failed tasks with error context
         // =====================================================================
         if !wave_result.tasks_failed.is_empty()
@@ -2870,7 +2861,157 @@ impl PlanRunner {
             }
         }
 
+        // =====================================================================
+        // Verification — after the retries, where a failure is final
+        // =====================================================================
+        self.verify_wave_tasks(
+            run_id,
+            plan_id,
+            cwd,
+            &wave_base_sha,
+            &mut wave_result,
+            VerifyPass::AfterRetry,
+        )
+        .await?;
+
         Ok(wave_result)
+    }
+
+    /// The `AgentExecution` of the latest attempt of each task in this run.
+    ///
+    /// Verification lands on the attempt it judges. The node is created at
+    /// launch, but verification runs once the attempt has closed, so it is
+    /// looked up rather than carried around.
+    async fn latest_attempt_ids(&self, run_id: Uuid) -> std::collections::HashMap<Uuid, Uuid> {
+        match self.graph.get_agent_executions_for_run(run_id).await {
+            Ok(executions) => {
+                let mut latest: std::collections::HashMap<Uuid, (u32, Uuid)> =
+                    std::collections::HashMap::new();
+                for execution in executions {
+                    let entry = latest
+                        .entry(execution.task_id)
+                        .or_insert((execution.attempt, execution.id));
+                    if execution.attempt >= entry.0 {
+                        *entry = (execution.attempt, execution.id);
+                    }
+                }
+                latest
+                    .into_iter()
+                    .map(|(task_id, (_, execution_id))| (task_id, execution_id))
+                    .collect()
+            }
+            Err(e) => {
+                warn!(
+                    "Could not list the AgentExecutions of run {}: {}",
+                    run_id, e
+                );
+                std::collections::HashMap::new()
+            }
+        }
+    }
+
+    /// Verify the tasks this wave counts as completed, and record every check.
+    ///
+    /// Runs twice per wave: before the retry loop (`VerifyPass::BeforeRetry`),
+    /// so a task that does not verify is retried with the reasons as context,
+    /// and once more after it (`VerifyPass::AfterRetry`), so a retry that
+    /// "succeeds" without fixing anything is still judged and fails for good.
+    ///
+    /// The project-wide checks (build, tests, git sanity, "the wave produced a
+    /// commit") run once per wave, on the last completed task: they judge the
+    /// working tree, not one task. The per-task checks (steps) run for every
+    /// task, which is what names the task that failed.
+    ///
+    /// The per-check result is written into the `verification_json` of the
+    /// attempt it judges: the shape `runner::routing::verification_passed`
+    /// reads, so a task that failed on one check is readable after the run.
+    async fn verify_wave_tasks(
+        &self,
+        run_id: Uuid,
+        plan_id: Uuid,
+        cwd: &str,
+        wave_base_sha: &str,
+        wave_result: &mut WaveResult,
+        pass: VerifyPass,
+    ) -> Result<()> {
+        if wave_result.tasks_completed.is_empty() {
+            return Ok(());
+        }
+
+        let attempts = self.latest_attempt_ids(run_id).await;
+        let completed = wave_result.tasks_completed.clone();
+        let mut failed: Vec<(Uuid, String)> = Vec::new();
+
+        for (position, task_id) in completed.iter().enumerate() {
+            let is_last = position + 1 == completed.len();
+            let build_check = is_last && self.config.build_check;
+            let test_runner = is_last && self.config.test_runner;
+
+            let verifier = if is_last && !wave_base_sha.is_empty() {
+                TaskVerifier::with_base_commit(
+                    self.graph.clone(),
+                    build_check,
+                    test_runner,
+                    wave_base_sha.to_string(),
+                )
+            } else {
+                TaskVerifier::new(self.graph.clone(), build_check, test_runner)
+            };
+
+            let report = verifier.verify_report(*task_id, cwd).await;
+            let json = report.to_json();
+
+            match attempts.get(task_id) {
+                Some(execution_id) => {
+                    if let Err(e) = self
+                        .graph
+                        .record_agent_execution_verification(*execution_id, &json)
+                        .await
+                    {
+                        warn!(
+                            "Failed to record the verification of task {} on execution {}: {}",
+                            task_id, execution_id, e
+                        );
+                    }
+                }
+                None => warn!(
+                    "No AgentExecution to record the verification of task {}: {}",
+                    task_id, json
+                ),
+            }
+
+            if report.is_pass() {
+                continue;
+            }
+
+            let reason = format!("Verification failed:\n- {}", report.failures().join("\n- "));
+            warn!(
+                "Task {} failed verification ({:?}): {}",
+                task_id, pass, reason
+            );
+            failed.push((*task_id, reason));
+        }
+
+        for (task_id, reason) in failed {
+            wave_result.tasks_completed.retain(|id| *id != task_id);
+            match pass {
+                // Same path as a task whose agent failed: retryable while
+                // retries remain, `Failed` once they are exhausted.
+                VerifyPass::BeforeRetry => {
+                    self.on_task_failed(run_id, plan_id, task_id, &reason, 0.0, 0.0)
+                        .await?;
+                }
+                // No retry loop is left: sending the task back to Pending
+                // would strand it there while still counting as completed.
+                VerifyPass::AfterRetry => {
+                    self.fail_task_definitively(run_id, task_id, &reason, 0)
+                        .await?;
+                }
+            }
+            wave_result.tasks_failed.push((task_id, reason));
+        }
+
+        Ok(())
     }
 
     /// Execute a single task by spawning a Claude Code agent.
@@ -3806,8 +3947,9 @@ impl PlanRunner {
             });
         }
 
-        // NOTE: Verification (build check, steps, git sanity) is now performed
-        // post-wave by execute_wave, not per-task. This avoids redundant build
+        // NOTE: Verification (build check, steps, git sanity) is performed by
+        // `execute_wave`, between the JoinSet and the retry loop, then again
+        // after the retries — not per-task here. This avoids redundant build
         // checks when multiple tasks run in parallel within the same wave.
 
         // Build TaskExecutionReport from event metrics + git data
@@ -4054,6 +4196,10 @@ impl PlanRunner {
                 let mut global = RUNNER_STATE.write().await;
                 if let Some(ref mut s) = *global {
                     s.remove_agent(&task_id);
+                    // A task about to be retried is neither completed nor
+                    // failed: verification can fail work that was already
+                    // counted as completed.
+                    s.unmark_task_completed(task_id);
                     *s.retry_counts.entry(task_id).or_insert(0) += 1;
                     if let Err(e) = self.graph.update_plan_run(s).await {
                         warn!("Failed to persist retry cleanup to Neo4j: {}", e);
@@ -4111,8 +4257,8 @@ impl PlanRunner {
     /// chat session if one is still registered, and emit `TaskFailed`.
     ///
     /// Used by `on_task_failed` once retries are exhausted, by the retry loop
-    /// when a retry fails, and by post-wave verification (which runs after the
-    /// retry loop, so a verification failure can no longer be retried).
+    /// when a retry fails, and by the post-retry verification pass, which runs
+    /// once the retry loop is over (see [`VerifyPass::AfterRetry`]).
     async fn fail_task_definitively(
         &self,
         run_id: Uuid,
@@ -10197,5 +10343,268 @@ mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains("No directory to run in"), "{err}");
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Verification before the retry loop (B5)
+    // ---------------------------------------------------------------
+
+    /// A task whose agent claims success but whose work does not verify is
+    /// retried once, then `Failed`. Before B5 the verification ran after the
+    /// retry loop, so its failure was final and no retry ever saw the reasons.
+    #[tokio::test]
+    async fn a_task_that_does_not_verify_is_retried_once_then_failed() {
+        use crate::neo4j::agent_execution::AgentExecutionNode;
+        use crate::neo4j::StepNode;
+
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
+        let (mut runner, mock_graph) = test_plan_runner_with_graph();
+        // Only the step check runs: this test is about the wiring, not cargo.
+        runner.config.build_check = false;
+        runner.config.test_runner = false;
+        assert_eq!(runner.config.max_retries, 1, "one retry, as the plan says");
+
+        let run_id = Uuid::new_v4();
+        let plan_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+
+        // A step still pending: the agent reported success, the work is not done.
+        mock_graph
+            .create_step(
+                task_id,
+                &StepNode {
+                    id: Uuid::new_v4(),
+                    order: 0,
+                    description: "Still pending step".to_string(),
+                    status: crate::neo4j::models::StepStatus::Pending,
+                    verification: None,
+                    created_at: chrono::Utc::now(),
+                    updated_at: None,
+                    completed_at: None,
+                    execution_context: None,
+                    persona: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // The attempt the verification is recorded on.
+        let execution = AgentExecutionNode::new(run_id, task_id);
+        let execution_id = execution.id;
+        mock_graph.create_agent_execution(&execution).await.unwrap();
+
+        // What on_task_completed left behind: the task is counted as completed.
+        {
+            let mut state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
+            state.mark_task_completed(task_id);
+            *RUNNER_STATE.write().await = Some(state);
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let mut wave_result = WaveResult {
+            tasks_completed: vec![task_id],
+            tasks_failed: Vec::new(),
+            wave_cost_usd: 0.0,
+            aborted: false,
+        };
+
+        // Pass 1 — between the JoinSet and the retry loop.
+        runner
+            .verify_wave_tasks(
+                run_id,
+                plan_id,
+                cwd,
+                "", // no wave base sha: the commit check is skipped
+                &mut wave_result,
+                VerifyPass::BeforeRetry,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            wave_result.tasks_completed.is_empty(),
+            "a task that does not verify is no longer completed"
+        );
+        assert_eq!(wave_result.tasks_failed.len(), 1);
+        assert!(
+            wave_result.tasks_failed[0].1.contains("Still pending step"),
+            "the failure names the task's own missing work: {:?}",
+            wave_result.tasks_failed[0].1
+        );
+        {
+            let global = RUNNER_STATE.read().await;
+            let state = global.as_ref().unwrap();
+            assert_eq!(
+                state.retry_counts.get(&task_id).copied(),
+                Some(1),
+                "the failure reached the retry machinery"
+            );
+            assert!(
+                !state.completed_tasks.contains(&task_id),
+                "not counted as completed while a retry is coming"
+            );
+            assert!(
+                !state.failed_tasks.contains(&task_id),
+                "not failed yet: the retry is still owed"
+            );
+        }
+
+        // The per-check result landed on the attempt it judges.
+        let stored = mock_graph
+            .agent_executions
+            .read()
+            .await
+            .get(&execution_id)
+            .expect("attempt node")
+            .verification_json
+            .clone()
+            .expect("verification recorded on the closed attempt");
+        let json: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(json["passed"], serde_json::json!(false));
+        assert_eq!(json["checks"]["steps"]["status"], serde_json::json!("fail"));
+        assert_eq!(
+            json["checks"]["build"]["status"],
+            serde_json::json!("skipped"),
+            "checks that did not run say so: {}",
+            json
+        );
+
+        // The retry runs and "succeeds" without fixing anything: the retry loop
+        // moves it back to completed, and the post-retry pass is final.
+        wave_result.tasks_completed.push(task_id);
+        wave_result.tasks_failed.clear();
+        runner
+            .verify_wave_tasks(
+                run_id,
+                plan_id,
+                cwd,
+                "",
+                &mut wave_result,
+                VerifyPass::AfterRetry,
+            )
+            .await
+            .unwrap();
+
+        assert!(wave_result.tasks_completed.is_empty());
+        assert_eq!(wave_result.tasks_failed.len(), 1);
+        {
+            let global = RUNNER_STATE.read().await;
+            let state = global.as_ref().unwrap();
+            assert!(
+                state.failed_tasks.contains(&task_id),
+                "Failed after its single retry"
+            );
+            assert_eq!(
+                state.retry_counts.get(&task_id).copied(),
+                Some(1),
+                "the post-retry pass grants no second retry"
+            );
+        }
+
+        reset_globals().await;
+    }
+
+    /// The checks that did run are recorded, and a task whose work verifies
+    /// stays completed: the new pass must not fail work that is fine.
+    #[tokio::test]
+    async fn a_task_that_verifies_stays_completed_and_records_every_check() {
+        use crate::neo4j::agent_execution::AgentExecutionNode;
+        use crate::neo4j::StepNode;
+
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
+        let (mut runner, mock_graph) = test_plan_runner_with_graph();
+        runner.config.build_check = false;
+        runner.config.test_runner = false;
+
+        let run_id = Uuid::new_v4();
+        let plan_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+
+        mock_graph
+            .create_step(
+                task_id,
+                &StepNode {
+                    id: Uuid::new_v4(),
+                    order: 0,
+                    description: "Done step".to_string(),
+                    status: crate::neo4j::models::StepStatus::Completed,
+                    verification: None,
+                    created_at: chrono::Utc::now(),
+                    updated_at: None,
+                    completed_at: None,
+                    execution_context: None,
+                    persona: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let execution = AgentExecutionNode::new(run_id, task_id);
+        let execution_id = execution.id;
+        mock_graph.create_agent_execution(&execution).await.unwrap();
+
+        {
+            let mut state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
+            state.mark_task_completed(task_id);
+            *RUNNER_STATE.write().await = Some(state);
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let mut wave_result = WaveResult {
+            tasks_completed: vec![task_id],
+            tasks_failed: Vec::new(),
+            wave_cost_usd: 0.0,
+            aborted: false,
+        };
+
+        runner
+            .verify_wave_tasks(
+                run_id,
+                plan_id,
+                cwd,
+                "",
+                &mut wave_result,
+                VerifyPass::BeforeRetry,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(wave_result.tasks_completed, vec![task_id]);
+        assert!(
+            wave_result.tasks_failed.is_empty(),
+            "a passing verification must not fail the task: {:?}",
+            wave_result.tasks_failed
+        );
+        {
+            let global = RUNNER_STATE.read().await;
+            let state = global.as_ref().unwrap();
+            assert!(state.completed_tasks.contains(&task_id));
+            assert_eq!(state.retry_counts.get(&task_id).copied(), None);
+        }
+
+        let stored = mock_graph
+            .agent_executions
+            .read()
+            .await
+            .get(&execution_id)
+            .expect("attempt node")
+            .verification_json
+            .clone()
+            .expect("verification recorded");
+        let json: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(json["passed"], serde_json::json!(true));
+        assert_eq!(json["checks"]["steps"]["status"], serde_json::json!("pass"));
+        assert_eq!(
+            json["checks"]["tests"]["status"],
+            serde_json::json!("skipped")
+        );
+
+        reset_globals().await;
     }
 }
