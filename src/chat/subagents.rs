@@ -91,6 +91,8 @@ use nexus_claude::agent::{
 use uuid::Uuid;
 
 use super::manager::ChatManager;
+use super::provider::policy::SessionAccess;
+use super::session_pool::{WarmFacts, WarmKey};
 use super::types::{ChatEvent, ChatRequest, SpawnedBy};
 
 /// The hooks of a native session that may run sub-agents: its other hooks, plus the host of
@@ -205,6 +207,40 @@ impl Drop for SubagentSlot {
                 slots.remove(&self.parent);
             }
         }
+    }
+}
+
+/// What the warm-session pool says about one delegation (CACHE-POOL): the key and the facts
+/// the child must be served with — computed for THIS delegation, never read from the warm
+/// session — and the warm session it may resume, when the pool had an eligible one.
+struct Reuse {
+    key: super::session_pool::WarmKey,
+    facts: super::session_pool::WarmFacts,
+    warm: Option<super::session_pool::WarmSession>,
+}
+
+impl Reuse {
+    /// Gives the child back to the pool, warm, once it is closed: the next delegation of the
+    /// same conversation, on the same engine and model, with the same facts, resumes it.
+    fn release(
+        self,
+        pool: &super::session_pool::SessionPool,
+        session_id: &str,
+        now: std::time::Instant,
+    ) {
+        let opened_at = self.warm.as_ref().map_or(now, |warm| warm.opened_at);
+        let uses = self.warm.as_ref().map_or(1, |warm| warm.uses + 1);
+        pool.release(
+            super::session_pool::WarmSession {
+                session_id: session_id.to_owned(),
+                key: self.key,
+                facts: self.facts,
+                opened_at,
+                last_used: now,
+                uses,
+            },
+            now,
+        );
     }
 }
 
@@ -466,6 +502,10 @@ impl ChatManager {
         // its own, and this future only awaits that task. `alive` is dropped with this
         // future — whether it ends normally (the task is over by then) or is cut — and that
         // is how the task learns nobody awaits the child any more.
+        // CACHE-POOL: the warm session this delegation may RESUME instead of opening a new
+        // child, and the facts it must match to be allowed to (session_pool). Claimed here,
+        // before the task is spawned, so a delegation that never runs does not hold it.
+        let reuse = self.reuse_for(&child, parent.owner.as_deref(), parent_session_id);
         let (alive, cancelled) = tokio::sync::oneshot::channel::<std::convert::Infallible>();
         let opening = {
             let manager = Arc::clone(&self);
@@ -473,7 +513,7 @@ impl ChatManager {
             let tool_use_id = request.tool_call_id.clone();
             tokio::spawn(async move {
                 manager
-                    .open_wait_close(child, cancelled, &parent, &tool_use_id, slot)
+                    .open_wait_close(child, cancelled, &parent, &tool_use_id, slot, reuse)
                     .await
             })
         };
@@ -483,6 +523,82 @@ impl ChatManager {
             .unwrap_or_else(|e| Err(refused(format!("the sub-agent's opening ended: {e}"))))
     }
 
+    /// What the warm-session pool says about one delegation (CACHE-POOL, module
+    /// [`super::session_pool`]): the key and the facts the child must be served with, and
+    /// the warm session it may resume — `None` when the pool has no eligible one.
+    ///
+    /// `None` (no pool lookup at all) when the child's engine and model are not settled
+    /// before the opening: a child the cognitive router opens (`route_child`) has neither,
+    /// and the pool is keyed on them. The facts are the ones the delegation needs, computed
+    /// the way the opening computes them — never read from the warm session.
+    fn reuse_for(
+        &self,
+        child: &ChatRequest,
+        parent_owner: Option<&str>,
+        parent_session_id: &str,
+    ) -> Option<Reuse> {
+        let provider = child.provider.clone().filter(|p| !p.trim().is_empty())?;
+        let model = child.model.clone().filter(|m| !m.trim().is_empty())?;
+        let owner = child
+            .user_claims
+            .as_ref()
+            .map(|claims| claims.sub.clone())
+            .or_else(|| parent_owner.map(str::to_owned));
+        let key = WarmKey {
+            provider,
+            model,
+            parent_session_id: parent_session_id.to_owned(),
+            project: child.project_slug.clone(),
+            owner: owner.clone(),
+        };
+        let mut declared = self.config.read_only_mcp_tools.clone();
+        declared.sort();
+        let facts = WarmFacts {
+            cwd: child.cwd.clone(),
+            access: child.access.unwrap_or_default(),
+            permission_mode: child.permission_mode.clone(),
+            add_dirs: child.add_dirs.clone().unwrap_or_default(),
+            workspace: child.workspace_slug.clone(),
+            consent: self.consent_fingerprint(owner.as_deref()),
+            tool_policy: super::session_pool::fingerprint(
+                [
+                    Some(match child.access.unwrap_or_default() {
+                        SessionAccess::Normal => "normal",
+                        SessionAccess::ReadOnly => "read_only",
+                    }),
+                    child.permission_mode.as_deref(),
+                ]
+                .into_iter()
+                .chain(declared.iter().map(|tool| Some(tool.as_str()))),
+            ),
+        };
+        let claim = self
+            .session_pool
+            .claim(&key, &facts, std::time::Instant::now());
+        tracing::debug!(parent = %parent_session_id, "sub-agent opening: {}", claim.summary());
+        Some(Reuse {
+            key,
+            facts,
+            warm: claim.held,
+        })
+    }
+
+    /// Fingerprint of the person's lasting approvals ([`super::lasting_rules`]): a warm
+    /// session is only resumed while they are exactly what they were when it was opened.
+    /// Reusing a session opened before an approval was granted (or after one was revoked)
+    /// would carry a consent this delegation never got — a security bug, not a saving.
+    fn consent_fingerprint(&self, owner: Option<&str>) -> String {
+        let rules = owner
+            .and_then(|owner| self.lasting_rule_store().map(|store| store.rules(owner)))
+            .unwrap_or_default();
+        let mut ids: Vec<String> = rules
+            .iter()
+            .map(|rule| format!("{}:{}", rule.project, rule.id))
+            .collect();
+        ids.sort();
+        super::session_pool::fingerprint(ids.iter().map(|id| Some(id.as_str())))
+    }
+
     /// Opens the child of one sub-agent call, waits for its answer and closes it. Runs in a
     /// task of its own ([`Self::run_subagent`]) so no drop can cut the opening halfway;
     /// `cancelled` resolves when nobody awaits the call any more, and the child is then
@@ -490,6 +606,10 @@ impl ChatManager {
     /// (module documentation): held by this task, then by its close guard, so it is given
     /// back only once the child this task owns is actually closed — on the ordinary path,
     /// on a dropped caller (P18b round 2, fix 2) and on a panic (round 3, fix E).
+    ///
+    /// `reuse` carries the warm session the pool offered (CACHE-POOL): the child RESUMES it
+    /// instead of being opened, and is given back warm once closed. Empty, or refused by the
+    /// provider, the child is opened fresh — exactly as before the pool existed.
     async fn open_wait_close(
         self: Arc<Self>,
         child: ChatRequest,
@@ -497,13 +617,12 @@ impl ChatManager {
         parent_session_id: &str,
         tool_use_id: &str,
         slot: SubagentSlot,
+        reuse: Option<Reuse>,
     ) -> Result<String, String> {
-        let opened = self
-            .create_session(&child)
-            .await
-            .map_err(|e| format!("the sub-agent could not start: {e:#}"))?;
-        let child_id = opened.session_id;
-        tracing::info!(parent = %parent_session_id, child = %child_id, tool_use_id = %tool_use_id, "sub-agent started");
+        let (child_id, resumed_from) = self
+            .open_child(&child, reuse.as_ref(), parent_session_id, tool_use_id)
+            .await?;
+        tracing::info!(parent = %parent_session_id, child = %child_id, tool_use_id = %tool_use_id, resumed = resumed_from.is_some(), "sub-agent started");
         // The child exists from here: whatever ends this task, it is closed first (it stays
         // resumable and visible). Nothing between here and the end of the explicit close
         // below panics today, but nothing rules one out after this module grows — `guard`
@@ -524,7 +643,9 @@ impl ChatManager {
         let answer = tokio::select! {
             biased;
             _ = cancelled => Err("the sub-agent's call was cancelled".to_owned()),
-            answer = self.wait_for_answer(&child_id) => answer,
+            // A resumed session's thread already holds the answer of the turn it ran
+            // before: only what came after `resumed_from` can be this call's answer.
+            answer = self.wait_for_answer_after(&child_id, resumed_from.unwrap_or(0)) => answer,
         };
         #[cfg(test)]
         panic_injection::panic_if_injected(parent_session_id);
@@ -532,11 +653,77 @@ impl ChatManager {
         if let Err(e) = self.close_session(&child_id).await {
             tracing::debug!(child = %child_id, error = %e, "sub-agent close");
         }
-        // The child is closed: the backstop is not needed any more, and dropping the guard
-        // gives the slot back — after the close, as on every other path.
+        // Closed: the backstop is not needed any more, and the session becomes the
+        // conversation's warm prefix for its next delegation of the same engine and model.
+        if let Some(reuse) = reuse {
+            reuse.release(&self.session_pool, &child_id, std::time::Instant::now());
+        }
+        // Dropping the guard gives the slot back — after the close, as on every other path.
         guard.disarm();
         drop(guard);
         answer
+    }
+
+    /// Opens the child a delegation runs in: the warm session `reuse` offers, RESUMED, or a
+    /// fresh session. Returns the child's id and, when it was resumed, the last event its
+    /// thread already held (the floor under what counts as this call's answer).
+    ///
+    /// A resume the provider refuses does not fail the delegation: the warm entry is dropped
+    /// and the child is opened fresh, exactly as before the pool existed. The pool is an
+    /// optimisation, never a new failure mode.
+    async fn open_child(
+        &self,
+        child: &ChatRequest,
+        reuse: Option<&Reuse>,
+        parent_session_id: &str,
+        tool_use_id: &str,
+    ) -> Result<(String, Option<i64>), String> {
+        if let Some(warm) = reuse.and_then(|reuse| reuse.warm.as_ref()) {
+            let floor = self.last_event_seq(&warm.session_id).await;
+            match self
+                .resume_session(&warm.session_id, &child.message, child.user_claims.as_ref())
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        parent = %parent_session_id,
+                        child = %warm.session_id,
+                        tool_use_id = %tool_use_id,
+                        uses = warm.uses,
+                        "sub-agent resumes a warm session"
+                    );
+                    return Ok((warm.session_id.clone(), Some(floor)));
+                }
+                Err(e) => {
+                    // The prefix is worthless (the provider's session is gone) or the
+                    // session can no longer be reopened: never offered again.
+                    tracing::info!(
+                        child = %warm.session_id,
+                        error = %e,
+                        "sub-agent cannot resume its warm session: opening a fresh one"
+                    );
+                    self.session_pool.abandon(&warm.session_id);
+                }
+            }
+        }
+        let opened = self
+            .create_session(child)
+            .await
+            .map_err(|e| format!("the sub-agent could not start: {e:#}"))?;
+        Ok((opened.session_id, None))
+    }
+
+    /// The last event sequence the thread of `sid` holds (0 when it has none): the floor a
+    /// resumed child's answer is read from.
+    async fn last_event_seq(&self, sid: &str) -> i64 {
+        match Uuid::parse_str(sid) {
+            Ok(uuid) => self
+                .graph
+                .get_latest_chat_event_seq(uuid)
+                .await
+                .unwrap_or(0),
+            Err(_) => 0,
+        }
     }
 
     /// Answers `deny` to every permission request the child `sid` still waits on, through
@@ -649,30 +836,49 @@ impl ChatManager {
         true
     }
 
-    /// The first `result` of the session `sid`, live or already persisted.
-    async fn wait_for_answer(&self, sid: &str) -> Result<String, String> {
+    /// The first `result` of the session `sid` after `floor`, live or already persisted.
+    /// `floor` is the sequence the thread had reached when the child was opened: a
+    /// delegation that RESUMED a warm session (CACHE-POOL) shares its thread with the turn
+    /// that session ran before, and without the floor the previous `result` would be read
+    /// as this call's answer the instant the wait began.
+    async fn wait_for_answer_after(&self, sid: &str, floor: i64) -> Result<String, String> {
         let rx = self
             .subscribe(sid)
             .await
             .map_err(|e| format!("the sub-agent cannot be followed: {e:#}"))?;
         let initial = self.agent_runtime.get(sid).await;
         let answers_itself = live_answers_itself(Arc::clone(&self.agent_runtime), sid, initial);
-        self.answer_from(sid, rx, &answers_itself).await
+        self.answer_from_floor(sid, rx, floor, &answers_itself)
+            .await
     }
 
-    /// [`Self::wait_for_answer`] on a subscription already taken — the seam the tests of a
-    /// lagged subscription and of a permission request drive. `answers_itself` says whether
-    /// the backend answers a request of the child itself (a grant or a lasting rule covers
-    /// it).
+    /// [`Self::wait_for_answer_after`] on a subscription already taken — the seam the tests
+    /// of a lagged subscription and of a permission request drive. `answers_itself` says
+    /// whether the backend answers a request of the child itself (a grant or a lasting rule
+    /// covers it).
+    #[cfg(test)]
     pub(super) async fn answer_from(
         &self,
         sid: &str,
+        rx: tokio::sync::broadcast::Receiver<ChatEvent>,
+        answers_itself: &(dyn Fn(&str) -> bool + Send + Sync),
+    ) -> Result<String, String> {
+        self.answer_from_floor(sid, rx, 0, answers_itself).await
+    }
+
+    /// [`Self::answer_from`] with the `floor` a resumed child starts from: nothing the
+    /// thread held at or before `floor` is this call's answer, and requests stored then are
+    /// not this call's requests either.
+    async fn answer_from_floor(
+        &self,
+        sid: &str,
         mut rx: tokio::sync::broadcast::Receiver<ChatEvent>,
+        floor: i64,
         answers_itself: &(dyn Fn(&str) -> bool + Send + Sync),
     ) -> Result<String, String> {
         let mut watch = Watch::default();
         // A turn that ended before the subscription is in the store.
-        if let Some(end) = self.read_back(sid, &mut watch).await {
+        if let Some(end) = self.read_back(sid, &mut watch, floor).await {
             return end;
         }
         // Once a `Lagged` was seen, the stream alone cannot be trusted any more: the thread
@@ -708,14 +914,14 @@ impl ChatManager {
                     }
                     // The stream is over: what it did not carry, the thread may still hold.
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        return self.read_back(sid, &mut watch).await.unwrap_or_else(|| {
+                        return self.read_back(sid, &mut watch, floor).await.unwrap_or_else(|| {
                             Err("the sub-agent's session ended before it answered".into())
                         });
                     }
                 },
                 _ = tick.tick(), if lagged || watch.is_asking() => {
                     if lagged {
-                        if let Some(end) = self.read_back(sid, &mut watch).await {
+                        if let Some(end) = self.read_back(sid, &mut watch, floor).await {
                             return end;
                         }
                     }
@@ -726,9 +932,15 @@ impl ChatManager {
 
     /// The end of `sid` as its STORED thread tells it — its answer, or its close — and
     /// what it still asks for there, into `watch` (a decision the stream dropped is seen
-    /// here). `None` while the thread shows no end.
-    async fn read_back(&self, sid: &str, watch: &mut Watch) -> Option<Result<String, String>> {
-        let persisted = self.persisted_events(sid).await;
+    /// here). `None` while the thread shows no end. Nothing at or before `floor` counts: it
+    /// belongs to the turn a resumed warm session ran before this call (CACHE-POOL).
+    async fn read_back(
+        &self,
+        sid: &str,
+        watch: &mut Watch,
+        floor: i64,
+    ) -> Option<Result<String, String>> {
+        let persisted = self.persisted_events_after(sid, floor).await;
         watch.reconcile(&persisted);
         if let Some(answer) = answer_of(&persisted) {
             return Some(answer);
@@ -749,8 +961,15 @@ impl ChatManager {
     /// The most recent events of `sid`'s STORED thread. Reads the TAIL of the thread, not
     /// the head (P18b round 2, fix 5): a long child's `result` can land after more than
     /// [`PERSISTED_READ_WINDOW`] events, and `get_chat_events` only reads forward from
-    /// `after_seq` — starting at 0 would never reach it.
+    /// `after_seq` — starting at 0 would never reach it. `floor` raises that starting point:
+    /// a delegation that resumed a warm session only reads what its own turn wrote
+    /// (CACHE-POOL).
     async fn persisted_events(&self, sid: &str) -> Vec<ChatEvent> {
+        self.persisted_events_after(sid, 0).await
+    }
+
+    /// [`Self::persisted_events`], ignoring everything at or before `floor`.
+    async fn persisted_events_after(&self, sid: &str, floor: i64) -> Vec<ChatEvent> {
         let Ok(uuid) = Uuid::parse_str(sid) else {
             return Vec::new();
         };
@@ -759,7 +978,7 @@ impl ChatManager {
             .get_latest_chat_event_seq(uuid)
             .await
             .unwrap_or(0);
-        let after_seq = (latest_seq - PERSISTED_READ_WINDOW).max(0);
+        let after_seq = (latest_seq - PERSISTED_READ_WINDOW).max(0).max(floor);
         self.graph
             .get_chat_events(uuid, after_seq, PERSISTED_READ_WINDOW)
             .await
@@ -1445,5 +1664,238 @@ mod tests {
         graph.store_chat_events(sid, events).await.unwrap();
         let answer = manager.persisted_answer(&sid.to_string()).await;
         assert_eq!(answer, Some(Ok("TAIL-ANSWER".to_string())));
+    }
+
+    // ---------------------------------------------------------------------
+    // CACHE-POOL (session_pool): what the delegation path asks the pool, and
+    // what it does with the answer. The token counts themselves need the real
+    // CLI; what is proven here is the MECHANISM and the eligibility rules.
+    // ---------------------------------------------------------------------
+
+    /// A delegation as `run_subagent` builds one, pinned to one engine and model.
+    fn delegation(project: &str, model: &str) -> ChatRequest {
+        ChatRequest {
+            message: "summarise src/chat/subagents.rs".into(),
+            cwd: "/work/proj".into(),
+            provider: Some("claude-code".into()),
+            model: Some(model.into()),
+            project_slug: Some(project.into()),
+            ..Default::default()
+        }
+    }
+
+    /// What `run_subagent` asks before it opens the child.
+    fn claim_for(manager: &ChatManager, child: &ChatRequest) -> Reuse {
+        manager
+            .reuse_for(child, None, "parent-1")
+            .expect("a delegation pinned to one engine and model asks the pool")
+    }
+
+    fn a_person() -> Option<crate::auth::jwt::Claims> {
+        Some(crate::auth::jwt::Claims::person("person-1", "a@b.c", "A"))
+    }
+
+    /// CACHE-POOL criterion 1, the MECHANISM: the second and third delegations of one
+    /// conversation, on the same engine and model, are handed the SAME warm session and
+    /// resume it instead of opening a new one. Red without the pool: every delegation
+    /// would be a fresh `create_session`.
+    #[tokio::test]
+    async fn a_second_delegation_of_the_same_conversation_reuses_the_warm_session() {
+        let (_graph, manager) = bare_manager();
+        let child = delegation("proj", "opus");
+        let first = claim_for(&manager, &child);
+        assert!(
+            first.warm.is_none(),
+            "the pool starts empty: a fresh session"
+        );
+        // Exactly what `open_wait_close` does once the child is closed.
+        first.release(&manager.session_pool, "warm-1", std::time::Instant::now());
+        assert_eq!(manager.session_pool.held(), vec!["warm-1".to_owned()]);
+
+        let second = claim_for(&manager, &child);
+        assert_eq!(
+            second.warm.as_ref().map(|warm| warm.session_id.as_str()),
+            Some("warm-1"),
+            "the same engine and model are handed the same warm handle"
+        );
+        assert!(
+            manager.session_pool.is_empty(),
+            "a claimed session is not lent to a concurrent delegation"
+        );
+
+        second.release(&manager.session_pool, "warm-1", std::time::Instant::now());
+        let third = claim_for(&manager, &child);
+        let warm = third.warm.as_ref().expect("still warm");
+        assert_eq!(warm.session_id, "warm-1");
+        assert_eq!(
+            warm.uses, 2,
+            "two delegations have already run in this session"
+        );
+    }
+
+    /// Another model (or another engine) is another warm session: the pool is keyed on the
+    /// pair, so a delegation routed elsewhere opens its own.
+    #[tokio::test]
+    async fn another_model_gets_no_warm_session() {
+        let (_graph, manager) = bare_manager();
+        let first = claim_for(&manager, &delegation("proj", "opus"));
+        first.release(&manager.session_pool, "warm-1", std::time::Instant::now());
+        let other = claim_for(&manager, &delegation("proj", "haiku"));
+        assert!(other.warm.is_none());
+        assert_eq!(
+            manager.session_pool.held(),
+            vec!["warm-1".to_owned()],
+            "the entry stays for the model it belongs to"
+        );
+    }
+
+    /// CACHE-POOL criterion 3, another PROJECT: the warm session of one project is never
+    /// resumed for a delegation of another. Red if `reuse_for` stops keying on the project.
+    #[tokio::test]
+    async fn another_project_gets_no_warm_session() {
+        let (_graph, manager) = bare_manager();
+        let first = claim_for(&manager, &delegation("proj", "opus"));
+        first.release(&manager.session_pool, "warm-1", std::time::Instant::now());
+        let other = claim_for(&manager, &delegation("autre-projet", "opus"));
+        assert!(other.warm.is_none(), "a warm session crosses no project");
+        assert_eq!(manager.session_pool.held(), vec!["warm-1".to_owned()]);
+    }
+
+    /// CACHE-POOL criterion 2 and 3, another TOOL POLICY: a child opened read-only never
+    /// resumes the session a `normal` child ran in, and another permission mode is refused
+    /// too. Red if the facts are read from the warm session instead of compared.
+    #[tokio::test]
+    async fn another_tool_policy_gets_no_warm_session() {
+        let (_graph, manager) = bare_manager();
+        let first = claim_for(&manager, &delegation("proj", "opus"));
+        first.release(&manager.session_pool, "warm-1", std::time::Instant::now());
+
+        let mut read_only = delegation("proj", "opus");
+        read_only.access = Some(SessionAccess::ReadOnly);
+        assert!(claim_for(&manager, &read_only).warm.is_none());
+
+        let mut edits = delegation("proj", "opus");
+        edits.permission_mode = Some("acceptEdits".into());
+        assert!(claim_for(&manager, &edits).warm.is_none());
+
+        // The entry is untouched for the delegation whose facts it does match.
+        assert_eq!(manager.session_pool.held(), vec!["warm-1".to_owned()]);
+    }
+
+    /// CACHE-POOL criterion 2, CONSENT: a person who approves (or revokes) a lasting rule
+    /// between two delegations makes the warm session ineligible — it was opened under
+    /// another consent, and a resume would carry approvals this delegation never got. Red
+    /// if `reuse_for` stops fingerprinting the lasting rules.
+    #[tokio::test]
+    async fn a_changed_consent_gets_no_warm_session() {
+        let dir = std::env::temp_dir().join(format!("po-warm-pool-{}", Uuid::new_v4()));
+        let config = crate::chat::config::ChatConfig {
+            lasting_rules_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let manager = ChatManager::new_without_memory(
+            dyn_graph,
+            crate::test_helpers::mock_app_state().meili,
+            config,
+        );
+        let mut child = delegation("proj", "opus");
+        child.user_claims = a_person();
+        let first = claim_for(&manager, &child);
+        first.release(&manager.session_pool, "warm-1", std::time::Instant::now());
+
+        // The person answers "always" to a call in this project meanwhile.
+        manager
+            .lasting_rule_store()
+            .expect("the configuration names a store")
+            .add(
+                "person-1",
+                super::super::lasting_rules::LastingRule {
+                    id: Uuid::new_v4(),
+                    project: "proj".into(),
+                    root: "/work/proj".into(),
+                    asker: "native".into(),
+                    tool: "Read".into(),
+                    canonical: Some("Read".into()),
+                    input: serde_json::json!({"file_path": "a.txt"}),
+                    rule: "Read: a.txt".into(),
+                    created_at: chrono::Utc::now(),
+                    session_id: None,
+                },
+            )
+            .expect("the rule is kept");
+
+        let second = claim_for(&manager, &child);
+        assert!(
+            second.warm.is_none(),
+            "a consent that changed since the opening is never inherited"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A child whose engine and model the cognitive router picks (`route_child`) has no key
+    /// to ask the pool with: the pool is not consulted at all, and the delegation opens
+    /// exactly as before.
+    #[tokio::test]
+    async fn a_routed_delegation_never_consults_the_pool() {
+        let (_graph, manager) = bare_manager();
+        let mut routed = delegation("proj", "opus");
+        routed.provider = None;
+        routed.model = None;
+        assert!(manager.reuse_for(&routed, None, "parent-1").is_none());
+        assert!(manager
+            .reuse_for(&delegation("proj", "opus"), None, "parent-1")
+            .is_some());
+    }
+
+    /// A resumed child shares its thread with the turn the warm session ran before: only
+    /// what came AFTER the floor is this call's answer. Red without the floor — the wait
+    /// would return the PREVIOUS delegation's answer at once, before the child did anything.
+    #[tokio::test]
+    async fn a_resumed_child_reads_only_its_own_turn() {
+        let (graph, manager) = bare_manager();
+        let sid = Uuid::new_v4();
+        let record = |seq: i64, event: ChatEvent| crate::neo4j::models::ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: sid,
+            seq,
+            event_type: "event".into(),
+            data: serde_json::to_string(&event).unwrap(),
+            created_at: chrono::Utc::now(),
+        };
+        graph
+            .store_chat_events(
+                sid,
+                vec![
+                    record(1, said("premier tour")),
+                    record(2, ok_result("PREMIERE-REPONSE")),
+                ],
+            )
+            .await
+            .unwrap();
+        let id = sid.to_string();
+        // Without a floor (a fresh child), the thread's end is the answer.
+        assert_eq!(
+            manager.read_back(&id, &mut Watch::default(), 0).await,
+            Some(Ok("PREMIERE-REPONSE".to_string()))
+        );
+        // Resumed from the floor the thread had reached: nothing to answer yet.
+        assert_eq!(manager.read_back(&id, &mut Watch::default(), 2).await, None);
+        // The resumed turn answers.
+        graph
+            .store_chat_events(
+                sid,
+                vec![
+                    record(3, said("second tour")),
+                    record(4, ok_result("DEUXIEME-REPONSE")),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.read_back(&id, &mut Watch::default(), 2).await,
+            Some(Ok("DEUXIEME-REPONSE".to_string()))
+        );
     }
 }
