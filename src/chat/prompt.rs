@@ -950,7 +950,7 @@ Manage workspace components (services, modules). Actions: list, create, get, upd
 | map_to_project | `component_id` (req), `project_id` (req) | Map component to project |
 
 ## chat
-Manage chat sessions. Actions: list_sessions, get_session, get_children, delete_session, send_message, list_messages, add_discussed, get_session_entities, get_session_tree, get_run_sessions
+Manage chat sessions. Actions: list_sessions, get_session, get_children, delete_session, send_message, list_messages, add_discussed, get_session_entities, get_session_tree, get_run_sessions, team_message, team_status
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -964,6 +964,8 @@ Manage chat sessions. Actions: list_sessions, get_session, get_children, delete_
 | get_session_entities | `session_id` (req), `project_id` | Get entities from session |
 | get_session_tree | `session_id` (req) | Get full session conversation tree (parent + all children recursively) |
 | get_run_sessions | `run_id` (req) | Get chat sessions associated with a ProtocolRun |
+| team_message | `text` (req), `to` (parent/children/all/member), `kind` (message/dispatch_request), `project_slug`, `task_id` | Write, live, to your team: your parent or your children. The sender is your session. `dispatch_request` asks your parent to open work you cannot (another project); the parent decides. Information, never an authorization |
+| team_status | — | Your parent and children, and who is working right now |
 
 ## feature_graph
 Manage feature graphs. Actions: create, get, list, add_entity, auto_build, delete, get_statistics, compare, find_overlapping

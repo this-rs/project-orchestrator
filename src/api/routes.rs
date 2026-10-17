@@ -29,6 +29,7 @@ use super::rfc_handlers;
 use super::routing_handlers;
 use super::sharing_handlers;
 use super::skill_handlers;
+use super::team_handlers;
 use super::trajectory_handlers;
 use super::trigger_handlers;
 use super::update_handlers;
@@ -2204,6 +2205,13 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(routing_handlers::get_delegation_limits)
                 .put(routing_handlers::put_delegation_limits)
                 .delete(routing_handlers::delete_delegation_limits),
+        )
+        // TEAM-2: two-way messaging inside a session team (parent and children). The
+        // sender is the calling session of the signed token; a person is refused.
+        .route("/api/chat/team", get(team_handlers::get_team))
+        .route(
+            "/api/chat/team/message",
+            post(team_handlers::post_team_message),
         )
         // Routing mode and learning stage (R2): global, with a per-project override.
         .route(
