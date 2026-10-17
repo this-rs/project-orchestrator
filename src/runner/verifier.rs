@@ -8,7 +8,6 @@
 
 use crate::neo4j::models::StepStatus;
 use crate::neo4j::traits::GraphStore;
-use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +36,184 @@ impl VerifyResult {
     }
 }
 
+// ============================================================================
+// CheckStatus / CheckOutcome / VerificationReport — one verdict per check
+// ============================================================================
+
+/// What a single verification check did.
+///
+/// Recorded per check in `AgentExecution.verification_json`, so a report says
+/// for every check whether it ran, passed or was skipped — instead of keeping
+/// only the first reason that made the task fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckStatus {
+    /// The check executed and its criterion holds.
+    Pass,
+    /// The check executed and its criterion does not hold.
+    Fail,
+    /// The check did not execute: disabled by configuration, or nothing to
+    /// check against (no build command for the language, no base commit, no
+    /// git context).
+    Skipped,
+    /// The check executed but could not conclude — `git` unavailable, shallow
+    /// clone, … It claims nothing about the task and never fails it.
+    Ran,
+}
+
+impl CheckStatus {
+    /// The value written into `verification_json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckStatus::Pass => "pass",
+            CheckStatus::Fail => "fail",
+            CheckStatus::Skipped => "skipped",
+            CheckStatus::Ran => "ran",
+        }
+    }
+}
+
+/// One check's outcome: its machine `name`, what it concluded, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckOutcome {
+    /// Machine key used in `verification_json` (`commits`, `build`, `steps`,
+    /// `git_sanity`, `tests`).
+    pub name: &'static str,
+    /// What the check concluded.
+    pub status: CheckStatus,
+    /// Sentence prefix used when the check fails ("Build check failed"), so the
+    /// failure reasons keep the wording the runner has always reported.
+    pub label: &'static str,
+    /// Why the check failed, was skipped, or could not conclude.
+    pub detail: Option<String>,
+}
+
+impl CheckOutcome {
+    /// A check that executed and passed.
+    pub fn pass(name: &'static str, label: &'static str) -> Self {
+        Self {
+            name,
+            status: CheckStatus::Pass,
+            label,
+            detail: None,
+        }
+    }
+
+    /// A check that did not execute, and why.
+    pub fn skipped(name: &'static str, label: &'static str, why: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: CheckStatus::Skipped,
+            label,
+            detail: Some(why.into()),
+        }
+    }
+
+    /// A check that executed but could not conclude, and why.
+    pub fn ran(name: &'static str, label: &'static str, why: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: CheckStatus::Ran,
+            label,
+            detail: Some(why.into()),
+        }
+    }
+
+    /// A check that executed and failed.
+    pub fn fail(name: &'static str, label: &'static str, err: impl std::fmt::Display) -> Self {
+        Self {
+            name,
+            status: CheckStatus::Fail,
+            label,
+            detail: Some(err.to_string()),
+        }
+    }
+
+    /// Whether this check leaves the task verified (everything but `fail`).
+    pub fn is_pass(&self) -> bool {
+        self.status != CheckStatus::Fail
+    }
+
+    /// The failure sentence this check contributes to `VerifyResult::Fail`.
+    pub fn reason(&self) -> Option<String> {
+        if self.status != CheckStatus::Fail {
+            return None;
+        }
+        Some(match self.detail {
+            Some(ref detail) => format!("{}: {}", self.label, detail),
+            None => self.label.to_string(),
+        })
+    }
+}
+
+/// Every check's outcome for one task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationReport {
+    /// Task this report judges.
+    pub task_id: Uuid,
+    /// One outcome per check, in the order the verifier runs them.
+    pub checks: Vec<CheckOutcome>,
+}
+
+impl VerificationReport {
+    /// Whether no check failed.
+    pub fn is_pass(&self) -> bool {
+        self.checks.iter().all(CheckOutcome::is_pass)
+    }
+
+    /// The failure sentences, in check order.
+    pub fn failures(&self) -> Vec<String> {
+        self.checks
+            .iter()
+            .filter_map(CheckOutcome::reason)
+            .collect()
+    }
+
+    /// The status of one check, when it ran in this report.
+    pub fn status(&self, name: &str) -> Option<CheckStatus> {
+        self.checks
+            .iter()
+            .find(|check| check.name == name)
+            .map(|check| check.status)
+    }
+
+    /// Serialize for `AgentExecution.verification_json`:
+    /// `{"passed": bool, "checks": {"build": {"status": "skipped"}, …}}`.
+    ///
+    /// `passed` is the verdict `runner::routing::verification_passed` reads;
+    /// `checks` carries the per-check detail.
+    pub fn to_json(&self) -> String {
+        let mut checks = serde_json::Map::new();
+        for check in &self.checks {
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "status".to_string(),
+                serde_json::Value::String(check.status.as_str().to_string()),
+            );
+            if let Some(ref detail) = check.detail {
+                entry.insert(
+                    "detail".to_string(),
+                    serde_json::Value::String(detail.clone()),
+                );
+            }
+            checks.insert(check.name.to_string(), serde_json::Value::Object(entry));
+        }
+        serde_json::json!({
+            "passed": self.is_pass(),
+            "checks": serde_json::Value::Object(checks),
+        })
+        .to_string()
+    }
+
+    /// Collapse the report into the historical `VerifyResult`.
+    pub fn into_verify_result(self) -> VerifyResult {
+        let reasons = self.failures();
+        if reasons.is_empty() {
+            VerifyResult::Pass
+        } else {
+            VerifyResult::Fail { reasons }
+        }
+    }
+}
 // ============================================================================
 // ProjectLanguage — detected from project files
 // ============================================================================
@@ -180,108 +357,121 @@ impl TaskVerifier {
         }
     }
 
+    /// Run every check for a completed task, one [`CheckOutcome`] each.
+    ///
+    /// This is what the runner records per task: which checks ran, which were
+    /// skipped, and which failed — instead of only the first failure.
+    pub async fn verify_report(&self, task_id: Uuid, cwd: &str) -> VerificationReport {
+        let cwd_path = Path::new(cwd);
+        let report = VerificationReport {
+            task_id,
+            checks: vec![
+                // 0. Commits (critical — prevents ghost completions)
+                self.verify_has_commits(cwd_path).await,
+                // 1. Build
+                self.verify_build(cwd_path).await,
+                // 2. Step completion
+                self.verify_steps(task_id).await,
+                // 3. Git sanity
+                self.verify_git_sanity(cwd_path).await,
+                // 4. Tests (optional)
+                self.verify_tests(cwd_path).await,
+            ],
+        };
+
+        if report.is_pass() {
+            info!("Task {} passed all verifications", task_id);
+        } else {
+            warn!(
+                "Task {} failed verification: {:?}",
+                task_id,
+                report.failures()
+            );
+        }
+        report
+    }
+
     /// Run all verifications for a completed task.
     ///
     /// Returns `VerifyResult::Pass` if all checks pass, or
-    /// `VerifyResult::Fail` with reasons if any check fails.
+    /// `VerifyResult::Fail` with reasons if any check fails. Callers that need
+    /// the per-check detail want [`Self::verify_report`].
     pub async fn verify(&self, task_id: Uuid, cwd: &str) -> VerifyResult {
-        let mut reasons = Vec::new();
-        let cwd_path = Path::new(cwd);
-
-        // 0. Verify the agent produced commits (critical — prevents ghost completions)
-        if let Err(e) = self.verify_has_commits(cwd_path).await {
-            reasons.push(format!("No code produced: {}", e));
-        }
-
-        // 1. Build check
-        if self.build_check_enabled {
-            if let Err(e) = self.verify_build(cwd_path).await {
-                reasons.push(format!("Build check failed: {}", e));
-            }
-        }
-
-        // 2. Step completion
-        if let Err(e) = self.verify_steps(task_id).await {
-            reasons.push(format!("Step completion check failed: {}", e));
-        }
-
-        // 3. Git sanity
-        if let Err(e) = self.verify_git_sanity(cwd_path).await {
-            reasons.push(format!("Git sanity check failed: {}", e));
-        }
-
-        // 4. Tests (optional)
-        if self.test_runner_enabled {
-            if let Err(e) = self.verify_tests(cwd_path).await {
-                reasons.push(format!("Tests failed: {}", e));
-            }
-        }
-
-        if reasons.is_empty() {
-            info!("Task {} passed all verifications", task_id);
-            VerifyResult::Pass
-        } else {
-            warn!("Task {} failed verification: {:?}", task_id, reasons);
-            VerifyResult::Fail { reasons }
-        }
+        self.verify_report(task_id, cwd).await.into_verify_result()
     }
 
     /// Verify the agent produced at least one new commit since the base commit.
     ///
     /// This prevents "ghost completions" where the agent updates MCP statuses
     /// but produces zero code changes. If `base_commit` is None (legacy callers),
-    /// we fall back to checking for uncommitted changes (dirty worktree).
-    async fn verify_has_commits(&self, cwd: &Path) -> Result<()> {
-        if let Some(ref base_sha) = self.base_commit {
-            // Count commits since base
-            let output = tokio::process::Command::new("git")
-                .args(["rev-list", "--count", &format!("{}..HEAD", base_sha)])
-                .current_dir(cwd)
-                .output()
-                .await;
+    /// the check is `skipped`; git errors leave it `ran` (nothing is claimed).
+    async fn verify_has_commits(&self, cwd: &Path) -> CheckOutcome {
+        const NAME: &str = "commits";
+        const LABEL: &str = "No code produced";
 
-            match output {
-                Ok(o) if o.status.success() => {
-                    let count_str = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    let count: usize = count_str.parse().unwrap_or(0);
-                    if count == 0 {
-                        // Also check for uncommitted changes — agent might have written
-                        // code but forgotten to commit
-                        let has_changes = self.has_uncommitted_changes(cwd).await;
-                        if has_changes {
-                            return Err(anyhow::anyhow!(
+        let Some(ref base_sha) = self.base_commit else {
+            // No base commit — nothing to compare against (legacy verifier callers)
+            return CheckOutcome::skipped(NAME, LABEL, "no base commit to compare against");
+        };
+
+        // Count commits since base
+        let output = tokio::process::Command::new("git")
+            .args(["rev-list", "--count", &format!("{}..HEAD", base_sha)])
+            .current_dir(cwd)
+            .output()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => {
+                let count_str = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                let count: usize = count_str.parse().unwrap_or(0);
+                if count == 0 {
+                    // Also check for uncommitted changes — agent might have written
+                    // code but forgotten to commit
+                    let has_changes = self.has_uncommitted_changes(cwd).await;
+                    if has_changes {
+                        return CheckOutcome::fail(
+                            NAME,
+                            LABEL,
+                            format!(
                                 "Agent wrote code but did NOT commit (0 new commits since {}, \
                                  but working tree has uncommitted changes). \
                                  The agent must run `git add` + `git commit`.",
-                                &base_sha[..8]
-                            ));
-                        }
-                        return Err(anyhow::anyhow!(
+                                &base_sha[..base_sha.len().min(8)]
+                            ),
+                        );
+                    }
+                    return CheckOutcome::fail(
+                        NAME,
+                        LABEL,
+                        format!(
                             "Agent produced 0 new commits since {} — no code was written. \
                              Task cannot be marked as completed without code changes.",
-                            &base_sha[..8]
-                        ));
-                    }
-                    info!(
-                        "Agent produced {} commit(s) since {}",
-                        count,
-                        &base_sha[..base_sha.len().min(8)]
+                            &base_sha[..base_sha.len().min(8)]
+                        ),
                     );
-                    Ok(())
                 }
-                Ok(o) => {
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    warn!("git rev-list failed (non-fatal): {}", stderr);
-                    Ok(()) // Don't fail on git errors — might be a shallow clone
-                }
-                Err(e) => {
-                    warn!("Failed to run git rev-list: {}", e);
-                    Ok(())
-                }
+                info!(
+                    "Agent produced {} commit(s) since {}",
+                    count,
+                    &base_sha[..base_sha.len().min(8)]
+                );
+                CheckOutcome::pass(NAME, LABEL)
             }
-        } else {
-            // No base commit — skip this check (legacy verifier callers)
-            Ok(())
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                warn!("git rev-list failed (non-fatal): {}", stderr);
+                // Don't fail on git errors — might be a shallow clone
+                CheckOutcome::ran(
+                    NAME,
+                    LABEL,
+                    format!("git rev-list failed: {}", stderr.trim()),
+                )
+            }
+            Err(e) => {
+                warn!("Failed to run git rev-list: {}", e);
+                CheckOutcome::ran(NAME, LABEL, format!("git rev-list could not run: {}", e))
+            }
         }
     }
 
@@ -303,18 +493,29 @@ impl TaskVerifier {
     }
 
     /// Check that the project builds without errors.
-    async fn verify_build(&self, cwd: &Path) -> Result<()> {
+    async fn verify_build(&self, cwd: &Path) -> CheckOutcome {
+        const NAME: &str = "build";
+        const LABEL: &str = "Build check failed";
+
+        if !self.build_check_enabled {
+            return CheckOutcome::skipped(NAME, LABEL, "build check disabled");
+        }
+
         let lang = ProjectLanguage::detect(cwd);
         let (cmd, args) = match lang.build_command() {
             Some(c) => c,
             None => {
                 info!("No build command for language {:?}, skipping", lang);
-                return Ok(());
+                return CheckOutcome::skipped(
+                    NAME,
+                    LABEL,
+                    format!("no build command for language {:?}", lang),
+                );
             }
         };
 
         info!("Running build check: {} {:?}", cmd, args);
-        let output = tokio::time::timeout(
+        let output = match tokio::time::timeout(
             self.command_timeout,
             tokio::process::Command::new(cmd)
                 .args(args)
@@ -322,17 +523,30 @@ impl TaskVerifier {
                 .output(),
         )
         .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Build command timed out after {}s",
-                self.command_timeout.as_secs()
-            )
-        })?
-        .map_err(|e| anyhow::anyhow!("Failed to run build command: {}", e))?;
+        {
+            Err(_) => {
+                return CheckOutcome::fail(
+                    NAME,
+                    LABEL,
+                    format!(
+                        "Build command timed out after {}s",
+                        self.command_timeout.as_secs()
+                    ),
+                )
+            }
+            Ok(Err(e)) => {
+                return CheckOutcome::fail(
+                    NAME,
+                    LABEL,
+                    format!("Failed to run build command: {}", e),
+                )
+            }
+            Ok(Ok(output)) => output,
+        };
 
         if output.status.success() {
             info!("Build check passed");
-            Ok(())
+            CheckOutcome::pass(NAME, LABEL)
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             // Truncate stderr to avoid huge error messages
@@ -344,18 +558,23 @@ impl TaskVerifier {
             } else {
                 stderr.to_string()
             };
-            Err(anyhow::anyhow!(
-                "{} {} failed:\n{}",
-                cmd,
-                args.join(" "),
-                truncated
-            ))
+            CheckOutcome::fail(
+                NAME,
+                LABEL,
+                format!("{} {} failed:\n{}", cmd, args.join(" "), truncated),
+            )
         }
     }
 
     /// Verify all steps of the task are completed or skipped.
-    async fn verify_steps(&self, task_id: Uuid) -> Result<()> {
-        let steps = self.graph.get_task_steps(task_id).await?;
+    async fn verify_steps(&self, task_id: Uuid) -> CheckOutcome {
+        const NAME: &str = "steps";
+        const LABEL: &str = "Step completion check failed";
+
+        let steps = match self.graph.get_task_steps(task_id).await {
+            Ok(steps) => steps,
+            Err(e) => return CheckOutcome::fail(NAME, LABEL, e),
+        };
 
         let incomplete: Vec<String> = steps
             .iter()
@@ -365,18 +584,25 @@ impl TaskVerifier {
 
         if incomplete.is_empty() {
             info!("All {} steps completed/skipped", steps.len());
-            Ok(())
+            CheckOutcome::pass(NAME, LABEL)
         } else {
-            Err(anyhow::anyhow!(
-                "{} step(s) not completed:\n- {}",
-                incomplete.len(),
-                incomplete.join("\n- ")
-            ))
+            CheckOutcome::fail(
+                NAME,
+                LABEL,
+                format!(
+                    "{} step(s) not completed:\n- {}",
+                    incomplete.len(),
+                    incomplete.join("\n- ")
+                ),
+            )
         }
     }
 
     /// Check git diff for sensitive files and unreasonable sizes.
-    async fn verify_git_sanity(&self, cwd: &Path) -> Result<()> {
+    async fn verify_git_sanity(&self, cwd: &Path) -> CheckOutcome {
+        const NAME: &str = "git_sanity";
+        const LABEL: &str = "Git sanity check failed";
+
         // Get list of changed files
         let output = tokio::process::Command::new("git")
             .args(["diff", "--name-only", "HEAD~1..HEAD"])
@@ -397,13 +623,14 @@ impl TaskVerifier {
                 // git exits >1 for usage errors
                 {
                     info!("No git context to diff against, skipping git sanity");
-                    return Ok(());
+                    return CheckOutcome::skipped(NAME, LABEL, "no git context to diff against");
                 }
-                return Err(anyhow::anyhow!("git diff failed: {}", stderr));
+                return CheckOutcome::fail(NAME, LABEL, format!("git diff failed: {}", stderr));
             }
             Err(e) => {
                 warn!("Failed to run git diff: {}", e);
-                return Ok(()); // Don't fail the task if git isn't available
+                // Don't fail the task if git isn't available
+                return CheckOutcome::ran(NAME, LABEL, format!("git diff could not run: {}", e));
             }
         };
 
@@ -418,14 +645,18 @@ impl TaskVerifier {
             .collect();
 
         if !sensitive.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Sensitive files detected in commit: {}",
-                sensitive
-                    .iter()
-                    .map(|f| f.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+            return CheckOutcome::fail(
+                NAME,
+                LABEL,
+                format!(
+                    "Sensitive files detected in commit: {}",
+                    sensitive
+                        .iter()
+                        .map(|f| f.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
         }
 
         // Check diff size (stat)
@@ -455,22 +686,33 @@ impl TaskVerifier {
             "Git sanity check passed ({} files changed)",
             changed_files.len()
         );
-        Ok(())
+        CheckOutcome::pass(NAME, LABEL)
     }
 
     /// Run tests if configured.
-    async fn verify_tests(&self, cwd: &Path) -> Result<()> {
+    async fn verify_tests(&self, cwd: &Path) -> CheckOutcome {
+        const NAME: &str = "tests";
+        const LABEL: &str = "Tests failed";
+
+        if !self.test_runner_enabled {
+            return CheckOutcome::skipped(NAME, LABEL, "test runner disabled");
+        }
+
         let lang = ProjectLanguage::detect(cwd);
         let (cmd, args) = match lang.test_command() {
             Some(c) => c,
             None => {
                 info!("No test command for language {:?}, skipping", lang);
-                return Ok(());
+                return CheckOutcome::skipped(
+                    NAME,
+                    LABEL,
+                    format!("no test command for language {:?}", lang),
+                );
             }
         };
 
         info!("Running tests: {} {:?}", cmd, args);
-        let output = tokio::time::timeout(
+        let output = match tokio::time::timeout(
             self.command_timeout,
             tokio::process::Command::new(cmd)
                 .args(args)
@@ -478,17 +720,30 @@ impl TaskVerifier {
                 .output(),
         )
         .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Test command timed out after {}s",
-                self.command_timeout.as_secs()
-            )
-        })?
-        .map_err(|e| anyhow::anyhow!("Failed to run test command: {}", e))?;
+        {
+            Err(_) => {
+                return CheckOutcome::fail(
+                    NAME,
+                    LABEL,
+                    format!(
+                        "Test command timed out after {}s",
+                        self.command_timeout.as_secs()
+                    ),
+                )
+            }
+            Ok(Err(e)) => {
+                return CheckOutcome::fail(
+                    NAME,
+                    LABEL,
+                    format!("Failed to run test command: {}", e),
+                )
+            }
+            Ok(Ok(output)) => output,
+        };
 
         if output.status.success() {
             info!("Tests passed");
-            Ok(())
+            CheckOutcome::pass(NAME, LABEL)
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -501,11 +756,13 @@ impl TaskVerifier {
             } else {
                 combined
             };
-            Err(anyhow::anyhow!("Tests failed:\n{}", truncated))
+            // NOTE: the historical reason is "Tests failed: Tests failed:\n…"
+            // — `verify_tests` repeats its own label. Kept verbatim so existing
+            // failure reasons (and their tests) do not change.
+            CheckOutcome::fail(NAME, LABEL, format!("Tests failed:\n{}", truncated))
         }
     }
 }
-
 /// Extract a number from git stat output (e.g., "3 insertions(+)")
 fn extract_stat_number(line: &str, keyword: &str) -> Option<usize> {
     let parts: Vec<&str> = line.split_whitespace().collect();
@@ -525,6 +782,16 @@ fn extract_stat_number(line: &str, keyword: &str) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::neo4j::StepNode;
+
+    /// The per-check helpers now report a [`CheckOutcome`]. The historical tests
+    /// assert on a `Result`, so adapt them here instead of rewriting every
+    /// claim: `Err` carries the failure sentence, anything else is `Ok`.
+    fn as_result(outcome: CheckOutcome) -> Result<(), String> {
+        match outcome.status {
+            CheckStatus::Fail => Err(outcome.reason().unwrap_or_default()),
+            _ => Ok(()),
+        }
+    }
 
     #[test]
     fn test_project_language_detect_rust() {
@@ -669,7 +936,7 @@ mod tests {
         graph.create_step(task_id, &step2).await.unwrap();
 
         let verifier = TaskVerifier::new(graph, false, false);
-        let result = verifier.verify_steps(task_id).await;
+        let result = as_result(verifier.verify_steps(task_id).await);
         assert!(result.is_ok());
     }
 
@@ -683,7 +950,7 @@ mod tests {
         graph.create_step(task_id, &step2).await.unwrap();
 
         let verifier = TaskVerifier::new(graph, false, false);
-        let result = verifier.verify_steps(task_id).await;
+        let result = as_result(verifier.verify_steps(task_id).await);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -703,7 +970,7 @@ mod tests {
         graph.create_step(task_id, &step2).await.unwrap();
 
         let verifier = TaskVerifier::new(graph, false, false);
-        let result = verifier.verify_steps(task_id).await;
+        let result = as_result(verifier.verify_steps(task_id).await);
         assert!(result.is_ok());
     }
 
@@ -786,7 +1053,7 @@ mod tests {
         graph.create_step(task_id, &step).await.unwrap();
 
         let verifier = TaskVerifier::with_base_commit(graph, false, false, base_sha);
-        let result = verifier.verify_has_commits(cwd).await;
+        let result = as_result(verifier.verify_has_commits(cwd).await);
 
         // Should fail — 0 new commits
         assert!(result.is_err());
@@ -855,7 +1122,7 @@ mod tests {
 
         let (graph, _task_id) = setup_mock_with_task().await;
         let verifier = TaskVerifier::with_base_commit(graph, false, false, base_sha);
-        let result = verifier.verify_has_commits(cwd).await;
+        let result = as_result(verifier.verify_has_commits(cwd).await);
 
         // Should pass — 1 new commit
         assert!(result.is_ok());
@@ -867,7 +1134,7 @@ mod tests {
 
         // No base_commit — should always pass (legacy behavior)
         let verifier = TaskVerifier::new(graph, false, false);
-        let result = verifier.verify_has_commits(Path::new("/tmp")).await;
+        let result = as_result(verifier.verify_has_commits(Path::new("/tmp")).await);
         assert!(result.is_ok());
     }
 
@@ -1032,7 +1299,7 @@ mod tests {
 
         // No steps at all — should pass (0 incomplete)
         let verifier = TaskVerifier::new(graph, false, false);
-        let result = verifier.verify_steps(task_id).await;
+        let result = as_result(verifier.verify_steps(task_id).await);
         assert!(result.is_ok());
     }
 
@@ -1044,7 +1311,7 @@ mod tests {
         graph.create_step(task_id, &step).await.unwrap();
 
         let verifier = TaskVerifier::new(graph, false, false);
-        let result = verifier.verify_steps(task_id).await;
+        let result = as_result(verifier.verify_steps(task_id).await);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1069,7 +1336,7 @@ mod tests {
         graph.create_step(task_id, &step4).await.unwrap();
 
         let verifier = TaskVerifier::new(graph, false, false);
-        let result = verifier.verify_steps(task_id).await;
+        let result = as_result(verifier.verify_steps(task_id).await);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         // Should report 2 incomplete steps
@@ -1139,7 +1406,7 @@ mod tests {
 
         let (graph, _task_id) = setup_mock_with_task().await;
         let verifier = TaskVerifier::with_base_commit(graph, false, false, base_sha);
-        let result = verifier.verify_has_commits(cwd).await;
+        let result = as_result(verifier.verify_has_commits(cwd).await);
 
         // Should fail with specific message about uncommitted changes
         assert!(result.is_err());
@@ -1270,7 +1537,7 @@ mod tests {
 
         let (graph, _task_id) = setup_mock_with_task().await;
         let verifier = TaskVerifier::new(graph, false, false);
-        let result = verifier.verify_git_sanity(cwd).await;
+        let result = as_result(verifier.verify_git_sanity(cwd).await);
         assert!(
             result.is_ok(),
             "Clean commit should pass git sanity: {:?}",
@@ -1288,7 +1555,7 @@ mod tests {
 
         let (graph, _task_id) = setup_mock_with_task().await;
         let verifier = TaskVerifier::new(graph, false, false);
-        let result = verifier.verify_git_sanity(cwd).await;
+        let result = as_result(verifier.verify_git_sanity(cwd).await);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -1313,7 +1580,7 @@ mod tests {
 
         let (graph, _task_id) = setup_mock_with_task().await;
         let verifier = TaskVerifier::new(graph, false, false);
-        let result = verifier.verify_git_sanity(cwd).await;
+        let result = as_result(verifier.verify_git_sanity(cwd).await);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("server.key"));
@@ -1328,7 +1595,7 @@ mod tests {
 
         let (graph, _task_id) = setup_mock_with_task().await;
         let verifier = TaskVerifier::new(graph, false, false);
-        let result = verifier.verify_git_sanity(cwd).await;
+        let result = as_result(verifier.verify_git_sanity(cwd).await);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("credentials.json"));
@@ -1341,7 +1608,7 @@ mod tests {
 
         let (graph, _task_id) = setup_mock_with_task().await;
         let verifier = TaskVerifier::new(graph, false, false);
-        let result = verifier.verify_git_sanity(tmp.path()).await;
+        let result = as_result(verifier.verify_git_sanity(tmp.path()).await);
         // Should not fail — we gracefully skip when not a git repo
         assert!(
             result.is_ok(),
@@ -1357,7 +1624,7 @@ mod tests {
 
         let (graph, _task_id) = setup_mock_with_task().await;
         let verifier = TaskVerifier::new(graph, false, false);
-        let result = verifier.verify_git_sanity(tmp.path()).await;
+        let result = as_result(verifier.verify_git_sanity(tmp.path()).await);
         // HEAD~1 fails on single-commit repo; should be handled gracefully
         assert!(
             result.is_ok(),
@@ -1387,7 +1654,7 @@ mod tests {
 
         let (graph, _task_id) = setup_mock_with_task().await;
         let verifier = TaskVerifier::new(graph, false, false);
-        let result = verifier.verify_git_sanity(cwd).await;
+        let result = as_result(verifier.verify_git_sanity(cwd).await);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains(".env.local") || err.contains("secrets.yaml"));
@@ -1404,7 +1671,7 @@ mod tests {
 
         let (graph, _task_id) = setup_mock_with_task().await;
         let verifier = TaskVerifier::new(graph, true, false);
-        let result = verifier.verify_build(tmp.path()).await;
+        let result = as_result(verifier.verify_build(tmp.path()).await);
         assert!(
             result.is_ok(),
             "Unknown language should skip build: {:?}",
@@ -1419,7 +1686,7 @@ mod tests {
 
         let (graph, _task_id) = setup_mock_with_task().await;
         let verifier = TaskVerifier::new(graph, true, false);
-        let result = verifier.verify_build(tmp.path()).await;
+        let result = as_result(verifier.verify_build(tmp.path()).await);
         assert!(
             result.is_ok(),
             "Python build should skip (no universal build): {:?}",
@@ -1433,7 +1700,7 @@ mod tests {
 
         let (graph, _task_id) = setup_mock_with_task().await;
         let verifier = TaskVerifier::new(graph, false, true);
-        let result = verifier.verify_tests(tmp.path()).await;
+        let result = as_result(verifier.verify_tests(tmp.path()).await);
         assert!(
             result.is_ok(),
             "Unknown language should skip tests: {:?}",
@@ -1721,7 +1988,7 @@ mod tests {
 
         let (graph, _task_id) = setup_mock_with_task().await;
         let verifier = TaskVerifier::with_base_commit(graph, false, false, base_sha);
-        let result = verifier.verify_has_commits(cwd).await;
+        let result = as_result(verifier.verify_has_commits(cwd).await);
         assert!(
             result.is_ok(),
             "Multiple commits should pass: {:?}",
@@ -1741,7 +2008,7 @@ mod tests {
             false,
             "0000000000000000000000000000000000000000".to_string(),
         );
-        let result = verifier.verify_has_commits(tmp.path()).await;
+        let result = as_result(verifier.verify_has_commits(tmp.path()).await);
         // git rev-list with invalid ref should fail gracefully (non-fatal)
         assert!(
             result.is_ok(),
@@ -1765,7 +2032,7 @@ mod tests {
 
         let (graph, _task_id) = setup_mock_with_task().await;
         let verifier = TaskVerifier::with_base_commit(graph, false, false, base_sha);
-        let result = verifier.verify_has_commits(cwd).await;
+        let result = as_result(verifier.verify_has_commits(cwd).await);
 
         // Should fail — 0 new commits, but has uncommitted changes
         assert!(result.is_err());
@@ -1788,8 +2055,137 @@ mod tests {
 
         let (graph, _task_id) = setup_mock_with_task().await;
         let verifier = TaskVerifier::new(graph, false, false);
-        let result = verifier.verify_git_sanity(cwd).await;
+        let result = as_result(verifier.verify_git_sanity(cwd).await);
         // Large diff only warns, doesn't fail
         assert!(result.is_ok(), "Large diff should pass: {:?}", result.err());
+    }
+
+    // ========================================================================
+    // Per-check verdicts and the `verification_json` they produce
+    // ========================================================================
+
+    #[tokio::test]
+    async fn verification_report_records_one_status_per_check() {
+        let (graph, task_id) = setup_mock_with_task().await;
+        let step = make_step("Only step", StepStatus::Completed);
+        graph.create_step(task_id, &step).await.unwrap();
+
+        // build_check / test_runner disabled, and /tmp has no git context:
+        // every check that cannot run must say `skipped`, not vanish.
+        let verifier = TaskVerifier::new(graph, false, false);
+        let report = verifier.verify_report(task_id, "/tmp").await;
+
+        assert!(report.is_pass(), "no check failed: {:?}", report.checks);
+        assert_eq!(report.status("commits"), Some(CheckStatus::Skipped));
+        assert_eq!(report.status("build"), Some(CheckStatus::Skipped));
+        assert_eq!(report.status("steps"), Some(CheckStatus::Pass));
+        assert_eq!(report.status("git_sanity"), Some(CheckStatus::Skipped));
+        assert_eq!(report.status("tests"), Some(CheckStatus::Skipped));
+        assert_eq!(report.checks.len(), 5, "one entry per check, none dropped");
+
+        let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        assert_eq!(json["passed"], serde_json::json!(true));
+        assert_eq!(json["checks"]["steps"]["status"], serde_json::json!("pass"));
+        assert_eq!(
+            json["checks"]["build"]["status"],
+            serde_json::json!("skipped"),
+            "the reason a check did not run is recorded: {}",
+            json
+        );
+        assert_eq!(
+            json["checks"]["commits"]["status"],
+            serde_json::json!("skipped")
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_report_names_the_failing_check() {
+        let (graph, task_id) = setup_mock_with_task().await;
+        let step = make_step("Still pending step", StepStatus::Pending);
+        graph.create_step(task_id, &step).await.unwrap();
+
+        let verifier = TaskVerifier::new(graph, false, false);
+        let report = verifier.verify_report(task_id, "/tmp").await;
+
+        assert!(!report.is_pass());
+        assert_eq!(report.status("steps"), Some(CheckStatus::Fail));
+        // The other checks still report their own status instead of disappearing.
+        assert_eq!(report.status("build"), Some(CheckStatus::Skipped));
+
+        let reasons = report.failures();
+        assert_eq!(
+            reasons.len(),
+            1,
+            "one reason per failed check: {:?}",
+            reasons
+        );
+        assert!(
+            reasons[0].contains("Still pending step"),
+            "the reason names the step: {}",
+            reasons[0]
+        );
+        assert!(
+            reasons[0].starts_with("Step completion check failed: "),
+            "the historical wording is kept: {}",
+            reasons[0]
+        );
+
+        let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        assert_eq!(json["passed"], serde_json::json!(false));
+        assert_eq!(json["checks"]["steps"]["status"], serde_json::json!("fail"));
+        assert!(json["checks"]["steps"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Still pending step"));
+    }
+
+    #[tokio::test]
+    async fn verification_json_is_read_by_the_routing_outcome() {
+        // The JSON written on AgentExecution is what closes the routing loop
+        // (routing::verification_passed): the two must agree on the shape.
+        let (graph, task_id) = setup_mock_with_task().await;
+        let step = make_step("Done step", StepStatus::Completed);
+        graph.create_step(task_id, &step).await.unwrap();
+
+        let passing = TaskVerifier::new(graph.clone(), false, false)
+            .verify_report(task_id, "/tmp")
+            .await;
+        assert_eq!(
+            crate::runner::routing::verification_passed(Some(&passing.to_json())),
+            Some(true)
+        );
+
+        let pending = make_step("Not done step", StepStatus::Pending);
+        graph.create_step(task_id, &pending).await.unwrap();
+        let failing = TaskVerifier::new(graph, false, false)
+            .verify_report(task_id, "/tmp")
+            .await;
+        assert_eq!(
+            crate::runner::routing::verification_passed(Some(&failing.to_json())),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_check_that_cannot_conclude_is_ran_and_never_fails_the_task() {
+        let (tmp, _base_sha) = init_git_repo_with_commit();
+        let (graph, _task_id) = setup_mock_with_task().await;
+
+        // An unknown base sha makes `git rev-list` fail: the check ran, but it
+        // cannot conclude anything about the task — so it says `ran`.
+        let verifier = TaskVerifier::with_base_commit(
+            graph,
+            false,
+            false,
+            "0000000000000000000000000000000000000000".to_string(),
+        );
+        let outcome = verifier.verify_has_commits(tmp.path()).await;
+
+        assert_eq!(outcome.status, CheckStatus::Ran);
+        assert!(
+            outcome.is_pass(),
+            "a check that cannot conclude never fails"
+        );
+        assert!(outcome.reason().is_none());
     }
 }

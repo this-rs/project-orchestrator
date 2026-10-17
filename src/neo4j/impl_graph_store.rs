@@ -4306,6 +4306,15 @@ impl GraphStore for Neo4jClient {
         self.list_running_agent_executions_impl().await
     }
 
+    async fn record_agent_execution_verification(
+        &self,
+        agent_execution_id: Uuid,
+        verification_json: &str,
+    ) -> anyhow::Result<()> {
+        self.record_agent_execution_verification_impl(agent_execution_id, verification_json)
+            .await
+    }
+
     async fn create_used_skill_relation(
         &self,
         agent_execution_id: Uuid,

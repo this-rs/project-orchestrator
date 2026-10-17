@@ -3840,6 +3840,17 @@ pub trait GraphStore: Send + Sync {
         run_id: Uuid,
     ) -> Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>>;
 
+    /// Record the per-check verification result on one execution.
+    ///
+    /// A narrow write on purpose: verification runs after the attempt is
+    /// closed, so rewriting the whole node from a stale copy would race with
+    /// the close and could put `status` back to `running`.
+    async fn record_agent_execution_verification(
+        &self,
+        agent_execution_id: Uuid,
+        verification_json: &str,
+    ) -> Result<()>;
+
     /// Every AgentExecution still `running`, across all runs (oldest first).
     ///
     /// Used by the reconciliation sweep to close the ones whose process is gone.
