@@ -1,0 +1,6 @@
+# Transcript of `fake_claude` for `chat::manager::test_support::connected_fake_cli`:
+# a CLI that stays up until its stdin closes. The explicit timeout replaces the
+# default of `wait_eof` (FAKE_CLAUDE_STDIN_TIMEOUT_MS, 10 s, a fixed deadline that
+# lines read do not push back), so a slow test (llvm-cov) keeps a live CLI. Keep it
+# aligned with the FAKE_CLAUDE_MAX_RUNTIME_MS the helper sets (600000).
+{"op":"wait_eof","timeout_ms":600000}

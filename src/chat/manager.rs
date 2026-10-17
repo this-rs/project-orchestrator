@@ -33319,7 +33319,8 @@ pub(crate) mod test_support {
     ///
     /// The CLI is `fake_claude`, the scripted stand-in for the Claude CLI that
     /// nexus builds (`NEXUS_FAKES_DIR`, the same binaries as the agent e2e tests),
-    /// RUNNING: connected, it waits for its stdin to close, so the session is
+    /// RUNNING: connected, it waits for its stdin to close (600 s at most, see
+    /// [`connected_fake_cli`]), so the session is
     /// live for `evict_if_cli_dead` as it would be with the real CLI. No `claude`
     /// has to be installed, and a missing fake FAILS instead of skipping. What the
     /// session writes to the CLI goes through the `stdin` channel the test reads.
@@ -33345,15 +33346,13 @@ pub(crate) mod test_support {
     }
 
     /// A client connected to a running `fake_claude` that stays up until its
-    /// stdin closes (the client is dropped, or the test process ends).
+    /// stdin closes (the client is dropped, or the test process ends) or for at
+    /// most 600 s: the transcript (`tests/fixtures/fake_claude/live_until_eof.jsonl`,
+    /// checked in, so nothing is left in the temp dir) waits for EOF with a 600 s
+    /// timeout, the same bound as the fake's watchdog set below.
     pub(crate) async fn connected_fake_cli() -> InteractiveClient {
-        static TRANSCRIPT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-        let transcript = TRANSCRIPT.get_or_init(|| {
-            let path = std::env::temp_dir()
-                .join(format!("po-live-fake-claude-{}.jsonl", std::process::id()));
-            std::fs::write(&path, "{\"op\":\"wait_eof\"}\n").expect("transcript written");
-            path
-        });
+        let transcript = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fake_claude/live_until_eof.jsonl");
         let mut options = nexus_claude::ClaudeCodeOptions {
             model: Some("test".into()),
             cli_path: Some(crate::chat::agent_e2e_tests::fake_bin("fake_claude")),
@@ -33363,7 +33362,8 @@ pub(crate) mod test_support {
             "FAKE_CLAUDE_TRANSCRIPT".into(),
             transcript.display().to_string(),
         );
-        // The fake's watchdog (30 s by default) must not end a CLI a slow test holds.
+        // The fake's watchdog (30 s by default) must not end a CLI a slow test holds;
+        // same bound as the `wait_eof` timeout of the transcript.
         options
             .env
             .insert("FAKE_CLAUDE_MAX_RUNTIME_MS".into(), "600000".into());
