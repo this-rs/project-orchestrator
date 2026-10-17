@@ -11967,6 +11967,54 @@ mod post_turn {
         );
     }
 
+    /// A child of a conversation is a sub-agent: its objective is the prompt it was given,
+    /// never the project's backlog. The objective reminder reads the PROJECT's pending
+    /// tasks, so on a child it nags about work the child never took — and the child pays a
+    /// whole extra billed turn to answer it (measured 17/10/2026 on a throwaway child:
+    /// 9 413 cache-creation tokens, 600 output tokens, $0.0094).
+    #[tokio::test]
+    async fn a_child_of_a_conversation_is_not_reminded_of_the_project_objectives() {
+        let r = rig(
+            ProviderKind::ClaudeCode,
+            vec![vec![steps::done(&caps())], vec![steps::done(&caps())]],
+        )
+        .await;
+        seed_pending_tasks(&r.graph, r.project.id).await;
+        // The session is opened AS a child of a conversation (an `Agent` call), the way
+        // `subagents.rs` opens one — not converted after the fact: the objective counters
+        // are built when the agent session is adopted, which happens at open.
+        let mut req = request(None, Some(&r.project.slug), "default");
+        req.message = String::new();
+        req.cwd = r.project.root_path.clone();
+        req.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: Uuid::new_v4(),
+                tool_use_id: Some("toolu_child".into()),
+            }
+            .to_json_string(),
+        );
+        let child = r.manager.create_session(&req).await.unwrap();
+        r.manager
+            .send_message(&child.session_id, "do the thing")
+            .await
+            .unwrap();
+        for _ in 0..400 {
+            if !r.manager.is_session_streaming(&child.session_id).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // A queued reminder becomes another turn: give it time to show up.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let sent = r.sent();
+        assert!(
+            !sent
+                .iter()
+                .any(|s| s.contains(super::super::post_stream::OBJECTIVE_REMINDER_MARKER)),
+            "a sub-agent is not reminded of the project's backlog: {sent:#?}"
+        );
+    }
+
     async fn idle(r: &super::parity::Rig) {
         for _ in 0..400 {
             if !r.manager.is_session_streaming(&r.sid).await {
