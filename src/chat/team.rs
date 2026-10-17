@@ -239,3 +239,120 @@ impl SessionHooks for TeamHooks {
     }
 
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+    use uuid::Uuid;
+
+    use crate::chat::manager::{test_support, ChatManager};
+    use crate::test_helpers::mock_app_state;
+
+    fn make_manager() -> ChatManager {
+        let state = mock_app_state();
+        ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config())
+    }
+
+    /// An idle target session: `inject_team_message` wins the compare_exchange
+    /// and sets `is_streaming = true` (a stream_response is spawned).
+    #[tokio::test]
+    async fn a_team_message_to_an_idle_session_starts_streaming() {
+        let manager = make_manager();
+        let to_id = Uuid::new_v4().to_string();
+        test_support::insert_live_session_without_cli(&manager, &to_id).await;
+
+        let from_id = Uuid::new_v4();
+        manager
+            .inject_team_message(from_id, "sender", &to_id, "hello from peer")
+            .await
+            .expect("inject succeeds");
+
+        // compare_exchange(false → true) was claimed by inject_team_message.
+        assert!(
+            manager.session_is_streaming(&to_id).await,
+            "is_streaming must be set after idle delivery"
+        );
+
+        // The pending queue must be empty: the message was sent as a live turn.
+        let sessions = manager.active_sessions.read().await;
+        let queue = sessions[&to_id].pending_messages.lock().await;
+        assert!(queue.is_empty(), "no pending messages for an idle delivery");
+    }
+
+    /// A streaming target session: `inject_team_message` loses the compare_exchange
+    /// and parks the message in the pending queue for drain.
+    #[tokio::test]
+    async fn a_team_message_to_a_streaming_session_is_queued() {
+        use crate::chat::types::PendingMessageKind;
+
+        let manager = make_manager();
+        let to_id = Uuid::new_v4().to_string();
+        test_support::insert_live_session_without_cli(&manager, &to_id).await;
+        // Manually flip is_streaming to true BEFORE inject.
+        {
+            let sessions = manager.active_sessions.read().await;
+            sessions[&to_id]
+                .is_streaming
+                .store(true, Ordering::SeqCst);
+        }
+
+        let from_id = Uuid::new_v4();
+        manager
+            .inject_team_message(from_id, "peer", &to_id, "queued text")
+            .await
+            .expect("inject succeeds");
+
+        let sessions = manager.active_sessions.read().await;
+        let queue = sessions[&to_id].pending_messages.lock().await;
+        assert_eq!(queue.len(), 1, "one message must be queued");
+        let msg = &queue[0];
+        assert!(
+            matches!(
+                &msg.kind,
+                PendingMessageKind::TeamMessage { from_session_id, from_name }
+                if *from_session_id == from_id && from_name == "peer"
+            ),
+            "queued message must be a TeamMessage from the correct sender: {:?}",
+            msg.kind
+        );
+    }
+
+    /// Rate limit: after 10 messages the 11th is silently dropped.
+    #[tokio::test]
+    async fn team_message_rate_limit_drops_after_10_per_minute() {
+        let manager = make_manager();
+        let to_id = Uuid::new_v4().to_string();
+        test_support::insert_live_session_without_cli(&manager, &to_id).await;
+
+        let from_id = Uuid::new_v4();
+        // Seed 10 recent instants for this (from, to) pair.
+        {
+            let mut rate = manager.team_msg_rate.lock().await;
+            let key = (from_id, to_id.clone());
+            let window = rate.entry(key).or_default();
+            for _ in 0..10 {
+                window.push(std::time::Instant::now());
+            }
+        }
+
+        let result = manager
+            .inject_team_message(from_id, "sender", &to_id, "over the limit")
+            .await;
+        assert!(result.is_ok(), "rate-limit drop must return Ok, not Err");
+
+        // Nothing was queued.
+        let sessions = manager.active_sessions.read().await;
+        let queue = sessions[&to_id].pending_messages.lock().await;
+        assert!(queue.is_empty(), "rate-limited message must not be queued");
+    }
+
+    /// Injecting to a session that does not exist returns an error.
+    #[tokio::test]
+    async fn team_message_to_unknown_session_returns_error() {
+        let manager = make_manager();
+        let result = manager
+            .inject_team_message(Uuid::new_v4(), "sender", "nonexistent-id", "hi")
+            .await;
+        assert!(result.is_err(), "must fail for an unknown session");
+    }
+}
