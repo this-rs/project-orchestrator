@@ -18183,6 +18183,7 @@ mod tests {
             lasting_rules_dir: None,
             native_turn_timeout_secs: None,
             native_session_max_tokens: None,
+            max_live_children: super::envelope::MAX_LIVE_CHILDREN,
         }
     }
 

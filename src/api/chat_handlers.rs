@@ -91,7 +91,7 @@ pub async fn create_session(
             // from the token.
             None => {
                 let env =
-                    envelope::envelope_for_caller(graph.as_ref(), chat_manager.as_ref(), &caller)
+                    envelope::envelope_for_caller(graph.as_ref(), chat_manager.as_ref(), &caller, chat_manager.config.max_live_children)
                         .await?
                         .expect("an agent caller always has an envelope");
                 let default_mode = chat_manager.default_permission_mode().await;
