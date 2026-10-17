@@ -591,6 +591,7 @@ mod tests {
             task_title: "Do stuff".into(),
             cost_usd: 0.05,
             duration_secs: 120.0,
+            cost_basis: None,
         };
         let envelope = RunWsEvent::RunnerEvent {
             event: &runner_event,

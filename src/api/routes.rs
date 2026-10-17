@@ -656,6 +656,11 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/plans/{plan_id}/run/budget",
             axum::routing::patch(handlers::update_run_budget),
         )
+        // Cost aggregates of every run (B35): two counters, never summed together.
+        .route(
+            "/api/runner/cost-breakdown",
+            get(handlers::get_runner_cost_breakdown),
+        )
         .route(
             "/api/plans/{plan_id}/run/auto-pr",
             post(handlers::create_auto_pr),

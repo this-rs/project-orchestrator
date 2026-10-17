@@ -12617,8 +12617,29 @@ impl GraphStore for MockGraphStore {
             .get_mut(&agent_execution_id)
         {
             node.verification_json = Some(verification_json.to_string());
+            if let Some(passed) =
+                crate::runner::routing::verification_passed(Some(verification_json))
+            {
+                node.verification_passed = Some(passed);
+            }
         }
         Ok(())
+    }
+
+    async fn agent_execution_cost_breakdown(
+        &self,
+        group_by: crate::neo4j::agent_execution::CostGroupBy,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<Vec<crate::neo4j::agent_execution::CostBreakdownRow>> {
+        use crate::neo4j::agent_execution::{breakdown, in_breakdown_window};
+        let store = self.agent_executions.read().await;
+        Ok(breakdown(
+            store
+                .values()
+                .filter(|ae| in_breakdown_window(ae, from, to)),
+            group_by,
+        ))
     }
 
     async fn create_used_skill_relation(

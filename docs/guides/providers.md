@@ -250,6 +250,20 @@ Two counters: *marginal* (reported or priced: real spend, the only one that can 
 *notional* (subscription or free). An unknown price is never a zero. `GET /api/chat/runs/{run_id}/costs`.
 The run totals also carry `cache_read_tokens` and `cache_write_tokens`.
 
+The runner keeps both counters on its run state (`cost_usd` is the marginal one, `notional_usd` the
+other, `tokens_used` the tokens of every attempt) and holds only the marginal one against
+`runner.max_cost_usd`. A provider that states no price (`cost_source: unknown`) never moves it: such a
+run is bounded in tokens by `runner.max_tokens` (or the run's `max_tokens`), and a budgeted run named
+on such a provider without any token budget is refused at start. A task that spends more than its
+profile's `max_cost_usd` raises `task_cost_cap_exceeded` (`runner.per_task_cap: warn`, the default) or
+fails the attempt (`enforce`); a notional amount never does.
+
+Across runs: `GET /api/runner/cost-breakdown?group_by=model|provider|task_class|routed_by&from=&to=`
+(RFC 3339, `[from, to)`, the last 30 days by default) answers one row per group with `executions`,
+`cost: { marginal_usd, notional_usd, unknown_count }` — never summed together —, `tokens`,
+`verified_first_attempt_rate` and `median_duration_secs`. An execution recorded before models were
+stored is filed under `unknown`.
+
 Tokens and prompt cache of a conversation, turn by turn: `GET /api/chat/sessions/{id}/usage`. It returns:
 
 - `input_tokens`, the tokens NOT served from the cache;

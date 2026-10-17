@@ -6,6 +6,7 @@
 
 use super::client::Neo4jClient;
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use neo4rs::query;
 use uuid::Uuid;
 
@@ -93,6 +94,11 @@ pub struct AgentExecutionNode {
     /// Per-check verification detail (serialized JSON).
     #[serde(default)]
     pub verification_json: Option<String>,
+    /// The verdict of `verification_json`, flat so a Cypher aggregate can read
+    /// it (B35). `None` for an attempt nobody verified, and for every node
+    /// written before the field existed.
+    #[serde(default)]
+    pub verification_passed: Option<bool>,
     /// Cognitive routing decision that chose this execution's model (B-R7),
     /// applied or not. `None` for an execution nobody routed, and for every
     /// node written before the field existed.
@@ -158,6 +164,7 @@ impl Default for AgentExecutionNode {
             cost_basis: None,
             num_turns: None,
             verification_json: None,
+            verification_passed: None,
             routing_decision_id: None,
         }
     }
@@ -292,6 +299,162 @@ impl AgentExecutionStatus {
     }
 }
 
+/// Groups of the cost breakdown (B35).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostGroupBy {
+    /// By effective model (`unknown` when the provider did not say).
+    Model,
+    /// By provider instance.
+    Provider,
+    /// By task class at launch (`unclassified` when none).
+    TaskClass,
+    /// By the resolution level that picked the provider/model.
+    RoutedBy,
+}
+
+impl CostGroupBy {
+    /// Every group the breakdown accepts, as the query parameter spells it.
+    pub const ALL: [&'static str; 4] = ["model", "provider", "task_class", "routed_by"];
+
+    /// The group a query parameter names, `None` for anything else.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "model" => Some(Self::Model),
+            "provider" => Some(Self::Provider),
+            "task_class" => Some(Self::TaskClass),
+            "routed_by" => Some(Self::RoutedBy),
+            _ => None,
+        }
+    }
+
+    /// The key an execution falls under: the same defaults the Cypher applies.
+    pub fn key_of(self, ae: &AgentExecutionNode) -> String {
+        fn or_default(value: Option<&str>, default: &str) -> String {
+            value
+                .filter(|s| !s.is_empty())
+                .unwrap_or(default)
+                .to_string()
+        }
+        match self {
+            Self::Model => or_default(ae.model.as_deref(), "unknown"),
+            Self::Provider => or_default(Some(&ae.provider_id), DEFAULT_PROVIDER_ID),
+            Self::TaskClass => or_default(ae.task_class.as_deref(), "unclassified"),
+            Self::RoutedBy => or_default(Some(&ae.routed_by), DEFAULT_ROUTED_BY),
+        }
+    }
+}
+
+/// Most groups one breakdown returns: the key spaces are small (models,
+/// instances, classes, levels), the cap only keeps a runaway query bounded.
+pub const MAX_BREAKDOWN_GROUPS: usize = 1_000;
+
+/// The two counters and the unknowns of a group: never summed together (A21).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CostCell {
+    /// Real spend: basis `reported` or `priced` (or none, the pre-A21 shape).
+    pub marginal_usd: f64,
+    /// Subscription or free usage at its stated amount.
+    pub notional_usd: f64,
+    /// Executions whose cost has no amount (`unknown` basis): counted, not summed.
+    pub unknown_count: u64,
+}
+
+/// Tokens of a group, `None` when no execution reported the figure.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TokenCell {
+    pub input: Option<u64>,
+    pub output: Option<u64>,
+}
+
+/// One group of the cost breakdown (B35).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CostBreakdownRow {
+    /// The group's key (model name, provider id, task class or routing level).
+    pub key: String,
+    /// Executions in the group (still-`running` attempts left out).
+    pub executions: u64,
+    pub cost: CostCell,
+    pub tokens: TokenCell,
+    /// Share of the first attempts (`attempt = 1`) whose verification passed;
+    /// `None` when the group has no first attempt.
+    pub verified_first_attempt_rate: Option<f64>,
+    /// Median of `duration_secs` (lower middle, as Cypher's `percentileDisc(0.5)`);
+    /// `None` for an empty group.
+    pub median_duration_secs: Option<f64>,
+}
+
+/// Whether an execution belongs to the breakdown of `[from, to)` (the mock's
+/// side of the Cypher `WHERE`).
+#[cfg(test)]
+pub fn in_breakdown_window(
+    ae: &AgentExecutionNode,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> bool {
+    ae.status != AgentExecutionStatus::Running && ae.started_at >= from && ae.started_at < to
+}
+
+/// The breakdown of `executions` by `group_by`, in memory: what the Cypher of
+/// [`Neo4jClient::agent_execution_cost_breakdown_impl`] computes, for the mock
+/// store and for the tests that pin the semantics. Sorted by key.
+#[cfg(test)]
+pub fn breakdown<'a>(
+    executions: impl IntoIterator<Item = &'a AgentExecutionNode>,
+    group_by: CostGroupBy,
+) -> Vec<CostBreakdownRow> {
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct Acc {
+        row: CostBreakdownRow,
+        first_attempts: u64,
+        verified_first: u64,
+        durations: Vec<f64>,
+    }
+
+    let mut groups: BTreeMap<String, Acc> = BTreeMap::new();
+    for ae in executions {
+        let acc = groups.entry(group_by.key_of(ae)).or_default();
+        acc.row.executions += 1;
+        match ae.cost_basis.as_deref() {
+            None | Some("reported") | Some("priced") => acc.row.cost.marginal_usd += ae.cost_usd,
+            Some("free") | Some("subscription") => acc.row.cost.notional_usd += ae.cost_usd,
+            Some(_) => acc.row.cost.unknown_count += 1,
+        }
+        if let Some(t) = ae.tokens_in {
+            *acc.row.tokens.input.get_or_insert(0) += t;
+        }
+        if let Some(t) = ae.tokens_out {
+            *acc.row.tokens.output.get_or_insert(0) += t;
+        }
+        if ae.attempt <= 1 {
+            acc.first_attempts += 1;
+            if ae.verification_passed == Some(true) {
+                acc.verified_first += 1;
+            }
+        }
+        acc.durations.push(ae.duration_secs);
+    }
+    groups
+        .into_iter()
+        .take(MAX_BREAKDOWN_GROUPS)
+        .map(|(key, mut acc)| {
+            acc.row.key = key;
+            acc.row.verified_first_attempt_rate = (acc.first_attempts > 0)
+                .then(|| acc.verified_first as f64 / acc.first_attempts as f64);
+            acc.durations
+                .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            acc.row.median_duration_secs = (!acc.durations.is_empty()).then(|| {
+                // percentileDisc(0.5): the value at the ceil(n / 2)-th position.
+                let n = acc.durations.len();
+                acc.durations[n.div_ceil(2) - 1]
+            });
+            acc.row
+        })
+        .collect()
+}
+
 impl Neo4jClient {
     // ========================================================================
     // AgentExecution operations
@@ -404,6 +567,10 @@ impl Neo4jClient {
             cypher.push_str(", ae.report_json = $report_json");
         }
 
+        if ae.verification_passed.is_some() {
+            cypher.push_str(", ae.verification_passed = $verification_passed");
+        }
+
         // Outcome of the attempt (effective model, usage, cost basis, checks):
         // written only when known, so closing a node never erases a value.
         // Launch-time properties (provider, routing, attempt, base_sha) are set
@@ -439,6 +606,10 @@ impl Neo4jClient {
             q = q.param("report_json", report_json.clone());
         }
 
+        if let Some(passed) = ae.verification_passed {
+            q = q.param("verification_passed", passed);
+        }
+
         for (name, value) in outcome_strings {
             q = q.param(name, value);
         }
@@ -460,17 +631,104 @@ impl Neo4jClient {
         agent_execution_id: Uuid,
         verification_json: &str,
     ) -> Result<()> {
-        let q = query(
+        let mut cypher = String::from(
             r#"
             MATCH (ae:AgentExecution {id: $id})
             SET ae.verification_json = $verification_json
             "#,
-        )
-        .param("id", agent_execution_id.to_string())
-        .param("verification_json", verification_json);
+        );
+        let passed = crate::runner::routing::verification_passed(Some(verification_json));
+        if passed.is_some() {
+            cypher.push_str(", ae.verification_passed = $verification_passed");
+        }
+        let mut q = query(&cypher)
+            .param("id", agent_execution_id.to_string())
+            .param("verification_json", verification_json);
+        if let Some(passed) = passed {
+            q = q.param("verification_passed", passed);
+        }
 
         self.graph.run(q).await?;
         Ok(())
+    }
+
+    /// Cost, tokens, first-attempt verification and median duration of the
+    /// executions started in `[from, to)`, grouped by `group_by` (B35).
+    ///
+    /// One aggregate per group, computed in the graph: the marginal and
+    /// notional amounts are summed in separate cells, an unknown cost is
+    /// counted and never summed, so no two bases ever meet in one figure.
+    /// Still-`running` attempts have no cost yet and are left out. Bounded by
+    /// the time window (`started_at` is indexed) and a cap on the groups.
+    pub async fn agent_execution_cost_breakdown_impl(
+        &self,
+        group_by: CostGroupBy,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<CostBreakdownRow>> {
+        let key = match group_by {
+            CostGroupBy::Model => "CASE WHEN ae.model IS NULL OR ae.model = '' THEN 'unknown' ELSE ae.model END",
+            CostGroupBy::Provider => "CASE WHEN ae.provider_id IS NULL OR ae.provider_id = '' THEN 'claude-code' ELSE ae.provider_id END",
+            CostGroupBy::TaskClass => "CASE WHEN ae.task_class IS NULL OR ae.task_class = '' THEN 'unclassified' ELSE ae.task_class END",
+            CostGroupBy::RoutedBy => "CASE WHEN ae.routed_by IS NULL OR ae.routed_by = '' THEN 'default' ELSE ae.routed_by END",
+        };
+        let cypher = format!(
+            r#"
+            MATCH (ae:AgentExecution)
+            WHERE ae.started_at >= datetime($from) AND ae.started_at < datetime($to)
+              AND ae.status <> 'running'
+            WITH ae, {key} AS key,
+                 CASE WHEN ae.cost_basis IS NULL OR ae.cost_basis IN ['reported', 'priced']
+                      THEN coalesce(ae.cost_usd, 0.0) ELSE 0.0 END AS marginal,
+                 CASE WHEN ae.cost_basis IN ['free', 'subscription']
+                      THEN coalesce(ae.cost_usd, 0.0) ELSE 0.0 END AS notional,
+                 CASE WHEN ae.cost_basis IS NULL OR ae.cost_basis IN ['reported', 'priced', 'free', 'subscription']
+                      THEN 0 ELSE 1 END AS unknown
+            RETURN key,
+                   count(ae) AS executions,
+                   sum(marginal) AS marginal_usd,
+                   sum(notional) AS notional_usd,
+                   sum(unknown) AS unknown_count,
+                   count(ae.tokens_in) AS with_input,
+                   sum(coalesce(ae.tokens_in, 0)) AS input_tokens,
+                   count(ae.tokens_out) AS with_output,
+                   sum(coalesce(ae.tokens_out, 0)) AS output_tokens,
+                   sum(CASE WHEN coalesce(ae.attempt, 1) = 1 THEN 1 ELSE 0 END) AS first_attempts,
+                   sum(CASE WHEN coalesce(ae.attempt, 1) = 1 AND ae.verification_passed = true THEN 1 ELSE 0 END) AS verified_first,
+                   percentileDisc(ae.duration_secs, 0.5) AS median_duration_secs
+            ORDER BY key ASC
+            LIMIT {MAX_BREAKDOWN_GROUPS}
+            "#
+        );
+        let q = query(&cypher)
+            .param("from", from.to_rfc3339())
+            .param("to", to.to_rfc3339());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut rows = Vec::new();
+        while let Some(row) = result.next().await? {
+            let count = |name: &str| row.get::<i64>(name).unwrap_or(0).max(0) as u64;
+            let with_input = count("with_input");
+            let with_output = count("with_output");
+            let first_attempts = count("first_attempts");
+            rows.push(CostBreakdownRow {
+                key: row.get("key")?,
+                executions: count("executions"),
+                cost: CostCell {
+                    marginal_usd: row.get("marginal_usd").unwrap_or(0.0),
+                    notional_usd: row.get("notional_usd").unwrap_or(0.0),
+                    unknown_count: count("unknown_count"),
+                },
+                tokens: TokenCell {
+                    input: (with_input > 0).then(|| count("input_tokens")),
+                    output: (with_output > 0).then(|| count("output_tokens")),
+                },
+                verified_first_attempt_rate: (first_attempts > 0)
+                    .then(|| count("verified_first") as f64 / first_attempts as f64),
+                median_duration_secs: row.get::<f64>("median_duration_secs").ok(),
+            });
+        }
+        Ok(rows)
     }
 
     /// Get all AgentExecution nodes for a given PlanRun.
@@ -607,6 +865,7 @@ impl Neo4jClient {
             cost_basis: opt_string("cost_basis"),
             num_turns: opt_u64("num_turns").and_then(|v| u32::try_from(v).ok()),
             verification_json: opt_string("verification_json"),
+            verification_passed: node.get::<bool>("verification_passed").ok(),
             routing_decision_id: opt_string("routing_decision_id")
                 .and_then(|s| Uuid::parse_str(&s).ok()),
         })
@@ -665,6 +924,7 @@ mod tests {
             cost_basis: Some("reported".to_string()),
             num_turns: Some(7),
             verification_json: Some(r#"{"build":"pass"}"#.to_string()),
+            verification_passed: Some(true),
             routing_decision_id: Some(Uuid::new_v4()),
             ..make_agent_execution(None, None)
         }
@@ -690,6 +950,7 @@ mod tests {
         assert_eq!(a.cost_basis, b.cost_basis);
         assert_eq!(a.num_turns, b.num_turns);
         assert_eq!(a.verification_json, b.verification_json);
+        assert_eq!(a.verification_passed, b.verification_passed);
         assert_eq!(a.routing_decision_id, b.routing_decision_id);
     }
 
@@ -746,6 +1007,7 @@ mod tests {
         assert!(ae.cost_basis.is_none());
         assert!(ae.num_turns.is_none());
         assert!(ae.verification_json.is_none());
+        assert!(ae.verification_passed.is_none());
         assert!(
             ae.routing_decision_id.is_none(),
             "a node written before routing decisions reads as None"
@@ -989,5 +1251,250 @@ mod tests {
             let deserialized: ExecutionType = serde_json::from_str(&json).unwrap();
             assert_eq!(*variant, deserialized);
         }
+    }
+
+    // ── Cost breakdown (B35) ───────────────────────────────────────────────
+
+    fn execution(
+        provider: &str,
+        model: Option<&str>,
+        class: Option<&str>,
+        routed_by: &str,
+        usd: f64,
+        basis: Option<&str>,
+    ) -> AgentExecutionNode {
+        let mut ae = AgentExecutionNode::new(Uuid::nil(), Uuid::new_v4());
+        ae.status = AgentExecutionStatus::Completed;
+        ae.provider_id = provider.into();
+        ae.model = model.map(str::to_string);
+        ae.task_class = class.map(str::to_string);
+        ae.routed_by = routed_by.into();
+        ae.cost_usd = usd;
+        ae.cost_basis = basis.map(str::to_string);
+        ae.duration_secs = 10.0;
+        ae
+    }
+
+    #[test]
+    fn a_group_by_is_parsed_from_the_four_names_only() {
+        for name in CostGroupBy::ALL {
+            assert!(CostGroupBy::parse(name).is_some(), "{name}");
+        }
+        assert_eq!(CostGroupBy::parse("session"), None);
+        assert_eq!(CostGroupBy::parse(""), None);
+        assert_eq!(CostGroupBy::parse("Model"), None, "exact spelling");
+    }
+
+    /// (B35) Three bases, four cells: the marginal and the notional sums never
+    /// meet, and an unknown cost is a count, not a zero in a sum. Old nodes
+    /// (no model) fall under `unknown`; no basis at all is a reported cost.
+    #[test]
+    fn a_breakdown_never_adds_two_bases_in_one_cell_and_files_old_nodes_under_unknown() {
+        let mut reported = execution(
+            "claude-code",
+            Some("opus"),
+            Some("complex"),
+            "default",
+            2.0,
+            Some("reported"),
+        );
+        reported.tokens_in = Some(100);
+        reported.tokens_out = Some(10);
+        let mut priced = execution(
+            "deepseek",
+            Some("ds-chat"),
+            Some("simple"),
+            "project_rule",
+            0.5,
+            Some("priced"),
+        );
+        priced.tokens_in = Some(40);
+        let sub = execution(
+            "claude-code",
+            Some("opus"),
+            Some("simple"),
+            "default",
+            3.0,
+            Some("subscription"),
+        );
+        let free = execution(
+            "local",
+            Some("llama"),
+            Some("simple"),
+            "run",
+            0.0,
+            Some("free"),
+        );
+        // A fictitious amount on an unknown basis is never summed anywhere.
+        let unknown = execution("local", Some("llama"), None, "run", 99.0, Some("unknown"));
+        let mut old = execution("claude-code", None, None, "default", 0.25, None);
+        old.attempt = 1;
+        old.duration_secs = 30.0;
+
+        let rows = breakdown(
+            [&reported, &priced, &sub, &free, &unknown, &old],
+            CostGroupBy::Model,
+        );
+        let by_key = |k: &str| rows.iter().find(|r| r.key == k).cloned().expect(k);
+        assert_eq!(
+            rows.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
+            ["ds-chat", "llama", "opus", "unknown"]
+        );
+        let opus = by_key("opus");
+        assert_eq!(opus.executions, 2);
+        assert_eq!(
+            opus.cost,
+            CostCell {
+                marginal_usd: 2.0,
+                notional_usd: 3.0,
+                unknown_count: 0
+            }
+        );
+        assert_eq!(
+            opus.tokens,
+            TokenCell {
+                input: Some(100),
+                output: Some(10)
+            }
+        );
+        let llama = by_key("llama");
+        assert_eq!(
+            llama.cost,
+            CostCell {
+                marginal_usd: 0.0,
+                notional_usd: 0.0,
+                unknown_count: 1
+            },
+            "99 USD of unknown basis counted, never summed"
+        );
+        assert_eq!(
+            llama.tokens,
+            TokenCell {
+                input: None,
+                output: None
+            },
+            "nothing reported: unknown, not zero"
+        );
+        let old_nodes = by_key("unknown");
+        assert_eq!(old_nodes.executions, 1);
+        assert_eq!(
+            old_nodes.cost.marginal_usd, 0.25,
+            "no basis at all: a reported cost"
+        );
+        assert_eq!(old_nodes.median_duration_secs, Some(30.0));
+        assert_eq!(
+            by_key("ds-chat").tokens,
+            TokenCell {
+                input: Some(40),
+                output: None
+            }
+        );
+
+        let by_provider = breakdown(
+            [&reported, &priced, &sub, &free, &unknown, &old],
+            CostGroupBy::Provider,
+        );
+        assert_eq!(
+            by_provider
+                .iter()
+                .map(|r| r.key.as_str())
+                .collect::<Vec<_>>(),
+            ["claude-code", "deepseek", "local"]
+        );
+        assert_eq!(
+            by_provider[0].cost,
+            CostCell {
+                marginal_usd: 2.25,
+                notional_usd: 3.0,
+                unknown_count: 0
+            }
+        );
+        let by_class = breakdown(
+            [&reported, &priced, &sub, &free, &unknown, &old],
+            CostGroupBy::TaskClass,
+        );
+        assert_eq!(
+            by_class
+                .iter()
+                .map(|r| (r.key.as_str(), r.executions))
+                .collect::<Vec<_>>(),
+            [("complex", 1), ("simple", 3), ("unclassified", 2)]
+        );
+        let by_route = breakdown(
+            [&reported, &priced, &sub, &free, &unknown, &old],
+            CostGroupBy::RoutedBy,
+        );
+        assert_eq!(
+            by_route.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
+            ["default", "project_rule", "run"]
+        );
+    }
+
+    #[test]
+    fn a_breakdown_rates_first_attempts_and_takes_the_lower_median() {
+        let mut first_ok = execution("p", Some("m"), None, "default", 0.1, Some("reported"));
+        first_ok.verification_passed = Some(true);
+        first_ok.duration_secs = 5.0;
+        let mut first_ko = execution("p", Some("m"), None, "default", 0.1, Some("reported"));
+        first_ko.verification_passed = Some(false);
+        first_ko.duration_secs = 50.0;
+        let mut first_unverified =
+            execution("p", Some("m"), None, "default", 0.1, Some("reported"));
+        first_unverified.duration_secs = 20.0;
+        let mut retry = execution("p", Some("m"), None, "default", 0.1, Some("reported"));
+        retry.attempt = 2;
+        retry.verification_passed = Some(true);
+        retry.duration_secs = 40.0;
+
+        let rows = breakdown(
+            [&first_ok, &first_ko, &first_unverified, &retry],
+            CostGroupBy::Provider,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].executions, 4);
+        assert_eq!(
+            rows[0].verified_first_attempt_rate,
+            Some(1.0 / 3.0),
+            "a retry's pass does not count as first-attempt"
+        );
+        assert_eq!(
+            rows[0].median_duration_secs,
+            Some(20.0),
+            "lower middle of [5, 20, 40, 50]"
+        );
+
+        let only_retries = breakdown([&retry], CostGroupBy::Provider);
+        assert_eq!(only_retries[0].verified_first_attempt_rate, None);
+        assert!(breakdown(std::iter::empty(), CostGroupBy::Provider).is_empty());
+    }
+
+    #[test]
+    fn the_breakdown_window_keeps_closed_attempts_started_in_it() {
+        use chrono::TimeZone;
+        let from = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let to = Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap();
+        let mut inside = execution("p", None, None, "default", 0.0, None);
+        inside.started_at = from;
+        assert!(in_breakdown_window(&inside, from, to), "from is inclusive");
+        let mut at_end = inside.clone();
+        at_end.started_at = to;
+        assert!(!in_breakdown_window(&at_end, from, to), "to is exclusive");
+        let mut running = inside.clone();
+        running.status = AgentExecutionStatus::Running;
+        assert!(!in_breakdown_window(&running, from, to), "no cost yet");
+    }
+
+    #[tokio::test]
+    async fn recording_a_verification_sets_the_flat_verdict_on_the_mock() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::GraphStore;
+        let g = MockGraphStore::new();
+        let ae = make_agent_execution(None, None);
+        g.create_agent_execution(&ae).await.unwrap();
+        g.record_agent_execution_verification(ae.id, r#"{"passed": false, "checks": {}}"#)
+            .await
+            .unwrap();
+        let read = g.get_agent_executions_for_run(ae.run_id).await.unwrap();
+        assert_eq!(read[0].verification_passed, Some(false));
     }
 }

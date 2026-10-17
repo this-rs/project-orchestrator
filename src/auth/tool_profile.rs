@@ -533,6 +533,7 @@ const ALLOWED_ROUTE_PREFIXES: &[&str] = &[
     "/api/reason",
     "/api/releases",
     "/api/resources",
+    "/api/runner",
     "/api/runs",
     "/api/skills",
     "/api/steps",

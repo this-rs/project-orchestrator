@@ -53,8 +53,22 @@ pub struct RunnerState {
     pub completed_at: Option<DateTime<Utc>>,
     /// Current run status
     pub status: PlanRunStatus,
-    /// Cumulative cost in USD
+    /// MARGINAL counter (A21): the real spend of the run in USD, i.e. the costs
+    /// whose basis is `reported` or `priced`. The only counter that can stop a
+    /// run. Serialized as `cost_usd` (the name the `PlanRun` node has always had).
     pub cost_usd: f64,
+    /// NOTIONAL counter (A21): what the run would have cost on a `subscription`
+    /// or a `free` endpoint. Informative, never cuts a run.
+    #[serde(default)]
+    pub notional_usd: f64,
+    /// Tokens (input + output) of every attempt, whatever the cost basis: the
+    /// budget of a run whose provider has no price.
+    #[serde(default)]
+    pub tokens_used: u64,
+    /// Attempts whose cost is unknown (no price for the model): counted apart,
+    /// never as zero.
+    #[serde(default)]
+    pub unknown_cost_attempts: u32,
     /// How this run was triggered
     pub triggered_by: TriggerSource,
     /// Project ID (for scoping)
@@ -70,6 +84,51 @@ pub struct RunnerState {
     /// this field existed: those cannot be resumed safely.
     #[serde(default)]
     pub cwd: Option<String>,
+}
+
+/// What one attempt cost, as the provider reported it on the turn's `Result`
+/// event: an amount only when the provider gave one (a model without a price
+/// has `None`, never 0), the basis of that amount, and the tokens of the turn.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AttemptCost {
+    /// Amount in USD, `None` when the provider stated no price.
+    pub usd: Option<f64>,
+    /// `reported`, `priced`, `free`, `subscription` or `unknown`; `None` for a
+    /// provider that stated an amount without a basis (counted as `reported`).
+    pub basis: Option<String>,
+    /// Input + output tokens of the attempt, when the provider reported them.
+    pub tokens: Option<u64>,
+}
+
+impl AttemptCost {
+    /// The amount, when it is real money (basis `reported` / `priced`, or none).
+    pub fn marginal_usd(&self) -> Option<f64> {
+        crate::chat::cost::counts_toward_budget(self.basis.as_deref())
+            .then_some(self.usd)
+            .flatten()
+    }
+}
+
+/// The limits of a run: a USD ceiling on the marginal counter and, for a
+/// provider without a price, a ceiling on the tokens of every attempt.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RunBudget {
+    /// USD limit on the marginal counter; `<= 0` disables it.
+    pub max_cost_usd: f64,
+    /// Token limit on the run; `None` disables it.
+    pub max_tokens: Option<u64>,
+}
+
+/// The limit a run went past.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BudgetBreach {
+    /// The marginal counter went past the USD limit.
+    Usd { cumulated_usd: f64, limit_usd: f64 },
+    /// The tokens of the run went past the token limit.
+    Tokens {
+        cumulated_tokens: u64,
+        limit_tokens: u64,
+    },
 }
 
 impl RunnerState {
@@ -96,6 +155,9 @@ impl RunnerState {
             completed_at: None,
             status: PlanRunStatus::Running,
             cost_usd: 0.0,
+            notional_usd: 0.0,
+            tokens_used: 0,
+            unknown_cost_attempts: 0,
             triggered_by,
             project_id: None,
             lifecycle_run_id: None,
@@ -112,14 +174,61 @@ impl RunnerState {
         self.active_agents.clear();
     }
 
-    /// Add cost from a completed task.
+    /// Add a REAL spend (basis `reported` or `priced`) to the marginal counter.
     pub fn add_cost(&mut self, cost_usd: f64) {
         self.cost_usd += cost_usd;
     }
 
-    /// Check if the budget has been exceeded.
+    /// The marginal counter: what the run really spent.
+    pub fn marginal_usd(&self) -> f64 {
+        self.cost_usd
+    }
+
+    /// Account the cost of one attempt on the counter its basis names (A21):
+    /// `reported` / `priced` (or no basis, the pre-A21 shape) on the marginal
+    /// counter, `subscription` / `free` on the notional one, `unknown` (or a
+    /// basis this version does not know) counted apart. Tokens always add up.
+    pub fn add_attempt_cost(&mut self, cost: &AttemptCost) {
+        match cost.basis.as_deref() {
+            None | Some("reported") | Some("priced") => {
+                if let Some(usd) = cost.usd {
+                    self.cost_usd += usd;
+                }
+            }
+            Some("subscription") | Some("free") => {
+                if let Some(usd) = cost.usd {
+                    self.notional_usd += usd;
+                }
+            }
+            Some(_) => self.unknown_cost_attempts += 1,
+        }
+        if let Some(tokens) = cost.tokens {
+            self.tokens_used = self.tokens_used.saturating_add(tokens);
+        }
+    }
+
+    /// Check if the USD budget has been exceeded (marginal counter only).
     pub fn is_budget_exceeded(&self, max_cost_usd: f64) -> bool {
         self.cost_usd > max_cost_usd
+    }
+
+    /// The first limit of `budget` the run has gone past, `None` while it is
+    /// within both. Only the marginal counter is held against the USD limit;
+    /// the tokens of every attempt, whatever their basis, against the token one.
+    pub fn budget_breach(&self, budget: &RunBudget) -> Option<BudgetBreach> {
+        if budget.max_cost_usd > 0.0 && self.cost_usd > budget.max_cost_usd {
+            return Some(BudgetBreach::Usd {
+                cumulated_usd: self.cost_usd,
+                limit_usd: budget.max_cost_usd,
+            });
+        }
+        match budget.max_tokens {
+            Some(limit) if self.tokens_used > limit => Some(BudgetBreach::Tokens {
+                cumulated_tokens: self.tokens_used,
+                limit_tokens: limit,
+            }),
+            _ => None,
+        }
     }
 
     /// Number of completed tasks.
@@ -306,6 +415,110 @@ mod tests {
 
         state.add_cost(3.00);
         assert!(state.is_budget_exceeded(10.0));
+    }
+
+    fn attempt(usd: Option<f64>, basis: Option<&str>, tokens: Option<u64>) -> AttemptCost {
+        AttemptCost {
+            usd,
+            basis: basis.map(str::to_string),
+            tokens,
+        }
+    }
+
+    /// A21: two counters. A reported or priced cost is real money (marginal);
+    /// a subscription or free one is notional; an unknown one has no amount and
+    /// is counted apart, never as 0. Tokens add up whatever the basis.
+    #[test]
+    fn an_attempt_cost_lands_on_the_counter_its_basis_names() {
+        let mut state = RunnerState::new(Uuid::new_v4(), Uuid::new_v4(), 3, TriggerSource::Manual);
+        state.add_attempt_cost(&attempt(Some(1.5), Some("reported"), Some(100)));
+        state.add_attempt_cost(&attempt(Some(0.5), Some("priced"), Some(50)));
+        state.add_attempt_cost(&attempt(Some(9.0), Some("subscription"), Some(10)));
+        state.add_attempt_cost(&attempt(Some(0.0), Some("free"), None));
+        state.add_attempt_cost(&attempt(None, Some("unknown"), Some(40)));
+        // A fictitious amount on a free endpoint never reaches the marginal counter.
+        state.add_attempt_cost(&attempt(Some(123.0), Some("free"), None));
+        // The pre-A21 shape: an amount without a basis was a reported cost.
+        state.add_attempt_cost(&attempt(Some(0.25), None, None));
+
+        assert!((state.marginal_usd() - 2.25).abs() < 1e-9, "{state:?}");
+        assert!((state.notional_usd - 132.0).abs() < 1e-9, "{state:?}");
+        assert_eq!(state.unknown_cost_attempts, 1);
+        assert_eq!(state.tokens_used, 200);
+    }
+
+    #[test]
+    fn an_unknown_cost_has_no_marginal_amount() {
+        assert_eq!(
+            attempt(Some(2.0), Some("unknown"), None).marginal_usd(),
+            None
+        );
+        assert_eq!(attempt(None, Some("reported"), None).marginal_usd(), None);
+        assert_eq!(attempt(Some(2.0), Some("free"), None).marginal_usd(), None);
+        assert_eq!(
+            attempt(Some(2.0), Some("priced"), None).marginal_usd(),
+            Some(2.0)
+        );
+        assert_eq!(attempt(Some(2.0), None, None).marginal_usd(), Some(2.0));
+    }
+
+    /// Only the marginal counter cuts on USD; a run on a provider without a
+    /// price is cut on its tokens, and only when a token limit is set.
+    #[test]
+    fn only_the_marginal_counter_breaches_the_usd_budget_and_tokens_cut_an_unpriced_run() {
+        let mut state = RunnerState::new(Uuid::new_v4(), Uuid::new_v4(), 3, TriggerSource::Manual);
+        let usd_only = RunBudget {
+            max_cost_usd: 1.0,
+            max_tokens: None,
+        };
+        state.add_attempt_cost(&attempt(Some(50.0), Some("subscription"), Some(500)));
+        assert_eq!(state.budget_breach(&usd_only), None, "notional never cuts");
+        state.add_attempt_cost(&attempt(None, Some("unknown"), Some(600)));
+        assert_eq!(
+            state.budget_breach(&usd_only),
+            None,
+            "no token limit: tokens do not cut"
+        );
+        let with_tokens = RunBudget {
+            max_cost_usd: 1.0,
+            max_tokens: Some(1_000),
+        };
+        assert_eq!(
+            state.budget_breach(&with_tokens),
+            Some(BudgetBreach::Tokens {
+                cumulated_tokens: 1_100,
+                limit_tokens: 1_000,
+            })
+        );
+        state.add_attempt_cost(&attempt(Some(1.5), Some("reported"), None));
+        assert_eq!(
+            state.budget_breach(&with_tokens),
+            Some(BudgetBreach::Usd {
+                cumulated_usd: 1.5,
+                limit_usd: 1.0,
+            }),
+            "the USD breach is named first"
+        );
+        let unlimited = RunBudget {
+            max_cost_usd: 0.0,
+            max_tokens: None,
+        };
+        assert_eq!(state.budget_breach(&unlimited), None);
+    }
+
+    #[test]
+    fn a_state_written_before_the_two_counters_reads_with_zeroes() {
+        let before = serde_json::json!({
+            "run_id": Uuid::new_v4(), "plan_id": Uuid::new_v4(), "total_tasks": 2,
+            "current_wave": 1, "completed_tasks": [], "failed_tasks": [],
+            "git_branch": "b", "started_at": "2026-01-01T00:00:00Z", "completed_at": null,
+            "status": "running", "cost_usd": 1.25, "triggered_by": "manual", "project_id": null
+        });
+        let state: RunnerState = serde_json::from_value(before).unwrap();
+        assert_eq!(state.marginal_usd(), 1.25);
+        assert_eq!(state.notional_usd, 0.0);
+        assert_eq!(state.tokens_used, 0);
+        assert_eq!(state.unknown_cost_attempts, 0);
     }
 
     #[test]

@@ -4306,6 +4306,16 @@ impl GraphStore for Neo4jClient {
         self.list_running_agent_executions_impl().await
     }
 
+    async fn agent_execution_cost_breakdown(
+        &self,
+        group_by: crate::neo4j::agent_execution::CostGroupBy,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<Vec<crate::neo4j::agent_execution::CostBreakdownRow>> {
+        self.agent_execution_cost_breakdown_impl(group_by, from, to)
+            .await
+    }
+
     async fn record_agent_execution_verification(
         &self,
         agent_execution_id: Uuid,
