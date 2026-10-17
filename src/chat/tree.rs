@@ -179,7 +179,7 @@ mod tests {
                 routed_by: Some("task".into()),
             },
         )]);
-        annotate(&mut tree, &infos);
+        annotate(&mut tree, &infos, 4);
         assert_eq!(tree[0].status, "active");
         assert_eq!(tree[0].routed_by.as_deref(), Some("task"));
     }
