@@ -3,6 +3,8 @@
 //! An adapter calls the production code path as it is wired today, with no
 //! parameter of its own, so the bench measures what the backend does.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -14,6 +16,9 @@ use crate::chat::prompt_sections::ToolRefGroupId;
 use crate::chat::provider::cognitive::signature::{ContextHints, TaskSignature};
 use crate::chat::routing::{HeuristicRouter, RoutingContext, RoutingProvider};
 use crate::events::{CrudAction, CrudEvent, EntityType, EventTrigger, TriggerRouter};
+use crate::neurons::activation::{
+    spread_and_rank, Neighbourhood, SpreadEdge, SpreadNode, SpreadRule,
+};
 use crate::neurons::intent::{IntentDetector, QueryIntentMode};
 use crate::skills::activation::evaluate_skill_match;
 use crate::skills::models::{SkillNode, SkillTrigger, TriggerType};
@@ -34,6 +39,7 @@ pub fn all() -> Vec<Box<dyn Classifier>> {
         Box::new(TaskClass),
         Box::new(Skills),
         Box::new(Triggers),
+        Box::new(RecallRanking),
     ]
 }
 
@@ -233,5 +239,178 @@ impl Classifier for Triggers {
             .find(|(id, _)| *id == top.trigger_id)
             .map(|(_, name)| name.clone())
             .ok_or_else(|| anyhow!("ranked trigger {} not in catalog", top.trigger_id))
+    }
+}
+
+/// Defaults of the recall fixture's rule, matching `SpreadingActivationConfig`.
+const RECALL_MAX_HOPS: usize = 1;
+const RECALL_MIN_ACTIVATION: f64 = 0.01;
+const RECALL_DECAY_PER_HOP: f64 = 0.5;
+const RECALL_MIN_ENERGY: f64 = 0.05;
+
+fn default_energy() -> f64 {
+    1.0
+}
+
+fn default_reachable() -> bool {
+    true
+}
+
+fn default_max_hops() -> usize {
+    RECALL_MAX_HOPS
+}
+
+fn default_min_activation() -> f64 {
+    RECALL_MIN_ACTIVATION
+}
+
+fn default_decay_per_hop() -> f64 {
+    RECALL_DECAY_PER_HOP
+}
+
+fn default_min_energy() -> f64 {
+    RECALL_MIN_ENERGY
+}
+
+#[derive(Deserialize)]
+struct RecallNodeSpec {
+    #[serde(default = "default_energy")]
+    energy: f64,
+    #[serde(default)]
+    scar_intensity: f64,
+    #[serde(default = "default_reachable")]
+    reachable: bool,
+}
+
+#[derive(Deserialize)]
+struct RecallEdgeSpec {
+    from: String,
+    to: String,
+    weight: f64,
+}
+
+#[derive(Deserialize)]
+struct RecallRuleSpec {
+    #[serde(default = "default_max_hops")]
+    max_hops: usize,
+    #[serde(default = "default_min_activation")]
+    min_activation: f64,
+    #[serde(default = "default_decay_per_hop")]
+    decay_per_hop: f64,
+    #[serde(default = "default_min_energy")]
+    min_energy: f64,
+}
+
+#[derive(Deserialize)]
+struct RecallGraphSpec {
+    #[serde(default)]
+    nodes: BTreeMap<String, RecallNodeSpec>,
+    #[serde(default)]
+    seeds: BTreeMap<String, f64>,
+    #[serde(default)]
+    edges: Vec<RecallEdgeSpec>,
+    #[serde(default)]
+    config: Option<RecallRuleSpec>,
+}
+
+/// The best *propagated* node of a graph declared in the case.
+///
+/// The case gives a small graph (seeds, weighted edges, node properties); the
+/// adapter runs the production rule — `spread_and_rank`, the same function
+/// `activate_with_profile` drives hop by hop — and names the node that
+/// received the most activation from propagation. Seeds are excluded on
+/// purpose: with a decay below 1 a propagated score can never beat its own
+/// seed, so the question the fixture asks is what propagation surfaces, not
+/// what vector search found.
+pub struct RecallRanking;
+
+impl Classifier for RecallRanking {
+    fn name(&self) -> &'static str {
+        "recall_ranking"
+    }
+
+    fn predict(&self, _fixture: &Fixture, case: &Case) -> Result<String> {
+        let spec: RecallGraphSpec = serde_json::from_value(case.input.clone())?;
+
+        // Deterministic ids: sorted names, so the parent order (and therefore
+        // every tie) does not depend on the JSON key order.
+        let mut names: BTreeSet<&str> = BTreeSet::new();
+        names.extend(spec.nodes.keys().map(String::as_str));
+        names.extend(spec.seeds.keys().map(String::as_str));
+        for edge in &spec.edges {
+            names.insert(edge.from.as_str());
+            names.insert(edge.to.as_str());
+        }
+        let ids: BTreeMap<&str, Uuid> = names
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| (name, Uuid::from_u128(index as u128 + 1)))
+            .collect();
+        let reverse: BTreeMap<Uuid, &str> = ids.iter().map(|(name, id)| (*id, *name)).collect();
+        let id_of = |name: &str| -> Result<Uuid> {
+            ids.get(name)
+                .copied()
+                .ok_or_else(|| anyhow!("unknown node `{name}`"))
+        };
+
+        let mut hood = Neighbourhood::default();
+        for (name, node) in &spec.nodes {
+            hood.nodes.insert(
+                id_of(name)?,
+                SpreadNode {
+                    energy: node.energy,
+                    scar_intensity: node.scar_intensity,
+                    reachable: node.reachable,
+                    project_id: None,
+                },
+            );
+        }
+        // Names referenced only by seeds or edges default to a live node.
+        for id in ids.values() {
+            hood.nodes.entry(*id).or_insert(SpreadNode {
+                energy: 1.0,
+                scar_intensity: 0.0,
+                reachable: true,
+                project_id: None,
+            });
+        }
+        for edge in &spec.edges {
+            hood.edges
+                .entry(id_of(&edge.from)?)
+                .or_default()
+                .push(SpreadEdge {
+                    neighbour: id_of(&edge.to)?,
+                    weight: edge.weight,
+                    is_decision: false,
+                });
+        }
+        let mut seeds: Vec<(Uuid, f64)> = Vec::with_capacity(spec.seeds.len());
+        for (name, activation) in &spec.seeds {
+            seeds.push((id_of(name)?, *activation));
+        }
+        let config = spec.config.as_ref();
+        let rule = SpreadRule {
+            max_hops: config.map_or(RECALL_MAX_HOPS, |c| c.max_hops),
+            min_activation: config.map_or(RECALL_MIN_ACTIVATION, |c| c.min_activation),
+            decay_per_hop: config.map_or(RECALL_DECAY_PER_HOP, |c| c.decay_per_hop),
+            min_energy: config.map_or(RECALL_MIN_ENERGY, |c| c.min_energy),
+        };
+
+        let hits = spread_and_rank(&seeds, &hood, &rule, None, 1.0);
+        let mut best: Option<(f64, &str)> = None;
+        for hit in &hits {
+            let name = reverse.get(&hit.node).copied().unwrap_or("none");
+            let better = match best {
+                None => true,
+                Some((score, current)) => {
+                    hit.score > score || (hit.score == score && name < current)
+                }
+            };
+            if better {
+                best = Some((hit.score, name));
+            }
+        }
+
+        Ok(best.map_or_else(|| "none".to_string(), |(_, name)| name.to_string()))
     }
 }

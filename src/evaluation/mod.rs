@@ -1,12 +1,12 @@
 //! Offline evaluation bench for the backend classifiers.
 //!
-//! Five classifiers decide things the backend acts on: which tool groups a
+//! Six classifiers decide things the backend acts on: which tool groups a
 //! message needs, the intent of a message, the class of a chat turn, which
-//! skill a message or file activates, and which event trigger fires. Until now
-//! none of them had an accuracy number. This module measures each one against a
-//! hand-labelled fixture (`tests/fixtures/classifiers/*.json`) and against the
-//! majority-class baseline, which is the score a classifier that ignores its
-//! input would get.
+//! skill a message or file activates, which event trigger fires, and which note
+//! the recall rule surfaces. Until now none of them had an accuracy number.
+//! This module measures each one against a hand-labelled fixture
+//! (`tests/fixtures/classifiers/*.json`) and against the majority-class
+//! baseline, which is the score a classifier that ignores its input would get.
 //!
 //! The bench is offline, deterministic and fast: no network, no Neo4j, no clock
 //! in the predictions. Its figures are published in the shadow routing report
@@ -204,6 +204,10 @@ pub fn embedded_fixtures() -> Result<Vec<Fixture>> {
             "triggers",
             include_str!("../../tests/fixtures/classifiers/triggers.json"),
         ),
+        (
+            "recall_ranking",
+            include_str!("../../tests/fixtures/classifiers/recall_ranking.json"),
+        ),
     ];
     SOURCES
         .iter()
@@ -214,7 +218,7 @@ pub fn embedded_fixtures() -> Result<Vec<Fixture>> {
         .collect()
 }
 
-/// Scores of the five classifiers on the embedded fixtures.
+/// Scores of the six classifiers on the embedded fixtures.
 pub fn run_embedded() -> Result<Vec<ClassifierScore>> {
     run(&embedded_fixtures()?)
 }
@@ -284,12 +288,19 @@ mod tests {
     }
 
     #[test]
-    fn the_embedded_fixtures_parse_and_name_the_five_classifiers() {
+    fn the_embedded_fixtures_parse_and_name_every_classifier() {
         let fixtures = embedded_fixtures().unwrap();
         let names: BTreeSet<&str> = fixtures.iter().map(|f| f.classifier.as_str()).collect();
         assert_eq!(
             names,
-            BTreeSet::from(["intent", "skills", "task_class", "tool_groups", "triggers"])
+            BTreeSet::from([
+                "intent",
+                "recall_ranking",
+                "skills",
+                "task_class",
+                "tool_groups",
+                "triggers",
+            ])
         );
     }
 }

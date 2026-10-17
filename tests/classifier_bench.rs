@@ -1,4 +1,4 @@
-//! Offline bench of the five backend classifiers (`project_orchestrator::evaluation`).
+//! Offline bench of the six backend classifiers (`project_orchestrator::evaluation`).
 //!
 //! Each classifier is scored on its hand-labelled fixture in
 //! `tests/fixtures/classifiers/` and compared with the majority-class baseline.
@@ -52,8 +52,15 @@ fn every_classifier_is_scored_against_the_majority_baseline() {
     let names: BTreeSet<&str> = scores.iter().map(|s| s.classifier.as_str()).collect();
     assert_eq!(
         names,
-        BTreeSet::from(["intent", "skills", "task_class", "tool_groups", "triggers"]),
-        "the bench must list the five classifiers"
+        BTreeSet::from([
+            "intent",
+            "recall_ranking",
+            "skills",
+            "task_class",
+            "tool_groups",
+            "triggers",
+        ]),
+        "the bench must list the six classifiers"
     );
     assert!(
         elapsed.as_secs_f64() < 5.0,

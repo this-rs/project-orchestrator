@@ -1,12 +1,13 @@
-# Classifier Bench — scoring the five backend classifiers
+# Classifier Bench — scoring the six backend classifiers
 
 The backend decides things from text and from events: which **tool groups** a
 message needs, the **intent** of a message, the **class** of a chat turn, which
-**skill** a message activates, and which event **trigger** fires. Each of those
-is a classifier. Until this bench, none of them had an accuracy number — only
-the tool-group router had a metamorphic invariance suite.
+**skill** a message activates, which event **trigger** fires, and which note the
+**recall rule** surfaces. Each of those is a classifier. Until this bench, none
+of them had an accuracy number — only the tool-group router had a metamorphic
+invariance suite.
 
-The bench scores all five **offline**, on hand-labelled fixtures, and compares
+The bench scores all six **offline**, on hand-labelled fixtures, and compares
 each one with the **majority-class baseline**: the accuracy a classifier that
 ignores its input completely would get. A classifier that cannot beat that
 baseline is not doing any work, and the bench fails.
@@ -48,6 +49,31 @@ The baseline matters more than the accuracy: `tool_groups` at 100 % against a
 43.8 % barely beats "always answer the same thing" — that gap is exactly what
 the follow-up work is meant to widen.
 
+## The recall rule fixture
+
+`recall_ranking` scores the integration rule of the spreading-activation engine
+(`src/neurons/activation.rs`), not a text classifier. Each case declares a small
+graph — seeds, weighted edges, node properties — and the adapter runs
+`spread_and_rank`, the same pure function `activate_with_profile` drives hop by
+hop. The label is the node that **should** win the propagation.
+
+The fixture is built so the answer discriminates between the two candidate
+rules:
+
+- `N = 2` and `N = 3` are **controls**: a target reached by 2 or 3 moderate
+  paths loses to a target reached by one stronger path under both rules;
+- `N >= 4` is the **discriminant**: the convergent target outranks the strong
+  single path only when contributions accumulate.
+
+Read it as a **non-regression ratchet on a chosen rule**, not as a measure of
+retrieval quality. The five text classifiers are judged on human labels
+independent of the code; this one is judged against a spec written before the
+code, and its job is to make the rule impossible to change by accident.
+
+The fixture is language-neutral by construction (a graph is not French or
+English), so it declares no `pair` ids and `FR<->EN` reads `n/a`. The `lang`
+field only satisfies the bench shape.
+
 ## Where the figures are published
 
 - **Shadow routing report** — `RoutingReport.classifiers`, served by
@@ -81,7 +107,7 @@ Then **refresh the manifest**, or the bench fails:
 
 ```bash
 cd tests/fixtures/classifiers
-shasum -a 256 intent.json skills.json task_class.json tool_groups.json triggers.json > MANIFEST.sha256
+shasum -a 256 *.json > MANIFEST.sha256
 ```
 
 `the_fixtures_match_their_sha256_manifest` recomputes every hash and also

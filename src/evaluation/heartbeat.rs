@@ -1,6 +1,6 @@
 //! The heartbeat publication of the classifier bench.
 //!
-//! `ClassifierBenchCheck` re-scores the five classifiers on their embedded
+//! `ClassifierBenchCheck` re-scores the six classifiers on their embedded
 //! fixtures and logs one line per classifier, warning when one falls under the
 //! majority baseline. It is pure computation — no graph, no network — so it is
 //! cheap enough for a six-hour heartbeat. The same figures are served by
