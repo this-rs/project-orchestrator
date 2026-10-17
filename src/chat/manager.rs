@@ -1074,6 +1074,9 @@ pub struct ChatManager {
     /// the SAME engine and model, with the SAME envelope, consent and tool policy. Empty
     /// when the pool finds nothing, which only means a fresh session, as before.
     pub(crate) session_pool: Arc<super::session_pool::SessionPool>,
+    /// Rate-limiting state for `inject_team_message`: sliding window per
+    /// (from_session_id, to_session_id) pair. Cleared lazily (no background task).
+    pub(crate) team_msg_rate: tokio::sync::Mutex<HashMap<(Uuid, String), Vec<std::time::Instant>>>,
 }
 
 // ============================================================================
@@ -3474,6 +3477,7 @@ impl ChatManager {
             mirrors: Default::default(),
             subagent_mirrors: true,
             session_pool: Arc::new(super::session_pool::SessionPool::from_env()),
+            team_msg_rate: Default::default(),
         }
     }
 
@@ -3574,6 +3578,7 @@ impl ChatManager {
             mirrors: Default::default(),
             subagent_mirrors: true,
             session_pool: Arc::new(super::session_pool::SessionPool::from_env()),
+            team_msg_rate: Default::default(),
         }
     }
 
@@ -5966,6 +5971,39 @@ impl ChatManager {
             depth: 1,
             spawned_by: ctx.map_or_else(|| "unknown".to_string(), |c| c.spawn_type),
         })
+    }
+
+    /// Whether a given session is currently streaming.  Used by `team::TeamHooks`.
+    pub(crate) async fn session_is_streaming(&self, session_id: &str) -> bool {
+        self.active_sessions
+            .read()
+            .await
+            .get(session_id)
+            .is_some_and(|s| s.is_streaming.load(Ordering::SeqCst))
+    }
+
+    /// All active sessions that are direct children of `parent_session_id`.
+    ///
+    /// "Direct child" = a session whose `spawned_by` field names `parent_session_id`.
+    /// Returns only sessions that are currently in `active_sessions` (alive).
+    pub(crate) async fn direct_children(&self, parent_session_id: &str) -> Vec<String> {
+        let active: Vec<String> = self.active_sessions.read().await.keys().cloned().collect();
+
+        let mut children = Vec::new();
+        for id in active {
+            if let Ok(uuid) = Uuid::parse_str(&id) {
+                if let Ok(Some(node)) = self.graph.get_chat_session(uuid).await {
+                    let is_child = node
+                        .spawned_by
+                        .as_deref()
+                        .is_some_and(|s| s.contains(parent_session_id));
+                    if is_child {
+                        children.push(id);
+                    }
+                }
+            }
+        }
+        children
     }
 
     /// Where a session comes from, for its tool profile (H6).
@@ -10355,6 +10393,197 @@ impl ChatManager {
             drop(sessions); // Release read lock before calling send_message
             self.send_message(session_id, message).await
         }
+    }
+
+    /// Relay a team message from `from_session_id` into `to_session_id`.
+    ///
+    /// # Behaviour
+    /// - **If the target is streaming**: the message is queued (priority 0, same
+    ///   as user messages); drain delivers it as its own turn after the current
+    ///   one ends. No interrupt.
+    /// - **If the target is idle**: the team message is persisted + broadcast
+    ///   immediately, and a new `stream_response` turn is spawned with the
+    ///   `[team {from_name}] {text}` prefix so the model can distinguish it from
+    ///   human input.
+    ///
+    /// The `from_session_id` and `from_name` are asserted by the backend — they
+    /// cannot be forged by model text. `text` is the raw message from the peer;
+    /// it is stored as-is in `ChatEvent::TeamMessage`; only the prompt passed to
+    /// the model receives the `[team …]` prefix.
+    ///
+    /// Rate limiting: at most `TEAM_MSG_RATE_MAX` messages per minute from any
+    /// single `(from_session_id, to_session_id)` pair.
+    pub async fn inject_team_message(
+        &self,
+        from_session_id: Uuid,
+        from_name: &str,
+        to_session_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        // Rate limiting — guard against runaway loops between two agents.
+        const TEAM_MSG_RATE_MAX: usize = 10; // messages per minute
+        const TEAM_MSG_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+        {
+            let mut rate = self.team_msg_rate.lock().await;
+            let key = (from_session_id, to_session_id.to_string());
+            let now = std::time::Instant::now();
+            let window = rate.entry(key).or_default();
+            window.retain(|t| now.duration_since(*t) < TEAM_MSG_RATE_WINDOW);
+            if window.len() >= TEAM_MSG_RATE_MAX {
+                warn!(
+                    from_session_id = %from_session_id,
+                    to_session_id = %to_session_id,
+                    "inject_team_message: rate limit exceeded ({}/min), dropping",
+                    TEAM_MSG_RATE_MAX
+                );
+                return Ok(());
+            }
+            window.push(now);
+        }
+
+        let session_state = {
+            let sessions = self.active_sessions.read().await;
+            sessions.get(to_session_id).map(|s| {
+                (
+                    s.client.clone(),
+                    s.events_tx.clone(),
+                    s.interrupt_flag.clone(),
+                    s.memory_manager.clone(),
+                    s.next_seq.clone(),
+                    s.pending_messages.clone(),
+                    s.is_streaming.clone(),
+                    s.streaming_text.clone(),
+                    s.streaming_events.clone(),
+                    s.sdk_control_rx.clone(),
+                    s.auto_continue.clone(),
+                )
+            })
+        };
+
+        let Some((
+            client,
+            events_tx,
+            interrupt_flag,
+            memory_manager,
+            next_seq,
+            pending_messages,
+            is_streaming,
+            streaming_text,
+            streaming_events,
+            sdk_control_rx,
+            auto_continue,
+        )) = session_state
+        else {
+            return Err(anyhow!(
+                "inject_team_message: target session {} not found",
+                to_session_id
+            ));
+        };
+
+        let session_uuid = Uuid::parse_str(to_session_id).ok();
+        let prompt_content = format!("[team {}] {}", from_name, text);
+
+        // Try to atomically claim the streaming slot (same approach as OOB listener).
+        let won_race = is_streaming
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+
+        if !won_race {
+            // A stream is already running — queue without interrupt; drain will
+            // pick it up with priority 0 after the current turn ends.
+            let mut queue = pending_messages.lock().await;
+            queue.push_back(super::types::PendingMessage::team_message(
+                text.to_string(),
+                from_session_id,
+                from_name.to_string(),
+            ));
+            debug!(
+                from_session_id = %from_session_id,
+                to_session_id = %to_session_id,
+                "inject_team_message: session streaming — queued for drain"
+            );
+            return Ok(());
+        }
+
+        // Won the race — session is now "streaming" (flag = true). Persist and
+        // broadcast the team_message event, then spawn stream_response directly.
+        if let Some(uuid) = session_uuid {
+            let event_record = crate::neo4j::models::ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id: uuid,
+                seq: next_seq.fetch_add(1, Ordering::SeqCst),
+                event_type: "team_message".to_string(),
+                data: serde_json::to_string(&ChatEvent::TeamMessage {
+                    from_session_id,
+                    from_name: from_name.to_string(),
+                    content: text.to_string(),
+                })
+                .unwrap_or_default(),
+                created_at: chrono::Utc::now(),
+            };
+            let graph = self.graph.clone();
+            let to_id = to_session_id.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = graph.store_chat_events(uuid, vec![event_record]).await {
+                    warn!(
+                        to_session_id = %to_id,
+                        "inject_team_message: failed to persist team_message: {}", e
+                    );
+                }
+            });
+        }
+        let team_event = ChatEvent::TeamMessage {
+            from_session_id,
+            from_name: from_name.to_string(),
+            content: text.to_string(),
+        };
+        let _ = events_tx.send(team_event.clone());
+        if let Some(ref nats) = self.nats {
+            nats.publish_chat_event(to_session_id, team_event);
+        }
+
+        // Spawn stream_response: the team message IS the turn prompt.
+        let session_id = to_session_id.to_string();
+        let graph = self.graph.clone();
+        let active_sessions = self.active_sessions.clone();
+        let context_injector = self.context_injector.clone();
+        let retry_config = self.config.retry.clone();
+        let enrichment_pipeline = self.enrichment_pipeline.clone();
+        let search = self.search.clone();
+        let documents = self.document_store.clone();
+        let cognitive_routing = self.cognitive_routing.clone();
+        let event_emitter = self.event_emitter.clone();
+        let nats = self.nats.clone();
+        tokio::spawn(async move {
+            ChatManager::stream_response(
+                client,
+                events_tx,
+                prompt_content,
+                session_id,
+                graph,
+                active_sessions,
+                interrupt_flag,
+                memory_manager,
+                context_injector,
+                next_seq,
+                pending_messages,
+                is_streaming,
+                streaming_text,
+                streaming_events,
+                event_emitter,
+                nats,
+                sdk_control_rx,
+                auto_continue,
+                retry_config,
+                enrichment_pipeline,
+                search,
+                documents,
+                cognitive_routing,
+            )
+            .await;
+        });
+
+        Ok(())
     }
 
     /// Hold a user message until the running turn ends — it interrupts nothing.
@@ -16212,6 +16441,18 @@ impl ChatManager {
                     )));
                 }
             }
+            // TEAM-1: TeamHooks wraps whatever hooks are active so far (SubagentHooks or
+            // GraphSessionHooks) and intercepts `Agent(subagent_type: "team_message" /
+            // "team_status")` before delegating to the real sub-agent runner.  Installed for
+            // ALL native sessions (root and child) so that children receive queued
+            // TeamMessages through the same drain path.
+            if let Some(manager) = self.weak_self() {
+                spec.hooks = Some(Arc::new(super::team::TeamHooks::new(
+                    spec.hooks.take(),
+                    manager,
+                    session_id,
+                )));
+            }
         }
         // The consent of the project and the revocation of the token are checked before ANY
         // other hook, and whether or not the session has the knowledge-graph hooks.
@@ -18219,6 +18460,7 @@ mod tests {
             lasting_rules_dir: None,
             native_turn_timeout_secs: None,
             native_session_max_tokens: None,
+            max_live_children: 4,
         }
     }
 

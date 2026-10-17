@@ -1288,6 +1288,10 @@ impl AgentSessionHandle {
                 .await;
                 self.count_user_message().await;
             }
+            // TeamMessage: already persisted and broadcast by drain before
+            // this method is called; no re-emit needed here. Does not count
+            // as a user message turn.
+            PendingMessageKind::TeamMessage { .. } => {}
         }
         // The same expansion as `stream_response` (`refs::turn`), for every turn
         // whatever started it (a message, the queue, auto-continue, another

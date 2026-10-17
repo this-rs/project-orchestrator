@@ -57,6 +57,7 @@ pub(crate) mod skill_hook;
 pub(crate) mod spill;
 pub mod stages;
 pub(crate) mod subagents;
+pub(crate) mod team;
 pub(crate) mod tool_clock;
 pub mod tree;
 pub mod types;

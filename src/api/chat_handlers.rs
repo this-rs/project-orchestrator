@@ -90,10 +90,14 @@ pub async fn create_session(
             // Opening a session: inside the caller's envelope, parent recorded
             // from the token.
             None => {
-                let env =
-                    envelope::envelope_for_caller(graph.as_ref(), chat_manager.as_ref(), &caller)
-                        .await?
-                        .expect("an agent caller always has an envelope");
+                let env = envelope::envelope_for_caller(
+                    graph.as_ref(),
+                    chat_manager.as_ref(),
+                    &caller,
+                    chat_manager.config.max_live_children,
+                )
+                .await?
+                .expect("an agent caller always has an envelope");
                 let default_mode = chat_manager.default_permission_mode().await;
                 env.apply(&mut request, &default_mode)?;
                 request.spawned_by = Some(envelope::conversation_spawned_by(env.parent_session_id));

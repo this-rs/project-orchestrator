@@ -493,6 +493,33 @@ pub enum RunnerEvent {
         task_title: String,
         timeout_secs: u64,
     },
+    /// No provider can run this task (B18): the opening was refused before any session
+    /// existed, and nothing was substituted. `code` is the stable code of the refusal
+    /// (`no_provider`, `provider_unknown`, `endpoint_not_allowed`, `provider_unavailable`,
+    /// or the kind of the provider's own error: `endpoint_unreachable`, `auth_required`...).
+    TaskProviderRefused {
+        run_id: Uuid,
+        task_id: Uuid,
+        task_title: String,
+        code: String,
+        /// The instance the refusal is about, when it names one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
+    },
+    /// The provider the run named failed its health check when the task's session
+    /// opened (B18): the task runs on the project's default instead, and the run says so
+    /// (this event, a warning in the log, `fallback_reason` on the AgentExecution).
+    TaskProviderFallback {
+        run_id: Uuid,
+        task_id: Uuid,
+        task_title: String,
+        /// The instance the run named, which failed.
+        from_provider: String,
+        /// The instance the task runs on instead.
+        to_provider: String,
+        /// Why: the kind of the health failure (`endpoint_unreachable`, `auth_required`...).
+        reason: String,
+    },
     /// A runner error occurred (non-fatal)
     RunnerError { run_id: Uuid, message: String },
     /// Budget limit exceeded — plan execution aborted
@@ -1298,6 +1325,46 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"event\":\"task_spawning_timeout\""));
         assert!(json.contains("\"timeout_secs\":120"));
+    }
+
+    /// B18: the two provider events of a task have stable wire names, and the refusal
+    /// carries the stable code of what refused it.
+    #[test]
+    fn provider_refusal_and_fallback_events_have_stable_wire_names() {
+        let refused = RunnerEvent::TaskProviderRefused {
+            run_id: Uuid::nil(),
+            task_id: Uuid::nil(),
+            task_title: "t".into(),
+            code: "no_provider".into(),
+            provider_id: None,
+        };
+        let json = serde_json::to_string(&refused).unwrap();
+        assert!(
+            json.contains("\"event\":\"task_provider_refused\""),
+            "{json}"
+        );
+        assert!(json.contains("\"code\":\"no_provider\""), "{json}");
+        assert!(!json.contains("provider_id"), "absent when unknown: {json}");
+
+        let fallback = RunnerEvent::TaskProviderFallback {
+            run_id: Uuid::nil(),
+            task_id: Uuid::nil(),
+            task_title: "t".into(),
+            from_provider: "deepseek".into(),
+            to_provider: "claude-code".into(),
+            reason: "endpoint_unreachable".into(),
+        };
+        let json = serde_json::to_string(&fallback).unwrap();
+        assert!(
+            json.contains("\"event\":\"task_provider_fallback\""),
+            "{json}"
+        );
+        let back: RunnerEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            RunnerEvent::TaskProviderFallback { ref from_provider, ref to_provider, ref reason, .. }
+                if from_provider == "deepseek" && to_provider == "claude-code" && reason == "endpoint_unreachable"
+        ));
     }
 
     #[test]

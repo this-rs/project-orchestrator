@@ -248,6 +248,12 @@ pub struct ChatConfig {
     /// `CHAT_NATIVE_SESSION_MAX_TOKENS`; `0` means unset. ISO5: a 10 M default, cache reads
     /// included, stopped every later turn of a conversation.
     pub native_session_max_tokens: Option<u64>,
+    /// Maximum number of child sessions that one parent session may keep alive at once
+    /// (PLAFOND-4). Default: 4 (matches [`super::envelope::MAX_LIVE_CHILDREN`]). Raise
+    /// only when the system has enough CPU and RAM for the extra sessions; the compilation
+    /// governor still bounds the real parallelism. From `CHAT_MAX_LIVE_CHILDREN`; `0`
+    /// means unset (use the default).
+    pub max_live_children: usize,
 }
 
 /// Environment variable selecting the [`ProviderPath`].
@@ -268,6 +274,9 @@ pub const NATIVE_TURN_TIMEOUT_VAR: &str = "CHAT_NATIVE_TURN_TIMEOUT_SECS";
 
 /// Environment variable of [`ChatConfig::native_session_max_tokens`].
 pub const NATIVE_SESSION_MAX_TOKENS_VAR: &str = "CHAT_NATIVE_SESSION_MAX_TOKENS";
+
+/// Environment variable of [`ChatConfig::max_live_children`].
+pub const MAX_LIVE_CHILDREN_VAR: &str = "CHAT_MAX_LIVE_CHILDREN";
 
 /// Variable naming the directory of the lasting approvals
 /// ([`ChatConfig::lasting_rules_dir`]).
@@ -410,6 +419,9 @@ impl ChatConfig {
             lasting_rules_dir: Self::lasting_rules_dir_from_env(),
             native_turn_timeout_secs: Self::positive_from_env(NATIVE_TURN_TIMEOUT_VAR),
             native_session_max_tokens: Self::positive_from_env(NATIVE_SESSION_MAX_TOKENS_VAR),
+            max_live_children: Self::positive_from_env(MAX_LIVE_CHILDREN_VAR)
+                .map(|n| n as usize)
+                .unwrap_or(4),
         }
     }
 
@@ -611,6 +623,7 @@ mod tests {
             lasting_rules_dir: None,
             native_turn_timeout_secs: None,
             native_session_max_tokens: None,
+            max_live_children: 4,
         };
 
         assert_eq!(config.default_model, "claude-sonnet-4-6");
@@ -633,12 +646,15 @@ mod tests {
         std::env::remove_var("CHAT_PROCESS_PATH");
         std::env::remove_var("CLAUDE_CLI_PATH");
         std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
+        std::env::remove_var("CHAT_MAX_LIVE_CHILDREN");
 
         let config = ChatConfig::from_env();
         // Tracks the `default_model` literal in `from_env`; bump both together.
         assert_eq!(config.default_model, "claude-sonnet-5");
         assert_eq!(config.max_sessions, 10);
         assert_eq!(config.session_timeout.as_secs(), 1800);
+        // PLAFOND-4: unset → default 4
+        assert_eq!(config.max_live_children, 4);
         // Permission defaults — MCP tools are pre-approved out of the box
         assert_eq!(config.permission.mode, "default");
         assert_eq!(
@@ -711,6 +727,16 @@ mod tests {
         std::env::set_var("CHAT_ALLOWED_TOOLS", "");
         let config = ChatConfig::from_env();
         assert!(config.permission.allowed_tools.is_empty());
+
+        // PLAFOND-4: custom cap is read from the env var
+        std::env::set_var("CHAT_MAX_LIVE_CHILDREN", "8");
+        let config = ChatConfig::from_env();
+        assert_eq!(config.max_live_children, 8);
+        // 0 means unset: falls back to 4
+        std::env::set_var("CHAT_MAX_LIVE_CHILDREN", "0");
+        let config = ChatConfig::from_env();
+        assert_eq!(config.max_live_children, 4);
+        std::env::remove_var("CHAT_MAX_LIVE_CHILDREN");
 
         // Phase 3: invalid value falls back to default
         std::env::set_var("CHAT_MAX_SESSIONS", "not_a_number");

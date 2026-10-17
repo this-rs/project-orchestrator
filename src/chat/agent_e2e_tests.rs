@@ -13164,6 +13164,115 @@ mod native_subagents {
             .is_none());
     }
 
+    /// B2b: CHAT_MAX_LIVE_CHILDREN is configurable — a cap of N accepts N children and
+    /// refuses the N+1-th with the stable code and the env var name in the message
+    /// (PLAFOND-4). Test with cap = 2 to keep the rig lightweight.
+    #[tokio::test]
+    async fn the_live_children_cap_is_configurable_and_names_the_env_var() {
+        // Build a rig manually so we can set max_live_children = 2.
+        let cap: usize = 2;
+        let dir = tempfile::tempdir().unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        let mut project = crate::test_helpers::test_project();
+        project.root_path = dir.path().display().to_string();
+        graph.create_project(&project).await.unwrap();
+        crate::skills::project_resolver::seed_resolve_cache_for_tests(std::slice::from_ref(
+            &project,
+        ));
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 20,
+            max_live_children: cap,
+            ..Default::default()
+        };
+        let mut child_caps = caps();
+        child_caps.interactive_permissions = true;
+        child_caps.permission_scopes = vec![nexus_claude::agent::PermissionScope::Once];
+        let provider = Tapped {
+            inner: Arc::new(ScriptedProvider::new(
+                "claude-code",
+                Script::builder()
+                    .capabilities(child_caps)
+                    .turn(vec![Step::AwaitInterrupt])
+                    .build(),
+            )),
+            kind: ProviderKind::Native,
+            answers: Arc::default(),
+        };
+        let rules = tempfile::tempdir().unwrap();
+        let bus = Arc::new(crate::events::EventBus::new(1024));
+        let manager = Arc::new(
+            ChatManager::new_without_memory(dyn_graph, state.meili, config)
+                .with_provider_source(Arc::new(SlowOpen {
+                    inner: provider,
+                    open_ms: 300,
+                    turn_ms: 0,
+                    answer_ms: 0,
+                }))
+                .with_event_emitter(bus.clone()),
+        );
+        manager.enable_subagents();
+        let mut req = request(None, Some(&project.slug), "default");
+        req.message = String::new();
+        req.cwd = project.root_path.clone();
+        let parent = manager.create_session(&req).await.unwrap().session_id;
+        let r = Arc::new(Rig {
+            manager,
+            graph,
+            parent,
+            bus,
+            _dir: dir,
+            _rules: rules,
+        });
+
+        // Spawn cap + 1 concurrent calls.
+        let calls: Vec<_> = (0..(cap + 1))
+            .map(|i| {
+                let r = r.clone();
+                tokio::spawn(async move { r.run(&format!("c{i}")).await })
+            })
+            .collect();
+        // Wait until cap children are live and 1 call has finished (refused).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let finished = calls.iter().filter(|h| h.is_finished()).count();
+            if r.children().await.len() >= cap && finished >= 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "children={}, finished={finished}",
+                r.children().await.len()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Exactly one call was refused with the stable code + env var name.
+        let mut refused = 0;
+        let mut running = Vec::new();
+        for handle in calls {
+            if handle.is_finished() {
+                let out = handle.await.unwrap();
+                assert!(
+                    out.as_ref().is_err_and(|e| {
+                        e.contains("envelope_too_many_children")
+                            && e.contains("CHAT_MAX_LIVE_CHILDREN")
+                    }),
+                    "unexpected: {out:?}"
+                );
+                refused += 1;
+            } else {
+                running.push(handle);
+            }
+        }
+        assert_eq!(refused, 1, "exactly one call past cap={cap} was refused");
+        for handle in running {
+            handle.abort();
+        }
+    }
+
     /// A child that fails: an error result for the parent, the child closed.
     #[tokio::test]
     async fn a_failed_child_is_an_error_and_is_closed() {

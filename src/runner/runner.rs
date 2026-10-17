@@ -495,6 +495,63 @@ pub(crate) fn eligible_wave_tasks(
         .collect()
 }
 
+/// A task session the runner opened, and the fallback it took to open it, if any (B18).
+struct OpenedTaskSession {
+    session: crate::chat::types::CreateSessionResponse,
+    fallback: Option<ProviderFallback>,
+}
+
+/// The run's provider failed its health check: the task runs on the project's default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderFallback {
+    /// The instance the run named.
+    from_provider: String,
+    /// The kind of the health failure (`endpoint_unreachable`, `auth_required`...).
+    reason: String,
+}
+
+impl ProviderFallback {
+    /// What goes in `AgentExecution.fallback_reason`: `<reason> on <provider>`.
+    fn record(&self) -> String {
+        format!("{} on {}", self.reason, self.from_provider)
+    }
+}
+
+/// The provider the run names when it is what the resolution opens on: nothing more
+/// explicit (a provider on the request, a task alias, a persona preference) stands above
+/// it (A16). `None` when the run names none, or when a higher level decides.
+fn run_level_provider(request: &ChatRequest) -> Option<&str> {
+    if request.provider.is_some() || request.task_alias.is_some() || request.persona_alias.is_some()
+    {
+        return None;
+    }
+    request.run_provider.as_deref().filter(|p| !p.is_empty())
+}
+
+/// The kind of a health failure in an opening error, `None` for any other refusal. What
+/// `AgentProvider::health` reports when the instance cannot open sessions now: the
+/// endpoint is unreachable, the login is missing, the CLI is absent, the credential is
+/// locked or rejected, the answer did not come. A configuration refusal (unknown
+/// instance, no consent, endpoint guard), a model refusal (no tools, window too small)
+/// or a protocol error is not one: nothing is substituted for those.
+fn health_failure(error: &anyhow::Error) -> Option<&'static str> {
+    use nexus_claude::agent::ProviderError;
+    let typed = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ProviderError>())?;
+    matches!(
+        typed,
+        ProviderError::EndpointUnreachable { .. }
+            | ProviderError::AuthRequired { .. }
+            | ProviderError::CliNotFound { .. }
+            | ProviderError::CredentialsLocked
+            | ProviderError::Unauthorized
+            | ProviderError::Timeout { .. }
+            | ProviderError::Overloaded
+    )
+    .then(|| typed.kind())
+}
+
 /// Autonomous plan execution engine.
 ///
 /// Spawns Claude Code agents for each task, monitors execution,
@@ -1017,6 +1074,10 @@ impl PlanRunner {
                     (run_id.to_string(), CrudAction::Updated)
                 }
                 RunnerEvent::TaskSpawningTimeout { run_id, .. } => {
+                    (run_id.to_string(), CrudAction::Updated)
+                }
+                RunnerEvent::TaskProviderRefused { run_id, .. }
+                | RunnerEvent::TaskProviderFallback { run_id, .. } => {
                     (run_id.to_string(), CrudAction::Updated)
                 }
                 RunnerEvent::LifecycleTransition { run_id, .. } => {
@@ -2005,6 +2066,117 @@ impl PlanRunner {
     /// is left `running` once its attempt has returned. `cost_usd` /
     /// `duration_secs` set to `None` keep the open node's cost and fall back to
     /// the wall-clock time since the attempt started.
+    /// Opens the session of a task attempt on the provider the resolution picks, with the
+    /// two rules of B18:
+    ///
+    /// - a refusal is explicit: the typed error comes back with its stable code, logged
+    ///   and announced ([`RunnerEvent::TaskProviderRefused`]), and nothing is substituted
+    ///   (no provider, an unknown or unallowed instance, a provider whose default failed);
+    /// - the ONLY substitution: the provider the run named (`run_provider`, with nothing
+    ///   more explicit above it) failed its health check at the opening. The task then
+    ///   runs on what the project's rules and default pick instead, and the run says so
+    ///   (a warning, [`RunnerEvent::TaskProviderFallback`], `routed_by = fallback` and
+    ///   `fallback_reason` on the AgentExecution).
+    async fn open_task_session(
+        &self,
+        request: &ChatRequest,
+        run_id: Uuid,
+        task_id: Uuid,
+        task_title: &str,
+    ) -> Result<OpenedTaskSession> {
+        let first = match self.chat_manager.create_session(request).await {
+            Ok(session) => {
+                return Ok(OpenedTaskSession {
+                    session,
+                    fallback: None,
+                })
+            }
+            Err(error) => error,
+        };
+        if let (Some(from_provider), Some(reason)) =
+            (run_level_provider(request), health_failure(&first))
+        {
+            warn!(
+                %run_id, %task_id, provider = from_provider, reason,
+                "the provider the run names failed its health check: the task runs on the \
+                 project's default instead"
+            );
+            let mut retry = request.clone();
+            retry.run_provider = None;
+            retry.run_model = None;
+            match self.chat_manager.create_session(&retry).await {
+                Ok(session) => {
+                    let to_provider = self.session_provider(&session.session_id).await;
+                    self.emit_event(RunnerEvent::TaskProviderFallback {
+                        run_id,
+                        task_id,
+                        task_title: task_title.to_string(),
+                        from_provider: from_provider.to_string(),
+                        to_provider,
+                        reason: reason.to_string(),
+                    });
+                    return Ok(OpenedTaskSession {
+                        session,
+                        fallback: Some(ProviderFallback {
+                            from_provider: from_provider.to_string(),
+                            reason: reason.to_string(),
+                        }),
+                    });
+                }
+                Err(second) => {
+                    return Err(self.refuse_task_provider(second, run_id, task_id, task_title, None))
+                }
+            }
+        }
+        Err(self.refuse_task_provider(
+            first,
+            run_id,
+            task_id,
+            task_title,
+            request.run_provider.as_deref(),
+        ))
+    }
+
+    /// The provider recorded on a session the runner just opened (`claude-code` for a node
+    /// that names none, as the resolver writes it).
+    async fn session_provider(&self, session_id: &str) -> String {
+        let node = match session_id.parse::<Uuid>() {
+            Ok(uuid) => self.graph.get_chat_session(uuid).await.ok().flatten(),
+            Err(_) => None,
+        };
+        node.and_then(|n| n.provider_id)
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| crate::chat::provider::resolver::CLAUDE_CODE.to_string())
+    }
+
+    /// Says a refused opening: the stable code of the refusal in the log, in the run's
+    /// events and in the error the attempt fails with. The error itself is kept (its
+    /// typed cause stays in the chain).
+    fn refuse_task_provider(
+        &self,
+        error: anyhow::Error,
+        run_id: Uuid,
+        task_id: Uuid,
+        task_title: &str,
+        provider_hint: Option<&str>,
+    ) -> anyhow::Error {
+        let failure = crate::chat::provider::errors::classify_open_error(&error, provider_hint);
+        let code = failure.as_ref().map_or("open_failed", |f| f.code);
+        let provider_id = failure.as_ref().and_then(|f| f.provider_id.clone());
+        error!(
+            %run_id, %task_id, code, provider = provider_id.as_deref().unwrap_or("-"),
+            "no provider can run this task: {error:#}"
+        );
+        self.emit_event(RunnerEvent::TaskProviderRefused {
+            run_id,
+            task_id,
+            task_title: task_title.to_string(),
+            code: code.to_string(),
+            provider_id,
+        });
+        error.context(format!("provider refused ({code})"))
+    }
+
     fn close_attempt(
         &self,
         open: Option<&AgentExecutionNode>,
@@ -3577,15 +3749,16 @@ impl PlanRunner {
             .push(request.clone());
 
         let spawning_timeout = Duration::from_secs(self.config.spawning_timeout_secs);
-        let session = match tokio::time::timeout(
+        let opened = match tokio::time::timeout(
             spawning_timeout,
-            self.chat_manager.create_session(&request),
+            self.open_task_session(&request, run_id, task_id, task_title),
         )
         .await
         {
-            Ok(Ok(session)) => session,
+            Ok(Ok(opened)) => opened,
             Ok(Err(e)) => {
-                // create_session returned an error (not a timeout)
+                // The opening was refused (not a timeout): said explicitly by
+                // `open_task_session`, never replaced by another provider here.
                 return Err(e);
             }
             Err(_elapsed) => {
@@ -3627,6 +3800,7 @@ impl PlanRunner {
                 });
             }
         };
+        let OpenedTaskSession { session, fallback } = opened;
         let session_id = session.session_id.clone();
         let session_uuid = session_id.parse::<Uuid>().ok();
 
@@ -3695,13 +3869,25 @@ impl PlanRunner {
                 .as_ref()
                 .and_then(|n| n.provider_id.clone())
                 .unwrap_or_else(|| crate::neo4j::agent_execution::DEFAULT_PROVIDER_ID.to_string()),
-            routed_by: routing
-                .as_ref()
-                .and_then(|n| n.routed_by.clone())
-                .unwrap_or_else(|| crate::neo4j::agent_execution::DEFAULT_ROUTED_BY.to_string()),
+            // A fallback the runner took (the run's provider failed its health check) is
+            // recorded as such, whatever level then picked the substitute (B18).
+            routed_by: match &fallback {
+                Some(_) => crate::chat::provider::resolver::RoutedBy::Fallback
+                    .as_str()
+                    .to_string(),
+                None => routing
+                    .as_ref()
+                    .and_then(|n| n.routed_by.clone())
+                    .unwrap_or_else(|| {
+                        crate::neo4j::agent_execution::DEFAULT_ROUTED_BY.to_string()
+                    }),
+            },
             model_alias: task_alias,
             route_rule: note_str("route_rule"),
-            fallback_reason: note_str("fallback_reason"),
+            fallback_reason: fallback
+                .as_ref()
+                .map(ProviderFallback::record)
+                .or_else(|| note_str("fallback_reason")),
             shadow_provider: note_str("shadow_provider"),
             shadow_model: note_str("shadow_model"),
             model_requested,
@@ -5975,6 +6161,7 @@ mod tests {
             lasting_rules_dir: None,
             native_turn_timeout_secs: None,
             native_session_max_tokens: None,
+            max_live_children: 4,
         };
         let chat_manager = Arc::new(ChatManager::new_without_memory(
             graph.clone(),
@@ -6589,6 +6776,7 @@ mod tests {
             lasting_rules_dir: None,
             native_turn_timeout_secs: None,
             native_session_max_tokens: None,
+            max_live_children: 4,
         };
         let chat_manager = Arc::new(ChatManager::new_without_memory(
             graph.clone(),
@@ -9368,6 +9556,7 @@ mod tests {
             lasting_rules_dir: None,
             native_turn_timeout_secs: None,
             native_session_max_tokens: None,
+            max_live_children: 4,
         };
         let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
         let chat_manager = Arc::new(
@@ -9547,6 +9736,7 @@ mod tests {
             lasting_rules_dir: None,
             native_turn_timeout_secs: None,
             native_session_max_tokens: None,
+            max_live_children: 4,
         };
         let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
         let chat_manager = Arc::new(
@@ -10078,6 +10268,611 @@ mod tests {
                 "{msg}"
             );
         }
+    }
+
+    // ---- Provider selection by the runner (B18) -------------------------------
+
+    /// The fake providers under the ids the tests name: the built-in `claude-code` and one
+    /// other instance (`other.0`), each a [`FakeProvider`] of its own.
+    struct TwoFakes {
+        claude: crate::chat::agent_runtime::fake::FakeProvider,
+        other: (String, crate::chat::agent_runtime::fake::FakeProvider),
+    }
+
+    impl crate::chat::agent_runtime::ProviderSource for TwoFakes {
+        fn get(&self, provider_id: &str) -> Option<Arc<dyn nexus_claude::agent::AgentProvider>> {
+            if provider_id == "claude-code" {
+                Some(Arc::new(self.claude.clone()))
+            } else if provider_id == self.other.0 {
+                Some(Arc::new(self.other.1.clone()))
+            } else {
+                None
+            }
+        }
+    }
+
+    /// A runner on `source`, signed (`jwt_secret`) so that a provider other than Claude
+    /// Code passes the security gate, with the run's events kept for the test.
+    async fn runner_on(
+        source: Arc<dyn crate::chat::agent_runtime::ProviderSource>,
+        max_cost_usd: f64,
+    ) -> (
+        PlanRunner,
+        Arc<dyn GraphStore>,
+        broadcast::Receiver<RunnerEvent>,
+    ) {
+        use crate::chat::config::{ChatConfig, ProviderPath};
+        use crate::chat::manager::ChatManager;
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::meilisearch::traits::SearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::notes::manager::NoteManager;
+        use crate::orchestrator::context::ContextBuilder;
+        use crate::plan::manager::PlanManager;
+
+        let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+        let search: Arc<dyn SearchStore> = Arc::new(MockSearchStore::new());
+        let chat_config = ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: std::path::PathBuf::from("/dev/null"),
+            nexus_tools_path: None,
+            nexus_browser_path: None,
+            obscura_path: None,
+            default_model: "test".into(),
+            max_sessions: 4,
+            session_timeout: std::time::Duration::from_secs(30),
+            neo4j_uri: "bolt://mock:7687".into(),
+            neo4j_user: "neo4j".into(),
+            neo4j_password: "test".into(),
+            meilisearch_url: "http://mock:7700".into(),
+            meilisearch_key: "test".into(),
+            nats_url: None,
+            max_turns: 5,
+            permission: Default::default(),
+            auto_continue: false,
+            retry: Default::default(),
+            process_path: None,
+            claude_cli_path: None,
+            auto_update_cli: false,
+            auto_update_app: false,
+            jwt_secret: Some("a-signing-secret-for-the-tests".into()),
+            server_port: 0,
+            session_token_expiry_secs: 3600,
+            read_only_mcp_tools: Vec::new(),
+            max_live_children: 4,
+            lasting_rules_dir: None,
+            native_turn_timeout_secs: None,
+            native_session_max_tokens: None,
+        };
+        let chat_manager = Arc::new(
+            ChatManager::new_without_memory(graph.clone(), search.clone(), chat_config)
+                .with_provider_source(source),
+        );
+        let plan_manager = Arc::new(PlanManager::new(graph.clone(), search.clone()));
+        let note_manager = Arc::new(NoteManager::new(graph.clone(), search.clone()));
+        let context_builder = Arc::new(ContextBuilder::new(
+            graph.clone(),
+            search.clone(),
+            plan_manager,
+            note_manager,
+        ));
+        let (event_tx, event_rx) = broadcast::channel(64);
+        let config = RunnerConfig {
+            max_cost_usd,
+            ..RunnerConfig::default()
+        };
+        let runner = PlanRunner::new(
+            chat_manager,
+            graph.clone(),
+            context_builder,
+            config,
+            event_tx,
+        );
+        (runner, graph, event_rx)
+    }
+
+    /// Stores an instance record and, outside any project (the scope of the runs these
+    /// tests start, B3), the consent that lets sessions open on it.
+    async fn stored_and_consented(
+        graph: &Arc<dyn GraphStore>,
+        record: &crate::chat::provider::settings::InstanceRecord,
+    ) {
+        use crate::chat::provider::settings::{
+            ConsentRecord, CONSENT_PREFIX, GLOBAL, INSTANCE_PREFIX, NO_PROJECT_SCOPE,
+        };
+        graph
+            .put_llm_setting(
+                GLOBAL,
+                &format!("{INSTANCE_PREFIX}{}", record.id),
+                &serde_json::to_string(record).unwrap(),
+            )
+            .await
+            .unwrap();
+        let consent = ConsentRecord {
+            provider_id: record.id.clone(),
+            origin: record.origin.clone(),
+            consented_by: "me@example.com".into(),
+            consented_at: chrono::Utc::now().to_rfc3339(),
+            credential_ref: Some(record.credential_ref.clone()),
+            ..Default::default()
+        };
+        graph
+            .put_llm_setting(
+                NO_PROJECT_SCOPE,
+                &format!("{CONSENT_PREFIX}{}", record.id),
+                &serde_json::to_string(&consent).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A Claude Code on another machine, `allow_trust` as given.
+    fn remote_record(allow_trust: bool) -> crate::chat::provider::settings::InstanceRecord {
+        crate::chat::provider::settings::InstanceRecord {
+            id: "claude-code@n1".into(),
+            kind: crate::chat::provider::settings::KIND_CLAUDE_CODE_REMOTE.into(),
+            label: "n1".into(),
+            base_url: String::new(),
+            origin: "ssh://n1.example.net".into(),
+            credential_ref: "none".into(),
+            default_model: Some("sonnet".into()),
+            host: Some("n1.example.net".into()),
+            remote_cwd: Some("/work/repo".into()),
+            allow_trust,
+            ..Default::default()
+        }
+    }
+
+    /// The next event of `kind` on the run's channel, within a second.
+    async fn next_event(
+        rx: &mut broadcast::Receiver<RunnerEvent>,
+        pick: impl Fn(&RunnerEvent) -> bool,
+    ) -> Option<RunnerEvent> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(event)) if pick(&event) => return Some(event),
+                Ok(Ok(_)) => continue,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                _ => return None,
+            }
+        }
+    }
+
+    /// Acceptance 1: a plan of two tasks on the scripted provider, each attempt costing
+    /// a real 0.6 USD against a 1 USD budget. The first succeeds, the second ends the run
+    /// on `BudgetExceeded`, and both AgentExecutions are closed carrying the provider
+    /// that ran them and the model it reported.
+    #[tokio::test]
+    async fn two_tasks_on_a_scripted_provider_exceed_the_budget_on_the_second_and_both_executions_are_closed(
+    ) {
+        use nexus_claude::agent::CostBasis;
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
+        let (mut runner, graph, mut events) = runner_on(Arc::new(fake.clone()), 1.0).await;
+        runner.config.max_cost_usd = 1.0;
+        let (plan_id, run_id) = seed_run(&graph).await;
+        let tasks: Vec<_> = (0..2).map(|_| crate::test_helpers::test_task()).collect();
+        for task in &tasks {
+            graph.create_task(plan_id, task).await.unwrap();
+        }
+
+        let mut outcomes = Vec::new();
+        for task in &tasks {
+            let exec = run_attempt_costing(
+                &runner,
+                &fake,
+                plan_id,
+                run_id,
+                task,
+                0.6,
+                CostBasis::Reported,
+            )
+            .await;
+            let (status, cost, duration) = attempt_outcome(&exec.result);
+            runner.close_attempt(
+                exec.agent_execution.as_ref(),
+                status,
+                cost,
+                duration,
+                exec.report.as_ref(),
+            );
+            outcomes.push(exec.result);
+        }
+        assert!(
+            matches!(outcomes[0], TaskResult::Success { .. }),
+            "first attempt: {:?}",
+            outcomes[0]
+        );
+        assert!(
+            matches!(
+                outcomes[1],
+                TaskResult::BudgetExceeded { cumulated_cost_usd, limit_usd, .. }
+                    if cumulated_cost_usd > 1.0 && limit_usd == 1.0
+            ),
+            "second attempt: {:?}",
+            outcomes[1]
+        );
+        // The nodes are closed by a spawned write: give it a moment.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let nodes = graph.get_agent_executions_for_run(run_id).await.unwrap();
+        reset_globals().await;
+        assert_eq!(nodes.len(), 2, "one AgentExecution per attempt");
+        for node in &nodes {
+            assert!(node.completed_at.is_some(), "closed: {node:?}");
+            assert_eq!(node.provider_id, "claude-code");
+            assert_eq!(
+                node.model.as_deref(),
+                Some("m"),
+                "the model the provider reported"
+            );
+            assert_eq!(
+                node.routed_by, "claude_code",
+                "nothing configured: the built-in instance"
+            );
+        }
+        let statuses: Vec<_> = nodes.iter().map(|n| n.status).collect();
+        assert!(
+            statuses.contains(&AgentExecutionStatus::Completed)
+                && statuses.contains(&AgentExecutionStatus::Interrupted),
+            "one completed, one cut by the budget: {statuses:?}"
+        );
+        assert!(
+            next_event(&mut events, |e| matches!(
+                e,
+                RunnerEvent::TaskProviderRefused { .. } | RunnerEvent::TaskProviderFallback { .. }
+            ))
+            .await
+            .is_none(),
+            "nothing was refused or substituted"
+        );
+    }
+
+    /// [`run_attempt`] with the cost the provider reports chosen by the test.
+    async fn run_attempt_costing(
+        runner: &PlanRunner,
+        fake: &crate::chat::agent_runtime::fake::FakeProvider,
+        plan_id: Uuid,
+        run_id: Uuid,
+        task: &crate::neo4j::models::TaskNode,
+        usd: f64,
+        basis: nexus_claude::agent::CostBasis,
+    ) -> TaskExecutionResult {
+        use nexus_claude::agent::{AgentEvent, Cost, StopReason};
+        let already = fake.state.turns_started.lock().unwrap().len();
+        let pusher = fake.clone();
+        tokio::spawn(async move {
+            while pusher.state.turns_started.lock().unwrap().len() <= already {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            pusher.state.push(AgentEvent::Done {
+                stop_reason: StopReason::Completed,
+                subtype: Some("success".into()),
+                is_error: false,
+                result_text: Some("done".into()),
+                usage: Default::default(),
+                cost: Cost {
+                    usd: Some(usd),
+                    basis,
+                },
+                duration_ms: 5,
+                duration_api_ms: None,
+                num_turns: 1,
+                model: Some("m".into()),
+                provider_session_id: Some("p-1".into()),
+                structured_output: None,
+                error: None,
+            });
+        });
+        let tmp = tempfile::TempDir::new().unwrap();
+        runner
+            .execute_task(
+                run_id,
+                plan_id,
+                task.id,
+                "costed task",
+                tmp.path().to_str().unwrap(),
+                None,
+                None,
+                "",
+                1,
+            )
+            .await
+            .expect("the task executes")
+    }
+
+    /// Acceptance 2: a task asks for trust (`bypassPermissions`) on a Claude Code on
+    /// another machine. Without the machine's explicit agreement (`allow_trust`), the
+    /// session opens under `ask` — never in trust; with it, in trust.
+    #[tokio::test]
+    async fn a_trust_task_on_a_remote_machine_runs_in_trust_only_with_its_explicit_agreement() {
+        use nexus_claude::agent::{CostBasis, PolicyMode};
+        let _lock = TEST_MUTEX.lock().await;
+        for (allow_trust, expected) in [(false, PolicyMode::Ask), (true, PolicyMode::Trust)] {
+            reset_globals().await;
+            let claude = crate::chat::agent_runtime::fake::FakeProvider::new();
+            let remote = crate::chat::agent_runtime::fake::FakeProvider::new();
+            let source = Arc::new(TwoFakes {
+                claude: claude.clone(),
+                other: ("claude-code@n1".into(), remote.clone()),
+            });
+            let (runner, graph, _events) = runner_on(source, 10.0).await;
+            let runner = runner.with_run_routing(Some("claude-code@n1".into()), None, None);
+            stored_and_consented(&graph, &remote_record(allow_trust)).await;
+            let (plan_id, run_id) = seed_run(&graph).await;
+            let task = crate::test_helpers::test_task();
+            graph.create_task(plan_id, &task).await.unwrap();
+
+            let exec = run_attempt_costing(
+                &runner,
+                &remote,
+                plan_id,
+                run_id,
+                &task,
+                0.1,
+                CostBasis::Reported,
+            )
+            .await;
+            assert!(
+                matches!(exec.result, TaskResult::Success { .. }),
+                "allow_trust={allow_trust}: {:?}",
+                exec.result
+            );
+            let specs = remote.state.opened_specs.lock().unwrap();
+            assert_eq!(
+                specs.len(),
+                1,
+                "allow_trust={allow_trust}: opened on the machine"
+            );
+            assert_eq!(
+                specs[0].policy.mode, expected,
+                "allow_trust={allow_trust}: the mode the session opened with"
+            );
+            assert!(
+                claude.state.opened_specs.lock().unwrap().is_empty(),
+                "allow_trust={allow_trust}: the local Claude Code was never opened"
+            );
+            assert_eq!(
+                exec.agent_execution
+                    .as_ref()
+                    .map(|ae| ae.provider_id.as_str()),
+                Some("claude-code@n1")
+            );
+        }
+        reset_globals().await;
+    }
+
+    /// Acceptance 5a: the run names an instance nobody registered. No candidate can run
+    /// the task: the attempt fails with the typed refusal and its stable code, the run
+    /// announces it, and nothing was opened instead.
+    #[tokio::test]
+    async fn a_run_provider_nobody_registered_is_an_explicit_refusal_never_a_substitute() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let claude = crate::chat::agent_runtime::fake::FakeProvider::new();
+        let (runner, graph, mut events) = runner_on(Arc::new(claude.clone()), 10.0).await;
+        let runner = runner.with_run_routing(Some("ghost".into()), None, None);
+        let (plan_id, run_id) = seed_run(&graph).await;
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = runner
+            .execute_task(
+                run_id,
+                plan_id,
+                task.id,
+                "orphan task",
+                tmp.path().to_str().unwrap(),
+                None,
+                None,
+                "",
+                1,
+            )
+            .await
+            .expect_err("no candidate: the attempt fails");
+        reset_globals().await;
+        assert!(
+            err.to_string()
+                .contains("provider refused (provider_unknown)"),
+            "{err:#}"
+        );
+        let typed = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<crate::chat::provider::resolver::ResolveError>())
+            .expect("the typed refusal stays in the chain");
+        assert_eq!(typed.code(), "provider_unknown");
+        assert!(
+            claude.state.opened_specs.lock().unwrap().is_empty(),
+            "nothing was opened instead"
+        );
+        let event = next_event(&mut events, |e| {
+            matches!(e, RunnerEvent::TaskProviderRefused { .. })
+        })
+        .await
+        .expect("the run announces the refusal");
+        assert!(matches!(
+            event,
+            RunnerEvent::TaskProviderRefused { ref code, ref provider_id, task_id, .. }
+                if code == "provider_unknown" && provider_id.as_deref() == Some("ghost") && task_id == task.id
+        ));
+    }
+
+    /// Acceptance 5b: the run names an instance that is registered and allowed, but whose
+    /// health check fails when the session opens. The task runs on the project's default
+    /// instead (the built-in Claude Code here), and the fallback is recorded three ways:
+    /// the run's event, `routed_by = fallback` and `fallback_reason` on the AgentExecution.
+    #[tokio::test]
+    async fn a_run_provider_that_fails_its_health_check_falls_back_to_the_default_and_says_so() {
+        use nexus_claude::agent::{CostBasis, ProviderError, ProviderHealth};
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let claude = crate::chat::agent_runtime::fake::FakeProvider::new();
+        let acp = crate::chat::agent_runtime::fake::FakeProvider::new();
+        *acp.health.lock().unwrap() = Some(ProviderHealth::unavailable(
+            ProviderError::EndpointUnreachable {
+                detail: "connection refused".into(),
+            },
+        ));
+        let source = Arc::new(TwoFakes {
+            claude: claude.clone(),
+            other: ("acp".into(), acp.clone()),
+        });
+        let (runner, graph, mut events) = runner_on(source, 10.0).await;
+        let runner = runner.with_run_routing(Some("acp".into()), Some("acp-default".into()), None);
+        stored_and_consented(
+            &graph,
+            &crate::chat::provider::settings::InstanceRecord {
+                id: "acp".into(),
+                kind: "acp".into(),
+                label: "acp".into(),
+                base_url: String::new(),
+                origin: "acp:openclaw".into(),
+                credential_ref: "none".into(),
+                default_model: Some("acp-default".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let (plan_id, run_id) = seed_run(&graph).await;
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let exec = run_attempt_costing(
+            &runner,
+            &claude,
+            plan_id,
+            run_id,
+            &task,
+            0.1,
+            CostBasis::Reported,
+        )
+        .await;
+        reset_globals().await;
+        assert!(
+            matches!(exec.result, TaskResult::Success { .. }),
+            "{:?}",
+            exec.result
+        );
+        assert!(
+            acp.state.opened_specs.lock().unwrap().is_empty(),
+            "the unhealthy instance was never opened"
+        );
+        assert_eq!(claude.state.opened_specs.lock().unwrap().len(), 1);
+        let requests = runner.request_spy.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "one request built by the attempt");
+        assert_eq!(
+            requests[0].run_provider.as_deref(),
+            Some("acp"),
+            "the run's provider was asked for first"
+        );
+        let ae = exec.agent_execution.expect("the attempt's node");
+        assert_eq!(ae.provider_id, "claude-code");
+        assert_eq!(ae.routed_by, "fallback");
+        assert_eq!(
+            ae.fallback_reason.as_deref(),
+            Some("endpoint_unreachable on acp")
+        );
+        let event = next_event(&mut events, |e| {
+            matches!(e, RunnerEvent::TaskProviderFallback { .. })
+        })
+        .await
+        .expect("the run announces the fallback");
+        assert!(matches!(
+            event,
+            RunnerEvent::TaskProviderFallback { ref from_provider, ref to_provider, ref reason, .. }
+                if from_provider == "acp" && to_provider == "claude-code" && reason == "endpoint_unreachable"
+        ));
+    }
+
+    /// The two predicates of the fallback: only the run's provider is ever substituted,
+    /// and only for a failure of its health.
+    #[test]
+    fn only_the_runs_provider_falls_back_and_only_on_a_health_failure() {
+        use nexus_claude::agent::ProviderError;
+        let mut request = crate::chat::types::ChatRequest {
+            file_scope_lifted: false,
+            access: None,
+            routing_pool: None,
+            routing_mode: None,
+            attachments: Vec::new(),
+            refs: Vec::new(),
+            message: String::new(),
+            session_id: None,
+            cwd: "/w".into(),
+            project_slug: None,
+            model: None,
+            provider: None,
+            task_alias: None,
+            persona_alias: None,
+            run_provider: Some("deepseek".into()),
+            run_model: None,
+            max_tokens: None,
+            task_class: None,
+            permission_mode: None,
+            add_dirs: None,
+            workspace_slug: None,
+            user_claims: None,
+            spawned_by: None,
+            task_context: None,
+            subagent_type: None,
+            route_auto: false,
+            scaffolding_override: None,
+            runner_context: None,
+            routing_decision_id: None,
+        };
+        assert_eq!(run_level_provider(&request), Some("deepseek"));
+        request.task_alias = Some("fast".into());
+        assert_eq!(
+            run_level_provider(&request),
+            None,
+            "a task alias stands above the run: never substituted"
+        );
+        request.task_alias = None;
+        request.persona_alias = Some("reviewer".into());
+        assert_eq!(run_level_provider(&request), None);
+        request.persona_alias = None;
+        request.provider = Some("x".into());
+        assert_eq!(run_level_provider(&request), None);
+        request.provider = None;
+        request.run_provider = Some(String::new());
+        assert_eq!(run_level_provider(&request), None);
+
+        let health = |e: ProviderError| health_failure(&anyhow::Error::new(e));
+        assert_eq!(
+            health(ProviderError::EndpointUnreachable { detail: "x".into() }),
+            Some("endpoint_unreachable")
+        );
+        assert_eq!(
+            health(ProviderError::AuthRequired { login_hint: None }),
+            Some("auth_required")
+        );
+        assert_eq!(
+            health(ProviderError::Timeout { after_ms: 1 }),
+            Some("timeout")
+        );
+        assert_eq!(
+            health(ProviderError::ModelNoTools { model: "m".into() }),
+            None,
+            "a model refusal is not a health failure"
+        );
+        assert_eq!(
+            health(ProviderError::unsupported("sandbox")),
+            None,
+            "a capability refusal is not a health failure"
+        );
+        assert_eq!(
+            health_failure(&anyhow::Error::new(
+                crate::chat::provider::resolver::ResolveError::NoProvider
+            )),
+            None,
+            "a resolution refusal is not a health failure"
+        );
+        // Wrapped in context, the typed cause is still found.
+        let wrapped = anyhow::Error::new(ProviderError::CredentialsLocked).context("opening");
+        assert_eq!(health_failure(&wrapped), Some("credentials_locked"));
     }
 
     /// (Round 3, finding 1) A person's run starts at full privilege; a

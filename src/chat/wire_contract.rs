@@ -46,7 +46,7 @@ const UPDATE_COMMAND: &str = "UPDATE_CHAT_CONTRACT=1 cargo test --lib chat::wire
 
 /// Every `ChatEvent` tag the examples must cover. Adding a variant means
 /// adding its tag here AND its examples in [`server_examples`].
-const EXPECTED_SERVER_TAGS: [&str; 39] = [
+const EXPECTED_SERVER_TAGS: [&str; 40] = [
     "active_tasks_update",
     "ask_user_question",
     "assistant_text",
@@ -77,6 +77,7 @@ const EXPECTED_SERVER_TAGS: [&str; 39] = [
     "streaming_status",
     "system_hint",
     "system_init",
+    "team_message",
     "thinking",
     "tool_cancelled",
     "tool_result",
@@ -151,6 +152,7 @@ fn variant_tag(e: &ChatEvent) -> &'static str {
         ChatEvent::ConversationRelayed { .. } => "conversation_relayed",
         ChatEvent::ProviderSwitched { .. } => "provider_switched",
         ChatEvent::ProviderOutage { .. } => "provider_outage",
+        ChatEvent::TeamMessage { .. } => "team_message",
     }
 }
 
@@ -801,6 +803,11 @@ fn server_examples() -> Vec<ServerExample> {
                 duration_ms: None,
             },
         ),
+        ServerExample::same(ChatEvent::TeamMessage {
+            from_session_id: fixed_uuid("a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"),
+            from_name: s("agent-alpha"),
+            content: s("task complete — ready for review"),
+        }),
     ]
 }
 
