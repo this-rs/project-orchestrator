@@ -1,0 +1,2319 @@
+{
+  "classifier": "recall_ranking",
+  "version": 1,
+  "catalog": {
+    "note": "Language-neutral by construction: the classifier reads a graph, not text. The lang field only satisfies the bench shape (>=30 cases, >=10 fr); lang_agreement is n/a because no pair ids are declared. Scenarios N=2 and N=3 are controls where the two integration rules agree; N>=4 is the discriminant."
+  },
+  "cases": [
+    {
+      "id": "recall-02-fr",
+      "lang": "fr",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "Y"
+    },
+    {
+      "id": "recall-02-en",
+      "lang": "en",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "Y"
+    },
+    {
+      "id": "recall-03-fr",
+      "lang": "fr",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "Y"
+    },
+    {
+      "id": "recall-03-en",
+      "lang": "en",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "Y"
+    },
+    {
+      "id": "recall-04-fr",
+      "lang": "fr",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-04-en",
+      "lang": "en",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-05-fr",
+      "lang": "fr",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-05-en",
+      "lang": "en",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-06-fr",
+      "lang": "fr",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-06-en",
+      "lang": "en",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-07-fr",
+      "lang": "fr",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-07-en",
+      "lang": "en",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-08-fr",
+      "lang": "fr",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5,
+          "s-8": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-8",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-08-en",
+      "lang": "en",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5,
+          "s-8": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-8",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-09-fr",
+      "lang": "fr",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5,
+          "s-8": 0.5,
+          "s-9": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-8",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-9",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-09-en",
+      "lang": "en",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5,
+          "s-8": 0.5,
+          "s-9": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-8",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-9",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-10-fr",
+      "lang": "fr",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5,
+          "s-8": 0.5,
+          "s-9": 0.5,
+          "s-10": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-8",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-9",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-10",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-10-en",
+      "lang": "en",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5,
+          "s-8": 0.5,
+          "s-9": 0.5,
+          "s-10": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-8",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-9",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-10",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-11-fr",
+      "lang": "fr",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5,
+          "s-8": 0.5,
+          "s-9": 0.5,
+          "s-10": 0.5,
+          "s-11": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-8",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-9",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-10",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-11",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-11-en",
+      "lang": "en",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5,
+          "s-8": 0.5,
+          "s-9": 0.5,
+          "s-10": 0.5,
+          "s-11": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-8",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-9",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-10",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-11",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-12-fr",
+      "lang": "fr",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5,
+          "s-8": 0.5,
+          "s-9": 0.5,
+          "s-10": 0.5,
+          "s-11": 0.5,
+          "s-12": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-8",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-9",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-10",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-11",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-12",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-12-en",
+      "lang": "en",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5,
+          "s-8": 0.5,
+          "s-9": 0.5,
+          "s-10": 0.5,
+          "s-11": 0.5,
+          "s-12": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-8",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-9",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-10",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-11",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-12",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-13-fr",
+      "lang": "fr",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5,
+          "s-8": 0.5,
+          "s-9": 0.5,
+          "s-10": 0.5,
+          "s-11": 0.5,
+          "s-12": 0.5,
+          "s-13": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-8",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-9",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-10",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-11",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-12",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-13",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-13-en",
+      "lang": "en",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5,
+          "s-8": 0.5,
+          "s-9": 0.5,
+          "s-10": 0.5,
+          "s-11": 0.5,
+          "s-12": 0.5,
+          "s-13": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-8",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-9",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-10",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-11",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-12",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-13",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-14-fr",
+      "lang": "fr",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5,
+          "s-8": 0.5,
+          "s-9": 0.5,
+          "s-10": 0.5,
+          "s-11": 0.5,
+          "s-12": 0.5,
+          "s-13": 0.5,
+          "s-14": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-8",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-9",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-10",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-11",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-12",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-13",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-14",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-14-en",
+      "lang": "en",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5,
+          "s-8": 0.5,
+          "s-9": 0.5,
+          "s-10": 0.5,
+          "s-11": 0.5,
+          "s-12": 0.5,
+          "s-13": 0.5,
+          "s-14": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-8",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-9",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-10",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-11",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-12",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-13",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-14",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-15-fr",
+      "lang": "fr",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5,
+          "s-8": 0.5,
+          "s-9": 0.5,
+          "s-10": 0.5,
+          "s-11": 0.5,
+          "s-12": 0.5,
+          "s-13": 0.5,
+          "s-14": 0.5,
+          "s-15": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-8",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-9",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-10",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-11",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-12",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-13",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-14",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-15",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-15-en",
+      "lang": "en",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5,
+          "s-8": 0.5,
+          "s-9": 0.5,
+          "s-10": 0.5,
+          "s-11": 0.5,
+          "s-12": 0.5,
+          "s-13": 0.5,
+          "s-14": 0.5,
+          "s-15": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-8",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-9",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-10",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-11",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-12",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-13",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-14",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-15",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-16-fr",
+      "lang": "fr",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5,
+          "s-8": 0.5,
+          "s-9": 0.5,
+          "s-10": 0.5,
+          "s-11": 0.5,
+          "s-12": 0.5,
+          "s-13": 0.5,
+          "s-14": 0.5,
+          "s-15": 0.5,
+          "s-16": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-8",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-9",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-10",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-11",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-12",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-13",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-14",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-15",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-16",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    },
+    {
+      "id": "recall-16-en",
+      "lang": "en",
+      "input": {
+        "config": {
+          "max_hops": 1,
+          "decay_per_hop": 0.5,
+          "min_activation": 0.01,
+          "min_energy": 0.05
+        },
+        "seeds": {
+          "s-strong": 0.9,
+          "s-1": 0.5,
+          "s-2": 0.5,
+          "s-3": 0.5,
+          "s-4": 0.5,
+          "s-5": 0.5,
+          "s-6": 0.5,
+          "s-7": 0.5,
+          "s-8": 0.5,
+          "s-9": 0.5,
+          "s-10": 0.5,
+          "s-11": 0.5,
+          "s-12": 0.5,
+          "s-13": 0.5,
+          "s-14": 0.5,
+          "s-15": 0.5,
+          "s-16": 0.5
+        },
+        "edges": [
+          {
+            "from": "s-strong",
+            "to": "Y",
+            "weight": 0.9
+          },
+          {
+            "from": "s-1",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-2",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-3",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-4",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-5",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-6",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-7",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-8",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-9",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-10",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-11",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-12",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-13",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-14",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-15",
+            "to": "X",
+            "weight": 0.5
+          },
+          {
+            "from": "s-16",
+            "to": "X",
+            "weight": 0.5
+          }
+        ]
+      },
+      "label": "X"
+    }
+  ]
+}

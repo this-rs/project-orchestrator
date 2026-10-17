@@ -210,15 +210,37 @@ pub struct SpreadHit {
 
 /// Combine the incoming contributions of one node.
 ///
-/// **This is the single place where the integration rule lives.** It keeps the
-/// strongest incoming path (`max`), which is what the engine has done since
-/// PR #494 made it deterministic. Any change of rule happens here and nowhere
-/// else.
+/// **This is the single place where the integration rule lives.**
+///
+/// The rule is a *bounded sum*: convergent evidence accumulates — a node
+/// reached by several moderate paths outranks a node reached by a single
+/// comparable one — and the result stays in `[0, 1]`, the ceiling the vector
+/// score already has and the UI assumes. The bound is load-bearing: an
+/// unbounded sum would let degree dominate the ranking and would surface
+/// scores above 100 %.
 pub fn combine_incoming(current: Option<f64>, incoming: f64) -> f64 {
     match current {
-        Some(previous) => previous.max(incoming),
-        None => incoming,
+        Some(previous) => (previous + incoming).min(1.0),
+        None => incoming.min(1.0),
     }
+}
+
+/// Running state of one node within a hop.
+struct Reached {
+    /// Combined activation (the integration rule).
+    score: f64,
+    /// Strongest single contribution, kept for the attribution.
+    strongest: f64,
+    /// Parent of the strongest contribution (lowest id on ties).
+    via: Uuid,
+}
+
+/// Whether a contribution should take the attribution from the current one.
+///
+/// Strictly stronger wins; on a tie the lowest parent id wins, so the answer
+/// never depends on the iteration order.
+fn takes_attribution(best: f64, best_via: Uuid, score: f64, via: Uuid) -> bool {
+    score > best || (score == best && via < best_via)
 }
 
 /// One hop of the rule: every neighbour reachable from `frontier`, combined.
@@ -235,7 +257,7 @@ pub fn apply_hop(
     hops: usize,
 ) -> Vec<SpreadHit> {
     let mut order: Vec<Uuid> = Vec::new();
-    let mut reached: HashMap<Uuid, SpreadHit> = HashMap::new();
+    let mut reached: HashMap<Uuid, Reached> = HashMap::new();
 
     let mut sorted: Vec<&(Uuid, f64)> = frontier.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
@@ -274,21 +296,23 @@ pub fn apply_hop(
             }
 
             match reached.get_mut(&neighbour) {
-                Some(existing) => {
-                    if combine_incoming(Some(existing.score), spread_score) > existing.score {
-                        existing.score = spread_score;
-                        existing.via = *node_id;
+                Some(acc) => {
+                    // The score accumulates; the attribution keeps the strongest
+                    // single contribution, which is what `via` has always meant.
+                    acc.score = combine_incoming(Some(acc.score), spread_score);
+                    if takes_attribution(acc.strongest, acc.via, spread_score, *node_id) {
+                        acc.strongest = spread_score;
+                        acc.via = *node_id;
                     }
                 }
                 None => {
                     order.push(neighbour);
                     reached.insert(
                         neighbour,
-                        SpreadHit {
-                            node: neighbour,
-                            score: spread_score,
+                        Reached {
+                            score: combine_incoming(None, spread_score),
+                            strongest: spread_score,
                             via: *node_id,
-                            hops,
                         },
                     );
                 }
@@ -298,7 +322,14 @@ pub fn apply_hop(
 
     order
         .into_iter()
-        .filter_map(|node| reached.remove(&node))
+        .filter_map(|node| {
+            reached.remove(&node).map(|acc| SpreadHit {
+                node,
+                score: acc.score,
+                via: acc.via,
+                hops,
+            })
+        })
         .collect()
 }
 
@@ -373,14 +404,15 @@ mod pure_rule_tests {
     }
 
     #[test]
-    fn combine_incoming_keeps_the_strongest_path() {
-        assert_eq!(combine_incoming(None, 0.3), 0.3);
-        assert_eq!(combine_incoming(Some(0.3), 0.1), 0.3);
-        assert_eq!(combine_incoming(Some(0.3), 0.9), 0.9);
+    fn combine_incoming_accumulates_convergent_paths_within_the_unit_interval() {
+        assert!((combine_incoming(None, 0.3) - 0.3).abs() < 1e-12);
+        assert!((combine_incoming(Some(0.3), 0.2) - 0.5).abs() < 1e-12);
+        // The ceiling is the same as a cosine similarity: never above 1.
+        assert!((combine_incoming(Some(0.8), 0.5) - 1.0).abs() < 1e-12);
     }
 
     #[test]
-    fn a_node_reached_by_several_parents_keeps_the_strongest_one() {
+    fn convergent_paths_accumulate_and_the_attribution_keeps_the_strongest_one() {
         let strong = Uuid::new_v4();
         let weak = Uuid::new_v4();
         let target = Uuid::new_v4();
@@ -397,8 +429,32 @@ mod pure_rule_tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].node, target);
+        // Attribution: the strongest single contribution.
         assert_eq!(hits[0].via, strong);
-        assert!((hits[0].score - (0.9 * 0.9 * 1.0 * 0.5)).abs() < 1e-12);
+        // Score: the bounded sum of both contributions.
+        let strong_contribution = 0.9 * 0.9 * 1.0 * 0.5;
+        let weak_contribution = 0.9 * 0.1 * 1.0 * 0.5;
+        assert!((hits[0].score - (strong_contribution + weak_contribution)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn many_convergent_paths_saturate_at_the_ceiling() {
+        let target = Uuid::new_v4();
+        let mut hood = Neighbourhood::default();
+        hood.nodes.insert(target, node(1.0));
+        let mut seeds: Vec<(Uuid, f64)> = Vec::new();
+        let mut visited: HashSet<Uuid> = HashSet::new();
+        for _ in 0..20 {
+            let parent = Uuid::new_v4();
+            hood.nodes.insert(parent, node(1.0));
+            hood.edges.insert(parent, vec![edge(target, 1.0)]);
+            seeds.push((parent, 1.0));
+            visited.insert(parent);
+        }
+
+        let hits = apply_hop(&seeds, &hood, &visited, &rule(), None, 1.0, 1);
+        assert_eq!(hits.len(), 1);
+        assert!((hits[0].score - 1.0).abs() < 1e-12);
     }
 
     #[test]
@@ -727,28 +783,22 @@ impl SpreadingActivationEngine {
 
             let mut next_frontier: Vec<(Uuid, f64)> = Vec::with_capacity(hits.len());
             for hit in &hits {
-                // Insert or update with the combined score — one rule, one place.
-                let should_insert = match activations.get(&hit.node) {
-                    None => true,
-                    Some((existing_score, _, _, _)) => {
-                        combine_incoming(Some(*existing_score), hit.score) > *existing_score
-                    }
-                };
-                if should_insert {
-                    if let Some((note, entity_type)) = resolved.remove(&hit.node) {
-                        activations.insert(
-                            hit.node,
-                            (
-                                hit.score,
-                                ActivationSource::Propagated {
-                                    via: hit.via,
-                                    hops: hit.hops,
-                                },
-                                note,
-                                entity_type,
-                            ),
-                        );
-                    }
+                // `visited` guarantees a node is reached in exactly one hop, so
+                // the rule already combined everything there is to combine:
+                // insert, do not merge.
+                if let Some((note, entity_type)) = resolved.remove(&hit.node) {
+                    activations.insert(
+                        hit.node,
+                        (
+                            hit.score,
+                            ActivationSource::Propagated {
+                                via: hit.via,
+                                hops: hit.hops,
+                            },
+                            note,
+                            entity_type,
+                        ),
+                    );
                 }
                 next_frontier.push((hit.node, hit.score));
             }
