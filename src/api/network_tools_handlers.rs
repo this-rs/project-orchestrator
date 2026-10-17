@@ -42,8 +42,8 @@ use crate::auth::jwt::Claims;
 use crate::chat::provider::endpoint_guard::origin_of;
 use crate::chat::provider::errors::OpenFailure;
 use crate::chat::provider::nexus_tools::{
-    builtin_obscura_engine, BrowserAuthorization, SearchProviderRecord, ToolOriginConsent,
-    BROWSER_KEY, BUILTIN_OBSCURA_ID, SEARCH_PROVIDER_PREFIX, TOOL_ORIGIN_PREFIX,
+    builtin_obscura_engine, record_origin_consent, BrowserAuthorization, SearchProviderRecord,
+    ToolOriginConsent, BROWSER_KEY, BUILTIN_OBSCURA_ID, SEARCH_PROVIDER_PREFIX, TOOL_ORIGIN_PREFIX,
     TOOL_PROVIDER_PREFIX,
 };
 use crate::chat::provider::settings::{project_scope, valid_id, GLOBAL};
@@ -318,6 +318,12 @@ fn origin_body(body: &Value) -> Result<OriginBody, AppError> {
 
 /// PUT /api/projects/{slug}/network-tools/origins — consent (human only). Idempotent: consenting
 /// again records who and when.
+///
+/// The write itself is [`nexus_tools::record_origin_consent`] (N23b), the ONE writer of that
+/// document: the answer `always` given in the chat reaches this very store through it, so a
+/// consent has a single place, a single key and a single reader, whoever recorded it. This route
+/// stays human-only on purpose: an agent session cannot reach it, and its only other caller is a
+/// person answering a question the HARNESS raised about a destination the harness asserted.
 pub async fn put_origin(
     State(state): State<OrchestratorState>,
     Extension(claims): Extension<Claims>,
@@ -327,22 +333,9 @@ pub async fn put_origin(
     require_human(&state, &claims)?;
     let origin = tool_origin(&origin_body(&body)?.origin)?;
     require_project(&state, &slug).await?;
-    let consent = ToolOriginConsent {
-        origin: origin.clone(),
-        consented_by: claims.email.clone(),
-        consented_at: Utc::now().to_rfc3339(),
-    };
-    let document = serde_json::to_string(&consent).map_err(|e| AppError::Internal(e.into()))?;
-    state
-        .orchestrator
-        .neo4j()
-        .put_llm_setting(
-            &project_scope(&slug),
-            &format!("{TOOL_ORIGIN_PREFIX}{origin}"),
-            &document,
-        )
+    let consent = record_origin_consent(state.orchestrator.neo4j(), &slug, &origin, &claims.email)
         .await
-        .map_err(AppError::Internal)?;
+        .map_err(|e| AppError::Internal(anyhow::Error::new(e)))?;
     Ok(Json(consent))
 }
 
