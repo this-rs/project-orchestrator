@@ -716,6 +716,51 @@ pub async fn serve_chat(
     addr
 }
 
+/// The real router over `graph`, with authentication ON ([`test_auth_config`]):
+/// what a test that carries a signed token — a person's, or a chat session's —
+/// talks to. [`serve_chat`] is the no-auth variant used by the WebSocket tests.
+pub async fn router_with_auth(graph: Arc<MockGraphStore>) -> axum::Router {
+    use crate::api::handlers::ServerState;
+    use crate::orchestrator::watcher::FileWatcher;
+    use crate::orchestrator::Orchestrator;
+
+    let app_state = mock_app_state_with_graph(graph);
+    let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+    let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+        orchestrator.clone(),
+    )));
+    let state = Arc::new(ServerState {
+        orchestrator,
+        watcher,
+        chat_manager: None,
+        event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+            crate::events::EventBus::default(),
+        ))),
+        nats_emitter: None,
+        auth_config: Some(test_auth_config()),
+        serve_frontend: false,
+        frontend_path: "./dist".to_string(),
+        setup_completed: true,
+        server_port: 0,
+        public_url: None,
+        remote_mcp: crate::RemoteMcpConfig::default(),
+        ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        registry_remote_url: None,
+        oidc_client: None,
+        neural_router: mock_neural_router(),
+        trajectory_collector: std::sync::RwLock::new(None),
+        trajectory_store_neo4j: None,
+        trajectory_store: None,
+        identity: None,
+        reactor_counters: std::sync::OnceLock::new(),
+        confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+        mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+        model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+        vault: crate::vault::VaultService::ephemeral(),
+    });
+    crate::api::routes::create_router(state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

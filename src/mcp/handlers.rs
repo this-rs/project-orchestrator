@@ -290,6 +290,20 @@ pub(crate) const MEGA_TOOL_ACTIONS: &[(&str, &str, &str)] = &[
     ("vault", "list_available", "vault_list_available"),
     ("vault", "request_secret", "vault_request_secret"),
 
+    // Provider — the instances (harnesses/engines) a session can run on. The
+    // agent's door is `/api/agent/providers`: `/api/chat/providers` stays a
+    // person's (A25), so the same operations are reachable here without
+    // widening the person's route.
+    ("provider", "list", "agent_list_providers"),
+    ("provider", "get", "agent_get_provider"),
+    ("provider", "create", "agent_create_provider"),
+    ("provider", "update", "agent_update_provider"),
+    ("provider", "delete", "agent_delete_provider"),
+    ("provider", "test", "agent_test_provider"),
+    ("provider", "status", "agent_provider_status"),
+    ("provider", "models", "agent_provider_models"),
+    ("provider", "scan_host_key", "agent_scan_host_key"),
+
     // Milestone
     ("milestone", "list", "list_milestones"),
     ("milestone", "create", "create_milestone"),
@@ -2160,6 +2174,141 @@ impl ToolHandler {
                         Some(&body),
                     )
                     .await?,
+                ))
+            }
+
+            // ── Provider: the agent door to the instances (B-M1) ────────
+            // Every arm forwards to the same server operations the settings
+            // routes use; the server decides what an agent may not grant
+            // itself (trust, a pinned host key).
+            "agent_list_providers" => Ok(Some(http.get("/api/agent/providers").await?)),
+
+            "agent_get_provider" => {
+                let id = extract_string(args, "id")?;
+                Ok(Some(http.get(&format!("/api/agent/providers/{id}")).await?))
+            }
+
+            "agent_create_provider" => {
+                // Only the keys the caller sent travel: the REST DTO refuses an
+                // unknown field, so `action` and the rest stay here.
+                let mut draft = serde_json::Map::new();
+                for key in &[
+                    "id",
+                    "kind",
+                    "preset",
+                    "label",
+                    "base_url",
+                    "default_model",
+                    "cost_source",
+                    "credential_ref",
+                    "host",
+                    "ssh_user",
+                    "ssh_port",
+                    "host_key",
+                    "remote_cwd",
+                    "allow_trust",
+                    "rate_limit",
+                ] {
+                    if let Some(v) = args.get(*key) {
+                        draft.insert((*key).to_string(), v.clone());
+                    }
+                }
+                Ok(Some(
+                    http.post("/api/agent/providers", &Value::Object(draft))
+                        .await?,
+                ))
+            }
+
+            "agent_update_provider" => {
+                let id = extract_string(args, "id")?;
+                let mut patch = serde_json::Map::new();
+                for key in &[
+                    "preset",
+                    "label",
+                    "base_url",
+                    "default_model",
+                    "cost_source",
+                    "credential_ref",
+                    "host",
+                    "ssh_user",
+                    "ssh_port",
+                    "host_key",
+                    "remote_cwd",
+                    "allow_trust",
+                    "rate_limit",
+                ] {
+                    if let Some(v) = args.get(*key) {
+                        patch.insert((*key).to_string(), v.clone());
+                    }
+                }
+                Ok(Some(
+                    http.patch(&format!("/api/agent/providers/{id}"), &Value::Object(patch))
+                        .await?,
+                ))
+            }
+
+            "agent_delete_provider" => {
+                let id = extract_string(args, "id")?;
+                Ok(Some(
+                    http.delete(&format!("/api/agent/providers/{id}")).await?,
+                ))
+            }
+
+            "agent_test_provider" => {
+                let mut draft = serde_json::Map::new();
+                for key in &[
+                    "id",
+                    "kind",
+                    "preset",
+                    "label",
+                    "base_url",
+                    "default_model",
+                    "cost_source",
+                    "credential_ref",
+                    "host",
+                    "ssh_user",
+                    "ssh_port",
+                    "host_key",
+                    "remote_cwd",
+                    "allow_trust",
+                    "rate_limit",
+                ] {
+                    if let Some(v) = args.get(*key) {
+                        draft.insert((*key).to_string(), v.clone());
+                    }
+                }
+                Ok(Some(
+                    http.post("/api/agent/providers/test", &Value::Object(draft))
+                        .await?,
+                ))
+            }
+
+            "agent_provider_status" => {
+                let id = extract_string(args, "id")?;
+                Ok(Some(
+                    http.get(&format!("/api/agent/providers/{id}/status"))
+                        .await?,
+                ))
+            }
+
+            "agent_provider_models" => {
+                let id = extract_string(args, "id")?;
+                Ok(Some(
+                    http.get(&format!("/api/agent/providers/{id}/models"))
+                        .await?,
+                ))
+            }
+
+            "agent_scan_host_key" => {
+                let host = extract_string(args, "host")?;
+                let mut body = serde_json::Map::new();
+                body.insert("host".to_string(), json!(host));
+                if let Some(port) = args.get("ssh_port") {
+                    body.insert("ssh_port".to_string(), port.clone());
+                }
+                Ok(Some(
+                    http.post("/api/agent/providers/ssh-host-key", &Value::Object(body))
+                        .await?,
                 ))
             }
 
@@ -6479,6 +6628,120 @@ mod tests {
 
         let client = McpHttpClient::new(base_url.clone(), Some("test-token".to_string()));
         (ToolHandler::new(client), base_url)
+    }
+
+    // -- Provider: the agent door of the `provider` mega-tool (B-M1) -------
+
+    #[tokio::test]
+    async fn a_provider_create_goes_through_the_agent_door_with_the_published_arguments() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "provider",
+                Some(json!({
+                    "action": "create",
+                    "id": "claude-code@n1",
+                    "kind": "claude_code_remote",
+                    "label": "n1",
+                    "host": "n1.example.net",
+                    "host_key": "ssh-ed25519 AAAA",
+                    "remote_cwd": "/work",
+                    "credential_ref": "vault:ssh-n1",
+                    "allow_trust": true,
+                    "ssh_port": 2222,
+                    "rate_limit": [],
+                    "stray_key": "never sent",
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(
+            result["path"], "/api/agent/providers",
+            "the agent door, not the person's route"
+        );
+        let body = &result["body"];
+        assert_eq!(body["id"], "claude-code@n1");
+        assert_eq!(body["allow_trust"], true);
+        assert_eq!(body["ssh_port"], 2222);
+        assert_eq!(body["rate_limit"], json!([]));
+        // The REST DTO refuses an unknown field: `action` and a stray key must
+        // not travel, or the call would answer 400 instead of creating anything.
+        assert!(body.get("action").is_none(), "{body}");
+        assert!(body.get("stray_key").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_provider_scan_reads_the_host_and_the_port_it_was_given() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "provider",
+                Some(json!({
+                    "action": "scan_host_key",
+                    "host": "n1.example.net",
+                    "ssh_port": 2222,
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/agent/providers/ssh-host-key");
+        assert_eq!(result["body"]["host"], "n1.example.net");
+        assert_eq!(result["body"]["ssh_port"], 2222);
+    }
+
+    #[tokio::test]
+    async fn a_provider_read_and_removal_reach_their_own_route() {
+        let (handler, _) = make_http_handler().await;
+        let cases = [
+            ("get", "GET", "/api/agent/providers/deepseek"),
+            ("delete", "DELETE", "/api/agent/providers/deepseek"),
+            ("status", "GET", "/api/agent/providers/deepseek/status"),
+            ("models", "GET", "/api/agent/providers/deepseek/models"),
+        ];
+        for (action, method, path) in cases {
+            let result = handler
+                .handle(
+                    "provider",
+                    Some(json!({ "action": action, "id": "deepseek" })),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result["method"], method, "{action}");
+            assert_eq!(result["path"], path, "{action}");
+        }
+        // And the listing takes no id at all.
+        let result = handler
+            .handle("provider", Some(json!({ "action": "list" })))
+            .await
+            .unwrap();
+        assert_eq!(result["path"], "/api/agent/providers");
+    }
+
+    #[tokio::test]
+    async fn a_provider_update_only_carries_the_fields_it_was_given() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "provider",
+                Some(json!({
+                    "action": "update",
+                    "id": "claude-code@n1",
+                    "label": "n1 renamed",
+                    "allow_trust": false,
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PATCH");
+        assert_eq!(result["path"], "/api/agent/providers/claude-code@n1");
+        let body = &result["body"];
+        assert_eq!(body["label"], "n1 renamed");
+        assert_eq!(body["allow_trust"], false);
+        // An absent field is left alone by the server (a patch, not a replace).
+        assert!(body.get("host_key").is_none(), "{body}");
+        assert!(body.get("id").is_none(), "the id is in the path: {body}");
     }
 
     // -- Projects ----------------------------------------------------------
