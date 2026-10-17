@@ -207,6 +207,22 @@ impl RunnerState {
         }
     }
 
+    /// Whether one of this run's executors runs `session_id` right now.
+    pub fn runs_session(&self, session_id: Uuid) -> bool {
+        self.active_agents
+            .iter()
+            .any(|a| a.session_id == Some(session_id))
+    }
+
+    /// Whether a delegation belongs to this run (B36): it was spawned by one of
+    /// this run's executors — `owner_run` is the run whose executor was its
+    /// parent when it started, `parent_session` the session that delegated. A
+    /// manual delegation, or one of an earlier run, is not this run's spend,
+    /// whatever its plan.
+    pub fn owns_delegation(&self, owner_run: Option<Uuid>, parent_session: Option<Uuid>) -> bool {
+        owner_run == Some(self.run_id) || parent_session.is_some_and(|p| self.runs_session(p))
+    }
+
     /// Check if the USD budget has been exceeded (marginal counter only).
     pub fn is_budget_exceeded(&self, max_cost_usd: f64) -> bool {
         self.cost_usd > max_cost_usd

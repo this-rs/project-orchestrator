@@ -1203,18 +1203,25 @@ pub async fn delegate_task(
         };
         let graph_clone = graph.clone();
         let ae_for_create = ae.clone();
-        tokio::spawn(async move {
+        let created = tokio::spawn(async move {
             if let Err(e) = graph_clone.create_agent_execution(&ae_for_create).await {
                 tracing::warn!("Failed to create AgentExecution for delegation: {}", e);
             }
         });
-        ae
+        // From here the execution is closed exactly once, whatever path the
+        // delegation ends on, and never before it is written (B36).
+        DelegationExecution::new(ae, graph.clone(), Some(created))
+    };
+    // The run whose executor delegated, read now: its cost is that run's only
+    // (a manual delegation has none; a later run is another run).
+    let owner = DelegationOwner {
+        run_id: run_of_session(parent_session_id).await,
+        parent_session_id,
     };
 
     // Step 4: Send the enriched prompt to the agent (async — don't block)
     let cm = chat_manager.clone();
     let graph_for_close = graph.clone();
-    let graph_for_execution = graph.clone();
     let sid = session_id.clone();
     let task_title_clone = task_title.clone();
 
@@ -1236,6 +1243,7 @@ pub async fn delegate_task(
                 task_id = %ev_task_id,
                 "Failed to send delegation prompt: {}", e
             );
+            // `execution` drops here: it is closed `failed`.
             return;
         }
 
@@ -1272,8 +1280,7 @@ pub async fn delegate_task(
             delegation_cwd,
             close,
             execution,
-            graph_for_execution,
-            ev_plan_id,
+            owner,
         )
         .await;
     });
@@ -1488,15 +1495,17 @@ async fn listen_delegation_result(
     event_bus: std::sync::Arc<crate::events::HybridEmitter>,
     cwd: Option<String>,
     close: Option<DelegationClose>,
-    execution: crate::neo4j::agent_execution::AgentExecutionNode,
-    graph: std::sync::Arc<dyn crate::neo4j::GraphStore>,
-    plan_id: Uuid,
+    execution: DelegationExecution,
+    owner: DelegationOwner,
 ) {
     use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 
-    let start = std::time::Instant::now();
+    // Tokio's clock, so a paused test clock reaches the 1h safety net.
+    let start = tokio::time::Instant::now();
     let timeout = std::time::Duration::from_secs(3600); // 1h safety net
 
+    // Every `break` but the `Result` one leaves `execution` to drop: closed
+    // `failed` (timeout, channel closed without a result).
     loop {
         let remaining = timeout.saturating_sub(start.elapsed());
         if remaining.is_zero() {
@@ -1509,6 +1518,9 @@ async fn listen_delegation_result(
                 cost_usd,
                 is_error,
                 cost: cost_detail,
+                usage,
+                model,
+                num_turns,
                 ..
             })) => {
                 let duration_secs = start.elapsed().as_secs_f64();
@@ -1525,39 +1537,32 @@ async fn listen_delegation_result(
                         .await;
                 }
                 let cost = cost_usd.unwrap_or(0.0);
-
-                // Close the delegation's AgentExecution with its cost: no
-                // execution is left `running` once its delegation has finished
-                // (B36). Fire-and-forget like the open.
-                close_delegation_execution(
-                    graph.as_ref(),
-                    &execution,
+                let end = DelegationEnd::of_result(
                     is_error,
-                    cost,
+                    cost_usd,
+                    cost_detail.as_ref(),
+                    usage.as_ref(),
+                    model,
+                    num_turns,
                     duration_secs,
-                )
-                .await;
+                );
 
-                // The delegation's spend is the run's spend (B36): only a real
-                // spend (`reported`/`priced`) moves the marginal counter that
-                // can cut the run, exactly as the run's own attempts do.
+                // The delegation's spend is its run's spend (B36), and only
+                // when an executor of that run delegated: only a real spend
+                // (`reported`/`priced`) moves the marginal counter that can
+                // cut the run, exactly as the run's own attempts do.
                 {
-                    let attempt_cost = crate::runner::state::AttemptCost {
-                        usd: cost_usd,
-                        basis: cost_detail
-                            .as_ref()
-                            .and_then(|c| c.get("basis"))
-                            .and_then(|b| b.as_str())
-                            .map(str::to_string),
-                        tokens: None,
-                    };
                     let mut global = crate::runner::RUNNER_STATE.write().await;
                     if let Some(ref mut state) = *global {
-                        if state.plan_id == plan_id {
-                            state.add_attempt_cost(&attempt_cost);
+                        if state.owns_delegation(owner.run_id, owner.parent_session_id) {
+                            state.add_attempt_cost(&end.attempt_cost());
                         }
                     }
                 }
+
+                // Close the delegation's AgentExecution with its cost, basis,
+                // tokens and model: no execution is left `running` (B36).
+                execution.close(&end).await;
 
                 // Emit a CrudEvent so WebSocket clients see the completion
                 let payload = serde_json::json!({
@@ -1633,27 +1638,213 @@ async fn listen_delegation_result(
     }
 }
 
-/// Close a delegation's AgentExecution with its final status, cost, duration
-/// and completion time (B36): no execution is left `running` once its
-/// delegation has finished. A close that fails is logged, never fatal.
-async fn close_delegation_execution(
-    graph: &dyn crate::neo4j::GraphStore,
-    execution: &crate::neo4j::agent_execution::AgentExecutionNode,
+/// The run a delegation is spent on: the run whose executor runs
+/// `parent_session_id` when the delegation starts (B36). `None` for a manual
+/// delegation or one spawned by a session no run owns.
+async fn run_of_session(parent_session_id: Option<Uuid>) -> Option<Uuid> {
+    let parent = parent_session_id?;
+    let global = crate::runner::RUNNER_STATE.read().await;
+    global
+        .as_ref()
+        .filter(|state| state.runs_session(parent))
+        .map(|state| state.run_id)
+}
+
+/// Who a delegation's spend belongs to (B36).
+#[derive(Debug, Clone, Copy, Default)]
+struct DelegationOwner {
+    /// The run whose executor delegated, read when the delegation started.
+    run_id: Option<Uuid>,
+    /// The session that delegated.
+    parent_session_id: Option<Uuid>,
+}
+
+/// How a delegation ended, as its session's `Result` event reported it — or
+/// without one (`DelegationEnd::failed`).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct DelegationEnd {
     is_error: bool,
-    cost_usd: f64,
-    duration_secs: f64,
+    /// Amount the provider stated; `None` when it stated none (never 0).
+    cost_usd: Option<f64>,
+    /// `reported`, `priced`, `free`, `subscription` or `unknown`.
+    cost_basis: String,
+    tokens_in: Option<u64>,
+    tokens_out: Option<u64>,
+    tokens_cache_read: Option<u64>,
+    tokens_cache_write: Option<u64>,
+    model: Option<String>,
+    num_turns: Option<u32>,
+    /// `None`: measured from the execution's start when it is closed.
+    duration_secs: Option<f64>,
+}
+
+impl DelegationEnd {
+    /// The end a `Result` event reports. The basis is the provider's; a cost
+    /// with no basis is `reported` (as the runner reads it), no cost at all is
+    /// `unknown` — never a `reported` 0.
+    fn of_result(
+        is_error: bool,
+        cost_usd: Option<f64>,
+        cost: Option<&serde_json::Value>,
+        usage: Option<&serde_json::Value>,
+        model: Option<String>,
+        num_turns: Option<i32>,
+        duration_secs: f64,
+    ) -> Self {
+        let basis = cost
+            .and_then(|c| c.get("basis"))
+            .and_then(|b| b.as_str())
+            .map(str::to_string);
+        let token = |k: &str| usage.and_then(|u| u.get(k)).and_then(|v| v.as_u64());
+        Self {
+            is_error,
+            cost_usd,
+            cost_basis: basis.unwrap_or_else(|| {
+                if cost_usd.is_some() {
+                    "reported"
+                } else {
+                    "unknown"
+                }
+                .to_string()
+            }),
+            tokens_in: token("input_tokens"),
+            tokens_out: token("output_tokens"),
+            tokens_cache_read: token("cache_read_tokens"),
+            tokens_cache_write: token("cache_creation_tokens"),
+            model,
+            num_turns: num_turns.and_then(|n| u32::try_from(n).ok()),
+            duration_secs: Some(duration_secs),
+        }
+    }
+
+    /// A delegation that ended without a `Result` (prompt not sent, channel
+    /// closed, 1h safety net): failed, at a cost nobody knows.
+    fn failed() -> Self {
+        Self {
+            is_error: true,
+            cost_basis: "unknown".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Input + output tokens, `None` when the provider reported neither.
+    fn tokens(&self) -> Option<u64> {
+        match (self.tokens_in, self.tokens_out) {
+            (None, None) => None,
+            (i, o) => Some(i.unwrap_or(0).saturating_add(o.unwrap_or(0))),
+        }
+    }
+
+    /// What it costs the run, in the runner's own attempt shape.
+    fn attempt_cost(&self) -> crate::runner::state::AttemptCost {
+        crate::runner::state::AttemptCost {
+            usd: self.cost_usd,
+            basis: Some(self.cost_basis.clone()),
+            tokens: self.tokens(),
+        }
+    }
+
+    /// The execution `open` closed with this end.
+    fn close(
+        &self,
+        open: &crate::neo4j::agent_execution::AgentExecutionNode,
+    ) -> crate::neo4j::agent_execution::AgentExecutionNode {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        let now = chrono::Utc::now();
+        let mut closed = open.clone();
+        closed.status = if self.is_error {
+            AgentExecutionStatus::Failed
+        } else {
+            AgentExecutionStatus::Completed
+        };
+        closed.completed_at = Some(now);
+        // An unknown cost stays 0 on the node, but under `unknown`: the
+        // aggregates count it apart, never as a real spend.
+        closed.cost_usd = self.cost_usd.unwrap_or(0.0);
+        closed.cost_basis = Some(self.cost_basis.clone());
+        closed.duration_secs = self
+            .duration_secs
+            .unwrap_or_else(|| (now - open.started_at).num_milliseconds().max(0) as f64 / 1000.0);
+        closed.tokens_in = self.tokens_in;
+        closed.tokens_out = self.tokens_out;
+        closed.tokens_cache_read = self.tokens_cache_read;
+        closed.tokens_cache_write = self.tokens_cache_write;
+        if self.model.is_some() {
+            closed.model = self.model.clone();
+        }
+        if self.num_turns.is_some() {
+            closed.num_turns = self.num_turns;
+        }
+        closed
+    }
+}
+
+/// A delegation's AgentExecution, closed exactly once (B36): by `close` with
+/// what its `Result` reported, or — on any other path (prompt not sent, channel
+/// closed, timeout, panic) — `failed` with an `unknown` cost when it drops. No
+/// execution is left `running`.
+struct DelegationExecution {
+    open: Option<crate::neo4j::agent_execution::AgentExecutionNode>,
+    graph: Arc<dyn crate::neo4j::GraphStore>,
+    /// The fire-and-forget write of the open node: the close waits for it, so
+    /// it never lands on a node not yet written.
+    created: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl DelegationExecution {
+    fn new(
+        open: crate::neo4j::agent_execution::AgentExecutionNode,
+        graph: Arc<dyn crate::neo4j::GraphStore>,
+        created: Option<tokio::task::JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            open: Some(open),
+            graph,
+            created,
+        }
+    }
+
+    /// Close the execution with `end`. A write that fails is logged, never fatal.
+    async fn close(mut self, end: &DelegationEnd) {
+        if let Some(open) = self.open.take() {
+            write_closed_execution(self.graph.as_ref(), self.created.take(), &end.close(&open))
+                .await;
+        }
+    }
+}
+
+impl Drop for DelegationExecution {
+    fn drop(&mut self) {
+        let Some(open) = self.open.take() else {
+            return;
+        };
+        let closed = DelegationEnd::failed().close(&open);
+        let graph = self.graph.clone();
+        let created = self.created.take();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    write_closed_execution(graph.as_ref(), created, &closed).await
+                });
+            }
+            Err(_) => tracing::warn!(
+                execution_id = %open.id,
+                "Delegation: no runtime to close its AgentExecution"
+            ),
+        }
+    }
+}
+
+async fn write_closed_execution(
+    graph: &dyn crate::neo4j::GraphStore,
+    created: Option<tokio::task::JoinHandle<()>>,
+    closed: &crate::neo4j::agent_execution::AgentExecutionNode,
 ) {
-    use crate::neo4j::agent_execution::AgentExecutionStatus;
-    let mut closed = execution.clone();
-    closed.status = if is_error {
-        AgentExecutionStatus::Failed
-    } else {
-        AgentExecutionStatus::Completed
-    };
-    closed.completed_at = Some(chrono::Utc::now());
-    closed.cost_usd = cost_usd;
-    closed.duration_secs = duration_secs;
-    if let Err(e) = graph.update_agent_execution(&closed).await {
+    if let Some(created) = created {
+        // A creation that panicked or was cancelled: the close is still tried.
+        let _ = created.await;
+    }
+    if let Err(e) = graph.update_agent_execution(closed).await {
         tracing::warn!(error = %e, "Delegation: failed to close its AgentExecution");
     }
 }
@@ -7384,50 +7575,315 @@ mod tests {
         }
     }
 
-    /// B36 — a delegation's AgentExecution is closed with its cost once the
-    /// delegation finishes: no execution is left `running` and the cost it cost
-    /// is written on the node.
-    #[tokio::test]
-    async fn delegation_execution_closed_with_its_cost() {
-        use crate::neo4j::agent_execution::{AgentExecutionNode, AgentExecutionStatus};
-        use crate::neo4j::GraphStore;
+    // ── B36: a delegation's execution and its cost ─────────────────────────
 
-        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
-        let graph: Arc<dyn GraphStore> = mock.clone();
-        let ae = AgentExecutionNode {
+    fn open_delegation_node() -> crate::neo4j::agent_execution::AgentExecutionNode {
+        crate::neo4j::agent_execution::AgentExecutionNode {
             id: Uuid::new_v4(),
             run_id: Uuid::nil(),
             task_id: Uuid::new_v4(),
-            session_id: None,
             started_at: chrono::Utc::now(),
-            completed_at: None,
-            cost_usd: 0.0,
-            duration_secs: 0.0,
-            status: AgentExecutionStatus::Running,
+            status: crate::neo4j::agent_execution::AgentExecutionStatus::Running,
             tools_used: "{}".to_string(),
-            files_modified: vec![],
-            commits: vec![],
             persona_profile: "delegation".to_string(),
-            vector_json: None,
-            report_json: None,
-            execution_type: Default::default(),
             ..Default::default()
-        };
+        }
+    }
+
+    /// A store holding one open delegation execution, and the guard that closes it.
+    async fn delegation_execution() -> (
+        Arc<crate::neo4j::mock::MockGraphStore>,
+        Uuid,
+        super::DelegationExecution,
+    ) {
+        use crate::neo4j::GraphStore;
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        let ae = open_delegation_node();
         graph.create_agent_execution(&ae).await.unwrap();
+        let id = ae.id;
+        (mock, id, super::DelegationExecution::new(ae, graph, None))
+    }
 
-        super::close_delegation_execution(graph.as_ref(), &ae, false, 0.25, 1.5).await;
+    /// The stored execution, once it is no longer `running` (the drop path
+    /// writes from a spawned task).
+    async fn closed_execution(
+        mock: &crate::neo4j::mock::MockGraphStore,
+        id: Uuid,
+    ) -> crate::neo4j::agent_execution::AgentExecutionNode {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        for _ in 0..200 {
+            let stored = mock.agent_executions.read().await.get(&id).cloned();
+            if let Some(ae) = stored.filter(|ae| ae.status != AgentExecutionStatus::Running) {
+                return ae;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the delegation's execution is still running");
+    }
 
-        let stored = mock
-            .agent_executions
-            .read()
-            .await
-            .get(&ae.id)
-            .cloned()
-            .expect("still stored");
+    fn delegation_result(
+        cost_usd: Option<f64>,
+        cost: Option<serde_json::Value>,
+        usage: Option<serde_json::Value>,
+    ) -> crate::chat::types::ChatEvent {
+        crate::chat::types::ChatEvent::Result {
+            session_id: "child".to_string(),
+            duration_ms: 1500,
+            cost_usd,
+            subtype: "success".to_string(),
+            is_error: false,
+            num_turns: Some(3),
+            result_text: None,
+            cost,
+            usage,
+            model: Some("child-model".to_string()),
+            stop_reason: None,
+            error_code: None,
+            error_message: None,
+        }
+    }
+
+    /// Runs the delegation listener on `events` (then a closed channel).
+    async fn listen_to(
+        events: Vec<crate::chat::types::ChatEvent>,
+        execution: super::DelegationExecution,
+        owner: super::DelegationOwner,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        for event in events {
+            tx.send(event).unwrap();
+        }
+        drop(tx);
+        let event_bus = Arc::new(crate::events::HybridEmitter::new(Arc::new(
+            crate::events::EventBus::default(),
+        )));
+        super::listen_delegation_result(
+            rx,
+            Uuid::new_v4(),
+            "delegated",
+            event_bus,
+            None,
+            None,
+            execution,
+            owner,
+        )
+        .await;
+    }
+
+    /// A run of `plan_id` whose executor runs `executor_session`.
+    fn run_with_executor(plan_id: Uuid, executor_session: Uuid) -> crate::runner::RunnerState {
+        let mut state = crate::runner::RunnerState::new(
+            Uuid::new_v4(),
+            plan_id,
+            1,
+            crate::runner::models::TriggerSource::Manual,
+        );
+        let mut agent = crate::runner::models::ActiveAgent::new(Uuid::new_v4(), "exec".into());
+        agent.session_id = Some(executor_session);
+        state.add_agent(agent);
+        state
+    }
+
+    fn reported(usd: f64) -> crate::chat::types::ChatEvent {
+        delegation_result(
+            Some(usd),
+            Some(serde_json::json!({"usd": usd, "basis": "reported"})),
+            Some(serde_json::json!({"input_tokens": 100, "output_tokens": 20})),
+        )
+    }
+
+    /// B36 (review 1) — a delegation nobody in the run spawned (a manual one,
+    /// on the same plan) does not touch the run's counters.
+    #[tokio::test]
+    async fn a_manual_delegation_during_a_run_does_not_charge_it() {
+        let _guard = crate::runner::runner::RUNNER_GLOBALS_TEST_LOCK.lock().await;
+        let plan_id = Uuid::new_v4();
+        *crate::runner::RUNNER_STATE.write().await =
+            Some(run_with_executor(plan_id, Uuid::new_v4()));
+        let (_mock, _id, execution) = delegation_execution().await;
+
+        let owner = super::DelegationOwner {
+            run_id: None,
+            parent_session_id: Some(Uuid::new_v4()),
+        };
+        listen_to(vec![reported(0.5)], execution, owner).await;
+
+        let state = crate::runner::RUNNER_STATE.read().await.clone().unwrap();
+        reset_runner_globals().await;
+        assert_eq!(state.cost_usd, 0.0, "not the run's spend");
+        assert_eq!(state.tokens_used, 0);
+    }
+
+    /// B36 (review 1) — a delegation of an earlier run that ends during the
+    /// next run (same plan) is not the new run's spend.
+    #[tokio::test]
+    async fn a_delegation_of_an_earlier_run_does_not_charge_the_next_one() {
+        let _guard = crate::runner::runner::RUNNER_GLOBALS_TEST_LOCK.lock().await;
+        let plan_id = Uuid::new_v4();
+        *crate::runner::RUNNER_STATE.write().await =
+            Some(run_with_executor(plan_id, Uuid::new_v4()));
+        let (_mock, _id, execution) = delegation_execution().await;
+
+        let owner = super::DelegationOwner {
+            run_id: Some(Uuid::new_v4()), // R1, gone
+            parent_session_id: Some(Uuid::new_v4()),
+        };
+        listen_to(vec![reported(0.5)], execution, owner).await;
+
+        let state = crate::runner::RUNNER_STATE.read().await.clone().unwrap();
+        reset_runner_globals().await;
+        assert_eq!(state.cost_usd, 0.0, "R1's delegation is not R2's spend");
+    }
+
+    /// B36 (review 1, 2) — a delegation spawned by the run's executor adds its
+    /// real cost AND its tokens (input + output) to the run, even when the
+    /// executor is gone by the time the delegation ends.
+    #[tokio::test]
+    async fn a_delegation_of_the_runs_executor_charges_cost_and_tokens() {
+        let _guard = crate::runner::runner::RUNNER_GLOBALS_TEST_LOCK.lock().await;
+        let plan_id = Uuid::new_v4();
+        let executor = Uuid::new_v4();
+        let state = run_with_executor(plan_id, executor);
+        let run_id = state.run_id;
+        *crate::runner::RUNNER_STATE.write().await = Some(state);
+        let (_mock, _id, execution) = delegation_execution().await;
+
+        let owner = super::DelegationOwner {
+            run_id: super::run_of_session(Some(executor)).await,
+            parent_session_id: Some(executor),
+        };
+        assert_eq!(
+            owner.run_id,
+            Some(run_id),
+            "the executor's run is read at launch"
+        );
+        // The executor finishes before its child.
+        if let Some(state) = crate::runner::RUNNER_STATE.write().await.as_mut() {
+            state.active_agents.clear();
+        }
+        listen_to(vec![reported(0.5)], execution, owner).await;
+
+        let state = crate::runner::RUNNER_STATE.read().await.clone().unwrap();
+        reset_runner_globals().await;
+        assert_eq!(state.cost_usd, 0.5);
+        assert_eq!(state.tokens_used, 120, "input + output tokens of the child");
+    }
+
+    /// B36 (review 3) — the closed execution carries its cost, basis, tokens
+    /// and model, as the runner's attempts do.
+    #[tokio::test]
+    async fn delegation_execution_closed_with_cost_basis_tokens_and_model() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        let (mock, id, execution) = delegation_execution().await;
+
+        let result = delegation_result(
+            Some(0.25),
+            Some(serde_json::json!({"usd": 0.25, "basis": "priced"})),
+            Some(
+                serde_json::json!({"input_tokens": 100, "output_tokens": 20, "cache_read_tokens": 7}),
+            ),
+        );
+        listen_to(vec![result], execution, super::DelegationOwner::default()).await;
+
+        let stored = closed_execution(&mock, id).await;
         assert_eq!(stored.status, AgentExecutionStatus::Completed);
         assert_eq!(stored.cost_usd, 0.25);
-        assert_eq!(stored.duration_secs, 1.5);
+        assert_eq!(stored.cost_basis.as_deref(), Some("priced"));
+        assert_eq!(stored.tokens_in, Some(100));
+        assert_eq!(stored.tokens_out, Some(20));
+        assert_eq!(stored.tokens_cache_read, Some(7));
+        assert_eq!(stored.model.as_deref(), Some("child-model"));
+        assert_eq!(stored.num_turns, Some(3));
         assert!(stored.completed_at.is_some());
+    }
+
+    /// B36 (review 3) — a delegation whose provider stated no price is closed
+    /// `unknown`, never a `reported` 0 (the aggregates read no basis as a real
+    /// spend).
+    #[tokio::test]
+    async fn a_delegation_without_a_price_is_closed_unknown_not_reported_zero() {
+        let (mock, id, execution) = delegation_execution().await;
+
+        listen_to(
+            vec![delegation_result(None, None, None)],
+            execution,
+            super::DelegationOwner::default(),
+        )
+        .await;
+
+        let stored = closed_execution(&mock, id).await;
+        assert_eq!(stored.cost_basis.as_deref(), Some("unknown"));
+    }
+
+    /// B36 (review 4) — the channel closes without a `Result` (the cascade
+    /// closed the child): the execution is closed `failed`, cost unknown.
+    #[tokio::test]
+    async fn a_delegation_whose_channel_closes_without_result_is_closed_failed() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        let (mock, id, execution) = delegation_execution().await;
+
+        listen_to(vec![], execution, super::DelegationOwner::default()).await;
+
+        let stored = closed_execution(&mock, id).await;
+        assert_eq!(stored.status, AgentExecutionStatus::Failed);
+        assert_eq!(stored.cost_basis.as_deref(), Some("unknown"));
+        assert!(stored.completed_at.is_some());
+    }
+
+    /// B36 (review 4) — the 1h safety net expires: the execution is closed
+    /// `failed`.
+    #[tokio::test(start_paused = true)]
+    async fn a_delegation_past_the_safety_net_is_closed_failed() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        let (mock, id, execution) = delegation_execution().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let event_bus = Arc::new(crate::events::HybridEmitter::new(Arc::new(
+            crate::events::EventBus::default(),
+        )));
+
+        super::listen_delegation_result(
+            rx,
+            Uuid::new_v4(),
+            "delegated",
+            event_bus,
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+        )
+        .await;
+        drop(tx);
+
+        let stored = closed_execution(&mock, id).await;
+        assert_eq!(stored.status, AgentExecutionStatus::Failed);
+    }
+
+    /// B36 (review 4) — a delegation that never gets to listen (its prompt
+    /// could not be sent) drops its execution: closed `failed`, after the open
+    /// node is written.
+    #[tokio::test]
+    async fn a_delegation_dropped_before_listening_is_closed_failed() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        use crate::neo4j::GraphStore;
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        let ae = open_delegation_node();
+        let id = ae.id;
+        let (graph_create, ae_create) = (graph.clone(), ae.clone());
+        let created = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            graph_create
+                .create_agent_execution(&ae_create)
+                .await
+                .unwrap();
+        });
+
+        drop(super::DelegationExecution::new(ae, graph, Some(created)));
+
+        let stored = closed_execution(&mock, id).await;
+        assert_eq!(stored.status, AgentExecutionStatus::Failed);
+        assert_eq!(stored.cost_basis.as_deref(), Some("unknown"));
     }
 
     #[test]

@@ -172,6 +172,10 @@ pub struct MockGraphStore {
     /// Makes every `create_chat_session` fail once set (a session written after it, such as
     /// the mirror of a sub-agent, is lost; the sessions already written are untouched).
     pub fail_session_writes: std::sync::atomic::AtomicBool,
+    /// Race injection: once `get_session_children(parent)` has answered, the
+    /// sessions queued here under `parent` are written — a delegation that lands
+    /// just after its parent's children were listed (B36 cascade).
+    pub land_children_after_read: std::sync::Mutex<HashMap<Uuid, Vec<ChatSessionNode>>>,
 
     // Relationships (adjacency lists)
     pub plan_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
@@ -396,6 +400,7 @@ impl MockGraphStore {
             fail_mark_read: std::sync::atomic::AtomicBool::new(false),
             fail_harness_writes: std::sync::atomic::AtomicBool::new(false),
             fail_session_writes: std::sync::atomic::AtomicBool::new(false),
+            land_children_after_read: std::sync::Mutex::new(HashMap::new()),
             plan_tasks: RwLock::new(HashMap::new()),
             task_steps: RwLock::new(HashMap::new()),
             task_decisions: RwLock::new(HashMap::new()),
@@ -7819,6 +7824,18 @@ impl GraphStore for MockGraphStore {
             .cloned()
             .collect();
         children.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        drop(sessions);
+        let landing = self
+            .land_children_after_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&parent_id);
+        if let Some(landing) = landing {
+            let mut sessions = self.chat_sessions.write().await;
+            for child in landing {
+                sessions.insert(child.id, child);
+            }
+        }
         Ok(children)
     }
 
