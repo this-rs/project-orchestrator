@@ -50,4 +50,20 @@ ignore = [
     # plist releases with quick-xml >= 0.40.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+
+    # RUSTSEC-2026-0367 / -0368 / -0369 — zip extraction (SUID/SGID preservation,
+    # symlink escape, permissions through symlinks). Patched only in zip >= 9.0.0,
+    # and no upgrade path exists today: calamine 0.36.1 -> zip ^8.6, candle-core
+    # 0.11.0 -> ^8.6.0 and tauri-plugin-updater 2.14.0 -> ^4 are all still below 9
+    # at their latest release, and office_oxide 0.1.15 (zip ^9) is blocked by
+    # pdf_oxide 0.3.78 — see the Cargo.toml block.
+    # Justification: the vulnerable API is ZipArchive::extract*() (writes files to
+    # disk). It is never called here — our only ZipArchive reader
+    # (src/update/mod.rs) reads a single entry into memory from the project's own
+    # release archive, every other zip use is read-only (candle npz,
+    # calamine/office_oxide) or a ZipWriter (document export). Revisit when a
+    # consumer reaches zip >= 9.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
 ]

@@ -90,6 +90,10 @@ ignore = [
     # ── quick-xml DoS advisories — no upgrade path (fix requires quick-xml >= 0.40).
     { id = "RUSTSEC-2026-0194", reason = "quick-xml quadratic duplicate-attribute check DoS. Transitive via plist 1.9.0 ← tauri; latest plist still pins quick-xml 0.39. Only used to read trusted macOS Info.plist bundle metadata — never untrusted XML. Revisit when plist bumps quick-xml >= 0.40." },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml parsing-cost DoS (same family as RUSTSEC-2026-0194). Same transitive chain and justification: plist ← tauri, trusted local Info.plist input only." },
+    # ── zip extraction advisories — no upgrade path (fix requires zip >= 9.0.0).
+    { id = "RUSTSEC-2026-0367", reason = "zip ZipArchive::extract() preserves SUID/SGID bits from an attacker-controlled archive. Patched only in zip >= 9.0.0; no upgrade path today (calamine 0.36.1 -> ^8.6, candle-core 0.11.0 -> ^8.6.0, tauri-plugin-updater 2.14.0 -> ^4 are all still below 9 at their latest; office_oxide 0.1.15 -> ^9 is blocked by pdf_oxide 0.3.78 — see the Cargo.toml block). The extract* API is never called here: our only ZipArchive reader (src/update/mod.rs) reads one entry into memory from the project's own release archive." },
+    { id = "RUSTSEC-2026-0368", reason = "zip: extract() creates symlinks whose attacker-controlled targets escape the destination dir. Same patched range (>= 9.0.0) and same blocked upgrade path as RUSTSEC-2026-0367; the extract* API is never called in this codebase." },
+    { id = "RUSTSEC-2026-0369", reason = "zip: stream extraction applies Unix permissions through symlinks without confining the target. Same range and same block as RUSTSEC-2026-0367; extract* never called." },
 ]
 
 [bans]
