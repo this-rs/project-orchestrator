@@ -122,6 +122,370 @@ impl Default for ActivationSearchConfig {
 }
 
 // ============================================================================
+// Pure spreading rule (no I/O)
+// ============================================================================
+//
+// The rule that decides *how much* activation a node receives from its
+// neighbours is separated from the code that talks to the graph store, so it
+// can be exercised offline and deterministically (see the classifier bench).
+// `activate_with_profile` drives it hop by hop; the bench calls
+// `spread_and_rank`. Neither re-implements the rule.
+
+/// The propagation-relevant view of a node: everything the rule reads.
+#[derive(Debug, Clone, Copy)]
+pub struct SpreadNode {
+    /// Decayed energy (`Note::computed_energy`). Decisions use 1.0.
+    pub energy: f64,
+    /// Scar intensity in `[0, 1]`; a scarred node is penalised.
+    pub scar_intensity: f64,
+    /// `true` when the node may be reached (status Active or NeedsReview).
+    pub reachable: bool,
+    /// Owning project, for project isolation.
+    pub project_id: Option<Uuid>,
+}
+
+/// One outgoing SYNAPSE as resolved from the graph store.
+#[derive(Debug, Clone, Copy)]
+pub struct SpreadEdge {
+    /// The node this edge points to.
+    pub neighbour: Uuid,
+    /// Synapse weight in `[0, 1]`.
+    pub weight: f64,
+    /// `true` when the neighbour is a Decision.
+    pub is_decision: bool,
+}
+
+/// A resolved neighbourhood: the only input the pure rule needs.
+#[derive(Debug, Clone, Default)]
+pub struct Neighbourhood {
+    /// Outgoing edges, keyed by source node.
+    pub edges: HashMap<Uuid, Vec<SpreadEdge>>,
+    /// Node metadata, keyed by node id.
+    pub nodes: HashMap<Uuid, SpreadNode>,
+}
+
+impl Neighbourhood {
+    /// Outgoing edges of `id` (empty slice when unknown).
+    pub fn edges_of(&self, id: Uuid) -> &[SpreadEdge] {
+        self.edges.get(&id).map(Vec::as_slice).unwrap_or(&[])
+    }
+}
+
+/// The subset of `SpreadingActivationConfig` that the pure rule uses.
+#[derive(Debug, Clone, Copy)]
+pub struct SpreadRule {
+    /// Maximum number of hops.
+    pub max_hops: usize,
+    /// Minimum contribution kept (applied per edge, before combination).
+    pub min_activation: f64,
+    /// Decay factor applied at each hop.
+    pub decay_per_hop: f64,
+    /// Nodes below this energy are dead and do not participate.
+    pub min_energy: f64,
+}
+
+impl From<&SpreadingActivationConfig> for SpreadRule {
+    fn from(config: &SpreadingActivationConfig) -> Self {
+        Self {
+            max_hops: config.max_hops,
+            min_activation: config.min_activation,
+            decay_per_hop: config.decay_per_hop,
+            min_energy: config.min_energy,
+        }
+    }
+}
+
+/// One node reached by the rule.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpreadHit {
+    /// The node reached.
+    pub node: Uuid,
+    /// Activation it received.
+    pub score: f64,
+    /// Parent it was reached from (the strongest contributor under `max`).
+    pub via: Uuid,
+    /// Distance from the nearest seed.
+    pub hops: usize,
+}
+
+/// Combine the incoming contributions of one node.
+///
+/// **This is the single place where the integration rule lives.** It keeps the
+/// strongest incoming path (`max`), which is what the engine has done since
+/// PR #494 made it deterministic. Any change of rule happens here and nowhere
+/// else.
+pub fn combine_incoming(current: Option<f64>, incoming: f64) -> f64 {
+    match current {
+        Some(previous) => previous.max(incoming),
+        None => incoming,
+    }
+}
+
+/// One hop of the rule: every neighbour reachable from `frontier`, combined.
+///
+/// Pure and synchronous. `frontier` is sorted by id internally so that ties are
+/// broken deterministically (`via` keeps the lowest parent id).
+pub fn apply_hop(
+    frontier: &[(Uuid, f64)],
+    hood: &Neighbourhood,
+    visited: &HashSet<Uuid>,
+    rule: &SpreadRule,
+    project_id: Option<Uuid>,
+    profile_synapse_weight: f64,
+    hops: usize,
+) -> Vec<SpreadHit> {
+    let mut order: Vec<Uuid> = Vec::new();
+    let mut reached: HashMap<Uuid, SpreadHit> = HashMap::new();
+
+    let mut sorted: Vec<&(Uuid, f64)> = frontier.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (node_id, parent_activation) in sorted {
+        for edge in hood.edges_of(*node_id) {
+            let neighbour = edge.neighbour;
+            if visited.contains(&neighbour) {
+                continue;
+            }
+            let Some(node) = hood.nodes.get(&neighbour) else {
+                continue;
+            };
+            if !node.reachable {
+                continue;
+            }
+            if let (Some(pid), Some(npid)) = (project_id, node.project_id) {
+                if pid != npid {
+                    continue;
+                }
+            }
+            if node.energy < rule.min_energy {
+                continue;
+            }
+
+            let scar_penalty = 1.0 - node.scar_intensity * 0.7;
+            let spread_score = parent_activation
+                * edge.weight
+                * node.energy
+                * rule.decay_per_hop
+                * scar_penalty
+                * profile_synapse_weight;
+
+            if spread_score < rule.min_activation {
+                continue;
+            }
+
+            match reached.get_mut(&neighbour) {
+                Some(existing) => {
+                    if combine_incoming(Some(existing.score), spread_score) > existing.score {
+                        existing.score = spread_score;
+                        existing.via = *node_id;
+                    }
+                }
+                None => {
+                    order.push(neighbour);
+                    reached.insert(
+                        neighbour,
+                        SpreadHit {
+                            node: neighbour,
+                            score: spread_score,
+                            via: *node_id,
+                            hops,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|node| reached.remove(&node))
+        .collect()
+}
+
+/// Run the whole rule over a fully resolved neighbourhood.
+///
+/// Pure and synchronous: no graph store, no embeddings, no clock. This is what
+/// the classifier bench calls; production drives `apply_hop` hop by hop so it
+/// only resolves the frontier it actually visits.
+pub fn spread_and_rank(
+    seeds: &[(Uuid, f64)],
+    hood: &Neighbourhood,
+    rule: &SpreadRule,
+    project_id: Option<Uuid>,
+    profile_synapse_weight: f64,
+) -> Vec<SpreadHit> {
+    let mut visited: HashSet<Uuid> = seeds.iter().map(|(id, _)| *id).collect();
+    let mut frontier: Vec<(Uuid, f64)> = seeds.to_vec();
+    let mut out: Vec<SpreadHit> = Vec::new();
+
+    for hop in 0..rule.max_hops {
+        if frontier.is_empty() {
+            break;
+        }
+        let hits = apply_hop(
+            &frontier,
+            hood,
+            &visited,
+            rule,
+            project_id,
+            profile_synapse_weight,
+            hop + 1,
+        );
+        if hits.is_empty() {
+            break;
+        }
+        visited.extend(hits.iter().map(|hit| hit.node));
+        frontier = hits.iter().map(|hit| (hit.node, hit.score)).collect();
+        out.extend(hits);
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod pure_rule_tests {
+    use super::*;
+
+    fn node(energy: f64) -> SpreadNode {
+        SpreadNode {
+            energy,
+            scar_intensity: 0.0,
+            reachable: true,
+            project_id: None,
+        }
+    }
+
+    fn edge(neighbour: Uuid, weight: f64) -> SpreadEdge {
+        SpreadEdge {
+            neighbour,
+            weight,
+            is_decision: false,
+        }
+    }
+
+    fn rule() -> SpreadRule {
+        SpreadRule {
+            max_hops: 1,
+            min_activation: 0.0,
+            decay_per_hop: 0.5,
+            min_energy: 0.05,
+        }
+    }
+
+    #[test]
+    fn combine_incoming_keeps_the_strongest_path() {
+        assert_eq!(combine_incoming(None, 0.3), 0.3);
+        assert_eq!(combine_incoming(Some(0.3), 0.1), 0.3);
+        assert_eq!(combine_incoming(Some(0.3), 0.9), 0.9);
+    }
+
+    #[test]
+    fn a_node_reached_by_several_parents_keeps_the_strongest_one() {
+        let strong = Uuid::new_v4();
+        let weak = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let mut hood = Neighbourhood::default();
+        hood.nodes.insert(strong, node(1.0));
+        hood.nodes.insert(weak, node(1.0));
+        hood.nodes.insert(target, node(1.0));
+        hood.edges.insert(strong, vec![edge(target, 0.9)]);
+        hood.edges.insert(weak, vec![edge(target, 0.1)]);
+
+        let seeds = vec![(strong, 0.9), (weak, 0.9)];
+        let visited: HashSet<Uuid> = seeds.iter().map(|(id, _)| *id).collect();
+        let hits = apply_hop(&seeds, &hood, &visited, &rule(), None, 1.0, 1);
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node, target);
+        assert_eq!(hits[0].via, strong);
+        assert!((hits[0].score - (0.9 * 0.9 * 1.0 * 0.5)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_hop_is_deterministic_across_repeated_runs() {
+        // The frontier is built from a HashMap upstream; ties must not depend on it.
+        let a = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let b = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let target = Uuid::new_v4();
+        let mut hood = Neighbourhood::default();
+        hood.nodes.insert(a, node(1.0));
+        hood.nodes.insert(b, node(1.0));
+        hood.nodes.insert(target, node(1.0));
+        hood.edges.insert(a, vec![edge(target, 0.5)]);
+        hood.edges.insert(b, vec![edge(target, 0.5)]);
+
+        let first = apply_hop(
+            &vec![(b, 1.0), (a, 1.0)],
+            &hood,
+            &HashSet::new(),
+            &rule(),
+            None,
+            1.0,
+            1,
+        );
+        for _ in 0..20 {
+            let again = apply_hop(
+                &vec![(a, 1.0), (b, 1.0)],
+                &hood,
+                &HashSet::new(),
+                &rule(),
+                None,
+                1.0,
+                1,
+            );
+            assert_eq!(first, again);
+        }
+        // Equal contributions: the lowest parent id wins the attribution.
+        assert_eq!(first[0].via, a);
+    }
+
+    #[test]
+    fn the_rule_reaches_two_hops_and_never_returns_to_a_visited_node() {
+        let seed = Uuid::new_v4();
+        let mid = Uuid::new_v4();
+        let far = Uuid::new_v4();
+        let mut hood = Neighbourhood::default();
+        for id in [seed, mid, far] {
+            hood.nodes.insert(id, node(1.0));
+        }
+        hood.edges.insert(seed, vec![edge(mid, 1.0)]);
+        hood.edges.insert(mid, vec![edge(far, 1.0)]);
+        hood.edges.insert(far, vec![edge(seed, 1.0)]);
+
+        let mut two = rule();
+        two.max_hops = 2;
+        let hits = spread_and_rank(&[(seed, 1.0)], &hood, &two, None, 1.0);
+        let nodes: Vec<Uuid> = hits.iter().map(|h| h.node).collect();
+
+        assert_eq!(nodes, vec![mid, far]);
+        assert_eq!(hits[0].hops, 1);
+        assert_eq!(hits[1].hops, 2);
+    }
+
+    #[test]
+    fn unreachable_or_dead_nodes_are_skipped() {
+        let seed = Uuid::new_v4();
+        let dead = Uuid::new_v4();
+        let archived = Uuid::new_v4();
+        let mut hood = Neighbourhood::default();
+        hood.nodes.insert(seed, node(1.0));
+        hood.nodes.insert(dead, node(0.0)); // below min_energy
+        hood.nodes.insert(
+            archived,
+            SpreadNode {
+                reachable: false,
+                ..node(1.0)
+            },
+        );
+        hood.edges
+            .insert(seed, vec![edge(dead, 1.0), edge(archived, 1.0)]);
+
+        let hits = spread_and_rank(&[(seed, 1.0)], &hood, &rule(), None, 1.0);
+        assert!(hits.is_empty());
+    }
+}
+
+// ============================================================================
 // Engine
 // ============================================================================
 
@@ -256,7 +620,15 @@ impl SpreadingActivationEngine {
         }
 
         // Phase 2: Spreading through synapses (cross-entity: Note ↔ Decision)
-        // BFS-style: process hop by hop
+        // BFS-style: process hop by hop. The integration rule itself lives in
+        // `apply_hop` (pure, synchronous) so the classifier bench can exercise it
+        // without a graph store; the only I/O happens here, in the resolution.
+        let rule = SpreadRule::from(config);
+        let profile_synapse_weight = profile
+            .and_then(|p| p.edge_weights.get("SYNAPSE"))
+            .copied()
+            .unwrap_or(1.0);
+
         let mut frontier: Vec<(Uuid, f64)> = activations
             .iter()
             .map(|(id, (score, _, _, _))| (*id, *score))
@@ -265,16 +637,19 @@ impl SpreadingActivationEngine {
         let mut visited: HashSet<Uuid> = activations.keys().copied().collect();
 
         for hop in 0..config.max_hops {
-            let mut next_frontier: Vec<(Uuid, f64)> = Vec::new();
-            // Index in `next_frontier` of nodes reached during this hop, so a
-            // stronger parent seen later in the same hop can replace the score.
-            // (`visited` only holds nodes settled in earlier hops.)
-            let mut reached_this_hop: HashMap<Uuid, usize> = HashMap::new();
+            if frontier.is_empty() {
+                break;
+            }
 
             // Deterministic order (the frontier is built from a HashMap).
-            frontier.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut sorted_frontier = frontier.clone();
+            sorted_frontier.sort_by(|a, b| a.0.cmp(&b.0));
 
-            for (node_id, parent_activation) in &frontier {
+            // Resolve the neighbourhood of the current frontier — the only I/O.
+            let mut hood = Neighbourhood::default();
+            let mut resolved: HashMap<Uuid, (Note, String)> = HashMap::new();
+
+            for (node_id, _) in &sorted_frontier {
                 // Get cross-entity synapses (Note↔Note, Note↔Decision, Decision↔Note)
                 let synapses = match self.graph_store.get_cross_entity_synapses(*node_id).await {
                     Ok(s) => s,
@@ -318,82 +693,67 @@ impl SpreadingActivationEngine {
                             }
                         };
 
-                    // Skip archived/obsolete/stale notes and notes of another
-                    // project (same filter as the Phase 1 vector search).
-                    if !matches!(
+                    let reachable = matches!(
                         neighbor_note.status,
                         crate::notes::NoteStatus::Active | crate::notes::NoteStatus::NeedsReview
-                    ) {
-                        continue;
+                    );
+
+                    hood.edges.entry(*node_id).or_default().push(SpreadEdge {
+                        neighbour: neighbor_id,
+                        weight: synapse_weight,
+                        is_decision: entity_type == "Decision",
+                    });
+                    hood.nodes.entry(neighbor_id).or_insert(SpreadNode {
+                        energy: neighbor_energy,
+                        scar_intensity: neighbor_note.scar_intensity,
+                        reachable,
+                        project_id: neighbor_note.project_id,
+                    });
+                    resolved
+                        .entry(neighbor_id)
+                        .or_insert((neighbor_note, neighbor_entity_type));
+                }
+            }
+
+            let hits = apply_hop(
+                &sorted_frontier,
+                &hood,
+                &visited,
+                &rule,
+                project_id,
+                profile_synapse_weight,
+                hop + 1,
+            );
+
+            let mut next_frontier: Vec<(Uuid, f64)> = Vec::with_capacity(hits.len());
+            for hit in &hits {
+                // Insert or update with the combined score — one rule, one place.
+                let should_insert = match activations.get(&hit.node) {
+                    None => true,
+                    Some((existing_score, _, _, _)) => {
+                        combine_incoming(Some(*existing_score), hit.score) > *existing_score
                     }
-                    if let (Some(pid), Some(npid)) = (project_id, neighbor_note.project_id) {
-                        if pid != npid {
-                            continue;
-                        }
-                    }
-
-                    // Skip dead neurons (decisions always have energy=1.0)
-                    if neighbor_energy < config.min_energy {
-                        continue;
-                    }
-
-                    // Calculate spread score with scar penalty (biomimicry: Elun Scar)
-                    let scar_penalty = 1.0 - neighbor_note.scar_intensity * 0.7;
-
-                    // Intent-adaptive: weight by profile's SYNAPSE edge weight
-                    let profile_synapse_weight = profile
-                        .and_then(|p| p.edge_weights.get("SYNAPSE"))
-                        .copied()
-                        .unwrap_or(1.0);
-
-                    let spread_score = parent_activation
-                        * synapse_weight
-                        * neighbor_energy
-                        * config.decay_per_hop
-                        * scar_penalty
-                        * profile_synapse_weight;
-
-                    // Skip if below threshold
-                    if spread_score < config.min_activation {
-                        continue;
-                    }
-
-                    // Insert or update with max score
-                    let existing = activations.get(&neighbor_id);
-                    let should_insert = match existing {
-                        None => true,
-                        Some((existing_score, _, _, _)) => spread_score > *existing_score,
-                    };
-
-                    if should_insert {
+                };
+                if should_insert {
+                    if let Some((note, entity_type)) = resolved.remove(&hit.node) {
                         activations.insert(
-                            neighbor_id,
+                            hit.node,
                             (
-                                spread_score,
+                                hit.score,
                                 ActivationSource::Propagated {
-                                    via: *node_id,
-                                    hops: hop + 1,
+                                    via: hit.via,
+                                    hops: hit.hops,
                                 },
-                                neighbor_note,
-                                neighbor_entity_type,
+                                note,
+                                entity_type,
                             ),
                         );
                     }
-
-                    match reached_this_hop.get(&neighbor_id) {
-                        Some(&idx) => {
-                            if spread_score > next_frontier[idx].1 {
-                                next_frontier[idx].1 = spread_score;
-                            }
-                        }
-                        None => {
-                            reached_this_hop.insert(neighbor_id, next_frontier.len());
-                            next_frontier.push((neighbor_id, spread_score));
-                        }
-                    }
                 }
+                next_frontier.push((hit.node, hit.score));
             }
-            visited.extend(reached_this_hop.keys().copied());
+
+            visited.extend(hits.iter().map(|hit| hit.node));
 
             debug!(
                 "Phase 2: hop {} spread to {} new entities",
