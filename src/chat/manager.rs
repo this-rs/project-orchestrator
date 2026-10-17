@@ -1070,9 +1070,7 @@ pub struct ChatManager {
     pub(crate) subagent_mirrors: bool,
     /// Rate-limiting state for `inject_team_message`: sliding window per
     /// (from_session_id, to_session_id) pair. Cleared lazily (no background task).
-    pub(crate) team_msg_rate: tokio::sync::Mutex<
-        HashMap<(Uuid, String), Vec<std::time::Instant>>,
-    >,
+    pub(crate) team_msg_rate: tokio::sync::Mutex<HashMap<(Uuid, String), Vec<std::time::Instant>>>,
 }
 
 // ============================================================================
@@ -5981,13 +5979,7 @@ impl ChatManager {
     /// "Direct child" = a session whose `spawned_by` field names `parent_session_id`.
     /// Returns only sessions that are currently in `active_sessions` (alive).
     pub(crate) async fn direct_children(&self, parent_session_id: &str) -> Vec<String> {
-        let active: Vec<String> = self
-            .active_sessions
-            .read()
-            .await
-            .keys()
-            .cloned()
-            .collect();
+        let active: Vec<String> = self.active_sessions.read().await.keys().cloned().collect();
 
         let mut children = Vec::new();
         for id in active {

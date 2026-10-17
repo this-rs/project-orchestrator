@@ -237,7 +237,6 @@ impl SessionHooks for TeamHooks {
             None => Err("this host runs no sub-agent".to_owned()),
         }
     }
-
 }
 
 #[cfg(test)]
@@ -291,9 +290,7 @@ mod tests {
         // Manually flip is_streaming to true BEFORE inject.
         {
             let sessions = manager.active_sessions.read().await;
-            sessions[&to_id]
-                .is_streaming
-                .store(true, Ordering::SeqCst);
+            sessions[&to_id].is_streaming.store(true, Ordering::SeqCst);
         }
 
         let from_id = Uuid::new_v4();
