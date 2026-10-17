@@ -1068,6 +1068,12 @@ pub struct ChatManager {
     pub(crate) mirrors: Arc<super::mirror::MirrorRegistry>,
     /// Whether the Claude Code sessions opened here get a mirror tap (always, but in tests).
     pub(crate) subagent_mirrors: bool,
+    /// The warm delegation sessions this server may resume instead of opening a new child
+    /// (CACHE-POOL, `chat::session_pool`): a closed sub-agent session whose prefix is still
+    /// in the provider's cache, reused by the next delegation of the SAME conversation, on
+    /// the SAME engine and model, with the SAME envelope, consent and tool policy. Empty
+    /// when the pool finds nothing, which only means a fresh session, as before.
+    pub(crate) session_pool: Arc<super::session_pool::SessionPool>,
     /// Rate-limiting state for `inject_team_message`: sliding window per
     /// (from_session_id, to_session_id) pair. Cleared lazily (no background task).
     pub(crate) team_msg_rate: tokio::sync::Mutex<HashMap<(Uuid, String), Vec<std::time::Instant>>>,
@@ -3470,6 +3476,7 @@ impl ChatManager {
             subagent_slots: Default::default(),
             mirrors: Default::default(),
             subagent_mirrors: true,
+            session_pool: Arc::new(super::session_pool::SessionPool::from_env()),
             team_msg_rate: Default::default(),
         }
     }
@@ -3570,6 +3577,7 @@ impl ChatManager {
             subagent_slots: Default::default(),
             mirrors: Default::default(),
             subagent_mirrors: true,
+            session_pool: Arc::new(super::session_pool::SessionPool::from_env()),
             team_msg_rate: Default::default(),
         }
     }
