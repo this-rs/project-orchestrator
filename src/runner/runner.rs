@@ -5773,6 +5773,7 @@ mod tests {
             lasting_rules_dir: None,
             native_turn_timeout_secs: None,
             native_session_max_tokens: None,
+            max_live_children: 4,
         };
         let chat_manager = Arc::new(ChatManager::new_without_memory(
             graph.clone(),
@@ -6387,6 +6388,7 @@ mod tests {
             lasting_rules_dir: None,
             native_turn_timeout_secs: None,
             native_session_max_tokens: None,
+            max_live_children: 4,
         };
         let chat_manager = Arc::new(ChatManager::new_without_memory(
             graph.clone(),
@@ -9160,6 +9162,7 @@ mod tests {
             lasting_rules_dir: None,
             native_turn_timeout_secs: None,
             native_session_max_tokens: None,
+            max_live_children: 4,
         };
         let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
         let chat_manager = Arc::new(
@@ -9320,6 +9323,7 @@ mod tests {
             lasting_rules_dir: None,
             native_turn_timeout_secs: None,
             native_session_max_tokens: None,
+            max_live_children: 4,
         };
         let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
         let chat_manager = Arc::new(
