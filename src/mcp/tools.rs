@@ -20,6 +20,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         constraint_tool(),
         release_tool(),
         environment_tool(),
+        provider_tool(),
         vault_tool(),
         milestone_tool(),
         commit_tool(),
@@ -627,6 +628,39 @@ fn environment_tool() -> ToolDefinition {
                 "finished_at": {"type": "string", "description": "Finish time ISO (update_deployment); auto-set on terminal status"},
                 "limit": {"type": "integer", "description": "Max results (list_deployments)"},
                 "offset": {"type": "integer", "description": "Offset (list_deployments)"}
+            })),
+            required: Some(vec!["action".to_string()]),
+        },
+    }
+}
+
+fn provider_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "provider".to_string(),
+        description: "Manage the provider instances (harnesses/engines) a chat session can run on: Claude Code locally or on a remote machine over ssh, an OpenAI-compatible endpoint, codex, acp. Actions: list, get, create, update, delete, test, status, models, scan_host_key. A credential is named by REFERENCE only (`vault:<name>` or `env:<VAR>`), never by value. `scan_host_key` reads the public key a machine presents and its fingerprint so a human can compare them before an instance pins it. `allow_trust` (a machine that runs without asking) and a pinned `host_key` need a person's agreement: on a session that does not run in trust they are refused with `provider_trust_needs_a_human` / `provider_host_key_needs_a_human` — ask the user to set it in Settings → Providers.".to_string(),
+        input_schema: InputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "get", "create", "update", "delete", "test", "status", "models", "scan_host_key"],
+                    "description": "Operation to perform"
+                },
+                "id": {"type": "string", "description": "Instance id (get/update/delete/status/models). `claude-code` is the built-in local instance and is never written"},
+                "kind": {"type": "string", "description": "Kind (create): openai_compatible (default), codex, acp, claude_code_remote"},
+                "preset": {"type": "string", "description": "Informational preset (create/update): deepseek, vllm, ollama, llama_server, nim. For acp, names the agent declared on the server"},
+                "label": {"type": "string", "description": "Display label (create/update). A claude_code_remote instance takes its id from it"},
+                "base_url": {"type": "string", "description": "Endpoint base URL (create/update), https outside loopback. Not used by codex, acp and claude_code_remote"},
+                "default_model": {"type": "string", "description": "Default model (create/update)"},
+                "cost_source": {"type": "string", "description": "Where the cost comes from (create/update): reported, priced, free, subscription, unknown"},
+                "credential_ref": {"type": "string", "description": "Credential REFERENCE (create/update): `vault:<name>`, `env:<VAR>` or `none`. Never a value"},
+                "host": {"type": "string", "description": "claude_code_remote: host name or address (create/update)"},
+                "ssh_user": {"type": "string", "description": "claude_code_remote: ssh user (create/update)"},
+                "ssh_port": {"type": "integer", "description": "claude_code_remote: ssh port, 22 when absent (create/update)"},
+                "host_key": {"type": "string", "description": "claude_code_remote: the PINNED public key, `<type> <base64>`, as `scan_host_key` returned it and a person confirmed its fingerprint (create/update)"},
+                "remote_cwd": {"type": "string", "description": "claude_code_remote: working directory ON THE REMOTE machine (create/update)"},
+                "allow_trust": {"type": "boolean", "description": "claude_code_remote: allow the no-confirmation mode on that machine (create/update). Needs a person's agreement"},
+                "rate_limit": {"type": "array", "description": "Optional limits of the instance (create/update), each {kind, window, max, scope}. Empty = no limit"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -1567,8 +1601,8 @@ mod tests {
         let tools = all_tools();
         assert_eq!(
             tools.len(),
-            31,
-            "Expected 31 mega-tools, got {}",
+            32,
+            "Expected 32 mega-tools, got {}",
             tools.len()
         );
     }

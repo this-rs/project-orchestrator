@@ -2084,6 +2084,39 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/providers/{id}/models",
             get(provider_handlers::provider_models),
         )
+        // The agent's own door to the SAME instance operations, for the MCP
+        // `provider` mega-tool. `/api/chat/providers` above keeps its mutations
+        // reserved to a person (A25); these routes add the refusals an agent
+        // cannot lift for itself (trust, pinned host key) instead of removing
+        // that rule. Closed to the restricted and read-only profiles, which do
+        // not see the `provider` tool either.
+        .route(
+            "/api/agent/providers",
+            get(provider_handlers::agent_list_providers)
+                .post(provider_handlers::agent_create_provider),
+        )
+        .route(
+            "/api/agent/providers/test",
+            post(provider_handlers::agent_test_provider),
+        )
+        .route(
+            "/api/agent/providers/ssh-host-key",
+            post(provider_handlers::agent_scan_host_key),
+        )
+        .route(
+            "/api/agent/providers/{id}",
+            get(provider_handlers::agent_get_provider)
+                .patch(provider_handlers::agent_update_provider)
+                .delete(provider_handlers::agent_delete_provider),
+        )
+        .route(
+            "/api/agent/providers/{id}/status",
+            get(provider_handlers::agent_provider_status),
+        )
+        .route(
+            "/api/agent/providers/{id}/models",
+            get(provider_handlers::agent_provider_models),
+        )
         .route(
             "/api/chat/send-journal",
             get(provider_handlers::send_journal),

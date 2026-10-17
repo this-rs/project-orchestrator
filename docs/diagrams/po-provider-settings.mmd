@@ -12,6 +12,8 @@
 %%   src/api/routing_handlers.rs  — get/put_routing, get/put/delete_project_routing (fichier possédé par po-cognitive-routing ; ses routes sont montrées ici)
 %%   src/api/routes.rs — le montage des routes (/api/chat/providers*, /api/projects/{slug}/llm-*)
 %%   src/auth/middleware.rs — is_human_only_mutation (la garde du middleware : préfixes + /api/projects/{slug}/llm-* et /routing)
+%%   src/api/provider_handlers.rs (surface agent) — instance_list/get/create/update/delete/test/status/models/scan_host_key,
+%%                                   agent_grants, Surface, AgentGrant, require_known_caller ; src/auth/tool_profile.rs — /api/agent/providers fermé
 %%   src/api/network_tools_handlers.rs — outils réseau d'une session native (P6) : consentement par origine, navigateur, moteurs de recherche ; écrit les documents que nexus_tools::GraphConsents lit (po-chat-provider)
 %% ---
 %% NON ETABLI :
@@ -41,6 +43,11 @@ flowchart TD
         PATCH["✅ PUT|PATCH /providers/{id} : l'id ne change jamais ; changer l'origine OU la référence d'identifiant invalide les consentements (consents_invalidated)<br/>test : consent_is_bound_to_the_origin_and_stops_holding_when_it_changes"]
     end
 
+    subgraph agentsurf["Surface agent — l'outil MCP `provider` (B-M1)"]
+        ADOOR["✅ /api/agent/providers, /test, /ssh-host-key, /{id}, /{id}/status, /{id}/models : la MÊME implémentation que les routes humaines ci-dessus (instance_list/get/create/update/delete/test/status/models/scan_host_key), ni seconde validation ni second magasin ; jeton de personne ou de session accepté, tout autre refusé ; fermées aux profils restricted et read_only (préfixe /api/agent/providers dans CLOSED_ROUTE_PREFIXES) et le tool provider n'est pas dans l'allow-list restreinte<br/>test : the_agent_surface_answers_exactly_as_the_human_one, the_agent_surface_answers_like_the_human_one_on_every_verb, an_agent_adds_an_instance_that_grants_nothing, the_persons_route_still_refuses_an_agent_token, an_agent_reads_the_instances_it_needs"]
+        GRANT["✅ allow_trust et une clé d'hôte épinglée = ACCORD D'UNE PERSONNE : refusés à un jeton de session dont le plafond n'est pas trust / bypassPermissions (403 provider_trust_needs_a_human, provider_host_key_needs_a_human ; rien n'est écrit) ; accordés quand le plafond l'est, et alors JOURNALISÉS dans le journal d'envoi (journal/provider:*, appelant, sub, session, instance, grants, plafond, horodatage) en échec fermé ; un PATCH ne concède que ce qu'il CHANGE<br/>test : an_agent_in_default_cannot_trust_a_machine, an_agent_in_trust_adds_the_machine_and_the_grant_is_journaled, a_patch_that_changes_nothing_grants_nothing, an_agent_cannot_flip_trust_on_an_instance_that_has_none"]
+    end
+
     subgraph consent["Consentement par projet"]
         CONSENT["✅ PUT /api/projects/{slug}/llm-consent[s][/id] : l'origine montrée doit être l'actuelle (409 origin_mismatch) ; enregistre qui, quand, quelle origine ET quelle référence ; DELETE retire<br/>test : consent_is_bound_to_the_origin_and_stops_holding_when_it_changes, changing_the_credential_reference_after_consent_stops_the_sending"]
         NOPROJ["✅ M1/B3 — GET/PUT /api/chat/llm-consents, PUT/DELETE /api/chat/llm-consents/{provider_id} : le consentement des chats HORS de tout projet (portée no_project) ;<br/>mêmes règles que celui d'un projet (put_consent / delete_consent partagés) MAIS écriture par le compte ROOT seulement (require_scope_writer → require_root, 403 root_required : la portée décide pour les chats de TOUS les utilisateurs ; revue de #722) ; PUT /api/chat/roles (pilote global) idem ;<br/> instance connue, claude-code refusé 400, origine montrée = actuelle sinon 409 origin_mismatch,<br/>lié à l'origine ET à la référence d'identifiant) ; un projet n'en hérite jamais ; allowed_here(portée) sert le default_provider du listing<br/>test : the_consent_for_chats_outside_a_project_follows_the_same_rules, only_root_allows_or_withdraws_a_provider_for_the_chats_outside_a_project,<br/>roles_aliases_and_policy_round_trip_and_are_validated (403 hors root), providers_answers_the_no_project_consent_without_a_project, agent_token_cannot_mutate_human_only_routes (middleware) ;<br/>sans projet demandé, le listing évalue allowed_for_project dans la portée no_project"]
@@ -62,7 +69,7 @@ flowchart TD
     subgraph nettools["Outils réseau d'une session native (P6) — network_tools_handlers.rs"]
         NTORIG["✅ PUT/DELETE /api/projects/{slug}/network-tools/origins : tool_origin:&lt;origine&gt; sous project:&lt;slug&gt;, lu par GraphConsents (B40) ; une URL est réduite à son origine (origin_of) ; http(s) sans identifiants, sinon 400 invalid_tool_origin ; projet inconnu 404 project_not_found<br/>test : network_origin_consent_is_stored_where_the_gate_reads_it_and_revoked, network_origin_refuses_what_is_not_an_http_origin_with_a_typed_400_and_stores_nothing, network_tools_of_an_unknown_project_are_a_404"]
         NTBROW["✅ PUT /api/projects/{slug}/network-tools/browser {allowed} : document browser ; attaché si l'exécutable est trouvé (obscura sur le PATH, ou dsh-obscura-nav avec chat.obscura_browser: true)<br/>test : network_browser_authorisation_is_stored_read_by_the_gate_and_withdrawn"]
-        NTSE["✅ GET/POST /api/chat/search-engines, DELETE /{id} : search_provider:&lt;id&gt; (global), clé par référence vault: seulement (secret_value_refused) ; grant Provider("tool:&lt;id&gt;") par POST /api/vault/grants nommant exactement la référence ; supprimer révoque ses grants<br/>test : search_engine_is_declared_by_vault_reference_listed_and_removed, search_engine_refuses_a_raw_key_and_invalid_drafts_with_typed_codes, search_engine_key_is_granted_under_tool_id_only_by_its_reference_and_revoked_with_it"]
+        NTSE["✅ GET/POST /api/chat/search-engines, DELETE /{id} : search_provider:&lt;id&gt; (global), clé par référence vault: seulement (secret_value_refused) ; grant Provider du tool &lt;id&gt; par POST /api/vault/grants nommant exactement la référence ; supprimer révoque ses grants<br/>test : search_engine_is_declared_by_vault_reference_listed_and_removed, search_engine_refuses_a_raw_key_and_invalid_drafts_with_typed_codes, search_engine_key_is_granted_under_tool_id_only_by_its_reference_and_revoked_with_it"]
         NTOBS["✅ moteur obscura (sans clé) : credential_ref none, PAS de base_url ni de chemin dans le corps (l'exécutable est la configuration du serveur : chat.obscura_path / OBSCURA_BIN, sinon PATH) ; origine consentie = https://html.duckduckgo.com ; MOTEUR INTÉGRÉ : si le nexus-tools du serveur embarque Obscura et qu'aucun moteur obscura n'est déclaré, la liste ajoute obscura-builtin (builtin: true, non stocké, non supprimable)<br/>test : an_obscura_engine_is_declared_keyless_and_gives_websearch_once_duckduckgo_is_consented, search_engine_refuses_a_raw_key_and_invalid_drafts_with_typed_codes"]
         NTSE --> NTOBS
         NTE2E["✅ consentement par la route ⇒ la session native suivante reçoit WebFetch ; révoqué ⇒ plus<br/>test : a_native_session_is_offered_webfetch_once_the_project_consents_to_an_origin_by_the_route, network_tools_mutations_are_refused_to_an_agent_token_and_reads_are_not"]
@@ -89,6 +96,9 @@ flowchart TD
     HUMAN --> JOURNAL
     HUMAN --> NOSEC
     HUMAN --> NTORIG
+    CALLER --> ADOOR
+    ADOOR --> GRANT
+    GRANT --> CREATE
     HUMAN --> NTBROW
     HUMAN --> NTSE
     NTORIG --> NTE2E

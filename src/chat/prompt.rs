@@ -16,7 +16,7 @@ All MCP tool interactions, code, and technical identifiers remain in English reg
 ## 1. Identity & Role
 
 You are an autonomous development agent integrated with the **Project Orchestrator**.
-You have **28 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills, reasoning, behavioral patterns, living personas, episodic memory, sharing.
+You have **32 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills, reasoning, behavioral patterns, living personas, episodic memory, sharing.
 
 **IMPORTANT — MCP-first Directive:**
 You use **EXCLUSIVELY the Project Orchestrator MCP tools** to organize your work.
@@ -36,7 +36,7 @@ Each tool has an `action` parameter that determines the operation:
 tool_name(action: "<action>", param1: value1, param2: value2, ...)
 ```
 
-The 28 mega-tools: `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `reasoning`, `admin`, `skill`, `analysis_profile`, `protocol`, `persona`, `episode`, `sharing`, `neural_routing`, `trajectory`, `lifecycle_hook`
+The 32 mega-tools: `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `environment`, `provider`, `vault`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `reasoning`, `admin`, `skill`, `analysis_profile`, `protocol`, `persona`, `episode`, `sharing`, `neural_routing`, `trajectory`, `lifecycle_hook`, `mcp_federation`
 
 ## 3. Data Model
 
@@ -661,7 +661,7 @@ Plans can be executed autonomously and triggered automatically:
 - `plan(action: "enrich", plan_id)` — auto-enrich plan with affected files and dependencies
 "#;
 
-/// Exhaustive reference of all 30 MCP mega-tools with every action and parameter.
+/// Exhaustive reference of all 32 MCP mega-tools with every action and parameter.
 /// Injected as the final section of the system prompt by `build_system_prompt()`.
 pub const TOOL_REFERENCE: &str = r#"# MCP Mega-Tools Reference
 
@@ -809,6 +809,31 @@ Manage project environments (dev/staging/production) and what was deployed where
 | update_deployment | `deployment_id` (req), `status`, `notes`, `finished_at` | Update deployment (terminal status sets finished_at) |
 | list_deployments | `environment_id` (req), `limit`, `offset` | Deployments of an environment, newest first |
 | get_matrix | `project_id` (req) | Environments x latest deployment + last 5 statuses |
+
+## provider
+Manage the provider instances: the harness/engine a chat session runs on. Actions: list, get, create, update, delete, test, status, models, scan_host_key
+
+| Action | Key Parameters | Description |
+|--------|---------------|-------------|
+| list | — | Every stored instance, each naming its credential REFERENCE |
+| get | `id` (req) | One instance, full detail |
+| create | `id`, `kind` (`openai_compatible`\|`codex`\|`acp`\|`claude_code_remote`), `preset`, `label`, `base_url`, `default_model`, `cost_source`, `credential_ref`, `host`, `ssh_user`, `ssh_port`, `host_key`, `remote_cwd`, `allow_trust`, `rate_limit` | Create an instance. A credential is a REFERENCE (`vault:<name>`, `env:<VAR>`), never a value |
+| update | `id` (req) + any field of `create` except `id` and `kind` | Change an instance |
+| delete | `id` (req) | Remove an instance (`claude-code` is built in and never written) |
+| test | the fields of `create` | Try a draft BEFORE saving it; the verdict is in the body, always 200 |
+| status | `id` (req) | Health of one instance: reachable, logged in |
+| models | `id` (req) | The models the instance declares, or the ones its endpoint lists |
+| scan_host_key | `host` (req), `ssh_port` | The public key a machine presents, and its fingerprint, for a human to compare |
+
+`allow_trust` (a machine that runs without asking) and a pinned `host_key` need a person's agreement: on a session that does not run in trust they answer `provider_trust_needs_a_human` / `provider_host_key_needs_a_human` — ask the user, in Settings → Providers.
+
+## vault
+Use the user's secrets vault without ever seeing a value. Actions: list_available, request_secret
+
+| Action | Key Parameters | Description |
+|--------|---------------|-------------|
+| list_available | — | Secret names and whether this session may read each; never a value |
+| request_secret | `name` (req), `reason` | Ask the user through a secure input card in the chat: END YOUR TURN after calling it |
 
 ## milestone
 Manage project milestones. Actions: list, create, get, update, delete, get_progress, add_task, link_plan, unlink_plan
@@ -1373,7 +1398,7 @@ pub struct ToolGroup {
     pub tools: &'static [ToolRef],
 }
 
-/// Static catalog of all 28 MCP mega-tools organized into semantic groups.
+/// Static catalog of all 32 MCP mega-tools organized into semantic groups.
 /// Used by the oneshot Opus refinement to select relevant tools per request,
 /// and by the keyword fallback when the oneshot fails.
 pub static TOOL_GROUPS: &[ToolGroup] = &[
@@ -1535,6 +1560,20 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             description: "Secrets vault for agents (list_available/request_secret) — use values only via `orchestrator secret exec|get` in the shell",
         }],
     },
+    // ── Provider instances ──────────────────────────────────────────
+    ToolGroup {
+        name: "providers",
+        description: "Add and inspect the engines (harnesses) a session can run on",
+        keywords: &[
+            "provider", "fournisseur", "instance", "endpoint", "harness", "moteur", "engine",
+            "remote", "distant", "ssh", "host key", "empreinte", "fingerprint", "trust",
+            "codex", "acp", "openai", "vllm", "ollama",
+        ],
+        tools: &[ToolRef {
+            name: "provider",
+            description: "Provider instances (list/get/create/update/delete/test/status/models/scan_host_key) — a credential is a REFERENCE, never a value; allow_trust and a pinned host_key need a person's agreement",
+        }],
+    },
     // ── Workspace ───────────────────────────────────────────────────
     ToolGroup {
         name: "workspace",
@@ -1688,7 +1727,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
 ];
 
 /// Total number of unique tools across all groups.
-/// Must match the MCP tools.rs count (currently 30 mega-tools).
+/// Must match the MCP tools.rs count (currently 32 mega-tools).
 pub fn tool_catalog_tool_count() -> usize {
     let mut names: Vec<&str> = TOOL_GROUPS
         .iter()
@@ -2602,7 +2641,7 @@ mod tests {
         assert!(BASE_SYSTEM_PROMPT.contains(r#"note(action: "create""#));
         assert!(BASE_SYSTEM_PROMPT.contains(r#"note(action: "link_to_entity""#));
         // Mega-tools section
-        assert!(BASE_SYSTEM_PROMPT.contains("28 mega-tools"));
+        assert!(BASE_SYSTEM_PROMPT.contains("32 mega-tools"));
         assert!(BASE_SYSTEM_PROMPT.contains("Mega-tools"));
     }
 
@@ -2998,8 +3037,8 @@ mod tests {
     fn test_tool_groups_cover_all_mega_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 31,
-            "TOOL_GROUPS must cover exactly 31 unique mega-tools (got {}). \
+            count, 32,
+            "TOOL_GROUPS must cover exactly 32 unique mega-tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );
@@ -3069,7 +3108,7 @@ mod tests {
 
     #[test]
     fn test_tool_groups_count() {
-        assert_eq!(TOOL_GROUPS.len(), 16, "Expected 16 tool groups");
+        assert_eq!(TOOL_GROUPS.len(), 17, "Expected 17 tool groups");
     }
 
     #[test]

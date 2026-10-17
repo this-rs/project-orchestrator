@@ -331,7 +331,7 @@ All MCP tool interactions, code, and technical identifiers remain in English reg
 ## 1. Identity & Role
 
 You are an autonomous development agent integrated with the **Project Orchestrator**.
-You have **28 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills, reasoning, behavioral patterns, living personas, episodic memory, sharing.
+You have **32 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills, reasoning, behavioral patterns, living personas, episodic memory, sharing.
 
 **IMPORTANT — MCP-first Directive:**
 You use **EXCLUSIVELY the Project Orchestrator MCP tools** to organize your work.
@@ -358,7 +358,7 @@ Each tool has an `action` parameter that determines the operation:
 tool_name(action: "<action>", param1: value1, param2: value2, ...)
 ```
 
-The 28 mega-tools: `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `reasoning`, `admin`, `skill`, `analysis_profile`, `protocol`, `persona`, `episode`, `sharing`, `neural_routing`, `trajectory`, `lifecycle_hook`"#;
+The 32 mega-tools: `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `environment`, `provider`, `vault`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `reasoning`, `admin`, `skill`, `analysis_profile`, `protocol`, `persona`, `episode`, `sharing`, `neural_routing`, `trajectory`, `lifecycle_hook`, `mcp_federation`"#;
 
 /// §3 — Data Model (Entity hierarchy, relations, code graph, notes)
 pub const SECTION_DATA_MODEL: &str = r#"## 3. Data Model
@@ -1413,7 +1413,8 @@ pub fn floor_char_boundary_pub(s: &str, index: usize) -> usize {
 /// selects relevant groups based on intent, FSM state, and scaffolding level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ToolRefGroupId {
-    /// project, plan, task, step, constraint, release, milestone — always included
+    /// project, plan, task, step, constraint, release, environment, provider, vault,
+    /// milestone — always included
     Core,
     /// note, decision, commit — always included (compact)
     Knowledge,
@@ -1455,6 +1456,8 @@ impl ToolRefGroupId {
                 "constraint",
                 "release",
                 "environment",
+                "provider",
+                "vault",
                 "milestone",
             ],
             Self::Knowledge => &["note", "decision", "commit"],
@@ -2050,17 +2053,17 @@ mod tests {
     // ── Tool Reference Group tests ───────────────────────────────────
 
     #[test]
-    fn test_tool_groups_cover_all_28_tools() {
+    fn test_tool_groups_cover_every_mega_tool() {
         let mut all_tools: Vec<&str> = ToolRefGroupId::ALL
             .iter()
             .flat_map(|g| g.tool_names().iter().copied())
             .collect();
         all_tools.sort();
         all_tools.dedup();
-        // Must cover all 30 mega-tools (29 existing + environment)
+        // Must cover all 32 mega-tools (see `mcp::tools::all_tools`)
         assert!(
-            all_tools.len() >= 30,
-            "Groups should cover at least 30 tools, got {}",
+            all_tools.len() >= 32,
+            "Groups should cover at least 32 tools, got {}",
             all_tools.len()
         );
     }

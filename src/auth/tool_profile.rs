@@ -548,6 +548,9 @@ const ALLOWED_ROUTE_PREFIXES: &[&str] = &[
 const CLOSED_ROUTE_PREFIXES: &[&str] = &[
     // withheld tools
     "/api/admin",
+    // the agent door of the `provider` tool: an instance is where a session's
+    // content goes, and a restricted or read-only session does not see the tool
+    "/api/agent/providers",
     "/api/mcp-federation",
     "/api/lifecycle-hooks",
     "/api/vault",
@@ -1419,6 +1422,7 @@ mod tests {
             "/api/agents",
             "/api/alerts",
             "/api/attention",
+            "/api/agent/providers",
             "/api/documents",
             "/api/feedback",
             "/api/graph",
