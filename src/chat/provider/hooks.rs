@@ -139,9 +139,13 @@ impl HookFallback {
                 tool,
                 input,
                 canonical,
+                parent_tool_use_id,
                 ..
             } => {
                 let name = canonical.clone().unwrap_or_else(|| tool.clone());
+                // One tool call: the ledger's clock (what was advised goes stale
+                // after `REINJECT_AFTER_CALLS` calls), as the PreToolUse hook's.
+                self.ledger.begin_call();
                 // The skill context this call would have been given before it ran
                 // never reaches it: said, not silent.
                 let total = self.ledger.record_lost(HookPoint::BeforeTool, &name);
@@ -160,7 +164,11 @@ impl HookFallback {
                         "per-tool injection lost (no hook in the provider)"
                     );
                 }
-                self.lock().open.insert(id.clone(), (name, input.clone()));
+                // A sub-agent's call is not advised on: its advice would land in
+                // front of the PARENT's next turn.
+                if parent_tool_use_id.is_none() {
+                    self.lock().open.insert(id.clone(), (name, input.clone()));
+                }
             }
             ChatEvent::ToolUseInputResolved { id, input, .. } => {
                 if let Some(call) = self.lock().open.get_mut(id) {
@@ -186,8 +194,6 @@ impl HookFallback {
                 self.lock().open.remove(id);
             }
             // The provider's compaction signal: what was injected is no longer in
-            // context.
-            // The provider's compaction signal: what was injected is no longer in
             // context. The guidance the provider would have been given before it
             // (`CompactionNotifier`) could not be: written once per compaction, on
             // its start (a provider that only says it ended, on its boundary).
@@ -210,7 +216,7 @@ impl HookFallback {
 
     /// After a turn: plays the post-tool hook over each tool result of the turn.
     /// Returns the advice it gave (announced as system hints by the caller), which
-    /// is also carried in front of the next turn ([`Self::take_carried`]).
+    /// is also carried in front of the next turn ([`Self::carried`]).
     pub(crate) async fn after_turn(&self) -> Vec<String> {
         let finished = std::mem::take(&mut self.lock().finished);
         let mut advice = Vec::new();
@@ -256,10 +262,21 @@ impl HookFallback {
         advice
     }
 
-    /// The advice of the previous turns, once: what goes in front of the next turn.
-    pub(crate) fn take_carried(&self) -> Option<String> {
-        let carried = std::mem::take(&mut self.lock().carried);
-        (!carried.is_empty()).then(|| carried.join("\n\n"))
+    /// The advice of the previous turns: what goes in front of the next turn. Only
+    /// read: [`Self::settle`] drops it once a turn carrying it was answered, as the
+    /// held context (`TurnOutcome::answered`).
+    pub(crate) fn carried(&self) -> Option<String> {
+        let state = self.lock();
+        (!state.carried.is_empty()).then(|| state.carried.join("\n\n"))
+    }
+
+    /// The end of a turn: an answered turn delivered what was carried in front of
+    /// it, which is dropped; a turn refused, failed or stopped keeps it for the next.
+    /// Called BEFORE [`Self::after_turn`] adds the advice of this turn's tools.
+    pub(crate) fn settle(&self, answered: bool) {
+        if answered {
+            self.lock().carried.clear();
+        }
     }
 }
 
@@ -273,6 +290,44 @@ fn additional_context(output: nexus_claude::HookJSONOutput) -> Option<String> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Answers a fixed advice after a `Grep`, nothing otherwise (tests).
+#[cfg(test)]
+pub(crate) struct TestAdvisor;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl nexus_claude::HookCallback for TestAdvisor {
+    async fn execute(
+        &self,
+        input: &nexus_claude::HookInput,
+        _tool_use_id: Option<&str>,
+        _context: &nexus_claude::HookContext,
+    ) -> Result<nexus_claude::HookJSONOutput, nexus_claude::SdkError> {
+        let context = match input {
+            nexus_claude::HookInput::PostToolUse(post) if post.tool_name == "Grep" => {
+                Some(format!(
+                    "use find_references ({})",
+                    post.tool_response.as_str().unwrap()
+                ))
+            }
+            _ => None,
+        };
+        Ok(nexus_claude::HookJSONOutput::Sync(
+            nexus_claude::SyncHookJSONOutput {
+                continue_: Some(true),
+                hook_specific_output: context.map(|c| {
+                    nexus_claude::HookSpecificOutput::PostToolUse(
+                        nexus_claude::PostToolUseHookSpecificOutput {
+                            additional_context: Some(c),
+                        },
+                    )
+                }),
+                ..Default::default()
+            },
+        ))
     }
 }
 
@@ -309,42 +364,6 @@ mod tests {
         }
     }
 
-    /// Answers a fixed advice after a `Grep`, nothing otherwise.
-    struct Advisor;
-
-    #[async_trait::async_trait]
-    impl nexus_claude::HookCallback for Advisor {
-        async fn execute(
-            &self,
-            input: &nexus_claude::HookInput,
-            _tool_use_id: Option<&str>,
-            _context: &nexus_claude::HookContext,
-        ) -> Result<nexus_claude::HookJSONOutput, nexus_claude::SdkError> {
-            let context = match input {
-                nexus_claude::HookInput::PostToolUse(post) if post.tool_name == "Grep" => {
-                    Some(format!(
-                        "use find_references ({})",
-                        post.tool_response.as_str().unwrap()
-                    ))
-                }
-                _ => None,
-            };
-            Ok(nexus_claude::HookJSONOutput::Sync(
-                nexus_claude::SyncHookJSONOutput {
-                    continue_: Some(true),
-                    hook_specific_output: context.map(|c| {
-                        nexus_claude::HookSpecificOutput::PostToolUse(
-                            nexus_claude::PostToolUseHookSpecificOutput {
-                                additional_context: Some(c),
-                            },
-                        )
-                    }),
-                    ..Default::default()
-                },
-            ))
-        }
-    }
-
     fn tool_use(id: &str, tool: &str, canonical: Option<&str>) -> ChatEvent {
         ChatEvent::ToolUse {
             id: id.into(),
@@ -368,7 +387,7 @@ mod tests {
     #[tokio::test]
     async fn the_fallback_advises_after_the_turn_carries_it_once_and_writes_the_loss() {
         let ledger = Arc::new(HookLedger::new());
-        let fallback = HookFallback::new(Arc::new(Advisor), Arc::clone(&ledger), "s", "/tmp");
+        let fallback = HookFallback::new(Arc::new(TestAdvisor), Arc::clone(&ledger), "s", "/tmp");
         // The provider spells it `grep`, its alias is the hooks' vocabulary.
         fallback.observe(&tool_use("t1", "grep", Some("Grep")));
         fallback.observe(&tool_result("t1", "30 lines", false));
@@ -382,16 +401,35 @@ mod tests {
             fallback.after_turn().await,
             vec!["use find_references (30 lines)".to_string()]
         );
+        let advice = Some("use find_references (30 lines)");
+        assert_eq!(fallback.carried().as_deref(), advice);
+        fallback.settle(false);
         assert_eq!(
-            fallback.take_carried().as_deref(),
-            Some("use find_references (30 lines)")
+            fallback.carried().as_deref(),
+            advice,
+            "kept by a turn not answered"
         );
-        assert_eq!(fallback.take_carried(), None, "carried once");
+        fallback.settle(true);
+        assert_eq!(fallback.carried(), None, "carried once");
         assert!(fallback.after_turn().await.is_empty(), "played once");
+        // A sub-agent's Grep: its loss is written, its advice is not given.
+        let mut sub = tool_use("t4", "Grep", None);
+        if let ChatEvent::ToolUse {
+            parent_tool_use_id, ..
+        } = &mut sub
+        {
+            *parent_tool_use_id = Some("agent-1".into());
+        }
+        fallback.observe(&sub);
+        fallback.observe(&tool_result("t4", "30 lines", false));
+        assert!(
+            fallback.after_turn().await.is_empty(),
+            "no advice for a sub-agent"
+        );
         assert_eq!(
             ledger.lost(),
             vec![
-                (HookPoint::BeforeTool, "Grep".to_string(), 2),
+                (HookPoint::BeforeTool, "Grep".to_string(), 3),
                 (HookPoint::BeforeTool, "read_file".to_string(), 1),
             ]
         );
@@ -410,7 +448,7 @@ mod tests {
             },
         ] {
             let ledger = Arc::new(HookLedger::new());
-            let fallback = HookFallback::new(Arc::new(Advisor), Arc::clone(&ledger), "s", "/");
+            let fallback = HookFallback::new(Arc::new(TestAdvisor), Arc::clone(&ledger), "s", "/");
             let key = InjectionKey::Redirect("find_references".into());
             ledger.begin_call();
             ledger.record(key.clone());
@@ -425,7 +463,7 @@ mod tests {
         }
         // Started then its boundary: one compaction, one guidance lost.
         let ledger = Arc::new(HookLedger::new());
-        let fallback = HookFallback::new(Arc::new(Advisor), Arc::clone(&ledger), "s", "/");
+        let fallback = HookFallback::new(Arc::new(TestAdvisor), Arc::clone(&ledger), "s", "/");
         fallback.observe(&ChatEvent::CompactionStarted {
             trigger: "manual".into(),
         });

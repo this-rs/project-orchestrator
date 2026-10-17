@@ -54,8 +54,9 @@ pub(crate) enum InjectionKey {
     Skill(Uuid),
     Persona(Uuid),
     Note(Uuid),
-    /// A redirect suggestion, keyed by the MCP tool it recommends: the advice
-    /// "use find_references instead of grep" does not improve by repetition.
+    /// A redirect suggestion: the advice "use find_references instead of grep"
+    /// does not improve by repetition. Keyed by the MCP tool it recommends, or
+    /// (`PostToolUseRedirectHook::with_ledger`) by the tool and the file advised on.
     Redirect(String),
 }
 

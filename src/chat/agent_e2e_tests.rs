@@ -5859,6 +5859,75 @@ mod parity {
         );
     }
 
+    /// B14 (review of #814): on a provider without hooks, the redirect advice is given
+    /// once (the ledger), and again after a compaction — the compaction signal resets
+    /// the ledger the advice is deduplicated by.
+    #[tokio::test]
+    async fn without_hooks_the_redirect_advice_is_given_again_after_a_compaction() {
+        let mut hookless = caps();
+        hookless.hooks = HookSupport::None;
+        let noisy: String = (0..30)
+            .map(|i| format!("src/chat/manager.rs:{i}: build_agent_spec(input)\n"))
+            .collect();
+        let grep = |id: &str| {
+            vec![
+                steps::tool_call(
+                    id,
+                    "Grep",
+                    json!({ "pattern": "build_agent_spec", "path": "." }),
+                ),
+                steps::tool_result(id, noisy.clone()),
+            ]
+        };
+        let mut third = vec![compaction_started()];
+        third.extend(grep("t3"));
+        third.push(steps::done(&caps()));
+        let mut first = grep("t1");
+        first.push(steps::done(&caps()));
+        let mut second = grep("t2");
+        second.push(steps::done(&caps()));
+        let mut r = rig_caps(
+            ProviderKind::Codex,
+            hookless,
+            vec![first, second, third],
+            None,
+            None,
+            false,
+            |m| m,
+        )
+        .await;
+        let mut hints = Vec::new();
+        for text in ["one", "two", "three"] {
+            r.manager.send_message(&r.sid, text).await.unwrap();
+            let mut n = 0;
+            loop {
+                match next_event(&mut r.rx, |e| {
+                    matches!(
+                        e,
+                        ChatEvent::SystemHint { .. }
+                            | ChatEvent::StreamingStatus {
+                                is_streaming: false
+                            }
+                    )
+                })
+                .await
+                {
+                    ChatEvent::SystemHint { content } if content.contains("find_references") => {
+                        n += 1
+                    }
+                    ChatEvent::SystemHint { .. } => {}
+                    _ => break,
+                }
+            }
+            hints.push(n);
+        }
+        assert_eq!(
+            hints,
+            vec![1, 0, 1],
+            "once, not repeated, given again after the compaction"
+        );
+    }
+
     /// H3 enrichment: a turn of the agent engine receives, in front of the message,
     /// the knowledge graph context the Claude Code engine puts in front of the same
     /// message (`enrichment_for_turn`, called by `stream_response`).
