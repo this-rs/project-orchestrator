@@ -630,6 +630,7 @@ code(action: "get_node_importance", project_slug: "my-project",
 | [Authentication](docs/guides/authentication.md) | JWT + OAuth/OIDC + Password auth setup |
 | [Chat & WebSocket](docs/guides/chat-websocket.md) | Real-time chat and events |
 | [Knowledge Notes](docs/guides/knowledge-notes.md) | Contextual knowledge capture |
+| [Classifier Bench](docs/guides/classifier-bench.md) | Offline bench of the five backend classifiers vs the majority baseline |
 
 ---
 

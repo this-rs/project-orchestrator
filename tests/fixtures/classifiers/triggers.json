@@ -1,0 +1,46 @@
+{
+  "classifier": "triggers",
+  "version": 1,
+  "catalog": {
+    "triggers": [
+      { "name": "project_first_sync", "entity_type": "project", "action": "synced", "payload_conditions": null },
+      { "name": "rfc_created", "entity_type": "note", "action": "created", "payload_conditions": { "note_type": "rfc" } },
+      { "name": "protocol_run_completed", "entity_type": "protocol_run", "action": "status_changed", "payload_conditions": { "new_status": "completed" } },
+      { "name": "plan_completed", "entity_type": "plan", "action": "status_changed", "payload_conditions": { "new_status": "completed" } }
+    ]
+  },
+  "cases": [
+    { "id": "triggers-01", "lang": "fr", "input": { "note": "premier sync du projet", "entity_type": "project", "action": "synced", "payload": {} }, "label": "project_first_sync" },
+    { "id": "triggers-02", "lang": "en", "input": { "note": "first sync of the project", "entity_type": "project", "action": "synced", "payload": {} }, "label": "project_first_sync" },
+    { "id": "triggers-03", "lang": "fr", "input": { "note": "un projet vient d'être créé", "entity_type": "project", "action": "created", "payload": {} }, "label": "none" },
+    { "id": "triggers-04", "lang": "en", "input": { "note": "a project was just created", "entity_type": "project", "action": "created", "payload": {} }, "label": "none" },
+    { "id": "triggers-05", "lang": "fr", "input": { "note": "une RFC vient d'être écrite", "entity_type": "note", "action": "created", "payload": { "note_type": "rfc" } }, "label": "rfc_created" },
+    { "id": "triggers-06", "lang": "en", "input": { "note": "an RFC was just written", "entity_type": "note", "action": "created", "payload": { "note_type": "rfc" } }, "label": "rfc_created" },
+    { "id": "triggers-07", "lang": "fr", "input": { "note": "une note de décision a été ajoutée", "entity_type": "note", "action": "created", "payload": { "note_type": "decision" } }, "label": "none" },
+    { "id": "triggers-08", "lang": "en", "input": { "note": "a decision note was added", "entity_type": "note", "action": "created", "payload": { "note_type": "decision" } }, "label": "none" },
+    { "id": "triggers-09", "lang": "fr", "input": { "note": "nouvelle RFC sur le routage", "entity_type": "note", "action": "created", "payload": { "note_type": "rfc", "title": "routage" } }, "label": "rfc_created" },
+    { "id": "triggers-10", "lang": "en", "input": { "note": "new RFC about routing", "entity_type": "note", "action": "created", "payload": { "note_type": "rfc", "title": "routing" } }, "label": "rfc_created" },
+    { "id": "triggers-11", "lang": "fr", "input": { "note": "le run de protocole est terminé", "entity_type": "protocol_run", "action": "status_changed", "payload": { "new_status": "completed" } }, "label": "protocol_run_completed" },
+    { "id": "triggers-12", "lang": "en", "input": { "note": "the protocol run is done", "entity_type": "protocol_run", "action": "status_changed", "payload": { "new_status": "completed" } }, "label": "protocol_run_completed" },
+    { "id": "triggers-13", "lang": "fr", "input": { "note": "le run de protocole repart", "entity_type": "protocol_run", "action": "status_changed", "payload": { "new_status": "running" } }, "label": "none" },
+    { "id": "triggers-14", "lang": "en", "input": { "note": "the protocol run restarts", "entity_type": "protocol_run", "action": "status_changed", "payload": { "new_status": "running" } }, "label": "none" },
+    { "id": "triggers-15", "lang": "fr", "input": { "note": "le plan est clos", "entity_type": "plan", "action": "status_changed", "payload": { "new_status": "completed" } }, "label": "plan_completed" },
+    { "id": "triggers-16", "lang": "en", "input": { "note": "the plan is closed", "entity_type": "plan", "action": "status_changed", "payload": { "new_status": "completed" } }, "label": "plan_completed" },
+    { "id": "triggers-17", "lang": "fr", "input": { "note": "le plan repasse en brouillon", "entity_type": "plan", "action": "status_changed", "payload": { "new_status": "draft" } }, "label": "none" },
+    { "id": "triggers-18", "lang": "en", "input": { "note": "the plan goes back to draft", "entity_type": "plan", "action": "status_changed", "payload": { "new_status": "draft" } }, "label": "none" },
+    { "id": "triggers-19", "lang": "fr", "input": { "note": "un commit a été créé", "entity_type": "commit", "action": "created", "payload": {} }, "label": "none" },
+    { "id": "triggers-20", "lang": "en", "input": { "note": "a commit was created", "entity_type": "commit", "action": "created", "payload": {} }, "label": "none" },
+    { "id": "triggers-21", "lang": "fr", "input": { "note": "une compétence a changé de statut", "entity_type": "skill", "action": "status_changed", "payload": { "new_status": "active" } }, "label": "none" },
+    { "id": "triggers-22", "lang": "en", "input": { "note": "a skill changed status", "entity_type": "skill", "action": "status_changed", "payload": { "new_status": "active" } }, "label": "none" },
+    { "id": "triggers-23", "lang": "fr", "input": { "note": "second sync du projet", "entity_type": "project", "action": "synced", "payload": {} }, "label": "project_first_sync" },
+    { "id": "triggers-24", "lang": "en", "input": { "note": "second sync of the project", "entity_type": "project", "action": "synced", "payload": {} }, "label": "project_first_sync" },
+    { "id": "triggers-25", "lang": "fr", "input": { "note": "RFC sur la mémoire", "entity_type": "note", "action": "created", "payload": { "note_type": "rfc" } }, "label": "rfc_created" },
+    { "id": "triggers-26", "lang": "en", "input": { "note": "RFC on memory", "entity_type": "note", "action": "created", "payload": { "note_type": "rfc" } }, "label": "rfc_created" },
+    { "id": "triggers-27", "lang": "fr", "input": { "note": "le plan du lot est clos", "entity_type": "plan", "action": "status_changed", "payload": { "new_status": "completed" } }, "label": "plan_completed" },
+    { "id": "triggers-28", "lang": "en", "input": { "note": "the batch plan is closed", "entity_type": "plan", "action": "status_changed", "payload": { "new_status": "completed" } }, "label": "plan_completed" },
+    { "id": "triggers-29", "lang": "fr", "input": { "note": "le protocole est terminé", "entity_type": "protocol_run", "action": "status_changed", "payload": { "new_status": "completed" } }, "label": "protocol_run_completed" },
+    { "id": "triggers-30", "lang": "en", "input": { "note": "the protocol is finished", "entity_type": "protocol_run", "action": "status_changed", "payload": { "new_status": "completed" } }, "label": "protocol_run_completed" },
+    { "id": "triggers-31", "lang": "fr", "input": { "note": "une note de décision sur le cache", "entity_type": "note", "action": "created", "payload": { "note_type": "decision" } }, "label": "none" },
+    { "id": "triggers-32", "lang": "en", "input": { "note": "a decision note about the cache", "entity_type": "note", "action": "created", "payload": { "note_type": "decision" } }, "label": "none" }
+  ]
+}
