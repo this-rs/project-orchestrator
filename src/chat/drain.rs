@@ -98,6 +98,7 @@ pub(crate) async fn drain_pending_messages(
                 PendingMessageKind::SystemHint => "system_hint",
                 PendingMessageKind::User => "user_message",
                 PendingMessageKind::BackgroundOutput => "background_output",
+                PendingMessageKind::TeamMessage { .. } => "team_message",
             },
             session_id
         );
@@ -156,6 +157,18 @@ pub(crate) async fn drain_pending_messages(
                         })
                         .unwrap_or_default(),
                     ),
+                    PendingMessageKind::TeamMessage {
+                        ref from_session_id,
+                        ref from_name,
+                    } => (
+                        "team_message".to_string(),
+                        serde_json::to_string(&ChatEvent::TeamMessage {
+                            from_session_id: *from_session_id,
+                            from_name: from_name.clone(),
+                            content: msg_content.clone(),
+                        })
+                        .unwrap_or_default(),
+                    ),
                     PendingMessageKind::BackgroundOutput => unreachable!(
                         "BackgroundOutput is filtered out by needs_persist_and_broadcast"
                     ),
@@ -194,6 +207,14 @@ pub(crate) async fn drain_pending_messages(
                 PendingMessageKind::User => ChatEvent::UserMessage {
                     content: msg_content.clone(),
                 },
+                PendingMessageKind::TeamMessage {
+                    ref from_session_id,
+                    ref from_name,
+                } => ChatEvent::TeamMessage {
+                    from_session_id: *from_session_id,
+                    from_name: from_name.clone(),
+                    content: msg_content.clone(),
+                },
                 PendingMessageKind::BackgroundOutput => unreachable!(),
             };
             let _ = events_tx.send(chat_event.clone());
@@ -208,11 +229,21 @@ pub(crate) async fn drain_pending_messages(
             );
         }
 
+        // For TeamMessage, prefix the content delivered to the model so it can
+        // distinguish peer messages from human messages. Raw content is already
+        // persisted and broadcast above (clients see `from_name` separately).
+        let prompt_content = match &kind {
+            PendingMessageKind::TeamMessage { from_name, .. } => {
+                format!("[team {}] {}", from_name, msg_content)
+            }
+            _ => msg_content,
+        };
+
         // Recursive call to process the queued message
         Box::pin(ChatManager::stream_response(
             client,
             events_tx,
-            msg_content,
+            prompt_content,
             session_id,
             graph,
             active_sessions,
@@ -273,8 +304,9 @@ pub(crate) async fn drain_pending_messages(
 /// automated entries (`SystemHint`, `BackgroundOutput` — Monitor ticks,
 /// auto-continue, objective reminders) are discarded, because they were
 /// produced by the very work the user just stopped and would re-arm the turn
-/// forever. Messages the human typed still run. Returns the message and how
-/// many automated entries were dropped.
+/// forever. Messages the human typed still run; team messages from peers are
+/// also kept since they represent real intent from another agent. Returns the
+/// message and how many automated entries were dropped.
 pub(crate) fn pop_next_after_turn(
     queue: &mut VecDeque<PendingMessage>,
     interrupted: bool,
@@ -282,7 +314,12 @@ pub(crate) fn pop_next_after_turn(
     let mut dropped = 0;
     if interrupted {
         let before = queue.len();
-        queue.retain(|m| matches!(m.kind, PendingMessageKind::User));
+        queue.retain(|m| {
+            matches!(
+                m.kind,
+                PendingMessageKind::User | PendingMessageKind::TeamMessage { .. }
+            )
+        });
         dropped = before - queue.len();
     }
     (pop_highest_priority(queue), dropped)
@@ -292,7 +329,7 @@ pub(crate) fn pop_next_after_turn(
 /// FIFO order within a single priority class.
 ///
 /// Priority order (lowest number = highest priority):
-///   0 — `User` : the human's intent always wins
+///   0 — `User`, `TeamMessage` : the human's intent and peer-agent messages always win
 ///   1 — `SystemHint` : system instructions (AgentGuard hints, plan-runner reminders)
 ///   2 — `BackgroundOutput` : passive observations from background tools (Monitor, BashOutput, …)
 ///
@@ -323,7 +360,7 @@ pub(crate) fn pop_next_after_turn(
 fn pop_highest_priority(queue: &mut VecDeque<PendingMessage>) -> Option<PendingMessage> {
     fn priority(kind: &PendingMessageKind) -> u8 {
         match kind {
-            PendingMessageKind::User => 0,
+            PendingMessageKind::User | PendingMessageKind::TeamMessage { .. } => 0,
             PendingMessageKind::SystemHint => 1,
             PendingMessageKind::BackgroundOutput => 2,
         }
