@@ -27,9 +27,10 @@ pub mod topic;
 pub(crate) mod wiring;
 
 pub use mode::{
-    conversation_routes, conversation_stage, effective_routing, parse_routing_settings,
-    validate_routing_settings, ConversationRoutingMode, EffectiveRouting, LearningStage,
-    ProviderRoutingMode, RoutingError, RoutingScope, RoutingSettings, ROUTING_KEY,
+    conversation_routes, conversation_stage, effective_routing, engine_is_pinned,
+    parse_routing_settings, take_over_subagent_tool, validate_routing_settings,
+    ConversationRoutingMode, EffectiveRouting, LearningStage, ProviderRoutingMode, RoutingError,
+    RoutingScope, RoutingSettings, ROUTING_KEY,
 };
 
 use crate::chat::provider::settings::{project_scope, GLOBAL};

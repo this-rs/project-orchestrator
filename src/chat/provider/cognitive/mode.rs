@@ -357,6 +357,30 @@ pub fn conversation_routes(mode: Option<ConversationRoutingMode>, pool_len: usiz
     mode == Some(ConversationRoutingMode::Full) || pool_len > 1
 }
 
+/// Whether a conversation's engine is pinned and must never be substituted: a
+/// provider named by the request (`routed_by: request`), a single ticked model
+/// (a pool of one), or a model pinned BY HAND elsewhere in the host (manual
+/// `set_session_model` -> `pin_session_model`; it updates neither `routed_by`
+/// nor `routing_mode`, so it must be read on its own — review point 4 of
+/// AUTO-SUB). Every one of these keeps the engine's own sub-agent tool, and its
+/// children inherit instead of being routed.
+pub fn engine_is_pinned(routed_by: Option<&str>, pool_len: usize, hand_pinned: bool) -> bool {
+    routed_by == Some("request") || pool_len == 1 || hand_pinned
+}
+
+/// Whether the harness takes over a conversation's sub-agent tool: the
+/// conversation routes (Auto full, or a pool of two models or more), the engine
+/// is not pinned, and cognitive routing is actually enabled. A conversation that
+/// routes but is pinned — or that has nothing to route (mono) — keeps its own
+/// tool and PO observes through the mirror (P18c), never inserting a pointless
+/// hop. Mono is a first-order case, not a degraded multi (constraint).
+pub fn take_over_subagent_tool(
+    parent_routes: bool,
+    pinned: bool,
+    cognitive_routing_active: bool,
+) -> bool {
+    parent_routes && !pinned && cognitive_routing_active
+}
 /// The stage a conversation's decisions are taken at (decision R-S1): a choice the user
 /// made on the conversation ([`conversation_routes`]) counts as `auto` for it, whatever the
 /// settings say. The settings' stage (`shadow` by default) is a LEARNING setting: it
@@ -398,6 +422,28 @@ impl From<(RoutingSettings, RoutingScope)> for EffectiveRouting {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_subagent_tool_is_taken_over_only_when_there_is_something_to_route() {
+        // Routes and not pinned, with cognitive routing on: taken over.
+        assert!(take_over_subagent_tool(true, false, true));
+        // Nothing to route (mono), pinned, or cognitive routing off: never taken over.
+        assert!(!take_over_subagent_tool(false, false, true));
+        assert!(!take_over_subagent_tool(true, true, true));
+        assert!(!take_over_subagent_tool(true, false, false));
+    }
+
+    #[test]
+    fn an_engine_is_pinned_by_request_single_tick_or_hand() {
+        // A provider named by the request, a single ticked model, or a model pinned by
+        // hand: all pins — the harness never substitutes the engine.
+        assert!(engine_is_pinned(Some("request"), 0, false));
+        assert!(engine_is_pinned(None, 1, false));
+        assert!(engine_is_pinned(None, 0, true));
+        // Nothing named, a real pool, and not pinned by hand: the harness may substitute.
+        assert!(!engine_is_pinned(None, 2, false));
+        assert!(!engine_is_pinned(None, 0, false));
+    }
 
     #[test]
     fn a_choice_on_the_conversation_is_the_auto_stage_for_it_only() {
