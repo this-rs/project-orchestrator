@@ -616,16 +616,25 @@ pub async fn get_session_tree(
         .map_err(AppError::Internal)?;
     // Which provider and model ran each node and what it cost, read from the
     // sessions themselves; a session that cannot be read stays unannotated.
+    let chat_manager = state.chat_manager.as_ref();
     let mut info = std::collections::HashMap::new();
     for node in &tree {
         if let Ok(id) = node.session_id.parse::<Uuid>() {
             if let Ok(Some(s)) = state.orchestrator.neo4j().get_chat_session(id).await {
+                let status = match chat_manager {
+                    Some(cm) if cm.is_session_active(&node.session_id).await => {
+                        Some("active".to_string())
+                    }
+                    _ => None,
+                };
                 info.insert(
                     node.session_id.clone(),
                     crate::chat::tree::NodeInfo {
                         provider_id: s.provider_id,
                         model: Some(s.model),
                         cost_usd: s.total_cost_usd,
+                        status,
+                        routed_by: s.routed_by,
                     },
                 );
             }
@@ -3790,6 +3799,29 @@ mod tests {
     // ====================================================================
     // Run routing, task alias, interrupt cascade, tree annotation
     // ====================================================================
+
+    /// B36: the session tree carries `status`, `routed_by`, `provider_id`,
+    /// `model` and `cost_usd` per node (a cold session is `closed`).
+    #[tokio::test]
+    async fn the_session_tree_reports_status_and_routed_by_per_node() {
+        let h = action_harness(None).await;
+        let mut session = crate::test_helpers::test_chat_session(None);
+        session.provider_id = Some("fake".to_string());
+        session.routed_by = Some("task".to_string());
+        session.total_cost_usd = Some(1.5);
+        h.graph.create_chat_session(&session).await.unwrap();
+
+        let uri = format!("/api/chat/sessions/{}/tree", session.id);
+        let (status, body) = call(&h.app, auth_get(&uri)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let tree = body.as_array().expect("an array of nodes");
+        assert_eq!(tree.len(), 1, "{body}");
+        assert_eq!(tree[0]["provider_id"], "fake");
+        assert_eq!(tree[0]["model"], "claude-opus-4-6");
+        assert_eq!(tree[0]["cost_usd"], 1.5);
+        assert_eq!(tree[0]["routed_by"], "task");
+        assert_eq!(tree[0]["status"], "closed");
+    }
 
     #[tokio::test]
     async fn a_task_model_alias_must_be_defined_is_stored_and_shown_and_can_be_cleared() {

@@ -7963,6 +7963,8 @@ impl GraphStore for MockGraphStore {
             subtree_cost_usd: None,
             max_depth: None,
             max_children: None,
+            status: "closed".to_string(),
+            routed_by: None,
         }])
     }
 
