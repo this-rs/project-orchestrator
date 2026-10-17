@@ -1054,8 +1054,13 @@ pub async fn delegate_task(
         envelope::session_header(&headers),
         state.auth_config.is_some(),
     )?;
-    let parent_envelope =
-        envelope::envelope_for_caller(graph.as_ref(), chat_manager.as_ref(), &caller).await?;
+    let parent_envelope = envelope::envelope_for_caller(
+        graph.as_ref(),
+        chat_manager.as_ref(),
+        &caller,
+        chat_manager.config.max_live_children,
+    )
+    .await?;
     let default_mode = chat_manager.default_permission_mode().await;
     let mut chat_request = delegation_chat_request(
         req.cwd,
@@ -7229,6 +7234,86 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code(), "envelope_project_mismatch");
+    }
+
+    /// The handler itself, not just `envelope::` below it: `delegate_task` identifies
+    /// the caller from the request and resolves the spawn envelope from the LIVE chat
+    /// config (`chat_manager.config.max_live_children`), not from a constant.
+    ///
+    /// The cap is set to 0 on the manager — a server that allows no live child at all
+    /// (the environment refuses 0, `positive_from_env`, so it is set on the struct
+    /// directly). With a parent session and 0 live children, the FIRST child is already
+    /// over budget, so the refusal can only be the cap. If the handler passed a constant
+    /// instead of the config, the same call would fall through to the envelope's
+    /// directories and be refused with `envelope_cwd_outside_parent` — the request's cwd
+    /// is deliberately outside the parent's, so this test reaches no session opening
+    /// either way.
+    #[tokio::test]
+    async fn delegate_task_resolves_the_envelope_with_the_configured_cap() {
+        use crate::neo4j::GraphStore;
+
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project = crate::test_helpers::test_project();
+        mock.create_project(&project).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(project.id);
+        mock.create_plan(&plan).await.unwrap();
+        let task = crate::test_helpers::test_task();
+        mock.create_task(plan.id, &task).await.unwrap();
+        // The calling session: its cwd is the only root its children may work in.
+        let parent = crate::test_helpers::test_chat_session(Some(&project.slug));
+        mock.create_chat_session(&parent).await.unwrap();
+
+        let dyn_graph: Arc<dyn GraphStore> = mock.clone();
+        let config = crate::chat::config::ChatConfig {
+            max_live_children: 0,
+            ..Default::default()
+        };
+        let manager = Arc::new(crate::chat::manager::ChatManager::new_without_memory(
+            dyn_graph,
+            crate::test_helpers::mock_app_state().meili,
+            config,
+        ));
+        let state = crate::test_helpers::server_state_with_chat(manager, mock.clone()).await;
+
+        // No auth on this state: the `X-Session-Id` header is what makes the caller an
+        // agent (`SpawnCaller::Agent`), so the envelope is resolved from that session.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            crate::chat::envelope::SESSION_ID_HEADER,
+            parent.id.to_string().parse().unwrap(),
+        );
+        let req = DelegateTaskRequest {
+            cwd: "/work/elsewhere".to_string(),
+            project_slug: None,
+            custom_sections: Vec::new(),
+            parent_session_id: None,
+            provider: None,
+            model: None,
+            task_class: None,
+        };
+
+        let result = delegate_task(
+            State(state),
+            None,
+            headers,
+            Path((plan.id, task.id)),
+            Json(req),
+        )
+        .await;
+
+        match result {
+            Err(AppError::Forbidden(message)) => {
+                assert!(
+                    message.starts_with("envelope_too_many_children"),
+                    "the configured cap must refuse the delegation first, got: {message}"
+                );
+                assert!(
+                    message.contains("maximum 0"),
+                    "the cap comes from chat_manager.config.max_live_children: {message}"
+                );
+            }
+            other => panic!("expected the configured cap to refuse, got {other:?}"),
+        }
     }
 
     #[test]

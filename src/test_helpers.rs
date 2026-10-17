@@ -662,13 +662,13 @@ pub fn test_persona(name: &str, model_preference: Option<&str>) -> PersonaNode {
     }
 }
 
-/// The real router (no-auth mode) on a loopback port, its chat served by
-/// `manager` over `graph`: what a WebSocket client of `/ws/chat/{id}` talks to
-/// in the tests.
-pub async fn serve_chat(
+/// The `ServerState` [`serve_chat`] builds — no-auth, chat served by `manager`
+/// over `graph` — WITHOUT starting a server: what a test hands to a handler it
+/// calls directly instead of going over HTTP.
+pub async fn server_state_with_chat(
     manager: Arc<crate::chat::manager::ChatManager>,
     graph: Arc<MockGraphStore>,
-) -> std::net::SocketAddr {
+) -> Arc<crate::api::handlers::ServerState> {
     use crate::api::handlers::ServerState;
     use crate::orchestrator::watcher::FileWatcher;
     use crate::orchestrator::Orchestrator;
@@ -678,7 +678,7 @@ pub async fn serve_chat(
     let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
         orchestrator.clone(),
     )));
-    let state = Arc::new(ServerState {
+    Arc::new(ServerState {
         orchestrator,
         watcher,
         chat_manager: Some(manager),
@@ -706,7 +706,17 @@ pub async fn serve_chat(
         mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
         vault: crate::vault::VaultService::ephemeral(),
-    });
+    })
+}
+
+/// The real router (no-auth mode) on a loopback port, its chat served by
+/// `manager` over `graph`: what a WebSocket client of `/ws/chat/{id}` talks to
+/// in the tests.
+pub async fn serve_chat(
+    manager: Arc<crate::chat::manager::ChatManager>,
+    graph: Arc<MockGraphStore>,
+) -> std::net::SocketAddr {
+    let state = server_state_with_chat(manager, graph).await;
     let app = crate::api::routes::create_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

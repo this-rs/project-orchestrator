@@ -170,16 +170,17 @@ pub(crate) struct SubagentSlot {
 }
 
 impl SubagentSlot {
-    /// A slot of `parent`, or `None` when its [`MAX_LIVE_CHILDREN`] slots are taken.
-    ///
-    /// [`MAX_LIVE_CHILDREN`]: super::envelope::MAX_LIVE_CHILDREN
+    /// A slot of `parent`, or `None` when `max_live_children` slots are taken.
+    /// The cap comes from [`ChatConfig::max_live_children`] (env `CHAT_MAX_LIVE_CHILDREN`,
+    /// default [`super::envelope::MAX_LIVE_CHILDREN`]).
     pub(crate) fn take(manager: &Arc<ChatManager>, parent: &str) -> Option<Self> {
+        let cap = manager.config.max_live_children;
         let mut slots = manager
             .subagent_slots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let taken = slots.entry(parent.to_string()).or_insert(0);
-        if *taken >= super::envelope::MAX_LIVE_CHILDREN {
+        if *taken >= cap {
             return None;
         }
         *taken += 1;
@@ -382,16 +383,22 @@ impl ChatManager {
         // lifetime, NOT in this frame — a drop of this future (the parent's turn
         // interrupted) must not free the slot before the spawned task has actually
         // closed the child (P18b round 2, fix 2).
+        let max = self.config.max_live_children;
         let slot = SubagentSlot::take(&self, parent_session_id).ok_or_else(|| {
             refused(format!(
-                "envelope_too_many_children (at most {} sub-agents of one session run at once)",
-                envelope::MAX_LIVE_CHILDREN
+                "envelope_too_many_children ({max} sub-agents of one session are already running; \
+                 raise CHAT_MAX_LIVE_CHILDREN to allow more)"
             ))
         })?;
-        let env =
-            envelope::resolve_envelope(self.graph.as_ref(), self.as_ref(), parent_session_id, None)
-                .await
-                .map_err(|e| refused(e.code().to_owned()))?;
+        let env = envelope::resolve_envelope(
+            self.graph.as_ref(),
+            self.as_ref(),
+            parent_session_id,
+            None,
+            self.config.max_live_children,
+        )
+        .await
+        .map_err(|e| refused(e.code().to_owned()))?;
         // AUTO-SUB: a parent conversation in Auto (mode `full`, or a pool of two models or
         // more) routes every `Agent` call over every candidate its person and project allow —
         // Claude Code included — instead of the child inheriting the parent's provider and
