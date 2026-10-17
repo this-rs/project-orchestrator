@@ -215,20 +215,6 @@ impl StatusInjectionStage {
         }
     }
 
-    /// Create with a ReasoningTreeEngine for full functionality.
-    #[allow(deprecated)]
-    pub fn with_reasoning(
-        graph: Arc<dyn GraphStore>,
-        reasoning_engine: Arc<ReasoningTreeEngine>,
-    ) -> Self {
-        Self {
-            graph,
-            reasoning_engine: Some(reasoning_engine),
-            protocol_provider: Arc::new(NoOpProtocolProvider),
-            config: StatusInjectionConfig::default(),
-        }
-    }
-
     /// Create with full configuration.
     pub fn with_config(
         graph: Arc<dyn GraphStore>,

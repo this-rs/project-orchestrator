@@ -20,12 +20,10 @@ coverage:
 ignore:
   # Desktop Tauri app — separate crate, not compiled by cargo llvm-cov
   - "desktop/**"
-  # Chat infrastructure — requires live CLI subprocess, WS connections, and
-  # streaming pipelines. Business logic is tested via mock-based unit tests
-  # but the send/stream/persist pipeline is integration-only.
-  - "src/api/ws_chat_handler.rs"
-  - "src/api/chat_handlers.rs"
-  - "src/chat/**"
+  # Chat (src/chat/**, src/api/chat_handlers.rs, src/api/ws_chat_handler.rs,
+  # src/neo4j/chat.rs) — NOT excluded since B19: the "needs a live CLI" motive
+  # is gone, the tests run on the nexus fakes (fake_claude, the scripted
+  # provider) and on the CI's Neo4j. See docs/COVERAGE_EXCLUSIONS.md.
   # Neo4j layer — NOT excluded because it needs a live Neo4j: the CI provisions
   # one (integration-tests, api-tests, coverage jobs), so these files are
   # measurable. What is left below is untested code with an owner, tracked one
@@ -36,7 +34,6 @@ ignore:
   # coverage job's merged lcov): client, traits, workspace, milestone,
   # constraint, release, commit, decision, user.
   - "src/neo4j/analytics.rs"       # needs the GDS plugin, absent from CI (APOC only)
-  - "src/neo4j/chat.rs"            # needs the fake CLI of task 3.2
   - "src/neo4j/code.rs"            # code-intelligence suite, task 2.B
   - "src/neo4j/event_trigger.rs"   # task 2.C
   - "src/neo4j/feature_graph.rs"   # task 2.B

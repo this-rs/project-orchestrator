@@ -20,8 +20,51 @@ apparaît un, il s'inscrit dans le tableau ci-dessous comme les autres.
 |---|---|---|---|
 | 2026-10-01 (baseline, tâche 0.3) | 31 | **22** | `origin/main` @ 962e2119 |
 | 2026-10-01 (cette PR, tâche 3.1) | 22 | **13** | branche `test/neo4j-coverage-ci` |
+| 2026-10-18 (tâche B19) | 18 | **12** | branche `test/b19-chat-coverage` |
 
 Les 9 exclusions retirées sont `src/neo4j/{client,traits,workspace,milestone,constraint,release,commit,decision,user}.rs`.
+Puis B19 retire les 4 exclusions du chat : `src/chat/**`, `src/api/chat_handlers.rs`,
+`src/api/ws_chat_handler.rs` et `src/neo4j/chat.rs` (section suivante).
+
+## Le chat n'est plus exclu (B19)
+
+Le motif inscrit était « il faut un CLI vivant ». Il ne tient plus : les tests qui
+demandaient un `claude` installé tournent sur `fake_claude`, le CLI scripté de nexus
+(construit en CI par `.github/actions/nexus-fakes`, comme les autres faux), et
+`src/neo4j/chat.rs` n'a jamais eu besoin d'un CLI — seulement du Neo4j que la CI
+fournit déjà.
+
+- Plus aucun test `#[ignore]` au motif du vrai CLI : les 7 tests de
+  `chat::manager` et `api::chat_handlers` passent sur un `fake_claude` qui tourne
+  (`test_support::insert_live_session`) ; le test d'authentification de
+  `chat::cli_auth` devient 5 tests sur `fake_claude` (JSON lu, déconnecté, réponse
+  illisible, délai dépassé, binaire absent) ; `chat::cli_version` lit la version de
+  `fake_claude`.
+- Restent ignorés, pour une autre raison : `cli_version::test_check_cli_status_integration`
+  (interroge npm, réseau) et trois tests de `chat::manager` qui tuent de vrais
+  processus et dépendent du temps (`test_kill_subtree_kills_real_sleep_subprocess`,
+  `test_pid_claim_async_updates_map_after_1s`, `test_cancel_task_with_pid_calls_kill_subtree`).
+- `src/neo4j/chat.rs` : 4 suites dans `tests/neo4j_store_tests.rs` (champs de session,
+  journal d'événements, lignée / runs / liens plan-tâche, DISCUSSED), et
+  `tests/harness_neo4j.rs` (ancres, réglages, arêtes SPAWNED_BY) entre dans la passe
+  Neo4j du job `coverage`. `assert_lcov_covers.py` garde désormais aussi ce fichier.
+
+Mesure locale (lcov, lignes ; tests `chat::`, `api::chat_handlers`,
+`api::ws_chat_handler`, `neo4j::chat` + `neo4j_store_tests` + `harness_neo4j`) :
+
+| Fichier(s) | avant (`origin/main` @ 6ef1f6e7) | après |
+|---|---|---|
+| `src/chat/**` | 93,4 % (83 475/89 408) | 93,6 % (83 797/89 496) |
+| `src/api/chat_handlers.rs` | 82,4 % (3 831/4 649) | 84,6 % (3 926/4 642) |
+| `src/api/ws_chat_handler.rs` | 63,2 % (768/1 215) | 63,2 % (768/1 215) |
+| `src/neo4j/chat.rs` | 36,5 % (827/2 263) ¹ | 86,7 % (1 961/2 263) |
+| dont `src/chat/cli_auth.rs` | 40,7 % | 92,1 % |
+
+¹ avant, mesuré en ajoutant `harness_neo4j` ; la CI ne le faisait pas, donc 0 % dans la CI.
+
+Le chiffre **gated** de ces fichiers passe de « non compté » (exclus) à la colonne
+« après ». `ws_chat_handler.rs` reste la plus faible : la boucle WebSocket elle-même
+(upgrade, lecture/écriture de trames) n'a pas de test ; c'est la dette restante.
 
 **Provenance des chiffres.** Les pourcentages du tableau « Exclusions
 restantes » viennent de la mesure de la tâche 0.3 (`origin/main` @ 962e2119,
@@ -116,19 +159,15 @@ retirer, le travail est identifié.
 | `src/bin/**` (`mcp_server.rs`) | 34 | 0 % | J | Point d'entrée, amorçage pur. | — |
 | `src/lib.rs` | 1 561 | 57,8 % | C | Mélange de la config (testée) et de `start_server` (bind Axum). Contournable : bind sur le port 0, ou extraire l'amorçage hors de `lib.rs`. | tâche 4.1 |
 | `src/events/nats.rs` | 396 | 41,2 % | C | Wrappers pub/sub. Le motif inscrit dans `codecov.yml` (« fait baisser le patch gate ») est un motif de confort, pas une impossibilité : testable avec un faux ou le service NATS en CI. | tâche 4.1 |
-| `src/chat/**` (35 fichiers) | 28 377 | 79,7 % | R | Déjà couvert à ~80 % par des mocks ; l'exclusion masque 28 k lignes pour rien. | tâche 3.2 |
-| `src/api/chat_handlers.rs` | 1 384 | 59,5 % | R | Mesuré sans aucun service. | tâche 3.2 |
-| `src/api/ws_chat_handler.rs` | 740 | 16,1 % | C | Pipeline WebSocket : testable avec un client WS en mémoire et un faux `ChatManager`. Vraie dette de test. | tâche 3.2 |
 | `src/api/routes.rs` | 1 577 | 99,9 % | R | La justification inscrite (« pas testable ») est fausse : 99,9 % couvert. L'exclusion ne sert à rien. | tâche 4.1 |
 
-### `src/neo4j` — 13 restantes
+### `src/neo4j` — 12 restantes
 
 Toutes de classe **R** : chacune a une suite d'intégration à écrire, pas un
 obstacle technique. L'ordre suit la baseline 0.3 (les moins couvertes d'abord).
 
 | Exclusion | Lignes src | % mesuré (Neo4j allumé) | Pourquoi encore exclue | Propriétaire / suite |
 |---|---|---|---|---|
-| `src/neo4j/chat.rs` | 1 780 | 0 % | Sessions de chat : les écrire demande le faux CLI de la tâche 3.2 pour produire des sessions réalistes. | tâche 3.2 |
 | `src/neo4j/feature_graph.rs` | 1 538 | 0 % | Gros domaine (entités, communautés) ; une suite à part entière. | tâche 2.B |
 | `src/neo4j/event_trigger.rs` | 318 | 0 % | Déclencheurs d'événements ; à écrire avec les triggers builtin de la tâche 2.C. | tâche 2.C |
 | `src/neo4j/plan_run.rs` | 313 | 0 % | État du runner ; `RunnerState` est volumineux à construire — à écrire avec le lot runner. | tâche 2.C |

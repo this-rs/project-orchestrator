@@ -1224,3 +1224,616 @@ async fn test_segment_store_round_trips_and_replaces() {
         .unwrap()
         .is_empty());
 }
+
+// ===========================================================================
+// src/neo4j/chat.rs
+// ===========================================================================
+//
+// Excluded from coverage until B19 with "needs the fake CLI of task 3.2": a
+// session is a Neo4j node, and these calls need no CLI, fake or real, to write
+// and read one. The anchors, the provider settings and the spawned-by edge are
+// exercised by `tests/harness_neo4j.rs` (also in the coverage pass); what
+// follows covers the rest: the session fields, the event log, the lineage,
+// the plan/task links and the DISCUSSED relations.
+
+fn a_chat_session(project_slug: Option<&str>) -> ChatSessionNode {
+    ChatSessionNode {
+        id: Uuid::new_v4(),
+        cli_session_id: None,
+        project_slug: project_slug.map(str::to_string),
+        workspace_slug: None,
+        cwd: "/tmp/neo4j-store-chat".to_string(),
+        title: None,
+        model: "test-model".to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        message_count: 0,
+        total_cost_usd: None,
+        conversation_id: None,
+        preview: None,
+        permission_mode: None,
+        add_dirs: None,
+        spawned_by: None,
+        provider_id: None,
+        routed_by: None,
+        capabilities: None,
+        engine: None,
+        resume_token: None,
+        execution_place: Default::default(),
+        access: Default::default(),
+        owner: None,
+        file_scope_lifted: false,
+        mirror_of: None,
+        routing_pool: None,
+        routing_mode: None,
+    }
+}
+
+fn an_event(
+    session_id: Uuid,
+    seq: i64,
+    event_type: &str,
+    data: serde_json::Value,
+) -> ChatEventRecord {
+    ChatEventRecord {
+        id: Uuid::new_v4(),
+        session_id,
+        seq,
+        event_type: event_type.to_string(),
+        data: data.to_string(),
+        created_at: chrono::Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn test_chat_session_fields_round_trip_and_unknown_ids_match_nothing() {
+    let client = store_or_skip!();
+    let store: &dyn GraphStore = &client;
+
+    let session = a_chat_session(None);
+    store.create_chat_session(&session).await.unwrap();
+
+    // --- the partial update sets what it is given, and only that ---
+    let updated = store
+        .update_chat_session(
+            session.id,
+            Some("cli-1".to_string()),
+            Some("A title".to_string()),
+            Some(3),
+            Some(0.5),
+            Some("conv-1".to_string()),
+            Some("a preview".to_string()),
+        )
+        .await
+        .unwrap()
+        .expect("the session exists");
+    assert_eq!(updated.cli_session_id.as_deref(), Some("cli-1"));
+    assert_eq!(updated.title.as_deref(), Some("A title"));
+    assert_eq!(updated.message_count, 3);
+    assert_eq!(updated.total_cost_usd, Some(0.5));
+    assert_eq!(updated.conversation_id.as_deref(), Some("conv-1"));
+    assert_eq!(updated.preview.as_deref(), Some("a preview"));
+    let unchanged = store
+        .update_chat_session(session.id, None, None, None, None, None, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unchanged.title.as_deref(),
+        Some("A title"),
+        "an empty update keeps the fields"
+    );
+    assert!(
+        store
+            .update_chat_session(
+                Uuid::new_v4(),
+                None,
+                Some("x".into()),
+                None,
+                None,
+                None,
+                None
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "an unknown id is reported, never created"
+    );
+
+    // --- the per-field setters ---
+    store
+        .update_chat_session_permission_mode(session.id, "plan")
+        .await
+        .unwrap();
+    store
+        .update_chat_session_file_scope_lifted(session.id, true)
+        .await
+        .unwrap();
+    store
+        .update_chat_session_model(session.id, "other-model")
+        .await
+        .unwrap();
+    let read = store.get_chat_session(session.id).await.unwrap().unwrap();
+    assert_eq!(read.permission_mode.as_deref(), Some("plan"));
+    assert!(read.file_scope_lifted);
+    assert_eq!(read.model, "other-model");
+
+    // --- routing: replaced, an absent value reads back as None ---
+    assert!(store
+        .update_chat_session_routing(session.id, Some("full"), Some("[\"a\"]"), Some("user"))
+        .await
+        .unwrap());
+    let read = store.get_chat_session(session.id).await.unwrap().unwrap();
+    assert_eq!(read.routing_mode.as_deref(), Some("full"));
+    assert_eq!(read.routing_pool.as_deref(), Some("[\"a\"]"));
+    assert_eq!(read.routed_by.as_deref(), Some("user"));
+    assert!(store
+        .update_chat_session_routing(session.id, None, None, None)
+        .await
+        .unwrap());
+    let read = store.get_chat_session(session.id).await.unwrap().unwrap();
+    assert_eq!(read.routing_mode, None);
+    assert_eq!(read.routing_pool, None);
+    assert!(!store
+        .update_chat_session_routing(Uuid::new_v4(), Some("full"), None, None)
+        .await
+        .unwrap());
+
+    // --- provider re-target clears the provider-specific fields; restore puts them back ---
+    store
+        .update_chat_session_harness(session.id, Some("{\"tools\":true}"), Some("token"))
+        .await
+        .unwrap();
+    let before = store.get_chat_session(session.id).await.unwrap().unwrap();
+    assert!(store
+        .update_chat_session_provider(session.id, "openai", "gpt", "fallback", "agent")
+        .await
+        .unwrap());
+    let moved = store.get_chat_session(session.id).await.unwrap().unwrap();
+    assert_eq!(moved.provider_id.as_deref(), Some("openai"));
+    assert_eq!(moved.model, "gpt");
+    assert_eq!(moved.engine.as_deref(), Some("agent"));
+    assert_eq!(moved.resume_token, None, "a token never crosses providers");
+    assert_eq!(moved.capabilities, None);
+    assert_eq!(moved.cli_session_id, None);
+    assert!(store
+        .restore_chat_session_provider(&before, "local")
+        .await
+        .unwrap());
+    let restored = store.get_chat_session(session.id).await.unwrap().unwrap();
+    assert_eq!(restored.provider_id.as_deref(), Some("local"));
+    assert_eq!(restored.model, before.model);
+    assert_eq!(restored.resume_token, before.resume_token);
+    assert_eq!(restored.cli_session_id, before.cli_session_id);
+    assert!(!store
+        .update_chat_session_provider(Uuid::new_v4(), "p", "m", "r", "e")
+        .await
+        .unwrap());
+    let mut ghost = before.clone();
+    ghost.id = Uuid::new_v4();
+    assert!(!store
+        .restore_chat_session_provider(&ghost, "p")
+        .await
+        .unwrap());
+
+    // --- shell moved: a new session has not moved, set is Some(true), unknown is None ---
+    assert_eq!(
+        store
+            .get_chat_session_shell_moved(session.id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    store
+        .set_chat_session_shell_moved(session.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_chat_session_shell_moved(session.id)
+            .await
+            .unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        store
+            .get_chat_session_shell_moved(Uuid::new_v4())
+            .await
+            .unwrap(),
+        None
+    );
+
+    // --- delete reports whether something was there ---
+    assert!(store.delete_chat_session(session.id).await.unwrap());
+    assert!(!store.delete_chat_session(session.id).await.unwrap());
+    assert!(store.get_chat_session(session.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_chat_events_replay_paginate_count_and_delete() {
+    let client = store_or_skip!();
+    let store: &dyn GraphStore = &client;
+
+    let session = a_chat_session(None);
+    store.create_chat_session(&session).await.unwrap();
+    let sid = session.id;
+
+    // --- empty log ---
+    assert_eq!(store.count_chat_events(sid).await.unwrap(), 0);
+    assert_eq!(store.get_latest_chat_event_seq(sid).await.unwrap(), 0);
+    store.store_chat_events(sid, vec![]).await.unwrap();
+    assert!(store.get_attention_events(&[]).await.unwrap().is_empty());
+
+    store
+        .store_chat_events(
+            sid,
+            vec![
+                an_event(
+                    sid,
+                    1,
+                    "user_message",
+                    serde_json::json!({"content": "Bonjour, regarde src/main.rs"}),
+                ),
+                an_event(
+                    sid,
+                    2,
+                    "assistant_text",
+                    serde_json::json!({"content": "ok"}),
+                ),
+                an_event(
+                    sid,
+                    3,
+                    "permission_request",
+                    serde_json::json!({"id": "req-1"}),
+                ),
+                an_event(
+                    sid,
+                    4,
+                    "permission_decision",
+                    serde_json::json!({"id": "req-1", "allow": true}),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // --- replay after a seq, in order, bounded ---
+    let after: Vec<i64> = store
+        .get_chat_events(sid, 1, 2)
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(after, vec![2, 3]);
+    let page: Vec<i64> = store
+        .get_chat_events_paginated(sid, 1, 10)
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(page, vec![2, 3, 4]);
+    assert_eq!(store.count_chat_events(sid).await.unwrap(), 4);
+    assert_eq!(store.get_latest_chat_event_seq(sid).await.unwrap(), 4);
+
+    // --- attention: only the kinds that matter, the user text blanked ---
+    let attention = store.get_attention_events(&[sid]).await.unwrap();
+    let kinds: Vec<&str> = attention.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["user_message", "permission_request", "permission_decision"]
+    );
+    assert_eq!(attention[0].data, "", "the user's words are not read back");
+    assert!(attention[1].data.contains("req-1"));
+
+    // --- previews are backfilled from the first user message ---
+    assert!(store.backfill_chat_session_previews().await.unwrap() >= 1);
+    let read = store.get_chat_session(sid).await.unwrap().unwrap();
+    assert!(
+        read.preview
+            .as_deref()
+            .is_some_and(|p| p.contains("Bonjour")),
+        "{:?}",
+        read.preview
+    );
+    assert!(read.title.is_some());
+
+    // --- delete the log, the session stays ---
+    store.delete_chat_events(sid).await.unwrap();
+    assert_eq!(store.count_chat_events(sid).await.unwrap(), 0);
+    assert!(store.get_chat_events(sid, 0, 10).await.unwrap().is_empty());
+    assert!(store.get_chat_session(sid).await.unwrap().is_some());
+
+    // --- unknown session: nothing, no error ---
+    let unknown = Uuid::new_v4();
+    assert_eq!(store.count_chat_events(unknown).await.unwrap(), 0);
+    store
+        .store_chat_events(
+            unknown,
+            vec![an_event(unknown, 1, "user_message", serde_json::json!({}))],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.count_chat_events(unknown).await.unwrap(),
+        0,
+        "an event is never written outside a session"
+    );
+
+    store.delete_chat_session(sid).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_chat_lineage_runs_and_plan_task_links() {
+    let client = store_or_skip!();
+    let store: &dyn GraphStore = &client;
+
+    let plan = PlanNode::new(
+        format!("Chat plan {}", Uuid::new_v4()),
+        "plan a conversation is linked to".to_string(),
+        "tester".to_string(),
+        1,
+    );
+    store.create_plan(&plan).await.unwrap();
+    let task = TaskNode::new("chat task".to_string());
+    store.create_task(plan.id, &task).await.unwrap();
+    let run_id = Uuid::new_v4();
+    store
+        .create_plan_run(&project_orchestrator::runner::RunnerState::new(
+            run_id,
+            plan.id,
+            1,
+            Default::default(),
+        ))
+        .await
+        .unwrap();
+
+    let root = a_chat_session(None);
+    let child = a_chat_session(None);
+    let grandchild = a_chat_session(None);
+    for s in [&root, &child, &grandchild] {
+        store.create_chat_session(s).await.unwrap();
+    }
+    let (r, c, g) = (
+        root.id.to_string(),
+        child.id.to_string(),
+        grandchild.id.to_string(),
+    );
+    store
+        .create_spawned_by_relation(&c, &r, "delegate", Some(run_id), Some(task.id))
+        .await
+        .unwrap();
+    store
+        .create_spawned_by_relation(&g, &c, "delegate", None, None)
+        .await
+        .unwrap();
+
+    // --- the tree, the root, the children ---
+    let tree = store.get_session_tree(&r).await.unwrap();
+    let depths: Vec<(String, u32)> = tree
+        .iter()
+        .map(|n| (n.session_id.clone(), n.depth))
+        .collect();
+    assert_eq!(depths, vec![(r.clone(), 0), (c.clone(), 1), (g.clone(), 2)]);
+    assert_eq!(tree[1].parent_session_id.as_deref(), Some(r.as_str()));
+    assert_eq!(tree[1].run_id, Some(run_id));
+    assert_eq!(tree[1].task_id, Some(task.id));
+    assert_eq!(tree[1].spawn_type.as_deref(), Some("delegate"));
+    assert_eq!(
+        store.get_session_root(&g).await.unwrap().as_deref(),
+        Some(r.as_str())
+    );
+    assert_eq!(
+        store.get_session_root(&r).await.unwrap().as_deref(),
+        Some(r.as_str())
+    );
+    assert_eq!(
+        store
+            .get_session_root(&Uuid::new_v4().to_string())
+            .await
+            .unwrap(),
+        None
+    );
+    let children: Vec<Uuid> = store
+        .get_session_children(root.id)
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(children, vec![child.id]);
+
+    // --- the sessions of a run ---
+    let run_sessions = store.get_run_sessions(run_id).await.unwrap();
+    assert_eq!(run_sessions.len(), 1);
+    assert_eq!(run_sessions[0].session_id, c);
+    assert_eq!(run_sessions[0].task_id, Some(task.id));
+
+    // --- a session linked to its run, and the link rows ---
+    assert!(store
+        .link_session_to_run(&r, run_id, Some(plan.id), Some(task.id))
+        .await
+        .unwrap());
+    assert!(
+        !store
+            .link_session_to_run(&r, Uuid::new_v4(), None, None)
+            .await
+            .unwrap(),
+        "an unknown run links nothing"
+    );
+    assert!(store
+        .create_associated_with(grandchild.id, "Plan", plan.id, "manual")
+        .await
+        .unwrap());
+    assert!(store
+        .create_associated_with(grandchild.id, "Task", task.id, "chat")
+        .await
+        .unwrap());
+    assert!(store
+        .create_associated_with(grandchild.id, "Milestone", plan.id, "manual")
+        .await
+        .is_err());
+    assert!(
+        !store
+            .create_associated_with(grandchild.id, "Plan", Uuid::new_v4(), "manual")
+            .await
+            .unwrap(),
+        "an unknown plan links nothing"
+    );
+    let rows = store
+        .get_session_link_rows(&[root.id, child.id, grandchild.id])
+        .await
+        .unwrap();
+    let kinds_of = |id: Uuid| -> Vec<SessionLinkKind> {
+        let mut k: Vec<_> = rows
+            .iter()
+            .filter(|r| r.session_id == id)
+            .map(|r| r.kind)
+            .collect();
+        k.sort_by_key(|k| format!("{k:?}"));
+        k
+    };
+    assert_eq!(kinds_of(root.id), vec![SessionLinkKind::RunRelation]);
+    assert_eq!(kinds_of(child.id), vec![SessionLinkKind::SpawnedByRelation]);
+    assert_eq!(
+        kinds_of(grandchild.id),
+        vec![
+            SessionLinkKind::PlanAssociation,
+            SessionLinkKind::SpawnedByRelation,
+            SessionLinkKind::TaskAssociation,
+        ]
+    );
+    let run_row = rows.iter().find(|r| r.session_id == root.id).unwrap();
+    assert_eq!(run_row.run_id, Some(run_id));
+    assert_eq!(run_row.plan_id, Some(plan.id));
+    assert!(store.get_session_link_rows(&[]).await.unwrap().is_empty());
+
+    // --- the links of a session, one and many ---
+    let links = store.get_session_links(grandchild.id).await.unwrap();
+    assert_eq!(links.linked_tasks.len(), 1);
+    assert_eq!(links.linked_tasks[0].id, task.id);
+    assert_eq!(links.linked_tasks[0].source, "chat");
+    assert!(links
+        .linked_plans
+        .iter()
+        .any(|p| p.id == plan.id && p.source == "manual"));
+    let batch = store
+        .get_session_links_batch(&[grandchild.id, root.id])
+        .await
+        .unwrap();
+    assert_eq!(batch[&grandchild.id].linked_tasks.len(), 1);
+    assert!(batch
+        .get(&root.id)
+        .is_none_or(|l| l.linked_tasks.is_empty() && l.linked_plans.is_empty()));
+    assert!(store.get_session_links_batch(&[]).await.unwrap().is_empty());
+
+    // --- and the reverse: the sessions of a plan, of a task ---
+    let for_plan = store.get_sessions_for_plan(plan.id).await.unwrap();
+    assert!(for_plan.iter().any(|s| s.session.id == grandchild.id));
+    let for_task = store.get_sessions_for_task(task.id).await.unwrap();
+    assert_eq!(for_task.len(), 1);
+    assert_eq!(for_task[0].session.id, grandchild.id);
+    assert_eq!(for_task[0].source, "chat");
+    assert_eq!(
+        store.get_task_plan_id(task.id).await.unwrap(),
+        Some(plan.id)
+    );
+    assert_eq!(store.get_task_plan_id(Uuid::new_v4()).await.unwrap(), None);
+
+    // --- cleanup ---
+    for s in [&root, &child, &grandchild] {
+        store.delete_chat_session(s.id).await.unwrap();
+    }
+    store.delete_plan(plan.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_chat_discussed_entities_and_graph_data() {
+    let client = store_or_skip!();
+    let store: &dyn GraphStore = &client;
+
+    let project = a_project();
+    store.create_project(&project).await.unwrap();
+    let path = format!("/tmp/n4j-chat-{}/src/lib.rs", Uuid::new_v4());
+    store
+        .upsert_file(&FileNode {
+            path: path.clone(),
+            language: "rust".to_string(),
+            hash: "h".to_string(),
+            last_parsed: chrono::Utc::now(),
+            project_id: Some(project.id),
+        })
+        .await
+        .unwrap();
+    let session = a_chat_session(Some(&project.slug));
+    store.create_chat_session(&session).await.unwrap();
+
+    // --- nothing to link, an unknown kind, an unknown file ---
+    assert_eq!(store.add_discussed(session.id, &[]).await.unwrap(), 0);
+    assert_eq!(
+        store
+            .add_discussed(
+                session.id,
+                &[
+                    ("Galaxy".to_string(), "x".to_string()),
+                    ("File".to_string(), "/no/such/file.rs".to_string()),
+                ],
+            )
+            .await
+            .unwrap(),
+        0
+    );
+
+    // --- a mention, then a second one: one relation, counted twice ---
+    let mention = [("File".to_string(), path.clone())];
+    assert_eq!(store.add_discussed(session.id, &mention).await.unwrap(), 1);
+    assert_eq!(store.add_discussed(session.id, &mention).await.unwrap(), 1);
+    let entities = store
+        .get_session_entities(session.id, Some(project.id))
+        .await
+        .unwrap();
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0].entity_type, "File");
+    assert_eq!(entities[0].entity_id, path);
+    assert_eq!(entities[0].mention_count, 2);
+    assert!(entities[0].last_mentioned_at.is_some());
+    assert_eq!(
+        store
+            .get_session_entities(session.id, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .get_session_entities(session.id, Some(Uuid::new_v4()))
+            .await
+            .unwrap()
+            .is_empty(),
+        "another project's view does not see this file"
+    );
+
+    // --- the chat layer of the project graph ---
+    let (sessions, discussed) = store.get_chat_graph_data(project.id, 10).await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, session.id.to_string());
+    assert_eq!(discussed.len(), 1);
+    let (none, _) = store.get_chat_graph_data(Uuid::new_v4(), 10).await.unwrap();
+    assert!(none.is_empty());
+
+    // --- no co-change history: no prediction, no error ---
+    assert!(store
+        .get_discussed_co_changers(project.id, 5, 10)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // --- cleanup ---
+    store.delete_chat_session(session.id).await.unwrap();
+    store
+        .delete_project(project.id, &project.name)
+        .await
+        .unwrap();
+}

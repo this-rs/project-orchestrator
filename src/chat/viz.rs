@@ -401,11 +401,6 @@ impl VizRegistry {
         })
     }
 
-    /// List all registered viz types.
-    pub fn registered_types(&self) -> Vec<&VizType> {
-        self.builders.keys().collect()
-    }
-
     /// Build a VizBlock, or return a fallback block for unregistered types.
     pub fn build_or_fallback(
         &self,

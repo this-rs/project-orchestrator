@@ -602,12 +602,16 @@ jobs:
           NEO4J_PASSWORD: testpassword
           MEILISEARCH_URL: http://localhost:${{ job.services.meilisearch.ports['7700'] }}
           MEILISEARCH_KEY: test-master-key
+        # harness_neo4j: the anchors, provider settings and lineage of src/neo4j/chat.rs
+        # (with neo4j_store_tests for the rest of the file). REQUIRED, so a missing
+        # Neo4j fails instead of uploading a 0 %.
         run: |
-          cargo llvm-cov --no-report --no-fail-fast \
+          HARNESS_NEO4J_REQUIRED=1 cargo llvm-cov --no-report --no-fail-fast \
             --test integration_tests \
             --test data_migrations \
             --test workspace_tests \
-            --test neo4j_store_tests
+            --test neo4j_store_tests \
+            --test harness_neo4j
 
       # (4) Merge every run above into one lcov.
       - name: Merge coverage runs into a single lcov
@@ -654,7 +658,8 @@ jobs:
             src/neo4j/decision.rs \
             src/neo4j/user.rs \
             src/neo4j/traits.rs \
-            src/neo4j/client.rs
+            src/neo4j/client.rs \
+            src/neo4j/chat.rs
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7

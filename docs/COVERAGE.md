@@ -19,6 +19,8 @@ Périmètre à la date de la mesure : la CI exécutait `cargo llvm-cov --lib --t
 
 **Depuis la tâche 3.1**, le job `coverage` collecte en plusieurs passes puis les **fusionne** (`cargo llvm-cov --no-report` ×3, puis `cargo llvm-cov report --lcov`) : tests unitaires du workspace entier (`--workspace --exclude project-orchestrator-desktop --lib`, ce qui inclut enfin les crates membres), `parser_tests`, puis les suites qui parlent au vrai Neo4j (`integration_tests`, `data_migrations`, `workspace_tests`, `neo4j_store_tests`). Les chiffres de ce document sont donc un plancher : ils datent d'avant cet élargissement.
 
+**Depuis B19**, le chat n'est plus exclu (`src/chat/**`, `src/api/chat_handlers.rs`, `src/api/ws_chat_handler.rs`, `src/neo4j/chat.rs`) et la passe Neo4j inclut `harness_neo4j` ; les lignes du tableau ci-dessous qui les concernent datent d'avant. Chiffres avant/après dans [COVERAGE_EXCLUSIONS.md](COVERAGE_EXCLUSIONS.md).
+
 Le registre des exclusions, avec le propriétaire de chacune et le compteur qui ne peut que baisser, est dans [COVERAGE_EXCLUSIONS.md](COVERAGE_EXCLUSIONS.md).
 
 ## Par module (run CI-équivalent, avec Neo4j)
