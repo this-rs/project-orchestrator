@@ -532,17 +532,15 @@ pub async fn envelope_for_caller(
         SpawnCaller::Agent {
             session_id,
             token_ceiling,
-        } => {
-            resolve_envelope(
-                graph,
-                live,
-                session_id,
-                token_ceiling.as_deref(),
-                max_live_children,
-            )
-            .await
-            .map(Some)
-        }
+        } => resolve_envelope(
+            graph,
+            live,
+            session_id,
+            token_ceiling.as_deref(),
+            max_live_children,
+        )
+        .await
+        .map(Some),
     }
 }
 
@@ -1104,9 +1102,15 @@ mod tests {
     #[tokio::test]
     async fn the_ceiling_falls_back_to_the_global_default() {
         let (graph, parent) = store_with_parent(None).await;
-        let env = resolve_envelope(&graph, &live("default"), &parent.to_string(), None, MAX_LIVE_CHILDREN)
-            .await
-            .unwrap();
+        let env = resolve_envelope(
+            &graph,
+            &live("default"),
+            &parent.to_string(),
+            None,
+            MAX_LIVE_CHILDREN,
+        )
+        .await
+        .unwrap();
         assert_eq!(env.ceiling, "default");
     }
 
@@ -1116,17 +1120,29 @@ mod tests {
         // A human lowered the live session to plan.
         let mut l = live("default");
         l.live_mode = Some("plan".into());
-        let env = resolve_envelope(&graph, &l, &parent.to_string(), Some("bypassPermissions"), MAX_LIVE_CHILDREN)
-            .await
-            .unwrap();
+        let env = resolve_envelope(
+            &graph,
+            &l,
+            &parent.to_string(),
+            Some("bypassPermissions"),
+            MAX_LIVE_CHILDREN,
+        )
+        .await
+        .unwrap();
         assert_eq!(env.ceiling, "plan");
 
         // The token was minted in Ask mode; the session was raised since.
         let mut l = live("default");
         l.live_mode = Some("bypassPermissions".into());
-        let env = resolve_envelope(&graph, &l, &parent.to_string(), Some("default"), MAX_LIVE_CHILDREN)
-            .await
-            .unwrap();
+        let env = resolve_envelope(
+            &graph,
+            &l,
+            &parent.to_string(),
+            Some("default"),
+            MAX_LIVE_CHILDREN,
+        )
+        .await
+        .unwrap();
         assert_eq!(env.ceiling, "default");
     }
 
@@ -1134,9 +1150,15 @@ mod tests {
     async fn a_spawned_session_cannot_spawn() {
         let (graph, parent) = store_with_parent(Some("default")).await;
         let child = add_child(&graph, parent).await;
-        let err = resolve_envelope(&graph, &live("default"), &child.to_string(), None, MAX_LIVE_CHILDREN)
-            .await
-            .unwrap_err();
+        let err = resolve_envelope(
+            &graph,
+            &live("default"),
+            &child.to_string(),
+            None,
+            MAX_LIVE_CHILDREN,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             err,
             EnvelopeError::DepthExceeded {

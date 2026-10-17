@@ -390,10 +390,15 @@ impl ChatManager {
                  raise CHAT_MAX_LIVE_CHILDREN to allow more)"
             ))
         })?;
-        let env =
-            envelope::resolve_envelope(self.graph.as_ref(), self.as_ref(), parent_session_id, None, self.config.max_live_children)
-                .await
-                .map_err(|e| refused(e.code().to_owned()))?;
+        let env = envelope::resolve_envelope(
+            self.graph.as_ref(),
+            self.as_ref(),
+            parent_session_id,
+            None,
+            self.config.max_live_children,
+        )
+        .await
+        .map_err(|e| refused(e.code().to_owned()))?;
         // AUTO-SUB: a parent conversation in Auto (mode `full`, or a pool of two models or
         // more) routes every `Agent` call over every candidate its person and project allow —
         // Claude Code included — instead of the child inheriting the parent's provider and

@@ -1054,8 +1054,13 @@ pub async fn delegate_task(
         envelope::session_header(&headers),
         state.auth_config.is_some(),
     )?;
-    let parent_envelope =
-        envelope::envelope_for_caller(graph.as_ref(), chat_manager.as_ref(), &caller, chat_manager.config.max_live_children).await?;
+    let parent_envelope = envelope::envelope_for_caller(
+        graph.as_ref(),
+        chat_manager.as_ref(),
+        &caller,
+        chat_manager.config.max_live_children,
+    )
+    .await?;
     let default_mode = chat_manager.default_permission_mode().await;
     let mut chat_request = delegation_chat_request(
         req.cwd,
