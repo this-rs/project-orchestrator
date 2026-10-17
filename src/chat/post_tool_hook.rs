@@ -36,6 +36,11 @@ pub(crate) struct PostToolUseRedirectHook {
     throttle: Mutex<HashMap<String, Instant>>,
     /// The resolved project of the session (mode `on`); `None`: historical resolution.
     session_project: Option<Arc<super::anchor_resolver::SessionProject>>,
+    /// The session's injection ledger, in place of the time throttle: an advice is
+    /// given once, again after `REINJECT_AFTER_CALLS` tool calls or a compaction
+    /// (`HookLedger::reset`). Set by the host's fallback for a provider without hooks
+    /// (`provider::hooks`, B14); `None`: the 60 s throttle.
+    ledger: Option<Arc<super::hook_ledger::HookLedger>>,
 }
 
 impl PostToolUseRedirectHook {
@@ -44,7 +49,14 @@ impl PostToolUseRedirectHook {
             graph_store,
             throttle: Mutex::new(HashMap::new()),
             session_project: None,
+            ledger: None,
         }
+    }
+
+    /// Deduplicate by the session's ledger instead of the time throttle.
+    pub fn with_ledger(mut self, ledger: Arc<super::hook_ledger::HookLedger>) -> Self {
+        self.ledger = Some(ledger);
+        self
     }
 
     /// Work for the project the session resolved instead of the tool cwd's.
@@ -182,7 +194,12 @@ impl nexus_claude::HookCallback for PostToolUseRedirectHook {
             post_tool.tool_name,
             extract_file_context(&post_tool.tool_name, &post_tool.tool_input).unwrap_or_default()
         );
-        if self.is_throttled(&throttle_key) {
+        let ledger_key = super::hook_ledger::InjectionKey::Redirect(throttle_key.clone());
+        let held_back = match &self.ledger {
+            Some(ledger) => !ledger.is_fresh(&ledger_key),
+            None => self.is_throttled(&throttle_key),
+        };
+        if held_back {
             return Ok(Self::passthrough());
         }
 
@@ -269,6 +286,9 @@ impl nexus_claude::HookCallback for PostToolUseRedirectHook {
             return Ok(Self::passthrough());
         }
 
+        if let Some(ledger) = &self.ledger {
+            ledger.record(ledger_key);
+        }
         let combined = context_parts.join("\n\n");
         Ok(nexus_claude::HookJSONOutput::Sync(
             nexus_claude::SyncHookJSONOutput {

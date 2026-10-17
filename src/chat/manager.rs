@@ -2210,16 +2210,18 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             Some(md) => prepend_enrichment(&md, &body),
             None => body,
         };
+        // The advice the post-tool hook gave after the previous turns' tools, when the
+        // provider runs no hook (B14): the host's door, in front of the next turn.
+        // Only read here, as the held context below: `after_turn` drops it once a
+        // turn carrying it was answered (`HookFallback::settle`).
+        let prepared = match self.hook_fallback.as_ref().and_then(|f| f.carried()) {
+            Some(advice) => prepend_enrichment(&advice, &prepared),
+            None => prepared,
+        };
         // What waits since the last compaction goes in front of this turn, whatever
         // started it. Only read here: `after_turn` clears it once a turn carrying it
         // was answered (`TurnOutcome::answered`), so a turn refused before it was
         // sent, failed, or stopped before any attempt was answered keeps it.
-        // The advice the post-tool hook gave after the previous turn's tools, when the
-        // provider runs no hook (B14): the host's door, in front of the next turn.
-        let prepared = match self.hook_fallback.as_ref().and_then(|f| f.take_carried()) {
-            Some(advice) => prepend_enrichment(&advice, &prepared),
-            None => prepared,
-        };
         let held = self.session.held.prefix();
         let prepared = match held {
             Some(context) => prepend_enrichment(&context, &prepared),
@@ -2573,8 +2575,11 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         }
         // A provider that runs no hook: the post-tool hook is played over the turn's
         // tool results, its advice said as a system hint and carried in front of the
-        // next turn (`HookFallback::take_carried`), B14.
+        // next turn (`HookFallback::carried`), B14.
         if let Some(fallback) = self.hook_fallback.clone() {
+            // What this turn carried is dropped first (answered) or kept, before the
+            // advice of its own tools is added.
+            fallback.settle(outcome.answered);
             if let Some(advice) = self
                 .step(&mut after, session_id, "post_tool_hooks", async move {
                     fallback.after_turn().await
@@ -16859,11 +16864,15 @@ impl ChatManager {
         if is_runner_spawned(node.spawned_by.as_deref()) {
             return None;
         }
+        // One ledger for the session: the fallback resets it on the compaction signal,
+        // the redirect hook gives an advice once per ledger window (B14).
+        let ledger = Arc::new(super::hook_ledger::HookLedger::new());
         let redirect =
-            Self::redirect_hook(self.graph.clone(), self.hook_session_project(session_id));
+            Self::redirect_hook(self.graph.clone(), self.hook_session_project(session_id))
+                .with_ledger(Arc::clone(&ledger));
         Some(Arc::new(super::provider::hooks::HookFallback::new(
             Arc::new(redirect),
-            Arc::new(super::hook_ledger::HookLedger::new()),
+            ledger,
             session_id,
             node.cwd,
         )))
@@ -34764,6 +34773,54 @@ mod held_context_tests {
         assert!(!then.contains("Post-Compaction Context"), "dropped: {then}");
         // And from the store too: written before `after_turn` returned.
         assert!(HeldContext::load(&s.graph, &sid).await.unwrap().is_empty());
+    }
+
+    /// B14 (review of #814): the post-tool advice of a provider without hooks is
+    /// carried like the held context — a turn prepared but not answered (refused,
+    /// failed, stopped) leaves it for the next one; a turn answered consumes it, once.
+    #[tokio::test]
+    async fn the_post_tool_advice_is_dropped_only_once_a_turn_is_answered() {
+        use super::super::agent_runtime::TurnServices as _;
+        let (manager, sid) = world().await;
+        let mut s = services(&manager, manager.agent_turn_state(&sid).await);
+        s.hook_fallback = Some(Arc::new(super::super::provider::hooks::HookFallback::new(
+            Arc::new(super::super::provider::hooks::TestAdvisor),
+            Arc::new(super::super::hook_ledger::HookLedger::new()),
+            sid.clone(),
+            "/tmp",
+        )));
+        s.observe(
+            &sid,
+            &ChatEvent::ToolUse {
+                id: "t1".into(),
+                tool: "Grep".into(),
+                input: serde_json::json!({}),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+            },
+        );
+        s.observe(
+            &sid,
+            &ChatEvent::ToolResult {
+                id: "t1".into(),
+                result: serde_json::json!("30 lines"),
+                is_error: false,
+                parent_tool_use_id: None,
+            },
+        );
+        // The turn of the Grep, answered: its advice waits for the next turn.
+        s.after_turn(&sid, &answered()).await;
+        let advice = "use find_references (30 lines)";
+        assert!(prepared(&s, &sid, "one").await.contains(advice));
+        // That turn failed: not answered, the advice is kept.
+        s.after_turn(&sid, &TurnOutcome::default()).await;
+        let again = prepared(&s, &sid, "two").await;
+        assert!(again.contains(advice), "kept: {again}");
+        // Answered: consumed, never carried twice.
+        s.after_turn(&sid, &answered()).await;
+        let then = prepared(&s, &sid, "three").await;
+        assert!(!then.contains(advice), "dropped: {then}");
     }
 
     #[test]
