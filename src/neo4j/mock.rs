@@ -12605,6 +12605,22 @@ impl GraphStore for MockGraphStore {
         Ok(v)
     }
 
+    async fn record_agent_execution_verification(
+        &self,
+        agent_execution_id: Uuid,
+        verification_json: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(node) = self
+            .agent_executions
+            .write()
+            .await
+            .get_mut(&agent_execution_id)
+        {
+            node.verification_json = Some(verification_json.to_string());
+        }
+        Ok(())
+    }
+
     async fn create_used_skill_relation(
         &self,
         _agent_execution_id: Uuid,

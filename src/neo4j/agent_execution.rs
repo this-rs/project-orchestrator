@@ -450,6 +450,29 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Record the per-check verification result on one AgentExecution.
+    ///
+    /// Single property, no read-modify-write: the attempt may be closed
+    /// concurrently, and a full-node update from a stale copy would restore
+    /// `status = running`.
+    pub async fn record_agent_execution_verification_impl(
+        &self,
+        agent_execution_id: Uuid,
+        verification_json: &str,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (ae:AgentExecution {id: $id})
+            SET ae.verification_json = $verification_json
+            "#,
+        )
+        .param("id", agent_execution_id.to_string())
+        .param("verification_json", verification_json);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
     /// Get all AgentExecution nodes for a given PlanRun.
     pub async fn get_agent_executions_for_run_impl(
         &self,

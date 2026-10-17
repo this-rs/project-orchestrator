@@ -8,7 +8,6 @@
 
 use crate::neo4j::models::StepStatus;
 use crate::neo4j::traits::GraphStore;
-use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;

@@ -153,6 +153,16 @@ impl RunnerState {
         self.sync_current_task_compat();
     }
 
+    /// Drop a task from `completed_tasks` without recording it as failed.
+    ///
+    /// Used when a task's agent run succeeded but its verification failed and a
+    /// retry is coming: until that retry lands, the task is neither completed
+    /// nor failed, so counting it as completed would overstate the run.
+    pub fn unmark_task_completed(&mut self, task_id: Uuid) {
+        self.completed_tasks.retain(|t| *t != task_id);
+        self.sync_current_task_compat();
+    }
+
     // ========================================================================
     // Active agent management
     // ========================================================================
