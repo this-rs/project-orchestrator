@@ -26502,7 +26502,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs the claude CLI on PATH (run with: cargo test -- --ignored)"]
     async fn live_snapshot_reports_the_permissions_each_live_cli_still_holds() {
         let (manager, _graph) = manager_with_mock();
         let with = Uuid::new_v4();
@@ -26513,12 +26512,10 @@ mod tests {
             true,
             &["req-1", "req-2"],
         )
-        .await
-        .expect("the Claude CLI binary must be installed to run this test");
+        .await;
         let _b =
             super::test_support::insert_live_session(&manager, &without.to_string(), false, &[])
-                .await
-                .expect("the Claude CLI binary must be installed to run this test");
+                .await;
         let snap = manager.live_session_snapshot().await;
         assert_eq!(snap.live, [with, without].into_iter().collect());
         assert_eq!(snap.streaming, [with].into_iter().collect());
@@ -26644,14 +26641,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs the claude CLI on PATH (run with: cargo test -- --ignored)"]
     async fn failed_stdin_send_keeps_the_permission_pending_for_a_retry() {
         let (manager, _graph) = manager_with_mock();
         let sid = Uuid::new_v4().to_string();
         let (stdin_rx, _q) =
-            super::test_support::insert_live_session(&manager, &sid, false, &["req-1"])
-                .await
-                .expect("the Claude CLI binary must be installed to run this test");
+            super::test_support::insert_live_session(&manager, &sid, false, &["req-1"]).await;
         // The CLI is gone: the stdin channel is closed, the send fails.
         drop(stdin_rx);
         let mut events = {
@@ -33542,24 +33536,25 @@ pub(crate) mod test_support {
     }
 
     /// Register a live session. Returns the receiver of what would be written
-    /// to the CLI's stdin and the queue of messages received while streaming,
-    /// or `None` when the Claude CLI binary is not installed (the dummy client
-    /// needs it). Callers that assert something must `.expect` it: a test must
-    /// never pass without verifying anything.
+    /// to the CLI's stdin and the queue of messages received while streaming.
+    ///
+    /// The CLI is `fake_claude`, the scripted stand-in for the Claude CLI that
+    /// nexus builds (`NEXUS_FAKES_DIR`, the same binaries as the agent e2e tests),
+    /// RUNNING: connected, it waits for its stdin to close (600 s at most, see
+    /// [`connected_fake_cli`]), so the session is
+    /// live for `evict_if_cli_dead` as it would be with the real CLI. No `claude`
+    /// has to be installed, and a missing fake FAILS instead of skipping. What the
+    /// session writes to the CLI goes through the `stdin` channel the test reads.
     pub(crate) async fn insert_live_session(
         manager: &ChatManager,
         session_id: &str,
         is_streaming: bool,
         pending_permissions: &[&str],
-    ) -> Option<(
+    ) -> (
         tokio::sync::mpsc::Receiver<String>,
         Arc<Mutex<VecDeque<PendingMessage>>>,
-    )> {
-        let client = InteractiveClient::new(nexus_claude::ClaudeCodeOptions {
-            model: Some("test".into()),
-            ..Default::default()
-        })
-        .ok()?;
+    ) {
+        let client = connected_fake_cli().await;
         insert_session_with_client(
             manager,
             session_id,
@@ -33568,6 +33563,36 @@ pub(crate) mod test_support {
             pending_permissions,
         )
         .await
+        .expect("the session is registered")
+    }
+
+    /// A client connected to a running `fake_claude` that stays up until its
+    /// stdin closes (the client is dropped, or the test process ends) or for at
+    /// most 600 s: the transcript (`tests/fixtures/fake_claude/live_until_eof.jsonl`,
+    /// checked in, so nothing is left in the temp dir) waits for EOF with a 600 s
+    /// timeout, the same bound as the fake's watchdog set below.
+    pub(crate) async fn connected_fake_cli() -> InteractiveClient {
+        let transcript = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fake_claude/live_until_eof.jsonl");
+        let mut options = nexus_claude::ClaudeCodeOptions {
+            model: Some("test".into()),
+            cli_path: Some(crate::chat::agent_e2e_tests::fake_bin("fake_claude")),
+            ..Default::default()
+        };
+        options.env.insert(
+            "FAKE_CLAUDE_TRANSCRIPT".into(),
+            transcript.display().to_string(),
+        );
+        // The fake's watchdog (30 s by default) must not end a CLI a slow test holds;
+        // same bound as the `wait_eof` timeout of the transcript.
+        options
+            .env
+            .insert("FAKE_CLAUDE_MAX_RUNTIME_MS".into(), "600000".into());
+        let mut client =
+            InteractiveClient::new(options).expect("an explicit CLI path is never searched for");
+        client.connect().await.expect("fake_claude starts");
+        assert!(client.is_alive().await, "the fake CLI is running");
+        client
     }
 
     /// A live session whose "CLI" is an in-memory transport: the handle shows

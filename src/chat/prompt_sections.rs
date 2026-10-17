@@ -198,19 +198,6 @@ impl ActivationCondition {
         }
     }
 
-    /// Section is included only when protocols are active.
-    pub const fn when_protocol_active() -> Self {
-        Self {
-            scaffolding_min: None,
-            scaffolding_max: None,
-            requires_active_plan: false,
-            requires_active_protocol: true,
-            min_task_count: None,
-            always: false,
-            compact_scaffolding_range: None,
-        }
-    }
-
     /// Whether the compact variant should be used at the given scaffolding level.
     pub fn use_compact(&self, scaffolding_level: u8) -> bool {
         if let Some((min, max)) = self.compact_scaffolding_range {

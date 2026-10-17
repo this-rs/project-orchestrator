@@ -768,28 +768,6 @@ pub fn spawn_observation_processing(
     });
 }
 
-/// Backward-compatible alias for `spawn_observation_processing`.
-#[deprecated(note = "Use spawn_observation_processing instead")]
-pub fn spawn_rfc_processing(
-    graph: Arc<dyn GraphStore>,
-    search: Arc<dyn SearchStore>,
-    project_id: Option<Uuid>,
-    response_text: String,
-    rfc_accumulator: Arc<Mutex<RfcAccumulator>>,
-    session_id: Option<Uuid>,
-    event_emitter: Option<Arc<dyn EventEmitter>>,
-) {
-    spawn_observation_processing(
-        graph,
-        search,
-        project_id,
-        response_text,
-        rfc_accumulator,
-        session_id,
-        event_emitter,
-    );
-}
-
 // ============================================================================
 // Tests
 // ============================================================================

@@ -352,37 +352,6 @@ pub async fn build_dependency_tree_viz(
     )))
 }
 
-/// Build an empty state VizBlock for the runner dashboard (no agents spawned).
-///
-/// Pure construction — no graph queries needed.
-pub fn build_empty_state_viz(
-    icon: &str,
-    title: &str,
-    description: &str,
-    cta_label: Option<&str>,
-    cta_action: Option<&str>,
-) -> Result<VizBlock> {
-    let builder = EmptyStateVizBuilder {
-        icon: icon.to_string(),
-        title: title.to_string(),
-        description: description.to_string(),
-        cta_label: cta_label.map(|s| s.to_string()),
-        cta_action: cta_action.map(|s| s.to_string()),
-    };
-    builder.build()
-}
-
-/// Build a tab layout VizBlock for runner dashboard navigation.
-///
-/// Pure construction — no graph queries needed.
-pub fn build_tab_layout_viz(tabs: Vec<TabDef>, active_tab: &str) -> Result<VizBlock> {
-    let builder = TabLayoutVizBuilder {
-        tabs,
-        active_tab: active_tab.to_string(),
-    };
-    builder.build()
-}
-
 /// Build a progress ring VizBlock from a plan ID.
 ///
 /// Queries the graph for the plan and its tasks, then builds a

@@ -639,11 +639,6 @@ impl EnrichmentPipeline {
     pub fn config(&self) -> &EnrichmentConfig {
         &self.config
     }
-
-    /// Update the config.
-    pub fn set_config(&mut self, config: EnrichmentConfig) {
-        self.config = config;
-    }
 }
 
 // ============================================================================

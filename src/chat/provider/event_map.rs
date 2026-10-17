@@ -406,11 +406,6 @@ impl EventMapper {
     }
 }
 
-/// One-shot form of [`EventMapper::map`] for a stateless caller (tests, replay).
-pub fn agent_event_to_chat_event(event: &AgentEvent, mapper: &mut EventMapper) -> Vec<ChatEvent> {
-    mapper.map(event)
-}
-
 fn category_name(c: ToolCategory) -> String {
     serde_json::to_value(c)
         .ok()

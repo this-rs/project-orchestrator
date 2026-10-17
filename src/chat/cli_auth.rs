@@ -50,12 +50,25 @@ pub async fn check_cli_auth_status() -> CliAuthStatus {
     };
 
     debug!(cli = %cli_path.display(), "Checking CLI auth status");
-
-    let output = match tokio::time::timeout(
+    auth_status_of(
+        tokio::process::Command::new(&cli_path),
         std::time::Duration::from_secs(10),
-        tokio::process::Command::new(&cli_path)
-            .args(["auth", "status"])
+    )
+    .await
+}
+
+/// Run `<cli> auth status` with the program (and environment) `cli` already
+/// carries, and read its answer. Split from [`check_cli_auth_status`] so the
+/// tests can point it at `fake_claude` instead of whatever is installed.
+async fn auth_status_of(
+    mut cli: tokio::process::Command,
+    timeout: std::time::Duration,
+) -> CliAuthStatus {
+    let output = match tokio::time::timeout(
+        timeout,
+        cli.args(["auth", "status"])
             .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
             .output(),
     )
     .await
@@ -71,7 +84,7 @@ pub async fn check_cli_auth_status() -> CliAuthStatus {
             };
         }
         Err(_) => {
-            warn!("claude auth status timed out (10s)");
+            warn!(?timeout, "claude auth status timed out");
             return CliAuthStatus {
                 logged_in: false,
                 auth_type: "none".to_string(),
@@ -171,14 +184,121 @@ mod tests {
         assert_eq!(raw.email, None);
     }
 
-    /// Integration test — requires a real Claude CLI.
+    /// `fake_claude` (the scripted Claude CLI of nexus) playing `transcript`.
+    fn fake_cli(
+        dir: &tempfile::TempDir,
+        transcript: &[serde_json::Value],
+    ) -> tokio::process::Command {
+        let path = dir.path().join("transcript.jsonl");
+        let lines: Vec<String> = transcript.iter().map(|op| op.to_string()).collect();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let mut cli =
+            tokio::process::Command::new(crate::chat::agent_e2e_tests::fake_bin("fake_claude"));
+        cli.env("FAKE_CLAUDE_TRANSCRIPT", &path);
+        cli
+    }
+
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
     #[tokio::test]
-    #[ignore]
-    async fn test_check_cli_auth_status_integration() {
-        let status = check_cli_auth_status().await;
-        // On a machine with Claude CLI installed and logged in
-        if status.logged_in {
-            assert_ne!(status.auth_type, "none");
-        }
+    async fn a_logged_in_cli_reports_its_method_and_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_cli(
+            &dir,
+            &[
+                serde_json::json!({"op": "emit_json", "json": {
+                    "loggedIn": true, "authMethod": "claude.ai", "email": "dev@example.com"
+                }}),
+                serde_json::json!({"op": "exit", "code": 0}),
+            ],
+        );
+        let status = auth_status_of(cli, PATIENCE).await;
+        assert!(status.logged_in);
+        assert_eq!(status.auth_type, "claude.ai");
+        assert_eq!(status.account_email.as_deref(), Some("dev@example.com"));
+        assert_eq!(status.message, None);
+    }
+
+    #[tokio::test]
+    async fn a_logged_out_cli_without_method_reads_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_cli(
+            &dir,
+            &[
+                serde_json::json!({"op": "emit_json", "json": {"loggedIn": false}}),
+                serde_json::json!({"op": "exit", "code": 1}),
+            ],
+        );
+        let status = auth_status_of(cli, PATIENCE).await;
+        assert!(!status.logged_in);
+        assert_eq!(status.auth_type, "none");
+        assert_eq!(status.account_email, None);
+        assert_eq!(status.message, None, "a parsed answer carries no message");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_answer_falls_back_on_the_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = fake_cli(
+            &dir,
+            &[
+                serde_json::json!({"op": "emit", "line": "Logged in."}),
+                serde_json::json!({"op": "exit", "code": 0}),
+            ],
+        );
+        let status = auth_status_of(ok, PATIENCE).await;
+        assert!(status.logged_in, "exit 0 reads as logged in");
+        assert_eq!(status.auth_type, "unknown");
+        assert_eq!(
+            status.message.as_deref(),
+            Some("Could not parse auth status (exit code: Some(0))")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let failed = fake_cli(
+            &dir,
+            &[
+                serde_json::json!({"op": "emit", "line": "Not logged in."}),
+                serde_json::json!({"op": "exit", "code": 3}),
+            ],
+        );
+        let status = auth_status_of(failed, PATIENCE).await;
+        assert!(!status.logged_in);
+        assert_eq!(status.auth_type, "none");
+        assert_eq!(
+            status.message.as_deref(),
+            Some("Could not parse auth status (exit code: Some(3))")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_does_not_answer_in_time_is_reported_as_a_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_cli(
+            &dir,
+            &[
+                serde_json::json!({"op": "sleep", "ms": 5000}),
+                serde_json::json!({"op": "exit", "code": 0}),
+            ],
+        );
+        let status = auth_status_of(cli, std::time::Duration::from_millis(200)).await;
+        assert!(!status.logged_in);
+        assert_eq!(status.auth_type, "none");
+        assert_eq!(status.message.as_deref(), Some("CLI auth check timed out"));
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_cannot_be_started_is_reported_as_such() {
+        let cli = tokio::process::Command::new("/nonexistent/claude");
+        let status = auth_status_of(cli, PATIENCE).await;
+        assert!(!status.logged_in);
+        assert_eq!(status.auth_type, "none");
+        assert!(
+            status
+                .message
+                .as_deref()
+                .is_some_and(|m| m.starts_with("Failed to run CLI: ")),
+            "{status:?}"
+        );
     }
 }

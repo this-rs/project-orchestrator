@@ -80,11 +80,6 @@ impl ConversationGraph {
         &self.turns
     }
 
-    /// The labels of a turn, when it is part of the graph.
-    pub fn labels_of(&self, turn: u32) -> Option<&BTreeSet<String>> {
-        self.labels.get(&turn)
-    }
-
     /// The tools of a turn, when it is part of the graph.
     pub fn tools_of(&self, turn: u32) -> Option<&BTreeSet<String>> {
         self.tools.get(&turn)

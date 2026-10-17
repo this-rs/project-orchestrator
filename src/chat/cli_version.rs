@@ -637,9 +637,41 @@ mod tests {
         );
     }
 
+    /// The version is read from the CLI itself, `X.Y.Z (Claude Code)` suffix
+    /// included: `fake_claude` (the scripted Claude CLI of nexus) answers
+    /// `--version` the way the real one does.
+    #[tokio::test]
+    async fn the_installed_version_is_read_from_the_cli_output() {
+        let fake = crate::chat::agent_e2e_tests::fake_bin("fake_claude");
+        let v = get_cli_version_robust(&fake)
+            .await
+            .expect("fake_claude answers --version");
+        let raw = std::process::Command::new(&fake)
+            .arg("--version")
+            .output()
+            .unwrap();
+        let raw = String::from_utf8_lossy(&raw.stdout).trim().to_string();
+        assert!(
+            raw.ends_with("(Claude Code)"),
+            "the fake prints the suffix the parser strips: {raw}"
+        );
+        assert_eq!(
+            Some(v.to_string().as_str()),
+            raw.split_whitespace().next(),
+            "the whole X.Y.Z, patch included ({raw})"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_cannot_be_run_has_no_version() {
+        assert!(get_cli_version_robust(Path::new("/nonexistent/claude"))
+            .await
+            .is_none());
+    }
+
     /// Integration test: check_cli_status returns a valid struct.
-    /// Marked #[ignore] because it requires network access for npm check
-    /// and a real Claude CLI installation.
+    /// Stays `#[ignore]`: it asks npm for the latest version (network), which
+    /// no fake stands in for. Its CLI half is covered above on `fake_claude`.
     #[tokio::test]
     #[ignore]
     async fn test_check_cli_status_integration() {
