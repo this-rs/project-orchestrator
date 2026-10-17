@@ -160,6 +160,108 @@ pub async fn delete_project_routing(
     }
 }
 
+/// Body of `PUT /api/chat/delegation-limits`; also what `GET` and `DELETE` answer (PLAFOND-RT).
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationLimitsBody {
+    /// How many children of one parent may be alive at once.
+    pub max_live_children: usize,
+}
+
+/// What `GET`, `PUT` and `DELETE /api/chat/delegation-limits` answer.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DelegationLimitsView {
+    /// The cap in force now.
+    pub max_live_children: usize,
+    /// The cap when nothing is set.
+    pub default_max_live_children: usize,
+    /// Smallest and largest cap that can be set.
+    pub min_live_children: usize,
+    pub max_live_children_ceiling: usize,
+}
+
+impl DelegationLimitsView {
+    fn of(max_live_children: usize) -> Self {
+        Self {
+            max_live_children,
+            default_max_live_children: crate::chat::envelope::MAX_LIVE_CHILDREN,
+            min_live_children: crate::chat::delegation_limits::MIN_LIVE_CHILDREN,
+            max_live_children_ceiling: crate::chat::delegation_limits::MAX_LIVE_CHILDREN_CEILING,
+        }
+    }
+}
+
+fn invalid_delegation_limits(message: String) -> AppError {
+    AppError::Provider(Box::new(OpenFailure {
+        status: StatusCode::BAD_REQUEST.as_u16(),
+        code: "invalid_delegation_limits",
+        message,
+        provider_id: None,
+        action: None,
+        retryable: false,
+        retry_after_ms: None,
+        fallbacks: None,
+        consent_scope: None,
+        candidates: None,
+    }))
+}
+
+fn chat_manager_of(state: &OrchestratorState) -> Result<&Arc<crate::chat::ChatManager>, AppError> {
+    state
+        .chat_manager
+        .as_ref()
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("chat is not enabled")))
+}
+
+/// GET /api/chat/delegation-limits — the cap on a parent's live children in force now, with
+/// its default and bounds. Readable by anyone signed in: it is the number an agent is
+/// refused with anyway.
+pub async fn get_delegation_limits(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<DelegationLimitsView>, AppError> {
+    let manager = chat_manager_of(&state)?;
+    Ok(Json(DelegationLimitsView::of(manager.max_live_children())))
+}
+
+/// PUT /api/chat/delegation-limits `{ "max_live_children": N }` — sets the cap for the NEXT
+/// delegations, no restart (PLAFOND-RT). The root account only: a server-wide resource
+/// decision, never an agent's (a model must not raise its own ceiling). Live children are
+/// never closed by a lower value.
+pub async fn put_delegation_limits(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<DelegationLimitsBody>,
+) -> Result<Json<DelegationLimitsView>, AppError> {
+    super::provider_handlers::require_root(&state, &claims)?;
+    let manager = chat_manager_of(&state)?;
+    let stored = manager
+        .set_max_live_children(body.max_live_children)
+        .await
+        .map_err(|bad| {
+            invalid_delegation_limits(format!(
+                "max_live_children must be between {} and {}, got {bad}",
+                crate::chat::delegation_limits::MIN_LIVE_CHILDREN,
+                crate::chat::delegation_limits::MAX_LIVE_CHILDREN_CEILING,
+            ))
+        })?
+        .map_err(AppError::Internal)?;
+    Ok(Json(DelegationLimitsView::of(stored)))
+}
+
+/// DELETE /api/chat/delegation-limits — back to the default cap (root account only).
+pub async fn delete_delegation_limits(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<DelegationLimitsView>, AppError> {
+    super::provider_handlers::require_root(&state, &claims)?;
+    let manager = chat_manager_of(&state)?;
+    let cap = manager
+        .reset_max_live_children()
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(DelegationLimitsView::of(cap)))
+}
+
 /// Most pairs a person's Auto list may hold.
 pub const MAX_AUTO_MODELS: usize = 500;
 
@@ -436,6 +538,13 @@ mod tests {
     use uuid::Uuid;
 
     async fn state() -> OrchestratorState {
+        state_with(None, crate::test_helpers::test_auth_config()).await
+    }
+
+    async fn state_with(
+        chat_manager: Option<Arc<crate::chat::ChatManager>>,
+        auth_config: crate::AuthConfig,
+    ) -> OrchestratorState {
         let app_state = mock_app_state();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
@@ -444,12 +553,12 @@ mod tests {
         Arc::new(ServerState {
             orchestrator,
             watcher,
-            chat_manager: None,
+            chat_manager,
             event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
                 crate::events::EventBus::default(),
             ))),
             nats_emitter: None,
-            auth_config: Some(crate::test_helpers::test_auth_config()),
+            auth_config: Some(auth_config),
             serve_frontend: false,
             frontend_path: "./dist".to_string(),
             setup_completed: true,
@@ -1115,5 +1224,140 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(got["code"], "invalid_auto_models");
+    }
+
+    const ROOT_EMAIL: &str = "root@ffs.holdings";
+
+    /// A server with a chat manager and a configured root account; returns the router, the
+    /// manager and the root account's bearer token.
+    async fn app_with_root() -> (axum::Router, Arc<crate::chat::ChatManager>, String) {
+        let mut auth = crate::test_helpers::test_auth_config();
+        auth.root_account = Some(crate::RootAccountConfig {
+            email: ROOT_EMAIL.to_string(),
+            name: "Root".to_string(),
+            password_hash: String::new(),
+        });
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn crate::neo4j::GraphStore> = graph;
+        let manager = Arc::new(crate::chat::ChatManager::new_without_memory(
+            dyn_graph,
+            mock_app_state().meili,
+            Default::default(),
+        ));
+        let root = Uuid::new_v5(&Uuid::NAMESPACE_URL, ROOT_EMAIL.as_bytes());
+        let app = create_router(state_with(Some(manager.clone()), auth).await);
+        (app, manager, person_bearer(root))
+    }
+
+    #[tokio::test]
+    async fn the_root_account_changes_the_live_children_cap_without_a_restart() {
+        let (app, manager, root) = app_with_root().await;
+        let uri = "/api/chat/delegation-limits";
+        let (status, body) = call(&app, req(&root, "GET", uri, None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["max_live_children"], 4);
+        assert_eq!(body["default_max_live_children"], 4);
+        assert_eq!(manager.max_live_children(), 4);
+        let (status, body) = call(
+            &app,
+            req(&root, "PUT", uri, Some(json!({"max_live_children": 12}))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["max_live_children"], 12);
+        // The running manager answers with the new cap at once: the next delegation uses it.
+        assert_eq!(manager.max_live_children(), 12);
+        // Lowering is allowed too (it never closes a live child, it refuses the next opening).
+        let (status, _) = call(
+            &app,
+            req(&root, "PUT", uri, Some(json!({"max_live_children": 2}))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(manager.max_live_children(), 2);
+        // DELETE returns to the default.
+        let (status, body) = call(&app, req(&root, "DELETE", uri, None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["max_live_children"], 4);
+        assert_eq!(manager.max_live_children(), 4);
+    }
+
+    #[tokio::test]
+    async fn the_stored_cap_is_read_again_after_a_restart() {
+        let (app, manager, root) = app_with_root().await;
+        let uri = "/api/chat/delegation-limits";
+        let (status, _) = call(
+            &app,
+            req(&root, "PUT", uri, Some(json!({"max_live_children": 9}))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // A new manager over the same graph, as after a restart: it starts at the default
+        // and reads the stored document.
+        let restarted = crate::chat::ChatManager::new_without_memory(
+            manager.graph.clone(),
+            mock_app_state().meili,
+            Default::default(),
+        );
+        assert_eq!(restarted.max_live_children(), 4);
+        restarted.load_delegation_limits().await;
+        assert_eq!(restarted.max_live_children(), 9);
+    }
+
+    #[tokio::test]
+    async fn a_cap_out_of_bounds_is_refused_with_a_typed_code_and_changes_nothing() {
+        let (app, manager, root) = app_with_root().await;
+        let uri = "/api/chat/delegation-limits";
+        for bad in [0, 33, 500] {
+            let (status, got) = call(
+                &app,
+                req(&root, "PUT", uri, Some(json!({"max_live_children": bad}))),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {got}");
+            assert_eq!(got["code"], "invalid_delegation_limits");
+        }
+        let (status, _) = call(
+            &app,
+            req(
+                &root,
+                "PUT",
+                uri,
+                Some(json!({"max_live_children": 4, "scope": "x"})),
+            ),
+        )
+        .await;
+        assert!(status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(manager.max_live_children(), 4);
+    }
+
+    #[tokio::test]
+    async fn neither_an_agent_nor_another_person_can_change_the_cap() {
+        let (app, manager, root) = app_with_root().await;
+        let uri = "/api/chat/delegation-limits";
+        let body = json!({"max_live_children": 30});
+        let agent = agent_bearer();
+        let other = person_bearer(Uuid::new_v4());
+        for token in [&agent, &other] {
+            for method in ["PUT", "DELETE"] {
+                let sent = if method == "PUT" {
+                    Some(body.clone())
+                } else {
+                    None
+                };
+                let (status, got) = call(&app, req(token, method, uri, sent)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {got}");
+            }
+        }
+        assert_eq!(
+            manager.max_live_children(),
+            4,
+            "no refused call changed the cap"
+        );
+        // Reading stays open to anyone signed in, and the root account still writes.
+        let (status, got) = call(&app, req(&agent, "GET", uri, None)).await;
+        assert_eq!(status, StatusCode::OK, "{got}");
+        let (status, _) = call(&app, req(&root, "PUT", uri, Some(body))).await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

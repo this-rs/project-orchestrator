@@ -1063,6 +1063,9 @@ pub struct ChatManager {
     /// envelope counts the live children and held until the sub-agent ends, so parallel `Agent`
     /// calls cannot all count the same children and pass the cap together.
     pub(crate) subagent_slots: std::sync::Mutex<HashMap<String, usize>>,
+    /// The cap on a parent's live children in force now (PLAFOND-RT): read at every delegation,
+    /// replaced at runtime by `set_max_live_children`, seeded from the stored setting at startup.
+    pub(crate) live_children_cap: std::sync::atomic::AtomicUsize,
     /// The read-only mirrors of Claude Code sub-agents this process wrote (`chat::mirror`,
     /// P18c): idempotency across the taps of a session, and the live view of the open ones.
     pub(crate) mirrors: Arc<super::mirror::MirrorRegistry>,
@@ -3474,6 +3477,9 @@ impl ChatManager {
             self_ref: Default::default(),
             agent_modes: Default::default(),
             subagent_slots: Default::default(),
+            live_children_cap: std::sync::atomic::AtomicUsize::new(
+                super::envelope::MAX_LIVE_CHILDREN,
+            ),
             mirrors: Default::default(),
             subagent_mirrors: true,
             session_pool: Arc::new(super::session_pool::SessionPool::from_env()),
@@ -3575,6 +3581,9 @@ impl ChatManager {
             self_ref: Default::default(),
             agent_modes: Default::default(),
             subagent_slots: Default::default(),
+            live_children_cap: std::sync::atomic::AtomicUsize::new(
+                super::envelope::MAX_LIVE_CHILDREN,
+            ),
             mirrors: Default::default(),
             subagent_mirrors: true,
             session_pool: Arc::new(super::session_pool::SessionPool::from_env()),
@@ -18460,7 +18469,6 @@ mod tests {
             lasting_rules_dir: None,
             native_turn_timeout_secs: None,
             native_session_max_tokens: None,
-            max_live_children: 4,
         }
     }
 

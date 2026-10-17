@@ -22,6 +22,7 @@ pub mod anchor;
 pub mod anchor_resolver;
 pub mod cancel_relay;
 pub mod cost;
+pub mod delegation_limits;
 #[cfg(test)]
 mod engine_parity_tests;
 pub mod enrichment;

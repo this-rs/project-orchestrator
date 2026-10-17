@@ -439,7 +439,7 @@ impl LiveSessions for ChatManager {
 /// Build the envelope of the calling session, checking depth and fan-out.
 ///
 /// `max_live_children` caps how many children one parent may have alive at once
-/// (default [`MAX_LIVE_CHILDREN`]; configurable via `CHAT_MAX_LIVE_CHILDREN`).
+/// (default [`MAX_LIVE_CHILDREN`]; set at runtime, see `delegation_limits`).
 pub async fn resolve_envelope(
     graph: &dyn GraphStore,
     live: &dyn LiveSessions,

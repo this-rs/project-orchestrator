@@ -2197,6 +2197,14 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/auto-models",
             get(routing_handlers::get_auto_models).put(routing_handlers::put_auto_models),
         )
+        // The cap on a parent's live children, changed while the server runs (PLAFOND-RT):
+        // readable by anyone signed in, written by the root account only.
+        .route(
+            "/api/chat/delegation-limits",
+            get(routing_handlers::get_delegation_limits)
+                .put(routing_handlers::put_delegation_limits)
+                .delete(routing_handlers::delete_delegation_limits),
+        )
         // Routing mode and learning stage (R2): global, with a per-project override.
         .route(
             "/api/chat/routing",

@@ -21,7 +21,11 @@ pub struct NodeInfo {
 
 /// Fills `provider_id`, `model`, `cost_usd`, `subtree_cost_usd` and, on the
 /// root, the delegation limits.
-pub fn annotate(tree: &mut [SessionTreeNode], info: &HashMap<String, NodeInfo>) {
+pub fn annotate(
+    tree: &mut [SessionTreeNode],
+    info: &HashMap<String, NodeInfo>,
+    max_children: usize,
+) {
     for node in tree.iter_mut() {
         if let Some(i) = info.get(&node.session_id) {
             node.provider_id = i.provider_id.clone();
@@ -67,7 +71,7 @@ pub fn annotate(tree: &mut [SessionTreeNode], info: &HashMap<String, NodeInfo>) 
     }
     if let Some(root) = tree.first_mut() {
         root.max_depth = Some(super::envelope::MAX_DELEGATION_DEPTH);
-        root.max_children = u32::try_from(super::envelope::MAX_LIVE_CHILDREN).ok();
+        root.max_children = u32::try_from(max_children).ok();
     }
 }
 
@@ -113,7 +117,7 @@ mod tests {
             ("a".to_string(), info(Some("ds"), Some(0.5))),
             ("b".to_string(), info(Some("ds"), Some(0.25))),
         ]);
-        annotate(&mut tree, &infos);
+        annotate(&mut tree, &infos, 4);
         assert_eq!(tree[0].subtree_cost_usd, Some(1.75));
         assert_eq!(tree[1].subtree_cost_usd, Some(0.5));
         assert_eq!(tree[1].provider_id.as_deref(), Some("ds"));
@@ -130,7 +134,7 @@ mod tests {
             ("root".to_string(), info(None, Some(1.0))),
             ("a".to_string(), info(Some("local"), None)),
         ]);
-        annotate(&mut tree, &infos);
+        annotate(&mut tree, &infos, 4);
         assert_eq!(tree[1].cost_usd, None);
         assert_eq!(tree[1].subtree_cost_usd, None);
         assert_eq!(
@@ -142,7 +146,7 @@ mod tests {
     #[test]
     fn a_node_that_could_not_be_read_stays_unannotated() {
         let mut tree = vec![node("root", None)];
-        annotate(&mut tree, &HashMap::new());
+        annotate(&mut tree, &HashMap::new(), 4);
         assert_eq!(tree[0].cost_usd, None);
         assert_eq!(tree[0].model, None);
     }
