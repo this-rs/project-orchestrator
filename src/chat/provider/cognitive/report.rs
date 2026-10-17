@@ -666,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn the_report_carries_the_five_classifier_rows_and_reads_back_without_them() {
+    fn the_report_carries_every_classifier_row_and_reads_back_without_them() {
         let report = summarise(&[], &NoPrices);
         let names: Vec<&str> = report
             .classifiers
@@ -675,7 +675,14 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["tool_groups", "intent", "task_class", "skills", "triggers"]
+            [
+                "tool_groups",
+                "intent",
+                "task_class",
+                "skills",
+                "triggers",
+                "recall_ranking",
+            ]
         );
 
         let mut json = serde_json::to_value(&report).unwrap();

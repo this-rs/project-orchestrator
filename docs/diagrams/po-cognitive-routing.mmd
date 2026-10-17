@@ -43,7 +43,7 @@
 %%   « aucun appelant » : grep -rn "load_routing\|RoutingSettings" src --include='*.rs' → cognitive/**, routing_handlers.rs, chat_handlers.rs, listing.rs seulement
 %% ---
 %% NON ETABLI :
-%%   les cinq classifieurs sont mesures sur des fixtures ECRITES A LA MAIN (32 cas chacune, FR/EN), pas sur le trafic reel : le canal de labels (L0) les remplacera quand il existera ; le banc ne lit ni Neo4j ni le reseau, aucun de ses chiffres ne vient d une instance vivante ;
+%%   les six classifieurs sont mesures sur des fixtures ECRITES A LA MAIN (32 cas chacune, FR/EN ; 30 pour recall_ranking, qui declare un graphe et non un message), pas sur le trafic reel : le canal de labels (L0) les remplacera quand il existera ; le banc ne lit ni Neo4j ni le reseau, aucun de ses chiffres ne vient d une instance vivante ;
 %%   le choix du modèle de compaction n'est PAS appliqué : aucun des deux moteurs ne le permet (nexus CompactionConfig sans modèle, CLI sans option) ; la décision est enregistrée en shadow, reason compaction_model_not_selectable ; le bout en bout tourne sur fake_openai, jamais contre un vrai modèle ;
 %%   le Cypher RoutingArm / RoutingDecision n'a PAS tourné en local (pas de Neo4j) : seul le CI le joue ; le mock enveloppe InMemoryRoutingStore ;
 %%   le feedback (close_decision) n'est appelé par aucun chemin de fin de travail ici ; la rétrogradation automatique et le rapport sont B-R5 ;
