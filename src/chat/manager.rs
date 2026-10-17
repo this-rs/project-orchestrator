@@ -5967,6 +5967,45 @@ impl ChatManager {
         })
     }
 
+    /// Whether a given session is currently streaming.  Used by `team::TeamHooks`.
+    pub(crate) async fn session_is_streaming(&self, session_id: &str) -> bool {
+        self.active_sessions
+            .read()
+            .await
+            .get(session_id)
+            .is_some_and(|s| s.is_streaming.load(Ordering::SeqCst))
+    }
+
+    /// All active sessions that are direct children of `parent_session_id`.
+    ///
+    /// "Direct child" = a session whose `spawned_by` field names `parent_session_id`.
+    /// Returns only sessions that are currently in `active_sessions` (alive).
+    pub(crate) async fn direct_children(&self, parent_session_id: &str) -> Vec<String> {
+        let active: Vec<String> = self
+            .active_sessions
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+
+        let mut children = Vec::new();
+        for id in active {
+            if let Ok(uuid) = Uuid::parse_str(&id) {
+                if let Ok(Some(node)) = self.graph.get_chat_session(uuid).await {
+                    let is_child = node
+                        .spawned_by
+                        .as_deref()
+                        .is_some_and(|s| s.contains(parent_session_id));
+                    if is_child {
+                        children.push(id);
+                    }
+                }
+            }
+        }
+        children
+    }
+
     /// Where a session comes from, for its tool profile (H6).
     ///
     /// `opened_by_third_party`: its caller's signed token carries the lineage
@@ -16401,6 +16440,18 @@ impl ChatManager {
                         user_claims.cloned(),
                     )));
                 }
+            }
+            // TEAM-1: TeamHooks wraps whatever hooks are active so far (SubagentHooks or
+            // GraphSessionHooks) and intercepts `Agent(subagent_type: "team_message" /
+            // "team_status")` before delegating to the real sub-agent runner.  Installed for
+            // ALL native sessions (root and child) so that children receive queued
+            // TeamMessages through the same drain path.
+            if let Some(manager) = self.weak_self() {
+                spec.hooks = Some(Arc::new(super::team::TeamHooks::new(
+                    spec.hooks.take(),
+                    manager,
+                    session_id,
+                )));
             }
         }
         // The consent of the project and the revocation of the token are checked before ANY
