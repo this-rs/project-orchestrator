@@ -20,6 +20,17 @@
 //! One ledger per hook instance, and the hook is instantiated per CLI session
 //! (`create_session` / `resume_session`), so the ledger's scope is the session
 //! without needing a session id.
+//!
+//! ## Whatever the provider (B14)
+//!
+//! The ledger knows nothing of the provider. A provider that runs the hooks in its
+//! loop resets it from its `PreCompact` callback ([`HookLedgerReset`]); a provider
+//! that runs none has it reset by the host when the session's compaction signal is
+//! seen (`provider::hooks::HookFallback`). Such a provider also loses the per-tool
+//! injection itself — the skill context then arrives once per turn, by the
+//! enrichment — and that loss is written here ([`HookLedger::record_lost`]), per
+//! hook point and tool, never silent. A reset does not forget it: it says what the
+//! session MISSED, not what it has in context.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -48,12 +59,26 @@ pub(crate) enum InjectionKey {
     Redirect(String),
 }
 
+/// Where a hook would have run, for an injection the provider could not take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum HookPoint {
+    /// Before a tool (`PreToolUse`: skill activation). The advice AFTER a tool is
+    /// not lost on a provider without hooks, only deferred to the end of the turn.
+    BeforeTool,
+    /// Before a compaction (`PreCompact`: the compaction guidance the provider could
+    /// not be given). Its "tool" is the compaction's trigger.
+    BeforeCompaction,
+}
+
 #[derive(Default)]
 struct LedgerState {
     /// Monotonic count of hook calls in this session.
     call: u64,
     /// Call number at which each key was last injected.
     last_injected: HashMap<InjectionKey, u64>,
+    /// Injections the provider could not take, per hook point and tool: how many.
+    /// Bounded by the number of distinct tools of the session.
+    lost: HashMap<(HookPoint, String), u64>,
 }
 
 #[derive(Default)]
@@ -93,10 +118,32 @@ impl HookLedger {
     }
 
     /// Forget everything — the context was compacted, so nothing injected
-    /// earlier can be assumed to still be visible to the agent.
+    /// earlier can be assumed to still be visible to the agent. What was lost
+    /// ([`Self::record_lost`]) is kept: it is not context.
     pub fn reset(&self) {
         let mut s = self.lock();
         s.last_injected.clear();
+    }
+
+    /// Record that the hook of `point` could not inject anything for a call of
+    /// `tool`: the provider runs no hook at that point. Returns how many
+    /// injections of the session were lost so far, all points and tools together.
+    pub fn record_lost(&self, point: HookPoint, tool: &str) -> u64 {
+        let mut s = self.lock();
+        *s.lost.entry((point, tool.to_string())).or_default() += 1;
+        s.lost.values().sum()
+    }
+
+    /// The injections lost so far: `(point, tool, count)`, in a stable order.
+    pub fn lost(&self) -> Vec<(HookPoint, String, u64)> {
+        let s = self.lock();
+        let mut lost: Vec<_> = s
+            .lost
+            .iter()
+            .map(|((point, tool), n)| (*point, tool.clone(), *n))
+            .collect();
+        lost.sort();
+        lost
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, LedgerState> {
@@ -217,6 +264,23 @@ mod tests {
         l.record(InjectionKey::Redirect("find_references".into()));
         assert!(!l.is_fresh(&InjectionKey::Redirect("find_references".into())));
         assert!(l.is_fresh(&InjectionKey::Redirect("search_project".into())));
+    }
+
+    #[test]
+    fn a_lost_injection_is_counted_per_point_and_tool_and_survives_a_reset() {
+        let l = HookLedger::new();
+        assert!(l.lost().is_empty());
+        assert_eq!(l.record_lost(HookPoint::BeforeTool, "Read"), 1);
+        assert_eq!(l.record_lost(HookPoint::BeforeTool, "Read"), 2);
+        assert_eq!(l.record_lost(HookPoint::BeforeTool, "Grep"), 3);
+        l.reset();
+        assert_eq!(
+            l.lost(),
+            vec![
+                (HookPoint::BeforeTool, "Grep".to_string(), 1),
+                (HookPoint::BeforeTool, "Read".to_string(), 2),
+            ]
+        );
     }
 
     #[test]

@@ -1687,6 +1687,9 @@ pub(crate) struct ManagerTurnServices {
     /// Mirrors the sub-agents of a Claude Code session into read-only child conversations
     /// (`chat::mirror`, P18c), from [`Self::observe`]. `None` for every other provider.
     mirror: Option<Arc<super::mirror::MirrorTap>>,
+    /// The host's door to the graph hooks when the session's provider runs none
+    /// (`provider::hooks`, B14). `None`: the provider runs them, or a runner session.
+    hook_fallback: Option<Arc<super::provider::hooks::HookFallback>>,
 }
 
 /// What a session of the agent engine keeps for the end of its turns: the fields of
@@ -2203,6 +2206,12 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         // started it. Only read here: `after_turn` clears it once a turn carrying it
         // was answered (`TurnOutcome::answered`), so a turn refused before it was
         // sent, failed, or stopped before any attempt was answered keeps it.
+        // The advice the post-tool hook gave after the previous turn's tools, when the
+        // provider runs no hook (B14): the host's door, in front of the next turn.
+        let prepared = match self.hook_fallback.as_ref().and_then(|f| f.take_carried()) {
+            Some(advice) => prepend_enrichment(&advice, &prepared),
+            None => prepared,
+        };
         let held = self.session.held.prefix();
         let prepared = match held {
             Some(context) => prepend_enrichment(&context, &prepared),
@@ -2287,6 +2296,11 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         // A Claude Code sub-agent's activity is mirrored, passively (P18c).
         if let Some(tap) = &self.mirror {
             tap.observe(event);
+        }
+        // A provider that runs no hook: the host sees the tools and the compaction
+        // signal in its place (B14).
+        if let Some(fallback) = &self.hook_fallback {
+            fallback.observe(event);
         }
         let mut open = self
             .session
@@ -2548,6 +2562,23 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             .flatten()
         {
             after.events.push(event);
+        }
+        // A provider that runs no hook: the post-tool hook is played over the turn's
+        // tool results, its advice said as a system hint and carried in front of the
+        // next turn (`HookFallback::take_carried`), B14.
+        if let Some(fallback) = self.hook_fallback.clone() {
+            if let Some(advice) = self
+                .step(&mut after, session_id, "post_tool_hooks", async move {
+                    fallback.after_turn().await
+                })
+                .await
+            {
+                after.events.extend(
+                    advice
+                        .into_iter()
+                        .map(|content| ChatEvent::SystemHint { content }),
+                );
+            }
         }
         after
     }
@@ -12105,6 +12136,40 @@ impl ChatManager {
             });
     }
 
+    /// The hooks a resumed Claude CLI session is given: the SAME as at its creation
+    /// (`create_session` → [`Self::graph_hook_table`]), B14.
+    fn resume_hook_table(
+        &self,
+        session_node: &ChatSessionNode,
+        events_tx: &broadcast::Sender<ChatEvent>,
+        work_log: &Arc<Mutex<SessionWorkLog>>,
+    ) -> super::agent_hooks::HookTable {
+        // The compaction is told about the task a runner works on, else the project,
+        // as at creation.
+        let context_source = match session_node
+            .spawned_by
+            .as_deref()
+            .and_then(parse_spawned_by)
+            .and_then(|ctx| ctx.task_id)
+        {
+            Some(task_id) => CompactionContextSource::Task(task_id),
+            None => match session_node.project_slug.as_deref() {
+                Some(slug) => CompactionContextSource::Session(slug.to_string()),
+                None => CompactionContextSource::None,
+            },
+        };
+        self.graph_hook_table(GraphHookInput {
+            session_id: session_node.id.to_string(),
+            context_source,
+            work_log: Arc::clone(work_log),
+            // A runner has its task context in the prompt: no per-tool hook, neither
+            // the skill activation nor the redirect advice (the resume used to
+            // register the latter unconditionally).
+            tool_knowledge: !is_runner_spawned(session_node.spawned_by.as_deref()),
+            announce: Some(events_tx.clone()),
+        })
+    }
+
     /// Refuses a request whose `provider` differs from the one the session was
     /// opened on (409 `provider_conflict`). A session that does not exist yet,
     /// or a request that names no provider, passes.
@@ -12303,53 +12368,8 @@ impl ChatManager {
         // Create work_log early so CompactionNotifier can reference it
         let work_log = Arc::new(Mutex::new(SessionWorkLog::default()));
 
-        // Build session hooks: PreCompact (compaction notifier) + PreToolUse (skill activation)
-        let session_hooks = {
-            let mut hooks = std::collections::HashMap::new();
-
-            // PreCompact → CompactionNotifier broadcasts ChatEvent::CompactionStarted
-            // + builds custom_instructions from session context
-            let context_source = match session_node.project_slug.as_deref() {
-                Some(slug) => CompactionContextSource::Session(slug.to_string()),
-                None => CompactionContextSource::None,
-            };
-            let notifier = CompactionNotifier::new(
-                events_tx.clone(),
-                self.nats.clone(),
-                session_id.to_string(),
-            )
-            .with_context(self.graph.clone(), context_source)
-            .with_work_log(work_log.clone())
-            .with_routing(Arc::clone(&self.turn_routing));
-            hooks.insert(
-                "PreCompact".to_string(),
-                vec![nexus_claude::HookMatcher {
-                    matcher: None,
-                    hooks: vec![std::sync::Arc::new(notifier)],
-                }],
-            );
-
-            // PreToolUse → SkillActivationHook injects skill context as additionalContext.
-            // Same runner exclusion as create_session: resuming a runner session
-            // used to re-enable the per-tool-call injection that creation
-            // deliberately skips.
-            let session_project = self.hook_session_project(session_id);
-            if !is_runner_spawned(session_node.spawned_by.as_deref()) {
-                Self::register_skill_hook(&mut hooks, self.graph.clone(), session_project.clone());
-            }
-
-            // PostToolUse → PostToolUseRedirectHook suggests MCP alternatives after noisy Grep
-            let post_hook = Self::redirect_hook(self.graph.clone(), session_project);
-            hooks.insert(
-                "PostToolUse".to_string(),
-                vec![nexus_claude::HookMatcher {
-                    matcher: None,
-                    hooks: vec![std::sync::Arc::new(post_hook)],
-                }],
-            );
-
-            hooks
-        };
+        // Build session hooks: the same table as at creation (B14).
+        let session_hooks = self.resume_hook_table(session_node, &events_tx, &work_log);
 
         // A resume keeps the access the session was opened with and can only narrow it.
         let access = super::provider::policy::SessionAccess::for_resume(session_node.access, None);
@@ -16385,12 +16405,8 @@ impl ChatManager {
         let runner = hooks.as_ref().is_some_and(|scope| scope.runner);
         // The knowledge graph's hooks, for the providers that run hooks in their loop. A
         // remote session has no local project to resolve a file against.
-        let runs_hooks = remote_cwd.is_none()
-            && matches!(
-                kind,
-                nexus_claude::agent::ProviderKind::Native
-                    | nexus_claude::agent::ProviderKind::ClaudeCode
-            );
+        // A provider that runs none gets the host's fallback (`provider::hooks`, B14).
+        let runs_hooks = super::provider::hooks::provider_takes_hooks(kind, remote_cwd.is_none());
         if let Some(scope) = hooks.filter(|_| runs_hooks) {
             let context_source = match (scope.task_id, scope.project_slug) {
                 (Some(task_id), _) => CompactionContextSource::Task(task_id),
@@ -16775,6 +16791,7 @@ impl ChatManager {
         &self,
         session: AgentTurnState,
         mirror: Option<Arc<super::mirror::MirrorTap>>,
+        hook_fallback: Option<Arc<super::provider::hooks::HookFallback>>,
     ) -> Arc<dyn super::agent_runtime::TurnServices> {
         Arc::new(ManagerTurnServices {
             graph: self.graph.clone(),
@@ -16795,7 +16812,46 @@ impl ChatManager {
                 .and_then(|routing| routing.store.clone()),
             open_decisions: std::sync::Arc::clone(&self.open_decisions),
             mirror,
+            hook_fallback,
         })
+    }
+
+    /// The host's door to the graph hooks of `session_id` when its provider runs none
+    /// ([`super::provider::hooks::HookPlan`]); `None` when the provider runs them, or
+    /// for a runner session (no per-tool hook, at creation as at resume).
+    async fn hook_fallback_for(
+        &self,
+        session_id: &str,
+        provider_id: &str,
+        kind: nexus_claude::agent::ProviderKind,
+        caps: &nexus_claude::agent::Capabilities,
+    ) -> Option<Arc<super::provider::hooks::HookFallback>> {
+        let local = self
+            .remote_cwd_of(provider_id)
+            .await
+            .ok()
+            .flatten()
+            .is_none();
+        if !super::provider::hooks::HookPlan::for_session(kind, caps, local).needs_fallback() {
+            return None;
+        }
+        let node = self
+            .graph
+            .get_chat_session(Uuid::parse_str(session_id).ok()?)
+            .await
+            .ok()
+            .flatten()?;
+        if is_runner_spawned(node.spawned_by.as_deref()) {
+            return None;
+        }
+        let redirect =
+            Self::redirect_hook(self.graph.clone(), self.hook_session_project(session_id));
+        Some(Arc::new(super::provider::hooks::HookFallback::new(
+            Arc::new(redirect),
+            Arc::new(super::hook_ledger::HookLedger::new()),
+            session_id,
+            node.cwd,
+        )))
     }
 
     /// The held context of `session_id` ([`HeldSlot`]), as a new state of the session
@@ -16952,6 +17008,10 @@ impl ChatManager {
             }
         }
         let kind_name = provider_kind_name(&kind);
+        // A provider that runs no hook gets the host's door to them (B14).
+        let hook_fallback = self
+            .hook_fallback_for(session_id, provider_id, kind, session.capabilities())
+            .await;
         let handle = self
             .agent_runtime
             .adopt_declaring(
@@ -16969,6 +17029,7 @@ impl ChatManager {
                         matches!(kind, nexus_claude::agent::ProviderKind::ClaudeCode)
                             .then(|| self.agent_mirror_tap(session_id))
                             .flatten(),
+                        hook_fallback,
                     ),
                 ),
                 host_missing,
@@ -17310,6 +17371,22 @@ impl ChatManager {
             .await
     }
 
+    /// The hooks a reopened session of the agent engine gets: the same as at its
+    /// opening (`open_agent_session`), B14.
+    fn resume_agent_hook_scope(node: &ChatSessionNode) -> AgentHookScope {
+        AgentHookScope {
+            project_slug: node.project_slug.clone(),
+            task_id: node
+                .spawned_by
+                .as_deref()
+                .and_then(parse_spawned_by)
+                .and_then(|ctx| ctx.task_id),
+            // A runner session gets no per-tool hook, as at its opening (the reopen
+            // used to give it every one).
+            runner: is_runner_spawned(node.spawned_by.as_deref()),
+        }
+    }
+
     /// [`Self::reopen_agent_session`] with `relay`: an in-place provider switch reopens on
     /// the node it was just re-targeted to (its provider/model are the target's), the first
     /// message goes out relay-prefixed, and the router is re-seeded from the carried
@@ -17432,15 +17509,7 @@ impl ChatManager {
                     kind: provider.kind(),
                     remote_cwd: remote_cwd.as_deref(),
                     per_session_mcp,
-                    hooks: Some(AgentHookScope {
-                        project_slug: node.project_slug.clone(),
-                        task_id: node
-                            .spawned_by
-                            .as_deref()
-                            .and_then(parse_spawned_by)
-                            .and_then(|ctx| ctx.task_id),
-                        runner: false,
-                    }),
+                    hooks: Some(Self::resume_agent_hook_scope(node)),
                 },
                 access,
             )
@@ -19932,6 +20001,55 @@ mod tests {
         // A runner has its task context in the prompt: compaction guidance, and the
         // tool clock (PreToolUse, which adds nothing to the context).
         assert_eq!(table(false), ["PreCompact", "PreToolUse"]);
+    }
+
+    /// B14: a session gets the same hooks whether it is created or resumed, runner or
+    /// not, on both engines. The resume used to register the redirect hook of a
+    /// runner (which creation skips) and, on the agent engine, every per-tool hook.
+    #[tokio::test]
+    async fn creation_and_resume_register_the_same_hooks() {
+        fn shape(table: &super::super::agent_hooks::HookTable) -> Vec<(String, Vec<usize>)> {
+            let mut shape: Vec<(String, Vec<usize>)> = table
+                .iter()
+                .map(|(event, matchers)| {
+                    (
+                        event.clone(),
+                        matchers.iter().map(|m| m.hooks.len()).collect(),
+                    )
+                })
+                .collect();
+            shape.sort();
+            shape
+        }
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let (tx, _rx) = broadcast::channel(8);
+        let runner = r#"{"type":"runner","run_id":"r","plan_id":"p"}"#;
+        for spawned_by in [None, Some(runner)] {
+            let mut node = crate::test_helpers::test_chat_session(None);
+            node.spawned_by = spawned_by.map(str::to_string);
+            let work_log = Arc::new(Mutex::new(SessionWorkLog::default()));
+            // `create_session`: per-tool hooks unless a runner.
+            let created = manager.graph_hook_table(GraphHookInput {
+                session_id: node.id.to_string(),
+                context_source: CompactionContextSource::None,
+                work_log: Arc::clone(&work_log),
+                tool_knowledge: spawned_by.is_none(),
+                announce: Some(tx.clone()),
+            });
+            let resumed = manager.resume_hook_table(&node, &tx, &work_log);
+            assert_eq!(
+                shape(&created),
+                shape(&resumed),
+                "legacy engine, spawned_by {spawned_by:?}"
+            );
+            // The agent engine: the opening says `runner` for a runner session.
+            assert_eq!(
+                ChatManager::resume_agent_hook_scope(&node).runner,
+                spawned_by.is_some(),
+                "agent engine, spawned_by {spawned_by:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -33579,6 +33697,7 @@ mod refs_turn_services_tests {
                 std::collections::HashMap::new(),
             )),
             mirror: None,
+            hook_fallback: None,
         };
 
         let note = Uuid::new_v4();
@@ -34011,6 +34130,7 @@ mod held_context_tests {
                 std::collections::HashMap::new(),
             )),
             mirror: None,
+            hook_fallback: None,
         }
     }
 
@@ -34574,6 +34694,7 @@ mod image_turn_services_tests {
                 std::collections::HashMap::new(),
             )),
             mirror: None,
+            hook_fallback: None,
         };
         // Before any turn input, nothing says an image comes.
         assert_eq!(services.model_for_images(&sid).await, None);
