@@ -1336,7 +1336,7 @@ async fn inherit_parent_engine(
         .provider_id
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| CLAUDE_CODE.to_string());
-    let model = (request.model.is_none() && !parent.model.is_empty()).then(|| parent.model);
+    let model = (request.model.is_none() && !parent.model.is_empty()).then_some(parent.model);
     tracing::debug!(
         parent = %parent_id,
         provider,

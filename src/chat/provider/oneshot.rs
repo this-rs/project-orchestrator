@@ -2,8 +2,8 @@
 //! single-turn utility call.
 //!
 //! A one-shot runs ONE turn on the instance the registry resolves for the project's
-//! executor role, through the same resolver ([`resolver::resolve`], A16: explicit choice
-//! > project rule > global rule > configured default > built-in Claude Code) and the same
+//! executor role, through the same resolver ([`resolver::resolve`], A16: explicit choice,
+//! then project rule, global rule, configured default, built-in Claude Code) and the same
 //! provider factory as every session — never a client built by hand on the Claude CLI.
 //! The project's consent (A28) and the health of the instance are checked before anything
 //! is sent; a refusal is typed, never worked around.
@@ -392,15 +392,17 @@ mod tests {
         .unwrap_or_else(|e| panic!("the turn runs: {e:#}"));
         assert_eq!(summary.text, "[{\"name\":\"auth\"}]");
         assert!(!summary.is_error);
-        let specs = fake.state.opened_specs.lock().unwrap();
-        assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].model.as_deref(), Some("sonnet"));
-        assert_eq!(specs[0].max_turns, Some(1));
-        assert_eq!(specs[0].policy.mode, PolicyMode::Trust);
-        assert_eq!(
-            specs[0].system_prompt.as_ref().map(|p| p.text.as_str()),
-            Some("Respond only with JSON.")
-        );
+        {
+            let specs = fake.state.opened_specs.lock().unwrap();
+            assert_eq!(specs.len(), 1);
+            assert_eq!(specs[0].model.as_deref(), Some("sonnet"));
+            assert_eq!(specs[0].max_turns, Some(1));
+            assert_eq!(specs[0].policy.mode, PolicyMode::Trust);
+            assert_eq!(
+                specs[0].system_prompt.as_ref().map(|p| p.text.as_str()),
+                Some("Respond only with JSON.")
+            );
+        }
         assert_eq!(fake.state.turns_started.lock().unwrap()[0], "propose");
         assert!(fake.state.closed.load(std::sync::atomic::Ordering::SeqCst));
 

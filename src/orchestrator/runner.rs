@@ -11149,20 +11149,21 @@ mod tests {
         assert_eq!(proposals.len(), 1, "{proposals:?}");
         assert_eq!(proposals[0].name, "Auth");
         assert_eq!(proposals[0].entry_function, "login");
-        let specs = fake.state.opened_specs.lock().unwrap();
-        assert_eq!(specs.len(), 1, "one session, through the factory");
-        assert_eq!(specs[0].model.as_deref(), Some(DEFAULT_FEATURE_GRAPH_MODEL));
-        assert_eq!(specs[0].max_turns, Some(1));
-        assert_eq!(specs[0].policy.mode, PolicyMode::Trust);
-        assert!(specs[0]
-            .system_prompt
-            .as_ref()
-            .is_some_and(|p| p.text.contains("code architecture analyst")));
+        let before = {
+            let specs = fake.state.opened_specs.lock().unwrap();
+            assert_eq!(specs.len(), 1, "one session, through the factory");
+            assert_eq!(specs[0].model.as_deref(), Some(DEFAULT_FEATURE_GRAPH_MODEL));
+            assert_eq!(specs[0].max_turns, Some(1));
+            assert_eq!(specs[0].policy.mode, PolicyMode::Trust);
+            assert!(specs[0]
+                .system_prompt
+                .as_ref()
+                .is_some_and(|p| p.text.contains("code architecture analyst")));
+            specs.len()
+        };
 
         // Claude Code absent and nothing else configured: no candidate, said and typed in
         // the log — an empty proposal, never a session opened by hand.
-        let before = specs.len();
-        drop(specs);
         let none = Orchestrator::propose_feature_graphs_routed(
             &graph, project.id, None, None, &fake, false,
         )
