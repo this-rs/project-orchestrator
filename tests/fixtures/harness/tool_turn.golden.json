@@ -1,0 +1,83 @@
+{
+  "events": [
+    {
+      "capabilities": {
+        "background_tasks": true,
+        "compaction_signal": true,
+        "cost": "reported",
+        "hooks": "in_protocol",
+        "images": true,
+        "interactive_permissions": true,
+        "native_question": true,
+        "per_session_mcp": true,
+        "permission_scopes": [
+          "once",
+          "session"
+        ],
+        "resume": true,
+        "sandbox": "none",
+        "secret_isolation": true,
+        "set_model_live": true,
+        "subagents": "nested",
+        "thinking": true,
+        "tool_cancel": true,
+        "tools": true
+      },
+      "cli_session_id": "golden-cli-session",
+      "degraded_features": [],
+      "engine": "legacy",
+      "mcp_servers": [
+        {
+          "name": "po",
+          "status": "connected"
+        }
+      ],
+      "model": "claude-sonnet-4-5",
+      "permission_mode": "acceptEdits",
+      "tools": [
+        "Bash",
+        "Read",
+        "Edit"
+      ],
+      "type": "system_init"
+    },
+    {
+      "content": "I should list the crate.",
+      "type": "thinking"
+    },
+    {
+      "content": "Let me look.",
+      "type": "assistant_text"
+    },
+    {
+      "id": "toolu_bash",
+      "input": {
+        "command": "ls"
+      },
+      "tool": "Bash",
+      "type": "tool_use"
+    },
+    {
+      "id": "toolu_bash",
+      "is_error": false,
+      "result": "Cargo.toml\nsrc\n",
+      "type": "tool_result"
+    },
+    {
+      "content": "One crate.",
+      "type": "assistant_text"
+    },
+    {
+      "cost_usd": 0.021,
+      "duration_ms": 5000,
+      "is_error": false,
+      "num_turns": 1,
+      "result_text": "One crate.",
+      "session_id": "golden-cli-session",
+      "subtype": "success",
+      "type": "result"
+    }
+  ],
+  "recording_lines": 5,
+  "sequence": "tool_turn"
+}

@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","data":{"session_id":"golden-cli-session","model":"claude-sonnet-4-5","tools":["Bash","Read","Edit"],"mcp_servers":[{"name":"po","status":"connected"}],"permissionMode":"acceptEdits","cwd":"/workspace/project"}}
+{"type":"result","subtype":"error_during_execution","duration_ms":1200,"duration_api_ms":900,"is_error":true,"num_turns":1,"session_id":"golden-cli-session","total_cost_usd":0.0,"result":"API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}"}

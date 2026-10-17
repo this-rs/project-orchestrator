@@ -1,0 +1,7 @@
+{"type":"system","subtype":"init","data":{"session_id":"golden-cli-session","model":"claude-sonnet-4-5","tools":["Bash","Read","Edit"],"mcp_servers":[{"name":"po","status":"connected"}],"permissionMode":"acceptEdits","cwd":"/workspace/project"}}
+{"type":"assistant","message":{"content":[{"id":"toolu_task","name":"Task","input":{"description":"run the suite","run_in_background":true}}]}}
+{"type":"system","subtype":"task_started","data":{"task_id":"task_g1","tool_use_id":"toolu_task","is_backgrounded":true}}
+{"type":"system","subtype":"task_progress","data":{"task_id":"task_g1","description":"run the suite","last_tool_name":"Bash"}}
+{"type":"system","subtype":"task_notification","data":{"task_id":"task_g1","status":"completed","summary":"184 tests passed"}}
+{"type":"user","message":{"content":"","content_blocks":[{"tool_use_id":"toolu_task","content":[{"type":"text","text":"184 tests passed"}],"is_error":false}]}}
+{"type":"result","subtype":"success","duration_ms":5000,"duration_api_ms":4500,"is_error":false,"num_turns":1,"session_id":"golden-cli-session","total_cost_usd":0.04}

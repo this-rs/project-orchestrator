@@ -1,0 +1,16 @@
+{
+  "events": [
+    {
+      "message": "A message from the agent was withheld: it contained a secret that could not be masked.",
+      "type": "error"
+    },
+    {
+      "id": "toolu_cite",
+      "is_error": false,
+      "result": "see \u2060#note:6f2b8f1c-4d3e-4a5b-8c9d-0e1f2a3b4c5d",
+      "type": "tool_result"
+    }
+  ],
+  "recording_lines": 6,
+  "sequence": "unmapped_and_neutralized_frames"
+}

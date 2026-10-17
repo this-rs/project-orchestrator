@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","data":{"session_id":"golden-cli-session","model":"claude-sonnet-4-5","tools":["Bash","Read","Edit"],"mcp_servers":[{"name":"po","status":"connected"}],"permissionMode":"acceptEdits","cwd":"/workspace/project"}}
+{"type":"assistant","message":{"content":[{"text":"Reading the whole module..."}]}}
+{"type":"system","subtype":"compact_boundary","data":{"compact_metadata":{"trigger":"auto","pre_tokens":167000}}}
+{"type":"assistant","message":{"content":[{"text":"I have the context back."}]}}
+{"type":"result","subtype":"success","duration_ms":5000,"duration_api_ms":4500,"is_error":false,"num_turns":1,"session_id":"golden-cli-session","total_cost_usd":0.03}

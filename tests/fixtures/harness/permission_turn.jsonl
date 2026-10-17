@@ -1,0 +1,6 @@
+{"type":"system","subtype":"init","data":{"session_id":"golden-cli-session","model":"claude-sonnet-4-5","tools":["Bash","Read","Edit"],"mcp_servers":[{"name":"po","status":"connected"}],"permissionMode":"acceptEdits","cwd":"/workspace/project"}}
+{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_write","name":"Write","input":{}}}}
+{"type":"assistant","message":{"content":[{"id":"toolu_write","name":"Write","input":{"file_path":"notes.md","content":"hi"}}]}}
+{"type":"user","message":{"content":"","content_blocks":[{"tool_use_id":"toolu_write","content":"The user doesn't want to proceed with this tool use.","is_error":true}]}}
+{"type":"assistant","message":{"content":[{"text":"Understood, I will not write the file."}]}}
+{"type":"result","subtype":"success","duration_ms":5000,"duration_api_ms":4500,"is_error":false,"num_turns":1,"session_id":"golden-cli-session","total_cost_usd":0.02}
