@@ -1081,7 +1081,7 @@ pub async fn delegate_task(
         .await
         .map(|s| s.len())
         .unwrap_or(0);
-    let routing_decision_id = route_delegation(
+    let routed = route_delegation(
         routing.as_deref(),
         graph.as_ref(),
         &mut chat_request,
@@ -1090,6 +1090,7 @@ pub async fn delegate_task(
         stated_class.as_deref(),
     )
     .await;
+    let routing_decision_id = routed.as_ref().map(|d| d.id);
     // A person may name the parent in the body; an agent's parent is its token's.
     let parent_session_id = match &parent_envelope {
         Some(env) => Some(env.parent_session_id),
@@ -1098,6 +1099,14 @@ pub async fn delegate_task(
             .as_deref()
             .and_then(|s| Uuid::parse_str(s).ok()),
     };
+    // Nothing named and nothing routed: the child runs on its parent's engine (B18).
+    inherit_parent_engine(
+        graph.as_ref(),
+        &mut chat_request,
+        parent_session_id,
+        routed.as_ref().is_some_and(|d| d.applied),
+    )
+    .await;
     let project_slug = chat_request.project_slug.clone();
 
     // Step 1: Build enriched prompt via ContextBuilder + EnrichmentPipeline
@@ -1284,6 +1293,60 @@ async fn apply_task_alias(
         .filter(|a| !a.is_empty());
 }
 
+/// The cognitive decision taken for a delegation: its id, and whether the router's
+/// choice applies to the session (it then stands above the parent's engine, B18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DelegationDecision {
+    id: Uuid,
+    applied: bool,
+}
+
+/// The engine of the session that delegates, for a child that names nothing (B18).
+///
+/// Fed at the `run` level of the resolution (A16): below an explicit choice (the
+/// request's provider, the task's alias, a persona naming a model) and above the
+/// project's rules — so the child of a session on DeepSeek runs on DeepSeek, not on a
+/// default its parent never chose, and a parent instance that cannot open now is skipped
+/// with the reason recorded (an executor level), never "no candidate". A decision the
+/// cognitive router APPLIED to this delegation stands above it: that is the project's own
+/// routing (B-R7), not a default. A model named alone keeps the parent's provider with
+/// that model. A parent that cannot be read, or that predates the harness (no provider
+/// written), is Claude Code, as the manager reads it.
+async fn inherit_parent_engine(
+    graph: &dyn crate::neo4j::GraphStore,
+    request: &mut crate::chat::types::ChatRequest,
+    parent_session_id: Option<Uuid>,
+    routing_applied: bool,
+) {
+    use crate::chat::provider::resolver::CLAUDE_CODE;
+    let Some(parent_id) = parent_session_id else {
+        return;
+    };
+    let named = request.provider.is_some()
+        || request.task_alias.is_some()
+        || request.persona_alias.is_some()
+        || request.run_provider.is_some();
+    if named || routing_applied {
+        return;
+    }
+    let Some(parent) = graph.get_chat_session(parent_id).await.ok().flatten() else {
+        return;
+    };
+    let provider = parent
+        .provider_id
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| CLAUDE_CODE.to_string());
+    let model = (request.model.is_none() && !parent.model.is_empty()).then(|| parent.model);
+    tracing::debug!(
+        parent = %parent_id,
+        provider,
+        model = model.as_deref().unwrap_or("-"),
+        "delegation names no engine: the child inherits its parent's"
+    );
+    request.run_provider = Some(provider);
+    request.run_model = model;
+}
+
 /// What closes the routing decision of a delegation when its session ends.
 struct DelegationClose {
     routing: Arc<crate::runner::routing::RoutingHandle>,
@@ -1303,7 +1366,7 @@ async fn route_delegation(
     task: &crate::neo4j::models::TaskNode,
     steps_count: usize,
     stated_class: Option<&str>,
-) -> Option<Uuid> {
+) -> Option<DelegationDecision> {
     use crate::chat::provider::cognitive::signature::{ContextHints, TaskSignature};
     // The persona level (A16): the preference of the persona the task names.
     // Fed whether or not a router is wired; a persona that names no model
@@ -1343,7 +1406,10 @@ async fn route_delegation(
         )
         .await?;
     request.routing_decision_id = Some(decision.id);
-    Some(decision.id)
+    Some(DelegationDecision {
+        id: decision.id,
+        applied: decision.applied,
+    })
 }
 
 /// The session request of a delegated task.
@@ -11205,6 +11271,209 @@ mod retry_plan_task_tests {
         assert_eq!(req.task_alias.as_deref(), Some("cheap"));
     }
 
+    // ── B18: a delegated task runs on its parent's engine ──────────────────
+
+    /// A parent session on `provider` (`model`), as the harness writes it.
+    async fn parent_on(
+        graph: &crate::neo4j::mock::MockGraphStore,
+        provider: Option<&str>,
+        model: &str,
+    ) -> Uuid {
+        let parent = crate::neo4j::models::ChatSessionNode {
+            provider_id: provider.map(str::to_string),
+            model: model.to_string(),
+            ..crate::test_helpers::test_chat_session(Some("demo"))
+        };
+        graph.create_chat_session(&parent).await.unwrap();
+        parent.id
+    }
+
+    /// Acceptance 4 (the request): a delegation that names nothing takes its parent's
+    /// provider and model at the run level; one that names a provider, an alias or a
+    /// persona's model, or one the router decided for, keeps what it has.
+    #[tokio::test]
+    async fn a_delegation_that_names_nothing_inherits_its_parents_engine() {
+        let graph = crate::neo4j::mock::MockGraphStore::new();
+        let task_id = Uuid::new_v4();
+        let base =
+            delegation_chat_request("/a".into(), None, task_id, "t", None, "default").unwrap();
+        let parent = parent_on(&graph, Some("deepseek"), "deepseek-v4-pro").await;
+
+        let mut plain = base.clone();
+        inherit_parent_engine(&graph, &mut plain, Some(parent), false).await;
+        assert_eq!(plain.run_provider.as_deref(), Some("deepseek"));
+        assert_eq!(plain.run_model.as_deref(), Some("deepseek-v4-pro"));
+        assert!(
+            plain.provider.is_none() && plain.model.is_none(),
+            "inherited at the run level, not as an explicit choice"
+        );
+
+        // A model named alone: the parent's provider, that model.
+        let mut model_only = base.clone();
+        model_only.model = Some("deepseek-v4-flash".into());
+        inherit_parent_engine(&graph, &mut model_only, Some(parent), false).await;
+        assert_eq!(model_only.run_provider.as_deref(), Some("deepseek"));
+        assert_eq!(model_only.run_model, None);
+        assert_eq!(model_only.model.as_deref(), Some("deepseek-v4-flash"));
+
+        // Something more explicit stands above: untouched.
+        for (label, named) in [
+            ("provider", {
+                let mut r = base.clone();
+                r.provider = Some("acp".into());
+                r
+            }),
+            ("task alias", {
+                let mut r = base.clone();
+                r.task_alias = Some("cheap".into());
+                r
+            }),
+            ("persona", {
+                let mut r = base.clone();
+                r.persona_alias = Some("opus".into());
+                r
+            }),
+        ] {
+            let mut r = named.clone();
+            inherit_parent_engine(&graph, &mut r, Some(parent), false).await;
+            assert_eq!(format!("{r:?}"), format!("{named:?}"), "{label}: untouched");
+        }
+        // The router's applied decision is the project's own choice: untouched.
+        let mut routed = base.clone();
+        inherit_parent_engine(&graph, &mut routed, Some(parent), true).await;
+        assert_eq!(routed.run_provider, None);
+        // No parent (a person delegating without one): untouched.
+        let mut orphan = base.clone();
+        inherit_parent_engine(&graph, &mut orphan, None, false).await;
+        assert_eq!(orphan.run_provider, None);
+        // A parent written before the harness is Claude Code.
+        let old = parent_on(&graph, None, "claude-opus-4-6").await;
+        let mut legacy = base.clone();
+        inherit_parent_engine(&graph, &mut legacy, Some(old), false).await;
+        assert_eq!(legacy.run_provider.as_deref(), Some("claude-code"));
+        assert_eq!(legacy.run_model.as_deref(), Some("claude-opus-4-6"));
+    }
+
+    /// Two fake providers under two ids, for the delegation test below.
+    struct ParentAndClaude {
+        claude: crate::chat::agent_runtime::fake::FakeProvider,
+        acp: crate::chat::agent_runtime::fake::FakeProvider,
+    }
+
+    impl crate::chat::agent_runtime::ProviderSource for ParentAndClaude {
+        fn get(&self, provider_id: &str) -> Option<Arc<dyn nexus_claude::agent::AgentProvider>> {
+            match provider_id {
+                "claude-code" => Some(Arc::new(self.claude.clone())),
+                "acp" => Some(Arc::new(self.acp.clone())),
+                _ => None,
+            }
+        }
+    }
+
+    /// Acceptance 4 (the session): the inherited request, opened through the chat manager
+    /// and the resolver, opens the child on the PARENT's instance — `acp` here, allowed
+    /// for the project — while the built-in Claude Code (the configured default of this
+    /// manager) is never touched. The node says which level decided (`run`).
+    #[tokio::test]
+    async fn a_delegated_task_runs_on_the_provider_of_its_parent_session() {
+        use crate::chat::provider::settings::{
+            ConsentRecord, InstanceRecord, CONSENT_PREFIX, GLOBAL, INSTANCE_PREFIX,
+        };
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn crate::neo4j::GraphStore> = mock.clone();
+        let search: Arc<dyn crate::meilisearch::traits::SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let config = crate::chat::config::ChatConfig {
+            provider_path: crate::chat::config::ProviderPath::Agent,
+            jwt_secret: Some("a-signing-secret-for-the-tests".into()),
+            ..crate::chat::config::ChatConfig::default()
+        };
+        let claude = crate::chat::agent_runtime::fake::FakeProvider::new();
+        let acp = crate::chat::agent_runtime::fake::FakeProvider::new();
+        let manager = ChatManager::new_without_memory(graph.clone(), search, config)
+            .with_provider_source(Arc::new(ParentAndClaude {
+                claude: claude.clone(),
+                acp: acp.clone(),
+            }));
+        let record = InstanceRecord {
+            id: "acp".into(),
+            kind: "acp".into(),
+            label: "acp".into(),
+            origin: "acp:openclaw".into(),
+            credential_ref: "none".into(),
+            default_model: Some("acp-default".into()),
+            ..Default::default()
+        };
+        graph
+            .put_llm_setting(
+                GLOBAL,
+                &format!("{INSTANCE_PREFIX}acp"),
+                &serde_json::to_string(&record).unwrap(),
+            )
+            .await
+            .unwrap();
+        let consent = ConsentRecord {
+            provider_id: "acp".into(),
+            origin: record.origin.clone(),
+            consented_by: "me@example.com".into(),
+            consented_at: chrono::Utc::now().to_rfc3339(),
+            credential_ref: Some("none".into()),
+            ..Default::default()
+        };
+        graph
+            .put_llm_setting(
+                "project:demo",
+                &format!("{CONSENT_PREFIX}acp"),
+                &serde_json::to_string(&consent).unwrap(),
+            )
+            .await
+            .unwrap();
+        let parent = parent_on(&mock, Some("acp"), "acp-default").await;
+
+        let task_id = Uuid::new_v4();
+        let mut request = delegation_chat_request(
+            "/a".into(),
+            Some("demo".into()),
+            task_id,
+            "t",
+            None,
+            "default",
+        )
+        .unwrap();
+        request.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Delegation {
+                plan_id: Uuid::new_v4(),
+                task_id,
+                parent_session_id: Some(parent),
+                scaffolding_level: None,
+            }
+            .to_json_string(),
+        );
+        inherit_parent_engine(graph.as_ref(), &mut request, Some(parent), false).await;
+
+        let created = manager
+            .create_session(&request)
+            .await
+            .unwrap_or_else(|e| panic!("the child opens: {e:#}"));
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&created.session_id).unwrap())
+            .await
+            .unwrap()
+            .expect("the child's node");
+        assert_eq!(
+            node.provider_id.as_deref(),
+            Some("acp"),
+            "the parent's instance"
+        );
+        assert_eq!(node.model, "acp-default");
+        assert_eq!(node.routed_by.as_deref(), Some("run"));
+        assert_eq!(acp.state.opened_specs.lock().unwrap().len(), 1);
+        assert!(
+            claude.state.opened_specs.lock().unwrap().is_empty(),
+            "the default was never opened"
+        );
+    }
+
     #[tokio::test]
     async fn a_routed_delegation_carries_the_decision_id_and_nothing_else_changes() {
         use crate::chat::provider::cognitive::candidates::Slot;
@@ -11226,7 +11495,7 @@ mod retry_plan_task_tests {
         // An unapplied decision: same request but for the id; the slot is automatic.
         let (decider, handle) = FakeDecider::handle(false);
         let mut routed = base.clone();
-        let id = route_delegation(
+        let decided = route_delegation(
             Some(&handle),
             &graph,
             &mut routed,
@@ -11236,7 +11505,8 @@ mod retry_plan_task_tests {
         )
         .await
         .expect("decided");
-        assert_eq!(routed.routing_decision_id, Some(id));
+        assert_eq!(routed.routing_decision_id, Some(decided.id));
+        assert!(!decided.applied);
         routed.routing_decision_id = None;
         assert_eq!(format!("{routed:?}"), format!("{base:?}"));
         let seen = decider.requests();
