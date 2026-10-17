@@ -346,12 +346,14 @@ pub(crate) const ACTION_CLASSES: &[(&str, &[&str], &[&str])] = &[
             "get_session_entities",
             "get_session_tree",
             "get_run_sessions",
+            "team_status",
         ],
         &[
             "delete_session",
             "send_message",
             "add_discussed",
             "associate_with",
+            "team_message",
         ],
     ),
     (

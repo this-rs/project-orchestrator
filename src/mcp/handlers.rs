@@ -404,6 +404,8 @@ pub(crate) const MEGA_TOOL_ACTIONS: &[(&str, &str, &str)] = &[
     ("chat", "get_session_tree", "get_session_tree"),
     ("chat", "get_run_sessions", "get_run_sessions"),
     ("chat", "associate_with", "associate_session"),
+    ("chat", "team_message", "team_message"),
+    ("chat", "team_status", "team_status"),
 
     // Feature Graph
     ("feature_graph", "create", "create_feature_graph"),
@@ -4174,6 +4176,26 @@ impl ToolHandler {
             "get_session_tree" => {
                 let id = extract_id(args, "session_id")?;
                 let result = http.get(&format!("/api/chat/sessions/{}/tree", id)).await?;
+                Ok(Some(result))
+            }
+
+            // TEAM-2: the sender is this MCP server's session (its token), never a body field.
+            "team_message" => {
+                let mut body = serde_json::Map::new();
+                body.insert("text".to_string(), json!(extract_string(args, "text")?));
+                for key in ["to", "kind", "project_slug", "task_id"] {
+                    if let Some(v) = args.get(key).and_then(|v| v.as_str()) {
+                        body.insert(key.to_string(), json!(v));
+                    }
+                }
+                let result = http
+                    .post("/api/chat/team/message", &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "team_status" => {
+                let result = http.get("/api/chat/team").await?;
                 Ok(Some(result))
             }
 
@@ -10676,6 +10698,8 @@ mod tests {
             ("get_session_tree", "get_session_tree"),
             ("get_run_sessions", "get_run_sessions"),
             ("associate_with", "associate_session"),
+            ("team_message", "team_message"),
+            ("team_status", "team_status"),
         ] {
             let args = json!({"action": action});
             let (name, _) = handler.resolve_mega_tool("chat", &args).unwrap();
