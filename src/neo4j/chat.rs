@@ -76,6 +76,7 @@ impl Neo4jClient {
                     engine: $engine,
                     resume_token: $resume_token,
                     execution_place: $execution_place,
+                    project_inferred: $project_inferred,
                     access: $access,
                     owner: $owner,
                     file_scope_lifted: $file_scope_lifted,
@@ -117,6 +118,7 @@ impl Neo4jClient {
                     engine: $engine,
                     resume_token: $resume_token,
                     execution_place: $execution_place,
+                    project_inferred: $project_inferred,
                     access: $access,
                     owner: $owner,
                     file_scope_lifted: $file_scope_lifted,
@@ -187,6 +189,7 @@ impl Neo4jClient {
                         session.resume_token.clone().unwrap_or_default(),
                     )
                     .param("execution_place", session.execution_place.as_str())
+                    .param("project_inferred", session.project_inferred)
                     .param("access", session.access.as_str())
                     .param("owner", session.owner.clone().unwrap_or_default())
                     .param("file_scope_lifted", session.file_scope_lifted)
@@ -1152,6 +1155,7 @@ impl Neo4jClient {
             execution_place: ExecutionPlace::parse_stored(
                 &node.get::<String>("execution_place").unwrap_or_default(),
             ),
+            project_inferred: node.get::<bool>("project_inferred").unwrap_or(false),
             access: crate::chat::provider::policy::SessionAccess::parse_stored(
                 &node.get::<String>("access").unwrap_or_default(),
             ),

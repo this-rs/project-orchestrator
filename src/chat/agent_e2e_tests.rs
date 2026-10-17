@@ -9873,6 +9873,7 @@ mod permission_scopes {
             engine: None,
             resume_token: None,
             execution_place: Default::default(),
+            project_inferred: false,
             access: Default::default(),
             owner: None,
         };

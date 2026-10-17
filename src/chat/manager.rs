@@ -1458,6 +1458,14 @@ pub(crate) struct TurnProtocol {
 /// precedence, whose cwd inference is reserved to sessions with a real cwd.
 /// A resolver error in `on` falls back to the historical path: a session never
 /// loses its project to a read error.
+/// ENV-WS: whether the project a new session ends with was DEDUCED (the request named
+/// none, the server found one from the cwd) rather than chosen. The only input from the
+/// request is the ABSENCE of a project: nothing a caller writes can mark a project as
+/// deduced, so no caller can widen its children by claiming it.
+pub(crate) fn project_was_inferred(requested: Option<&str>, resolved: Option<&str>) -> bool {
+    requested.is_none() && resolved.is_some()
+}
+
 pub(crate) async fn infer_session_project(
     graph: &dyn GraphStore,
     mode: super::anchor_resolver::AnchorContextMode,
@@ -7258,6 +7266,11 @@ impl ChatManager {
             } else {
                 super::neutral_place::ExecutionPlace::Project
             },
+            // ENV-WS: decided HERE, by the server, from the request having no project.
+            project_inferred: project_was_inferred(
+                request.project_slug.as_deref(),
+                project_slug.as_deref(),
+            ),
             access,
             owner,
         };
@@ -12834,6 +12847,8 @@ impl ChatManager {
                 &node.cwd,
             )
             .await;
+            // ENV-WS: a project found here was deduced, not chosen.
+            node.project_inferred = node.project_slug.is_some();
         }
         let frozen = super::provider::resolver::resolve_for_open(
             node.provider_id.as_deref(),
@@ -26638,6 +26653,7 @@ mod tests {
             engine: None,
             resume_token: None,
             execution_place: Default::default(),
+            project_inferred: false,
             access: Default::default(),
             owner: None,
         };
@@ -27011,6 +27027,7 @@ mod tests {
             engine: None,
             resume_token: None,
             execution_place: Default::default(),
+            project_inferred: false,
             access: Default::default(),
             owner: None,
         };
@@ -27054,6 +27071,7 @@ mod tests {
             engine: None,
             resume_token: None,
             execution_place: Default::default(),
+            project_inferred: false,
             access: Default::default(),
             owner: None,
         };

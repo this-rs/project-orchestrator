@@ -7154,6 +7154,7 @@ mod tests {
             roots: vec!["/work/repo".to_string()],
             project_slug: Some("demo".to_string()),
             workspace_slug: None,
+            workspace_projects: None,
         }
     }
 

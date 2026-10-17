@@ -263,6 +263,14 @@ pub struct ChatSessionNode {
     /// host made for it. Absent on every session written before it existed: `project`.
     #[serde(default)]
     pub execution_place: ExecutionPlace,
+    /// `project_slug` was DEDUCED from the cwd (a session opened in all-projects mode),
+    /// not chosen. Set by the server only, at open or resume — never read from a request.
+    /// The deduced project gives the graph context; it is not a boundary: a parent with a
+    /// workspace bounds its children to that workspace, not to the deduced project
+    /// (ENV-WS). Absent on every session written before it existed: `false` (chosen),
+    /// which keeps the strict rule.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub project_inferred: bool,
     /// What the session may do to the world, fixed at open and kept by every resume
     /// (`normal` | `read_only`). Absent on every session written before it existed: `normal`.
     #[serde(default, skip_serializing_if = "SessionAccess::is_normal")]
@@ -3565,6 +3573,7 @@ mod tests {
             engine: None,
             resume_token: None,
             execution_place: Default::default(),
+            project_inferred: false,
             access: Default::default(),
             owner: None,
         };
@@ -3605,6 +3614,7 @@ mod tests {
             engine: None,
             resume_token: None,
             execution_place: Default::default(),
+            project_inferred: false,
             access: Default::default(),
             owner: None,
         };
