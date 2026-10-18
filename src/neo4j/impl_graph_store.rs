@@ -2589,6 +2589,22 @@ impl GraphStore for Neo4jClient {
         self.apply_anchor_op(session_id, op).await
     }
 
+    async fn apply_anchor_op_if(
+        &self,
+        session_id: Uuid,
+        op: crate::chat::anchor::AnchorOp,
+        if_match: Option<u64>,
+    ) -> anyhow::Result<crate::chat::anchor::AnchorSetChange> {
+        self.apply_anchor_op_if(session_id, op, if_match).await
+    }
+
+    async fn get_anchor_set(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Option<crate::chat::anchor::AnchorSet>> {
+        self.get_anchor_set(session_id).await
+    }
+
     async fn list_session_anchors(
         &self,
         session_id: Uuid,

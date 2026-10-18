@@ -54,6 +54,9 @@ pub type DiscussedCall = (Uuid, Vec<(String, String)>);
 pub struct MockAnchorStore {
     pub anchors: HashMap<Uuid, crate::chat::anchor::Anchor>,
     pub events: Vec<crate::chat::anchor::AnchorEvent>,
+    /// Version of the anchor set of each session: `ChatSession.anchor_seq` in
+    /// Neo4j, bumped once per committed change, never decreased.
+    pub versions: HashMap<Uuid, u64>,
 }
 
 pub struct MockGraphStore {
@@ -8325,22 +8328,32 @@ impl GraphStore for MockGraphStore {
         let mut anchors = self.anchor_store.write().await;
         anchors.anchors.retain(|_, a| a.session_id != id);
         anchors.events.retain(|e| e.session_id != id);
+        anchors.versions.remove(&id);
         drop(anchors);
         Ok(self.chat_sessions.write().await.remove(&id).is_some())
     }
 
     // Chat anchors — same rules as the Neo4j store (both call `anchor::apply_op`).
 
-    async fn apply_anchor_op(
+    async fn apply_anchor_op_if(
         &self,
         session_id: Uuid,
         op: crate::chat::anchor::AnchorOp,
-    ) -> Result<crate::chat::anchor::AnchorChange> {
+        if_match: Option<u64>,
+    ) -> Result<crate::chat::anchor::AnchorSetChange> {
         use crate::chat::anchor::*;
         // One lock over anchors + journal: state and event change together.
         let mut store = self.anchor_store.write().await;
         if !self.chat_sessions.read().await.contains_key(&session_id) {
             return Err(AnchorError::SessionNotFound(session_id).into());
+        }
+        let current = store.versions.get(&session_id).copied().unwrap_or(0);
+        if let Some(expected) = if_match.filter(|v| *v != current) {
+            return Err(AnchorError::SetVersionConflict {
+                expected,
+                actual: current,
+            }
+            .into());
         }
         let existing: Vec<Anchor> = store
             .anchors
@@ -8349,17 +8362,16 @@ impl GraphStore for MockGraphStore {
             .cloned()
             .collect();
         let mut change = apply_op(session_id, &existing, op, chrono::Utc::now())?;
-        let next_seq = store
-            .events
-            .iter()
-            .filter(|e| e.session_id == session_id)
-            .map(|e| e.seq)
-            .max()
-            .unwrap_or(0)
-            + 1;
+        let next_seq = current + 1;
         if let Some(ev) = change.event.as_mut() {
             ev.seq = next_seq;
         }
+        let version = if change.event.is_some() {
+            store.versions.insert(session_id, next_seq);
+            next_seq
+        } else {
+            current
+        };
         if change.deleted {
             store.anchors.remove(&change.anchor.id);
         } else if change.event.is_some() {
@@ -8370,7 +8382,29 @@ impl GraphStore for MockGraphStore {
         if let Some(ev) = &change.event {
             store.events.push(ev.clone());
         }
-        Ok(change)
+        Ok(AnchorSetChange { change, version })
+    }
+
+    async fn get_anchor_set(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<crate::chat::anchor::AnchorSet>> {
+        // Same lock as the writes: anchors and version are one consistent read.
+        let store = self.anchor_store.read().await;
+        if !self.chat_sessions.read().await.contains_key(&session_id) {
+            return Ok(None);
+        }
+        let mut anchors: Vec<_> = store
+            .anchors
+            .values()
+            .filter(|a| a.session_id == session_id)
+            .cloned()
+            .collect();
+        anchors.sort_by_key(|a| (a.created_at, a.id));
+        Ok(Some(crate::chat::anchor::AnchorSet {
+            version: store.versions.get(&session_id).copied().unwrap_or(0),
+            anchors,
+        }))
     }
 
     async fn list_session_anchors(

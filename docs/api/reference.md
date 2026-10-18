@@ -336,6 +336,37 @@ curl -X DELETE -H "Authorization: Bearer <JWT>" \
   http://localhost:8080/api/chat/sessions/{id}
 ```
 
+### Context anchors -- Protected
+
+The typed context of a conversation (`target_type` + `target_id`, roles `focus` /
+`mention` / `origin`). Every answer carries the version of the session's anchor set
+in `ETag: "<n>"` (and `version` in the body).
+
+| Route | Effect |
+|---|---|
+| `GET /api/chat/sessions/{id}/anchors` | `{session_id, version, anchors}` |
+| `POST /api/chat/sessions/{id}/anchors` | body `{target_type, target_id, roles?, snapshot_name?, snapshot_path?, snapshot_type?, rev?}`; `201` created, `200` already there with those roles (nothing written) |
+| `PATCH /api/chat/sessions/{id}/anchors/{anchor_id}` | body `{action: "promote"\|"demote", role, version?}` |
+| `DELETE /api/chat/sessions/{id}/anchors/{anchor_id}?version=` | removes it (never the origin) |
+| `GET /api/chat/anchored-sessions?target_type=&target_id=&state=&limit=&cursor=` | reverse read: `{items: [{session, anchor}], next_cursor?}`, `limit` 1..=100 (default 20) |
+
+- **Who placed the anchor is taken from the token, never from the body** (a `by`
+  or `placed_by` key is ignored): a person's own session token places as `user`;
+  an agent session's token, an MCP token, a vault token and the anonymous user
+  place as `agent`. An agent may only add a `mention`. Only a `user` anchor on a
+  project or a workspace opens that project's content to the conversation.
+- An agent session's token writes only on its own session or a session it spawned.
+- `If-Match: "<n>"` on a mutation: refused with `409`
+  `{error, code: "anchor_set_version_conflict", current: {version, anchors}}` (and
+  the current `ETag`) when the set changed since `<n>`. The other refusals:
+  `400` (invalid target, role, last role), `403` (`origin_immutable`,
+  `agent_cannot_focus`, `agent_role_forbidden`), `404` (session or anchor),
+  `409` (`focus_cap_reached`, `session_cap_reached`, `already_anchored`,
+  `anchor_version_conflict`, `origin_already_exists`), each with its `code`.
+- Every committed change emits on `/ws/events` a `chat_session` / `updated` event
+  whose payload is `{anchors: {change, anchor_id, target_type, target_id, roles,
+  state, by, version}}`. A no-op emits nothing.
+
 ### POST /api/chat/sessions/{id}/cancel-tools and /cancel-task/{task_id} -- Protected
 
 Stop the running tools of a session (the turn goes on), or one background task
