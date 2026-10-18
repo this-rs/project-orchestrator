@@ -975,6 +975,14 @@ pub trait GraphStore: Send + Sync {
     /// Get the project ID for a decision (traverses Decision←Task←Plan←Project).
     async fn get_decision_project_id(&self, decision_id: Uuid) -> Result<Option<String>>;
 
+    /// Project of each decision in one batched lookup (same traversal as
+    /// `get_decision_project_id`). Decisions whose project is not verifiable
+    /// (plan without project, unknown id) are absent from the map.
+    async fn get_decision_project_ids(
+        &self,
+        decision_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Uuid>>;
+
     /// Update a decision
     async fn update_decision(
         &self,

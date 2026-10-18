@@ -1217,6 +1217,13 @@ impl GraphStore for Neo4jClient {
         self.get_decision_project_id(decision_id).await
     }
 
+    async fn get_decision_project_ids(
+        &self,
+        decision_ids: &[Uuid],
+    ) -> anyhow::Result<std::collections::HashMap<Uuid, Uuid>> {
+        self.get_decision_project_ids(decision_ids).await
+    }
+
     async fn update_decision(
         &self,
         decision_id: Uuid,

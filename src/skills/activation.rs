@@ -893,7 +893,7 @@ pub fn spawn_activation_increment(graph_store: Arc<dyn GraphStore>, skill_id: Uu
 /// This is the actual DB work — called inside a `tokio::spawn` by
 /// `spawn_hook_reinforcement`. NOT intended to be called directly
 /// from request handlers.
-async fn reinforce_hook_activation(
+pub(crate) async fn reinforce_hook_activation(
     graph_store: &dyn GraphStore,
     note_ids: &[Uuid],
     config: &AutoReinforcementConfig,

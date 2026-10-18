@@ -226,10 +226,12 @@ pub async fn reason_feedback(
 
     let neo4j = state.orchestrator.neo4j();
 
-    // `followed_nodes` is client-supplied: every id that is a Note must belong to
-    // the project of the tree (or, when the tree is gone or unscoped, to one and
-    // the same known project). Other ids (Decisions) cannot be checked and only
-    // receive scars, never energy nor synapses.
+    // `followed_nodes` is client-supplied: every id that is a Note, or a
+    // Decision whose project is known, must belong to the project of the tree
+    // (or, when the tree is gone or unscoped, to one and the same known
+    // project). Decisions only ever receive scars, never energy nor synapses;
+    // a decision whose plan has no project is not verifiable and keeps
+    // receiving scars (T0f-bis decision).
     let tree_project = match state.orchestrator.reasoning_engine() {
         Some(engine) => engine
             .cache()
@@ -244,7 +246,19 @@ pub async fn reason_feedback(
             note_entries.push((*node_id, note.project_id));
         }
     }
-    check_followed_project(&note_entries, tree_project)?;
+    let others: Vec<Uuid> = body
+        .followed_nodes
+        .iter()
+        .filter(|id| !note_entries.iter().any(|(n, _)| n == *id))
+        .copied()
+        .collect();
+    let decision_projects = neo4j
+        .get_decision_project_ids(&others)
+        .await
+        .map_err(AppError::Internal)?;
+    let mut checked = note_entries.clone();
+    checked.extend(decision_projects.iter().map(|(d, p)| (*d, Some(*p))));
+    check_followed_project(&checked, tree_project)?;
     let followed_notes: Vec<Uuid> = note_entries.iter().map(|(id, _)| *id).collect();
 
     let mut neurons_boosted = 0u64;
@@ -708,6 +722,79 @@ mod tests {
         let after = graph.get_note(b.id).await.unwrap().unwrap();
         assert_eq!(after.scar_intensity, 0.0);
         assert_eq!(after.energy, 0.5);
+    }
+
+    /// T0f-bis: a followed decision whose project is known is checked like a
+    /// note: one of another project is refused (400, nothing written); one of
+    /// the tree's project, or one whose plan has no project (not verifiable),
+    /// passes.
+    #[tokio::test]
+    async fn test_feedback_checks_the_project_of_followed_decisions() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::GraphStore;
+        use std::sync::Arc;
+
+        let graph = Arc::new(MockGraphStore::new());
+        let (server, orchestrator) = feedback_fixture(graph.clone()).await;
+        let (mine, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let decision_in = |project: Option<Uuid>| {
+            let graph = graph.clone();
+            async move {
+                let mut plan = crate::test_helpers::test_plan();
+                plan.project_id = project;
+                graph.create_plan(&plan).await.unwrap();
+                let task = crate::test_helpers::test_task();
+                graph.create_task(plan.id, &task).await.unwrap();
+                let d = crate::test_helpers::test_decision("d", "r");
+                graph.create_decision(task.id, &d).await.unwrap();
+                d.id
+            }
+        };
+        let own_d = decision_in(Some(mine)).await;
+        let foreign_d = decision_in(Some(other)).await;
+        let loose_d = decision_in(None).await;
+        assert_eq!(
+            graph
+                .get_decision_project_ids(&[own_d, foreign_d, loose_d])
+                .await
+                .unwrap(),
+            [(own_d, mine), (foreign_d, other)].into_iter().collect()
+        );
+        let a = mk_note(Some(mine));
+        graph.create_note(&a).await.unwrap();
+
+        let tree = crate::reasoning::ReasoningTree::new("scoped", Some(mine));
+        let tree_id = tree.id;
+        orchestrator
+            .reasoning_engine()
+            .expect("reasoning engine")
+            .cache()
+            .insert(tree)
+            .await;
+        let feedback = |nodes: Vec<Uuid>| {
+            let server = server.clone();
+            async move {
+                let body: ReasonFeedbackRequest = serde_json::from_value(json!({
+                    "followed_nodes": nodes,
+                    "outcome": "failure",
+                }))
+                .unwrap();
+                reason_feedback(State(server), Path(tree_id), Json(body)).await
+            }
+        };
+
+        let err = feedback(vec![a.id, foreign_d]).await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+        assert_eq!(
+            graph.get_note(a.id).await.unwrap().unwrap().scar_intensity,
+            0.0
+        );
+        // A foreign decision alone (no note) is refused too.
+        assert!(feedback(vec![foreign_d]).await.is_err());
+
+        let ok = feedback(vec![a.id, own_d, loose_d]).await.unwrap();
+        assert_eq!(ok.0.scars_applied, 1);
+        assert!(graph.get_note(a.id).await.unwrap().unwrap().scar_intensity > 0.0);
     }
 
     /// Same-project nodes pass, and the response counts real synapses.
