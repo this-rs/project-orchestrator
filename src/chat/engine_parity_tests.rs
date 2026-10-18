@@ -169,6 +169,10 @@ const FUNCTIONS: &[(&str, &str)] = &[
         "compaction_started et compact_boundary sur le fil",
     ),
     (
+        "compaction.manual",
+        "`/compact <instructions>` envoyé depuis le chat : Claude Code reçoit la commande telle quelle (le CLI compacte, compact_boundary trigger manual) ; le natif compacte hors tour (AgentSession::compact), les instructions et le hook PreCompact dans la requête de résumé, aucun tour envoyé au modèle, compaction_started / compact_boundary trigger manual sur le fil (ISO3)",
+    ),
+    (
         "message_queue",
         "un message envoyé pendant un tour l'interrompt et passe ensuite",
     ),
@@ -1668,6 +1672,22 @@ fn transcript_main(k: Keys, cwd: &str, path: ProviderPath) -> Vec<Value> {
         result_ok("answered huge"),
     ]);
     t.extend(answer(&k.k("TURN-AFTER-HUGE"), "answered after huge"));
+    // ISO3: `/compact <instructions>` typed in the chat reaches the CLI as the command; the
+    // CLI compacts (boundary `manual`) and ends the turn. The historical engine then
+    // re-injects the work context in a turn of its own, as after TURN-ONE.
+    t.extend(vec![
+        await_in(&format!("/compact {}", k.k("MANUAL-KEEP"))),
+        emit(json!({"type": "system", "subtype": "compact_boundary",
+                    "compact_metadata": {"trigger": "manual", "pre_tokens": 5400}})),
+        result_ok(""),
+    ]);
+    if path == ProviderPath::Legacy {
+        t.extend(vec![
+            await_in("Work Already Done"),
+            text("noted again"),
+            result_ok("noted again"),
+        ]);
+    }
     // Closed by the backend going down (EOF on stdin).
     t.push(wait_eof());
     t
@@ -2086,6 +2106,8 @@ fn native_script(k: Keys, cwd: &str) -> Value {
     r.push(sse_route(&k.k("TURN-PRIME"), prime));
     r.push(says("Additional instructions", "the summary"));
     r.push(says(&k.k("TURN-COMPACT"), "answered compact"));
+    // ISO3: the summary request of `/compact <instructions>` (its key is the instructions).
+    r.push(says(&k.k("MANUAL-KEEP"), "the summary, on request"));
     // After the restart.
     r.push(says(&k.k("RESUMED"), "answered resumed"));
     Value::Array(r)
@@ -2402,6 +2424,117 @@ async fn cc_huge(
             "ce que le CLI fait du mégaoctet (fichier de session, avis de ~1,6 Ko) est relevé \
              sur 2.1.296 et rejoué par fake_claude"
                 .to_string(),
+        ),
+    )
+}
+
+/// `compaction.manual` on Claude Code (both engines): `/compact <instructions>` sent from the
+/// chat reaches the CLI as the command, unchanged at the head of the turn's text, and the
+/// CLI's boundary (`manual`) reaches the thread. One message sent.
+async fn cc_manual_compact(
+    manager: &ChatManager,
+    w: &Watch,
+    cli: &FakeClaude,
+    k: Keys,
+    sid: &str,
+    path: ProviderPath,
+) -> (bool, String) {
+    let ends = w.turn_ends();
+    let command = format!("/compact {}", k.k("MANUAL-KEEP"));
+    manager.send_message(sid, &command).await.unwrap();
+    let line = cli.wait_line(0, &command, WAIT).await;
+    let text = line.as_deref().map(user_line_text).unwrap_or_default();
+    let as_command = text.trim_start().starts_with("/compact");
+    let boundary = w
+        .wait(
+            WAIT,
+            |e| matches!(e, ChatEvent::CompactBoundary { trigger, .. } if trigger == "manual"),
+        )
+        .await;
+    w.settle(ends, manager).await;
+    if path == ProviderPath::Legacy {
+        // The work context the historical engine re-injects in a turn of its own.
+        let ends = w.turn_ends();
+        if w.said(WAIT, "noted again").await {
+            w.settle(ends, manager).await;
+        }
+    }
+    (
+        line.is_some() && as_command && boundary,
+        format!(
+            "commande lue par le CLI={}, en tête du texte={as_command} ({}), compact_boundary \
+             manual={boundary}",
+            line.is_some(),
+            excerpt(&text)
+        ),
+    )
+}
+
+/// The text of a user message line written to the CLI's stdin.
+fn user_line_text(line: &str) -> String {
+    let v: Value = serde_json::from_str(line).unwrap_or_default();
+    match &v["message"]["content"] {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => line.to_string(),
+    }
+}
+
+/// `compaction.manual` on the native harness: `/compact <instructions>` is a compaction out of
+/// turn — ONE request to the model, the summary, carrying the instructions and the PreCompact
+/// hook's guidance (the project's name); no turn; both phases on the thread with `trigger:
+/// manual`; the outcome said. One message sent.
+async fn native_manual_compact(
+    manager: &ChatManager,
+    wn: &Watch,
+    fake: &FakeOpenAi,
+    k: Keys,
+    nid: &str,
+    project: &str,
+) -> (bool, String) {
+    let ends = wn.turn_ends();
+    let before = bodies(fake).len();
+    let instructions = k.k("MANUAL-KEEP");
+    manager
+        .send_message(nid, &format!("/compact {instructions}"))
+        .await
+        .unwrap();
+    let summary = wait_body(fake, &instructions).await.unwrap_or_default();
+    let with_instructions = summary.contains(&format!("Additional instructions: {instructions}"));
+    let with_hook = summary.contains(project);
+    let started = wn
+        .wait(
+            WAIT,
+            |e| matches!(e, ChatEvent::CompactionStarted { trigger } if trigger == "manual"),
+        )
+        .await;
+    let boundary = wn
+        .wait(
+            WAIT,
+            |e| matches!(e, ChatEvent::CompactBoundary { trigger, .. } if trigger == "manual"),
+        )
+        .await;
+    let said = wn
+        .wait(WAIT, |e| {
+            matches!(e, ChatEvent::SystemHint { content }
+                if content.starts_with("Conversation compacted on request"))
+        })
+        .await;
+    wn.settle(ends, manager).await;
+    let requests = bodies(fake).len() - before;
+    let no_turn = !bodies(fake)[before..]
+        .iter()
+        .any(|b| b.contains("/compact"));
+    (
+        with_instructions && with_hook && started && boundary && said && requests == 1 && no_turn,
+        format!(
+            "instructions dans le résumé={with_instructions}, hook PreCompact={with_hook}, \
+             compaction_started manual={started}, compact_boundary manual={boundary}, issue \
+             dite={said}, requêtes au modèle={requests}, aucun tour /compact={no_turn}"
         ),
     )
 }
@@ -3178,6 +3311,11 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     let (ok, seen) = Box::pin(cc_huge(&manager, &w, &cli, kc, &sid)).await;
     cc_sent += 2;
     cc.check("tool_result.huge", ok, Cause::Harness, seen);
+
+    // ISO3: `/compact <instructions>` from the chat goes to the CLI as the command.
+    let (ok, seen) = Box::pin(cc_manual_compact(&manager, &w, &cli, kc, &sid, path)).await;
+    cc_sent += 1;
+    cc.check("compaction.manual", ok, Cause::Harness, seen);
 
     // The announcement and the record.
     let init = w.system_init().await;
@@ -4041,6 +4179,19 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         Cause::Harness,
         format!("compaction_started={started}, compact_boundary={boundary}"),
     );
+
+    // ISO3: `/compact <instructions>` from the chat: compacted out of turn on request.
+    let (ok, seen) = Box::pin(native_manual_compact(
+        &manager,
+        &wn,
+        &fake,
+        kn,
+        &nid,
+        &stage.project.name,
+    ))
+    .await;
+    na_sent += 1;
+    na.check("compaction.manual", ok, Cause::Harness, seen);
 
     // The announcement (hard rule, below) and the record.
     let unduly = init.as_ref().map(not_model_limits);

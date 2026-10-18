@@ -2190,6 +2190,15 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         sent: &str,
         turn: &crate::refs::turn::TurnExpansion,
     ) -> String {
+        // `/compact` reaching a provider here is one whose CLI reads the command itself
+        // (Claude Code; the others are compacted by the runtime, ISO3): it must head the text
+        // the CLI reads, or the CLI hands it to the model as a sentence. Nothing in front.
+        if sent == shown && super::manual_compaction::compact_command(shown).is_some() {
+            if let Some(router) = self.turn_routing.get(session_id) {
+                router.set_turn_input(shown);
+            }
+            return shown.to_string();
+        }
         // What follows the enrichment. No references: the attachments expanded
         // (references in the conversation, content for the model), a relayed
         // history kept in front. References: the relay, the visible text, its
@@ -8890,20 +8899,25 @@ impl ChatManager {
                 let window = sessions.get(&session_id).and_then(|s| s.context_window);
                 (protocol, anchor, window)
             };
-            match enrichment_for_turn(
-                &graph,
-                &enrichment_pipeline,
-                &session_id,
-                &prompt,
-                protocol,
-                turn.excluded_note_ids.clone(),
-                &anchor,
-                window,
-            )
-            .await
-            {
-                Some(enrichment_md) => prepend_enrichment(&enrichment_md, &prompt),
-                None => prompt,
+            // `/compact`: the CLI reads the command only at the head of the text (ISO3).
+            if super::manual_compaction::compact_command(&prompt).is_some() {
+                prompt
+            } else {
+                match enrichment_for_turn(
+                    &graph,
+                    &enrichment_pipeline,
+                    &session_id,
+                    &prompt,
+                    protocol,
+                    turn.excluded_note_ids.clone(),
+                    &anchor,
+                    window,
+                )
+                .await
+                {
+                    Some(enrichment_md) => prepend_enrichment(&enrichment_md, &prompt),
+                    None => prompt,
+                }
             }
         };
 

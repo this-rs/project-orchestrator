@@ -1433,6 +1433,34 @@ mod tests {
         );
     }
 
+    /// ISO3: a `/compact` on the native harness is announced out of turn with `trigger:
+    /// manual`; both phases reach the thread with that trigger (never dropped, never read
+    /// as automatic).
+    #[test]
+    fn a_manual_compaction_out_of_turn_keeps_its_trigger() {
+        use nexus_claude::agent::{CompactionPhase, CompactionTrigger};
+        let events = [
+            AgentEvent::Compaction {
+                phase: CompactionPhase::Started,
+                trigger: Some(CompactionTrigger::Manual),
+                pre_tokens: Some(9000),
+            },
+            AgentEvent::Compaction {
+                phase: CompactionPhase::Completed,
+                trigger: Some(CompactionTrigger::Manual),
+                pre_tokens: Some(9000),
+            },
+        ];
+        let out = out_of_band_to_chat_events(&events, &mut EventMapper::new(), Utc::now());
+        assert!(
+            matches!(out.as_slice(), [
+                ChatEvent::CompactionStarted { trigger: started },
+                ChatEvent::CompactBoundary { trigger: done, pre_tokens: Some(9000) },
+            ] if started == "manual" && done == "manual"),
+            "{out:?}"
+        );
+    }
+
     #[test]
     fn an_unknown_cost_is_not_a_fake_zero() {
         let done = AgentEvent::Done {
