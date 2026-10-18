@@ -751,6 +751,7 @@ mod tests {
                 canonical: None,
                 tool_use_id: None,
                 always: None,
+                consent: None,
             },
             ChatEvent::Result {
                 session_id: "sess-1".into(),

@@ -1229,6 +1229,7 @@ mod tests {
             canonical: None,
             tool_use_id: None,
             always: None,
+            consent: None,
         }
     }
 
@@ -1430,6 +1431,7 @@ mod tests {
             canonical: Some("Write".into()),
             tool_use_id: None,
             always: None,
+            consent: None,
         };
         let first = adopt().await;
         let answers_itself = live_answers_itself(Arc::clone(&runtime), "child", Some(first));

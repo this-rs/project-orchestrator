@@ -423,6 +423,7 @@ mod tests {
             canonical: None,
             tool_use_id: call.map(str::to_string),
             always: None,
+            consent: None,
         }
     }
 

@@ -228,6 +228,7 @@ impl EventMapper {
                 canonical: canonical.clone(),
                 tool_use_id: tool_call_id.clone(),
                 always: None,
+                consent: None,
             }],
             AgentEvent::Question {
                 question_id,
