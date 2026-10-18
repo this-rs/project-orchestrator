@@ -4406,7 +4406,7 @@ impl ChatManager {
 
     /// Persist permission config to config.yaml using surgical YAML modification.
     ///
-    /// Reads the existing file as a `serde_yaml::Value` tree, updates only the
+    /// Reads the existing file as a `crate::yaml::Value` tree, updates only the
     /// `chat.permissions` subtree, and writes back atomically (tmp + rename).
     /// This preserves all other config sections (auth, server, neo4j, etc.)
     /// without needing `Serialize` on those structs.
@@ -4417,13 +4417,13 @@ impl ChatManager {
         use std::io::Write;
 
         // 1. Read existing YAML as a Value tree (or start from empty mapping)
-        let mut doc: serde_yaml::Value = if yaml_path.exists() {
+        let mut doc: crate::yaml::Value = if yaml_path.exists() {
             let contents = std::fs::read_to_string(yaml_path)
                 .with_context(|| format!("Reading {}", yaml_path.display()))?;
-            serde_yaml::from_str(&contents)
+            crate::yaml::value_from_str(&contents)
                 .with_context(|| format!("Parsing {}", yaml_path.display()))?
         } else {
-            serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+            crate::yaml::Value::Mapping(crate::yaml::Mapping::new())
         };
 
         // 2. Ensure doc is a mapping
@@ -4432,11 +4432,11 @@ impl ChatManager {
             .ok_or_else(|| anyhow!("config.yaml root is not a YAML mapping"))?;
 
         // 3. Ensure chat section exists as a mapping
-        let chat_key = serde_yaml::Value::String("chat".into());
+        let chat_key = "chat".to_string();
         if !root.contains_key(&chat_key) {
             root.insert(
                 chat_key.clone(),
-                serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+                crate::yaml::Value::Mapping(crate::yaml::Mapping::new()),
             );
         }
         let chat_section = root
@@ -4445,13 +4445,13 @@ impl ChatManager {
             .ok_or_else(|| anyhow!("chat section is not a YAML mapping"))?;
 
         // 4. Serialize PermissionConfig to a YAML Value and insert
-        let perm_value = serde_yaml::to_value(permission)
+        let perm_value = crate::yaml::to_value(permission)
             .context("Serializing PermissionConfig to YAML value")?;
-        chat_section.insert(serde_yaml::Value::String("permissions".into()), perm_value);
+        chat_section.insert("permissions".to_string(), perm_value);
 
         // 5. Serialize the full document back to YAML string
         let yaml_str =
-            serde_yaml::to_string(&doc).context("Serializing config document to YAML")?;
+            crate::yaml::to_string(&doc).context("Serializing config document to YAML")?;
 
         // 6. Atomic write: write to .tmp then rename
         let tmp_path = yaml_path.with_extension("yaml.tmp");
@@ -4563,13 +4563,13 @@ impl ChatManager {
         use std::io::Write;
 
         // 1. Read existing YAML as a Value tree (or start from empty mapping)
-        let mut doc: serde_yaml::Value = if yaml_path.exists() {
+        let mut doc: crate::yaml::Value = if yaml_path.exists() {
             let contents = std::fs::read_to_string(yaml_path)
                 .with_context(|| format!("Reading {}", yaml_path.display()))?;
-            serde_yaml::from_str(&contents)
+            crate::yaml::value_from_str(&contents)
                 .with_context(|| format!("Parsing {}", yaml_path.display()))?
         } else {
-            serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+            crate::yaml::Value::Mapping(crate::yaml::Mapping::new())
         };
 
         // 2. Ensure doc is a mapping
@@ -4578,11 +4578,11 @@ impl ChatManager {
             .ok_or_else(|| anyhow!("config.yaml root is not a YAML mapping"))?;
 
         // 3. Ensure chat section exists as a mapping
-        let chat_key = serde_yaml::Value::String("chat".into());
+        let chat_key = "chat".to_string();
         if !root.contains_key(&chat_key) {
             root.insert(
                 chat_key.clone(),
-                serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+                crate::yaml::Value::Mapping(crate::yaml::Mapping::new()),
             );
         }
         let chat_section = root
@@ -4591,43 +4591,43 @@ impl ChatManager {
             .ok_or_else(|| anyhow!("chat section is not a YAML mapping"))?;
 
         // 4. Set/remove individual fields surgically
-        let path_key = serde_yaml::Value::String("process_path".into());
-        let cli_key = serde_yaml::Value::String("claude_cli_path".into());
-        let auto_key = serde_yaml::Value::String("auto_update_cli".into());
+        let path_key = "process_path".to_string();
+        let cli_key = "claude_cli_path".to_string();
+        let auto_key = "auto_update_cli".to_string();
 
         match &env.process_path {
             Some(val) => {
-                chat_section.insert(path_key, serde_yaml::Value::String(val.clone()));
+                chat_section.insert(path_key, crate::yaml::Value::String(val.clone()));
             }
             None => {
-                chat_section.remove(&path_key);
+                chat_section.shift_remove(&path_key);
             }
         }
         match &env.claude_cli_path {
             Some(val) => {
-                chat_section.insert(cli_key, serde_yaml::Value::String(val.clone()));
+                chat_section.insert(cli_key, crate::yaml::Value::String(val.clone()));
             }
             None => {
-                chat_section.remove(&cli_key);
+                chat_section.shift_remove(&cli_key);
             }
         }
         // Only write auto_update_cli when true (omit when false to keep YAML clean)
         if env.auto_update_cli {
-            chat_section.insert(auto_key, serde_yaml::Value::Bool(true));
+            chat_section.insert(auto_key, crate::yaml::Value::Bool(true));
         } else {
-            chat_section.remove(&auto_key);
+            chat_section.shift_remove(&auto_key);
         }
         // Only write auto_update_app when false (default is true, so omit when true to keep YAML clean)
-        let auto_app_key = serde_yaml::Value::String("auto_update_app".into());
+        let auto_app_key = "auto_update_app".to_string();
         if !env.auto_update_app {
-            chat_section.insert(auto_app_key, serde_yaml::Value::Bool(false));
+            chat_section.insert(auto_app_key, crate::yaml::Value::Bool(false));
         } else {
-            chat_section.remove(&auto_app_key);
+            chat_section.shift_remove(&auto_app_key);
         }
 
         // 5. Serialize the full document back to YAML string
         let yaml_str =
-            serde_yaml::to_string(&doc).context("Serializing config document to YAML")?;
+            crate::yaml::to_string(&doc).context("Serializing config document to YAML")?;
 
         // 6. Atomic write: write to .tmp then rename
         let tmp_path = yaml_path.with_extension("yaml.tmp");
@@ -29309,7 +29309,7 @@ mod tests {
 
         // Re-read and verify
         let contents = std::fs::read_to_string(&yaml_path).unwrap();
-        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+        let doc = crate::yaml::value_from_str(&contents).unwrap();
 
         // Other sections preserved
         assert_eq!(
@@ -29365,7 +29365,7 @@ mod tests {
         // File should now exist
         assert!(yaml_path.exists());
         let contents = std::fs::read_to_string(&yaml_path).unwrap();
-        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+        let doc = crate::yaml::value_from_str(&contents).unwrap();
 
         assert_eq!(
             doc["chat"]["permissions"]["mode"].as_str().unwrap(),
@@ -29470,7 +29470,7 @@ mod tests {
 
         // Verify it was persisted to disk
         let contents = std::fs::read_to_string(&yaml_path).unwrap();
-        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+        let doc = crate::yaml::value_from_str(&contents).unwrap();
         assert_eq!(
             doc["chat"]["permissions"]["mode"].as_str().unwrap(),
             "acceptEdits"
@@ -30967,23 +30967,14 @@ mod tests {
         ChatManager::persist_env_config_to_yaml(&yaml_path, &env).unwrap();
 
         let contents = std::fs::read_to_string(&yaml_path).unwrap();
-        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+        let doc = crate::yaml::value_from_str(&contents).unwrap();
         let chat = doc["chat"].as_mapping().unwrap();
         assert_eq!(
-            chat[&serde_yaml::Value::String("process_path".into())]
-                .as_str()
-                .unwrap(),
+            chat["process_path"].as_str().unwrap(),
             "/custom/path:/usr/bin"
         );
-        assert_eq!(
-            chat[&serde_yaml::Value::String("claude_cli_path".into())]
-                .as_str()
-                .unwrap(),
-            "/opt/claude"
-        );
-        assert!(chat[&serde_yaml::Value::String("auto_update_cli".into())]
-            .as_bool()
-            .unwrap());
+        assert_eq!(chat["claude_cli_path"].as_str().unwrap(), "/opt/claude");
+        assert!(chat["auto_update_cli"].as_bool().unwrap());
     }
 
     #[test]
@@ -31008,7 +30999,7 @@ mod tests {
         ChatManager::persist_env_config_to_yaml(&yaml_path, &env).unwrap();
 
         let contents = std::fs::read_to_string(&yaml_path).unwrap();
-        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+        let doc = crate::yaml::value_from_str(&contents).unwrap();
 
         // server section preserved
         assert_eq!(doc["server"]["port"].as_u64().unwrap(), 6600);
@@ -31054,13 +31045,13 @@ mod tests {
         ChatManager::persist_env_config_to_yaml(&yaml_path, &env2).unwrap();
 
         let contents = std::fs::read_to_string(&yaml_path).unwrap();
-        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+        let doc = crate::yaml::value_from_str(&contents).unwrap();
 
         // All fields should be removed
         let chat = doc["chat"].as_mapping().unwrap();
-        assert!(!chat.contains_key(serde_yaml::Value::String("process_path".into())));
-        assert!(!chat.contains_key(serde_yaml::Value::String("claude_cli_path".into())));
-        assert!(!chat.contains_key(serde_yaml::Value::String("auto_update_cli".into())));
+        assert!(!chat.contains_key("process_path"));
+        assert!(!chat.contains_key("claude_cli_path"));
+        assert!(!chat.contains_key("auto_update_cli"));
     }
 
     // ================================================================

@@ -497,7 +497,9 @@ pub async fn check_dependencies(
         if config_exists {
             match std::fs::read_to_string(&config_path) {
                 Ok(contents) => {
-                    match serde_yaml::from_str::<project_orchestrator::YamlConfig>(&contents) {
+                    match project_orchestrator::yaml::from_str::<project_orchestrator::YamlConfig>(
+                        &contents,
+                    ) {
                         Ok(yaml) => {
                             let setup = yaml.setup_completed;
                             let mode = yaml
@@ -631,7 +633,7 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
     // ── Read existing config for secret preservation (reconfigure mode) ──
     let existing: Option<project_orchestrator::YamlConfig> = std::fs::read_to_string(&path)
         .ok()
-        .and_then(|contents| serde_yaml::from_str(&contents).ok());
+        .and_then(|contents| project_orchestrator::yaml::from_str(&contents).ok());
 
     // Build YAML structure — preserve secrets from existing config when fields are empty
     let neo4j_password = if !config.neo4j_password.is_empty() {
@@ -931,7 +933,8 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
     };
 
     // Serialize
-    let yaml_str = serde_yaml::to_string(&yaml).map_err(|e| format!("YAML error: {}", e))?;
+    let yaml_str =
+        project_orchestrator::yaml::to_string(&yaml).map_err(|e| format!("YAML error: {}", e))?;
 
     // Add header comment
     let output = format!(
@@ -1036,7 +1039,10 @@ pub fn setup_claude_code(server_url: Option<String>, port: Option<u16>) -> Claud
             std::fs::read_to_string(&config_path)
                 .ok()
                 .and_then(|contents| {
-                    serde_yaml::from_str::<project_orchestrator::YamlConfig>(&contents).ok()
+                    project_orchestrator::yaml::from_str::<project_orchestrator::YamlConfig>(
+                        &contents,
+                    )
+                    .ok()
                 })
                 .and_then(|yaml| yaml.auth.map(|a| a.jwt_secret))
         } else {
@@ -1140,7 +1146,7 @@ pub fn read_config() -> Result<ReadConfigResponse, String> {
     let contents = std::fs::read_to_string(&path)
         .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
 
-    let yaml: project_orchestrator::YamlConfig = serde_yaml::from_str(&contents)
+    let yaml: project_orchestrator::YamlConfig = project_orchestrator::yaml::from_str(&contents)
         .map_err(|e| format!("Cannot parse {}: {}", path.display(), e))?;
 
     // Determine infra mode: read from YAML (new configs), fallback to heuristic (old configs)
@@ -1417,7 +1423,8 @@ pub fn generate_default_config() -> Result<PathBuf, String> {
         remote_mcp: build_remote_mcp_section(false, None),
     };
 
-    let yaml_str = serde_yaml::to_string(&yaml).map_err(|e| format!("YAML error: {}", e))?;
+    let yaml_str =
+        project_orchestrator::yaml::to_string(&yaml).map_err(|e| format!("YAML error: {}", e))?;
     let output = format!(
         "# =============================================================================\n\
          # Project Orchestrator — Default Configuration (not yet configured)\n\
@@ -2144,12 +2151,55 @@ fn chrono_now() -> String {
 mod remote_mcp_tests {
     use super::*;
 
+    /// The config file the wizard writes reads back into the backend config, and
+    /// secrets that look like numbers or booleans stay strings.
+    #[test]
+    fn the_written_config_reads_back_with_its_secrets_intact() {
+        let yaml = YamlOutput {
+            setup_completed: false,
+            infra_mode: "docker".into(),
+            server: ServerSection {
+                port: DEFAULT_DESKTOP_PORT,
+                workspace_path: ".".into(),
+                serve_frontend: false,
+                frontend_path: "./dist".into(),
+                public_url: None,
+            },
+            neo4j: Neo4jSection {
+                uri: "bolt://localhost:7687".into(),
+                user: "neo4j".into(),
+                password: "0123456789".into(),
+            },
+            meilisearch: MeilisearchSection {
+                url: "http://localhost:7700".into(),
+                key: "true".into(),
+            },
+            nats: None,
+            chat: None,
+            embeddings: None,
+            auth: None,
+            remote_mcp: build_remote_mcp_section(false, None),
+        };
+        let written = project_orchestrator::yaml::to_string(&yaml).unwrap();
+        let read: project_orchestrator::YamlConfig =
+            project_orchestrator::yaml::from_str(&written).unwrap();
+        assert!(!read.setup_completed);
+        assert_eq!(read.infra_mode.as_deref(), Some("docker"));
+        assert_eq!(read.server.port, DEFAULT_DESKTOP_PORT);
+        assert_eq!(read.neo4j.password, "0123456789");
+        assert_eq!(read.meilisearch.key, "true");
+        // And the desktop's own untyped reads see the same file.
+        let tree = project_orchestrator::yaml::value_from_str(&written).unwrap();
+        assert_eq!(tree["infra_mode"].as_str(), Some("docker"));
+        assert_eq!(tree["neo4j"]["password"].as_str(), Some("0123456789"));
+    }
+
     /// Serializing the wizard's RemoteMcpSection must deserialize cleanly into
     /// the backend RemoteMcpConfig — proves the emitted keys align with the
     /// struct that gates the routes.
     fn roundtrip(section: &RemoteMcpSection) -> project_orchestrator::RemoteMcpConfig {
-        let yaml = serde_yaml::to_string(section).unwrap();
-        serde_yaml::from_str(&yaml).unwrap()
+        let yaml = project_orchestrator::yaml::to_string(section).unwrap();
+        project_orchestrator::yaml::from_str(&yaml).unwrap()
     }
 
     #[test]
@@ -2234,7 +2284,8 @@ meilisearch:
   url: "http://localhost:7700"
   key: "meili-kept"
 "#;
-        let yaml: project_orchestrator::YamlConfig = serde_yaml::from_str(legacy).unwrap();
+        let yaml: project_orchestrator::YamlConfig =
+            project_orchestrator::yaml::from_str(legacy).unwrap();
         assert!(!yaml.remote_mcp.enabled);
         // Pre-existing secrets are untouched by the (absent) remote MCP section.
         assert_eq!(yaml.neo4j.password, "secret-kept");

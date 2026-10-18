@@ -928,7 +928,7 @@ mod tests {
             task_timeout_secs: 600
             auto_pr: true
         "#;
-        let config: RunnerConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: RunnerConfig = crate::yaml::from_str(yaml).unwrap();
         assert_eq!(config.task_timeout_secs, 600);
         assert!(config.auto_pr);
         // Defaults applied for missing fields
@@ -1048,7 +1048,7 @@ mod tests {
         let config = RunnerConfig::default();
         assert_eq!(config.per_task_cap, PerTaskCap::Warn);
         assert_eq!(config.max_tokens, None);
-        let config: RunnerConfig = serde_yaml::from_str(
+        let config: RunnerConfig = crate::yaml::from_str(
             r#"
             max_tokens: 250000
             per_task_cap: enforce
@@ -1057,7 +1057,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.max_tokens, Some(250_000));
         assert_eq!(config.per_task_cap, PerTaskCap::Enforce);
-        assert!(serde_yaml::from_str::<RunnerConfig>("per_task_cap: abort").is_err());
+        assert!(crate::yaml::from_str::<RunnerConfig>("per_task_cap: abort").is_err());
     }
 
     #[test]
@@ -1377,7 +1377,7 @@ mod tests {
         let yaml = r#"
             spawning_timeout_secs: 30
         "#;
-        let config: RunnerConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: RunnerConfig = crate::yaml::from_str(yaml).unwrap();
         assert_eq!(config.spawning_timeout_secs, 30);
         // Other defaults still applied
         assert_eq!(config.task_timeout_secs, 10800);
@@ -1413,7 +1413,7 @@ mod tests {
         let yaml = r#"
             cwd_validation: strict
         "#;
-        let config: RunnerConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: RunnerConfig = crate::yaml::from_str(yaml).unwrap();
         assert_eq!(config.cwd_validation, CwdValidation::Strict);
     }
 

@@ -31,7 +31,7 @@ pub struct ComposeService {
     /// Present when the service is built from this repository — that makes it the
     /// project's own component rather than a third-party one.
     #[serde(default)]
-    pub build: Option<serde_yaml::Value>,
+    pub build: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     pub environment: Option<EnvBlock>,
     #[serde(default)]
@@ -63,7 +63,7 @@ impl EnvBlock {
 #[serde(untagged)]
 pub enum DependsOn {
     List(Vec<String>),
-    Map(BTreeMap<String, serde_yaml::Value>),
+    Map(BTreeMap<String, serde::de::IgnoredAny>),
 }
 
 impl DependsOn {
@@ -151,7 +151,7 @@ fn protocols_by_host(env: &Option<EnvBlock>) -> BTreeMap<String, String> {
 
 /// Parse a compose file into services and their edges.
 pub fn parse_compose(raw: &str) -> anyhow::Result<Vec<ComposedService>> {
-    let file: ComposeFile = serde_yaml::from_str(raw)?;
+    let file: ComposeFile = crate::yaml::from_str(raw)?;
 
     let mut out: Vec<ComposedService> = file
         .services
@@ -353,5 +353,100 @@ services:
     fn service_without_depends_on_yields_no_edges() {
         let svcs = parse_compose(COMPOSE).unwrap();
         assert!(get(&svcs, "neo4j").depends_on.is_empty());
+    }
+
+    fn fixture() -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/yaml/docker-compose.yml"),
+        )
+        .unwrap()
+    }
+
+    /// A compose file in the shapes real projects use (extension block, anchors,
+    /// `<<` merges, an environment list and mapping with an empty value, long and
+    /// short `depends_on`, healthchecks) reads in full.
+    #[test]
+    fn real_world_compose_file_reads_in_full() {
+        let svcs = parse_compose(&fixture()).unwrap();
+        let names: Vec<_> = svcs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["app", "frontend", "meilisearch", "nats", "neo4j"]);
+
+        let app = get(&svcs, "app");
+        assert!(app.is_local_build, "build as a mapping");
+        let edges: Vec<_> = app
+            .depends_on
+            .iter()
+            .map(|e| (e.target.as_str(), e.protocol.as_deref()))
+            .collect();
+        assert_eq!(
+            edges,
+            [
+                ("meilisearch", Some("HTTP")),
+                ("nats", Some("NATS")),
+                ("neo4j", Some("BOLT")),
+            ]
+        );
+
+        let frontend = get(&svcs, "frontend");
+        assert!(frontend.is_local_build, "build as a string");
+        assert_eq!(frontend.depends_on.len(), 1);
+        assert_eq!(frontend.depends_on[0].target, "app");
+        assert_eq!(frontend.depends_on[0].protocol.as_deref(), Some("HTTP"));
+
+        let neo4j = get(&svcs, "neo4j");
+        assert_eq!(neo4j.component_type, ComponentType::Database);
+        assert_eq!(neo4j.image.as_deref(), Some("neo4j:5.26-community"));
+        assert_eq!(
+            get(&svcs, "nats").component_type,
+            ComponentType::MessageQueue
+        );
+    }
+
+    /// Pinned as serde_yaml did: an unquoted number or boolean in an
+    /// `environment:` mapping fails the whole file (`EnvBlock` is untagged, so
+    /// serde buffers the value as a number before trying `Option<String>`).
+    #[test]
+    fn an_unquoted_number_in_an_environment_mapping_still_fails_the_file() {
+        assert!(parse_compose(
+            "services:\n  app:\n    image: x\n    environment:\n      PORT: 8080\n"
+        )
+        .is_err());
+        assert!(parse_compose(
+            "services:\n  app:\n    image: x\n    environment:\n      PORT: \"8080\"\n"
+        )
+        .is_ok());
+    }
+
+    /// `<<: *anchor` is expanded (serde_yaml 0.9 left `<<` as an ordinary key, so
+    /// an image given through a merge was lost).
+    #[test]
+    fn merge_keys_bring_their_fields_into_the_service() {
+        let svcs = parse_compose(
+            "x-db: &db\n  image: postgres:16\nservices:\n  db:\n    <<: *db\n    ports: [\"5432:5432\"]\n",
+        )
+        .unwrap();
+        assert_eq!(get(&svcs, "db").image.as_deref(), Some("postgres:16"));
+        assert_eq!(get(&svcs, "db").component_type, ComponentType::Database);
+    }
+
+    /// A compose file comes from any repository: an alias bomb is refused with
+    /// an error, it does not hang the analysis.
+    #[test]
+    fn an_alias_bomb_in_a_compose_file_is_refused() {
+        let mut bomb = String::from(
+            "x-a: &a [\"lol\",\"lol\",\"lol\",\"lol\",\"lol\",\"lol\",\"lol\",\"lol\",\"lol\"]\n",
+        );
+        for (prev, name) in ["a", "b", "c", "d", "e", "f", "g", "h"]
+            .iter()
+            .zip(["b", "c", "d", "e", "f", "g", "h", "i"])
+        {
+            let refs = vec![format!("*{prev}"); 9].join(",");
+            bomb.push_str(&format!("x-{name}: &{name} [{refs}]\n"));
+        }
+        bomb.push_str("services:\n  app:\n    image: nginx\n    environment: *i\n");
+        let started = std::time::Instant::now();
+        assert!(parse_compose(&bomb).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 }

@@ -141,6 +141,7 @@ pub mod transport;
 pub mod update;
 pub(crate) mod utils;
 pub mod vault;
+pub mod yaml;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
@@ -1120,7 +1121,7 @@ impl Config {
     /// a fresh install (`setup_completed: false`).
     fn try_load_yaml(path: &Path) -> Result<YamlConfig> {
         match std::fs::read_to_string(path) {
-            Ok(contents) => match serde_yaml::from_str(&contents) {
+            Ok(contents) => match crate::yaml::from_str(&contents) {
                 Ok(config) => {
                     tracing::info!("Loaded config from {}", path.display());
                     Ok(config)
@@ -2678,7 +2679,7 @@ auth:
   frontend_url: "http://localhost:3000"
 "#;
 
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         assert_eq!(config.server.port, 9090);
         assert_eq!(config.server.workspace_path, "/tmp/test");
         assert_eq!(config.neo4j.uri, "bolt://db:7687");
@@ -2709,7 +2710,7 @@ server:
 neo4j:
   uri: bolt://localhost:7687
 "#;
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         assert!(!config.remote_mcp.enabled);
         assert_eq!(config.remote_mcp.bind_addr, "127.0.0.1");
         assert_eq!(config.remote_mcp.session_ttl_secs, 3600);
@@ -2738,7 +2739,7 @@ remote_mcp:
     - "https://claude.ai"
     - "https://claude.com"
 "#;
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         assert!(config.remote_mcp.enabled);
         assert_eq!(config.remote_mcp.session_ttl_secs, 1800);
         assert_eq!(
@@ -2795,7 +2796,7 @@ server:
 neo4j:
   uri: bolt://localhost:7687
 "#;
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         assert!(config.auth.is_none());
     }
 
@@ -2823,7 +2824,7 @@ neo4j:
 
         // serde default → true: existing config.yaml without the field is already set up
         let yaml = "server:\n  port: 9090\n";
-        let parsed: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let parsed: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         assert!(
             parsed.setup_completed,
             "Existing config.yaml missing the field should default to true (backward compat)"
@@ -2831,7 +2832,7 @@ neo4j:
 
         // Explicit false in config.yaml → respected
         let yaml_explicit = "setup_completed: false\n";
-        let parsed_explicit: YamlConfig = serde_yaml::from_str(yaml_explicit).unwrap();
+        let parsed_explicit: YamlConfig = crate::yaml::from_str(yaml_explicit).unwrap();
         assert!(
             !parsed_explicit.setup_completed,
             "Explicit setup_completed: false must be respected"
@@ -2847,7 +2848,7 @@ auth:
   google_redirect_uri: "http://localhost/callback"
   jwt_secret: "min-32-chars-secret-key-for-test!"
 "#;
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         let auth = config.auth.unwrap();
         assert_eq!(auth.access_token_expiry_secs, 900); // 15min default
         assert_eq!(auth.refresh_token_expiry_secs, 604800); // 7 days default
@@ -2863,7 +2864,7 @@ auth:
   jwt_secret: "min-32-chars-secret-key-for-test!"
   jwt_expiry_secs: 3600
 "#;
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         let auth = config.auth.unwrap();
         assert_eq!(auth.access_token_expiry_secs, 3600);
     }
@@ -3042,7 +3043,7 @@ auth:
     name: "Admin"
     password_hash: "$2b$12$LJ3m4ys1fFNwNkfMjkLx3u"
 "#;
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         let auth = config.auth.unwrap();
         assert!(auth.has_password_auth());
         assert!(!auth.has_oidc());
@@ -3066,7 +3067,7 @@ auth:
     redirect_uri: "http://localhost:3000/auth/callback"
     provider_name: "Google"
 "#;
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         let auth = config.auth.unwrap();
         assert!(!auth.has_password_auth());
         assert!(auth.has_oidc());
@@ -3097,7 +3098,7 @@ auth:
     auth_endpoint: "https://okta.example.com/authorize"
     token_endpoint: "https://okta.example.com/token"
 "#;
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         let auth = config.auth.unwrap();
         assert!(auth.has_password_auth());
         assert!(auth.has_oidc());
@@ -3123,7 +3124,7 @@ auth:
   google_redirect_uri: "http://localhost:3000/auth/callback"
   jwt_secret: "super-secret-key-min-32-characters!"
 "#;
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         let auth = config.auth.unwrap();
 
         // No explicit oidc section
@@ -3152,7 +3153,7 @@ auth:
     redirect_uri: "http://localhost:3000/auth/callback"
     provider_name: "Microsoft"
 "#;
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         let auth = config.auth.unwrap();
         let oidc = auth.effective_oidc().unwrap();
         // Explicit oidc section takes priority
@@ -3166,7 +3167,7 @@ auth:
 auth:
   jwt_secret: "super-secret-key-min-32-characters!"
 "#;
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         let auth = config.auth.unwrap();
         assert!(!auth.allow_registration);
     }
@@ -3178,7 +3179,7 @@ auth:
 server:
   port: 8080
 "#;
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         assert!(config.auth.is_none());
         // When auth is None, the middleware should allow all requests (no-auth mode)
     }
@@ -3202,7 +3203,7 @@ server:
   serve_frontend: false
   frontend_path: "/var/www/orchestrator/dist"
 "#;
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         assert!(!config.server.serve_frontend);
         assert_eq!(config.server.frontend_path, "/var/www/orchestrator/dist");
     }
@@ -3214,7 +3215,7 @@ server:
 server:
   port: 9090
 "#;
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         assert!(config.server.serve_frontend); // default true
         assert_eq!(config.server.frontend_path, "./dist"); // default
     }
@@ -3337,7 +3338,7 @@ auth:
     - "partner@external.com"
     - "consultant@agency.io"
 "#;
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         let auth = config.auth.unwrap();
         assert_eq!(auth.allowed_email_domain, Some("ffs.holdings".into()));
         let emails = auth.allowed_emails.as_ref().unwrap();
@@ -3358,7 +3359,7 @@ auth:
   jwt_secret: "super-secret-key-min-32-characters!"
   allowed_email_domain: "ffs.holdings"
 "#;
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         let auth = config.auth.unwrap();
         assert!(auth.allowed_emails.is_none());
         // Domain still works
@@ -3379,7 +3380,7 @@ chat:
   claude_cli_path: "/opt/homebrew/bin/claude"
   auto_update_cli: true
 "#;
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         assert_eq!(
             config.chat.process_path.as_deref(),
             Some("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
@@ -3398,7 +3399,7 @@ chat:
 chat:
   default_model: "claude-sonnet-4-6"
 "#;
-        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: YamlConfig = crate::yaml::from_str(yaml).unwrap();
         assert!(config.chat.process_path.is_none());
         assert!(config.chat.claude_cli_path.is_none());
         assert!(config.chat.auto_update_cli.is_none());

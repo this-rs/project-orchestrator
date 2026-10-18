@@ -32,5 +32,5 @@ candle-nn = { workspace = true }
 sysinfo = { workspace = true }
 
 [dev-dependencies]
-serde_yaml = { workspace = true }
+serde-saphyr = { workspace = true }
 tokio-test = "0.4"

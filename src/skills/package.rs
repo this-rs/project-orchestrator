@@ -1182,8 +1182,8 @@ mod tests {
         sign_package(&mut package, &identity).unwrap();
 
         // Serialize to YAML and back
-        let yaml = serde_yaml::to_string(&package).unwrap();
-        let restored: SkillPackage = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = crate::yaml::to_string(&package).unwrap();
+        let restored: SkillPackage = crate::yaml::from_str(&yaml).unwrap();
 
         // Verification should still pass after YAML roundtrip
         let verified = verify_package_signature(&restored).unwrap();

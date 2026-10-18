@@ -90,7 +90,7 @@ fn handle_menu_event(app: &AppHandle, item_id: &str) {
                 // In "external" mode, the user's services must not be touched.
                 let infra_mode = std::fs::read_to_string(crate::setup::config_path())
                     .ok()
-                    .and_then(|c| serde_yaml::from_str::<serde_yaml::Value>(&c).ok())
+                    .and_then(|c| project_orchestrator::yaml::value_from_str(&c).ok())
                     .and_then(|v| {
                         v.get("infra_mode")
                             .and_then(|m| m.as_str().map(String::from))
