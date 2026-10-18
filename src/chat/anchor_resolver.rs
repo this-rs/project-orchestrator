@@ -12,6 +12,16 @@
 //!   widens the scope only when [`ConsentReader`] (`may_read`) allows it; else
 //!   it is *excluded* with a reason and rendered `[nœud non autorisé]` + an
 //!   opaque id, without title, type or neighbours.
+//! - One widening needs no consent (decision 75e160f4, T3-ter): a live
+//!   `project` / `workspace` anchor put by a HUMAN (`by = user`) opens the
+//!   project(s) it names to this conversation; their content is read like the
+//!   session project's, except what is marked ExplicitDeny. The same anchor put
+//!   by an agent opens nothing; removing the anchor (or its leaving `live`)
+//!   closes the project again. The anchor journal records who put it.
+//! - Containers (project, workspace) never take a slot nor budget in an
+//!   expansion: the real store links every note to its project (`HAS_NOTE`,
+//!   weight 1.0), so the project would otherwise be the best neighbour of every
+//!   note, and it is already named at the head of the map.
 //! - Only `live` anchors supply content. `moved` is resolved once (its current
 //!   target, with a "déplacé de X vers Y" mention). `dangling` / `archived` /
 //!   `unknown` produce ONE line, no content.
@@ -30,8 +40,8 @@
 use crate::chat::anchor::{Anchor, AnchorRole, AnchorState, AnchorTargetType};
 use crate::chat::untrusted::{self, Origin};
 use crate::graph::neighborhood::{
-    hierarchy_step_allowed, Layer, NeighborhoodParams, ProjectFilter, ScopedNeighborhood,
-    ScopedNode, DEFAULT_FANOUT,
+    entity_kind, hierarchy_step_allowed, Layer, NeighborhoodParams, ProjectFilter,
+    ScopedNeighborhood, ScopedNode, DEFAULT_FANOUT,
 };
 use crate::neo4j::models::ExecutionPlace;
 use crate::neo4j::GraphStore;
@@ -100,9 +110,20 @@ pub fn effective_role(roles: &BTreeSet<AnchorRole>) -> AnchorRole {
     }
 }
 
-/// Rough token estimate (4 chars per token, rounded up).
+/// Characters per token of [`est_tokens`], times ten: 2.2.
+///
+/// Measured with the real tokenizer (the Claude CLI's input-token count,
+/// claude-haiku/sonnet/opus-5-5 agreeing within 5 tokens, 18/10/2026) on the
+/// French corpus of `tests/harness_neo4j.rs`: 2.54 characters per token for the
+/// 50 texts, 2.31 for the lines the resolver renders from them (ids, guillemets
+/// and indentation cost more than prose). The old 4 under-estimated by 36-41 %.
+/// 2.2 keeps the estimate above both, by 5-15 %: a budget in tokens holds.
+pub const CHARS_PER_TOKEN_X10: usize = 22;
+
+/// Token estimate, never under the real count on French text (see
+/// [`CHARS_PER_TOKEN_X10`]), rounded up.
 pub fn est_tokens(s: &str) -> usize {
-    s.chars().count().div_ceil(4)
+    (s.chars().count() * 10).div_ceil(CHARS_PER_TOKEN_X10)
 }
 
 // ----------------------------------------------------------------------------
@@ -285,7 +306,13 @@ pub fn select_nodes(
     if budget.depth == 0 || budget.max_nodes == 0 {
         return (Vec::new(), 0);
     }
-    let by_id: HashMap<&str, &ScopedNode> = nodes.iter().map(|n| (n.node.id.as_str(), n)).collect();
+    // Containers are neither candidates nor counted as omitted (module notes);
+    // the walk never expands them, so nothing is reached only through one.
+    let by_id: HashMap<&str, &ScopedNode> = nodes
+        .iter()
+        .filter(|n| !entity_kind(&n.node.node_type).is_some_and(|k| k.container))
+        .map(|n| (n.node.id.as_str(), n))
+        .collect();
     let mut adj: HashMap<&str, Vec<(&str, f64)>> = HashMap::new();
     for e in edges {
         adj.entry(e.source.as_str())
@@ -497,7 +524,9 @@ pub async fn resolve_anchors(
             .cmp(&effective_role(&b.roles))
             .then(a.id.cmp(&b.id))
     });
-    let mut reader = ConsentReader::new(store, project.as_ref().map(|p| p.id));
+    let session_pid = project.as_ref().map(|p| p.id);
+    let opened = opened_projects(store, session_pid, &anchors).await?;
+    let mut reader = ConsentReader::new(store, session_pid).with_opened_projects(opened.clone());
     let mut extra: BTreeSet<Uuid> = BTreeSet::new();
     for a in &anchors {
         if !matches!(a.state, AnchorState::Live | AnchorState::Moved) {
@@ -510,7 +539,17 @@ pub async fn resolve_anchors(
             continue;
         }
         let key = format!("{}:{}", a.target_type, a.target_id);
-        match resolve_one(store, &mut reader, project.as_ref(), a, secret, &mut extra).await? {
+        match resolve_one(
+            store,
+            &mut reader,
+            project.as_ref(),
+            &opened,
+            a,
+            secret,
+            &mut extra,
+        )
+        .await?
+        {
             Outcome::Admitted(x) => scope.anchors.push(*x),
             Outcome::Excluded(reason) => scope.excluded.push(ExcludedAnchor {
                 anchor_id: a.id,
@@ -527,6 +566,41 @@ pub async fn resolve_anchors(
     }
     scope.extra_projects = extra.into_iter().collect();
     Ok(scope)
+}
+
+/// Projects other than the session's that a human opened to the conversation:
+/// the existing projects named by its live `project` anchors and the projects of
+/// its live `workspace` anchors, put by a user (decision 75e160f4). An agent's
+/// anchor never opens anything.
+async fn opened_projects(
+    store: &dyn GraphStore,
+    session_pid: Option<Uuid>,
+    anchors: &[Anchor],
+) -> Result<BTreeSet<Uuid>> {
+    use crate::chat::anchor::AnchorActor;
+    let mut opened = BTreeSet::new();
+    for a in anchors
+        .iter()
+        .filter(|a| a.state == AnchorState::Live && a.by == AnchorActor::User)
+    {
+        let Ok(id) = Uuid::parse_str(&a.target_id) else {
+            continue;
+        };
+        match a.target_type {
+            AnchorTargetType::Project if store.get_project(id).await?.is_some() => {
+                opened.insert(id);
+            }
+            AnchorTargetType::Workspace => {
+                let projects = store.list_workspace_projects(id).await?;
+                opened.extend(projects.iter().map(|p| p.id));
+            }
+            _ => {}
+        }
+    }
+    if let Some(p) = session_pid {
+        opened.remove(&p);
+    }
+    Ok(opened)
 }
 
 fn admitted(a: &Anchor, title: String, project_id: Option<Uuid>, cross: bool) -> AdmittedAnchor {
@@ -549,6 +623,7 @@ async fn resolve_one(
     store: &dyn GraphStore,
     reader: &mut ConsentReader<'_>,
     project: Option<&ScopeProject>,
+    opened: &BTreeSet<Uuid>,
     a: &Anchor,
     secret: &[u8],
     extra: &mut BTreeSet<Uuid>,
@@ -618,9 +693,14 @@ async fn resolve_one(
             let role = effective_role(&a.roles);
             let budget = budget_for(role);
             let params = params_for(budget);
-            let local = session_pid
-                .map(|p| ProjectFilter::only(p.to_string()))
-                .unwrap_or_default();
+            // the session project and the projects a human opened (module notes)
+            let local = ProjectFilter {
+                project_ids: session_pid
+                    .iter()
+                    .chain(opened)
+                    .map(|p| p.to_string())
+                    .collect(),
+            };
             let Some(mut walk) = store
                 .get_scoped_entity_neighborhood(ty, &a.target_id, &params, &local)
                 .await?
@@ -640,7 +720,9 @@ async fn resolve_one(
                 // the owner project is now readable: walk it too (still filtered)
                 extra.insert(o);
                 let mut ids: Vec<String> = local.project_ids.clone();
-                ids.push(o.to_string());
+                if !ids.contains(&o.to_string()) {
+                    ids.push(o.to_string());
+                }
                 if let Some(w) = store
                     .get_scoped_entity_neighborhood(
                         ty,
@@ -779,9 +861,16 @@ pub fn render_anchor_map(scope: &ResolvedScope, cache_key: &str) -> String {
     if lines.is_empty() {
         lines.push("(aucune ancre)".to_string());
     }
-    let body = clip_to_tokens(lines, MAP_MAX_TOKENS, "éléments");
     let nonce = untrusted::nonce_from_seed(cache_key, 0);
     let slug = scope.project.as_ref().map(|p| p.slug.as_str());
+    // the container's own tags count against the ceiling too
+    let frame = est_tokens(&untrusted::wrap(
+        "",
+        Origin::new("anchor_map", slug),
+        &nonce,
+        0,
+    ));
+    let body = clip_to_tokens(lines, MAP_MAX_TOKENS.saturating_sub(frame), "éléments");
     untrusted::wrap(
         &body,
         Origin::new("anchor_map", slug),
@@ -825,9 +914,11 @@ pub fn render_live_block(scope: &ResolvedScope) -> String {
         out.push_str(&notices.join("\n"));
     }
     if !lines.is_empty() {
-        let used = est_tokens(&out);
-        let body = clip_to_tokens(lines, LIVE_MAX_TOKENS.saturating_sub(used + 20), "lignes");
         let slug = scope.project.as_ref().map(|p| p.slug.as_str());
+        // the notices, the newline and the container's own tags count too
+        let frame = est_tokens(&untrusted::wrap_graph("", "anchor_context", slug));
+        let used = est_tokens(&out) + 1 + frame;
+        let body = clip_to_tokens(lines, LIVE_MAX_TOKENS.saturating_sub(used), "lignes");
         if !out.is_empty() {
             out.push('\n');
         }
@@ -1656,6 +1747,15 @@ mod tests {
                 .add_edge(s, t, "RELATES_TO", w);
         }
         async fn anchor(&self, t: AnchorTargetType, id: &str, roles: &[AnchorRole]) -> Anchor {
+            self.anchor_by(t, id, roles, AnchorActor::User).await
+        }
+        async fn anchor_by(
+            &self,
+            t: AnchorTargetType,
+            id: &str,
+            roles: &[AnchorRole],
+            by: AnchorActor,
+        ) -> Anchor {
             let id = &if matches!(t, AnchorTargetType::Project | AnchorTargetType::Workspace) {
                 id.to_string()
             } else {
@@ -1664,13 +1764,7 @@ mod tests {
             self.store
                 .apply_anchor_op(
                     self.session,
-                    AnchorOp::Add(NewAnchor::new(
-                        t,
-                        id,
-                        roles.iter().copied(),
-                        AnchorActor::User,
-                        "t",
-                    )),
+                    AnchorOp::Add(NewAnchor::new(t, id, roles.iter().copied(), by, "t")),
                 )
                 .await
                 .unwrap()
@@ -1698,6 +1792,9 @@ mod tests {
         assert!(render_live_block(&scope).contains("Ancrez-la"));
     }
 
+    /// The project stays the session's even under a human focus anchor on another
+    /// one; that anchor opens the other project (decision 75e160f4), it does not
+    /// replace the session's.
     #[tokio::test]
     async fn project_comes_from_the_session_not_from_an_anchor() {
         let f = fx().await;
@@ -1709,21 +1806,34 @@ mod tests {
         .await;
         let scope = f.resolve().await;
         assert_eq!(scope.project.as_ref().unwrap().id, f.a);
-        // beta has no policy: refused, no title
-        assert!(scope.anchors.is_empty());
-        assert_eq!(scope.excluded.len(), 1);
+        assert!(scope.excluded.is_empty(), "{scope:#?}");
+        assert_eq!(scope.anchors.len(), 1);
+        assert!(scope.anchors[0].cross_project);
+        assert_eq!(scope.extra_projects, vec![f.b]);
+    }
+
+    /// An AGENT's anchor on another project opens nothing, whatever that project's
+    /// policy: a container has no consent of its own and Auto needs a score.
+    #[tokio::test]
+    async fn an_agent_foreign_project_anchor_stays_refused_even_with_auto_policy() {
+        let f = fx().await;
+        // no policy: refused, no title
+        f.anchor_by(
+            AnchorTargetType::Project,
+            &f.b.to_string(),
+            &[AnchorRole::Mention],
+            AnchorActor::Agent,
+        )
+        .await;
+        let scope = f.resolve().await;
+        assert!(scope.anchors.is_empty() && scope.extra_projects.is_empty());
         assert!(matches!(
             scope.excluded[0].reason,
             ExclusionReason::ConsentDenied(ReadDenial::NoPolicy)
         ));
-        assert!(scope.extra_projects.is_empty());
         let map = render_anchor_map(&scope, "k");
         assert!(map.contains("[nœud non autorisé] n-") && !map.contains("beta"));
-    }
-
-    #[tokio::test]
-    async fn foreign_project_anchor_stays_refused_even_with_auto_policy() {
-        let f = fx().await;
+        // Auto policy: still refused
         let policy = SharingPolicy {
             enabled: true,
             mode: SharingMode::Auto,
@@ -1731,14 +1841,7 @@ mod tests {
             ..Default::default()
         };
         f.store.update_sharing_policy(f.b, &policy).await.unwrap();
-        f.anchor(
-            AnchorTargetType::Project,
-            &f.b.to_string(),
-            &[AnchorRole::Mention],
-        )
-        .await;
         let scope = f.resolve().await;
-        // a container has no consent of its own and Auto needs a score: refused
         assert!(scope.anchors.is_empty() && scope.extra_projects.is_empty());
         assert!(matches!(
             scope.excluded[0].reason,
@@ -1746,6 +1849,8 @@ mod tests {
         ));
     }
 
+    /// An agent's workspace anchor needs the session project or a readable one
+    /// inside; a human's opens every project inside.
     #[tokio::test]
     async fn workspace_anchor_needs_the_session_project_or_a_readable_one() {
         let f = fx().await;
@@ -1753,12 +1858,14 @@ mod tests {
         w.name = "Hub".into();
         f.store.create_workspace(&w).await.unwrap();
         f.store.add_project_to_workspace(w.id, f.b).await.unwrap();
-        f.anchor(
-            AnchorTargetType::Workspace,
-            &w.id.to_string(),
-            &[AnchorRole::Focus],
-        )
-        .await;
+        let by_agent = f
+            .anchor_by(
+                AnchorTargetType::Workspace,
+                &w.id.to_string(),
+                &[AnchorRole::Mention],
+                AnchorActor::Agent,
+            )
+            .await;
         // only beta (refused) inside: out of scope
         let scope = f.resolve().await;
         assert!(scope.anchors.is_empty());
@@ -1768,6 +1875,117 @@ mod tests {
         let scope = f.resolve().await;
         assert_eq!(scope.anchors[0].title, "Hub");
         assert!(scope.extra_projects.is_empty());
+        // the same workspace anchored by a human: beta is opened
+        f.store
+            .remove_anchor(
+                f.session,
+                by_agent.id,
+                by_agent.version,
+                AnchorActor::User,
+                "t",
+            )
+            .await
+            .unwrap();
+        f.anchor(
+            AnchorTargetType::Workspace,
+            &w.id.to_string(),
+            &[AnchorRole::Mention],
+        )
+        .await;
+        let scope = f.resolve().await;
+        assert_eq!(scope.anchors[0].title, "Hub");
+        assert_eq!(scope.extra_projects, vec![f.b]);
+    }
+
+    /// Decision 75e160f4 on the mock: a human's project anchor opens beta's
+    /// content (walked, its notes readable without any policy), except
+    /// ExplicitDeny; removing the anchor closes beta again.
+    #[tokio::test]
+    async fn a_human_project_anchor_opens_its_content_except_explicit_deny_until_removed() {
+        let f = fx().await;
+        f.seed(node("nb", "note", "note de beta", 1.0), f.b).await;
+        f.seed(node("open", "note", "voisin ouvert", 1.0), f.b)
+            .await;
+        f.seed(node("deny", "note", "SECRET refusé", 1.0), f.b)
+            .await;
+        f.edge("nb", "open", 1.0).await;
+        f.edge("nb", "deny", 1.0).await;
+        f.store
+            .neighborhood_ownership
+            .write()
+            .await
+            .consent_of
+            .insert(k("deny"), SharingConsent::ExplicitDeny);
+        f.anchor(AnchorTargetType::Note, "nb", &[AnchorRole::Mention])
+            .await;
+        // beta has no policy: the note is refused
+        let scope = f.resolve().await;
+        assert!(scope.anchors.is_empty() && scope.excluded.len() == 1);
+
+        let opener = f
+            .anchor(
+                AnchorTargetType::Project,
+                &f.b.to_string(),
+                &[AnchorRole::Mention],
+            )
+            .await;
+        let scope = f.resolve().await;
+        assert!(scope.excluded.is_empty(), "{scope:#?}");
+        let n = scope
+            .anchors
+            .iter()
+            .find(|a| a.target_type == AnchorTargetType::Note)
+            .unwrap();
+        assert!(n.cross_project);
+        assert_eq!(titles(n), vec!["voisin ouvert"]);
+        assert_eq!(n.expansion.denied.len(), 1);
+        assert!(!render_live_block(&scope).contains("SECRET"));
+
+        f.store
+            .remove_anchor(f.session, opener.id, opener.version, AnchorActor::User, "t")
+            .await
+            .unwrap();
+        let scope = f.resolve().await;
+        assert!(scope.anchors.is_empty() && scope.extra_projects.is_empty());
+    }
+
+    /// The project (a container) never takes a slot nor counts as omitted, even
+    /// when it is the strongest neighbour (the real store's `HAS_NOTE`).
+    #[test]
+    fn containers_take_no_slot_in_a_selection() {
+        let scoped = |id: &str, ty: &str, w: f64| ScopedNode {
+            node: node(id, ty, id, w),
+            project_id: None,
+            consent: SharingConsent::NotSet,
+        };
+        let nodes = vec![
+            scoped("proj", "project", 1.0),
+            scoped("ws", "workspace", 1.0),
+            scoped("n1", "note", 0.5),
+            scoped("n2", "note", 0.5),
+        ];
+        let edge = |t: &str, w: f64| crate::graph::neighborhood::RawEdge {
+            source: "c".into(),
+            target: t.into(),
+            rel: "X".into(),
+            weight: w,
+            layer: Layer::ALL[0],
+        };
+        let edges = vec![
+            edge("proj", 1.0),
+            edge("ws", 1.0),
+            edge("n1", 0.6),
+            edge("n2", 0.6),
+        ];
+        let budget = RoleBudget {
+            depth: 1,
+            max_nodes: 2,
+            max_tokens: 1000,
+        };
+        let (kept, omitted) = select_nodes("c", &nodes, &edges, budget);
+        let ids: Vec<_> = kept.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["n1", "n2"]);
+        assert_eq!(omitted, 0);
     }
 
     #[tokio::test]
