@@ -529,6 +529,14 @@ pub struct ActiveSession {
     /// `get_descendant_pids(child_pid)` (decision 33bce470, audit note
     /// 2482f4e0).
     pub active_background_tasks: Arc<Mutex<HashMap<String, BackgroundTaskInfo>>>,
+    /// The CLI's descendants read when a `Bash` call STARTS (its
+    /// `ContentBlockStart`, input still empty), keyed by `tool_use_id`, taken
+    /// back by the second pass of `track_background_task_start`. The CLI cannot
+    /// fork the tool before its input is complete, so this is the reference a
+    /// background task's PID claim compares against: read at the full
+    /// `ToolUse` instead, it already held a process the CLI forked right after
+    /// printing the call, which was then never claimed (task 51f87943).
+    pub tool_start_descendants: Arc<Mutex<HashMap<String, Vec<u32>>>>,
     /// How many background tasks the CLI itself says are running, from its
     /// last `background_tasks_changed` system message (0 until one arrives).
     ///
@@ -7731,6 +7739,7 @@ impl ChatManager {
                     cancel_tools_cap: CANCEL_TOOLS_CAP,
                     cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
                     active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+                    tool_start_descendants: Arc::new(Mutex::new(HashMap::new())),
                     cli_background_tasks: Arc::new(AtomicUsize::new(0)),
                     cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
                     cancel_task_cap: CANCEL_TASK_CAP,
@@ -7969,7 +7978,10 @@ impl ChatManager {
     ///
     /// Note that Bash's `run_in_background` flag is only present on the
     /// **second** pass (full input), so the first pass for a Bash call
-    /// returns `false` and the second pass performs the actual insert.
+    /// returns `false` and the second pass performs the actual insert. The
+    /// first pass of a Bash call still reads the CLI's descendants
+    /// (`ActiveSession::tool_start_descendants`): that reading, taken before
+    /// the CLI can fork the tool, is the reference of the PID claim.
     /// For Monitor, both passes succeed (the second one just updates
     /// the description in place).
     ///
@@ -7988,6 +8000,39 @@ impl ChatManager {
         input: &serde_json::Value,
         parent_tool_use_id: Option<&str>,
     ) -> bool {
+        // Task 51f87943: the reference of a Bash background task's PID claim is
+        // read when the call STARTS (first pass, `ContentBlockStart`, empty
+        // input): the CLI cannot fork the tool before the input is complete. Read
+        // on the second pass instead, it already held a process the CLI forked
+        // right after printing the call — never a newcomer, never claimed, and
+        // `cancel_task` then signalled nothing. Every Bash call is read (its
+        // `run_in_background` flag is not known yet) and the reading is taken
+        // back on the second pass, whatever the flag says.
+        let early_before: Option<Vec<u32>> = if tool_name == "Bash" {
+            let (early, cli_pid) = {
+                let sessions = active_sessions.read().await;
+                let Some(active) = sessions.get(session_id) else {
+                    return false;
+                };
+                (active.tool_start_descendants.clone(), active.child_pid)
+            };
+            if input.as_object().is_none_or(serde_json::Map::is_empty) {
+                if let Some(cli_pid) = cli_pid {
+                    let pids = Self::get_descendant_pids(cli_pid);
+                    early
+                        .lock()
+                        .await
+                        .entry(tool_use_id.to_string())
+                        .or_insert(pids);
+                }
+                return false;
+            }
+            let taken = early.lock().await.remove(tool_use_id);
+            taken
+        } else {
+            None
+        };
+
         // Decide whether the tool kind is something we track.
         let kind = match tool_name {
             "Monitor" => Some(BackgroundTaskKind::Monitor),
@@ -8028,14 +8073,18 @@ impl ChatManager {
             (active.active_background_tasks.clone(), active.child_pid)
         };
 
-        // Capture the descendant snapshot BEFORE the subprocess forks.
-        // This must run lock-free because `pgrep -P` may take 10-50 ms.
-        // Plan fc35b25e (T2): the async claim spawned below compares this
-        // snapshot to readings taken every PID_CLAIM_POLL (up to
+        // Capture the descendant snapshot BEFORE the subprocess forks: the one
+        // read when the Bash call started when there is one (task 51f87943),
+        // else now. This must run lock-free because `pgrep -P` may take
+        // 10-50 ms. Plan fc35b25e (T2): the async claim spawned below compares
+        // this snapshot to readings taken every PID_CLAIM_POLL (up to
         // PID_CLAIM_WINDOW) to discover the new PID.
-        let before_pids: Vec<u32> = child_pid_for_before
-            .map(Self::get_descendant_pids)
-            .unwrap_or_default();
+        let before_pids: Vec<u32> = match early_before {
+            Some(pids) => pids,
+            None => child_pid_for_before
+                .map(Self::get_descendant_pids)
+                .unwrap_or_default(),
+        };
 
         // Now perform the upsert under the tasks lock and capture the
         // fresh snapshot for the broadcast. We use `match entry` instead of
@@ -12748,6 +12797,7 @@ impl ChatManager {
                     cancel_tools_cap: CANCEL_TOOLS_CAP,
                     cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
                     active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+                    tool_start_descendants: Arc::new(Mutex::new(HashMap::new())),
                     cli_background_tasks: Arc::new(AtomicUsize::new(0)),
                     cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
                     cancel_task_cap: CANCEL_TASK_CAP,
@@ -27847,6 +27897,7 @@ mod tests {
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
             active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+            tool_start_descendants: Arc::new(Mutex::new(HashMap::new())),
             cli_background_tasks: Arc::new(AtomicUsize::new(0)),
             cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_task_cap: CANCEL_TASK_CAP,
@@ -29612,6 +29663,7 @@ mod tests {
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
             active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+            tool_start_descendants: Arc::new(Mutex::new(HashMap::new())),
             cli_background_tasks: Arc::new(AtomicUsize::new(0)),
             cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_task_cap: CANCEL_TASK_CAP,
@@ -32381,6 +32433,116 @@ mod tests {
         );
     }
 
+    /// Task 51f87943: the CLI forks a background Bash right after it prints the
+    /// complete call, often before this server reads the CLI's descendants on
+    /// that `ToolUse`. The reference of the claim is the reading taken when the
+    /// call STARTED (`ContentBlockStart`, empty input), so the process is still
+    /// a newcomer: claimed, and the Stop reaches it. Read on the second pass (as
+    /// before), the process was already in the reference: never claimed,
+    /// `cancel_task` signalled nothing.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_background_process_forked_before_the_full_tool_use_is_claimed_and_stopped() {
+        use std::io::Write as _;
+        use std::process::Stdio;
+
+        // A "CLI" that forks nothing until it is told to (`read` is a builtin).
+        let mut cli = std::process::Command::new("bash")
+            .args(["-c", "read line; sleep 30 & wait"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let cli_pid = cli.id();
+        let mut stdin = cli.stdin.take().expect("stdin is piped");
+
+        let (mut session, _) = create_dummy_session(false, "", vec![]);
+        session.child_pid = Some(cli_pid);
+        let (events_tx, tasks) = (
+            session.events_tx.clone(),
+            session.active_background_tasks.clone(),
+        );
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-early".into(), session);
+        let track = |input: serde_json::Value| {
+            let sessions = manager.active_sessions.clone();
+            let events_tx = events_tx.clone();
+            async move {
+                ChatManager::track_background_task_start(
+                    "s-early",
+                    &sessions,
+                    &events_tx,
+                    &None,
+                    "tool_Early",
+                    "Bash",
+                    &input,
+                    None,
+                )
+                .await
+            }
+        };
+
+        // The call starts (ContentBlockStart): nothing tracked yet.
+        assert!(!track(serde_json::json!({})).await);
+        // The CLI forks the tool ...
+        stdin.write_all(b"go\n").unwrap();
+        stdin.flush().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let child = loop {
+            if let Some(pid) = ChatManager::get_descendant_pids(cli_pid).first() {
+                break *pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "the CLI forked");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        // ... before this server sees the complete call.
+        assert!(track(serde_json::json!({"command": "sleep 30", "run_in_background": true})).await);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        let claimed = loop {
+            let pid = tasks.lock().await["tool_Early"].pid;
+            if pid.is_some() || std::time::Instant::now() >= deadline {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let stop = if claimed.is_some() {
+            Some(manager.cancel_task("s-early", "tool_Early").await.unwrap())
+        } else {
+            None
+        };
+        // Cleanup before asserting, so a failure does not leak the processes.
+        unsafe { libc::kill(child as i32, libc::SIGKILL) };
+        let _ = cli.kill();
+        let _ = cli.wait();
+        assert_eq!(
+            claimed,
+            Some(child),
+            "the process forked before the full ToolUse was claimed"
+        );
+        let stop = stop.unwrap();
+        assert!(stop.killed_pids.contains(&child), "{stop:?}");
+        assert!(
+            manager
+                .active_sessions
+                .read()
+                .await
+                .get("s-early")
+                .unwrap()
+                .tool_start_descendants
+                .lock()
+                .await
+                .is_empty(),
+            "the start reading was taken back by the second pass"
+        );
+    }
+
     /// Review of #691, finding 2: two concurrent stops of one task signal it once
     /// and count once in the cap (before: both passed the check and both counted).
     /// The cap history is held so that both are in flight together.
@@ -34178,6 +34340,7 @@ pub(crate) mod test_support {
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
             active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+            tool_start_descendants: Arc::new(Mutex::new(HashMap::new())),
             cli_background_tasks: Arc::new(AtomicUsize::new(0)),
             cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_task_cap: CANCEL_TASK_CAP,
