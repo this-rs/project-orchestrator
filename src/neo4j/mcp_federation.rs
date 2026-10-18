@@ -133,20 +133,22 @@ impl Neo4jClient {
 
     /// List ALL MCP servers across all projects (used for startup bootstrap).
     pub async fn list_all_mcp_servers(&self) -> Result<Vec<McpServerNode>> {
-        let q = query(
-            r#"
+        const CYPHER: &str = r#"
             MATCH (s:McpServer)
             RETURN s ORDER BY s.server_id
-            "#,
-        );
+            "#;
 
-        let mut result = self.graph.execute(q).await?;
-        let mut servers = Vec::new();
-        while let Some(row) = result.next().await? {
-            let node: neo4rs::Node = row.get("s")?;
-            servers.push(self.parse_mcp_server_node(&node)?);
-        }
-        Ok(servers)
+        // Read-only scan of McpServer nodes: replayed on a transient error.
+        self.read_retrying(CYPHER, || async move {
+            let mut result = self.graph.execute(query(CYPHER)).await?;
+            let mut servers = Vec::new();
+            while let Some(row) = result.next().await? {
+                let node: neo4rs::Node = row.get("s")?;
+                servers.push(self.parse_mcp_server_node(&node)?);
+            }
+            Ok(servers)
+        })
+        .await
     }
 
     /// Delete an MCP server by its string server_id (e.g. "discord").
