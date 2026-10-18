@@ -2349,6 +2349,135 @@ mod anchor_scope {
         w.cleanup().await;
     }
 
+    // (5b) cost of a turn on the real store -----------------------------------------
+    //
+    // What mode `shadow` (and `on`) pays per turn, measured on Neo4j rather than
+    // on the mock's read counter: a full resolution (the anchors, the project,
+    // the sharing policies, one scoped walk per content anchor) against a turn
+    // served by the session cache (the anchors and the sharing policies only).
+    // The figures are printed (`SHADOW_COST`) for the record; the assertions are
+    // about the cache, never about a duration (a loaded runner must not fail it).
+
+    fn median(mut v: Vec<u128>) -> u128 {
+        v.sort();
+        v[v.len() / 2]
+    }
+
+    #[tokio::test]
+    async fn shadow_cost_of_a_turn_on_the_real_store_and_an_anchor_added_mid_session() {
+        use project_orchestrator::chat::anchor_resolver::{
+            AnchorCache, GraphCwdInference, ProjectInputs,
+        };
+        use project_orchestrator::neo4j::models::ExecutionPlace;
+        let Some(e) = env().await else { return };
+        let store: &dyn GraphStore = &e.client;
+        let mut w = World::new(&e);
+        let a = w.project("cost").await;
+        let slug = format!("cost-{}", w.run);
+        // a realistic anchor set: a focus note with 20 neighbours, a file with 10,
+        // a mention note, the project itself
+        let focus = w.note(a, "note au centre", 0.9).await;
+        for i in 0..20 {
+            let n = w.note(a, &format!("voisin {i}"), 0.5).await;
+            w.edge(&focus, &n, "SYNAPSE", Some(0.6)).await;
+        }
+        let file = w.path("cost.rs");
+        w.node("file", &file, NodeProps::default(), Some(a), true, None)
+            .await;
+        for i in 0..10 {
+            let n = w.note(a, &format!("note du fichier {i}"), 0.5).await;
+            w.edge(&n, &file, "LINKED_TO", Some(0.8)).await;
+        }
+        let mention = w.note(a, "note mentionnée", 0.4).await;
+
+        let sid = Uuid::new_v4();
+        let mut s = node(sid);
+        s.project_slug = Some(slug.clone());
+        store.create_chat_session(&s).await.unwrap();
+        w.sessions.push(sid);
+        let a_id = a.to_string();
+        for (t, id, role) in [
+            (AnchorTargetType::Note, focus.as_str(), AnchorRole::Focus),
+            (AnchorTargetType::File, file.as_str(), AnchorRole::Focus),
+            (
+                AnchorTargetType::Note,
+                mention.as_str(),
+                AnchorRole::Mention,
+            ),
+            (
+                AnchorTargetType::Project,
+                a_id.as_str(),
+                AnchorRole::Mention,
+            ),
+        ] {
+            store
+                .add_anchor(sid, NewAnchor::new(t, id, [role], AnchorActor::User, "h"))
+                .await
+                .unwrap();
+        }
+        let inputs = ProjectInputs {
+            explicit_slug: Some(&slug),
+            place: ExecutionPlace::Project,
+            cwd: "",
+        };
+        let infer = GraphCwdInference(store);
+
+        const RUNS: usize = 15;
+        let (mut full, mut served) = (Vec::new(), Vec::new());
+        for _ in 0..RUNS {
+            // a fresh cache: what the first turn of a session (or a stale one) pays
+            let cache = AnchorCache::default();
+            let t0 = std::time::Instant::now();
+            let (res, hit) = cache.resolve(store, sid, &inputs, &infer).await.unwrap();
+            full.push(t0.elapsed().as_micros());
+            assert!(!hit);
+            assert_eq!(res.scope.anchors.len(), 4, "{:#?}", res.scope);
+            // the next turn, nothing changed: served by the cache
+            let t0 = std::time::Instant::now();
+            let (_, hit) = cache.resolve(store, sid, &inputs, &infer).await.unwrap();
+            served.push(t0.elapsed().as_micros());
+            assert!(hit, "an unchanged session is served by the cache");
+        }
+
+        // an anchor put mid-session is in the very next turn (no TTL, no rebuild)
+        let cache = AnchorCache::default();
+        cache.resolve(store, sid, &inputs, &infer).await.unwrap();
+        let late = w.note(a, "ANCRE TARDIVE", 0.9).await;
+        let n = w.note(a, "voisin de l'ancre tardive", 0.9).await;
+        w.edge(&late, &n, "SYNAPSE", Some(0.9)).await;
+        store
+            .add_anchor(
+                sid,
+                NewAnchor::new(
+                    AnchorTargetType::Note,
+                    &late,
+                    [AnchorRole::Mention],
+                    AnchorActor::User,
+                    "h",
+                ),
+            )
+            .await
+            .unwrap();
+        let (res, hit) = cache.resolve(store, sid, &inputs, &infer).await.unwrap();
+        assert!(
+            !hit,
+            "a new anchor changes the anchor epoch on the real store"
+        );
+        // (the map, not the live block: the live block is clipped at its token
+        // ceiling and the order of two mentions follows their random ids)
+        assert!(res.scope.anchors.iter().any(|x| x.title == "ANCRE TARDIVE"));
+        assert!(res.map().contains("ANCRE TARDIVE"));
+
+        let (fm, sm) = (median(full.clone()), median(served.clone()));
+        eprintln!(
+            "SHADOW_COST anchors=4 walks=3 runs={RUNS} full_median_us={fm} full_max_us={} \
+             served_median_us={sm} served_max_us={}",
+            full.iter().max().unwrap(),
+            served.iter().max().unwrap()
+        );
+        w.cleanup().await;
+    }
+
     // (6) token estimate -----------------------------------------------------------
 
     const FRENCH: [&str; 50] = [
