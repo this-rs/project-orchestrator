@@ -34,6 +34,7 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | `permissions.always` | une permission accordée pour toujours est retenue au-delà de la session | ok | ok | ok | not_measured | not_measured | not_measured |
 | `tool_timing` | un outil qui a attendu une permission porte tool_timing persisté : prise en charge, attente, exécution, fin | ok | ok | ok | not_measured | not_measured | not_measured |
 | `po_tools` | les outils project-orchestrator (MCP) sont donnés et appelables | ok | ok | ok | not_measured | not_measured | not_measured |
+| `tool_search` | un outil différé n'est pas envoyé ; ToolSearch le charge, il est ajouté EN FIN de liste et appelable dans le même tour (CTX2) | not_measured | not_measured | ok | not_measured | not_measured | not_measured |
 | `nexus_tools` | Read / Edit / Bash s'exécutent sur le projet | not_measured | not_measured | ok | not_measured | not_measured | not_measured |
 | `enrichment` | le contexte du graphe précède le message du tour | ok | ok | ok | not_measured | not_measured | not_measured |
 | `refs` | une référence #kind:id atteint le modèle en pointeur po-context | ok | ok | ok | not_measured | not_measured | not_measured |
@@ -47,7 +48,7 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | `system_init.degraded` | system_init n'annonce comme manquant qu'une limite du modèle (liste fermée) | ok | ok | ok | not_measured | not_measured | not_measured |
 | `session_limits` | sans réglage, aucune limite de durée par tour ni budget de session (ISO5) : le CLI ne reçoit pas --max-budget-usd, une session du moteur agent s'ouvre et reprend sans turn_timeout_ms ni max_tokens | ok | ok | ok | not_measured | not_measured | not_measured |
 
-`ok` : Claude Code 29/30, Claude Code (moteur agent) 29/30, natif 30/30, Codex 0/30, opencode 0/30, ACP 0/30.
+`ok` : Claude Code 29/31, Claude Code (moteur agent) 29/31, natif 31/31, Codex 0/31, opencode 0/31, ACP 0/31.
 
 ## Écarts déclarés
 
@@ -58,7 +59,9 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 
 | Moteur | Fonction | Pourquoi |
 |---|---|---|
+| Claude Code | `tool_search` | les outils différés et ToolSearch sont internes au CLI Claude : la liste d'outils qu'il envoie au modèle n'est pas visible du harnais, et fake_claude rejoue un transcript |
 | Claude Code | `nexus_tools` | Read / Edit / Bash sont les outils internes du CLI Claude : fake_claude rejoue un transcript et n'exécute aucun outil |
+| Claude Code (moteur agent) | `tool_search` | les outils différés et ToolSearch sont internes au CLI Claude : la liste d'outils qu'il envoie au modèle n'est pas visible du harnais, et fake_claude rejoue un transcript |
 | Claude Code (moteur agent) | `nexus_tools` | Read / Edit / Bash sont les outils internes du CLI Claude : fake_claude rejoue un transcript et n'exécute aucun outil |
 | Codex | `hooks.before_tool` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | Codex | `hooks.after_tool` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
@@ -78,6 +81,7 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | Codex | `permissions.always` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | Codex | `tool_timing` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | Codex | `po_tools` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
+| Codex | `tool_search` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | Codex | `nexus_tools` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | Codex | `enrichment` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | Codex | `refs` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
@@ -108,6 +112,7 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | opencode | `permissions.always` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `tool_timing` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `po_tools` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
+| opencode | `tool_search` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `nexus_tools` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `enrichment` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `refs` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
@@ -138,6 +143,7 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | ACP | `permissions.always` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
 | ACP | `tool_timing` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
 | ACP | `po_tools` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
+| ACP | `tool_search` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
 | ACP | `nexus_tools` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
 | ACP | `enrichment` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
 | ACP | `refs` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |

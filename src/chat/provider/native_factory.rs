@@ -75,7 +75,7 @@ pub async fn probe_instance(
     vault: Option<Arc<VaultService>>,
     model: Option<&str>,
 ) -> Result<ProbeReport, ProviderError> {
-    let provider = build_native(record, vault)?;
+    let provider = build_native(record, vault, &[])?;
     let health = provider.health().await;
     if health.status == nexus_claude::agent::HealthStatus::Unavailable {
         return Ok(ProbeReport {
@@ -122,7 +122,7 @@ pub async fn list_models(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
 ) -> Result<Vec<String>, ProviderError> {
-    let provider = build_native(record, vault)?;
+    let provider = build_native(record, vault, &[])?;
     Ok(provider
         .catalog()
         .await?
@@ -147,15 +147,17 @@ pub fn declared_capabilities(record: &InstanceRecord) -> nexus_claude::agent::Ca
 fn build_native(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
+    deferred_tools: &[String],
 ) -> Result<Arc<NativeProvider>, ProviderError> {
-    native_provider(record, vault).map(Arc::new)
+    native_provider(record, vault, deferred_tools).map(Arc::new)
 }
 
 fn native_provider(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
+    deferred_tools: &[String],
 ) -> Result<NativeProvider, ProviderError> {
-    native_provider_with(record, sessions_resolver(vault, None))
+    native_provider_with(record, sessions_resolver(vault, None), deferred_tools)
 }
 
 /// The resolver of an instance: the vault's (per request, under a grant) or the
@@ -178,6 +180,7 @@ fn sessions_resolver(
 fn native_provider_with(
     record: &InstanceRecord,
     resolver: Arc<dyn CredentialResolver>,
+    deferred_tools: &[String],
 ) -> Result<NativeProvider, ProviderError> {
     // A stored record is checked again here: an `env:` reference must name a
     // variable declared for provider credentials, whenever it was stored.
@@ -203,6 +206,10 @@ fn native_provider_with(
     let mut config = NativeConfig::new(record.id.clone());
     config.default_model = record.default_model.clone();
     config.strict_tool_exposure = STRICT_TOOL_EXPOSURE;
+    // The tools whose definitions are withheld behind `ToolSearch` (CTX2,
+    // `chat::deferred_tools`): the list in force when this provider is built. Empty =
+    // every definition is sent, as before.
+    config.deferred_tools = deferred_tools.to_vec();
     // The harness's own `AskUserQuestion` (P18): its `question { reply: turn }` becomes the
     // `ask_user_question` card (synthetic, A45) and the user's answer is the next turn.
     config.ask_user_question = true;
@@ -228,9 +235,10 @@ fn build_native_for_sessions(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
     transcripts: Option<&std::path::Path>,
+    deferred_tools: &[String],
 ) -> Result<Arc<NativeProvider>, ProviderError> {
     let Some(root) = transcripts else {
-        return build_native(record, vault);
+        return build_native(record, vault, deferred_tools);
     };
     if super::transcripts::inside_git_worktree(root) {
         // The files hold the conversation in clear: never where a `git add -A` would
@@ -239,7 +247,7 @@ fn build_native_for_sessions(
             instance = %record.id,
             "native transcripts kept in memory: their directory is inside a git work tree"
         );
-        return build_native(record, vault);
+        return build_native(record, vault, deferred_tools);
     }
     let known = KnownSecrets::new();
     let store = super::transcripts::store_for(root, &record.id, known.clone()).map_err(|e| {
@@ -247,8 +255,12 @@ fn build_native_for_sessions(
         ProviderError::protocol(format!("transcript store unavailable: {:?}", e.kind()))
     })?;
     Ok(Arc::new(
-        native_provider_with(record, sessions_resolver(vault, Some(&known)))?
-            .with_transcript_store(store),
+        native_provider_with(
+            record,
+            sessions_resolver(vault, Some(&known)),
+            deferred_tools,
+        )?
+        .with_transcript_store(store),
     ))
 }
 
@@ -258,7 +270,8 @@ pub fn build_native_provider(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
 ) -> Result<Arc<dyn AgentProvider>, ProviderError> {
-    build_provider_with_handle(record, vault, None, &AcpSetup::default())
+    // A one-shot or a probe has no conversation to load tools into: nothing deferred.
+    build_provider_with_handle(record, vault, None, &AcpSetup::default(), &[])
         .map(|(provider, _)| provider)
 }
 
@@ -283,11 +296,13 @@ pub type BuiltProvider = (Arc<dyn AgentProvider>, Option<Arc<NativeProvider>>);
 /// `transcripts`: where the native sessions keep their conversations
 /// ([`build_native_for_sessions`]). `acp`: the declared ACP agents and where their
 /// `HOME`s live ([`AcpSetup`]).
+/// `deferred_tools`: what the native harness withholds behind `ToolSearch` (CTX2).
 pub fn build_provider_with_handle(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
     transcripts: Option<&std::path::Path>,
     acp: &AcpSetup,
+    deferred_tools: &[String],
 ) -> Result<BuiltProvider, ProviderError> {
     match record.kind.as_str() {
         "codex" => build_codex(record, vault).map(|p| (p, None)),
@@ -296,7 +311,7 @@ pub fn build_provider_with_handle(
             build_remote_claude(record, vault).map(|p| (p, None))
         }
         _ => {
-            let native = build_native_for_sessions(record, vault, transcripts)?;
+            let native = build_native_for_sessions(record, vault, transcripts, deferred_tools)?;
             Ok((Arc::clone(&native) as Arc<dyn AgentProvider>, Some(native)))
         }
     }
@@ -584,8 +599,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
         let root = tmp.path().join("native-transcripts");
-        let built =
-            build_native_for_sessions(&record("none", Some("llama_server")), None, Some(&root));
+        let built = build_native_for_sessions(
+            &record("none", Some("llama_server")),
+            None,
+            Some(&root),
+            &[],
+        );
         assert!(built.is_ok());
         assert!(!root.exists(), "nothing is created inside the work tree");
     }
@@ -658,7 +677,7 @@ mod tests {
 
     #[test]
     fn a_native_instance_sets_no_turn_time_limit_and_no_session_budget() {
-        let p = native_provider(&record("none", Some("deepseek")), None).unwrap();
+        let p = native_provider(&record("none", Some("deepseek")), None, &[]).unwrap();
         assert_eq!(p.config().limits, SessionLimits::default());
         assert_eq!(p.config().limits.turn_timeout_ms, None);
         assert_eq!(p.config().limits.max_tokens, None);

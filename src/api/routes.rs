@@ -2206,6 +2206,14 @@ fn protected_routes() -> Router<OrchestratorState> {
                 .put(routing_handlers::put_delegation_limits)
                 .delete(routing_handlers::delete_delegation_limits),
         )
+        // The tools the native harness defers behind `ToolSearch` (CTX2): readable by
+        // anyone signed in, written by the root account only.
+        .route(
+            "/api/chat/deferred-tools",
+            get(routing_handlers::get_deferred_tools)
+                .put(routing_handlers::put_deferred_tools)
+                .delete(routing_handlers::delete_deferred_tools),
+        )
         // TEAM-2: two-way messaging inside a session team (parent and children). The
         // sender is the calling session of the signed token; a person is refused.
         .route("/api/chat/team", get(team_handlers::get_team))

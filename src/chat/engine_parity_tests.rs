@@ -225,6 +225,10 @@ const FUNCTIONS: &[(&str, &str)] = &[
         "les outils project-orchestrator (MCP) sont donnés et appelables",
     ),
     (
+        "tool_search",
+        "un outil différé n'est pas envoyé ; ToolSearch le charge, il est ajouté EN FIN de liste et appelable dans le même tour (CTX2)",
+    ),
+    (
         "nexus_tools",
         "Read / Edit / Bash s'exécutent sur le projet",
     ),
@@ -285,11 +289,30 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
         "nexus_tools",
         Expect::NotMeasured { why: CLI_TOOLS },
     ),
+    (
+        Engine::ClaudeCode,
+        "tool_search",
+        Expect::NotMeasured {
+            why: CLI_TOOL_SEARCH,
+        },
+    ),
+    (
+        Engine::ClaudeCodeAgent,
+        "tool_search",
+        Expect::NotMeasured {
+            why: CLI_TOOL_SEARCH,
+        },
+    ),
 ];
 
 /// Why `nexus_tools` is not measured on Claude Code, whatever its engine.
 const CLI_TOOLS: &str = "Read / Edit / Bash sont les outils internes du CLI Claude : fake_claude \
                          rejoue un transcript et n'exécute aucun outil";
+
+/// Why `tool_search` is not measured on Claude Code, whatever its engine.
+const CLI_TOOL_SEARCH: &str = "les outils différés et ToolSearch sont internes au CLI Claude : la \
+                               liste d'outils qu'il envoie au modèle n'est pas visible du \
+                               harnais, et fake_claude rejoue un transcript";
 
 /// Why every function is `not_measured` on Codex (YARDSTICK, task 87eb345e).
 const CODEX_NOT_MEASURED: &str =
@@ -810,6 +833,11 @@ impl Stage {
             .with_document_store(self.store.clone())
             .with_native_transcripts(self.data.path().join("native-transcripts"));
         manager.update_claude_cli_path(Some(cli.path())).await;
+        // As the server does at startup (CTX2): the deferred tools come from the stored
+        // setting, read BEFORE the native provider is built. The scenario stores
+        // `readonly` as deferred (see the native part), so the row `tool_search` can be
+        // measured; every other PO tool of the fakes stays offered as before.
+        manager.load_deferred_tools().await;
         let real = manager
             .provider_for("local")
             .await
@@ -1927,6 +1955,16 @@ fn native_script(k: Keys, cwd: &str) -> Value {
             json!({"command": "echo BASH-RAN-$((40+2))"}),
         ),
         says(&k.k("TURN-BASH"), "answered bash"),
+        // TURN-SEARCH (CTX2): `readonly` is deferred in this scenario. The model loads it
+        // with ToolSearch, calls it in the same turn, then answers.
+        calls(
+            &k.k("TURN-SEARCH"),
+            "cs1",
+            "ToolSearch",
+            json!({"query": format!("select:{}", po("readonly"))}),
+        ),
+        calls(&k.k("TURN-SEARCH"), "cs2", &po("readonly"), json!({})),
+        says(&k.k("TURN-SEARCH"), "answered search"),
         // References, the image.
         says(&k.k("TURN-REFS"), "answered refs"),
         says(&k.k("TURN-IMG"), "answered img"),
@@ -2335,6 +2373,13 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     let mut cc = Measures::default();
     let mut na = Measures::default();
 
+    // The stored setting every backend of the scenario reads at startup (CTX2): the PO
+    // tool `readonly` of fake_mcp is deferred — no other row uses it, so the rest of the
+    // scenario sees exactly the tools it always saw. Measured by the row `tool_search`.
+    super::deferred_tools::store(stage.graph.as_ref(), &[po("readonly")])
+        .await
+        .unwrap();
+
     // ===================================================================
     // Claude Code, historical engine (backend process #1)
     // ===================================================================
@@ -2439,6 +2484,11 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         "nexus_tools",
         Verdict::NotMeasured,
         "outils internes du CLI, non exécutés par fake_claude",
+    );
+    cc.set(
+        "tool_search",
+        Verdict::NotMeasured,
+        "outils différés internes au CLI, liste d'outils invisible du harnais",
     );
     w.settle(0, &manager).await;
 
@@ -3520,6 +3570,53 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
             tools.iter().any(|t| t == &po("echo"))
         ),
     );
+    // Deferred tools (CTX2): `readonly` is deferred for this manager (see `backend`). Its
+    // definition is withheld and ToolSearch offered instead; once loaded, it is sent
+    // appended at the END of the list, and the call in the same turn is served.
+    let ends = wn.turn_ends();
+    manager
+        .send_message(&nid, &kn.k("TURN-SEARCH"))
+        .await
+        .unwrap();
+    na_sent += 1;
+    let names = |body: &str| -> Vec<String> {
+        serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|b| b["tools"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str().map(str::to_string))
+            .collect()
+    };
+    let first = wait_body_nth(&fake, &kn.k("TURN-SEARCH"), 0, WAIT)
+        .await
+        .map(|b| names(&b))
+        .unwrap_or_default();
+    let withheld = !first.iter().any(|t| t == &po("readonly"));
+    let offered_search = first.iter().any(|t| t == "ToolSearch");
+    let second = wait_body_nth(&fake, &kn.k("TURN-SEARCH"), 1, WAIT)
+        .await
+        .map(|b| names(&b))
+        .unwrap_or_default();
+    let loaded_last = second.last().is_some_and(|t| t == &po("readonly"));
+    let prefix_kept = second.len() == first.len() + 1 && second[..first.len()] == first[..];
+    let served = wait_body_nth(&fake, &kn.k("TURN-SEARCH"), 2, WAIT)
+        .await
+        .is_some_and(|b| b.contains("readonly ok"));
+    let answered = wn.said(WAIT, "answered search").await;
+    na.check(
+        "tool_search",
+        withheld && offered_search && loaded_last && prefix_kept && served && answered,
+        Cause::Harness,
+        format!(
+            "différé retenu={withheld}, ToolSearch offert={offered_search}, chargé en fin de liste={loaded_last}, \
+             préfixe inchangé={prefix_kept}, appel servi={served}, tour clos={answered} ; \
+             1re liste={} outils, 2e={}",
+            first.len(),
+            second.len()
+        ),
+    );
+    wn.settle(ends, &manager).await;
 
     // References.
     let ends = wn.turn_ends();

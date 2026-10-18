@@ -262,6 +262,101 @@ pub async fn delete_delegation_limits(
     Ok(Json(DelegationLimitsView::of(cap)))
 }
 
+// ── CTX2: the tools the native harness defers behind `ToolSearch` ───────────────────
+
+/// Body of `PUT /api/chat/deferred-tools`.
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeferredToolsBody {
+    /// Exact tool names or prefixes ending in `*`. Empty = defer nothing.
+    pub tools: Vec<String>,
+}
+
+/// What `GET`, `PUT` and `DELETE /api/chat/deferred-tools` answer.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeferredToolsView {
+    /// The list in force for the native providers built from now on.
+    pub tools: Vec<String>,
+    /// The list when nothing is set.
+    pub default_tools: Vec<String>,
+    /// `true` when the list in force is the default one.
+    pub is_default: bool,
+    /// Most patterns a list may hold.
+    pub max_patterns: usize,
+}
+
+impl DeferredToolsView {
+    fn of(tools: Vec<String>) -> Self {
+        let default_tools = crate::chat::deferred_tools::default_deferred_tools();
+        Self {
+            is_default: tools == default_tools,
+            tools,
+            default_tools,
+            max_patterns: crate::chat::deferred_tools::MAX_PATTERNS,
+        }
+    }
+}
+
+fn invalid_deferred_tools(message: String) -> AppError {
+    AppError::Provider(Box::new(OpenFailure {
+        status: StatusCode::BAD_REQUEST.as_u16(),
+        code: "invalid_deferred_tools",
+        message,
+        provider_id: None,
+        action: None,
+        retryable: false,
+        retry_after_ms: None,
+        fallbacks: None,
+        consent_scope: None,
+        candidates: None,
+    }))
+}
+
+/// GET /api/chat/deferred-tools — the tools the native harness withholds behind
+/// `ToolSearch` for the sessions opened from now on, with the default. Readable by anyone
+/// signed in: the model is told the same by the error of a deferred call.
+pub async fn get_deferred_tools(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<DeferredToolsView>, AppError> {
+    let manager = chat_manager_of(&state)?;
+    Ok(Json(DeferredToolsView::of(
+        (*manager.deferred_tools()).clone(),
+    )))
+}
+
+/// PUT /api/chat/deferred-tools `{ "tools": [...] }` — sets the list for the native providers
+/// built next (a running session keeps its own), no restart (CTX2). The root account only:
+/// what a model is offered is a server-wide decision, never an agent's. An empty list
+/// defers nothing.
+pub async fn put_deferred_tools(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<DeferredToolsBody>,
+) -> Result<Json<DeferredToolsView>, AppError> {
+    super::provider_handlers::require_root(&state, &claims)?;
+    let manager = chat_manager_of(&state)?;
+    let stored = manager
+        .set_deferred_tools(&body.tools)
+        .await
+        .map_err(|bad| invalid_deferred_tools(bad.to_string()))?
+        .map_err(AppError::Internal)?;
+    Ok(Json(DeferredToolsView::of(stored)))
+}
+
+/// DELETE /api/chat/deferred-tools — back to the default list (root account only).
+pub async fn delete_deferred_tools(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<DeferredToolsView>, AppError> {
+    super::provider_handlers::require_root(&state, &claims)?;
+    let manager = chat_manager_of(&state)?;
+    let tools = manager
+        .reset_deferred_tools()
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(DeferredToolsView::of(tools)))
+}
+
 /// Most pairs a person's Auto list may hold.
 pub const MAX_AUTO_MODELS: usize = 500;
 
@@ -1302,6 +1397,130 @@ mod tests {
         assert_eq!(restarted.max_live_children(), 4);
         restarted.load_delegation_limits().await;
         assert_eq!(restarted.max_live_children(), 9);
+    }
+
+    // ── CTX2: the deferred tools ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn the_root_account_changes_the_deferred_tools_without_a_restart() {
+        let (app, manager, root) = app_with_root().await;
+        let uri = "/api/chat/deferred-tools";
+        let default = crate::chat::deferred_tools::default_deferred_tools();
+        let (status, body) = call(&app, req(&root, "GET", uri, None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["is_default"], true);
+        assert_eq!(body["tools"], json!(default));
+        assert_eq!(body["default_tools"], json!(default));
+        assert_eq!(*manager.deferred_tools(), default);
+
+        // An explicit list: in force at once for the providers built next.
+        let (status, body) = call(
+            &app,
+            req(
+                &root,
+                "PUT",
+                uri,
+                Some(json!({"tools": ["mcp__project-orchestrator__admin", " mcp__nexus__Web* "]})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["tools"],
+            json!(["mcp__project-orchestrator__admin", "mcp__nexus__Web*"])
+        );
+        assert_eq!(body["is_default"], false);
+        assert_eq!(
+            *manager.deferred_tools(),
+            vec![
+                "mcp__project-orchestrator__admin".to_string(),
+                "mcp__nexus__Web*".to_string()
+            ]
+        );
+        // An EMPTY list is the switch off: nothing deferred, every definition sent.
+        let (status, body) = call(&app, req(&root, "PUT", uri, Some(json!({"tools": []})))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["tools"], json!([]));
+        assert!(manager.deferred_tools().is_empty());
+        // DELETE returns to the default.
+        let (status, body) = call(&app, req(&root, "DELETE", uri, None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["is_default"], true);
+        assert_eq!(*manager.deferred_tools(), default);
+    }
+
+    #[tokio::test]
+    async fn the_stored_deferred_tools_are_read_again_after_a_restart() {
+        let (app, manager, root) = app_with_root().await;
+        let uri = "/api/chat/deferred-tools";
+        let (status, _) = call(
+            &app,
+            req(
+                &root,
+                "PUT",
+                uri,
+                Some(json!({"tools": ["mcp__project-orchestrator__vault"]})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let restarted = crate::chat::ChatManager::new_without_memory(
+            manager.graph.clone(),
+            mock_app_state().meili,
+            Default::default(),
+        );
+        assert_eq!(
+            *restarted.deferred_tools(),
+            crate::chat::deferred_tools::default_deferred_tools()
+        );
+        restarted.load_deferred_tools().await;
+        assert_eq!(
+            *restarted.deferred_tools(),
+            vec!["mcp__project-orchestrator__vault".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_deferred_list_is_refused_with_a_typed_code_and_changes_nothing() {
+        let (app, manager, root) = app_with_root().await;
+        let uri = "/api/chat/deferred-tools";
+        let default = crate::chat::deferred_tools::default_deferred_tools();
+        for bad in [json!(["*"]), json!(["a b"]), json!([""]), json!(["x/y"])] {
+            let (status, got) =
+                call(&app, req(&root, "PUT", uri, Some(json!({"tools": bad})))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {got}");
+            assert_eq!(got["code"], "invalid_deferred_tools");
+        }
+        // An unknown field is refused by the body itself.
+        let (status, _) = call(
+            &app,
+            req(
+                &root,
+                "PUT",
+                uri,
+                Some(json!({"tools": [], "strict": true})),
+            ),
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK);
+        assert_eq!(*manager.deferred_tools(), default, "nothing changed");
+    }
+
+    /// What a model is offered is a server-wide decision: an agent token neither writes
+    /// nor resets the list (it may read it: the error of a deferred call tells it as much).
+    #[tokio::test]
+    async fn an_agent_token_cannot_change_the_deferred_tools() {
+        let (app, manager, _root) = app_with_root().await;
+        let uri = "/api/chat/deferred-tools";
+        let agent = agent_bearer();
+        for (method, payload) in [("PUT", Some(json!({"tools": []}))), ("DELETE", None)] {
+            let (status, got) = call(&app, req(&agent, method, uri, payload)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} -> {got}");
+        }
+        assert_eq!(
+            *manager.deferred_tools(),
+            crate::chat::deferred_tools::default_deferred_tools()
+        );
     }
 
     #[tokio::test]
