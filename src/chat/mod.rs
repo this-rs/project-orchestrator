@@ -34,6 +34,7 @@ pub mod feedback;
 pub(crate) mod hook_ledger;
 pub mod lasting_rules;
 pub mod manager;
+pub(crate) mod manual_compaction;
 pub mod message_attachments;
 pub mod mirror;
 pub mod model_catalog;
