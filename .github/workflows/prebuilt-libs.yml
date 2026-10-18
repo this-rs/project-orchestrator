@@ -25,7 +25,10 @@ on:
         default: false
         type: boolean
   push:
-    branches: [main]
+    # TEMPORARY: the branch of the PR that introduces this file, so the producer can be proven
+    # before it lands on main (Workflow_dispatch only accepts a workflow present on the default
+    # branch). Removed before merge.
+    branches: [main, feat/release-prebuilt-libs]
     paths:
       - scripts/native-libs.env
       - scripts/prebuilt-lib.sh
