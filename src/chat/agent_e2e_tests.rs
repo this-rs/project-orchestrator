@@ -2814,6 +2814,64 @@ mod auto_on_a_locked_vault {
         );
     }
 
+    /// DELEG-500: `delegate_task` from a conversation that is ALREADY open. The vault
+    /// re-locks at every restart of the server; the delegation names nothing (its
+    /// router applied, so the parent's engine was not inherited) and was refused with
+    /// `credentials_locked` — a bare 500 until #825. Like the `Agent` call above, it has
+    /// a stated fallback, the pair of the session that delegated: it opens there.
+    #[tokio::test]
+    async fn a_delegation_of_an_open_parent_is_not_refused_on_a_locked_vault() {
+        let s = setup(Given::default()).await;
+        let parent = s
+            .manager
+            .create_session(&request(Some("free"), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("the parent opens: {e:#}"));
+        let mut child = request(None, Some("proj"), "bypassPermissions");
+        child.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Delegation {
+                plan_id: Uuid::new_v4(),
+                task_id: Uuid::new_v4(),
+                parent_session_id: Some(Uuid::parse_str(&parent.session_id).unwrap()),
+                scaffolding_level: None,
+            }
+            .to_json_string(),
+        );
+        let choice = s
+            .manager
+            .resolve_provider_choice(&child, Some("proj"))
+            .await
+            .unwrap_or_else(|e| panic!("the delegation still opens: {e:#}"));
+        assert_eq!(
+            (choice.provider_id.as_str(), choice.model.as_deref()),
+            ("free", Some("m")),
+            "the child opens off the vault-keyed instance, on its parent's engine"
+        );
+    }
+
+    /// A delegation that no session spawned (a person, from the plan page) has no
+    /// parent to fall back on: refused as any Auto opening is, with what needs no vault.
+    #[tokio::test]
+    async fn a_delegation_from_a_person_is_still_refused_on_a_locked_vault() {
+        let s = setup(Given::default()).await;
+        let mut child = request(None, Some("proj"), "bypassPermissions");
+        child.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Delegation {
+                plan_id: Uuid::new_v4(),
+                task_id: Uuid::new_v4(),
+                parent_session_id: None,
+                scaffolding_level: None,
+            }
+            .to_json_string(),
+        );
+        let error = s
+            .manager
+            .resolve_provider_choice(&child, Some("proj"))
+            .await
+            .unwrap_err();
+        assert_eq!(refused(&error), [("free".to_string(), "m".to_string())]);
+    }
+
     /// The refusal reaches the caller with the models that need no vault, and it is
     /// decided BEFORE the decision is stored (review of #689, nit 6: each 423 left a
     /// decision no session would ever close).

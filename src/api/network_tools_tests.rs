@@ -268,6 +268,7 @@ async fn network_tools_mutations_are_refused_to_an_agent_token_and_reads_are_not
             Some(json!({"id": "sx", "engine": "searxng", "base_url": "https://sx.example"})),
         ),
         ("DELETE", format!("{ENGINES}/sx"), None),
+        ("PUT", ENGINES.to_string(), Some(json!({"order": []}))),
     ] {
         let (status, got) = call(&app, req(&agent, method, &uri, body)).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri} -> {got}");
@@ -744,6 +745,118 @@ async fn a_native_session_is_offered_webfetch_once_the_project_consents_to_an_or
     assert_eq!(status, StatusCode::NO_CONTENT);
     let revoked = native_session_tools(graph, "p6-revoked").await;
     assert!(!revoked.iter().any(|t| t == "WebFetch"), "{revoked:?}");
+}
+
+/// The `--search-engine` values of a native session's nexus-tools, first tried first.
+#[cfg(unix)]
+fn engine_flags(args: &[String]) -> Vec<String> {
+    args.windows(2)
+        .filter(|w| w[0] == "--search-engine")
+        .map(|w| w[1].clone())
+        .collect()
+}
+
+#[cfg(unix)]
+fn ids_of(listed: &Value) -> Vec<String> {
+    listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The order a person chooses on the route is the order the engines are listed in AND the order
+/// a native session's nexus-tools receives them (so tries them) in. Without a choice — every
+/// installation so far — the order by id, as before.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_search_engine_order_chosen_on_the_route_is_the_order_nexus_tools_receives() {
+    let (app, graph) = app().await;
+    for (id, url) in [
+        ("alpha", "https://a.example"),
+        ("beta", "https://b.example"),
+    ] {
+        let (status, got) = call(
+            &app,
+            human(
+                "POST",
+                ENGINES,
+                Some(json!({"id": id, "engine": "searxng", "base_url": url})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{got}");
+        let (status, _) = call(&app, human("PUT", ORIGINS, Some(json!({"origin": url})))).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    // No order chosen: by id, as before.
+    let (_, listed) = call(&app, human("GET", ENGINES, None)).await;
+    assert_eq!(ids_of(&listed), ["alpha", "beta"]);
+    let before = native_session_args(graph.clone(), "ord-before", None).await;
+    assert_eq!(
+        engine_flags(&before),
+        ["searxng:https://a.example", "searxng:https://b.example"]
+    );
+
+    let (status, answered) = call(
+        &app,
+        human("PUT", ENGINES, Some(json!({"order": ["beta", "alpha"]}))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    assert_eq!(ids_of(&answered), ["beta", "alpha"]);
+    let (_, listed) = call(
+        &app,
+        human("GET", &format!("{ENGINES}?project={PROJECT}"), None),
+    )
+    .await;
+    assert_eq!(ids_of(&listed), ["beta", "alpha"]);
+    let (_, summary) = call(&app, human("GET", SUMMARY, None)).await;
+    assert_eq!(ids_of(&summary["search_engines"]), ["beta", "alpha"]);
+    let after = native_session_args(graph.clone(), "ord-after", None).await;
+    assert_eq!(
+        engine_flags(&after),
+        ["searxng:https://b.example", "searxng:https://a.example"],
+        "{after:?}"
+    );
+
+    // An engine declared after the choice goes last.
+    let (status, _) = call(
+        &app,
+        human(
+            "POST",
+            ENGINES,
+            Some(json!({"id": "aardvark", "engine": "searxng", "base_url": "https://c.example"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, listed) = call(&app, human("GET", ENGINES, None)).await;
+    assert_eq!(ids_of(&listed), ["beta", "alpha", "aardvark"]);
+
+    // Refusals: an unknown id, a duplicate, another shape. The stored order stays.
+    for (body, code) in [
+        (
+            json!({"order": ["beta", "nope"]}),
+            "search_engine_not_found",
+        ),
+        (
+            json!({"order": ["beta", "beta"]}),
+            "invalid_search_engine_order",
+        ),
+        (json!({"order": "beta"}), "invalid_search_engine_order"),
+        (
+            json!({"order": ["beta"], "extra": 1}),
+            "invalid_search_engine_order",
+        ),
+    ] {
+        let (status, got) = call(&app, human("PUT", ENGINES, Some(body.clone()))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body} -> {got}");
+        assert_eq!(got["code"], code, "{body} -> {got}");
+    }
+    let (_, listed) = call(&app, human("GET", ENGINES, None)).await;
+    assert_eq!(ids_of(&listed), ["beta", "alpha", "aardvark"]);
 }
 
 /// A release nexus-tools (decision 1e9d7501): it embeds Obscura, so search is keyless by

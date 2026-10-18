@@ -107,6 +107,40 @@ fn rewriting_the_production_config_shape_keeps_every_value_and_the_order() {
     );
 }
 
+// ── config.yaml.example (copied as the config by the .deb and .rpm) ──────────
+
+fn example() -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.yaml.example"),
+    )
+    .unwrap()
+}
+
+/// The shipped example loads, and its chat section names its provider.
+#[test]
+fn the_example_config_loads_with_its_chat_provider() {
+    let c = config(&example()).unwrap();
+    assert_eq!(c.chat.provider.as_deref(), Some("claude-code"));
+    assert_eq!(c.chat.default_model.as_deref(), Some("claude-opus-4-7"));
+    assert_eq!(c.server.port, 8080);
+}
+
+/// The example's other choice, `provider: "none"` with its Claude-only lines
+/// removed as the comment says, loads too: no Claude field is required.
+#[test]
+fn the_example_config_loads_without_claude_code() {
+    let without_claude: String = example()
+        .replace(r#"provider: "claude-code""#, r#"provider: "none""#)
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("default_model:"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let c = config(&without_claude).unwrap();
+    assert_eq!(c.chat.provider.as_deref(), Some("none"));
+    assert_eq!(c.chat.default_model, None);
+    assert_eq!(c.chat.claude_cli_path, None);
+}
+
 // ── The config loader: behaviour pinned against serde_yaml ───────────────────
 
 #[test]

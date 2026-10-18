@@ -1,0 +1,72 @@
+%% name: po-synaptic-shadow
+%% covers: backend:src/neurons/synaptic_shadow.rs backend:src/neurons/synaptic_shadow_tests.rs backend:src/neo4j/synapse_shadow.rs
+%% verified: a99844d9
+%% ---
+%% PROUVE : la couche synaptique en mode ombre (T8, plan « Chat sans dépendance au cwd ») :
+%%   une seconde piste de poids (shadow_weight sur les arêtes SYNAPSE EXISTANTES, notes d'un même projet),
+%%   récompensée uniquement par des signaux externes, décrue proportionnellement au temps écoulé,
+%%   et une expansion best-first depuis les ancres de la session, journalisée (trace versionnée) sans
+%%   jamais être injectée. SYNAPSE.weight n'est jamais écrit, aucune arête n'est créée ni supprimée.
+%% ---
+%% SOURCES LUES :
+%%   src/neurons/synaptic_shadow.rs (règles pures + pilote), src/neo4j/synapse_shadow.rs (Cypher),
+%%   src/neo4j/{traits,mock,impl_graph_store,client}.rs (8 méthodes, contrainte + index de trace),
+%%   appelants : src/chat/manager.rs (enrichment_for_turn), src/runner/runner.rs (verify_wave_tasks),
+%%   src/api/note_handlers.rs (confirm_note), src/heartbeat/checks/synapse_decay.rs (passe de 6 h)
+%%   tests : src/neurons/synaptic_shadow_tests.rs (mock, horloges injectées), tests/neo4j_synapse_shadow.rs
+%% ---
+%% NON ETABLI :
+%%   le mode on n'est pas ouvert : il tourne comme shadow tant que T9 n'a pas mesuré B >= A + 3 points ;
+%%   le coût réel par tour sur le serveur (une lecture d'ancres + <= 3 lectures d'arêtes) n'est pas mesuré ;
+%%   le mock ne connaît pas les projets dormants (le Cypher les gèle : prouvé sur Neo4j réel) ;
+%%   ShadowTraceFilter::ContainingNote parcourt toutes les traces (bornées à 50 par session).
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quel test)  ⚪ autre domaine
+
+flowchart TD
+    subgraph legend["Légende"]
+        direction LR
+        L1["✅ vérifié par un test"]
+        L2["⚪ autre domaine"]
+    end
+
+    FLAGS["✅ SynapticLayerFlags<br/>PO_SYNAPTIC_LAYER + PO_SYNAPTIC_LAYER_PROJECTS<br/>off / shadow / on (on → shadow)<br/>the_flags_default_to_off_and_are_set_per_project"]
+
+    subgraph turn["Tour de chat (détaché, jamais attendu)"]
+        ENR["⚪ chat/manager.rs<br/>enrichment_for_turn"]
+        SPAWN["✅ spawn_turn + claim_turn<br/>1 trace / session / 60 s (horloge tokio)"]
+        SEEDS["✅ session_seeds → anchor_affinity<br/>focus 1.0, mention 0.6, origin 0.3, lié ×0.8, top-K 20"]
+        HOOD["✅ load_hood<br/>≤ 3 lectures shadow_synapse_edges, projet seul"]
+        EXP["✅ best_first_expand<br/>seuil 0,15 · 3 sauts · 1200 jetons (priment) · 10 % exploration"]
+        TRACE["✅ SynapseShadowTrace v1<br/>empreinte des poids + des paramètres<br/>:SynapseShadowTrace + ligne synapse_shadow"]
+        ENR --> SPAWN --> SEEDS --> HOOD --> EXP --> TRACE
+    end
+
+    subgraph rewards["Récompenses : signaux externes seulement"]
+        VER["⚪ runner verify_wave_tasks<br/>verification_json"]
+        HUM["⚪ POST /notes/:id/confirm<br/>personne connectée (is_human, auth active)"]
+        CLO["✅ settle_closures (heartbeat)<br/>72 h sans tentative ultérieure = calme (+)<br/>tentative ultérieure = relancée (−)"]
+        PAIRS["✅ rewarded_pairs<br/>arêtes via → note suivies, notes créées AVANT la conversation"]
+        CLAIM["✅ claim_shadow_trace_reward<br/>une fois par clé (verrou avant décision)"]
+        REW["✅ reward_shadow_synapses<br/>arêtes existantes, même projet, borné [0,1]"]
+        VER --> PAIRS
+        HUM --> PAIRS
+        CLO --> PAIRS
+        PAIRS --> CLAIM --> REW
+    end
+
+    subgraph decay["Décroissance"]
+        HB["⚪ SynapseDecayCheck (6 h)"]
+        DEC["✅ decay_shadow_synapses<br/>w · 2^(−Δt / 2,55 j) : 1,0 → 0,05 en 11 j<br/>projet dormant gelé"]
+        HB --> DEC
+        HB --> CLO
+    end
+
+    FLAGS -.-> SPAWN
+    FLAGS -.-> CLAIM
+    FLAGS -.-> DEC
+    TRACE -.->|"traces de la session"| PAIRS
+    LEGACY["⚪ SYNAPSE.weight (couche historique)<br/>jamais écrit ici"]
+    REW -.->|"✗"| LEGACY
+    DEC -.->|"✗"| LEGACY

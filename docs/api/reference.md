@@ -482,6 +482,17 @@ declared, the list also holds the built-in `{"id": "obscura-builtin", "engine": 
 (not stored, not deletable): a project that consents to `https://html.duckduckgo.com` gets a keyless
 `WebSearch` from it when no other engine is attached.
 
+The list is in the order the engines are queried in: the order chosen with `PUT` below, the engines it
+does not name after, by id (without a chosen order, by id, the built-in engine last).
+
+### PUT /api/chat/search-engines -- Protected (human only)
+
+`{"order": ["home", "brave"]}`: the order a native session's `WebSearch` tries the engines in (stored as
+`search_engine_order`, scope `global`; `nexus-tools` gets its `--search-engine` flags in this order and
+falls back down the list). Each id names an engine listed now, at most once; an engine left out, or declared
+later, comes after the named ones. 200 with the engines in their new order. Codes:
+`invalid_search_engine_order` (another shape, a duplicate), `search_engine_not_found` (an id no engine has).
+
 ### POST /api/chat/search-engines -- Protected (human only)
 
 `{"id": "brave", "engine": "brave", "credential_ref": "vault:brave"}` or

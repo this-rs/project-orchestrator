@@ -21,6 +21,10 @@
 //! | `before_tool` | `PreToolUse` | `additionalContext` → `AddContext`; `decision: block` or `permissionDecision: deny` → `Deny`; `updatedInput` → `ReplaceInput` |
 //! | `after_tool` | `PostToolUse` | `additionalContext` |
 //! | `before_compaction` | `PreCompact` | the callbacks' `systemMessage` (where the notifier puts the instructions it built: the field the CLI appends to the summary's instructions and also shows to the user in its "Compacted…" line; it ignores `reason`, M2c) |
+//! | `session_start` | `SessionStart` | `hookSpecificOutput.additionalContext`, `systemMessage` (contract v7) |
+//! | `user_prompt_submit` | `UserPromptSubmit` | `decision: block` + `reason`, `hookSpecificOutput.additionalContext`, `systemMessage` |
+//! | `before_stop` / `before_subagent_stop` | `Stop` / `SubagentStop` | `decision: block` + `reason` (the turn goes on with the reason), `systemMessage` |
+//! | `notification` | `Notification` | nothing (observation only, as on the CLI) |
 //!
 //! The tool is named as Claude Code names it (`canonical`, else the provider's
 //! name) and its input is given as is: that is the vocabulary the hooks were
@@ -52,12 +56,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use nexus_claude::agent::{
-    CompactionDirective, CompactionInfo, HookVerdict, SessionHooks, ToolCallInfo, ToolResultInfo,
+    CompactionDirective, CompactionInfo, HookReply, HookVerdict, NotificationInfo, PromptInfo,
+    SessionHooks, SessionStartInfo, StopInfo, SubagentStopInfo, ToolCallInfo, ToolResultInfo,
     TurnContext, TurnDirective,
 };
 use nexus_claude::{
-    HookContext, HookInput, HookJSONOutput, HookMatcher, PostToolUseHookInput, PreCompactHookInput,
-    PreToolUseHookInput,
+    HookContext, HookInput, HookJSONOutput, HookMatcher, NotificationHookInput,
+    PostToolUseHookInput, PreCompactHookInput, PreToolUseHookInput, SessionStartHookInput,
+    StopHookInput, SubagentStopHookInput, UserPromptSubmitHookInput,
 };
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -88,6 +94,11 @@ pub(crate) type HookTable = HashMap<String, Vec<HookMatcher>>;
 pub(crate) const PRE_TOOL_USE: &str = "PreToolUse";
 pub(crate) const POST_TOOL_USE: &str = "PostToolUse";
 pub(crate) const PRE_COMPACT: &str = "PreCompact";
+pub(crate) const SESSION_START: &str = "SessionStart";
+pub(crate) const USER_PROMPT_SUBMIT: &str = "UserPromptSubmit";
+pub(crate) const STOP: &str = "Stop";
+pub(crate) const SUBAGENT_STOP: &str = "SubagentStop";
+pub(crate) const NOTIFICATION: &str = "Notification";
 
 /// [`SessionHooks`] over a [`HookTable`].
 pub(crate) struct GraphSessionHooks {
@@ -317,6 +328,106 @@ impl SessionHooks for GraphSessionHooks {
             Some(router) => directive_for_compaction(router).await,
             None => CompactionDirective::none(),
         }
+    }
+
+    async fn session_start(&self, info: &SessionStartInfo) -> HookReply {
+        let input = HookInput::SessionStart(SessionStartHookInput {
+            session_id: self.session_id.clone(),
+            transcript_path: String::new(),
+            cwd: self.cwd.clone(),
+            permission_mode: self.permission_mode.clone(),
+            source: info.source.clone(),
+        });
+        self.lifecycle(SESSION_START, &input).await
+    }
+
+    async fn user_prompt_submit(&self, prompt: &PromptInfo) -> HookReply {
+        let input = HookInput::UserPromptSubmit(UserPromptSubmitHookInput {
+            session_id: self.session_id.clone(),
+            transcript_path: String::new(),
+            cwd: self.cwd.clone(),
+            permission_mode: self.permission_mode.clone(),
+            prompt: prompt.prompt.clone(),
+        });
+        self.lifecycle(USER_PROMPT_SUBMIT, &input).await
+    }
+
+    async fn before_stop(&self, info: &StopInfo) -> HookReply {
+        let input = HookInput::Stop(StopHookInput {
+            session_id: self.session_id.clone(),
+            transcript_path: String::new(),
+            cwd: self.cwd.clone(),
+            permission_mode: self.permission_mode.clone(),
+            stop_hook_active: info.stop_hook_active,
+            last_assistant_message: info.last_assistant_message.clone(),
+        });
+        self.lifecycle(STOP, &input).await
+    }
+
+    async fn before_subagent_stop(&self, info: &SubagentStopInfo) -> HookReply {
+        let input = HookInput::SubagentStop(SubagentStopHookInput {
+            session_id: self.session_id.clone(),
+            transcript_path: String::new(),
+            cwd: self.cwd.clone(),
+            permission_mode: self.permission_mode.clone(),
+            stop_hook_active: info.stop_hook_active,
+            last_assistant_message: info.last_assistant_message.clone(),
+            agent_id: info.agent_id.clone(),
+            agent_type: info.agent_type.clone(),
+        });
+        self.lifecycle(SUBAGENT_STOP, &input).await
+    }
+
+    async fn notification(&self, info: &NotificationInfo) {
+        let input = HookInput::Notification(NotificationHookInput {
+            session_id: self.session_id.clone(),
+            transcript_path: String::new(),
+            cwd: self.cwd.clone(),
+            permission_mode: self.permission_mode.clone(),
+            message: info.message.clone(),
+            title: info.title.clone(),
+            notification_type: info.notification_type.clone(),
+        });
+        // Observation only, as on the CLI: what the callbacks answer is not read.
+        self.lifecycle(NOTIFICATION, &input).await;
+    }
+}
+
+impl GraphSessionHooks {
+    /// Runs the table's callbacks for one of Claude Code's own events (contract v7) and
+    /// reads what the CLI would read: `decision: "block"` + `reason`, the event's
+    /// `additionalContext`, `systemMessage`. Several callbacks: the texts are joined; one
+    /// block blocks. A failing callback is skipped.
+    async fn lifecycle(&self, event: &str, input: &HookInput) -> HookReply {
+        use nexus_claude::HookSpecificOutput;
+        let (mut blocks, mut contexts, mut messages) = (Vec::new(), Vec::new(), Vec::new());
+        for hook in self.callbacks(event, None) {
+            let Some(HookJSONOutput::Sync(sync)) = self.run(hook, input, None, event).await else {
+                continue;
+            };
+            if sync.decision.as_deref() == Some("block") {
+                blocks.push(
+                    sync.reason
+                        .clone()
+                        .unwrap_or_else(|| "blocked by a hook".to_owned()),
+                );
+            }
+            messages.extend(sync.system_message);
+            match sync.hook_specific_output {
+                Some(HookSpecificOutput::UserPromptSubmit(output)) => {
+                    contexts.extend(output.additional_context)
+                }
+                Some(HookSpecificOutput::SessionStart(output)) => {
+                    contexts.extend(output.additional_context)
+                }
+                _ => {}
+            }
+        }
+        let mut reply = HookReply::none();
+        reply.block = joined(blocks);
+        reply.additional_context = joined(contexts);
+        reply.system_message = joined(messages);
+        reply
     }
 }
 
@@ -1947,6 +2058,134 @@ mod tests {
             panic!("a PreCompact input is expected");
         };
         assert_eq!(pre.trigger, "auto");
+    }
+
+    // ------------------------------------------------------------------
+    // Claude Code's own events (contract v7, ISO1): the same table, two doors.
+    // ------------------------------------------------------------------
+
+    fn blocking(reason: &str) -> SyncHookJSONOutput {
+        SyncHookJSONOutput {
+            decision: Some("block".into()),
+            reason: Some(reason.into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_reads_the_block_the_context_and_the_message_of_the_table() {
+        use nexus_claude::agent::PromptInfo;
+        use nexus_claude::UserPromptSubmitHookSpecificOutput;
+        let context = Scripted::answering(SyncHookJSONOutput {
+            system_message: Some("checked".into()),
+            hook_specific_output: Some(HookSpecificOutput::UserPromptSubmit(
+                UserPromptSubmitHookSpecificOutput {
+                    additional_context: Some("GRAPH: plan 5ad54c48".into()),
+                },
+            )),
+            ..Default::default()
+        });
+        let hooks_ = hooks(table(USER_PROMPT_SUBMIT, None, vec![context.clone()]));
+        let reply = hooks_.user_prompt_submit(&PromptInfo::new("fix it")).await;
+        assert_eq!(reply.block, None);
+        assert_eq!(
+            reply.additional_context.as_deref(),
+            Some("GRAPH: plan 5ad54c48")
+        );
+        assert_eq!(reply.system_message.as_deref(), Some("checked"));
+        let seen = context.seen.lock().unwrap()[0].clone();
+        let HookInput::UserPromptSubmit(input) = &seen else {
+            panic!("a UserPromptSubmit input is expected");
+        };
+        assert_eq!(input.prompt, "fix it");
+        assert_eq!(input.cwd, "/work/app");
+
+        let block = Scripted::answering(blocking("no bananas"));
+        let hooks_ = hooks(table(USER_PROMPT_SUBMIT, None, vec![block]));
+        let reply = hooks_.user_prompt_submit(&PromptInfo::new("bananas")).await;
+        assert_eq!(reply.block.as_deref(), Some("no bananas"));
+    }
+
+    #[tokio::test]
+    async fn the_stop_hooks_hand_over_the_flag_and_the_last_answer_and_return_the_block() {
+        use nexus_claude::agent::{StopInfo, SubagentStopInfo};
+        let stop = Scripted::answering(blocking("write the tests first"));
+        let hooks_ = hooks(table(STOP, None, vec![stop.clone()]));
+        let reply = hooks_
+            .before_stop(&StopInfo::new(true, Some("done".into())))
+            .await;
+        assert_eq!(reply.block.as_deref(), Some("write the tests first"));
+        let seen = stop.seen.lock().unwrap()[0].clone();
+        let HookInput::Stop(input) = &seen else {
+            panic!("a Stop input is expected");
+        };
+        assert!(input.stop_hook_active);
+        assert_eq!(input.last_assistant_message.as_deref(), Some("done"));
+
+        let sub = Scripted::answering(blocking("one more line"));
+        let hooks_ = hooks(table(SUBAGENT_STOP, None, vec![sub.clone()]));
+        let mut info = SubagentStopInfo::new(false, Some("sub-done".into()));
+        info.agent_type = Some("general-purpose".into());
+        let reply = hooks_.before_subagent_stop(&info).await;
+        assert_eq!(reply.block.as_deref(), Some("one more line"));
+        let seen = sub.seen.lock().unwrap()[0].clone();
+        let HookInput::SubagentStop(input) = &seen else {
+            panic!("a SubagentStop input is expected");
+        };
+        assert_eq!(input.agent_type.as_deref(), Some("general-purpose"));
+        // A Stop callback is not a SubagentStop one: each event reads its own entry.
+        assert_eq!(
+            hooks_.before_stop(&StopInfo::new(false, None)).await.block,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_and_notification_reach_the_callbacks_of_their_event() {
+        use nexus_claude::agent::{NotificationInfo, SessionStartInfo};
+        use nexus_claude::SessionStartHookSpecificOutput;
+        let start = Scripted::answering(SyncHookJSONOutput {
+            hook_specific_output: Some(HookSpecificOutput::SessionStart(
+                SessionStartHookSpecificOutput {
+                    additional_context: Some("GRAPH: project nexus".into()),
+                },
+            )),
+            ..Default::default()
+        });
+        let notified = Scripted::answering(SyncHookJSONOutput::default());
+        let mut table_ = table(SESSION_START, None, vec![start.clone()]);
+        table_.insert(
+            NOTIFICATION.to_owned(),
+            vec![HookMatcher {
+                matcher: None,
+                hooks: vec![notified.clone()],
+            }],
+        );
+        let hooks_ = hooks(table_);
+        let reply = hooks_.session_start(&SessionStartInfo::new("resume")).await;
+        assert_eq!(
+            reply.additional_context.as_deref(),
+            Some("GRAPH: project nexus")
+        );
+        let seen = start.seen.lock().unwrap()[0].clone();
+        let HookInput::SessionStart(input) = &seen else {
+            panic!("a SessionStart input is expected");
+        };
+        assert_eq!(input.source, "resume");
+        hooks_
+            .notification(&NotificationInfo::permission_prompt("Bash"))
+            .await;
+        let seen = notified.seen.lock().unwrap()[0].clone();
+        let HookInput::Notification(input) = &seen else {
+            panic!("a Notification input is expected");
+        };
+        assert_eq!(input.notification_type, "permission_prompt");
+        // Nothing registered for an event: nothing said, nothing blocked.
+        let empty = hooks(HookTable::new());
+        assert_eq!(
+            empty.session_start(&SessionStartInfo::new("startup")).await,
+            nexus_claude::agent::HookReply::none()
+        );
     }
 }
 

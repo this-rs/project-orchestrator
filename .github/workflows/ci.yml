@@ -181,9 +181,9 @@ jobs:
         # --workspace so EVERY member crate is linted (neural-routing-*,
         # tree-sitter-*), not just the root package. Without it, member crates
         # only compile as path-dependencies and their own targets/tests are
-        # never linted. project-orchestrator-desktop is excluded until its
-        # bollard 0.21 migration lands (tracked) — it doesn't compile on main
-        # and needs Tauri system deps + the frontend dist to build on CI.
+        # never linted. project-orchestrator-desktop is excluded here: it needs
+        # Tauri system deps + a frontend dist; the "Desktop (Tauri)" job below
+        # compiles and tests it.
         run: cargo clippy --workspace --exclude project-orchestrator-desktop --all-targets --all-features -- -D warnings
 
       # Index des diagrammes (docs/diagrams/INDEX.yml). Node est deja sur les
@@ -229,6 +229,49 @@ jobs:
 
       - name: Test the forbidden-token checker
         run: node --test scripts/forbidden/check-forbidden-tokens.test.mjs
+
+  # ==========================================================================
+  # Desktop - the Tauri crate compiles and its tests pass
+  # ==========================================================================
+  # Every other job excludes project-orchestrator-desktop (it needs the WebKitGTK
+  # headers and a frontend dist/). Without this job a change of the library's API,
+  # or of desktop/src-tauri itself, broke the desktop with no signal until a release.
+  # `cargo test` compiles every target of the crate (what `cargo check --all-targets`
+  # checks, plus the link) and runs its tests (setup wizard config, Docker, network).
+  # FULL tier only, like Build: it compiles the library once more.
+  desktop:
+    name: Desktop (Tauri)
+    if: (github.base_ref == 'main' && !github.event.pull_request.draft) || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-desktop-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
+          save-if: ${{ env.CACHE_SAVE == 'true' && env.CACHE_FRESH == '' }}
+          cache-workspace-crates: true
+
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libssl-dev
+
+      # build.rs refuses to build without desktop/dist/index.html, and tauri-build checks
+      # that every bundle resource exists (target/release/mcp_server). Placeholders: this
+      # job checks the Rust code, it bundles nothing.
+      - name: Placeholder frontend dist and mcp_server resource
+        run: |
+          mkdir -p desktop/dist target/release
+          echo '<!doctype html><title>ci</title>' > desktop/dist/index.html
+          [ -e target/release/mcp_server ] || { printf '#!/bin/sh\n' > target/release/mcp_server; chmod +x target/release/mcp_server; }
+
+      - name: Compile and test the desktop crate
+        run: cargo test -p project-orchestrator-desktop
 
   # ==========================================================================
   # Unit Tests - Library and parser tests without external services
@@ -280,7 +323,8 @@ jobs:
       #   routing_metamorphic: RoutingProvider invariance harness
       # Deliberately NOT run here (all #[ignore]d, need live resources):
       #   mcp_federation_integration: real remote MCP servers over the network
-      #   cancel_task_e2e, cancel_tools_e2e: Anthropic API key + Claude Code CLI
+      # (cancel-tools / cancel-task end to end run in the lib step above: src/chat/cancel_e2e_tests.rs,
+      # against fake_claude, on both engines; no CLI, no key.)
       - name: Run service-free integration tests
         run: cargo test --test p2p_integration --test p2p_http_exchange --test prompt_completeness --test routing_metamorphic
 
@@ -368,7 +412,8 @@ jobs:
           # is the one that keeps the fix from being undone — it must run somewhere.
           HARNESS_NEO4J_REQUIRED=1 cargo test --test integration_tests --test data_migrations \
             --test workspace_tests --test neo4j_store_tests --test harness_neo4j \
-            --test neo4j_note_consent --test neo4j_decision_project --test neural_routing_indexes
+            --test neo4j_note_consent --test neo4j_decision_project --test neural_routing_indexes \
+            --test neo4j_synapse_shadow
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch

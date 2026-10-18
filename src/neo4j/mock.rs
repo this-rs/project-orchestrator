@@ -56,6 +56,9 @@ pub struct MockAnchorStore {
     pub events: Vec<crate::chat::anchor::AnchorEvent>,
 }
 
+/// Shadow state of one directed synapse: `(shadow_weight, last shadow decay)`.
+pub type MockShadowSynapse = (f64, Option<chrono::DateTime<chrono::Utc>>);
+
 pub struct MockGraphStore {
     // Entity stores
     pub projects: RwLock<HashMap<Uuid, ProjectNode>>,
@@ -231,6 +234,10 @@ pub struct MockGraphStore {
     pub note_embeddings: RwLock<HashMap<Uuid, (Vec<f32>, String)>>,
     /// Note synapses: bidirectional adjacency list (note_id -> Vec<(neighbor_id, weight)>)
     pub note_synapses: RwLock<HashMap<Uuid, Vec<(Uuid, f64)>>>,
+    /// Shadow state of the directed synapses (from, to) -> (shadow_weight, last shadow decay).
+    pub synapse_shadow: RwLock<HashMap<(Uuid, Uuid), MockShadowSynapse>>,
+    /// Synaptic shadow traces, in insertion order.
+    pub synapse_shadow_traces: RwLock<Vec<crate::neurons::synaptic_shadow::SynapseShadowTrace>>,
     /// Scope argument of every `init_note_energy` call, in order (test probe).
     pub init_note_energy_calls: RwLock<Vec<Option<Uuid>>>,
     /// Synapse source tags: (note_a, note_b) -> source ("cosine" | "coactivation")
@@ -443,6 +450,8 @@ impl MockGraphStore {
             function_analytics: RwLock::new(HashMap::new()),
             note_embeddings: RwLock::new(HashMap::new()),
             note_synapses: RwLock::new(HashMap::new()),
+            synapse_shadow: RwLock::new(HashMap::new()),
+            synapse_shadow_traces: RwLock::new(Vec::new()),
             init_note_energy_calls: RwLock::new(Vec::new()),
             synapse_sources: RwLock::new(HashMap::new()),
             file_embeddings: RwLock::new(HashMap::new()),
@@ -7254,6 +7263,245 @@ impl GraphStore for MockGraphStore {
         }
 
         Ok(count)
+    }
+
+    async fn shadow_synapse_edges(
+        &self,
+        project_id: Uuid,
+        from: &[Uuid],
+    ) -> Result<Vec<crate::neurons::synaptic_shadow::ShadowEdgeRow>> {
+        use crate::neurons::synaptic_shadow::{estimate_tokens, ShadowEdgeRow, ShadowNode};
+        let notes = self.notes.read().await;
+        let synapses = self.note_synapses.read().await;
+        let shadow = self.synapse_shadow.read().await;
+        let in_project = |id: &Uuid| notes.get(id).and_then(|n| n.project_id) == Some(project_id);
+        let mut rows = Vec::new();
+        for a in from {
+            if !in_project(a) {
+                continue;
+            }
+            for (b, w) in synapses.get(a).map(Vec::as_slice).unwrap_or(&[]) {
+                if a == b || !in_project(b) {
+                    continue;
+                }
+                let note = &notes[b];
+                rows.push(ShadowEdgeRow {
+                    from: *a,
+                    to: *b,
+                    weight: shadow.get(&(*a, *b)).map(|s| s.0).unwrap_or(*w),
+                    target: ShadowNode {
+                        energy: note.energy,
+                        scar_intensity: note.scar_intensity,
+                        reachable: matches!(
+                            note.status,
+                            crate::notes::NoteStatus::Active
+                                | crate::notes::NoteStatus::NeedsReview
+                        ),
+                        tokens: estimate_tokens(note.content.chars().count()),
+                        created_at: Some(note.created_at),
+                    },
+                });
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn reward_shadow_synapses(
+        &self,
+        project_id: Uuid,
+        pairs: &[(Uuid, Uuid)],
+        delta: f64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize> {
+        let notes = self.notes.read().await;
+        let synapses = self.note_synapses.read().await;
+        let mut shadow = self.synapse_shadow.write().await;
+        let in_project = |id: &Uuid| notes.get(id).and_then(|n| n.project_id) == Some(project_id);
+        let mut unique: Vec<(Uuid, Uuid)> = pairs
+            .iter()
+            .filter(|(a, b)| a != b)
+            .map(|(a, b)| if a < b { (*a, *b) } else { (*b, *a) })
+            .collect();
+        unique.sort();
+        unique.dedup();
+        let mut written = 0usize;
+        for (a, b) in unique {
+            if !in_project(&a) || !in_project(&b) {
+                continue;
+            }
+            for (x, y) in [(a, b), (b, a)] {
+                // Existing edges only: never create one.
+                let Some(legacy) = synapses
+                    .get(&x)
+                    .and_then(|out| out.iter().find(|(n, _)| *n == y))
+                    .map(|(_, w)| *w)
+                else {
+                    continue;
+                };
+                let entry = shadow.entry((x, y)).or_insert((legacy, None));
+                entry.0 = (entry.0 + delta).clamp(0.0, 1.0);
+                if entry.1.is_none() {
+                    entry.1 = Some(now);
+                }
+                written += 1;
+            }
+        }
+        Ok(written)
+    }
+
+    async fn decay_shadow_synapses(
+        &self,
+        scope: &crate::neurons::synaptic_shadow::ShadowDecayScope,
+        half_life_days: f64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize> {
+        // The mock has no notion of a dormant project: every project in scope decays.
+        let notes = self.notes.read().await;
+        let synapses = self.note_synapses.read().await;
+        let mut shadow = self.synapse_shadow.write().await;
+        let mut visited = 0usize;
+        for (a, out) in synapses.iter() {
+            let Some(pa) = notes.get(a).and_then(|n| n.project_id) else {
+                continue;
+            };
+            if !scope.includes(pa) {
+                continue;
+            }
+            for (b, w) in out {
+                if notes.get(b).and_then(|n| n.project_id) != Some(pa) {
+                    continue;
+                }
+                let entry = shadow.entry((*a, *b)).or_insert((*w, None));
+                let elapsed = entry
+                    .1
+                    .map(|at| (now - at).num_milliseconds() as f64 / 1000.0)
+                    .unwrap_or(0.0);
+                entry.0 = crate::neurons::synaptic_shadow::proportional_decay(
+                    entry.0,
+                    elapsed,
+                    half_life_days,
+                );
+                if elapsed >= 0.0 {
+                    entry.1 = Some(now);
+                }
+                visited += 1;
+            }
+        }
+        Ok(visited)
+    }
+
+    async fn record_synapse_shadow_trace(
+        &self,
+        trace: &crate::neurons::synaptic_shadow::SynapseShadowTrace,
+        keep: usize,
+    ) -> Result<()> {
+        let mut traces = self.synapse_shadow_traces.write().await;
+        traces.push(trace.clone());
+        let mut of_session: Vec<(chrono::DateTime<chrono::Utc>, Uuid)> = traces
+            .iter()
+            .filter(|t| t.session_id == trace.session_id)
+            .map(|t| (t.created_at, t.id))
+            .collect();
+        of_session.sort_by(|a, b| b.cmp(a));
+        let dropped: std::collections::HashSet<Uuid> =
+            of_session.iter().skip(keep).map(|(_, id)| *id).collect();
+        traces.retain(|t| !dropped.contains(&t.id));
+        Ok(())
+    }
+
+    async fn list_synapse_shadow_traces(
+        &self,
+        filter: &crate::neurons::synaptic_shadow::ShadowTraceFilter,
+    ) -> Result<Vec<crate::neurons::synaptic_shadow::SynapseShadowTrace>> {
+        use crate::neurons::synaptic_shadow::ShadowTraceFilter;
+        let traces = self.synapse_shadow_traces.read().await;
+        Ok(match filter {
+            ShadowTraceFilter::Session(sid) => {
+                let mut out: Vec<_> = traces
+                    .iter()
+                    .filter(|t| t.session_id == *sid)
+                    .cloned()
+                    .collect();
+                out.sort_by_key(|t| (t.created_at, t.id));
+                out
+            }
+            ShadowTraceFilter::ContainingNote { note_id, limit } => {
+                let mut out: Vec<_> = traces
+                    .iter()
+                    .filter(|t| t.note_ids().contains(note_id))
+                    .cloned()
+                    .collect();
+                out.sort_by_key(|t| std::cmp::Reverse((t.created_at, t.id)));
+                out.truncate(*limit);
+                out
+            }
+        })
+    }
+
+    async fn get_synapse_shadow_trace(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<crate::neurons::synaptic_shadow::SynapseShadowTrace>> {
+        let traces = self.synapse_shadow_traces.read().await;
+        Ok(traces.iter().find(|t| t.id == id).cloned())
+    }
+
+    async fn claim_shadow_trace_reward(&self, trace_id: Uuid, key: &str) -> Result<bool> {
+        let mut traces = self.synapse_shadow_traces.write().await;
+        let Some(trace) = traces.iter_mut().find(|t| t.id == trace_id) else {
+            return Ok(false);
+        };
+        if trace.rewarded.iter().any(|k| k == key) {
+            return Ok(false);
+        }
+        trace.rewarded.push(key.to_string());
+        Ok(true)
+    }
+
+    async fn shadow_trace_closures(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, crate::neurons::synaptic_shadow::TaskClosure)>> {
+        use crate::neurons::synaptic_shadow::{TaskClosure, CLOSURE_KEY};
+        let traces = self.synapse_shadow_traces.read().await;
+        let executions = self.agent_executions.read().await;
+        let tasks = self.tasks.read().await;
+        let mut ordered: Vec<_> = traces
+            .iter()
+            .filter(|t| !t.rewarded.iter().any(|k| k == CLOSURE_KEY))
+            .collect();
+        ordered.sort_by_key(|t| (t.created_at, t.id));
+        let mut out = Vec::new();
+        for trace in ordered {
+            let mut restarted = false;
+            let mut quiet = false;
+            for ae in executions.values().filter(|ae| {
+                ae.session_id == Some(trace.session_id)
+                    && ae.completed_at.is_some_and(|at| at < cutoff)
+            }) {
+                let Some(task) = tasks.get(&ae.task_id) else {
+                    continue;
+                };
+                if executions
+                    .values()
+                    .any(|later| later.task_id == ae.task_id && later.started_at > ae.started_at)
+                {
+                    restarted = true;
+                } else if task.status == crate::neo4j::models::TaskStatus::Completed {
+                    quiet = true;
+                }
+            }
+            if restarted {
+                out.push((trace.id, TaskClosure::Restarted));
+            } else if quiet {
+                out.push((trace.id, TaskClosure::Quiet));
+            }
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     async fn weaken_node_synapses(

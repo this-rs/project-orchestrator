@@ -20,6 +20,8 @@ pub(crate) mod agent_hooks;
 pub mod agent_runtime;
 pub mod anchor;
 pub mod anchor_resolver;
+#[cfg(all(test, unix))]
+mod cancel_e2e_tests;
 pub mod cancel_relay;
 pub(crate) mod cancelled_parents;
 pub mod cost;
@@ -45,6 +47,7 @@ pub mod path_detect;
 pub mod pending_queue;
 pub(crate) mod post_stream;
 pub(crate) mod post_tool_hook;
+pub mod posture;
 pub mod prompt;
 pub mod prompt_sections;
 pub mod provider;

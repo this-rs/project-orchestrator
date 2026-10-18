@@ -65,7 +65,7 @@ The binary is at `./target/release/mcp_server`.
 curl -fsSL https://raw.githubusercontent.com/this-rs/project-orchestrator/main/install.sh | sh
 ```
 
-Then auto-configure Claude Code:
+If you use Claude Code (optional: any other provider is added in Settings → Providers), auto-configure it:
 
 ```bash
 orchestrator setup-claude
