@@ -377,7 +377,9 @@ fn configured_endpoints() -> Vec<(&'static str, String)> {
     let Ok(contents) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
-    let Ok(yaml) = serde_yaml::from_str::<project_orchestrator::YamlConfig>(&contents) else {
+    let Ok(yaml) =
+        project_orchestrator::yaml::from_str::<project_orchestrator::YamlConfig>(&contents)
+    else {
         return Vec::new();
     };
     let mut endpoints = vec![

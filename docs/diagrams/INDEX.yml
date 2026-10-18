@@ -308,6 +308,13 @@ diagrams:
     covers:
       - "backend:src/refs/**"
       - "backend:src/api/refs_handlers.rs"
+  - name: po-yaml
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-yaml.mmd
+    covers:
+      - "backend:src/yaml.rs"
+      - "backend:src/yaml/**"
   - name: po-bugs
     owner: theotime
     status: verified

@@ -396,7 +396,7 @@ fn main() {
                 // Read infra_mode from the YAML config (defaults to "docker")
                 let infra_mode = std::fs::read_to_string(&config_path)
                     .ok()
-                    .and_then(|contents| serde_yaml::from_str::<serde_yaml::Value>(&contents).ok())
+                    .and_then(|contents| project_orchestrator::yaml::value_from_str(&contents).ok())
                     .and_then(|v| v.get("infra_mode").and_then(|m| m.as_str().map(String::from)))
                     .unwrap_or_else(|| "docker".to_string());
 
@@ -528,7 +528,7 @@ fn main() {
             // stop containers that the app didn't start.
             let infra_mode = std::fs::read_to_string(setup::config_path())
                 .ok()
-                .and_then(|c| serde_yaml::from_str::<serde_yaml::Value>(&c).ok())
+                .and_then(|c| project_orchestrator::yaml::value_from_str(&c).ok())
                 .and_then(|v| {
                     v.get("infra_mode")
                         .and_then(|m| m.as_str().map(String::from))
