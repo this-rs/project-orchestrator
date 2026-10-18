@@ -939,6 +939,7 @@ jobs:
           scripts/prebuilt-lib.sh use ort ${{ matrix.target }}
           if [ "$RUNNER_OS" = "Linux" ]; then
             # The path contains a space, which RUSTFLAGS would split: CARGO_ENCODED_RUSTFLAGS.
+            # shellcheck disable=SC2016  # $ORIGIN must reach the linker literally
             echo 'CARGO_ENCODED_RUSTFLAGS=-Clink-arg=-Wl,-rpath,$ORIGIN/../lib/Project Orchestrator' >> "$GITHUB_ENV"
           fi
 
@@ -1904,7 +1905,7 @@ jobs:
             type=registry,ref=ghcr.io/${{ github.repository }}-cache:docker-${{ matrix.variant }}
           cache-to: |
             type=gha,mode=max,scope=release-docker-${{ matrix.variant }}
-            type=registry,ref=ghcr.io/${{ github.repository }}-cache:docker-${{ matrix.variant }},mode=max
+            type=registry,ref=ghcr.io/${{ github.repository }}-cache:docker-${{ matrix.variant }},mode=max,ignore-error=true
 
       # GHCR packages default to private, even when the repo is public.
       # Make the package public after the first push so `docker pull` works
