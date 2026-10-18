@@ -2268,7 +2268,29 @@ pub trait GraphStore: Send + Sync {
         &self,
         session_id: Uuid,
         op: crate::chat::anchor::AnchorOp,
-    ) -> Result<crate::chat::anchor::AnchorChange>;
+    ) -> Result<crate::chat::anchor::AnchorChange> {
+        Ok(self.apply_anchor_op_if(session_id, op, None).await?.change)
+    }
+
+    /// [`Self::apply_anchor_op`] with an optimistic check on the whole anchor
+    /// set: when `if_match` is `Some(v)` and the set of the session is no longer
+    /// at version `v`, nothing is written and the error is
+    /// `AnchorError::SetVersionConflict`. The check and the write happen in the
+    /// same transaction, under the session's lock. Returns the version of the
+    /// set after the operation.
+    async fn apply_anchor_op_if(
+        &self,
+        session_id: Uuid,
+        op: crate::chat::anchor::AnchorOp,
+        if_match: Option<u64>,
+    ) -> Result<crate::chat::anchor::AnchorSetChange>;
+
+    /// The anchors of a session (oldest first) and the version of the set, read
+    /// together. `None` when the session does not exist.
+    async fn get_anchor_set(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<crate::chat::anchor::AnchorSet>>;
 
     /// Anchor a session on an entity (idempotent for a role set already held).
     async fn add_anchor(

@@ -154,6 +154,51 @@ pub enum AnchorError {
     VersionConflict { expected: u64, actual: u64 },
     #[error("an anchor cannot be left without a role; remove it instead")]
     LastRole,
+    /// The caller's `If-Match` names a version of the anchor SET of the session
+    /// that is no longer the current one: somebody changed the anchors since.
+    #[error("anchor set version conflict: expected {expected}, found {actual}")]
+    SetVersionConflict { expected: u64, actual: u64 },
+}
+
+impl AnchorError {
+    /// Stable machine code of the refusal, carried by the API (`code`).
+    pub fn code(&self) -> &'static str {
+        match self {
+            AnchorError::InvalidTargetId { .. } => "invalid_target_id",
+            AnchorError::EmptyRoles => "empty_roles",
+            AnchorError::InvalidConfidence => "invalid_confidence",
+            AnchorError::FieldTooLong { .. } => "field_too_long",
+            AnchorError::FocusCapReached { .. } => "focus_cap_reached",
+            AnchorError::SessionCapReached { .. } => "session_cap_reached",
+            AnchorError::OriginAlreadyExists => "origin_already_exists",
+            AnchorError::OriginImmutable => "origin_immutable",
+            AnchorError::AgentCannotFocus => "agent_cannot_focus",
+            AnchorError::AgentRoleForbidden(_) => "agent_role_forbidden",
+            AnchorError::AlreadyAnchored { .. } => "already_anchored",
+            AnchorError::NotFound(_) => "anchor_not_found",
+            AnchorError::SessionNotFound(_) => "session_not_found",
+            AnchorError::VersionConflict { .. } => "anchor_version_conflict",
+            AnchorError::LastRole => "last_role",
+            AnchorError::SetVersionConflict { .. } => "anchor_set_version_conflict",
+        }
+    }
+}
+
+/// The anchors of a session with the version of the set: the number of the last
+/// change committed to it (`0` before any). Every committed operation bumps it by
+/// one, a no-op does not. What `If-Match` / `ETag` carry on the anchors API.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AnchorSet {
+    pub version: u64,
+    pub anchors: Vec<Anchor>,
+}
+
+/// Result of an operation applied with its set-version check.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnchorSetChange {
+    pub change: AnchorChange,
+    /// The version of the set after the operation (unchanged by a no-op).
+    pub version: u64,
 }
 
 /// A stored anchor.

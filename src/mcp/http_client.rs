@@ -218,6 +218,32 @@ impl McpHttpClient {
         self.handle_response(resp, "DELETE", &url).await
     }
 
+    /// A request with an optional JSON body and an optional `If-Match` header
+    /// (optimistic concurrency of the anchors API: the `version` a previous
+    /// answer carried).
+    pub async fn send_if_match(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+        if_match: Option<u64>,
+    ) -> Result<Value> {
+        let url = format!("{}{}", self.base_url, path);
+        debug!("{} {} (If-Match: {:?})", method, url, if_match);
+
+        let mut req = self.client.request(method.clone(), &url);
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        if let Some(v) = if_match {
+            req = req.header(reqwest::header::IF_MATCH, format!("\"{v}\""));
+        }
+        req = self.inject_auth(req);
+
+        let resp = req.send().await.context("HTTP request failed")?;
+        self.handle_response(resp, method.as_str(), &url).await
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────
 
     /// Inject Authorization: Bearer header and X-Session-Id header if available.

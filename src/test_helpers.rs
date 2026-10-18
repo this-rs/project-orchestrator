@@ -731,6 +731,14 @@ pub async fn serve_chat(
 /// what a test that carries a signed token — a person's, or a chat session's —
 /// talks to. [`serve_chat`] is the no-auth variant used by the WebSocket tests.
 pub async fn router_with_auth(graph: Arc<MockGraphStore>) -> axum::Router {
+    router_with_auth_and_events(graph).await.0
+}
+
+/// [`router_with_auth`], with the event bus its handlers emit on: what a test
+/// that checks the CRUD events of `/ws/events` subscribes to.
+pub async fn router_with_auth_and_events(
+    graph: Arc<MockGraphStore>,
+) -> (axum::Router, Arc<crate::events::HybridEmitter>) {
     use crate::api::handlers::ServerState;
     use crate::orchestrator::watcher::FileWatcher;
     use crate::orchestrator::Orchestrator;
@@ -740,13 +748,14 @@ pub async fn router_with_auth(graph: Arc<MockGraphStore>) -> axum::Router {
     let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
         orchestrator.clone(),
     )));
+    let event_bus = Arc::new(crate::events::HybridEmitter::new(Arc::new(
+        crate::events::EventBus::default(),
+    )));
     let state = Arc::new(ServerState {
         orchestrator,
         watcher,
         chat_manager: None,
-        event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
-            crate::events::EventBus::default(),
-        ))),
+        event_bus: event_bus.clone(),
         nats_emitter: None,
         auth_config: Some(test_auth_config()),
         serve_frontend: false,
@@ -769,7 +778,7 @@ pub async fn router_with_auth(graph: Arc<MockGraphStore>) -> axum::Router {
         model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
         vault: crate::vault::VaultService::ephemeral(),
     });
-    crate::api::routes::create_router(state)
+    (crate::api::routes::create_router(state), event_bus)
 }
 
 #[cfg(test)]
