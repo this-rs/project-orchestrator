@@ -36,6 +36,7 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | `po_tools` | les outils project-orchestrator (MCP) sont donnés et appelables | ok | ok | ok | not_measured | not_measured | not_measured |
 | `tool_search` | un outil différé n'est pas envoyé ; ToolSearch le charge, il est ajouté EN FIN de liste et appelable dans le même tour (CTX2) | not_measured | not_measured | ok | not_measured | not_measured | not_measured |
 | `nexus_tools` | Read / Edit / Bash s'exécutent sur le projet | not_measured | not_measured | ok | not_measured | not_measured | not_measured |
+| `tool_result.huge` | un résultat d'outil MCP d'environ 1 Mo ne tue pas le tour : seul un avis borné (moins de 8 Ko) atteint le fil et le modèle, le tour se clôt et le suivant démarre ; natif : le mégaoctet est gardé sur disque, au chemin que l'avis nomme (Claude Code : ce que fait le CLI est relevé, puis rejoué par fake_claude) | ok | ok | ok | not_measured | not_measured | not_measured |
 | `enrichment` | le contexte du graphe précède le message du tour | ok | ok | ok | not_measured | not_measured | not_measured |
 | `refs` | une référence #kind:id atteint le modèle en pointeur po-context | ok | ok | ok | not_measured | not_measured | not_measured |
 | `provider_switch.relay` | la bascule vers ce moteur relaie la conversation sur le même fil (provider_switched) | ok | ok | ok | not_measured | not_measured | not_measured |
@@ -48,7 +49,7 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | `system_init.degraded` | system_init n'annonce comme manquant qu'une limite du modèle (liste fermée) | ok | ok | ok | not_measured | not_measured | not_measured |
 | `session_limits` | sans réglage, aucune limite de durée par tour ni budget de session (ISO5) : le CLI ne reçoit pas --max-budget-usd, une session du moteur agent s'ouvre et reprend sans turn_timeout_ms ni max_tokens | ok | ok | ok | not_measured | not_measured | not_measured |
 
-`ok` : Claude Code 29/31, Claude Code (moteur agent) 29/31, natif 31/31, Codex 0/31, opencode 0/31, ACP 0/31.
+`ok` : Claude Code 30/32, Claude Code (moteur agent) 30/32, natif 32/32, Codex 0/32, opencode 0/32, ACP 0/32.
 
 ## Écarts déclarés
 
@@ -83,6 +84,7 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | Codex | `po_tools` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | Codex | `tool_search` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | Codex | `nexus_tools` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
+| Codex | `tool_result.huge` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | Codex | `enrichment` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | Codex | `refs` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | Codex | `provider_switch.relay` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
@@ -114,6 +116,7 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | opencode | `po_tools` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `tool_search` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `nexus_tools` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
+| opencode | `tool_result.huge` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `enrichment` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `refs` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `provider_switch.relay` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
@@ -145,6 +148,7 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | ACP | `po_tools` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
 | ACP | `tool_search` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
 | ACP | `nexus_tools` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
+| ACP | `tool_result.huge` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
 | ACP | `enrichment` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
 | ACP | `refs` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
 | ACP | `provider_switch.relay` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
@@ -164,3 +168,4 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | Comportement | Mesuré sur | Comment | Note PO |
 |---|---|---|---|
 | re-check PreCompact systemMessage : le CLI ajoute le `systemMessage` d'une réponse au hook PreCompact aux instructions du résumé (et l'affiche à l'utilisateur dans la ligne « Compacted… »), ignore `reason`, rejette `hookSpecificOutput.additionalContext` | Claude Code 2.1.295 | `docs/parity/m2c-precompact/` (README) | 172c164e (tâche M2c 79cc48df) |
+| re-check résultat d'outil de 1 Mo : le CLI écrit le résultat entier dans un fichier de la session (`tool-results/`) et ne rend au modèle qu'un avis d'environ 1,6 Ko qui nomme ce fichier, sans aperçu du contenu ni `is_error` ; le tour se clôt normalement (`tool_result.huge`, rejoué par fake_claude) | Claude Code 2.1.296 (18/10/2026) | `docs/parity/gros1b-big-tool-result/` (README) | tâche GROS-1b 4b687177 |

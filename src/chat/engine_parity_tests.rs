@@ -233,6 +233,10 @@ const FUNCTIONS: &[(&str, &str)] = &[
         "Read / Edit / Bash s'exécutent sur le projet",
     ),
     (
+        "tool_result.huge",
+        "un résultat d'outil MCP d'environ 1 Mo ne tue pas le tour : seul un avis borné (moins de 8 Ko) atteint le fil et le modèle, le tour se clôt et le suivant démarre ; natif : le mégaoctet est gardé sur disque, au chemin que l'avis nomme (Claude Code : ce que fait le CLI est relevé, puis rejoué par fake_claude)",
+    ),
+    (
         "enrichment",
         "le contexte du graphe précède le message du tour",
     ),
@@ -556,14 +560,87 @@ fn render(run: &Run<'_>) -> String {
 
 /// What the parity takes from the real CLI without measuring it here (the fakes replay
 /// it): to re-check on each Claude Code CLI bump. (behaviour, measured on, how, PO note)
-const RE_MEASURE: &[(&str, &str, &str, &str)] = &[(
-    "re-check PreCompact systemMessage : le CLI ajoute le `systemMessage` d'une réponse au \
-     hook PreCompact aux instructions du résumé (et l'affiche à l'utilisateur dans la ligne \
-     « Compacted… »), ignore `reason`, rejette `hookSpecificOutput.additionalContext`",
-    "Claude Code 2.1.295",
-    "`docs/parity/m2c-precompact/` (README)",
-    "172c164e (tâche M2c 79cc48df)",
-)];
+const RE_MEASURE: &[(&str, &str, &str, &str)] = &[
+    (
+        "re-check PreCompact systemMessage : le CLI ajoute le `systemMessage` d'une réponse au \
+         hook PreCompact aux instructions du résumé (et l'affiche à l'utilisateur dans la ligne \
+         « Compacted… »), ignore `reason`, rejette `hookSpecificOutput.additionalContext`",
+        "Claude Code 2.1.295",
+        "`docs/parity/m2c-precompact/` (README)",
+        "172c164e (tâche M2c 79cc48df)",
+    ),
+    (
+        "re-check résultat d'outil de 1 Mo : le CLI écrit le résultat entier dans un fichier de \
+         la session (`tool-results/`) et ne rend au modèle qu'un avis d'environ 1,6 Ko qui nomme \
+         ce fichier, sans aperçu du contenu ni `is_error` ; le tour se clôt normalement \
+         (`tool_result.huge`, rejoué par fake_claude)",
+        "Claude Code 2.1.296 (18/10/2026)",
+        "`docs/parity/gros1b-big-tool-result/` (README)",
+        "tâche GROS-1b 4b687177",
+    ),
+];
+
+/// The size of the tool result of the row `tool_result.huge`: about a megabyte.
+const BIG_RESULT_CHARS: u64 = 1_000_000;
+
+/// What may reach the thread (and the model) for a result of [`BIG_RESULT_CHARS`]: the two
+/// shapes measured are ~1.6 KB (the CLI's notice) and ~2.2 KB (the native
+/// `<persisted-output>`: a 2 KB preview and the path). Anything near the megabyte fails.
+const BIG_SEEN_BOUND: usize = 8 * 1024;
+
+/// What Claude Code 2.1.296 handed the model for a 1,000,000-character MCP result, VERBATIM
+/// (`claude -p`, claude-haiku-5-5, 18/10/2026, `docs/parity/gros1b-big-tool-result/`), `{path}`
+/// standing for the file of the session where the CLI wrote the whole result. No `is_error`.
+/// `fake_claude` replays it: the CLI runs no tool here.
+const CLI_BIG_NOTICE: &str = "Error: result (1,000,000 characters across 1 line) exceeds maximum allowed tokens. Output has been saved to {path}.\n\
+Format: Plain text\n\
+Search within the file for specific content, and use jq if the content is JSON.\n\
+REQUIREMENTS FOR SUMMARIZATION/ANALYSIS/REVIEW:\n\
+- You MUST read the content from the file at {path} in sequential chunks until 100% of the content has been read.\n\
+- Note: this file's lines are too long for Read's offset/limit chunking. If a shell tool is available, slice by character range (e.g. python read()[A:B], dd, or cut -c) instead.\n\
+- If you receive truncation warnings when reading the file, reduce the chunk size until you have read 100% of the content without truncation.\n\
+- Before producing ANY summary or analysis, you MUST explicitly describe what portion of the content you have read. ***If you did not read the entire content, you MUST explicitly state this.***\n\
+- If after a few attempts you cannot read the file (file not found, lines too long for Read's offset/limit, no shell access), STOP retrying. Summarize what you were able to read, explicitly state which portion you could not read and why, and proceed.\n";
+
+/// [`CLI_BIG_NOTICE`] for a session whose CLI keeps its tool results under `cwd`.
+fn cli_big_notice(cwd: &str) -> String {
+    CLI_BIG_NOTICE.replace(
+        "{path}",
+        &format!(
+            "{}/.claude-tool-results/mcp-project-orchestrator-big-1.txt",
+            cwd.trim_end_matches('/')
+        ),
+    )
+}
+
+/// The verdict of `tool_result.huge` from what the thread showed of the big call `id`, whether
+/// its turn and the next one answered, and `extra` (the native disk check; `true` on Claude Code).
+fn big_verdict(
+    events: &[ChatEvent],
+    id: &str,
+    answered: bool,
+    next: bool,
+    extra: (bool, String),
+) -> (bool, String) {
+    let shown = events.iter().find_map(|e| match e {
+        ChatEvent::ToolResult {
+            id: r,
+            result,
+            is_error,
+            ..
+        } if r == id => Some((result.to_string().len(), *is_error)),
+        _ => None,
+    });
+    let bounded = shown.is_some_and(|(len, _)| len < BIG_SEEN_BOUND);
+    (
+        bounded && answered && next && extra.0,
+        format!(
+            "résultat sur le fil (octets, is_error)={shown:?} (borne {BIG_SEEN_BOUND}), tour \
+             clos={answered}, tour suivant={next}, {}",
+            extra.1
+        ),
+    )
+}
 
 /// [`EXPECTED`] by engine, then in the order of the table.
 fn declared_in_table_order() -> Vec<(Engine, &'static str, Expect)> {
@@ -1581,6 +1658,16 @@ fn transcript_main(k: Keys, cwd: &str, path: ProviderPath) -> Vec<Value> {
         text("answered agent"),
         result_ok("answered agent"),
     ]);
+    // TURN-HUGE: a PO tool answers about a megabyte. What the CLI hands back is what the real
+    // CLI 2.1.296 did (CLI_BIG_NOTICE, measured); then the next turn (TURN-AFTER-HUGE).
+    t.extend(vec![
+        await_in(&k.k("TURN-HUGE")),
+        cc_tool_use("t-big", &po("big"), json!({"n": BIG_RESULT_CHARS})),
+        cc_tool_result("t-big", &cli_big_notice(cwd), false),
+        text("answered huge"),
+        result_ok("answered huge"),
+    ]);
+    t.extend(answer(&k.k("TURN-AFTER-HUGE"), "answered after huge"));
     // Closed by the backend going down (EOF on stdin).
     t.push(wait_eof());
     t
@@ -1981,6 +2068,16 @@ fn native_script(k: Keys, cwd: &str) -> Value {
         ),
         says(&k.k("SUB-PROMPT"), &k.k("SUB-ANSWER")),
         says(&k.k("TURN-AGENT"), "answered agent"),
+        // TURN-HUGE: a PO tool answers about a megabyte (fake_mcp `big`); the model then
+        // answers; the next turn (TURN-AFTER-HUGE) starts on that history.
+        calls(
+            &k.k("TURN-HUGE"),
+            "cbig",
+            &po("big"),
+            json!({"n": BIG_RESULT_CHARS}),
+        ),
+        says(&k.k("TURN-HUGE"), "answered huge"),
+        says(&k.k("TURN-AFTER-HUGE"), "answered after huge"),
     ];
     // A turn whose reported size makes the next model call compact first; the
     // summary request carries the guidance of the before_compaction hook.
@@ -2256,6 +2353,123 @@ async fn answer_if_asked(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     false
+}
+
+/// The deadline of the steps that carry the megabyte of `tool_result.huge` (the PO server
+/// writing it, the harness reading and persisting it): its own, like
+/// [`INTERRUPT_TURN_END_WAIT`], because under the Code Coverage job every hop is slower. `WAIT`
+/// itself is not widened.
+const HUGE_WAIT: Duration = Duration::from_secs(60);
+
+/// `tool_result.huge` on Claude Code: TURN-HUGE (the CLI's measured notice, replayed), then
+/// TURN-AFTER-HUGE. Two messages sent.
+async fn cc_huge(
+    manager: &ChatManager,
+    w: &Watch,
+    cli: &FakeClaude,
+    k: Keys,
+    sid: &str,
+) -> (bool, String) {
+    let ends = w.turn_ends();
+    manager.send_message(sid, &k.k("TURN-HUGE")).await.unwrap();
+    let read = cli.wait_line(0, &k.k("TURN-HUGE"), WAIT).await.is_some();
+    let shown = w
+        .wait(
+            HUGE_WAIT,
+            |e| matches!(e, ChatEvent::ToolResult { id, .. } if id == "t-big"),
+        )
+        .await;
+    let answered = read && shown && w.said(HUGE_WAIT, "answered huge").await;
+    w.settle(ends, manager).await;
+    let ends = w.turn_ends();
+    manager
+        .send_message(sid, &k.k("TURN-AFTER-HUGE"))
+        .await
+        .unwrap();
+    let next = cli
+        .wait_line(0, &k.k("TURN-AFTER-HUGE"), WAIT)
+        .await
+        .is_some()
+        && w.said(WAIT, "answered after huge").await;
+    w.settle(ends, manager).await;
+    big_verdict(
+        &w.all().await,
+        "t-big",
+        answered,
+        next,
+        (
+            true,
+            "ce que le CLI fait du mégaoctet (fichier de session, avis de ~1,6 Ko) est relevé \
+             sur 2.1.296 et rejoué par fake_claude"
+                .to_string(),
+        ),
+    )
+}
+
+/// `tool_result.huge` on the native harness: TURN-HUGE calls the PO tool `big` (fake_mcp, a
+/// real megabyte through MCP), then TURN-AFTER-HUGE. Two messages sent.
+async fn native_huge(
+    manager: &ChatManager,
+    w: &Watch,
+    fake: &FakeOpenAi,
+    k: Keys,
+    sid: &str,
+) -> (bool, String) {
+    let ends = w.turn_ends();
+    manager.send_message(sid, &k.k("TURN-HUGE")).await.unwrap();
+    // A read-only PO tool is not asked; answered once if it ever is.
+    answer_if_asked(manager, w, fake, "1000000", &k.k("TURN-HUGE"), 1).await;
+    // The request after the call: what the model received for it.
+    let after = wait_body_nth(fake, &k.k("TURN-HUGE"), 1, HUGE_WAIT)
+        .await
+        .unwrap_or_default();
+    let to_model = serde_json::from_str::<Value>(&after)
+        .ok()
+        .and_then(|b| {
+            b["messages"].as_array().and_then(|m| {
+                m.iter()
+                    .find(|m| m["role"] == "tool" && m["tool_call_id"] == "cbig")
+                    .map(|m| match &m["content"] {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+            })
+        })
+        .unwrap_or_default();
+    let persisted = to_model.starts_with("<persisted-output>");
+    let path = to_model
+        .split_once("Full output saved to: ")
+        .and_then(|(_, rest)| rest.lines().next())
+        .unwrap_or_default()
+        .to_string();
+    let on_disk = std::fs::metadata(&path).map(|m| m.len()).ok();
+    let answered = !after.is_empty() && w.said(HUGE_WAIT, "answered huge").await;
+    w.settle(ends, manager).await;
+    let ends = w.turn_ends();
+    manager
+        .send_message(sid, &k.k("TURN-AFTER-HUGE"))
+        .await
+        .unwrap();
+    let next = wait_body(fake, &k.k("TURN-AFTER-HUGE")).await.is_some()
+        && w.said(WAIT, "answered after huge").await;
+    w.settle(ends, manager).await;
+    let kept = on_disk == Some(BIG_RESULT_CHARS);
+    let _ = std::fs::remove_file(&path);
+    big_verdict(
+        &w.all().await,
+        "cbig",
+        answered,
+        next,
+        (
+            persisted && to_model.len() < BIG_SEEN_BOUND && kept,
+            format!(
+                "reçu par le modèle : {} octets, <persisted-output>={persisted}, fichier nommé \
+                 {} octets sur disque",
+                to_model.len(),
+                on_disk.map_or("absent".to_string(), |n| n.to_string())
+            ),
+        ),
+    )
 }
 
 /// The last user message of a request body (the turn, not the history).
@@ -2959,6 +3173,11 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         format!("messages du sous-agent sous t-agent={nested}, réponse en résultat={returned}"),
     );
     w.settle(ends, &manager).await;
+
+    // A tool result of about a megabyte: the turn closes, the next one starts.
+    let (ok, seen) = Box::pin(cc_huge(&manager, &w, &cli, kc, &sid)).await;
+    cc_sent += 2;
+    cc.check("tool_result.huge", ok, Cause::Harness, seen);
 
     // The announcement and the record.
     let init = w.system_init().await;
@@ -3773,6 +3992,12 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         ),
     );
     wn.settle(ends, &manager).await;
+
+    // A tool result of about a megabyte: persisted, a bounded preview reaches the model, the
+    // turn closes and the next one starts.
+    let (ok, seen) = Box::pin(native_huge(&manager, &wn, &fake, kn, &nid)).await;
+    na_sent += 2;
+    na.check("tool_result.huge", ok, Cause::Harness, seen);
 
     // Compaction: a turn reports a context near the window; the next one compacts.
     let ends = wn.turn_ends();
