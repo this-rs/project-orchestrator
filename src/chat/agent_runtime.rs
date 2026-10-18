@@ -402,6 +402,13 @@ pub const NEXUS_TOOLS_FEATURE: &str = "nexus_tools";
 /// `ChatManager::carries_per_session_mcp`).
 pub const PO_TOOLS_FEATURE: &str = "project_orchestrator_tools";
 
+/// The identifier of a native session whose conversation is kept in MEMORY only: the
+/// directory its transcripts would be written to lies inside a git work tree (a versioned
+/// HOME, a data directory placed in a project), where a `git add -A` would publish them
+/// (`transcripts::inside_git_worktree`, CTX6). The session works, but does not resume
+/// after a server restart. The HOST knows it, so it is added at adoption.
+pub const RESUME_AFTER_RESTART_FEATURE: &str = "resume_after_restart";
+
 /// The identifier of a session whose provider has no sub-agents of its own
 /// (`SubagentSupport::None`) and that the host gives no fallback: the backend runs the
 /// `Agent` calls as child sessions for the native harness only

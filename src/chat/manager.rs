@@ -2932,6 +2932,18 @@ pub(crate) fn lacks_nexus_tools(
 /// Name of the project-orchestrator MCP server in a session's spec.
 pub(crate) const PO_MCP_SERVER: &str = "project-orchestrator";
 
+/// Whether a native session keeps its conversation in MEMORY only: the transcript root it
+/// would write to lies inside a git work tree, which the factory refuses
+/// (`native_factory::build_native_for_sessions`, the SAME predicate). The session works and
+/// says it will not resume after a restart (`resume_after_restart`, CTX6 follow-up).
+pub(crate) fn transcripts_kept_in_memory(
+    kind: nexus_claude::agent::ProviderKind,
+    root: Option<&std::path::Path>,
+) -> bool {
+    matches!(kind, nexus_claude::agent::ProviderKind::Native)
+        && root.is_some_and(super::provider::transcripts::inside_git_worktree)
+}
+
 /// What a session about to open lacks that the HOST knows and its provider's
 /// capabilities may not say, as `degraded_features` entries: `nexus_tools`
 /// ([`lacks_nexus_tools`]) and `project_orchestrator_tools` when the spec carries no
@@ -16789,6 +16801,9 @@ impl ChatManager {
             &spec,
             self.config.nexus_tools_path.as_deref(),
         );
+        if transcripts_kept_in_memory(provider.kind(), self.native_transcripts.as_deref()) {
+            host_missing.push(super::agent_runtime::RESUME_AFTER_RESTART_FEATURE.to_string());
+        }
         // The project's files are on this machine unless the instance is remote.
         let project_dir =
             (!super::provider::resolver::is_remote_instance(provider_id)).then(|| spec.cwd.clone());
@@ -17676,6 +17691,9 @@ impl ChatManager {
             &spec,
             self.config.nexus_tools_path.as_deref(),
         );
+        if transcripts_kept_in_memory(provider.kind(), self.native_transcripts.as_deref()) {
+            host_missing.push(super::agent_runtime::RESUME_AFTER_RESTART_FEATURE.to_string());
+        }
         // The project's files are on this machine unless the instance is remote.
         let project_dir = (!super::provider::resolver::is_remote_instance(&provider_id))
             .then(|| spec.cwd.clone());
