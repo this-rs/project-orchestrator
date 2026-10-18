@@ -3242,6 +3242,20 @@ impl PlanRunner {
 
         let attempts = self.latest_attempt_ids(run_id).await;
         let completed = wave_result.tasks_completed.clone();
+        // The session of each attempt, for the synaptic layer's reward (T8): read
+        // only when the layer runs for some project.
+        let attempt_sessions: std::collections::HashMap<Uuid, Uuid> =
+            if crate::neurons::synaptic_shadow::SynapticLayerFlags::global().any_enabled() {
+                self.graph
+                    .get_agent_executions_for_run(run_id)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|ae| Some((ae.id, ae.session_id?)))
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
         let mut failed: Vec<(Uuid, String)> = Vec::new();
 
         for (position, task_id) in completed.iter().enumerate() {
@@ -3273,6 +3287,18 @@ impl PlanRunner {
                         warn!(
                             "Failed to record the verification of task {} on execution {}: {}",
                             task_id, execution_id, e
+                        );
+                    }
+                    // The verdict as `verification_json` records it: an unknown
+                    // shape is no signal.
+                    if let (Some(session_id), Some(passed)) = (
+                        attempt_sessions.get(execution_id),
+                        crate::runner::routing::verification_passed(Some(&json)),
+                    ) {
+                        crate::neurons::synaptic_shadow::spawn_verification_reward(
+                            self.graph.clone(),
+                            *session_id,
+                            passed,
                         );
                     }
                 }

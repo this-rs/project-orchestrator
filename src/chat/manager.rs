@@ -1706,6 +1706,12 @@ pub(crate) async fn enrichment_for_turn(
     // Resolve the project id once for every stage: stages that only read
     // `project_id` (reflex) were skipped for every chat message.
     let project_id = enrichment_project_id(graph.as_ref(), project_slug.as_deref()).await;
+    // The synaptic layer (T8) observes the turn when it is in shadow for the
+    // project: a detached task, never awaited, whose result is journaled and
+    // never reaches this prompt.
+    if let Some(pid) = project_id {
+        crate::neurons::synaptic_shadow::spawn_turn(graph.clone(), uuid, pid, node.created_at);
+    }
     let input = super::enrichment::EnrichmentInput {
         message: message.to_string(),
         session_id: uuid,

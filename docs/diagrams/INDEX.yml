@@ -227,7 +227,9 @@ diagrams:
     owner: theotime
     status: planned
     covers:
-      - "backend:src/neurons/**"
+      # Arbitrage : src/neurons/synaptic_shadow{,_tests}.rs (couche synaptique en ombre, T8) est
+      # possede par po-synaptic-shadow (verified), avec sa persistance src/neo4j/synapse_shadow.rs.
+      - "backend:src/neurons/{activation,config,intent,mod,search}.rs"
       - "backend:src/embeddings/**"
       - "backend:src/meilisearch/**"
   # Arbitrage (2026-10-02) : po-nexus-sdk est RETIRE. Son perimetre (claude-code-sdk-rs/src/{lib,client,
@@ -308,6 +310,14 @@ diagrams:
     covers:
       - "backend:src/refs/**"
       - "backend:src/api/refs_handlers.rs"
+  - name: po-synaptic-shadow
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-synaptic-shadow.mmd
+    covers:
+      - "backend:src/neurons/synaptic_shadow.rs"
+      - "backend:src/neurons/synaptic_shadow_tests.rs"
+      - "backend:src/neo4j/synapse_shadow.rs"
   - name: po-yaml
     owner: theotime
     status: verified

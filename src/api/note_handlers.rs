@@ -512,6 +512,7 @@ pub async fn unlink_note_from_entity(
 /// Confirm a note is still valid
 pub async fn confirm_note(
     State(state): State<OrchestratorState>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
     Path(note_id): Path<Uuid>,
 ) -> Result<Json<Note>, AppError> {
     let note = state
@@ -521,7 +522,25 @@ pub async fn confirm_note(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Note {} not found", note_id)))?;
 
+    if confirmed_by_a_person(state.auth_config.is_some(), claims.as_ref().map(|c| &c.0)) {
+        crate::neurons::synaptic_shadow::spawn_human_confirmation_reward(
+            state.orchestrator.neo4j_arc(),
+            note_id,
+        );
+    }
+
     Ok(Json(note))
+}
+
+/// Whether a confirmation is the « confirmed by a human » signal of the synaptic
+/// layer (T8): a signed-in person — never an agent session, an MCP token, the
+/// server's account or the anonymous user. Without authentication there is no
+/// person to tell apart from an agent, so there is no such signal.
+pub(crate) fn confirmed_by_a_person(
+    auth_enabled: bool,
+    claims: Option<&crate::auth::jwt::Claims>,
+) -> bool {
+    auth_enabled && claims.is_some_and(|c| c.is_human())
 }
 
 /// Invalidate a note
@@ -2558,5 +2577,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[cfg(test)]
+mod human_confirmation_tests {
+    use super::confirmed_by_a_person;
+    use crate::auth::jwt::{Claims, TOKEN_TYPE_AGENT_SESSION, TOKEN_TYPE_MCP};
+
+    fn person() -> Claims {
+        Claims {
+            sub: uuid::Uuid::new_v4().to_string(),
+            email: "someone@example.org".into(),
+            name: "Someone".into(),
+            iat: 0,
+            exp: i64::MAX,
+            token_type: None,
+            scope: None,
+            jti: None,
+        }
+    }
+
+    #[test]
+    fn only_a_signed_in_person_gives_the_human_confirmation_signal() {
+        assert!(confirmed_by_a_person(true, Some(&person())));
+        // Without authentication nobody can be told apart from an agent.
+        assert!(!confirmed_by_a_person(false, Some(&person())));
+        assert!(!confirmed_by_a_person(true, None));
+        assert!(!confirmed_by_a_person(true, Some(&Claims::anonymous())));
+        for token_type in [TOKEN_TYPE_AGENT_SESSION, TOKEN_TYPE_MCP] {
+            let agent = Claims {
+                token_type: Some(token_type.to_string()),
+                ..person()
+            };
+            assert!(!confirmed_by_a_person(true, Some(&agent)), "{token_type}");
+        }
     }
 }
