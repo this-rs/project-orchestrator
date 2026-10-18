@@ -1083,6 +1083,10 @@ pub struct ChatManager {
     /// the SAME engine and model, with the SAME envelope, consent and tool policy. Empty
     /// when the pool finds nothing, which only means a fresh session, as before.
     pub(crate) session_pool: Arc<super::session_pool::SessionPool>,
+    /// The sessions a cascade closed in the last minutes (B36-RACE,
+    /// `chat::cancelled_parents`): a delegated child whose parent is here is refused at its
+    /// activation, inside the critical section that would make it live.
+    pub(crate) cancelled_parents: Arc<super::cancelled_parents::CancelledParents>,
     /// Rate-limiting state for `inject_team_message`: sliding window per
     /// (from_session_id, to_session_id) pair. Cleared lazily (no background task).
     pub(crate) team_msg_rate: tokio::sync::Mutex<HashMap<(Uuid, String), Vec<std::time::Instant>>>,
@@ -3536,6 +3540,7 @@ impl ChatManager {
             mirrors: Default::default(),
             subagent_mirrors: true,
             session_pool: Arc::new(super::session_pool::SessionPool::from_env()),
+            cancelled_parents: Default::default(),
             team_msg_rate: Default::default(),
         }
     }
@@ -3643,6 +3648,7 @@ impl ChatManager {
             mirrors: Default::default(),
             subagent_mirrors: true,
             session_pool: Arc::new(super::session_pool::SessionPool::from_env()),
+            cancelled_parents: Default::default(),
             team_msg_rate: Default::default(),
         }
     }
@@ -7630,8 +7636,20 @@ impl ChatManager {
             .await;
         // Its Claude Code sub-agents are mirrored (P18c, `chat::mirror`).
         let mirror_tap = self.mirror_tap(&session_id.to_string());
+        let parent = super::cancelled_parents::parent_of(request.spawned_by.as_deref());
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
+            // B36-RACE: a child whose parent a cascade closed while it was opening is
+            // refused HERE, under the lock that would make it live (`chat::cancelled_parents`).
+            let admitted = self
+                .cancelled_parents
+                .admit(&session_id.to_string(), parent.as_deref());
+            if let Err(refused) = admitted {
+                drop(sessions);
+                self.refuse_legacy_activation(&session_id.to_string(), client, &refused)
+                    .await;
+                return Err(anyhow::Error::new(refused));
+            }
             // Cancel stale NATS listeners from a previous session with the same ID
             if let Some(old_session) = sessions.get(&session_id.to_string()) {
                 info!(
@@ -12631,8 +12649,17 @@ impl ChatManager {
         // Its Claude Code sub-agents are mirrored (P18c): a new tap per resume, the registry
         // keeps one mirror per call.
         let mirror_tap = self.mirror_tap(session_id);
+        let parent = super::cancelled_parents::parent_of(session_node.spawned_by.as_deref());
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
+            // B36-RACE: a child (a warm one the pool resumes included) whose parent a cascade
+            // closed is refused HERE, under the lock that would make it live.
+            if let Err(refused) = self.cancelled_parents.admit(session_id, parent.as_deref()) {
+                drop(sessions);
+                self.refuse_legacy_activation(session_id, client, &refused)
+                    .await;
+                return Err(anyhow::Error::new(refused));
+            }
             // Cancel stale NATS listeners from a previous resume/create of this session.
             // Without this, each resume_session() spawns 3 new NATS listeners (interrupt,
             // snapshot, RPC) that accumulate — the old ones never stop because the session
@@ -16766,7 +16793,6 @@ impl ChatManager {
                 return Err(anyhow::Error::new(e));
             }
         }
-        cleanup.disarm();
         // Lasting approvals only for a session whose files are on this machine, running in
         // its project's root.
         let lasting = match &project_dir {
@@ -16787,8 +16813,12 @@ impl ChatManager {
             project_dir,
             lasting,
             false,
+            super::cancelled_parents::parent_of(request.spawned_by.as_deref()),
         )
-        .await;
+        .await?;
+        // Live: the token and the router are the session's now (a refusal above left
+        // `cleanup` armed, which undoes them).
+        cleanup.disarm();
         // The session is open: the lists learn it now — a sub-agent opened by an `Agent`
         // call included (it never goes through an HTTP handler) — and BEFORE its first
         // turn starts, so `created` precedes that session's first CRUD `updated` (a turn
@@ -17023,7 +17053,8 @@ impl ChatManager {
         project_dir: Option<std::path::PathBuf>,
         lasting: Option<super::lasting_rules::LastingScope>,
         resumed: bool,
-    ) {
+        parent: Option<String>,
+    ) -> std::result::Result<(), super::cancelled_parents::ParentCancelled> {
         // What the provider's kind tells beyond its capabilities (an unknown window on
         // the native harness, no sub-agents and no fallback).
         for feature in super::agent_runtime::kind_degraded(kind, session.capabilities()) {
@@ -17069,7 +17100,7 @@ impl ChatManager {
             .await;
         let handle = self
             .agent_runtime
-            .adopt_declaring(
+            .adopt_admitting(
                 session_id,
                 provider_id,
                 session,
@@ -17096,8 +17127,14 @@ impl ChatManager {
                     super::session_grants::Asker::from_provider_kind(&kind_name),
                 )
                 .await,
+                // B36-RACE: refused under the runtime's write lock when a cascade closed
+                // the parent while this child was opening (`chat::cancelled_parents`).
+                || self.cancelled_parents.admit(session_id, parent.as_deref()),
             )
-            .await;
+            .await
+            .inspect_err(|refused| {
+                info!(session_id, parent = %refused.parent_session_id, "delegated session refused: its parent was cancelled");
+            })?;
         // A failed turn is retried as the chat's configuration says, on both engines.
         handle.configure_retry(self.config.retry.clone());
         // A provider instance the detector declares DOWN holds the turn instead of
@@ -17109,6 +17146,7 @@ impl ChatManager {
             super::provider::outage::HoldPolicy::from_env(),
         );
         self.spawn_agent_nats_listeners(handle);
+        Ok(())
     }
 
     /// The loop of an agent-engine cancel listener: hands each request to `on_request`
@@ -17650,7 +17688,6 @@ impl ChatManager {
             .get_latest_chat_event_seq(node.id)
             .await
             .unwrap_or(0);
-        cleanup.disarm();
         let lasting = match &project_dir {
             Some(dir) => {
                 Box::pin(self.lasting_scope(
@@ -17678,8 +17715,11 @@ impl ChatManager {
             // moved, which would make every `always` command be asked again). Only a plain
             // resume (no relay) may have moved.
             relay.is_none(),
+            // B36-RACE: a warm child the pool resumes is refused like a fresh one.
+            super::cancelled_parents::parent_of(node.spawned_by.as_deref()),
         )
-        .await;
+        .await?;
+        cleanup.disarm();
         let handle = self
             .agent_runtime
             .get(&sid)
@@ -17698,6 +17738,22 @@ impl ChatManager {
         } else {
             handle.send_message(message).await
         }
+    }
+
+    /// A legacy session refused at its activation (B36-RACE): never inserted, its MCP
+    /// token revoked and its CLI disconnected (dropped after 5 s, which kills it).
+    async fn refuse_legacy_activation(
+        &self,
+        session_id: &str,
+        client: Arc<Mutex<InteractiveClient>>,
+        refused: &super::cancelled_parents::ParentCancelled,
+    ) {
+        info!(session_id, parent = %refused.parent_session_id, "delegated session refused: its parent was cancelled");
+        crate::auth::agent_tokens::revoke_session(session_id);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            client.lock().await.disconnect().await
+        })
+        .await;
     }
 
     /// Close an active session: interrupt first, then disconnect and remove.
@@ -17721,7 +17777,21 @@ impl ChatManager {
     /// children are still reached). Each closed session loses its neutral
     /// directory. A descendant that cannot be closed does not stop the rest:
     /// the first error is reported.
+    ///
+    /// A delegation whose node is written but whose session is not live yet (its
+    /// provider still opening) is seen INACTIVE by the read below and skipped: it is
+    /// refused at its activation instead (B36-RACE, `chat::cancelled_parents`). Each
+    /// session the cascade closes gets a tombstone BEFORE it is closed — so before its
+    /// children are read — and every activation of a child checks its parent's tombstone
+    /// inside the critical section that inserts it in the live map. A child inserted
+    /// BEFORE the tombstone is seen live by the read (which comes after) and closed here;
+    /// one inserted AFTER reads the tombstone and is refused. The tombstone's mutex being
+    /// taken inside that critical section, no third order exists. Nothing waits: a
+    /// cancel with no delegation in flight costs one map insert per closed session.
     pub async fn close_session_with_cascade(&self, session_id: &str, cascade: bool) -> Result<()> {
+        if cascade {
+            self.cancelled_parents.mark(session_id);
+        }
         let mut result = self.close_session_inner(session_id).await;
         // The neutral directory (if the session had one) goes with the session; a resume
         // makes it again.
@@ -17739,6 +17809,10 @@ impl ChatManager {
                 for child in self.session_children(&parent).await {
                     if seen.insert(child.clone()) {
                         found_new = true;
+                        // Its own in-flight delegations are refused too — even when it is
+                        // closed already: a delegation it started before closing may still
+                        // be opening.
+                        self.cancelled_parents.mark(&child);
                         if self.is_session_active(&child).await {
                             if let Err(e) = self.close_session_inner(&child).await {
                                 tracing::warn!(session_id = %child, error = %e, "cascade: closing a descendant failed");
@@ -22478,6 +22552,189 @@ mod tests {
         let left = child_dir.exists();
         let _ = std::fs::remove_dir_all(&child_dir);
         assert!(!left, "the child's neutral directory goes with it");
+    }
+
+    // ---- B36-RACE: a delegation in flight when its parent is cancelled ----
+
+    /// An agent-engine delegation request whose `spawned_by` names `parent`.
+    fn delegation_of(parent: Uuid) -> ChatRequest {
+        let mut req = agent_request("delegated work");
+        req.spawned_by = Some(
+            serde_json::json!({"type": "delegation", "parent_session_id": parent.to_string()})
+                .to_string(),
+        );
+        req
+    }
+
+    /// A live parent (node written, session live) on the agent-path manager.
+    async fn live_parent(
+        manager: &ChatManager,
+        graph: &crate::neo4j::mock::MockGraphStore,
+    ) -> ChatSessionNode {
+        let parent = test_chat_session(None);
+        graph.create_chat_session(&parent).await.unwrap();
+        test_support::insert_live_session_without_cli(manager, &parent.id.to_string()).await;
+        parent
+    }
+
+    /// The first child node of `parent` the graph holds, waited for (5 s at most).
+    async fn child_node_written(
+        graph: &crate::neo4j::mock::MockGraphStore,
+        parent: Uuid,
+    ) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(child) = graph.get_session_children(parent).await.unwrap().first() {
+                return child.id.to_string();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the child's node is never written"
+            );
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// B36-RACE, criterion 1 — the PRODUCTION order: the child's node is written (its
+    /// provider still opening), the parent is closed with cascade, THEN the child would
+    /// become live. The cascade saw it inactive and skipped it; its activation reads the
+    /// parent's tombstone and refuses it, with a typed error the delegation reads. Red
+    /// without the tombstone: the child ends live, outliving the cancelled run.
+    #[tokio::test]
+    async fn a_delegation_in_flight_when_its_parent_is_cancelled_is_refused_at_activation() {
+        let (manager, graph, fake) = agent_manager();
+        let manager = Arc::new(manager);
+        let parent = live_parent(&manager, &graph).await;
+        // The provider takes a while to open: the window the race lives in.
+        *fake.open_delay.lock().unwrap() = Some(Duration::from_millis(400));
+        let opening = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            let request = delegation_of(parent.id);
+            async move { manager.create_session(&request).await }
+        });
+        let child = child_node_written(&graph, parent.id).await;
+        assert!(
+            !manager.is_session_active(&child).await,
+            "written, not live yet"
+        );
+
+        manager
+            .close_session_with_cascade(&parent.id.to_string(), true)
+            .await
+            .unwrap();
+
+        let opened = opening.await.expect("the opening task ends");
+        let err = opened.expect_err("a child of a cancelled parent is never started");
+        let refused = super::super::cancelled_parents::ParentCancelled::in_chain(&err)
+            .expect("the delegation reads a typed refusal");
+        assert_eq!(refused.parent_session_id, parent.id.to_string());
+        assert_eq!(refused.session_id, child);
+        assert!(err.to_string().contains("was cancelled"), "{err}");
+        assert!(
+            !manager.is_session_active(&child).await,
+            "the late child is not live"
+        );
+        assert!(!manager.agent_runtime.owns(&child).await);
+    }
+
+    /// B36-RACE, criterion 2 — the agent engine's RESUME (the path the warm pool takes): a
+    /// closed child of a cancelled parent is refused when it is resumed, not made live.
+    #[tokio::test]
+    async fn resuming_a_child_of_a_cancelled_parent_is_refused() {
+        let (manager, graph, _fake) = agent_manager();
+        let parent = live_parent(&manager, &graph).await;
+        let child = manager
+            .create_session(&delegation_of(parent.id))
+            .await
+            .expect("the parent is live: the child opens")
+            .session_id;
+        manager.close_session(&child).await.unwrap();
+        manager
+            .close_session_with_cascade(&parent.id.to_string(), true)
+            .await
+            .unwrap();
+
+        let err = manager
+            .resume_session(&child, "again", None)
+            .await
+            .expect_err("refused");
+        assert!(
+            super::super::cancelled_parents::ParentCancelled::in_chain(&err).is_some(),
+            "{err:#}"
+        );
+        assert!(!manager.is_session_active(&child).await);
+    }
+
+    /// B36-RACE, criterion 5 — no regression: a session without a parent, a child whose
+    /// parent is live, and a child whose parent was closed WITHOUT cascade all open; and a
+    /// child created BEFORE the cascade (live when it ran) is closed by it, as before.
+    #[tokio::test]
+    async fn sessions_whose_parent_was_not_cancelled_open_as_before() {
+        let (manager, graph, _fake) = agent_manager();
+        let lone = manager
+            .create_session(&agent_request("alone"))
+            .await
+            .expect("no parent: opens")
+            .session_id;
+        assert!(manager.is_session_active(&lone).await);
+
+        let parent = live_parent(&manager, &graph).await;
+        let child = manager
+            .create_session(&delegation_of(parent.id))
+            .await
+            .expect("a live parent: opens")
+            .session_id;
+        assert!(manager.is_session_active(&child).await);
+
+        // A plain close leaves no tombstone: a delegation of that parent still opens.
+        let other = live_parent(&manager, &graph).await;
+        manager.close_session(&other.id.to_string()).await.unwrap();
+        let orphan = manager
+            .create_session(&delegation_of(other.id))
+            .await
+            .expect("no cascade, no refusal")
+            .session_id;
+        assert!(manager.is_session_active(&orphan).await);
+
+        // The child live before the cascade is closed by it.
+        manager
+            .close_session_with_cascade(&parent.id.to_string(), true)
+            .await
+            .unwrap();
+        assert!(!manager.is_session_active(&child).await);
+        assert!(
+            manager.is_session_active(&lone).await,
+            "unrelated sessions stay"
+        );
+    }
+
+    /// B36-RACE, criterion 3 — a cancel with no delegation in flight waits for nothing:
+    /// the cascade returns at once (far below the tombstone's lifetime), leaving only its
+    /// tombstones behind.
+    #[tokio::test]
+    async fn a_cancel_without_a_delegation_in_flight_adds_no_wait() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let parent = crate::test_helpers::test_chat_session(None);
+        let child = delegated_child_of(&parent);
+        for node in [&parent, &child] {
+            manager.graph.create_chat_session(node).await.unwrap();
+            test_support::insert_live_session_without_cli(&manager, &node.id.to_string()).await;
+        }
+        let started = Instant::now();
+        manager
+            .close_session_with_cascade(&parent.id.to_string(), true)
+            .await
+            .unwrap();
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(2),
+            "the cascade waits for no in-flight delegation: {took:?}"
+        );
+        assert!(manager.cancelled_parents.is_marked(&parent.id.to_string()));
+        assert!(manager.cancelled_parents.is_marked(&child.id.to_string()));
+        assert!(!manager.is_session_active(&child.id.to_string()).await);
     }
 
     #[tokio::test]

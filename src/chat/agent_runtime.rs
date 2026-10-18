@@ -2515,6 +2515,45 @@ impl AgentRuntime {
         extra_degraded: Vec<String>,
         grants: super::session_grants::SessionGrants,
     ) -> Arc<AgentSessionHandle> {
+        match self
+            .adopt_admitting(
+                session_id,
+                provider_id,
+                session,
+                first_seq,
+                provider_kind,
+                tool_policy,
+                services,
+                extra_degraded,
+                grants,
+                || Ok::<(), std::convert::Infallible>(()),
+            )
+            .await
+        {
+            Ok(handle) => handle,
+            Err(never) => match never {},
+        }
+    }
+
+    /// [`Self::adopt_declaring`] for a session `admit` may still refuse: it is called INSIDE
+    /// the critical section that inserts the session in the live map (B36-RACE: a delegated
+    /// child whose parent a cascade closed, `super::cancelled_parents`). Refused, the session
+    /// is never inserted, its out-of-turn pump never started and its provider session
+    /// closed; the refusal is returned.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn adopt_admitting<E>(
+        &self,
+        session_id: &str,
+        provider_id: &str,
+        session: Arc<dyn AgentSession>,
+        first_seq: i64,
+        provider_kind: &str,
+        tool_policy: serde_json::Value,
+        services: Option<Arc<dyn TurnServices>>,
+        extra_degraded: Vec<String>,
+        grants: super::session_grants::SessionGrants,
+        admit: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Arc<AgentSessionHandle>, E> {
         let mut degraded = degraded_features(session.capabilities());
         for feature in extra_degraded {
             if !degraded.contains(&feature) {
@@ -2567,15 +2606,23 @@ impl AgentRuntime {
             last_activity: std::sync::Mutex::new(Instant::now()),
             registry: Arc::downgrade(&self.sessions),
         });
+        let replaced = {
+            let mut sessions = self.sessions.write().await;
+            if let Err(refused) = admit() {
+                drop(sessions);
+                handle.closed.cancel();
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), session.close()).await;
+                });
+                return Err(refused);
+            }
+            sessions.insert(session_id.to_string(), Arc::clone(&handle))
+        };
+        // Started once the session is live (a refused one never runs it).
         if let Some(oob) = session.out_of_band() {
             let pump = Arc::clone(&handle);
             tokio::spawn(async move { super::oob_listener::pump_out_of_band(pump, oob).await });
         }
-        let replaced = self
-            .sessions
-            .write()
-            .await
-            .insert(session_id.to_string(), Arc::clone(&handle));
         // Two resumes raced for one session: the handle replaced is ended, or its
         // listeners keep answering the session's NATS subjects next to the new ones
         // (a message from another instance played twice) and its provider session
@@ -2590,7 +2637,7 @@ impl AgentRuntime {
                 let _ = tokio::time::timeout(Duration::from_secs(5), old.session.close()).await;
             });
         }
-        handle
+        Ok(handle)
     }
 
     /// Closes a session: tells the provider, announces `session_closed` (A45),

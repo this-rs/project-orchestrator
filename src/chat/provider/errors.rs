@@ -445,6 +445,12 @@ pub fn classify_open_error(err: &anyhow::Error, provider_id: Option<&str>) -> Op
         if cause.is::<crate::chat::mirror::MirrorReadOnly>() {
             return Some(crate::chat::mirror::MirrorReadOnly::failure());
         }
+        // B36-RACE: a delegation refused because its parent was cancelled meanwhile.
+        if let Some(refused) =
+            cause.downcast_ref::<crate::chat::cancelled_parents::ParentCancelled>()
+        {
+            return Some(refused.failure());
+        }
         if let Some(locked) = cause.downcast_ref::<AutoVaultLocked>() {
             let mut failure = open_failure(&ProviderError::CredentialsLocked, None);
             failure.fallbacks = Some(locked.fallbacks.clone());
