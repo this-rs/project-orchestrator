@@ -11,7 +11,10 @@
 //! * `DELETE /api/projects/{slug}/network-tools/origins?origin=<origin>` — revoke it.
 //! * `PUT    /api/projects/{slug}/network-tools/browser` `{allowed}` — allow or deny the browser
 //!   (`browser`, scope `project:<slug>`). Attaching the browser itself is N23: the authorisation
-//!   is stored and read, the browser is attached only once its executable is configured.
+//!   is stored and read, the browser is attached only once THIS installation provides one. Which
+//!   it does is the view's `available` (N23c): the two are different floors — the operator's
+//!   configuration (`NEXUS_TOOLS_PATH`, `OBSCURA_BROWSER`, `chat.obscura_browser`) says whether a
+//!   browser exists here, this authorisation says whether the project consents to it.
 //! * `GET    /api/chat/search-engines[?project=<slug>]` — the search engines (tool providers).
 //! * `POST   /api/chat/search-engines` `{id, engine, base_url?, credential_ref}` — declare one
 //!   (`brave` with a vault key, `searxng` with its `base_url`, or `obscura`: keyless, no
@@ -244,30 +247,52 @@ pub struct NetworkToolsView {
     search_engines: Vec<SearchEngineView>,
 }
 
-/// The project's browser authorisation.
+/// The project's browser authorisation, and whether THIS installation provides a browser at all.
+///
+/// `allowed` and `available` are the two floors the page used to confuse (N23c): `allowed` is
+/// this project's consent, written here; `available` is the server's own build and configuration,
+/// which no request can change. A project may consent either way — with `available: false` the
+/// consent is recorded and takes effect the day the installation provides a browser.
 #[derive(Debug, Serialize)]
 pub struct BrowserView {
     allowed: bool,
+    /// Whether a native session opened here would get a browser, by the resolution of the
+    /// attachment itself ([`ChatManager::provides_browser`]): a separate `obscura` executable, or
+    /// a `nexus-tools` that embeds it. `false` without a chat manager (nothing attaches anything).
+    ///
+    /// [`ChatManager::provides_browser`]: crate::chat::manager::ChatManager::provides_browser
+    available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     authorized_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     authorized_at: Option<String>,
 }
 
-impl From<Option<BrowserAuthorization>> for BrowserView {
-    fn from(value: Option<BrowserAuthorization>) -> Self {
-        match value {
+impl BrowserView {
+    fn of(authorization: Option<BrowserAuthorization>, available: bool) -> Self {
+        match authorization {
             Some(a) => Self {
                 allowed: true,
+                available,
                 authorized_by: Some(a.authorized_by),
                 authorized_at: Some(a.authorized_at),
             },
             None => Self {
                 allowed: false,
+                available,
                 authorized_by: None,
                 authorized_at: None,
             },
         }
+    }
+}
+
+/// Whether this installation provides a browser: asked of the chat manager, which resolves it
+/// exactly as it does when it opens a session. No chat manager, no session, no browser.
+async fn browser_available(state: &OrchestratorState) -> bool {
+    match state.chat_manager.as_ref() {
+        Some(manager) => manager.provides_browser().await,
+        None => false,
     }
 }
 
@@ -278,7 +303,10 @@ pub async fn get_network_tools(
 ) -> Result<Json<NetworkToolsView>, AppError> {
     require_project(&state, &slug).await?;
     let origins = consented_origins(&state, &slug).await?;
-    let browser = browser_of(&state, &slug).await?.into();
+    let browser = BrowserView::of(
+        browser_of(&state, &slug).await?,
+        browser_available(&state).await,
+    );
     let search_engines = engines(&state)
         .await?
         .into_iter()
@@ -407,13 +435,16 @@ pub async fn put_browser(
             .put_llm_setting(&scope, BROWSER_KEY, &document)
             .await
             .map_err(AppError::Internal)?;
-        Ok(Json(Some(authorization).into()))
+        Ok(Json(BrowserView::of(
+            Some(authorization),
+            browser_available(&state).await,
+        )))
     } else {
         graph
             .delete_llm_setting(&scope, BROWSER_KEY)
             .await
             .map_err(AppError::Internal)?;
-        Ok(Json(None.into()))
+        Ok(Json(BrowserView::of(None, browser_available(&state).await)))
     }
 }
 

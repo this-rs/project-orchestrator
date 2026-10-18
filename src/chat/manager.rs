@@ -16182,6 +16182,57 @@ impl ChatManager {
         }
     }
 
+    /// The browser a native session of THIS installation is attached to, when its project allows
+    /// it: the separate executable the operator configured (`OBSCURA_BROWSER` /
+    /// `chat.obscura_browser`), else the copy embedded in `nexus-tools` (built with the `obscura`
+    /// feature). Found is still not authorised: [`super::provider::nexus_tools::attach`] gives it
+    /// only to a project that allowed it.
+    ///
+    /// This is the ONE resolution: the opening of a session calls it, and
+    /// [`Self::provides_browser`] — what the Network tools panel reports (N23c) — calls it too.
+    /// There is no second reading of the configuration.
+    pub(crate) fn browser_of_installation(
+        &self,
+        program: &std::path::Path,
+        embedded_obscura: bool,
+    ) -> Option<nexus_claude::providers::native::BrowserTools> {
+        use super::provider::native_factory::runnable_nexus_tools;
+        self.config
+            .nexus_browser_path
+            .as_deref()
+            .and_then(runnable_nexus_tools)
+            .map(nexus_claude::providers::native::BrowserTools::new)
+            .or_else(|| {
+                embedded_obscura.then(|| {
+                    nexus_claude::providers::native::BrowserTools::embedded_in_nexus_tools(
+                        program.to_path_buf(),
+                    )
+                })
+            })
+    }
+
+    /// Whether THIS installation PROVIDES the browser at all (N23c): its `nexus-tools` runs and
+    /// [`Self::browser_of_installation`] — the resolution of the attachment itself — finds a
+    /// browser. A project may authorise the browser either way (the two are different floors: the
+    /// operator's configuration and the project's consent); when the installation provides none,
+    /// the authorisation takes effect only once it does. The real case is a build without the
+    /// `obscura` feature (the macOS Intel legacy archive, 10.15–13.3).
+    pub async fn provides_browser(&self) -> bool {
+        match self
+            .config
+            .nexus_tools_path
+            .as_deref()
+            .and_then(super::provider::native_factory::runnable_nexus_tools)
+        {
+            Some(program) => {
+                let embedded_obscura = super::provider::nexus_tools::embeds_obscura(&program).await;
+                self.browser_of_installation(&program, embedded_obscura)
+                    .is_some()
+            }
+            None => false,
+        }
+    }
+
     /// The `SessionSpec` of a session of the agent path: working directory,
     /// model, system prompt, the neutral tool policy of the permission mode,
     /// the project-orchestrator MCP server (same environment as the Claude
@@ -16359,19 +16410,8 @@ impl ChatManager {
                     // The browser is held to the same rule: an absolute, executable path. Without
                     // one, the copy embedded in nexus-tools (`nexus-tools obscura mcp`). Found is
                     // still not authorised: `attach` gives it only to a project that allowed it.
-                    let browser = self
-                        .config
-                        .nexus_browser_path
-                        .as_deref()
-                        .and_then(runnable_nexus_tools)
-                        .map(nexus_claude::providers::native::BrowserTools::new)
-                        .or_else(|| {
-                            embedded_obscura.then(|| {
-                                nexus_claude::providers::native::BrowserTools::embedded_in_nexus_tools(
-                                    program.clone(),
-                                )
-                            })
-                        });
+                    // The SAME call answers the Network tools panel (`provides_browser`, N23c).
+                    let browser = self.browser_of_installation(&program, embedded_obscura);
                     let attachment = nt::attach(
                         &nt::NexusToolsConfig {
                             program,

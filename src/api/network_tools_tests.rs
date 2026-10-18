@@ -309,7 +309,9 @@ async fn network_browser_authorisation_is_stored_read_by_the_gate_and_withdrawn(
     assert_eq!(summary["browser"]["allowed"], true);
     let (status, body) = call(&app, human("PUT", BROWSER, Some(json!({"allowed": false})))).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!({"allowed": false}));
+    // A deny names nobody; `available` is this installation's own answer (N23c), and this state
+    // has no chat manager, so nothing provides a browser here.
+    assert_eq!(body, json!({"allowed": false, "available": false}));
     assert!(!consents.browser_authorized(PROJECT).await.unwrap());
     // Denying twice is still a deny, not an error.
     let (status, _) = call(&app, human("PUT", BROWSER, Some(json!({"allowed": false})))).await;
@@ -843,4 +845,81 @@ async fn the_engine_list_shows_the_built_in_obscura_only_when_nexus_tools_embeds
             .any(|e| e["id"] == "obscura-builtin"),
         "{listed}"
     );
+}
+
+/// N23c — the browser view says whether THIS installation provides a browser, by the resolution
+/// of the attachment itself ([`crate::chat::manager::ChatManager::browser_of_installation`]): a
+/// separate executable the operator configured, OR a `nexus-tools` that embeds Obscura. The panel
+/// reads nothing else, so the page can stop guessing. The project's consent (`allowed`) is the
+/// OTHER floor: it is recorded either way, and a server that provides nothing says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_browser_view_says_whether_this_installation_provides_the_browser() {
+    use std::os::unix::fs::PermissionsExt;
+    // A router whose chat manager has this `nexus-tools` script, and this configured browser.
+    let with = |script: &'static str, separate_browser: bool| async move {
+        let graph = Arc::new(MockGraphStore::new());
+        graph
+            .create_project(&test_project_named(PROJECT))
+            .await
+            .unwrap();
+        let bin = tempfile::TempDir::new().unwrap();
+        let program = bin.path().join("nexus-tools");
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = crate::chat::config::ChatConfig::from_env();
+        config.nexus_tools_path = Some(program);
+        config.nexus_browser_path = separate_browser.then(|| {
+            let obscura = bin.path().join("obscura");
+            std::fs::write(&obscura, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&obscura, std::fs::Permissions::from_mode(0o755)).unwrap();
+            obscura
+        });
+        let state = mock_app_state_with_graph(graph.clone());
+        let manager = Arc::new(crate::chat::manager::ChatManager::new_without_memory(
+            state.neo4j,
+            state.meili,
+            config,
+        ));
+        (
+            create_router(state_on_with(graph, Some(manager)).await),
+            bin,
+        )
+    };
+    const EMBEDS: &str =
+        "#!/bin/sh\n[ \"$1\" = --capabilities ] && echo '{\"version\":\"0.5.1\",\"tls\":true,\"obscura\":true}'\n";
+    const PLAIN: &str = "#!/bin/sh\necho '{\"version\":\"0.5.1\",\"tls\":true}'\n";
+
+    // A release nexus-tools: it embeds Obscura, so this installation provides the browser.
+    let (router, _bin) = with(EMBEDS, false).await;
+    let (status, summary) = call(&router, human("GET", SUMMARY, None)).await;
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    assert_eq!(summary["browser"]["available"], true, "{summary}");
+    assert_eq!(summary["browser"]["allowed"], false, "{summary}");
+
+    // The real case: a build WITHOUT the obscura feature (macOS Intel legacy, or a source build),
+    // and no separate executable. The consent is still recorded, and still says `available: false`
+    // — it will take effect the day this installation provides a browser.
+    let (router, _bin) = with(PLAIN, false).await;
+    let (_, summary) = call(&router, human("GET", SUMMARY, None)).await;
+    assert_eq!(summary["browser"]["available"], false, "{summary}");
+    let (status, allowed) = call(
+        &router,
+        human("PUT", BROWSER, Some(json!({"allowed": true}))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{allowed}");
+    assert_eq!(allowed["allowed"], true, "{allowed}");
+    assert_eq!(allowed["available"], false, "{allowed}");
+
+    // The OTHER half of the one resolution: no feature, but a separate `obscura` executable the
+    // operator configured. The attachment would take it, so the panel says `available`.
+    let (router, _bin) = with(PLAIN, true).await;
+    let (_, summary) = call(&router, human("GET", SUMMARY, None)).await;
+    assert_eq!(summary["browser"]["available"], true, "{summary}");
+
+    // No chat manager at all: nothing opens a session here, so nothing provides a browser.
+    let (bare, _graph) = app().await;
+    let (_, summary) = call(&bare, human("GET", SUMMARY, None)).await;
+    assert_eq!(summary["browser"]["available"], false, "{summary}");
 }
