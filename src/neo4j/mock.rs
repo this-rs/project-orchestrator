@@ -7978,7 +7978,11 @@ impl GraphStore for MockGraphStore {
             let spawn = spawned_by_of(s);
             SessionTreeNode {
                 session_id: s.id.to_string(),
-                parent_session_id: if depth == 0 { None } else { spawn.parent.clone() },
+                parent_session_id: if depth == 0 {
+                    None
+                } else {
+                    spawn.parent.clone()
+                },
                 spawn_type: if depth == 0 { None } else { spawn.kind.clone() },
                 run_id: if depth == 0 { None } else { spawn.run_id },
                 task_id: if depth == 0 { None } else { spawn.task_id },
@@ -18202,7 +18206,10 @@ mod session_tree_tests {
     use super::*;
     use chrono::{DateTime, Utc};
 
-    fn session(spawned_by: Option<serde_json::Value>, created_at: DateTime<Utc>) -> ChatSessionNode {
+    fn session(
+        spawned_by: Option<serde_json::Value>,
+        created_at: DateTime<Utc>,
+    ) -> ChatSessionNode {
         let mut node = crate::test_helpers::test_chat_session(None);
         node.id = Uuid::new_v4();
         node.created_at = created_at;
@@ -18210,7 +18217,11 @@ mod session_tree_tests {
         node
     }
 
-    fn child_of(parent: &ChatSessionNode, kind: &str, created_at: DateTime<Utc>) -> ChatSessionNode {
+    fn child_of(
+        parent: &ChatSessionNode,
+        kind: &str,
+        created_at: DateTime<Utc>,
+    ) -> ChatSessionNode {
         session(
             Some(serde_json::json!({"type": kind, "parent_session_id": parent.id.to_string()})),
             created_at,
@@ -18231,7 +18242,11 @@ mod session_tree_tests {
         let root = session(None, t0);
         let late_child = child_of(&root, "conversation", t0 + chrono::Duration::seconds(2));
         let early_child = child_of(&root, "delegation", t0 + chrono::Duration::seconds(1));
-        let grandchild = child_of(&early_child, "conversation", t0 + chrono::Duration::seconds(3));
+        let grandchild = child_of(
+            &early_child,
+            "conversation",
+            t0 + chrono::Duration::seconds(3),
+        );
         let stranger = session(None, t0);
         let mock = store(&[&root, &late_child, &early_child, &grandchild, &stranger]).await;
 
@@ -18247,11 +18262,20 @@ mod session_tree_tests {
             ],
             "depth first, then created_at; the stranger is not in the tree"
         );
-        assert_eq!(tree.iter().map(|n| n.depth).collect::<Vec<_>>(), vec![0, 1, 1, 2]);
+        assert_eq!(
+            tree.iter().map(|n| n.depth).collect::<Vec<_>>(),
+            vec![0, 1, 1, 2]
+        );
         assert_eq!(tree[0].parent_session_id, None, "the root names no parent");
-        assert_eq!(tree[1].parent_session_id.as_deref(), Some(root.id.to_string().as_str()));
+        assert_eq!(
+            tree[1].parent_session_id.as_deref(),
+            Some(root.id.to_string().as_str())
+        );
         assert_eq!(tree[1].spawn_type.as_deref(), Some("delegation"));
-        assert_eq!(tree[3].parent_session_id.as_deref(), Some(early_child.id.to_string().as_str()));
+        assert_eq!(
+            tree[3].parent_session_id.as_deref(),
+            Some(early_child.id.to_string().as_str())
+        );
         assert_eq!(tree[3].spawn_type.as_deref(), Some("conversation"));
     }
 
@@ -18264,12 +18288,20 @@ mod session_tree_tests {
         let mock = store(&[&root, &child, &grandchild]).await;
 
         let tree = mock.get_session_tree(&child.id.to_string()).await.unwrap();
-        assert_eq!(tree.len(), 2, "the child and its own descendant, not its parent");
+        assert_eq!(
+            tree.len(),
+            2,
+            "the child and its own descendant, not its parent"
+        );
         assert_eq!(tree[0].session_id, child.id.to_string());
         assert_eq!(tree[0].depth, 0);
         assert_eq!(tree[1].session_id, grandchild.id.to_string());
 
-        assert!(mock.get_session_tree(&Uuid::new_v4().to_string()).await.unwrap().is_empty());
+        assert!(mock
+            .get_session_tree(&Uuid::new_v4().to_string())
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -18281,32 +18313,72 @@ mod session_tree_tests {
         let mock = store(&[&root, &child, &grandchild]).await;
 
         let root_id = root.id.to_string();
-        assert_eq!(mock.get_session_root(&grandchild.id.to_string()).await.unwrap().as_deref(), Some(root_id.as_str()));
-        assert_eq!(mock.get_session_root(&child.id.to_string()).await.unwrap().as_deref(), Some(root_id.as_str()));
-        assert_eq!(mock.get_session_root(&root_id).await.unwrap().as_deref(), Some(root_id.as_str()), "a root is its own root");
-        assert_eq!(mock.get_session_root(&Uuid::new_v4().to_string()).await.unwrap(), None, "unknown session");
+        assert_eq!(
+            mock.get_session_root(&grandchild.id.to_string())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(root_id.as_str())
+        );
+        assert_eq!(
+            mock.get_session_root(&child.id.to_string())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(root_id.as_str())
+        );
+        assert_eq!(
+            mock.get_session_root(&root_id).await.unwrap().as_deref(),
+            Some(root_id.as_str()),
+            "a root is its own root"
+        );
+        assert_eq!(
+            mock.get_session_root(&Uuid::new_v4().to_string())
+                .await
+                .unwrap(),
+            None,
+            "unknown session"
+        );
     }
 
     #[tokio::test]
     async fn a_parent_the_store_no_longer_holds_ends_the_walk_and_a_cycle_does_not_hang() {
         let t0 = Utc::now();
         let orphan = session(
-            Some(serde_json::json!({"type": "delegation", "parent_session_id": Uuid::new_v4().to_string()})),
+            Some(
+                serde_json::json!({"type": "delegation", "parent_session_id": Uuid::new_v4().to_string()}),
+            ),
             t0,
         );
         let mut a = session(None, t0);
         let mut b = session(None, t0);
-        a.spawned_by = Some(serde_json::json!({"type": "conversation", "parent_session_id": b.id.to_string()}).to_string());
-        b.spawned_by = Some(serde_json::json!({"type": "conversation", "parent_session_id": a.id.to_string()}).to_string());
+        a.spawned_by = Some(
+            serde_json::json!({"type": "conversation", "parent_session_id": b.id.to_string()})
+                .to_string(),
+        );
+        b.spawned_by = Some(
+            serde_json::json!({"type": "conversation", "parent_session_id": a.id.to_string()})
+                .to_string(),
+        );
         let mock = store(&[&orphan, &a, &b]).await;
 
         assert_eq!(
-            mock.get_session_root(&orphan.id.to_string()).await.unwrap().as_deref(),
+            mock.get_session_root(&orphan.id.to_string())
+                .await
+                .unwrap()
+                .as_deref(),
             Some(orphan.id.to_string().as_str()),
             "the last known session of the walk"
         );
         let cyclic_root = mock.get_session_root(&a.id.to_string()).await.unwrap();
         assert!(cyclic_root.is_some(), "a cycle ends, it does not hang");
-        assert_eq!(mock.get_session_tree(&a.id.to_string()).await.unwrap().len(), 2, "a and b once each");
+        assert_eq!(
+            mock.get_session_tree(&a.id.to_string())
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "a and b once each"
+        );
     }
 }
