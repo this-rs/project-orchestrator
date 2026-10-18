@@ -62,9 +62,12 @@ class ProjectOrchestrator < Formula
         brew services start project-orchestrator
         # or: orchestrator serve
 
-      To configure Claude Code integration:
+      Chat providers: Claude Code is optional. An OpenAI-compatible
+      endpoint, Codex or an ACP agent is added in Settings > Providers.
+
+      Optional, only if you use Claude Code:
         orchestrator setup-claude
-        (auto-configures the MCP server in Claude Code)
+        (registers the MCP server in Claude Code; does nothing without it)
 
       The MCP server binary is at: #{opt_bin}/mcp_server
       The CLI tool is at: #{opt_bin}/orch

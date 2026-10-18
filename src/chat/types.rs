@@ -622,6 +622,24 @@ pub struct BackgroundTaskInfo {
     pub signalled: bool,
 }
 
+/// What a permission request about a DESTINATION is about (N23b, CONSENT-WIRE): the answer
+/// is then about an origin, not a tool call.
+///
+/// - `once`: this call only;
+/// - `session`: every page of `subject` for the rest of the session (the harness remembers
+///   `tool\u{0}subject`);
+/// - `always`: the project's network consent for every entry of `destinations` — the same
+///   store Settings → Network tools writes, listed and revocable there.
+///
+/// `subject` is the endpoint really connected to (`https://` once nexus-tools upgraded it);
+/// `destinations` holds every form the gate judges (`http://` and its `https://` twin), which
+/// is what `always` writes. A client renders these; it never derives them from the input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsentSubject {
+    pub subject: String,
+    pub destinations: Vec<String>,
+}
+
 /// Events emitted by the chat system (sent via WebSocket / broadcast)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -769,6 +787,12 @@ pub enum ChatEvent {
         /// so a client does not offer it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         always: Option<bool>,
+        /// Present when the question is about a DESTINATION, not a tool (N23b): the page a
+        /// fetch loads or a browser opens. Asserted by PO from the CALL, by the same function
+        /// the answer path records with (`nexus_tools::consent_subject` / `destinations_of`),
+        /// never from what the model says. Absent on every ordinary tool permission.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consent: Option<ConsentSubject>,
     },
     /// Claude Code called the AskUserQuestion tool — display the interactive
     /// question widget instead of a permission approval dialog.
@@ -2455,6 +2479,7 @@ mod tests {
                 canonical: None,
                 tool_use_id: None,
                 always: None,
+                consent: None,
             }
             .event_type(),
             "permission_request"
@@ -2554,6 +2579,7 @@ mod tests {
                 canonical: None,
                 tool_use_id: None,
                 always: None,
+                consent: None,
             },
             ChatEvent::Result {
                 session_id: "cli-123".into(),
@@ -3033,6 +3059,7 @@ mod tests {
                 canonical: None,
                 tool_use_id: None,
                 always: None,
+                consent: None,
             },
             ChatEvent::ToolUseInputResolved {
                 id: "tu1".into(),

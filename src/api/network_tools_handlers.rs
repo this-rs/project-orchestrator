@@ -11,7 +11,10 @@
 //! * `DELETE /api/projects/{slug}/network-tools/origins?origin=<origin>` — revoke it.
 //! * `PUT    /api/projects/{slug}/network-tools/browser` `{allowed}` — allow or deny the browser
 //!   (`browser`, scope `project:<slug>`). Attaching the browser itself is N23: the authorisation
-//!   is stored and read, the browser is attached only once its executable is configured.
+//!   is stored and read, the browser is attached only once THIS installation provides one. Which
+//!   it does is the view's `available` (N23c): the two are different floors — the operator's
+//!   configuration (`NEXUS_TOOLS_PATH`, `OBSCURA_BROWSER`, `chat.obscura_browser`) says whether a
+//!   browser exists here, this authorisation says whether the project consents to it.
 //! * `GET    /api/chat/search-engines[?project=<slug>]` — the search engines (tool providers).
 //! * `POST   /api/chat/search-engines` `{id, engine, base_url?, credential_ref}` — declare one
 //!   (`brave` with a vault key, `searxng` with its `base_url`, or `obscura`: keyless, no
@@ -20,6 +23,10 @@
 //!   a value is refused. The key is then granted with `POST /api/vault/grants` and the scope
 //!   `{"kind":"provider","value":"tool:<id>"}` (the grant `Provider("tool:<id>")` of A26).
 //! * `DELETE /api/chat/search-engines/{id}` — remove it, and revoke its provider grants.
+//! * `PUT    /api/chat/search-engines` `{order: [id, …]}` — the order the engines are listed and
+//!   queried in (`search_engine_order`, scope `global`): a native session's `nexus-tools` gets its
+//!   `--search-engine` flags in this order and tries them first to last. An engine the list does
+//!   not name comes after, by id; without the document (every installation before it), by id.
 //!
 //! Every mutation is reserved to a human session: `auth::middleware` refuses an `agent_session`
 //! token on these paths and each handler checks again. A refused body answers 400 with a typed
@@ -42,9 +49,10 @@ use crate::auth::jwt::Claims;
 use crate::chat::provider::endpoint_guard::origin_of;
 use crate::chat::provider::errors::OpenFailure;
 use crate::chat::provider::nexus_tools::{
-    builtin_obscura_engine, record_origin_consent, BrowserAuthorization, SearchProviderRecord,
-    ToolOriginConsent, BROWSER_KEY, BUILTIN_OBSCURA_ID, SEARCH_PROVIDER_PREFIX, TOOL_ORIGIN_PREFIX,
-    TOOL_PROVIDER_PREFIX,
+    builtin_obscura_engine, order_search_providers, read_search_engine_order,
+    record_origin_consent, BrowserAuthorization, SearchEngineOrder, SearchProviderRecord,
+    ToolOriginConsent, BROWSER_KEY, BUILTIN_OBSCURA_ID, SEARCH_ENGINE_ORDER_KEY,
+    SEARCH_PROVIDER_PREFIX, TOOL_ORIGIN_PREFIX, TOOL_PROVIDER_PREFIX,
 };
 use crate::chat::provider::settings::{project_scope, valid_id, GLOBAL};
 use crate::vault::{GrantScope, SecretSelector};
@@ -185,6 +193,12 @@ async fn engines(state: &OrchestratorState) -> Result<Vec<SearchProviderRecord>,
             }
         }
     }
+    // The order a person chose (`PUT /api/chat/search-engines`), the one `nexus-tools` is given:
+    // without one, the order above (by id, the built-in engine last).
+    order_search_providers(
+        &mut engines,
+        &read_search_engine_order(state.orchestrator.neo4j()).await,
+    );
     Ok(engines)
 }
 
@@ -244,30 +258,52 @@ pub struct NetworkToolsView {
     search_engines: Vec<SearchEngineView>,
 }
 
-/// The project's browser authorisation.
+/// The project's browser authorisation, and whether THIS installation provides a browser at all.
+///
+/// `allowed` and `available` are the two floors the page used to confuse (N23c): `allowed` is
+/// this project's consent, written here; `available` is the server's own build and configuration,
+/// which no request can change. A project may consent either way — with `available: false` the
+/// consent is recorded and takes effect the day the installation provides a browser.
 #[derive(Debug, Serialize)]
 pub struct BrowserView {
     allowed: bool,
+    /// Whether a native session opened here would get a browser, by the resolution of the
+    /// attachment itself ([`ChatManager::provides_browser`]): a separate `obscura` executable, or
+    /// a `nexus-tools` that embeds it. `false` without a chat manager (nothing attaches anything).
+    ///
+    /// [`ChatManager::provides_browser`]: crate::chat::manager::ChatManager::provides_browser
+    available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     authorized_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     authorized_at: Option<String>,
 }
 
-impl From<Option<BrowserAuthorization>> for BrowserView {
-    fn from(value: Option<BrowserAuthorization>) -> Self {
-        match value {
+impl BrowserView {
+    fn of(authorization: Option<BrowserAuthorization>, available: bool) -> Self {
+        match authorization {
             Some(a) => Self {
                 allowed: true,
+                available,
                 authorized_by: Some(a.authorized_by),
                 authorized_at: Some(a.authorized_at),
             },
             None => Self {
                 allowed: false,
+                available,
                 authorized_by: None,
                 authorized_at: None,
             },
         }
+    }
+}
+
+/// Whether this installation provides a browser: asked of the chat manager, which resolves it
+/// exactly as it does when it opens a session. No chat manager, no session, no browser.
+async fn browser_available(state: &OrchestratorState) -> bool {
+    match state.chat_manager.as_ref() {
+        Some(manager) => manager.provides_browser().await,
+        None => false,
     }
 }
 
@@ -278,7 +314,10 @@ pub async fn get_network_tools(
 ) -> Result<Json<NetworkToolsView>, AppError> {
     require_project(&state, &slug).await?;
     let origins = consented_origins(&state, &slug).await?;
-    let browser = browser_of(&state, &slug).await?.into();
+    let browser = BrowserView::of(
+        browser_of(&state, &slug).await?,
+        browser_available(&state).await,
+    );
     let search_engines = engines(&state)
         .await?
         .into_iter()
@@ -407,13 +446,16 @@ pub async fn put_browser(
             .put_llm_setting(&scope, BROWSER_KEY, &document)
             .await
             .map_err(AppError::Internal)?;
-        Ok(Json(Some(authorization).into()))
+        Ok(Json(BrowserView::of(
+            Some(authorization),
+            browser_available(&state).await,
+        )))
     } else {
         graph
             .delete_llm_setting(&scope, BROWSER_KEY)
             .await
             .map_err(AppError::Internal)?;
-        Ok(Json(None.into()))
+        Ok(Json(BrowserView::of(None, browser_available(&state).await)))
     }
 }
 
@@ -580,6 +622,64 @@ pub async fn create_search_engine(
         .await
         .map_err(AppError::Internal)?;
     Ok((StatusCode::CREATED, Json(engine_view(&state, record, None))))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrderBody {
+    order: Vec<String>,
+}
+
+/// PUT /api/chat/search-engines — `{order: [id, …]}`: the order the engines are queried in
+/// (human only). Each id names an engine listed now, at most once; an engine left out comes after
+/// the named ones, by id. Answers the engines in their new order.
+pub async fn put_search_engine_order(
+    State(state): State<OrchestratorState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<Json<Vec<SearchEngineView>>, AppError> {
+    require_human(&state, &claims)?;
+    let body: OrderBody = serde_json::from_value(body).map_err(|_| {
+        bad(
+            "invalid_search_engine_order",
+            "the body is {\"order\": [\"<engine id>\", …]}",
+        )
+    })?;
+    let known = engines(&state).await?;
+    let mut seen = std::collections::BTreeSet::new();
+    for id in &body.order {
+        if !seen.insert(id.as_str()) {
+            return Err(bad(
+                "invalid_search_engine_order",
+                "an engine appears at most once in the order",
+            ));
+        }
+        if !known.iter().any(|e| e.id == *id) {
+            return Err(bad(
+                "search_engine_not_found",
+                "the order names an engine that is not declared",
+            ));
+        }
+    }
+    let order = SearchEngineOrder {
+        order: body.order,
+        ordered_by: claims.email.clone(),
+        ordered_at: Utc::now().to_rfc3339(),
+    };
+    let document = serde_json::to_string(&order).map_err(|e| AppError::Internal(e.into()))?;
+    state
+        .orchestrator
+        .neo4j()
+        .put_llm_setting(GLOBAL, SEARCH_ENGINE_ORDER_KEY, &document)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(
+        engines(&state)
+            .await?
+            .into_iter()
+            .map(|record| engine_view(&state, record, None))
+            .collect(),
+    ))
 }
 
 /// DELETE /api/chat/search-engines/{id} — remove an engine and revoke the grants made to it

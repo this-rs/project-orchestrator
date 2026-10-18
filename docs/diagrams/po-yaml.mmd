@@ -1,0 +1,48 @@
+%% name: po-yaml
+%% covers: backend:src/yaml.rs backend:src/yaml/**
+%% verified: 8f9c0184
+%% ---
+%% PROUVE : tout YAML lu ou écrit par le backend et l'app de bureau passe par src/yaml.rs
+%%   (tâche SEC-YAML) : config.yaml, réglages du runner, paquets de skills (parfois tiers),
+%%   docker-compose des projets analysés. Analyseur serde-saphyr 1.3 sur granit-parser 1.3,
+%%   tous deux #![forbid(unsafe_code)] ; serde_yaml et unsafe-libyaml (RUSTSEC-2024-0449) retirés.
+%%   Relu contre le code de la branche fix/sec-yaml-serde-saphyr (base origin/main 8f9c0184).
+%% ---
+%% SOURCES LUES :
+%%   src/yaml.rs, src/yaml/tests.rs, tests/fixtures/yaml/{config.prod-shape.yaml,docker-compose.yml}
+%%   appelants : src/lib.rs (try_load_yaml), src/chat/manager.rs (persist_*_to_yaml),
+%%   src/architecture/compose.rs (parse_compose), src/skills/package.rs (test),
+%%   src/runner/models.rs (tests), desktop/src-tauri/src/{setup,net,main,tray,updater}.rs
+%% ---
+%% NON ETABLI :
+%%   un nombre ou un booléen non cité dans un bloc `environment:` en mapping fait encore échouer
+%%   tout le docker-compose (EnvBlock est untagged), comme avec serde_yaml : comportement épinglé,
+%%   pas corrigé ici ;
+%%   les étiquettes (!tag) d'un fichier réécrit par persist_*_to_yaml sont perdues (la valeur reste).
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quel test)  ⚪ autre domaine
+
+flowchart TD
+    subgraph legend["Légende"]
+        direction LR
+        L1["✅ vérifié par test"]
+        L2["⚪ autre domaine"]
+    end
+
+    CALLERS["⚪ appelants : config.yaml (lib.rs, desktop), runner, compose (dépôt quelconque), paquets de skills"]
+    SIZE["✅ check_size : MAX_INPUT_BYTES 4 Mio, refusé avant toute analyse ;<br/>test: an_oversized_document_is_refused_before_parsing"]
+    BUDGET["✅ options() : budget serde-saphyr<br/>profondeur 64, 1 000 alias, 1 000 ancres, 100 000 événements rejoués par alias, 100 000 nœuds, 250 000 événements ;<br/>test: an_alias_bomb_is_refused, deep_nesting_is_refused, too_many_nodes_are_refused, too_many_aliases_or_anchors_are_refused"]
+    NOSNIP["✅ with_snippet = false : une erreur ne cite jamais l'entrée (secrets de config.yaml) ;<br/>test: a_parse_error_does_not_quote_the_input"]
+    TYPED["✅ from_str&lt;T&gt; : le type Rust est le schéma ; booléens YAML 1.2 stricts, clé en double = erreur ;<br/>test: the_production_config_shape_loads_every_section, numbers_read_as_before, booleans_are_yaml_1_2_as_before"]
+    TREE["✅ value_from_str : 1re passe bornée (IgnoredAny), puis arbre Value construit depuis les événements granit ;<br/>scalaires résolus comme serde_yaml (017 reste une chaîne), ordre des clés gardé, << gardé tel quel ;<br/>test: value_scalars_resolve_as_serde_yaml_did, value_documents_keep_their_shape"]
+    WRITE["✅ to_string : chaînes ambiguës citées, pas de pliage > ;<br/>test: strings_that_look_like_other_types_survive_a_rewrite, rewriting_the_production_config_shape_keeps_every_value_and_the_order"]
+    COMPOSE["✅ architecture::compose::parse_compose (via from_str) ;<br/>test: real_world_compose_file_reads_in_full, an_alias_bomb_in_a_compose_file_is_refused"]
+
+    CALLERS --> SIZE
+    SIZE --> BUDGET
+    BUDGET --> NOSNIP
+    NOSNIP --> TYPED
+    NOSNIP --> TREE
+    TREE --> WRITE
+    TYPED --> COMPOSE

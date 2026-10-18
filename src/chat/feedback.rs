@@ -173,11 +173,20 @@ pub fn collect_node_ids(roots: &[crate::reasoning::models::ReasoningNode]) -> Ve
 /// - Reinforce synapses between adjacent nodes (synapse_boost = 0.05)
 ///
 /// This is the Hebbian learning rule: "neurons that fire together wire together."
+///
+/// Only the notes of `project_id` (the session's project) are touched: a
+/// tracked id that is a note of another project, a global note, a decision or
+/// an unknown id is dropped. Without a project, nothing is reinforced (the
+/// tracker is still drained).
 pub async fn reinforce_tracked_paths(
     graph: Arc<dyn GraphStore>,
     tracker: &ReasoningPathTracker,
+    project_id: Option<Uuid>,
 ) -> usize {
     let paths = tracker.take_all().await;
+    let Some(project_id) = project_id else {
+        return 0;
+    };
     if paths.is_empty() {
         return 0;
     }
@@ -186,7 +195,10 @@ pub async fn reinforce_tracked_paths(
     let synapse_boost = 0.05;
     let mut total_reinforced = 0usize;
 
-    for (_tree_id, node_ids) in &paths {
+    for (_tree_id, tracked) in &paths {
+        let node_ids =
+            &crate::notes::coactivation::note_ids_of_project(graph.as_ref(), tracked, project_id)
+                .await;
         // Boost energy for each node
         for node_id in node_ids {
             if let Err(e) = graph.boost_energy(*node_id, energy_boost).await {
@@ -1015,7 +1027,7 @@ mod tests {
         assert_eq!(tracker.len().await, 1);
 
         // Reinforce
-        let reinforced = reinforce_tracked_paths(mock.clone(), &tracker).await;
+        let reinforced = reinforce_tracked_paths(mock.clone(), &tracker, Some(pid)).await;
         // Mock reinforces synapses between 3 notes → creates up to 3 pairs
         assert!(reinforced > 0);
 
@@ -1442,13 +1454,66 @@ mod tests {
             mock.create_note(&n).await.unwrap();
         }
         let graph: Arc<dyn crate::neo4j::traits::GraphStore> = Arc::new(mock);
-        let count = reinforce_tracked_paths(graph, &tracker).await;
+        let count = reinforce_tracked_paths(graph, &tracker, Some(pid)).await;
 
         // MockGraphStore's reinforce_synapses creates actual synapse pairs.
         // 3 nodes → C(3,2)=3 pairs × 2 directions = 6 synapses created/reinforced.
         assert_eq!(count, 6);
         // Tracker should be drained after reinforcement
         assert!(tracker.is_empty().await);
+    }
+
+    /// T0f-bis: a tracked path warms the notes of the session's project only;
+    /// without a project nothing is warmed (the tracker is still drained).
+    #[tokio::test]
+    async fn test_tracked_paths_touch_only_the_session_project() {
+        use crate::notes::models::{Note, NoteType};
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (mine, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut ids = Vec::new();
+        for owner in [Some(mine), Some(mine), Some(other), None] {
+            let mut n = Note::new(owner, NoteType::Guideline, "n".into(), "t".into());
+            n.energy = 0.3;
+            n.last_activated = None;
+            mock.create_note(&n).await.unwrap();
+            ids.push(n.id);
+        }
+        let graph: Arc<dyn crate::neo4j::traits::GraphStore> = mock.clone();
+
+        let tracker = ReasoningPathTracker::new();
+        tracker.record_path(Uuid::new_v4(), ids.clone()).await;
+        assert_eq!(
+            reinforce_tracked_paths(graph.clone(), &tracker, None).await,
+            0
+        );
+        assert!(tracker.is_empty().await);
+        for id in &ids {
+            assert!(mock
+                .get_note(*id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_activated
+                .is_none());
+        }
+
+        tracker.record_path(Uuid::new_v4(), ids.clone()).await;
+        // 2 own notes = 1 pair = 2 directed synapses.
+        assert_eq!(
+            reinforce_tracked_paths(graph, &tracker, Some(mine)).await,
+            2
+        );
+        for id in &ids[..2] {
+            assert!(mock.get_note(*id).await.unwrap().unwrap().energy > 0.3);
+        }
+        for id in &ids[2..] {
+            let n = mock.get_note(*id).await.unwrap().unwrap();
+            assert!(
+                (n.energy - 0.3).abs() < 1e-9,
+                "foreign/global note untouched"
+            );
+            assert!(n.last_activated.is_none());
+        }
     }
 }
 

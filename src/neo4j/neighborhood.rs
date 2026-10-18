@@ -34,8 +34,10 @@ const PROPS_PROJECTION: &str = "{\
 /// Owning project id of node `m`, as the project filter reads it. A node carries
 /// `project_id` itself, is a Project, or hangs under a Plan of a Project (Plan,
 /// Task, Step). Anything else has no known owner (`null`): the filter refuses it.
-/// NOT run against a real database (written from the schema, see the PR).
-const OWNER_CYPHER: &str = "coalesce(m.project_id, \
+/// A global note is stored with `project_id = ''`: no owner either (`null`, as
+/// the in-memory walk says), not an owner named `""` (T3-ter). Run against a
+/// real Neo4j by `tests/harness_neo4j.rs` (`anchor_scope`).
+const OWNER_CYPHER: &str = "coalesce(CASE WHEN m.project_id <> '' THEN m.project_id END, \
     CASE WHEN m:Project THEN m.id END, \
     head([(op:Project)-[:HAS_PLAN]->(m) | op.id]), \
     head([(op:Project)-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(m) | op.id]), \

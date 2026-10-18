@@ -436,7 +436,8 @@ browser), and the search engines. Mutations are human only (403 for an agent tok
 {
   "project": "my-project",
   "origins": [{"origin": "https://docs.rs", "consented_by": "me@example.com", "consented_at": "2026-10-10T09:00:00Z"}],
-  "browser": {"allowed": true, "authorized_by": "me@example.com", "authorized_at": "2026-10-10T09:00:00Z"},
+  "browser": {"allowed": true, "available": true,
+              "authorized_by": "me@example.com", "authorized_at": "2026-10-10T09:00:00Z"},
   "search_engines": [{"id": "brave", "engine": "brave", "base_url": null, "credential_ref": "vault:brave",
                       "origin": "https://api.search.brave.com", "grant_id": "tool:brave",
                       "key_granted": true, "origin_consented": false}]
@@ -457,10 +458,21 @@ session of the project is offered `WebFetch` once any origin is consented; each 
 
 ### PUT /api/projects/{slug}/network-tools/browser -- Protected (human only)
 
-`{"allowed": true|false}` → `{allowed, authorized_by?, authorized_at?}`. 400 `invalid_browser_setting`.
-The browser is attached only when its executable is found too: `obscura` on the `PATH`, or the Obscura
-executable with `chat.obscura_browser: true` / `OBSCURA_BROWSER=1`, or else the browser embedded in
-nexus-tools (release builds, `nexus-tools obscura mcp`).
+`{"allowed": true|false}` → `{allowed, available, authorized_by?, authorized_at?}`. 400 `invalid_browser_setting`.
+
+`allowed` and `available` are two different floors, and the Network tools panel says which is which:
+
+* `allowed` is THIS PROJECT's consent, written by this route.
+* `available` is what THIS INSTALLATION provides, which no request changes: `true` when a native
+  session opened here would get a browser -- the Obscura executable configured by the operator
+  (`chat.obscura_browser` / `OBSCURA_BROWSER`), or else the one embedded in `nexus-tools`
+  (release builds, `nexus-tools obscura mcp`). It is `false` for a build without the `obscura`
+  feature (the macOS Intel legacy archive, 10.15-13.3) and for a server with no `nexus-tools`.
+  It is resolved by the attachment's own code, so the answer cannot drift from what opening a
+  session does.
+
+A project may consent either way: with `available: false` the consent is recorded and takes effect
+the day the installation provides a browser.
 
 ### GET /api/chat/search-engines[?project={slug}] -- Protected
 
@@ -469,6 +481,17 @@ The search engines (tool providers), each with `origin`, `grant_id` (`tool:<id>`
 declared, the list also holds the built-in `{"id": "obscura-builtin", "engine": "obscura", "builtin": true}`
 (not stored, not deletable): a project that consents to `https://html.duckduckgo.com` gets a keyless
 `WebSearch` from it when no other engine is attached.
+
+The list is in the order the engines are queried in: the order chosen with `PUT` below, the engines it
+does not name after, by id (without a chosen order, by id, the built-in engine last).
+
+### PUT /api/chat/search-engines -- Protected (human only)
+
+`{"order": ["home", "brave"]}`: the order a native session's `WebSearch` tries the engines in (stored as
+`search_engine_order`, scope `global`; `nexus-tools` gets its `--search-engine` flags in this order and
+falls back down the list). Each id names an engine listed now, at most once; an engine left out, or declared
+later, comes after the named ones. 200 with the engines in their new order. Codes:
+`invalid_search_engine_order` (another shape, a duplicate), `search_engine_not_found` (an id no engine has).
 
 ### POST /api/chat/search-engines -- Protected (human only)
 

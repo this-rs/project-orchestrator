@@ -396,7 +396,7 @@ fn main() {
                 // Read infra_mode from the YAML config (defaults to "docker")
                 let infra_mode = std::fs::read_to_string(&config_path)
                     .ok()
-                    .and_then(|contents| serde_yaml::from_str::<serde_yaml::Value>(&contents).ok())
+                    .and_then(|contents| project_orchestrator::yaml::value_from_str(&contents).ok())
                     .and_then(|v| v.get("infra_mode").and_then(|m| m.as_str().map(String::from)))
                     .unwrap_or_else(|| "docker".to_string());
 
@@ -528,7 +528,7 @@ fn main() {
             // stop containers that the app didn't start.
             let infra_mode = std::fs::read_to_string(setup::config_path())
                 .ok()
-                .and_then(|c| serde_yaml::from_str::<serde_yaml::Value>(&c).ok())
+                .and_then(|c| project_orchestrator::yaml::value_from_str(&c).ok())
                 .and_then(|v| {
                     v.get("infra_mode")
                         .and_then(|m| m.as_str().map(String::from))
@@ -565,14 +565,14 @@ fn main() {
 fn style_splash_window(handle: &tauri::AppHandle) {
     #[cfg(target_os = "macos")]
     if let Some(splash) = handle.get_webview_window("splashscreen") {
-        let _ = splash.with_webview(|webview| unsafe {
-            use cocoa::appkit::{NSColor, NSView, NSWindow};
-            use cocoa::base::id;
-            use objc::{msg_send, sel, sel_impl};
+        let _ = splash.with_webview(|webview| {
+            use objc2_app_kit::NSColor;
+            use plugins::mac_rounded_corners as mac;
 
-            let ns_window = webview.ns_window() as id;
-            let bg = NSColor::colorWithSRGBRed_green_blue_alpha_(
-                cocoa::base::nil,
+            let Some(ns_window) = mac::ns_window(&webview) else {
+                return;
+            };
+            let bg = NSColor::colorWithSRGBRed_green_blue_alpha(
                 11.0 / 255.0,
                 13.0 / 255.0,
                 19.0 / 255.0,
@@ -580,19 +580,11 @@ fn style_splash_window(handle: &tauri::AppHandle) {
             );
             // The window itself is clear and has no shadow: the rounded content view is the only
             // thing drawn, so there is no frame, outline or square corner around it.
-            ns_window.setOpaque_(cocoa::base::NO);
-            ns_window.setBackgroundColor_(NSColor::clearColor(cocoa::base::nil));
-            ns_window.setHasShadow_(cocoa::base::NO);
-            let wk_webview = webview.inner() as id;
-            let _: () = msg_send![wk_webview, setUnderPageBackgroundColor: bg];
-
-            let content_view = ns_window.contentView();
-            content_view.setWantsLayer(cocoa::base::YES);
-            let layer: id = msg_send![content_view, layer];
-            if !layer.is_null() {
-                let _: () = msg_send![layer, setCornerRadius: 18.0_f64];
-                let _: () = msg_send![layer, setMasksToBounds: cocoa::base::YES];
-            }
+            ns_window.setOpaque(false);
+            ns_window.setBackgroundColor(Some(&NSColor::clearColor()));
+            ns_window.setHasShadow(false);
+            mac::set_under_page_background(&webview, &bg);
+            mac::round_content_view(&ns_window, Some(18.0));
         });
     }
     #[cfg(not(target_os = "macos"))]
@@ -651,70 +643,53 @@ fn show_main_window(handle: &tauri::AppHandle) {
         #[cfg(target_os = "macos")]
         {
             let _ = main_window.with_webview(|webview| {
-                unsafe {
-                    use cocoa::appkit::{
-                        NSColor, NSView, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
-                    };
-                    use cocoa::base::id;
-                    use cocoa::foundation::NSString;
-                    use objc::{class, msg_send, sel, sel_impl};
+                use objc2_app_kit::{
+                    NSAppearance, NSAppearanceCustomization, NSAppearanceNameDarkAqua, NSColor,
+                    NSWindowTitleVisibility,
+                };
+                use plugins::mac_rounded_corners as mac;
 
-                    let ns_window = webview.ns_window() as id;
+                let Some(ns_window) = mac::ns_window(&webview) else {
+                    return;
+                };
 
-                    // 1. Force dark appearance on the window.
-                    //    This makes the webview report prefers-color-scheme: dark,
-                    //    so external pages (Google SSO, etc.) render in dark mode.
-                    //    It also prevents white flashes during page transitions.
-                    let dark_appearance: id = msg_send![
-                        class!(NSAppearance),
-                        appearanceNamed: cocoa::foundation::NSString::alloc(cocoa::base::nil)
-                            .init_str("NSAppearanceNameDarkAqua")
-                    ];
-                    if !dark_appearance.is_null() {
-                        let _: () = msg_send![ns_window, setAppearance: dark_appearance];
-                    }
-
-                    // 2. Set dark background color matching --surface-base (#0f1117)
-                    let bg_color: id = NSColor::colorWithSRGBRed_green_blue_alpha_(
-                        cocoa::base::nil,
-                        15.0 / 255.0, // 0x0f
-                        17.0 / 255.0, // 0x11
-                        23.0 / 255.0, // 0x17
-                        1.0,
-                    );
-                    ns_window.setBackgroundColor_(bg_color);
-
-                    // 2. Apply modern window style with rounded corners
-                    let mut style_mask = ns_window.styleMask();
-                    style_mask |= NSWindowStyleMask::NSFullSizeContentViewWindowMask;
-                    style_mask |= NSWindowStyleMask::NSTitledWindowMask;
-                    style_mask |= NSWindowStyleMask::NSClosableWindowMask;
-                    style_mask |= NSWindowStyleMask::NSMiniaturizableWindowMask;
-                    style_mask |= NSWindowStyleMask::NSResizableWindowMask;
-                    ns_window.setStyleMask_(style_mask);
-
-                    // 3. Transparent titlebar that blends with content
-                    ns_window.setTitlebarAppearsTransparent_(cocoa::base::YES);
-                    ns_window.setTitleVisibility_(NSWindowTitleVisibility::NSWindowTitleHidden);
-                    ns_window.setHasShadow_(cocoa::base::YES);
-
-                    // 4. Set dark underPageBackgroundColor on the WKWebView.
-                    //    This is the color shown behind page content — visible
-                    //    during overscroll, navigation transitions, and before a
-                    //    page paints. Setting it to dark prevents white flashes
-                    //    when navigating to external SSO pages.
-                    let wk_webview = webview.inner() as id;
-                    let _: () = msg_send![wk_webview, setUnderPageBackgroundColor: bg_color];
-
-                    // 5. Set corner radius on the content view layer
-                    let content_view = ns_window.contentView();
-                    content_view.setWantsLayer(cocoa::base::YES);
-                    let layer: id = msg_send![content_view, layer];
-                    if !layer.is_null() {
-                        let _: () = msg_send![layer, setCornerRadius: 10.0_f64];
-                        let _: () = msg_send![layer, setMasksToBounds: cocoa::base::YES];
-                    }
+                // 1. Force dark appearance on the window.
+                //    This makes the webview report prefers-color-scheme: dark,
+                //    so external pages (Google SSO, etc.) render in dark mode.
+                //    It also prevents white flashes during page transitions.
+                // SAFETY: reading an AppKit `extern` constant (an immutable NSString exported by
+                // AppKit since macOS 10.14; the app's minimum is above that).
+                let dark_aqua = unsafe { NSAppearanceNameDarkAqua };
+                if let Some(dark_appearance) = NSAppearance::appearanceNamed(dark_aqua) {
+                    ns_window.setAppearance(Some(&dark_appearance));
                 }
+
+                // 2. Set dark background color matching --surface-base (#0f1117)
+                let bg_color = NSColor::colorWithSRGBRed_green_blue_alpha(
+                    15.0 / 255.0, // 0x0f
+                    17.0 / 255.0, // 0x11
+                    23.0 / 255.0, // 0x17
+                    1.0,
+                );
+                ns_window.setBackgroundColor(Some(&bg_color));
+
+                // 3. Apply modern window style with rounded corners
+                mac::add_modern_style_mask(&ns_window);
+
+                // 4. Transparent titlebar that blends with content
+                ns_window.setTitlebarAppearsTransparent(true);
+                ns_window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+                ns_window.setHasShadow(true);
+
+                // 5. Set dark underPageBackgroundColor on the WKWebView.
+                //    This is the color shown behind page content — visible
+                //    during overscroll, navigation transitions, and before a
+                //    page paints. Setting it to dark prevents white flashes
+                //    when navigating to external SSO pages.
+                mac::set_under_page_background(&webview, &bg_color);
+
+                // 6. Set corner radius on the content view layer
+                mac::round_content_view(&ns_window, Some(10.0));
             });
         }
 

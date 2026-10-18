@@ -64,7 +64,7 @@ static LAST_NOTIFIED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(N
 /// `chat.auto_update_app` from a config.yaml body. Defaults to true when the
 /// file, the section or the key is missing or unreadable.
 pub fn parse_auto_update_app(yaml: &str) -> bool {
-    serde_yaml::from_str::<serde_yaml::Value>(yaml)
+    project_orchestrator::yaml::value_from_str(yaml)
         .ok()
         .and_then(|v| {
             v.get("chat")

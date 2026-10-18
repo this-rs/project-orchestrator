@@ -149,6 +149,10 @@ pub(crate) fn decide_by_policy(
 //
 // (*) `PolicyAuto` is treated like `NotSet`, exactly as `evaluate_note` does.
 //
+// One exception, in `ConsentReader` only: a project a human OPENED to the
+// reader by anchoring it in the conversation (`with_opened_projects`, decision
+// 75e160f4) is read like the reader's own project, except ExplicitDeny.
+//
 // Code nodes (File, Function, Component, Feature...) have no consent of their
 // own: they are read with `consent = NotSet` and no type/score, so they
 // inherit the owner project's policy (in `Auto` mode, no score exists, so they
@@ -319,6 +323,8 @@ pub struct ConsentReader<'a> {
     store: &'a dyn crate::neo4j::GraphStore,
     reader: Option<Uuid>,
     cache: HashMap<Uuid, OwnerPolicyState>,
+    /// Projects a human opened to this reader ([`Self::with_opened_projects`]).
+    opened: std::collections::BTreeSet<Uuid>,
 }
 
 impl<'a> ConsentReader<'a> {
@@ -327,7 +333,34 @@ impl<'a> ConsentReader<'a> {
             store,
             reader,
             cache: HashMap::new(),
+            opened: Default::default(),
         }
+    }
+
+    /// Projects whose content a HUMAN opened to this reader by anchoring them (a
+    /// `project` / `workspace` anchor of the conversation; decision 75e160f4,
+    /// T3-ter): what they own is read as if it were the reader's own project,
+    /// EXCEPT what is marked [`SharingConsent::ExplicitDeny`]. Only the anchor
+    /// resolver sets it; every other reader keeps the decision table above.
+    pub fn with_opened_projects(mut self, opened: std::collections::BTreeSet<Uuid>) -> Self {
+        self.opened = opened;
+        self
+    }
+
+    /// Verdict on an artifact of an opened project (`None`: not opened, or the
+    /// reader's own project, which the table already admits).
+    fn opened_verdict(&self, owner: Uuid, consent: SharingConsent) -> Option<ReadVerdict> {
+        if !self.opened.contains(&owner) || self.reader == Some(owner) {
+            return None;
+        }
+        Some(match consent {
+            SharingConsent::ExplicitDeny => {
+                ReadVerdict::Deny(ReadDenial::Policy(DenialReason::ExplicitDeny))
+            }
+            SharingConsent::ExplicitAllow | SharingConsent::NotSet | SharingConsent::PolicyAuto => {
+                ReadVerdict::Allow
+            }
+        })
     }
 
     async fn owner_state(&mut self, owner: Uuid) -> &OwnerPolicyState {
@@ -353,6 +386,12 @@ impl<'a> ConsentReader<'a> {
         let Some(scope) = ReadScope::between(self.reader, note.project_id) else {
             return ReadVerdict::Allow;
         };
+        if let Some(v) = note
+            .project_id
+            .and_then(|o| self.opened_verdict(o, note.sharing_consent))
+        {
+            return v;
+        }
         match (scope, note.project_id) {
             (ReadScope::SameProject, _) => may_read_note(scope, note, OwnerSharing::NoPolicy),
             (_, Some(owner)) => {
@@ -368,6 +407,9 @@ impl<'a> ConsentReader<'a> {
         let Some(owner) = owner else {
             return may_read_code_node(ReadScope::CrossProject, OwnerSharing::OwnerUnknown);
         };
+        if let Some(v) = self.opened_verdict(owner, SharingConsent::NotSet) {
+            return v;
+        }
         match ReadScope::between(self.reader, Some(owner)) {
             Some(ReadScope::SameProject) => {
                 may_read_code_node(ReadScope::SameProject, OwnerSharing::NoPolicy)
@@ -389,6 +431,9 @@ impl<'a> ConsentReader<'a> {
                 ArtifactFacts::NONE,
             );
         };
+        if let Some(v) = self.opened_verdict(owner, consent) {
+            return v;
+        }
         match ReadScope::between(self.reader, Some(owner)) {
             Some(ReadScope::SameProject) => may_read(
                 ReadScope::SameProject,
@@ -894,6 +939,9 @@ mod tests {
         let allow = owned_note(&store, Some(other), SharingConsent::ExplicitAllow, f).await;
         let deny = owned_note(&store, Some(other), SharingConsent::ExplicitDeny, f).await;
         let notset = owned_note(&store, Some(other), SharingConsent::NotSet, f).await;
+        // Above the coupling floor (MIN_COUPLING), which every cross-project
+        // read applies: this test is about consent, not coupling.
+        store.set_pairwise_coupling(me, other, 1.0).await;
 
         let ids = |v: Vec<crate::notes::PropagatedNote>| {
             let mut s: Vec<Uuid> = v.into_iter().map(|p| p.note.id).collect();

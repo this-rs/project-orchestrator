@@ -975,6 +975,14 @@ pub trait GraphStore: Send + Sync {
     /// Get the project ID for a decision (traverses Decision←Task←Plan←Project).
     async fn get_decision_project_id(&self, decision_id: Uuid) -> Result<Option<String>>;
 
+    /// Project of each decision in one batched lookup (same traversal as
+    /// `get_decision_project_id`). Decisions whose project is not verifiable
+    /// (plan without project, unknown id) are absent from the map.
+    async fn get_decision_project_ids(
+        &self,
+        decision_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Uuid>>;
+
     /// Update a decision
     async fn update_decision(
         &self,
@@ -1902,6 +1910,76 @@ pub trait GraphStore: Send + Sync {
         decay_amount: f64,
         prune_threshold: f64,
     ) -> Result<(usize, usize)>;
+
+    // ------------------------------------------------------------------
+    // Synaptic layer in shadow mode (`crate::neurons::synaptic_shadow`).
+    // Only the `shadow_*` properties of EXISTING `SYNAPSE` edges between two
+    // notes of one project: never `weight`, never an edge created or deleted.
+    // ------------------------------------------------------------------
+
+    /// Outgoing `SYNAPSE` edges of `from` towards notes of `project_id` (both
+    /// ends in the project), with `shadow_weight` (the legacy `weight` while the
+    /// edge has none) and the target's metadata.
+    async fn shadow_synapse_edges(
+        &self,
+        project_id: Uuid,
+        from: &[Uuid],
+    ) -> Result<Vec<crate::neurons::synaptic_shadow::ShadowEdgeRow>>;
+
+    /// Add `delta` to the shadow weight of the existing edges (both directions)
+    /// of each unordered pair, both notes in `project_id`, clamped to [0, 1].
+    /// Returns the number of directed edges written.
+    async fn reward_shadow_synapses(
+        &self,
+        project_id: Uuid,
+        pairs: &[(Uuid, Uuid)],
+        delta: f64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize>;
+
+    /// Proportional decay of the shadow weights of the projects in `scope`:
+    /// `w · 2^(−Δt / half_life)` since the edge's last shadow decay (an edge
+    /// seen for the first time starts from its legacy weight, undecayed). A
+    /// dormant project's edges are frozen (their clock advances, their weight
+    /// does not). Returns the number of edges visited.
+    async fn decay_shadow_synapses(
+        &self,
+        scope: &crate::neurons::synaptic_shadow::ShadowDecayScope,
+        half_life_days: f64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize>;
+
+    /// Persist a shadow trace; keeps the latest `keep` traces of its session.
+    async fn record_synapse_shadow_trace(
+        &self,
+        trace: &crate::neurons::synaptic_shadow::SynapseShadowTrace,
+        keep: usize,
+    ) -> Result<()>;
+
+    /// Read shadow traces.
+    async fn list_synapse_shadow_traces(
+        &self,
+        filter: &crate::neurons::synaptic_shadow::ShadowTraceFilter,
+    ) -> Result<Vec<crate::neurons::synaptic_shadow::SynapseShadowTrace>>;
+
+    /// One shadow trace by id.
+    async fn get_synapse_shadow_trace(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<crate::neurons::synaptic_shadow::SynapseShadowTrace>>;
+
+    /// Claim the reward `key` of a trace: `true` the first time only (the lock
+    /// is taken before the check, so two concurrent claims cannot both win).
+    async fn claim_shadow_trace_reward(&self, trace_id: Uuid, key: &str) -> Result<bool>;
+
+    /// Traces not yet judged on their task's closure whose session's attempt
+    /// closed before `cutoff`: `Restarted` when a later attempt of the task
+    /// exists, `Quiet` when the task is completed (others are left for later).
+    async fn shadow_trace_closures(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, crate::neurons::synaptic_shadow::TaskClosure)>>;
 
     /// Apply knowledge scars to notes/decisions after failed reasoning feedback.
     /// Biomimicry: Elun HypersphereIdentity.Scar — penalizes nodes in search scoring.

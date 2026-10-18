@@ -268,6 +268,7 @@ async fn network_tools_mutations_are_refused_to_an_agent_token_and_reads_are_not
             Some(json!({"id": "sx", "engine": "searxng", "base_url": "https://sx.example"})),
         ),
         ("DELETE", format!("{ENGINES}/sx"), None),
+        ("PUT", ENGINES.to_string(), Some(json!({"order": []}))),
     ] {
         let (status, got) = call(&app, req(&agent, method, &uri, body)).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri} -> {got}");
@@ -309,7 +310,9 @@ async fn network_browser_authorisation_is_stored_read_by_the_gate_and_withdrawn(
     assert_eq!(summary["browser"]["allowed"], true);
     let (status, body) = call(&app, human("PUT", BROWSER, Some(json!({"allowed": false})))).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!({"allowed": false}));
+    // A deny names nobody; `available` is this installation's own answer (N23c), and this state
+    // has no chat manager, so nothing provides a browser here.
+    assert_eq!(body, json!({"allowed": false, "available": false}));
     assert!(!consents.browser_authorized(PROJECT).await.unwrap());
     // Denying twice is still a deny, not an error.
     let (status, _) = call(&app, human("PUT", BROWSER, Some(json!({"allowed": false})))).await;
@@ -744,6 +747,118 @@ async fn a_native_session_is_offered_webfetch_once_the_project_consents_to_an_or
     assert!(!revoked.iter().any(|t| t == "WebFetch"), "{revoked:?}");
 }
 
+/// The `--search-engine` values of a native session's nexus-tools, first tried first.
+#[cfg(unix)]
+fn engine_flags(args: &[String]) -> Vec<String> {
+    args.windows(2)
+        .filter(|w| w[0] == "--search-engine")
+        .map(|w| w[1].clone())
+        .collect()
+}
+
+#[cfg(unix)]
+fn ids_of(listed: &Value) -> Vec<String> {
+    listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The order a person chooses on the route is the order the engines are listed in AND the order
+/// a native session's nexus-tools receives them (so tries them) in. Without a choice — every
+/// installation so far — the order by id, as before.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_search_engine_order_chosen_on_the_route_is_the_order_nexus_tools_receives() {
+    let (app, graph) = app().await;
+    for (id, url) in [
+        ("alpha", "https://a.example"),
+        ("beta", "https://b.example"),
+    ] {
+        let (status, got) = call(
+            &app,
+            human(
+                "POST",
+                ENGINES,
+                Some(json!({"id": id, "engine": "searxng", "base_url": url})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{got}");
+        let (status, _) = call(&app, human("PUT", ORIGINS, Some(json!({"origin": url})))).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    // No order chosen: by id, as before.
+    let (_, listed) = call(&app, human("GET", ENGINES, None)).await;
+    assert_eq!(ids_of(&listed), ["alpha", "beta"]);
+    let before = native_session_args(graph.clone(), "ord-before", None).await;
+    assert_eq!(
+        engine_flags(&before),
+        ["searxng:https://a.example", "searxng:https://b.example"]
+    );
+
+    let (status, answered) = call(
+        &app,
+        human("PUT", ENGINES, Some(json!({"order": ["beta", "alpha"]}))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    assert_eq!(ids_of(&answered), ["beta", "alpha"]);
+    let (_, listed) = call(
+        &app,
+        human("GET", &format!("{ENGINES}?project={PROJECT}"), None),
+    )
+    .await;
+    assert_eq!(ids_of(&listed), ["beta", "alpha"]);
+    let (_, summary) = call(&app, human("GET", SUMMARY, None)).await;
+    assert_eq!(ids_of(&summary["search_engines"]), ["beta", "alpha"]);
+    let after = native_session_args(graph.clone(), "ord-after", None).await;
+    assert_eq!(
+        engine_flags(&after),
+        ["searxng:https://b.example", "searxng:https://a.example"],
+        "{after:?}"
+    );
+
+    // An engine declared after the choice goes last.
+    let (status, _) = call(
+        &app,
+        human(
+            "POST",
+            ENGINES,
+            Some(json!({"id": "aardvark", "engine": "searxng", "base_url": "https://c.example"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, listed) = call(&app, human("GET", ENGINES, None)).await;
+    assert_eq!(ids_of(&listed), ["beta", "alpha", "aardvark"]);
+
+    // Refusals: an unknown id, a duplicate, another shape. The stored order stays.
+    for (body, code) in [
+        (
+            json!({"order": ["beta", "nope"]}),
+            "search_engine_not_found",
+        ),
+        (
+            json!({"order": ["beta", "beta"]}),
+            "invalid_search_engine_order",
+        ),
+        (json!({"order": "beta"}), "invalid_search_engine_order"),
+        (
+            json!({"order": ["beta"], "extra": 1}),
+            "invalid_search_engine_order",
+        ),
+    ] {
+        let (status, got) = call(&app, human("PUT", ENGINES, Some(body.clone()))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body} -> {got}");
+        assert_eq!(got["code"], code, "{body} -> {got}");
+    }
+    let (_, listed) = call(&app, human("GET", ENGINES, None)).await;
+    assert_eq!(ids_of(&listed), ["beta", "alpha", "aardvark"]);
+}
+
 /// A release nexus-tools (decision 1e9d7501): it embeds Obscura, so search is keyless by
 /// default. Nothing declared, nothing consented: the engine is passed all the same (`obscura`, in
 /// process) and WebSearch is offered; the consent is judged at the call (the first search names
@@ -843,4 +958,81 @@ async fn the_engine_list_shows_the_built_in_obscura_only_when_nexus_tools_embeds
             .any(|e| e["id"] == "obscura-builtin"),
         "{listed}"
     );
+}
+
+/// N23c — the browser view says whether THIS installation provides a browser, by the resolution
+/// of the attachment itself ([`crate::chat::manager::ChatManager::browser_of_installation`]): a
+/// separate executable the operator configured, OR a `nexus-tools` that embeds Obscura. The panel
+/// reads nothing else, so the page can stop guessing. The project's consent (`allowed`) is the
+/// OTHER floor: it is recorded either way, and a server that provides nothing says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_browser_view_says_whether_this_installation_provides_the_browser() {
+    use std::os::unix::fs::PermissionsExt;
+    // A router whose chat manager has this `nexus-tools` script, and this configured browser.
+    let with = |script: &'static str, separate_browser: bool| async move {
+        let graph = Arc::new(MockGraphStore::new());
+        graph
+            .create_project(&test_project_named(PROJECT))
+            .await
+            .unwrap();
+        let bin = tempfile::TempDir::new().unwrap();
+        let program = bin.path().join("nexus-tools");
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = crate::chat::config::ChatConfig::from_env();
+        config.nexus_tools_path = Some(program);
+        config.nexus_browser_path = separate_browser.then(|| {
+            let obscura = bin.path().join("obscura");
+            std::fs::write(&obscura, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&obscura, std::fs::Permissions::from_mode(0o755)).unwrap();
+            obscura
+        });
+        let state = mock_app_state_with_graph(graph.clone());
+        let manager = Arc::new(crate::chat::manager::ChatManager::new_without_memory(
+            state.neo4j,
+            state.meili,
+            config,
+        ));
+        (
+            create_router(state_on_with(graph, Some(manager)).await),
+            bin,
+        )
+    };
+    const EMBEDS: &str =
+        "#!/bin/sh\n[ \"$1\" = --capabilities ] && echo '{\"version\":\"0.5.1\",\"tls\":true,\"obscura\":true}'\n";
+    const PLAIN: &str = "#!/bin/sh\necho '{\"version\":\"0.5.1\",\"tls\":true}'\n";
+
+    // A release nexus-tools: it embeds Obscura, so this installation provides the browser.
+    let (router, _bin) = with(EMBEDS, false).await;
+    let (status, summary) = call(&router, human("GET", SUMMARY, None)).await;
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    assert_eq!(summary["browser"]["available"], true, "{summary}");
+    assert_eq!(summary["browser"]["allowed"], false, "{summary}");
+
+    // The real case: a build WITHOUT the obscura feature (macOS Intel legacy, or a source build),
+    // and no separate executable. The consent is still recorded, and still says `available: false`
+    // — it will take effect the day this installation provides a browser.
+    let (router, _bin) = with(PLAIN, false).await;
+    let (_, summary) = call(&router, human("GET", SUMMARY, None)).await;
+    assert_eq!(summary["browser"]["available"], false, "{summary}");
+    let (status, allowed) = call(
+        &router,
+        human("PUT", BROWSER, Some(json!({"allowed": true}))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{allowed}");
+    assert_eq!(allowed["allowed"], true, "{allowed}");
+    assert_eq!(allowed["available"], false, "{allowed}");
+
+    // The OTHER half of the one resolution: no feature, but a separate `obscura` executable the
+    // operator configured. The attachment would take it, so the panel says `available`.
+    let (router, _bin) = with(PLAIN, true).await;
+    let (_, summary) = call(&router, human("GET", SUMMARY, None)).await;
+    assert_eq!(summary["browser"]["available"], true, "{summary}");
+
+    // No chat manager at all: nothing opens a session here, so nothing provides a browser.
+    let (bare, _graph) = app().await;
+    let (_, summary) = call(&bare, human("GET", SUMMARY, None)).await;
+    assert_eq!(summary["browser"]["available"], false, "{summary}");
 }

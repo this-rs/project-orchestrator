@@ -150,6 +150,54 @@ impl SessionHooks for SubagentHooks {
         }
     }
 
+    // Claude Code's own events (contract v7, ISO1) belong to the inner hooks: a wrapper that
+    // dropped them would hide the graph's answers on the agent engine.
+    async fn session_start(
+        &self,
+        info: &nexus_claude::agent::SessionStartInfo,
+    ) -> nexus_claude::agent::HookReply {
+        match &self.inner {
+            Some(inner) => inner.session_start(info).await,
+            None => nexus_claude::agent::HookReply::none(),
+        }
+    }
+
+    async fn user_prompt_submit(
+        &self,
+        prompt: &nexus_claude::agent::PromptInfo,
+    ) -> nexus_claude::agent::HookReply {
+        match &self.inner {
+            Some(inner) => inner.user_prompt_submit(prompt).await,
+            None => nexus_claude::agent::HookReply::none(),
+        }
+    }
+
+    async fn before_stop(
+        &self,
+        info: &nexus_claude::agent::StopInfo,
+    ) -> nexus_claude::agent::HookReply {
+        match &self.inner {
+            Some(inner) => inner.before_stop(info).await,
+            None => nexus_claude::agent::HookReply::none(),
+        }
+    }
+
+    async fn before_subagent_stop(
+        &self,
+        info: &nexus_claude::agent::SubagentStopInfo,
+    ) -> nexus_claude::agent::HookReply {
+        match &self.inner {
+            Some(inner) => inner.before_subagent_stop(info).await,
+            None => nexus_claude::agent::HookReply::none(),
+        }
+    }
+
+    async fn notification(&self, info: &nexus_claude::agent::NotificationInfo) {
+        if let Some(inner) = &self.inner {
+            inner.notification(info).await;
+        }
+    }
+
     fn runs_subagents(&self) -> bool {
         true
     }
@@ -711,9 +759,14 @@ impl ChatManager {
     ) -> Result<(String, Option<i64>), String> {
         if let Some(warm) = reuse.and_then(|reuse| reuse.warm.as_ref()) {
             let floor = self.last_event_seq(&warm.session_id).await;
-            match self
-                .resume_session(&warm.session_id, &child.message, child.user_claims.as_ref())
-                .await
+            // A delegation's resume: checked against the parent's tombstone like a fresh child
+            // (B36-RACE-RESUME: a person's resume of the same session would pass).
+            match super::cancelled_parents::as_delegation(self.resume_session(
+                &warm.session_id,
+                &child.message,
+                child.user_claims.as_ref(),
+            ))
+            .await
             {
                 Ok(()) => {
                     tracing::info!(
@@ -1229,6 +1282,7 @@ mod tests {
             canonical: None,
             tool_use_id: None,
             always: None,
+            consent: None,
         }
     }
 
@@ -1430,6 +1484,7 @@ mod tests {
             canonical: Some("Write".into()),
             tool_use_id: None,
             always: None,
+            consent: None,
         };
         let first = adopt().await;
         let answers_itself = live_answers_itself(Arc::clone(&runtime), "child", Some(first));

@@ -1477,7 +1477,7 @@ impl Neo4jClient {
     /// Returns the number of relations created.
     pub async fn backfill_produced_during(&self, project_id: Uuid) -> Result<usize> {
         let q = query(
-            r#"
+            &r#"
             MATCH (r:ProtocolRun {status: 'completed'})
             MATCH (p:Protocol {id: r.protocol_id})
             WHERE p.project_id = $project_id
@@ -1491,14 +1491,16 @@ impl Neo4jClient {
               AND NOT (n)-[:PRODUCED_DURING]->(r)
             WITH r, collect(DISTINCT n) AS notes
 
-            // Find decisions created during the run window
+            // Find decisions of the same project created during the run
+            // window (one decision→project traversal, DECISION_PROJECT_PATH;
+            // the former check was a separate OPTIONAL MATCH on a
+            // Plan-[:BELONGS_TO]->Project edge that is never written, so it
+            // filtered nothing and linked decisions of every project).
             OPTIONAL MATCH (d:Decision)
             WHERE d.decided_at >= r.started_at
               AND d.decided_at <= r.completed_at
               AND NOT (d)-[:PRODUCED_DURING]->(r)
-
-            // Check decision is linked to a task in the same project
-            OPTIONAL MATCH (d)<-[:INFORMED_BY]-(t:Task)<-[:HAS_TASK]-(pl:Plan)-[:BELONGS_TO]->(proj:Project {id: $project_id})
+              AND EXISTS { MATCH __PATH__ WHERE proj.id = $project_id }
             WITH r, notes, collect(DISTINCT d) AS decisions
 
             // Create PRODUCED_DURING for notes
@@ -1517,7 +1519,8 @@ impl Neo4jClient {
             ON CREATE SET rel.produced_at = d.decided_at, rel.backfilled = true
 
             RETURN sum(note_count) + count(rel) AS total_created
-            "#,
+            "#
+            .replace("__PATH__", super::decision::DECISION_PROJECT_PATH),
         )
         .param("project_id", project_id.to_string());
 

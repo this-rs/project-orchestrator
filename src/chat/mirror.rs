@@ -1262,6 +1262,7 @@ mod tests {
                 canonical: None,
                 tool_use_id: Some("toolu_read".into()),
                 always: None,
+                consent: None,
             },
             answered("toolu_read", "the spec", Some(CALL)),
             said("found it", Some(CALL)),

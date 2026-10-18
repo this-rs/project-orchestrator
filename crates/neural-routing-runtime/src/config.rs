@@ -287,7 +287,7 @@ nn:
   cache_capacity: 1000
   cache_ttl_secs: 7200
 "#;
-        let config: NeuralRoutingConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: NeuralRoutingConfig = serde_saphyr::from_str(yaml).unwrap();
         assert!(config.enabled);
         assert_eq!(config.mode, RoutingMode::NN);
         assert_eq!(config.inference.timeout_ms, 20);
@@ -298,7 +298,7 @@ nn:
     #[test]
     fn test_deserialize_full_mode() {
         let yaml = "mode: full";
-        let config: NeuralRoutingConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: NeuralRoutingConfig = serde_saphyr::from_str(yaml).unwrap();
         assert_eq!(config.mode, RoutingMode::Full);
     }
 }

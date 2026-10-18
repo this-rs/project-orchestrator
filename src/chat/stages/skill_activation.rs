@@ -324,26 +324,7 @@ impl ParallelEnrichmentStage for SkillActivationStage {
                             "Failed to increment skill activation count"
                         );
                     }
-                    // Boost energy of member notes
-                    // Only current members: boosting archived/superseded
-                    // notes kept old knowledge ranked high.
-                    match crate::skills::activation::current_skill_members(graph.as_ref(), skill_id)
-                        .await
-                    {
-                        Ok((notes, _decisions)) => {
-                            let note_ids: Vec<Uuid> = notes.iter().map(|n| n.id).collect();
-                            for note_id in &note_ids {
-                                let _ = graph.boost_energy(*note_id, boost).await;
-                            }
-                        }
-                        Err(e) => {
-                            debug!(
-                                skill_id = %skill_id,
-                                error = %e,
-                                "Failed to load skill members for energy boost"
-                            );
-                        }
-                    }
+                    boost_skill_member_notes(graph.as_ref(), skill_id, project_id, boost).await;
                 }
             });
         }
@@ -440,9 +421,71 @@ fn detect_intent_from_message(message: &str) -> &'static str {
 // Tests
 // ============================================================================
 
+/// Boost the energy of the current member notes of an activated skill.
+///
+/// Only current members (boosting archived/superseded notes kept old knowledge
+/// ranked high), and only those of the session's project: a skill's member
+/// list is not guarded by project, a note of another project must not be
+/// warmed by this session.
+async fn boost_skill_member_notes(
+    graph: &dyn GraphStore,
+    skill_id: Uuid,
+    project_id: Uuid,
+    boost: f64,
+) {
+    match crate::skills::activation::current_skill_members(graph, skill_id).await {
+        Ok((notes, _decisions)) => {
+            for note in crate::notes::coactivation::of_project(notes, project_id) {
+                let _ = graph.boost_energy(note.id, boost).await;
+            }
+        }
+        Err(e) => {
+            debug!(
+                skill_id = %skill_id,
+                error = %e,
+                "Failed to load skill members for energy boost"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T0f-bis: an activated skill warms its member notes of the session's
+    /// project only.
+    #[tokio::test]
+    async fn skill_member_boost_touches_only_the_session_project() {
+        use crate::notes::{Note, NoteType};
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("Mine");
+        store.create_project(&project).await.unwrap();
+        let skill = SkillNode::new(project.id, "S");
+        store.create_skill(&skill).await.unwrap();
+        let mut ids = Vec::new();
+        for owner in [Some(project.id), Some(Uuid::new_v4()), None] {
+            let mut n = Note::new(owner, NoteType::Guideline, "n".into(), "t".into());
+            n.energy = 0.3;
+            n.last_activated = None;
+            store.create_note(&n).await.unwrap();
+            store
+                .add_skill_member(skill.id, "note", n.id)
+                .await
+                .unwrap();
+            ids.push(n.id);
+        }
+        boost_skill_member_notes(&store, skill.id, project.id, 0.1).await;
+        assert!(store.get_note(ids[0]).await.unwrap().unwrap().energy > 0.3);
+        for id in &ids[1..] {
+            let n = store.get_note(*id).await.unwrap().unwrap();
+            assert!(
+                (n.energy - 0.3).abs() < 1e-9,
+                "foreign/global note untouched"
+            );
+            assert!(n.last_activated.is_none());
+        }
+    }
 
     #[tokio::test]
     async fn test_skill_context_is_live_never_the_raw_template() {

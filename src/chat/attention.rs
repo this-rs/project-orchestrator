@@ -424,6 +424,7 @@ mod tests {
                 canonical: None,
                 tool_use_id: None,
                 always: None,
+                consent: None,
             },
         )
     }

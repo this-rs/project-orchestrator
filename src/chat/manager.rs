@@ -529,6 +529,14 @@ pub struct ActiveSession {
     /// `get_descendant_pids(child_pid)` (decision 33bce470, audit note
     /// 2482f4e0).
     pub active_background_tasks: Arc<Mutex<HashMap<String, BackgroundTaskInfo>>>,
+    /// The CLI's descendants read when a `Bash` call STARTS (its
+    /// `ContentBlockStart`, input still empty), keyed by `tool_use_id`, taken
+    /// back by the second pass of `track_background_task_start`. The CLI cannot
+    /// fork the tool before its input is complete, so this is the reference a
+    /// background task's PID claim compares against: read at the full
+    /// `ToolUse` instead, it already held a process the CLI forked right after
+    /// printing the call, which was then never claimed (task 51f87943).
+    pub tool_start_descendants: Arc<Mutex<HashMap<String, Vec<u32>>>>,
     /// How many background tasks the CLI itself says are running, from its
     /// last `background_tasks_changed` system message (0 until one arrives).
     ///
@@ -1436,6 +1444,22 @@ fn is_subagent_spawn(request: &ChatRequest) -> bool {
         .is_some_and(|ctx| ctx.spawn_type == "conversation")
 }
 
+/// Whether the opening has a stated fallback in the session that sent it, so Auto on a
+/// locked vault is not refused but opens on that session's pair (`parent_pair_of`):
+/// an `Agent` call PO routes (`route_auto`, AUTO-SUB), or a delegation (`delegate_task`)
+/// sent by an open conversation (DELEG-500 — the vault re-locks at every restart, and
+/// each such delegation answered `credentials_locked`, a bare 500 until #825). A
+/// delegation nobody sent (a person, from the plan page) has no parent: refused as
+/// any Auto opening is.
+fn falls_back_on_parent(request: &ChatRequest) -> bool {
+    request.route_auto
+        || request
+            .spawned_by
+            .as_deref()
+            .and_then(parse_spawned_by)
+            .is_some_and(|ctx| ctx.spawn_type == "delegation" && ctx.parent_session_id.is_some())
+}
+
 /// Project id handed to every enrichment stage, resolved once from the
 /// session's slug. Stages that read only `project_id` (reflex) were skipped
 /// for every chat message when it was left `None`.
@@ -1542,6 +1566,47 @@ pub(crate) fn spawn_anchor_shadow(
     });
 }
 
+/// One shadow turn of the posture of a session (T7, `chat::posture`): derived from its
+/// focus anchors, fitted to the capability snapshot of its opening, tracked with
+/// hysteresis and journaled (target `posture_shadow`). It changes nothing the turn does:
+/// no prompt, tool or enrichment reads it.
+pub(crate) fn observe_posture(
+    session_id: Uuid,
+    node: &crate::neo4j::models::ChatSessionNode,
+    anchors: &[super::anchor::Anchor],
+    admitted: Option<&super::anchor_resolver::ResolvedScope>,
+) -> super::posture::PostureObservation {
+    let caps: Option<nexus_claude::agent::Capabilities> = node
+        .capabilities
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok());
+    let invariants = super::posture::Invariants {
+        access: node.access,
+        permission_mode: node.permission_mode.clone(),
+    };
+    super::posture::book().observe_turn(session_id, anchors, admitted, &invariants, caps.as_ref())
+}
+
+/// Mode `shadow`: the resolver does not run for the turn, so the posture is observed in
+/// a detached task on the session's anchors (one read), never delaying the turn. The
+/// resolver's admission is not applied there; nothing of it reaches the model.
+fn spawn_posture_shadow(
+    graph: Arc<dyn GraphStore>,
+    session_id: Uuid,
+    node: crate::neo4j::models::ChatSessionNode,
+) {
+    tokio::spawn(async move {
+        match graph.list_session_anchors(session_id).await {
+            Ok(anchors) => {
+                observe_posture(session_id, &node, &anchors, None);
+            }
+            Err(e) => {
+                warn!(target: "posture_shadow", session_id = %session_id, error = %e, "posture shadow: anchors unreadable (ignored)")
+            }
+        }
+    });
+}
+
 /// The knowledge graph's context for one turn whose message is `message`, as the
 /// markdown put in front of it (`None`: nothing to add). Both engines call it
 /// before every turn — the Claude Code engine in `stream_response`, the agent
@@ -1590,6 +1655,8 @@ pub(crate) async fn enrichment_for_turn(
             .await
         {
             Ok((r, _)) => {
+                // Posture, shadow (T7): from the resolver's admitted anchors, no I/O.
+                observe_posture(uuid, &node, &r.anchors, Some(&r.scope));
                 live_block = r.live_block();
                 let mut slug = r.decision.project.as_ref().map(|p| p.slug.clone());
                 // An explicit `project_slug` that does not resolve to a project is
@@ -1625,6 +1692,7 @@ pub(crate) async fn enrichment_for_turn(
         },
     };
     if mode == AnchorContextMode::Shadow {
+        spawn_posture_shadow(graph.clone(), uuid, node.clone());
         spawn_anchor_shadow(
             graph.clone(),
             anchor.cache.clone(),
@@ -1638,6 +1706,12 @@ pub(crate) async fn enrichment_for_turn(
     // Resolve the project id once for every stage: stages that only read
     // `project_id` (reflex) were skipped for every chat message.
     let project_id = enrichment_project_id(graph.as_ref(), project_slug.as_deref()).await;
+    // The synaptic layer (T8) observes the turn when it is in shadow for the
+    // project: a detached task, never awaited, whose result is journaled and
+    // never reaches this prompt.
+    if let Some(pid) = project_id {
+        crate::neurons::synaptic_shadow::spawn_turn(graph.clone(), uuid, pid, node.created_at);
+    }
     let input = super::enrichment::EnrichmentInput {
         message: message.to_string(),
         session_id: uuid,
@@ -2182,6 +2256,15 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         sent: &str,
         turn: &crate::refs::turn::TurnExpansion,
     ) -> String {
+        // `/compact` reaching a provider here is one whose CLI reads the command itself
+        // (Claude Code; the others are compacted by the runtime, ISO3): it must head the text
+        // the CLI reads, or the CLI hands it to the model as a sentence. Nothing in front.
+        if sent == shown && super::manual_compaction::compact_command(shown).is_some() {
+            if let Some(router) = self.turn_routing.get(session_id) {
+                router.set_turn_input(shown);
+            }
+            return shown.to_string();
+        }
         // What follows the enrichment. No references: the attachments expanded
         // (references in the conversation, content for the model), a relayed
         // history kept in front. References: the relay, the visible text, its
@@ -2931,6 +3014,18 @@ pub(crate) fn lacks_nexus_tools(
 
 /// Name of the project-orchestrator MCP server in a session's spec.
 pub(crate) const PO_MCP_SERVER: &str = "project-orchestrator";
+
+/// Whether a native session keeps its conversation in MEMORY only: the transcript root it
+/// would write to lies inside a git work tree, which the factory refuses
+/// (`native_factory::build_native_for_sessions`, the SAME predicate). The session works and
+/// says it will not resume after a restart (`resume_after_restart`, CTX6 follow-up).
+pub(crate) fn transcripts_kept_in_memory(
+    kind: nexus_claude::agent::ProviderKind,
+    root: Option<&std::path::Path>,
+) -> bool {
+    matches!(kind, nexus_claude::agent::ProviderKind::Native)
+        && root.is_some_and(super::provider::transcripts::inside_git_worktree)
+}
 
 /// What a session about to open lacks that the HOST knows and its provider's
 /// capabilities may not say, as `degraded_features` entries: `nexus_tools`
@@ -4406,7 +4501,7 @@ impl ChatManager {
 
     /// Persist permission config to config.yaml using surgical YAML modification.
     ///
-    /// Reads the existing file as a `serde_yaml::Value` tree, updates only the
+    /// Reads the existing file as a `crate::yaml::Value` tree, updates only the
     /// `chat.permissions` subtree, and writes back atomically (tmp + rename).
     /// This preserves all other config sections (auth, server, neo4j, etc.)
     /// without needing `Serialize` on those structs.
@@ -4417,13 +4512,13 @@ impl ChatManager {
         use std::io::Write;
 
         // 1. Read existing YAML as a Value tree (or start from empty mapping)
-        let mut doc: serde_yaml::Value = if yaml_path.exists() {
+        let mut doc: crate::yaml::Value = if yaml_path.exists() {
             let contents = std::fs::read_to_string(yaml_path)
                 .with_context(|| format!("Reading {}", yaml_path.display()))?;
-            serde_yaml::from_str(&contents)
+            crate::yaml::value_from_str(&contents)
                 .with_context(|| format!("Parsing {}", yaml_path.display()))?
         } else {
-            serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+            crate::yaml::Value::Mapping(crate::yaml::Mapping::new())
         };
 
         // 2. Ensure doc is a mapping
@@ -4432,11 +4527,11 @@ impl ChatManager {
             .ok_or_else(|| anyhow!("config.yaml root is not a YAML mapping"))?;
 
         // 3. Ensure chat section exists as a mapping
-        let chat_key = serde_yaml::Value::String("chat".into());
+        let chat_key = "chat".to_string();
         if !root.contains_key(&chat_key) {
             root.insert(
                 chat_key.clone(),
-                serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+                crate::yaml::Value::Mapping(crate::yaml::Mapping::new()),
             );
         }
         let chat_section = root
@@ -4445,13 +4540,13 @@ impl ChatManager {
             .ok_or_else(|| anyhow!("chat section is not a YAML mapping"))?;
 
         // 4. Serialize PermissionConfig to a YAML Value and insert
-        let perm_value = serde_yaml::to_value(permission)
+        let perm_value = crate::yaml::to_value(permission)
             .context("Serializing PermissionConfig to YAML value")?;
-        chat_section.insert(serde_yaml::Value::String("permissions".into()), perm_value);
+        chat_section.insert("permissions".to_string(), perm_value);
 
         // 5. Serialize the full document back to YAML string
         let yaml_str =
-            serde_yaml::to_string(&doc).context("Serializing config document to YAML")?;
+            crate::yaml::to_string(&doc).context("Serializing config document to YAML")?;
 
         // 6. Atomic write: write to .tmp then rename
         let tmp_path = yaml_path.with_extension("yaml.tmp");
@@ -4563,13 +4658,13 @@ impl ChatManager {
         use std::io::Write;
 
         // 1. Read existing YAML as a Value tree (or start from empty mapping)
-        let mut doc: serde_yaml::Value = if yaml_path.exists() {
+        let mut doc: crate::yaml::Value = if yaml_path.exists() {
             let contents = std::fs::read_to_string(yaml_path)
                 .with_context(|| format!("Reading {}", yaml_path.display()))?;
-            serde_yaml::from_str(&contents)
+            crate::yaml::value_from_str(&contents)
                 .with_context(|| format!("Parsing {}", yaml_path.display()))?
         } else {
-            serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+            crate::yaml::Value::Mapping(crate::yaml::Mapping::new())
         };
 
         // 2. Ensure doc is a mapping
@@ -4578,11 +4673,11 @@ impl ChatManager {
             .ok_or_else(|| anyhow!("config.yaml root is not a YAML mapping"))?;
 
         // 3. Ensure chat section exists as a mapping
-        let chat_key = serde_yaml::Value::String("chat".into());
+        let chat_key = "chat".to_string();
         if !root.contains_key(&chat_key) {
             root.insert(
                 chat_key.clone(),
-                serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+                crate::yaml::Value::Mapping(crate::yaml::Mapping::new()),
             );
         }
         let chat_section = root
@@ -4591,43 +4686,43 @@ impl ChatManager {
             .ok_or_else(|| anyhow!("chat section is not a YAML mapping"))?;
 
         // 4. Set/remove individual fields surgically
-        let path_key = serde_yaml::Value::String("process_path".into());
-        let cli_key = serde_yaml::Value::String("claude_cli_path".into());
-        let auto_key = serde_yaml::Value::String("auto_update_cli".into());
+        let path_key = "process_path".to_string();
+        let cli_key = "claude_cli_path".to_string();
+        let auto_key = "auto_update_cli".to_string();
 
         match &env.process_path {
             Some(val) => {
-                chat_section.insert(path_key, serde_yaml::Value::String(val.clone()));
+                chat_section.insert(path_key, crate::yaml::Value::String(val.clone()));
             }
             None => {
-                chat_section.remove(&path_key);
+                chat_section.shift_remove(&path_key);
             }
         }
         match &env.claude_cli_path {
             Some(val) => {
-                chat_section.insert(cli_key, serde_yaml::Value::String(val.clone()));
+                chat_section.insert(cli_key, crate::yaml::Value::String(val.clone()));
             }
             None => {
-                chat_section.remove(&cli_key);
+                chat_section.shift_remove(&cli_key);
             }
         }
         // Only write auto_update_cli when true (omit when false to keep YAML clean)
         if env.auto_update_cli {
-            chat_section.insert(auto_key, serde_yaml::Value::Bool(true));
+            chat_section.insert(auto_key, crate::yaml::Value::Bool(true));
         } else {
-            chat_section.remove(&auto_key);
+            chat_section.shift_remove(&auto_key);
         }
         // Only write auto_update_app when false (default is true, so omit when true to keep YAML clean)
-        let auto_app_key = serde_yaml::Value::String("auto_update_app".into());
+        let auto_app_key = "auto_update_app".to_string();
         if !env.auto_update_app {
-            chat_section.insert(auto_app_key, serde_yaml::Value::Bool(false));
+            chat_section.insert(auto_app_key, crate::yaml::Value::Bool(false));
         } else {
-            chat_section.remove(&auto_app_key);
+            chat_section.shift_remove(&auto_app_key);
         }
 
         // 5. Serialize the full document back to YAML string
         let yaml_str =
-            serde_yaml::to_string(&doc).context("Serializing config document to YAML")?;
+            crate::yaml::to_string(&doc).context("Serializing config document to YAML")?;
 
         // 6. Atomic write: write to .tmp then rename
         let tmp_path = yaml_path.with_extension("yaml.tmp");
@@ -7719,6 +7814,7 @@ impl ChatManager {
                     cancel_tools_cap: CANCEL_TOOLS_CAP,
                     cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
                     active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+                    tool_start_descendants: Arc::new(Mutex::new(HashMap::new())),
                     cli_background_tasks: Arc::new(AtomicUsize::new(0)),
                     cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
                     cancel_task_cap: CANCEL_TASK_CAP,
@@ -7957,7 +8053,10 @@ impl ChatManager {
     ///
     /// Note that Bash's `run_in_background` flag is only present on the
     /// **second** pass (full input), so the first pass for a Bash call
-    /// returns `false` and the second pass performs the actual insert.
+    /// returns `false` and the second pass performs the actual insert. The
+    /// first pass of a Bash call still reads the CLI's descendants
+    /// (`ActiveSession::tool_start_descendants`): that reading, taken before
+    /// the CLI can fork the tool, is the reference of the PID claim.
     /// For Monitor, both passes succeed (the second one just updates
     /// the description in place).
     ///
@@ -7976,6 +8075,39 @@ impl ChatManager {
         input: &serde_json::Value,
         parent_tool_use_id: Option<&str>,
     ) -> bool {
+        // Task 51f87943: the reference of a Bash background task's PID claim is
+        // read when the call STARTS (first pass, `ContentBlockStart`, empty
+        // input): the CLI cannot fork the tool before the input is complete. Read
+        // on the second pass instead, it already held a process the CLI forked
+        // right after printing the call — never a newcomer, never claimed, and
+        // `cancel_task` then signalled nothing. Every Bash call is read (its
+        // `run_in_background` flag is not known yet) and the reading is taken
+        // back on the second pass, whatever the flag says.
+        let early_before: Option<Vec<u32>> = if tool_name == "Bash" {
+            let (early, cli_pid) = {
+                let sessions = active_sessions.read().await;
+                let Some(active) = sessions.get(session_id) else {
+                    return false;
+                };
+                (active.tool_start_descendants.clone(), active.child_pid)
+            };
+            if input.as_object().is_none_or(serde_json::Map::is_empty) {
+                if let Some(cli_pid) = cli_pid {
+                    let pids = Self::get_descendant_pids(cli_pid);
+                    early
+                        .lock()
+                        .await
+                        .entry(tool_use_id.to_string())
+                        .or_insert(pids);
+                }
+                return false;
+            }
+            let taken = early.lock().await.remove(tool_use_id);
+            taken
+        } else {
+            None
+        };
+
         // Decide whether the tool kind is something we track.
         let kind = match tool_name {
             "Monitor" => Some(BackgroundTaskKind::Monitor),
@@ -8016,14 +8148,18 @@ impl ChatManager {
             (active.active_background_tasks.clone(), active.child_pid)
         };
 
-        // Capture the descendant snapshot BEFORE the subprocess forks.
-        // This must run lock-free because `pgrep -P` may take 10-50 ms.
-        // Plan fc35b25e (T2): the async claim spawned below compares this
-        // snapshot to readings taken every PID_CLAIM_POLL (up to
+        // Capture the descendant snapshot BEFORE the subprocess forks: the one
+        // read when the Bash call started when there is one (task 51f87943),
+        // else now. This must run lock-free because `pgrep -P` may take
+        // 10-50 ms. Plan fc35b25e (T2): the async claim spawned below compares
+        // this snapshot to readings taken every PID_CLAIM_POLL (up to
         // PID_CLAIM_WINDOW) to discover the new PID.
-        let before_pids: Vec<u32> = child_pid_for_before
-            .map(Self::get_descendant_pids)
-            .unwrap_or_default();
+        let before_pids: Vec<u32> = match early_before {
+            Some(pids) => pids,
+            None => child_pid_for_before
+                .map(Self::get_descendant_pids)
+                .unwrap_or_default(),
+        };
 
         // Now perform the upsert under the tasks lock and capture the
         // fresh snapshot for the broadcast. We use `match entry` instead of
@@ -8829,20 +8965,25 @@ impl ChatManager {
                 let window = sessions.get(&session_id).and_then(|s| s.context_window);
                 (protocol, anchor, window)
             };
-            match enrichment_for_turn(
-                &graph,
-                &enrichment_pipeline,
-                &session_id,
-                &prompt,
-                protocol,
-                turn.excluded_note_ids.clone(),
-                &anchor,
-                window,
-            )
-            .await
-            {
-                Some(enrichment_md) => prepend_enrichment(&enrichment_md, &prompt),
-                None => prompt,
+            // `/compact`: the CLI reads the command only at the head of the text (ISO3).
+            if super::manual_compaction::compact_command(&prompt).is_some() {
+                prompt
+            } else {
+                match enrichment_for_turn(
+                    &graph,
+                    &enrichment_pipeline,
+                    &session_id,
+                    &prompt,
+                    protocol,
+                    turn.excluded_note_ids.clone(),
+                    &anchor,
+                    window,
+                )
+                .await
+                {
+                    Some(enrichment_md) => prepend_enrichment(&enrichment_md, &prompt),
+                    None => prompt,
+                }
             }
         };
 
@@ -12649,11 +12790,13 @@ impl ChatManager {
         // Its Claude Code sub-agents are mirrored (P18c): a new tap per resume, the registry
         // keeps one mirror per call.
         let mirror_tap = self.mirror_tap(session_id);
-        let parent = super::cancelled_parents::parent_of(session_node.spawned_by.as_deref());
+        let parent =
+            super::cancelled_parents::parent_checked_on_resume(session_node.spawned_by.as_deref());
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
-            // B36-RACE: a child (a warm one the pool resumes included) whose parent a cascade
-            // closed is refused HERE, under the lock that would make it live.
+            // B36-RACE: a child the warm pool resumes for a new delegation, whose parent a
+            // cascade closed, is refused HERE, under the lock that would make it live. A person
+            // resuming it passes (B36-RACE-RESUME, `parent_checked_on_resume`).
             if let Err(refused) = self.cancelled_parents.admit(session_id, parent.as_deref()) {
                 drop(sessions);
                 self.refuse_legacy_activation(session_id, client, &refused)
@@ -12736,6 +12879,7 @@ impl ChatManager {
                     cancel_tools_cap: CANCEL_TOOLS_CAP,
                     cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
                     active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+                    tool_start_descendants: Arc::new(Mutex::new(HashMap::new())),
                     cli_background_tasks: Arc::new(AtomicUsize::new(0)),
                     cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
                     cancel_task_cap: CANCEL_TASK_CAP,
@@ -14904,7 +15048,15 @@ impl ChatManager {
         // AUTO-SUB (review point 1): the pair of the session that spawned this child. Read
         // once, applied below ONLY when the router applies nothing — the declared rules
         // must never substitute a default for a child whose parent named its engine.
-        let parent_fallback = if request.route_auto {
+        // Never over an engine the request itself names (DELEG-500): a delegation that
+        // names one keeps it, and its refusal stays the request's own. That includes the
+        // run level, where `inherit_parent_engine` already puts the parent's pair (and the
+        // task and persona levels): the fallback is for an opening that names NOTHING.
+        let names_an_engine = input.request.is_some()
+            || input.task.is_some()
+            || input.persona.is_some()
+            || input.run.is_some();
+        let parent_fallback = if falls_back_on_parent(request) && !names_an_engine {
             self.parent_pair_of(request).await
         } else {
             None
@@ -15741,7 +15893,9 @@ impl ChatManager {
         // is ALREADY open and holds a working pair. The fallback here is not silent, it is
         // that pair (`parent_pair_of`), so the refusal buys nothing: it would only make the
         // tool call fail on a vault that re-locked while the parent idled.
-        if vault_locked && !named && !request.route_auto {
+        // DELEG-500: a delegation sent by a conversation that is already open has the same
+        // stated fallback (`falls_back_on_parent`): it is not refused either.
+        if vault_locked && !named && !falls_back_on_parent(request) {
             let waits = match routing.claude_code_catalog.as_ref() {
                 Some(catalog) => catalog.waits_on_vault().await,
                 None => false,
@@ -16182,6 +16336,57 @@ impl ChatManager {
         }
     }
 
+    /// The browser a native session of THIS installation is attached to, when its project allows
+    /// it: the separate executable the operator configured (`OBSCURA_BROWSER` /
+    /// `chat.obscura_browser`), else the copy embedded in `nexus-tools` (built with the `obscura`
+    /// feature). Found is still not authorised: [`super::provider::nexus_tools::attach`] gives it
+    /// only to a project that allowed it.
+    ///
+    /// This is the ONE resolution: the opening of a session calls it, and
+    /// [`Self::provides_browser`] — what the Network tools panel reports (N23c) — calls it too.
+    /// There is no second reading of the configuration.
+    pub(crate) fn browser_of_installation(
+        &self,
+        program: &std::path::Path,
+        embedded_obscura: bool,
+    ) -> Option<nexus_claude::providers::native::BrowserTools> {
+        use super::provider::native_factory::runnable_nexus_tools;
+        self.config
+            .nexus_browser_path
+            .as_deref()
+            .and_then(runnable_nexus_tools)
+            .map(nexus_claude::providers::native::BrowserTools::new)
+            .or_else(|| {
+                embedded_obscura.then(|| {
+                    nexus_claude::providers::native::BrowserTools::embedded_in_nexus_tools(
+                        program.to_path_buf(),
+                    )
+                })
+            })
+    }
+
+    /// Whether THIS installation PROVIDES the browser at all (N23c): its `nexus-tools` runs and
+    /// [`Self::browser_of_installation`] — the resolution of the attachment itself — finds a
+    /// browser. A project may authorise the browser either way (the two are different floors: the
+    /// operator's configuration and the project's consent); when the installation provides none,
+    /// the authorisation takes effect only once it does. The real case is a build without the
+    /// `obscura` feature (the macOS Intel legacy archive, 10.15–13.3).
+    pub async fn provides_browser(&self) -> bool {
+        match self
+            .config
+            .nexus_tools_path
+            .as_deref()
+            .and_then(super::provider::native_factory::runnable_nexus_tools)
+        {
+            Some(program) => {
+                let embedded_obscura = super::provider::nexus_tools::embeds_obscura(&program).await;
+                self.browser_of_installation(&program, embedded_obscura)
+                    .is_some()
+            }
+            None => false,
+        }
+    }
+
     /// The `SessionSpec` of a session of the agent path: working directory,
     /// model, system prompt, the neutral tool policy of the permission mode,
     /// the project-orchestrator MCP server (same environment as the Claude
@@ -16359,19 +16564,8 @@ impl ChatManager {
                     // The browser is held to the same rule: an absolute, executable path. Without
                     // one, the copy embedded in nexus-tools (`nexus-tools obscura mcp`). Found is
                     // still not authorised: `attach` gives it only to a project that allowed it.
-                    let browser = self
-                        .config
-                        .nexus_browser_path
-                        .as_deref()
-                        .and_then(runnable_nexus_tools)
-                        .map(nexus_claude::providers::native::BrowserTools::new)
-                        .or_else(|| {
-                            embedded_obscura.then(|| {
-                                nexus_claude::providers::native::BrowserTools::embedded_in_nexus_tools(
-                                    program.clone(),
-                                )
-                            })
-                        });
+                    // The SAME call answers the Network tools panel (`provides_browser`, N23c).
+                    let browser = self.browser_of_installation(&program, embedded_obscura);
                     let attachment = nt::attach(
                         &nt::NexusToolsConfig {
                             program,
@@ -16749,6 +16943,9 @@ impl ChatManager {
             &spec,
             self.config.nexus_tools_path.as_deref(),
         );
+        if transcripts_kept_in_memory(provider.kind(), self.native_transcripts.as_deref()) {
+            host_missing.push(super::agent_runtime::RESUME_AFTER_RESTART_FEATURE.to_string());
+        }
         // The project's files are on this machine unless the instance is remote.
         let project_dir =
             (!super::provider::resolver::is_remote_instance(provider_id)).then(|| spec.cwd.clone());
@@ -17636,6 +17833,9 @@ impl ChatManager {
             &spec,
             self.config.nexus_tools_path.as_deref(),
         );
+        if transcripts_kept_in_memory(provider.kind(), self.native_transcripts.as_deref()) {
+            host_missing.push(super::agent_runtime::RESUME_AFTER_RESTART_FEATURE.to_string());
+        }
         // The project's files are on this machine unless the instance is remote.
         let project_dir = (!super::provider::resolver::is_remote_instance(&provider_id))
             .then(|| spec.cwd.clone());
@@ -17715,8 +17915,9 @@ impl ChatManager {
             // moved, which would make every `always` command be asked again). Only a plain
             // resume (no relay) may have moved.
             relay.is_none(),
-            // B36-RACE: a warm child the pool resumes is refused like a fresh one.
-            super::cancelled_parents::parent_of(node.spawned_by.as_deref()),
+            // B36-RACE: a warm child the pool resumes for a delegation is refused like a fresh
+            // one; a person resuming it passes (B36-RACE-RESUME).
+            super::cancelled_parents::parent_checked_on_resume(node.spawned_by.as_deref()),
         )
         .await?;
         cleanup.disarm();
@@ -18581,6 +18782,7 @@ fn parse_permission_control_msg(
             .map(str::to_string),
         // Set by the session (`mark_always_eligibility`), which knows its lasting rules.
         always: None,
+        consent: None,
     })
 }
 
@@ -19191,6 +19393,80 @@ mod tests {
             assert!(
                 out.is_none_or(|o| !o.contains(crate::chat::anchor_resolver::NOTICE_NO_CONTEXT)),
                 "{mode:?}"
+            );
+        }
+    }
+
+    /// T7: the posture is observed and journaled every turn, in `on` and in `shadow`,
+    /// and the turn's enrichment is the one it would be without it.
+    #[tokio::test]
+    async fn the_posture_is_observed_in_shadow_without_changing_the_turn() {
+        let state = mock_app_state();
+        let graph: Arc<dyn GraphStore> = state.neo4j.clone();
+        let pipeline = crate::chat::enrichment::EnrichmentPipeline::new(Default::default());
+        for mode in [AnchorContextMode::On, AnchorContextMode::Shadow] {
+            let s = crate::test_helpers::test_chat_session(None);
+            state.neo4j.create_chat_session(&s).await.unwrap();
+            let sid = s.id.to_string();
+            let turn = |anchor: crate::chat::anchor_resolver::AnchorSession| {
+                let (graph, pipeline, sid) = (&graph, &pipeline, sid.clone());
+                async move {
+                    enrichment_for_turn(
+                        graph,
+                        pipeline,
+                        &sid,
+                        "hello",
+                        Default::default(),
+                        Default::default(),
+                        &anchor,
+                        None,
+                    )
+                    .await
+                }
+            };
+            // The observation of `turns` turns (shadow: a detached task).
+            let observed = |turns: u64| async move {
+                for _ in 0..10_000 {
+                    match crate::chat::posture::book().tracker(s.id) {
+                        Some(t) if t.turns >= turns => return t,
+                        _ => tokio::task::yield_now().await,
+                    }
+                }
+                panic!("{mode:?}: turn {turns} never observed");
+            };
+            let before = turn(anchor_in(mode)).await;
+            assert_eq!(
+                observed(1).await.effective(),
+                Some(&crate::chat::posture::Posture::neutral())
+            );
+            let project = crate::test_helpers::test_project_named(&format!("posture-{mode:?}"));
+            state.neo4j.create_project(&project).await.unwrap();
+            human_anchors_project(
+                &graph,
+                s.id,
+                project.id,
+                crate::chat::anchor::AnchorActor::User,
+            )
+            .await;
+            let after = turn(anchor_in(mode)).await;
+            for out in [&before, &after].into_iter().flatten() {
+                assert!(
+                    !out.contains("## Posture") && !out.contains("Posture :"),
+                    "{mode:?}: {out}"
+                );
+            }
+            if mode == AnchorContextMode::Shadow {
+                assert_eq!(
+                    before, after,
+                    "shadow: the anchor changes nothing of the turn"
+                );
+            }
+            let tracker = observed(2).await;
+            assert_eq!(tracker.turns, 2, "{mode:?}");
+            assert_eq!(
+                tracker.effective().map(|p| p.persona),
+                Some(crate::chat::posture::Persona::ProjectLead),
+                "{mode:?}: the user's focus anchor switched at once"
             );
         }
     }
@@ -22638,8 +22914,9 @@ mod tests {
         assert!(!manager.agent_runtime.owns(&child).await);
     }
 
-    /// B36-RACE, criterion 2 — the agent engine's RESUME (the path the warm pool takes): a
-    /// closed child of a cancelled parent is refused when it is resumed, not made live.
+    /// B36-RACE, criterion 2 — the agent engine's RESUME on behalf of a DELEGATION (the
+    /// path the warm pool takes, `subagents::open_child`): a closed child of a cancelled
+    /// parent is refused when it is resumed, not made live.
     #[tokio::test]
     async fn resuming_a_child_of_a_cancelled_parent_is_refused() {
         let (manager, graph, _fake) = agent_manager();
@@ -22655,15 +22932,62 @@ mod tests {
             .await
             .unwrap();
 
-        let err = manager
-            .resume_session(&child, "again", None)
-            .await
-            .expect_err("refused");
+        let err = super::super::cancelled_parents::as_delegation(
+            manager.resume_session(&child, "again", None),
+        )
+        .await
+        .expect_err("refused");
         assert!(
             super::super::cancelled_parents::ParentCancelled::in_chain(&err).is_some(),
             "{err:#}"
         );
         assert!(!manager.is_session_active(&child).await);
+    }
+
+    /// B36-RACE-RESUME — the tombstone stops late DELEGATIONS, not people: right after a
+    /// cascade cancelled the run, a person reopens one of its children by hand (the chat,
+    /// the API) and it opens, while a late delegation of the same parent is still refused.
+    #[tokio::test]
+    async fn a_person_reopens_the_child_of_a_cancelled_run_at_once() {
+        let (manager, graph, _fake) = agent_manager();
+        let parent = live_parent(&manager, &graph).await;
+        let child = manager
+            .create_session(&delegation_of(parent.id))
+            .await
+            .expect("the parent is live: the child opens")
+            .session_id;
+        manager.close_session(&child).await.unwrap();
+        manager
+            .close_session_with_cascade(&parent.id.to_string(), true)
+            .await
+            .unwrap();
+
+        manager
+            .resume_session(&child, "let me look at what you did", None)
+            .await
+            .expect("a person's resume is not a late delegation: it opens");
+        assert!(manager.is_session_active(&child).await);
+
+        // The invariant still holds for delegations: a NEW child of the cancelled parent…
+        let late = manager
+            .create_session(&delegation_of(parent.id))
+            .await
+            .expect_err("a late delegation is refused");
+        assert!(
+            super::super::cancelled_parents::ParentCancelled::in_chain(&late).is_some(),
+            "{late:#}"
+        );
+        // …and the warm pool resuming a child for a delegation.
+        manager.close_session(&child).await.unwrap();
+        let warm = super::super::cancelled_parents::as_delegation(
+            manager.resume_session(&child, "again", None),
+        )
+        .await
+        .expect_err("a delegation's resume is refused");
+        assert!(
+            super::super::cancelled_parents::ParentCancelled::in_chain(&warm).is_some(),
+            "{warm:#}"
+        );
     }
 
     /// B36-RACE, criterion 5 — no regression: a session without a parent, a child whose
@@ -24405,6 +24729,7 @@ mod tests {
             canonical: Some("Bash".into()),
             tool_use_id: None,
             always: None,
+            consent: None,
         };
         handle.emit(ask("refused")).await;
         handle.emit(ask("allowed")).await;
@@ -24462,6 +24787,7 @@ mod tests {
             canonical: Some("Bash".into()),
             tool_use_id: None,
             always: None,
+            consent: None,
         };
         handle.emit(ask("won")).await;
         handle.emit(ask("pending")).await;
@@ -24526,6 +24852,7 @@ mod tests {
             canonical: Some("Bash".into()),
             tool_use_id: None,
             always: None,
+            consent: None,
         })
         .unwrap();
         let tail = [
@@ -27785,6 +28112,7 @@ mod tests {
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
             active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+            tool_start_descendants: Arc::new(Mutex::new(HashMap::new())),
             cli_background_tasks: Arc::new(AtomicUsize::new(0)),
             cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_task_cap: CANCEL_TASK_CAP,
@@ -28407,6 +28735,7 @@ mod tests {
                 canonical: None,
                 tool_use_id: None,
                 always: None,
+                consent: None,
             },
             ChatEvent::Error {
                 message: "Something went wrong".into(),
@@ -29309,7 +29638,7 @@ mod tests {
 
         // Re-read and verify
         let contents = std::fs::read_to_string(&yaml_path).unwrap();
-        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+        let doc = crate::yaml::value_from_str(&contents).unwrap();
 
         // Other sections preserved
         assert_eq!(
@@ -29365,7 +29694,7 @@ mod tests {
         // File should now exist
         assert!(yaml_path.exists());
         let contents = std::fs::read_to_string(&yaml_path).unwrap();
-        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+        let doc = crate::yaml::value_from_str(&contents).unwrap();
 
         assert_eq!(
             doc["chat"]["permissions"]["mode"].as_str().unwrap(),
@@ -29470,7 +29799,7 @@ mod tests {
 
         // Verify it was persisted to disk
         let contents = std::fs::read_to_string(&yaml_path).unwrap();
-        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+        let doc = crate::yaml::value_from_str(&contents).unwrap();
         assert_eq!(
             doc["chat"]["permissions"]["mode"].as_str().unwrap(),
             "acceptEdits"
@@ -29549,6 +29878,7 @@ mod tests {
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
             active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+            tool_start_descendants: Arc::new(Mutex::new(HashMap::new())),
             cli_background_tasks: Arc::new(AtomicUsize::new(0)),
             cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_task_cap: CANCEL_TASK_CAP,
@@ -30967,23 +31297,14 @@ mod tests {
         ChatManager::persist_env_config_to_yaml(&yaml_path, &env).unwrap();
 
         let contents = std::fs::read_to_string(&yaml_path).unwrap();
-        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+        let doc = crate::yaml::value_from_str(&contents).unwrap();
         let chat = doc["chat"].as_mapping().unwrap();
         assert_eq!(
-            chat[&serde_yaml::Value::String("process_path".into())]
-                .as_str()
-                .unwrap(),
+            chat["process_path"].as_str().unwrap(),
             "/custom/path:/usr/bin"
         );
-        assert_eq!(
-            chat[&serde_yaml::Value::String("claude_cli_path".into())]
-                .as_str()
-                .unwrap(),
-            "/opt/claude"
-        );
-        assert!(chat[&serde_yaml::Value::String("auto_update_cli".into())]
-            .as_bool()
-            .unwrap());
+        assert_eq!(chat["claude_cli_path"].as_str().unwrap(), "/opt/claude");
+        assert!(chat["auto_update_cli"].as_bool().unwrap());
     }
 
     #[test]
@@ -31008,7 +31329,7 @@ mod tests {
         ChatManager::persist_env_config_to_yaml(&yaml_path, &env).unwrap();
 
         let contents = std::fs::read_to_string(&yaml_path).unwrap();
-        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+        let doc = crate::yaml::value_from_str(&contents).unwrap();
 
         // server section preserved
         assert_eq!(doc["server"]["port"].as_u64().unwrap(), 6600);
@@ -31054,13 +31375,13 @@ mod tests {
         ChatManager::persist_env_config_to_yaml(&yaml_path, &env2).unwrap();
 
         let contents = std::fs::read_to_string(&yaml_path).unwrap();
-        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+        let doc = crate::yaml::value_from_str(&contents).unwrap();
 
         // All fields should be removed
         let chat = doc["chat"].as_mapping().unwrap();
-        assert!(!chat.contains_key(serde_yaml::Value::String("process_path".into())));
-        assert!(!chat.contains_key(serde_yaml::Value::String("claude_cli_path".into())));
-        assert!(!chat.contains_key(serde_yaml::Value::String("auto_update_cli".into())));
+        assert!(!chat.contains_key("process_path"));
+        assert!(!chat.contains_key("claude_cli_path"));
+        assert!(!chat.contains_key("auto_update_cli"));
     }
 
     // ================================================================
@@ -32315,6 +32636,116 @@ mod tests {
             pid.is_some(),
             "the process forked 2.5 s into the window was claimed (a single reading \
              at 1 s would have missed it)"
+        );
+    }
+
+    /// Task 51f87943: the CLI forks a background Bash right after it prints the
+    /// complete call, often before this server reads the CLI's descendants on
+    /// that `ToolUse`. The reference of the claim is the reading taken when the
+    /// call STARTED (`ContentBlockStart`, empty input), so the process is still
+    /// a newcomer: claimed, and the Stop reaches it. Read on the second pass (as
+    /// before), the process was already in the reference: never claimed,
+    /// `cancel_task` signalled nothing.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_background_process_forked_before_the_full_tool_use_is_claimed_and_stopped() {
+        use std::io::Write as _;
+        use std::process::Stdio;
+
+        // A "CLI" that forks nothing until it is told to (`read` is a builtin).
+        let mut cli = std::process::Command::new("bash")
+            .args(["-c", "read line; sleep 30 & wait"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let cli_pid = cli.id();
+        let mut stdin = cli.stdin.take().expect("stdin is piped");
+
+        let (mut session, _) = create_dummy_session(false, "", vec![]);
+        session.child_pid = Some(cli_pid);
+        let (events_tx, tasks) = (
+            session.events_tx.clone(),
+            session.active_background_tasks.clone(),
+        );
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-early".into(), session);
+        let track = |input: serde_json::Value| {
+            let sessions = manager.active_sessions.clone();
+            let events_tx = events_tx.clone();
+            async move {
+                ChatManager::track_background_task_start(
+                    "s-early",
+                    &sessions,
+                    &events_tx,
+                    &None,
+                    "tool_Early",
+                    "Bash",
+                    &input,
+                    None,
+                )
+                .await
+            }
+        };
+
+        // The call starts (ContentBlockStart): nothing tracked yet.
+        assert!(!track(serde_json::json!({})).await);
+        // The CLI forks the tool ...
+        stdin.write_all(b"go\n").unwrap();
+        stdin.flush().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let child = loop {
+            if let Some(pid) = ChatManager::get_descendant_pids(cli_pid).first() {
+                break *pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "the CLI forked");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        // ... before this server sees the complete call.
+        assert!(track(serde_json::json!({"command": "sleep 30", "run_in_background": true})).await);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        let claimed = loop {
+            let pid = tasks.lock().await["tool_Early"].pid;
+            if pid.is_some() || std::time::Instant::now() >= deadline {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let stop = if claimed.is_some() {
+            Some(manager.cancel_task("s-early", "tool_Early").await.unwrap())
+        } else {
+            None
+        };
+        // Cleanup before asserting, so a failure does not leak the processes.
+        unsafe { libc::kill(child as i32, libc::SIGKILL) };
+        let _ = cli.kill();
+        let _ = cli.wait();
+        assert_eq!(
+            claimed,
+            Some(child),
+            "the process forked before the full ToolUse was claimed"
+        );
+        let stop = stop.unwrap();
+        assert!(stop.killed_pids.contains(&child), "{stop:?}");
+        assert!(
+            manager
+                .active_sessions
+                .read()
+                .await
+                .get("s-early")
+                .unwrap()
+                .tool_start_descendants
+                .lock()
+                .await
+                .is_empty(),
+            "the start reading was taken back by the second pass"
         );
     }
 
@@ -34115,6 +34546,7 @@ pub(crate) mod test_support {
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
             active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+            tool_start_descendants: Arc::new(Mutex::new(HashMap::new())),
             cli_background_tasks: Arc::new(AtomicUsize::new(0)),
             cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_task_cap: CANCEL_TASK_CAP,
@@ -35378,6 +35810,7 @@ mod granted_answer_clock_tests {
                 canonical: None,
                 tool_use_id: Some("t1".into()),
                 always: None,
+                consent: None,
             },
             chrono::Utc::now(),
         );

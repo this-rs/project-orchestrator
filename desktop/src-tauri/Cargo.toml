@@ -34,9 +34,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # HTTP client (for health check — blocking needed for pre-Tauri startup)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 
-# YAML config generation
-serde_yaml = "0.9"
-
 # Random secret generation
 rand = "0.10"
 
@@ -59,10 +56,25 @@ tauri-plugin-opener = "2.5.4"
 tauri-plugin-dialog = "2"
 tauri-plugin-websocket = "2"
 
-# macOS native rounded corners
+# macOS native window styling (rounded corners, dark background, traffic lights).
+# Same objc2 versions as Tauri/wry/tao already pull: no second copy of the bindings.
 [target.'cfg(target_os = "macos")'.dependencies]
-cocoa = "0.27"
-objc = "0.2"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "NSGeometry"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "objc2-quartz-core",
+    "NSAppearance",
+    "NSButton",
+    "NSColor",
+    "NSControl",
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "CALayer"] }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "objc2-app-kit", "WKWebView"] }
 
 [features]
 default = ["custom-protocol", "local-embeddings"]

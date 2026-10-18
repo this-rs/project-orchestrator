@@ -59,6 +59,51 @@ pub async fn reinforce_per_project(
     }
 }
 
+/// The notes of `project` only, duplicates merged.
+///
+/// The energy boost follows the same rule as the chat (`neural_reinforcement`):
+/// a caller warms the notes of ITS project, never those of another project
+/// that happen to be anchored on the same path, and never global notes.
+pub fn of_project(notes: Vec<Note>, project: Uuid) -> Vec<Note> {
+    let mut out: Vec<Note> = Vec::with_capacity(notes.len());
+    for note in notes {
+        if note.project_id == Some(project) && !out.iter().any(|n| n.id == note.id) {
+            out.push(note);
+        }
+    }
+    out
+}
+
+/// The notes anchored on an entity that belong to `project`.
+pub async fn project_notes_for_entity(
+    graph: &dyn GraphStore,
+    entity_type: &super::models::EntityType,
+    entity_id: &str,
+    project: Uuid,
+) -> Result<Vec<Note>> {
+    let notes = graph.get_notes_for_entity(entity_type, entity_id).await?;
+    Ok(of_project(notes, project))
+}
+
+/// Of `ids`, the ones that are notes of `project` (order kept, duplicates
+/// merged). Other ids (decisions, unknown ids, notes of another project or
+/// global notes) are dropped: `boost_energy` and `reinforce_synapses` only act
+/// on notes, and only on those of the caller's project.
+pub async fn note_ids_of_project(graph: &dyn GraphStore, ids: &[Uuid], project: Uuid) -> Vec<Uuid> {
+    let mut out: Vec<Uuid> = Vec::with_capacity(ids.len());
+    for id in ids {
+        if out.contains(id) {
+            continue;
+        }
+        if let Ok(Some(note)) = graph.get_note(*id).await {
+            if note.project_id == Some(project) {
+                out.push(*id);
+            }
+        }
+    }
+    out
+}
+
 /// Project of a chat session (its `project_slug` resolved), if any.
 pub async fn session_project_id(graph: &dyn GraphStore, session_id: Uuid) -> Option<Uuid> {
     let session = graph.get_chat_session(session_id).await.ok().flatten()?;
@@ -128,6 +173,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn project_filters_keep_only_the_notes_of_the_project() {
+        let mock = MockGraphStore::new();
+        let (p, q) = (Uuid::new_v4(), Uuid::new_v4());
+        let (a, b, g) = (note(Some(p)), note(Some(q)), note(None));
+        for n in [&a, &b, &g] {
+            mock.create_note(n).await.unwrap();
+        }
+        let kept = of_project(vec![a.clone(), b.clone(), g.clone(), a.clone()], p);
+        assert_eq!(kept.iter().map(|n| n.id).collect::<Vec<_>>(), vec![a.id]);
+        let ghost = Uuid::new_v4();
+        let ids = note_ids_of_project(&mock, &[b.id, a.id, g.id, ghost, a.id], p).await;
+        assert_eq!(ids, vec![a.id]);
     }
 
     #[test]

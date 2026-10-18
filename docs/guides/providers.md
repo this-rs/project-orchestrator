@@ -206,6 +206,9 @@ policy. The network tools follow the project's consent, per **origin** (scheme, 
    `{"kind":"provider","value":"tool:brave"}`, naming exactly that secret. The project then consents to
    the engine's origin (`https://api.search.brave.com` for Brave). A locked vault or a missing grant
    leaves the engine out of the session; no fallback.
+   Several engines are tried in order, falling back down the list: the order is chosen with
+   `PUT /api/chat/search-engines` `{"order": ["home", "brave"]}` (Settings → Network tools); without
+   a choice, by id.
 
    **Keyless: Obscura.** `{"id": "obscura", "engine": "obscura", "credential_ref": "none"}` (no
    `base_url`, no key). Each query runs `<obscura> serp --max-results N -- <query>` (the

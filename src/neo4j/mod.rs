@@ -36,6 +36,7 @@ pub mod segment;
 mod sharing;
 mod skill;
 mod step;
+mod synapse_shadow;
 mod task;
 mod topology;
 pub mod traits;

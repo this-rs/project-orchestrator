@@ -1217,6 +1217,13 @@ impl GraphStore for Neo4jClient {
         self.get_decision_project_id(decision_id).await
     }
 
+    async fn get_decision_project_ids(
+        &self,
+        decision_ids: &[Uuid],
+    ) -> anyhow::Result<std::collections::HashMap<Uuid, Uuid>> {
+        self.get_decision_project_ids(decision_ids).await
+    }
+
     async fn update_decision(
         &self,
         decision_id: Uuid,
@@ -2277,6 +2284,68 @@ impl GraphStore for Neo4jClient {
         prune_threshold: f64,
     ) -> anyhow::Result<(usize, usize)> {
         self.decay_synapses(decay_amount, prune_threshold).await
+    }
+
+    async fn shadow_synapse_edges(
+        &self,
+        project_id: Uuid,
+        from: &[Uuid],
+    ) -> anyhow::Result<Vec<crate::neurons::synaptic_shadow::ShadowEdgeRow>> {
+        self.shadow_synapse_edges(project_id, from).await
+    }
+
+    async fn reward_shadow_synapses(
+        &self,
+        project_id: Uuid,
+        pairs: &[(Uuid, Uuid)],
+        delta: f64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<usize> {
+        self.reward_shadow_synapses(project_id, pairs, delta, now)
+            .await
+    }
+
+    async fn decay_shadow_synapses(
+        &self,
+        scope: &crate::neurons::synaptic_shadow::ShadowDecayScope,
+        half_life_days: f64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<usize> {
+        self.decay_shadow_synapses(scope, half_life_days, now).await
+    }
+
+    async fn record_synapse_shadow_trace(
+        &self,
+        trace: &crate::neurons::synaptic_shadow::SynapseShadowTrace,
+        keep: usize,
+    ) -> anyhow::Result<()> {
+        self.record_synapse_shadow_trace(trace, keep).await
+    }
+
+    async fn list_synapse_shadow_traces(
+        &self,
+        filter: &crate::neurons::synaptic_shadow::ShadowTraceFilter,
+    ) -> anyhow::Result<Vec<crate::neurons::synaptic_shadow::SynapseShadowTrace>> {
+        self.list_synapse_shadow_traces(filter).await
+    }
+
+    async fn get_synapse_shadow_trace(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<crate::neurons::synaptic_shadow::SynapseShadowTrace>> {
+        self.get_synapse_shadow_trace(id).await
+    }
+
+    async fn claim_shadow_trace_reward(&self, trace_id: Uuid, key: &str) -> anyhow::Result<bool> {
+        self.claim_shadow_trace_reward(trace_id, key).await
+    }
+
+    async fn shadow_trace_closures(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(Uuid, crate::neurons::synaptic_shadow::TaskClosure)>> {
+        self.shadow_trace_closures(cutoff, limit).await
     }
 
     async fn apply_scars(&self, node_ids: &[Uuid], increment: f64) -> anyhow::Result<usize> {

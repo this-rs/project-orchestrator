@@ -490,6 +490,9 @@
         // -- Claude Code CLI (informational — setup wizard handles blocking) --
         if (deps.claudeCodeAvailable) {
           setCheck('check-claude', 'success');
+        } else if (deps.claudeCodeOptional) {
+          // Another provider (or no config yet): Claude Code is optional.
+          setCheck('check-claude', 'skipped', 'Optional — only needed for the Claude Code provider');
         } else {
           setCheck('check-claude', 'warning', 'Not detected — install via setup wizard');
         }

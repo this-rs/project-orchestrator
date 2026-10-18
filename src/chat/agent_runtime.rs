@@ -402,6 +402,13 @@ pub const NEXUS_TOOLS_FEATURE: &str = "nexus_tools";
 /// `ChatManager::carries_per_session_mcp`).
 pub const PO_TOOLS_FEATURE: &str = "project_orchestrator_tools";
 
+/// The identifier of a native session whose conversation is kept in MEMORY only: the
+/// directory its transcripts would be written to lies inside a git work tree (a versioned
+/// HOME, a data directory placed in a project), where a `git add -A` would publish them
+/// (`transcripts::inside_git_worktree`, CTX6). The session works, but does not resume
+/// after a server restart. The HOST knows it, so it is added at adoption.
+pub const RESUME_AFTER_RESTART_FEATURE: &str = "resume_after_restart";
+
 /// The identifier of a session whose provider has no sub-agents of its own
 /// (`SubagentSupport::None`) and that the host gives no fallback: the backend runs the
 /// `Agent` calls as child sessions for the native harness only
@@ -873,6 +880,7 @@ impl AgentSessionHandle {
             input,
             canonical,
             always,
+            consent,
             ..
         } = &mut event
         {
@@ -882,13 +890,43 @@ impl AgentSessionHandle {
                 canonical: canonical.clone(),
                 input: input.clone(),
             };
-            // Whether this very call may be answered `always` (the client offers it then).
-            *always = self
-                .session_grants
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .lasting_grant_for(&call)
-                .map(|_| true);
+            // A question about a DESTINATION (N23b, CONSENT-WIRE): its subject is named on the
+            // wire by the very functions the answer path records with
+            // (`deliver_permission_answer`), so what the person is shown is what PO keeps.
+            *consent =
+                super::provider::nexus_tools::consent_subject(tool, canonical.as_deref(), input)
+                    .map(|subject| super::types::ConsentSubject {
+                        subject,
+                        destinations: super::provider::nexus_tools::destinations_of(
+                            tool,
+                            canonical.as_deref(),
+                            input,
+                        ),
+                    });
+            // Whether this very question may be answered `always` (the client offers it then).
+            // About a destination: the project's network consent, kept only by a session that
+            // keeps lasting rules in a project (`keep_origin_consents`), on a provider that
+            // offers `always`. About a call: the backend's comparator for that call.
+            *always = if consent.is_some() {
+                let offers_always = self
+                    .offered_capabilities()
+                    .permission_scopes
+                    .contains(&PermissionScope::Always);
+                let grants = self
+                    .session_grants
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                (offers_always
+                    && grants.keeps_lasting(self.asker)
+                    && grants.lasting_scope().is_some())
+                .then_some(true)
+            } else {
+                self.session_grants
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .lasting_grant_for(&call)
+                    .map(|_| true)
+            };
             covered = Box::pin(super::session_grants::cover(&self.session_grants, &call))
                 .await
                 .map(|cover| (id.clone(), cover));
@@ -1147,12 +1185,34 @@ impl AgentSessionHandle {
     /// relayed history (B-SW) goes in front of the user's message without becoming
     /// part of it.
     pub async fn send_message_relayed(self: &Arc<Self>, shown: &str, sent: &str) -> Result<()> {
+        // `/compact` the host runs itself (ISO3). Not behind a relayed history: the relay
+        // must reach the model, so that message stays a turn.
+        let compaction = if shown == sent {
+            self.manual_compaction(shown)
+        } else {
+            None
+        };
         {
             // `is_streaming` is read and set under the queue lock, the lock the end
             // of a turn holds to decide there is nothing left to drain: a message
             // is either seen by the running turn or starts its own.
             let mut queue = self.pending.lock().await;
             if self.is_streaming.load(Ordering::SeqCst) {
+                if compaction.is_some() {
+                    // Never queued behind the turn nor interrupting it: refused, with the
+                    // code nexus gives a `compact` during a turn.
+                    drop(queue);
+                    self.emit(ChatEvent::UserMessage {
+                        content: shown.to_string(),
+                    })
+                    .await;
+                    self.count_user_message().await;
+                    self.emit(super::manual_compaction::refusal_event(
+                        &ProviderError::TurnInProgress,
+                    ))
+                    .await;
+                    return Ok(());
+                }
                 queue.push_back(PendingMessage::user(shown.to_string()));
                 drop(queue);
                 self.interrupt_for_the_queue().await;
@@ -1161,6 +1221,65 @@ impl AgentSessionHandle {
             self.is_streaming.store(true, Ordering::SeqCst);
         }
         self.start(PendingMessageKind::User, shown, sent).await
+    }
+
+    /// `Some(instructions)` when `text` is `/compact` and this host runs it: every
+    /// provider but Claude Code, whose CLI reads the command itself (it stays a turn).
+    fn manual_compaction(&self, text: &str) -> Option<Option<String>> {
+        if self.asker == super::session_grants::Asker::ClaudeCode {
+            return None;
+        }
+        super::manual_compaction::compact_command(text)
+    }
+
+    /// Runs `/compact` (`is_streaming` held by the caller, no turn of the provider
+    /// running): the message is shown and counted like any, then the provider is asked
+    /// to compact — when it declares `compaction_manual`, else a typed refusal. The
+    /// `compaction` events come out of turn from the provider; the outcome is said here.
+    /// A compaction that ran ends like a turn that compacted (`after_turn`): the work
+    /// context is restored in front of the next turn, as after an automatic one.
+    async fn compact_on_request(&self, shown: &str, instructions: Option<String>) {
+        self.interrupted.store(false, Ordering::SeqCst);
+        self.emit(ChatEvent::UserMessage {
+            content: shown.to_string(),
+        })
+        .await;
+        self.count_user_message().await;
+        if !self.capabilities.compaction_manual {
+            tracing::info!(session_id = %self.session_id, "/compact refused: the provider does not declare compaction_manual");
+            self.emit(super::manual_compaction::refusal_event(
+                &ProviderError::unsupported("compaction_manual"),
+            ))
+            .await;
+            return;
+        }
+        self.emit(ChatEvent::StreamingStatus { is_streaming: true })
+            .await;
+        match self.session.compact(instructions).await {
+            Ok(outcome) => {
+                tracing::info!(
+                    session_id = %self.session_id,
+                    compacted = outcome.compacted,
+                    messages_summarised = outcome.messages_summarised,
+                    "manual compaction"
+                );
+                self.emit(super::manual_compaction::outcome_event(&outcome))
+                    .await;
+                if outcome.compacted {
+                    self.after_turn(&TurnOutcome {
+                        compacted: true,
+                        context_window: self.capabilities.context_window.map(|w| w.value),
+                        ..TurnOutcome::default()
+                    })
+                    .await;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(session_id = %self.session_id, %error, "manual compaction failed");
+                self.emit(super::manual_compaction::refusal_event(&error))
+                    .await;
+            }
+        }
     }
 
     /// Holds a user message until the running turn ends — it interrupts nothing
@@ -1231,6 +1350,20 @@ impl AgentSessionHandle {
         shown: &str,
         sent: &str,
     ) -> Result<()> {
+        if kind == PendingMessageKind::User && shown == sent {
+            if let Some(instructions) = self.manual_compaction(shown) {
+                // Like a turn: in the background, `is_streaming` held (a message sent
+                // meanwhile is queued, and its interrupt stops the summary as it stops a
+                // turn), then the queue is played.
+                let me = Arc::clone(self);
+                let shown = shown.to_string();
+                tokio::spawn(async move {
+                    me.compact_on_request(&shown, instructions).await;
+                    me.drive(None).await;
+                });
+                return Ok(());
+            }
+        }
         match self.open_turn(kind, shown, sent).await {
             // `None`: stopped while it was prepared, only the queue is left to play.
             Ok(first) => {
@@ -1382,6 +1515,13 @@ impl AgentSessionHandle {
             let Some(next) = self.next_queued().await else {
                 return;
             };
+            // A `/compact` held until the turn ended runs now, between two turns.
+            if next.kind == PendingMessageKind::User {
+                if let Some(instructions) = self.manual_compaction(&next.content) {
+                    self.compact_on_request(&next.content, instructions).await;
+                    continue;
+                }
+            }
             match self
                 .open_turn(next.kind, &next.content, &next.content)
                 .await
@@ -2836,6 +2976,8 @@ pub(crate) mod fake {
         pub hold_answers: StdMutex<Option<Arc<tokio::sync::Notify>>>,
         /// The same, for the answers that allow only (a denial is taken at once).
         pub hold_allows: StdMutex<Option<Arc<tokio::sync::Notify>>>,
+        /// The instructions of every `compact` asked (ISO3).
+        pub compactions: StdMutex<Vec<Option<String>>>,
     }
 
     impl FakeState {
@@ -2965,6 +3107,24 @@ pub(crate) mod fake {
         ) -> Result<(), ProviderError> {
             self.state.modes.lock().unwrap().push(mode);
             Ok(())
+        }
+        async fn compact(
+            &self,
+            instructions: Option<String>,
+        ) -> Result<nexus_claude::agent::CompactOutcome, ProviderError> {
+            self.state.compactions.lock().unwrap().push(instructions);
+            if !self.caps.compaction_manual {
+                return Err(ProviderError::unsupported("compaction_manual"));
+            }
+            if self.state.turn_tx.lock().unwrap().is_some() {
+                return Err(ProviderError::TurnInProgress);
+            }
+            Ok(nexus_claude::agent::CompactOutcome {
+                compacted: true,
+                tokens_before: Some(9000),
+                tokens_after: Some(1200),
+                messages_summarised: 14,
+            })
         }
         fn out_of_band(&self) -> Option<EventStream> {
             self.oob.lock().unwrap().take()
@@ -3606,6 +3766,7 @@ mod adopt_tests {
             canonical: Some("Write".into()),
             tool_use_id: None,
             always: None,
+            consent: None,
         };
         handle.emit(write("write-1")).await;
         // The provider takes the answer, and does not return yet.
@@ -3683,6 +3844,7 @@ mod adopt_tests {
             canonical: Some("WebFetch".into()),
             tool_use_id: None,
             always: None,
+            consent: None,
         }
     }
 
@@ -3860,6 +4022,153 @@ mod adopt_tests {
         }
     }
 
+    /// The permission request a person sees, as the client receives it (decorated by `emit`).
+    async fn emitted_request(rx: &mut broadcast::Receiver<ChatEvent>, id: &str) -> ChatEvent {
+        while let Ok(event) = rx.try_recv() {
+            if matches!(&event, ChatEvent::PermissionRequest { id: got, .. } if got == id) {
+                return event;
+            }
+        }
+        panic!("no permission_request {id} was emitted");
+    }
+
+    async fn origin_handle(
+        runtime: &AgentRuntime,
+        provider: &FakeProvider,
+        sid: &str,
+        lasting: Option<super::super::lasting_rules::LastingScope>,
+    ) -> Arc<AgentSessionHandle> {
+        provider.caps.lock().unwrap().permission_scopes = vec![
+            PermissionScope::Once,
+            PermissionScope::Session,
+            PermissionScope::Always,
+        ];
+        runtime
+            .adopt_declaring(
+                sid,
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+                Vec::new(),
+                super::super::session_grants::SessionGrants::declaring(Vec::new())
+                    .with_lasting(lasting),
+            )
+            .await
+    }
+
+    /// CONSENT-WIRE: a question about a DESTINATION names, on the wire, the subject PO asserts
+    /// from the call (`https://` once upgraded) and every form `always` will write — and the
+    /// answer records EXACTLY those, so what the person approves is what PO keeps.
+    #[tokio::test]
+    async fn an_origin_question_names_its_subject_and_the_answer_keeps_exactly_it() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(Arc::clone(&graph));
+        let provider = FakeProvider::new();
+        let root = tempfile::tempdir().unwrap();
+        let handle = origin_handle(
+            &runtime,
+            &provider,
+            "consent-wire",
+            Some(lasting_scope_of(root.path())),
+        )
+        .await;
+        let mut rx = handle.events_tx.subscribe();
+        handle.emit(fetch_request("p1", "http://docs.rs/x")).await;
+
+        let ChatEvent::PermissionRequest {
+            consent, always, ..
+        } = emitted_request(&mut rx, "p1").await
+        else {
+            unreachable!()
+        };
+        let consent = consent.expect("a question about a destination names its subject");
+        assert_eq!(
+            consent.subject, "https://docs.rs",
+            "the endpoint really reached"
+        );
+        assert_eq!(
+            consent.destinations,
+            vec!["http://docs.rs".to_string(), "https://docs.rs".to_string()],
+            "every form the gate judges"
+        );
+        assert_eq!(
+            always,
+            Some(true),
+            "a human session in a project may keep the origin for good"
+        );
+
+        // The answer path keeps the very destinations the wire named, no more, no less.
+        handle
+            .answer_permission_scoped("p1", true, PermissionAnswerScope::Always)
+            .await
+            .expect("the answer is delivered");
+        for origin in &consent.destinations {
+            let (scope, key) = consent_key(origin);
+            assert!(
+                graph.get_llm_setting(&scope, &key).await.unwrap().is_some(),
+                "{origin} was shown and must be kept"
+            );
+        }
+    }
+
+    /// CONSENT-WIRE: an ordinary tool permission is serialized exactly as before — no `consent`
+    /// key at all — so nothing changes for a client that never meets a destination.
+    #[tokio::test]
+    async fn an_ordinary_tool_permission_carries_no_consent() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(Arc::clone(&graph));
+        let provider = FakeProvider::new();
+        let handle = origin_handle(&runtime, &provider, "consent-wire-bash", None).await;
+        let mut rx = handle.events_tx.subscribe();
+        handle
+            .emit(ChatEvent::PermissionRequest {
+                id: "b1".into(),
+                tool: "Bash".into(),
+                input: serde_json::json!({ "command": "ls" }),
+                parent_tool_use_id: None,
+                category: Some("command".into()),
+                canonical: Some("Bash".into()),
+                tool_use_id: None,
+                always: None,
+                consent: None,
+            })
+            .await;
+        let event = emitted_request(&mut rx, "b1").await;
+        let ChatEvent::PermissionRequest { consent, .. } = &event else {
+            unreachable!()
+        };
+        assert!(consent.is_none());
+        let wire = serde_json::to_value(&event).unwrap();
+        assert!(wire.get("consent").is_none(), "no key on the wire: {wire}");
+    }
+
+    /// CONSENT-WIRE: a session that cannot keep a lasting consent (no project, nobody whose
+    /// `always` it would be) still names the subject, but never offers `always`: the client
+    /// would offer an answer the backend refuses (`keep_origin_consents`).
+    #[tokio::test]
+    async fn without_a_project_an_origin_question_never_offers_always() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(Arc::clone(&graph));
+        let provider = FakeProvider::new();
+        let handle = origin_handle(&runtime, &provider, "consent-wire-nowhere", None).await;
+        let mut rx = handle.events_tx.subscribe();
+        handle.emit(fetch_request("p1", "https://docs.rs/x")).await;
+        let ChatEvent::PermissionRequest {
+            consent, always, ..
+        } = emitted_request(&mut rx, "p1").await
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            consent.map(|c| c.subject).as_deref(),
+            Some("https://docs.rs")
+        );
+        assert_eq!(always, None, "`always` would be refused: not offered");
+    }
+
     /// Follow-up review of #726, point 1: the request carrying a `session` answer is
     /// cancelled (the client dropped its HTTP or WebSocket request) while the provider
     /// takes it. The grant made pending for that time is rolled back: the identical call
@@ -3891,6 +4200,7 @@ mod adopt_tests {
             canonical: Some("Write".into()),
             tool_use_id: None,
             always: None,
+            consent: None,
         };
         handle.emit(write("write-1")).await;
         let hold = Arc::new(tokio::sync::Notify::new());
@@ -3949,6 +4259,7 @@ mod adopt_tests {
             canonical: Some("Edit".into()),
             tool_use_id: None,
             always: None,
+            consent: None,
         };
         // The first patch (README.md): `session` refused, nothing answered; `once` goes.
         handle.emit(patch("patch-readme")).await;
@@ -4003,6 +4314,7 @@ mod adopt_tests {
             canonical: Some("Write".into()),
             tool_use_id: None,
             always: None,
+            consent: None,
         };
         native.emit(write("write-1")).await;
         native
@@ -4060,6 +4372,7 @@ mod adopt_tests {
             canonical: Some("Write".into()),
             tool_use_id: None,
             always: None,
+            consent: None,
         };
         native.emit(write("write-0")).await;
         assert!(!native.answers_itself("write-0"), "waits for the user");
@@ -4088,6 +4401,7 @@ mod adopt_tests {
                 canonical: Some("Bash".into()),
                 tool_use_id: None,
                 always: None,
+                consent: None,
             })
             .await;
         assert!(!native.answers_itself("bash-1"));
@@ -4123,6 +4437,7 @@ mod adopt_tests {
             canonical: Some("Bash".into()),
             tool_use_id: None,
             always: None,
+            consent: None,
         };
         let first = adopt().await;
         first.emit(bash("old-1")).await;
@@ -4419,6 +4734,184 @@ mod session_record_tests {
             )
             .await;
         (graph, provider, handle)
+    }
+
+    /// A session of `kind` whose provider declares (or not) `compaction_manual`, with its
+    /// events subscribed.
+    async fn compact_rig(
+        kind: &str,
+        manual: bool,
+    ) -> (
+        FakeProvider,
+        Arc<AgentSessionHandle>,
+        broadcast::Receiver<ChatEvent>,
+    ) {
+        let graph = Arc::new(MockGraphStore::new());
+        let node = crate::test_helpers::test_chat_session(None);
+        graph.create_chat_session(&node).await.unwrap();
+        let dyn_graph: Arc<dyn GraphStore> = graph;
+        let runtime = AgentRuntime::new(dyn_graph);
+        let provider = FakeProvider::new();
+        provider.caps.lock().unwrap().compaction_manual = manual;
+        let handle = runtime
+            .adopt(
+                &node.id.to_string(),
+                "local",
+                provider.session(),
+                1,
+                kind,
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        let rx = handle.events_tx.subscribe();
+        (provider, handle, rx)
+    }
+
+    /// The events of `rx` until the session is idle again (bounded).
+    async fn until_idle(
+        handle: &AgentSessionHandle,
+        rx: &mut broadcast::Receiver<ChatEvent>,
+    ) -> Vec<ChatEvent> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        loop {
+            while let Ok(event) = rx.try_recv() {
+                seen.push(event);
+            }
+            if !handle.is_streaming.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                while let Ok(event) = rx.try_recv() {
+                    seen.push(event);
+                }
+                return seen;
+            }
+            assert!(Instant::now() < deadline, "the session never went idle");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// ISO3: on a provider that declares `compaction_manual`, `/compact <instructions>`
+    /// is a compaction with those instructions, never a turn; the outcome is said.
+    #[tokio::test]
+    async fn slash_compact_compacts_with_its_instructions_instead_of_sending_a_turn() {
+        let (provider, handle, mut rx) = compact_rig("native", true).await;
+        handle
+            .send_message("/compact keep the API decisions")
+            .await
+            .unwrap();
+        let seen = until_idle(&handle, &mut rx).await;
+        assert_eq!(
+            *provider.state.compactions.lock().unwrap(),
+            vec![Some("keep the API decisions".to_string())]
+        );
+        assert!(
+            provider.state.turns_started.lock().unwrap().is_empty(),
+            "/compact reached the model as a turn"
+        );
+        assert!(seen
+            .iter()
+            .any(|e| matches!(e, ChatEvent::UserMessage { content }
+            if content == "/compact keep the API decisions")));
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, ChatEvent::SystemHint { content }
+                if content.contains("14 message(s) summarised"))),
+            "{seen:?}"
+        );
+        // The session takes the next message as a turn.
+        handle.send_message("go on").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while provider.state.turns_started.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the next turn never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Without the capability (Codex, ACP...): a typed refusal, no turn, no crash.
+    #[tokio::test]
+    async fn slash_compact_without_the_capability_is_a_typed_refusal() {
+        let (provider, handle, mut rx) = compact_rig("codex", false).await;
+        handle.send_message("/compact").await.unwrap();
+        let seen = until_idle(&handle, &mut rx).await;
+        assert!(provider.state.turns_started.lock().unwrap().is_empty());
+        assert!(provider.state.compactions.lock().unwrap().is_empty());
+        assert!(
+            seen.iter().any(
+                |e| matches!(e, ChatEvent::Error { code: Some(c), reason: Some(r), .. }
+                if c == "compaction_refused" && r == "compaction_manual")
+            ),
+            "{seen:?}"
+        );
+    }
+
+    /// On Claude Code the CLI reads `/compact` itself: it stays a turn, as before.
+    #[tokio::test]
+    async fn slash_compact_on_claude_code_stays_a_turn_for_the_cli() {
+        let (provider, handle, _rx) = compact_rig("claude_code", false).await;
+        handle.send_message("/compact keep it short").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while provider.state.turns_started.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the turn never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(provider.state.turns_started.lock().unwrap()[0].contains("/compact keep it short"));
+        assert!(provider.state.compactions.lock().unwrap().is_empty());
+    }
+
+    /// While a turn runs, `/compact` is refused with nexus' code: not queued, and the
+    /// turn is not interrupted.
+    #[tokio::test]
+    async fn slash_compact_during_a_turn_is_refused_without_interrupting_it() {
+        let (provider, handle, mut rx) = compact_rig("native", true).await;
+        handle.send_message("a long turn").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while provider.state.turns_started.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the turn never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        handle.send_message("/compact").await.unwrap();
+        assert!(provider.state.interrupts.lock().unwrap().is_empty());
+        assert!(handle.queue_snapshot().await.is_empty());
+        assert!(provider.state.compactions.lock().unwrap().is_empty());
+        provider.state.push(done(None));
+        let seen = until_idle(&handle, &mut rx).await;
+        assert!(
+            seen.iter().any(
+                |e| matches!(e, ChatEvent::Error { code: Some(c), reason: Some(r), .. }
+                if c == "compaction_refused" && r == "turn_in_progress")
+            ),
+            "{seen:?}"
+        );
+        assert_eq!(provider.state.turns_started.lock().unwrap().len(), 1);
+    }
+
+    /// A `/compact` the user HELD for after the turn (`queue_message`) runs between two
+    /// turns, as a compaction: never played as a turn.
+    #[tokio::test]
+    async fn a_held_slash_compact_runs_as_a_compaction_once_the_turn_ends() {
+        let (provider, handle, mut rx) = compact_rig("native", true).await;
+        handle.send_message("a long turn").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while provider.state.turns_started.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the turn never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(handle.queue_message("/compact after it").await.unwrap());
+        provider.state.push(done(None));
+        provider.state.end_turn();
+        let seen = until_idle(&handle, &mut rx).await;
+        assert_eq!(
+            *provider.state.compactions.lock().unwrap(),
+            vec![Some("after it".to_string())]
+        );
+        assert_eq!(provider.state.turns_started.lock().unwrap().len(), 1);
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, ChatEvent::SystemHint { content }
+                if content.starts_with("Conversation compacted on request"))),
+            "{seen:?}"
+        );
     }
 
     async fn node(
@@ -5740,6 +6233,7 @@ mod tool_timing_tests {
                 canonical: None,
                 tool_use_id: Some("t1".into()),
                 always: None,
+                consent: None,
             })
             .await;
         let hold = Arc::new(tokio::sync::Notify::new());
@@ -5821,6 +6315,7 @@ mod tool_timing_tests {
                 canonical: None,
                 tool_use_id: Some("t1".into()),
                 always: None,
+                consent: None,
             })
             .await;
         let hold = Arc::new(tokio::sync::Notify::new());
@@ -5898,6 +6393,7 @@ mod tool_timing_tests {
             canonical: Some("Write".into()),
             tool_use_id: Some(call.to_string()),
             always: None,
+            consent: None,
         };
         handle.emit(write("write-1", "t1")).await;
         handle
@@ -6014,6 +6510,7 @@ mod tool_timing_tests {
                 canonical: None,
                 tool_use_id: Some("t1".into()),
                 always: None,
+                consent: None,
             })
             .await;
         handle.answer_permission("req-1", true).await.unwrap();

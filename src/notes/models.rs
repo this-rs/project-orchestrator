@@ -1011,29 +1011,31 @@ pub enum PropagationScope {
     /// Notes of this project, plus global notes. Nothing from other projects.
     Project(Uuid),
     /// Like `Project`, but notes of other projects are admitted too, weighted
-    /// by pairwise coupling (internal callers only; `force_cross_project`).
+    /// by pairwise coupling and dropped below [`Self::MIN_COUPLING`] (internal
+    /// callers only; `force_cross_project`).
     CrossProject(Uuid),
     /// No project boundary (legacy; only when no project is known at all).
     Unscoped,
 }
 
 impl PropagationScope {
-    /// Minimum coupling below which a foreign project's notes are suppressed
-    /// (unless `force`).
+    /// Minimum coupling below which a foreign project's notes are suppressed.
     pub const MIN_COUPLING: f64 = 0.2;
 
     /// Cross-project coupling rule, shared by the Neo4j client and the mock:
     /// `None` coupling (unknown) drops the note (fail closed); a coupling below
-    /// `MIN_COUPLING` drops it unless `force`; otherwise the score is weighted by
-    /// the coupling and must still reach `min_score`.
-    pub fn weigh_foreign(
-        score: f64,
-        coupling: Option<f64>,
-        force: bool,
-        min_score: f64,
-    ) -> Option<f64> {
+    /// `MIN_COUPLING` drops it; otherwise the score is weighted by the coupling
+    /// and must still reach `min_score`.
+    ///
+    /// Decision (T0f-bis): the floor applies to EVERY `CrossProject` read.
+    /// `force_cross_project` used to mean both "widen to other projects" and
+    /// "skip the floor"; as it is also the only way to reach `CrossProject`, the
+    /// floor was never applied at all, and a widened read admitted notes of
+    /// projects with zero coupling (score `0 >= min_score 0`). `force` now
+    /// only widens.
+    pub fn weigh_foreign(score: f64, coupling: Option<f64>, min_score: f64) -> Option<f64> {
         let coupling = coupling?;
-        if coupling < Self::MIN_COUPLING && !force {
+        if coupling < Self::MIN_COUPLING {
             return None;
         }
         let weighted = score * coupling;
@@ -1270,6 +1272,20 @@ mod tests {
         let none = PropagationScope::from_params(None, false);
         assert_eq!(none, PropagationScope::Unscoped);
         assert!(none.admits(Some(other)) && none.admits(None));
+    }
+
+    /// T0f-bis: the coupling floor is applied to every cross-project read
+    /// (`force` only widens), unknown coupling fails closed, and the weighted
+    /// score must still reach `min_score`.
+    #[test]
+    fn test_weigh_foreign_applies_the_coupling_floor() {
+        let w = PropagationScope::weigh_foreign;
+        assert_eq!(w(1.0, None, 0.0), None);
+        assert_eq!(w(1.0, Some(0.0), 0.0), None, "zero coupling never admitted");
+        assert_eq!(w(1.0, Some(0.19), 0.0), None);
+        assert_eq!(w(1.0, Some(0.2), 0.0), Some(0.2));
+        assert_eq!(w(0.5, Some(0.5), 0.3), None, "0.25 < min_score 0.3");
+        assert_eq!(w(0.8, Some(0.5), 0.3), Some(0.4));
     }
 
     #[test]

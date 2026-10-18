@@ -56,6 +56,9 @@ pub struct MockAnchorStore {
     pub events: Vec<crate::chat::anchor::AnchorEvent>,
 }
 
+/// Shadow state of one directed synapse: `(shadow_weight, last shadow decay)`.
+pub type MockShadowSynapse = (f64, Option<chrono::DateTime<chrono::Utc>>);
+
 pub struct MockGraphStore {
     // Entity stores
     pub projects: RwLock<HashMap<Uuid, ProjectNode>>,
@@ -231,6 +234,10 @@ pub struct MockGraphStore {
     pub note_embeddings: RwLock<HashMap<Uuid, (Vec<f32>, String)>>,
     /// Note synapses: bidirectional adjacency list (note_id -> Vec<(neighbor_id, weight)>)
     pub note_synapses: RwLock<HashMap<Uuid, Vec<(Uuid, f64)>>>,
+    /// Shadow state of the directed synapses (from, to) -> (shadow_weight, last shadow decay).
+    pub synapse_shadow: RwLock<HashMap<(Uuid, Uuid), MockShadowSynapse>>,
+    /// Synaptic shadow traces, in insertion order.
+    pub synapse_shadow_traces: RwLock<Vec<crate::neurons::synaptic_shadow::SynapseShadowTrace>>,
     /// Scope argument of every `init_note_energy` call, in order (test probe).
     pub init_note_energy_calls: RwLock<Vec<Option<Uuid>>>,
     /// Synapse source tags: (note_a, note_b) -> source ("cosine" | "coactivation")
@@ -443,6 +450,8 @@ impl MockGraphStore {
             function_analytics: RwLock::new(HashMap::new()),
             note_embeddings: RwLock::new(HashMap::new()),
             note_synapses: RwLock::new(HashMap::new()),
+            synapse_shadow: RwLock::new(HashMap::new()),
+            synapse_shadow_traces: RwLock::new(Vec::new()),
             init_note_energy_calls: RwLock::new(Vec::new()),
             synapse_sources: RwLock::new(HashMap::new()),
             file_embeddings: RwLock::new(HashMap::new()),
@@ -4818,9 +4827,43 @@ impl GraphStore for MockGraphStore {
         Ok((page, total))
     }
 
-    async fn get_decision_project_id(&self, _decision_id: Uuid) -> Result<Option<String>> {
-        // Mock doesn't track Decision→Task→Plan→Project chain
-        Ok(None)
+    async fn get_decision_project_id(&self, decision_id: Uuid) -> Result<Option<String>> {
+        Ok(self
+            .get_decision_project_ids(&[decision_id])
+            .await?
+            .remove(&decision_id)
+            .map(|p| p.to_string()))
+    }
+
+    async fn get_decision_project_ids(&self, decision_ids: &[Uuid]) -> Result<HashMap<Uuid, Uuid>> {
+        // Same chain as the Cypher (Project→Plan→Task→Decision); several
+        // projects → the smallest id, like `min(proj.id)`.
+        let task_decisions = self.task_decisions.read().await;
+        let plan_tasks = self.plan_tasks.read().await;
+        let project_plans = self.project_plans.read().await;
+        let mut out = HashMap::new();
+        for did in decision_ids {
+            let project = task_decisions
+                .iter()
+                .filter(|(_, ds)| ds.contains(did))
+                .flat_map(|(t, _)| {
+                    plan_tasks
+                        .iter()
+                        .filter(move |(_, ts)| ts.contains(t))
+                        .map(|(p, _)| *p)
+                })
+                .flat_map(|plan| {
+                    project_plans
+                        .iter()
+                        .filter(move |(_, ps)| ps.contains(&plan))
+                        .map(|(pr, _)| *pr)
+                })
+                .min_by_key(|p| p.to_string());
+            if let Some(p) = project {
+                out.insert(*did, p);
+            }
+        }
+        Ok(out)
     }
 
     async fn update_decision(
@@ -6679,7 +6722,6 @@ impl GraphStore for MockGraphStore {
                         let weighted = crate::notes::PropagationScope::weigh_foreign(
                             pn.relevance_score,
                             coupling,
-                            force_cross_project,
                             min_score,
                         )?;
                         pn.relevance_score = weighted;
@@ -7221,6 +7263,245 @@ impl GraphStore for MockGraphStore {
         }
 
         Ok(count)
+    }
+
+    async fn shadow_synapse_edges(
+        &self,
+        project_id: Uuid,
+        from: &[Uuid],
+    ) -> Result<Vec<crate::neurons::synaptic_shadow::ShadowEdgeRow>> {
+        use crate::neurons::synaptic_shadow::{estimate_tokens, ShadowEdgeRow, ShadowNode};
+        let notes = self.notes.read().await;
+        let synapses = self.note_synapses.read().await;
+        let shadow = self.synapse_shadow.read().await;
+        let in_project = |id: &Uuid| notes.get(id).and_then(|n| n.project_id) == Some(project_id);
+        let mut rows = Vec::new();
+        for a in from {
+            if !in_project(a) {
+                continue;
+            }
+            for (b, w) in synapses.get(a).map(Vec::as_slice).unwrap_or(&[]) {
+                if a == b || !in_project(b) {
+                    continue;
+                }
+                let note = &notes[b];
+                rows.push(ShadowEdgeRow {
+                    from: *a,
+                    to: *b,
+                    weight: shadow.get(&(*a, *b)).map(|s| s.0).unwrap_or(*w),
+                    target: ShadowNode {
+                        energy: note.energy,
+                        scar_intensity: note.scar_intensity,
+                        reachable: matches!(
+                            note.status,
+                            crate::notes::NoteStatus::Active
+                                | crate::notes::NoteStatus::NeedsReview
+                        ),
+                        tokens: estimate_tokens(note.content.chars().count()),
+                        created_at: Some(note.created_at),
+                    },
+                });
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn reward_shadow_synapses(
+        &self,
+        project_id: Uuid,
+        pairs: &[(Uuid, Uuid)],
+        delta: f64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize> {
+        let notes = self.notes.read().await;
+        let synapses = self.note_synapses.read().await;
+        let mut shadow = self.synapse_shadow.write().await;
+        let in_project = |id: &Uuid| notes.get(id).and_then(|n| n.project_id) == Some(project_id);
+        let mut unique: Vec<(Uuid, Uuid)> = pairs
+            .iter()
+            .filter(|(a, b)| a != b)
+            .map(|(a, b)| if a < b { (*a, *b) } else { (*b, *a) })
+            .collect();
+        unique.sort();
+        unique.dedup();
+        let mut written = 0usize;
+        for (a, b) in unique {
+            if !in_project(&a) || !in_project(&b) {
+                continue;
+            }
+            for (x, y) in [(a, b), (b, a)] {
+                // Existing edges only: never create one.
+                let Some(legacy) = synapses
+                    .get(&x)
+                    .and_then(|out| out.iter().find(|(n, _)| *n == y))
+                    .map(|(_, w)| *w)
+                else {
+                    continue;
+                };
+                let entry = shadow.entry((x, y)).or_insert((legacy, None));
+                entry.0 = (entry.0 + delta).clamp(0.0, 1.0);
+                if entry.1.is_none() {
+                    entry.1 = Some(now);
+                }
+                written += 1;
+            }
+        }
+        Ok(written)
+    }
+
+    async fn decay_shadow_synapses(
+        &self,
+        scope: &crate::neurons::synaptic_shadow::ShadowDecayScope,
+        half_life_days: f64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize> {
+        // The mock has no notion of a dormant project: every project in scope decays.
+        let notes = self.notes.read().await;
+        let synapses = self.note_synapses.read().await;
+        let mut shadow = self.synapse_shadow.write().await;
+        let mut visited = 0usize;
+        for (a, out) in synapses.iter() {
+            let Some(pa) = notes.get(a).and_then(|n| n.project_id) else {
+                continue;
+            };
+            if !scope.includes(pa) {
+                continue;
+            }
+            for (b, w) in out {
+                if notes.get(b).and_then(|n| n.project_id) != Some(pa) {
+                    continue;
+                }
+                let entry = shadow.entry((*a, *b)).or_insert((*w, None));
+                let elapsed = entry
+                    .1
+                    .map(|at| (now - at).num_milliseconds() as f64 / 1000.0)
+                    .unwrap_or(0.0);
+                entry.0 = crate::neurons::synaptic_shadow::proportional_decay(
+                    entry.0,
+                    elapsed,
+                    half_life_days,
+                );
+                if elapsed >= 0.0 {
+                    entry.1 = Some(now);
+                }
+                visited += 1;
+            }
+        }
+        Ok(visited)
+    }
+
+    async fn record_synapse_shadow_trace(
+        &self,
+        trace: &crate::neurons::synaptic_shadow::SynapseShadowTrace,
+        keep: usize,
+    ) -> Result<()> {
+        let mut traces = self.synapse_shadow_traces.write().await;
+        traces.push(trace.clone());
+        let mut of_session: Vec<(chrono::DateTime<chrono::Utc>, Uuid)> = traces
+            .iter()
+            .filter(|t| t.session_id == trace.session_id)
+            .map(|t| (t.created_at, t.id))
+            .collect();
+        of_session.sort_by(|a, b| b.cmp(a));
+        let dropped: std::collections::HashSet<Uuid> =
+            of_session.iter().skip(keep).map(|(_, id)| *id).collect();
+        traces.retain(|t| !dropped.contains(&t.id));
+        Ok(())
+    }
+
+    async fn list_synapse_shadow_traces(
+        &self,
+        filter: &crate::neurons::synaptic_shadow::ShadowTraceFilter,
+    ) -> Result<Vec<crate::neurons::synaptic_shadow::SynapseShadowTrace>> {
+        use crate::neurons::synaptic_shadow::ShadowTraceFilter;
+        let traces = self.synapse_shadow_traces.read().await;
+        Ok(match filter {
+            ShadowTraceFilter::Session(sid) => {
+                let mut out: Vec<_> = traces
+                    .iter()
+                    .filter(|t| t.session_id == *sid)
+                    .cloned()
+                    .collect();
+                out.sort_by_key(|t| (t.created_at, t.id));
+                out
+            }
+            ShadowTraceFilter::ContainingNote { note_id, limit } => {
+                let mut out: Vec<_> = traces
+                    .iter()
+                    .filter(|t| t.note_ids().contains(note_id))
+                    .cloned()
+                    .collect();
+                out.sort_by_key(|t| std::cmp::Reverse((t.created_at, t.id)));
+                out.truncate(*limit);
+                out
+            }
+        })
+    }
+
+    async fn get_synapse_shadow_trace(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<crate::neurons::synaptic_shadow::SynapseShadowTrace>> {
+        let traces = self.synapse_shadow_traces.read().await;
+        Ok(traces.iter().find(|t| t.id == id).cloned())
+    }
+
+    async fn claim_shadow_trace_reward(&self, trace_id: Uuid, key: &str) -> Result<bool> {
+        let mut traces = self.synapse_shadow_traces.write().await;
+        let Some(trace) = traces.iter_mut().find(|t| t.id == trace_id) else {
+            return Ok(false);
+        };
+        if trace.rewarded.iter().any(|k| k == key) {
+            return Ok(false);
+        }
+        trace.rewarded.push(key.to_string());
+        Ok(true)
+    }
+
+    async fn shadow_trace_closures(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, crate::neurons::synaptic_shadow::TaskClosure)>> {
+        use crate::neurons::synaptic_shadow::{TaskClosure, CLOSURE_KEY};
+        let traces = self.synapse_shadow_traces.read().await;
+        let executions = self.agent_executions.read().await;
+        let tasks = self.tasks.read().await;
+        let mut ordered: Vec<_> = traces
+            .iter()
+            .filter(|t| !t.rewarded.iter().any(|k| k == CLOSURE_KEY))
+            .collect();
+        ordered.sort_by_key(|t| (t.created_at, t.id));
+        let mut out = Vec::new();
+        for trace in ordered {
+            let mut restarted = false;
+            let mut quiet = false;
+            for ae in executions.values().filter(|ae| {
+                ae.session_id == Some(trace.session_id)
+                    && ae.completed_at.is_some_and(|at| at < cutoff)
+            }) {
+                let Some(task) = tasks.get(&ae.task_id) else {
+                    continue;
+                };
+                if executions
+                    .values()
+                    .any(|later| later.task_id == ae.task_id && later.started_at > ae.started_at)
+                {
+                    restarted = true;
+                } else if task.status == crate::neo4j::models::TaskStatus::Completed {
+                    quiet = true;
+                }
+            }
+            if restarted {
+                out.push((trace.id, TaskClosure::Restarted));
+            } else if quiet {
+                out.push((trace.id, TaskClosure::Quiet));
+            }
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     async fn weaken_node_synapses(
@@ -7964,30 +8245,90 @@ impl GraphStore for MockGraphStore {
         Ok(rows)
     }
 
+    /// P18-suite (point 12): a real traversal of the mock's `spawned_by`, with the
+    /// semantics of the Neo4j query — the session itself at depth 0, then every
+    /// descendant found through the JSON parent, breadth first, siblings by
+    /// `created_at`; an unknown session is an empty tree. `status`, provider, model
+    /// and costs stay unset here: the API fills them, as it does for the real store.
     async fn get_session_tree(&self, session_id: &str) -> Result<Vec<SessionTreeNode>> {
-        // Mock: return the session itself as root with depth 0
-        Ok(vec![SessionTreeNode {
-            session_id: session_id.to_string(),
-            parent_session_id: None,
-            spawn_type: None,
-            run_id: None,
-            task_id: None,
-            depth: 0,
-            created_at: Some(chrono::Utc::now()),
-            provider_id: None,
-            model: None,
-            cost_usd: None,
-            subtree_cost_usd: None,
-            max_depth: None,
-            max_children: None,
-            status: "closed".to_string(),
-            routed_by: None,
-        }])
+        let sessions = self.chat_sessions.read().await;
+        let Some(root) = sessions.values().find(|s| s.id.to_string() == session_id) else {
+            return Ok(Vec::new());
+        };
+        let node_of = |s: &ChatSessionNode, depth: u32| {
+            let spawn = spawned_by_of(s);
+            SessionTreeNode {
+                session_id: s.id.to_string(),
+                parent_session_id: if depth == 0 {
+                    None
+                } else {
+                    spawn.parent.clone()
+                },
+                spawn_type: if depth == 0 { None } else { spawn.kind.clone() },
+                run_id: if depth == 0 { None } else { spawn.run_id },
+                task_id: if depth == 0 { None } else { spawn.task_id },
+                depth,
+                created_at: Some(s.created_at),
+                provider_id: None,
+                model: None,
+                cost_usd: None,
+                subtree_cost_usd: None,
+                max_depth: None,
+                max_children: None,
+                status: "closed".to_string(),
+                routed_by: None,
+            }
+        };
+        let mut nodes = vec![node_of(root, 0)];
+        let mut frontier = vec![root.id.to_string()];
+        let mut seen: std::collections::HashSet<String> = frontier.iter().cloned().collect();
+        let mut depth = 0u32;
+        // The real query stops at ten hops (`SPAWNED_BY*0..10`).
+        while !frontier.is_empty() && depth < 10 {
+            depth += 1;
+            let mut next = Vec::new();
+            for parent in &frontier {
+                let mut children: Vec<&ChatSessionNode> = sessions
+                    .values()
+                    .filter(|s| spawned_by_of(s).parent.as_deref() == Some(parent.as_str()))
+                    .filter(|s| !seen.contains(&s.id.to_string()))
+                    .collect();
+                children.sort_by_key(|s| s.created_at);
+                for child in children {
+                    seen.insert(child.id.to_string());
+                    nodes.push(node_of(child, depth));
+                    next.push(child.id.to_string());
+                }
+            }
+            frontier = next;
+        }
+        Ok(nodes)
     }
 
+    /// P18-suite (point 12): follow the JSON parent upward to the session that has
+    /// none — ten hops at most, a cycle stops the walk — or `None` for an unknown
+    /// session, as the Neo4j query answers.
     async fn get_session_root(&self, session_id: &str) -> Result<Option<String>> {
-        // Mock: the session itself is the root
-        Ok(Some(session_id.to_string()))
+        let sessions = self.chat_sessions.read().await;
+        let by_id = |id: &str| sessions.values().find(|s| s.id.to_string() == id);
+        let Some(mut current) = by_id(session_id) else {
+            return Ok(None);
+        };
+        let mut seen = std::collections::HashSet::from([current.id.to_string()]);
+        for _ in 0..10 {
+            let Some(parent_id) = spawned_by_of(current).parent else {
+                break;
+            };
+            if !seen.insert(parent_id.clone()) {
+                break;
+            }
+            match by_id(&parent_id) {
+                Some(parent) => current = parent,
+                // A parent the store no longer holds: the walk ends on the last known session.
+                None => break,
+            }
+        }
+        Ok(Some(current.id.to_string()))
     }
 
     async fn get_run_sessions(&self, _run_id: Uuid) -> Result<Vec<SessionInfo>> {
@@ -18103,6 +18444,222 @@ mod cross_project_parity {
         assert!(
             notes[20..].iter().all(|w| !r.contains(&w.id)),
             "weakly coupled foreign notes cut after the weighting"
+        );
+    }
+}
+
+/// What a session's `spawned_by` JSON says about its parent (mock-side reading of the
+/// `SPAWNED_BY` edge): the parent id and the spawn type, plus the run and task when the
+/// JSON names them. Anything unreadable is simply absent.
+struct SpawnedByFields {
+    parent: Option<String>,
+    kind: Option<String>,
+    run_id: Option<Uuid>,
+    task_id: Option<Uuid>,
+}
+
+fn spawned_by_of(session: &ChatSessionNode) -> SpawnedByFields {
+    let value: Option<serde_json::Value> = session
+        .spawned_by
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok());
+    let text = |key: &str| {
+        value
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    SpawnedByFields {
+        parent: text("parent_session_id"),
+        kind: text("type"),
+        run_id: text("run_id").and_then(|s| s.parse().ok()),
+        task_id: text("task_id").and_then(|s| s.parse().ok()),
+    }
+}
+
+#[cfg(test)]
+mod session_tree_tests {
+    //! P18-suite (point 12): the mock's session tree is a real traversal, so the cascade
+    //! and tree tests built on it prove something. Red on the former stubs, which answered
+    //! the session alone (tree) and the session itself (root) whatever the parents.
+    use super::*;
+    use chrono::{DateTime, Utc};
+
+    fn session(
+        spawned_by: Option<serde_json::Value>,
+        created_at: DateTime<Utc>,
+    ) -> ChatSessionNode {
+        let mut node = crate::test_helpers::test_chat_session(None);
+        node.id = Uuid::new_v4();
+        node.created_at = created_at;
+        node.spawned_by = spawned_by.map(|v| v.to_string());
+        node
+    }
+
+    fn child_of(
+        parent: &ChatSessionNode,
+        kind: &str,
+        created_at: DateTime<Utc>,
+    ) -> ChatSessionNode {
+        session(
+            Some(serde_json::json!({"type": kind, "parent_session_id": parent.id.to_string()})),
+            created_at,
+        )
+    }
+
+    async fn store(nodes: &[&ChatSessionNode]) -> MockGraphStore {
+        let mock = MockGraphStore::new();
+        for node in nodes {
+            mock.create_chat_session(&(*node).clone()).await.unwrap();
+        }
+        mock
+    }
+
+    #[tokio::test]
+    async fn the_tree_holds_every_descendant_with_its_depth_parent_and_spawn_type() {
+        let t0 = Utc::now();
+        let root = session(None, t0);
+        let late_child = child_of(&root, "conversation", t0 + chrono::Duration::seconds(2));
+        let early_child = child_of(&root, "delegation", t0 + chrono::Duration::seconds(1));
+        let grandchild = child_of(
+            &early_child,
+            "conversation",
+            t0 + chrono::Duration::seconds(3),
+        );
+        let stranger = session(None, t0);
+        let mock = store(&[&root, &late_child, &early_child, &grandchild, &stranger]).await;
+
+        let tree = mock.get_session_tree(&root.id.to_string()).await.unwrap();
+        let ids: Vec<&str> = tree.iter().map(|n| n.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                root.id.to_string(),
+                early_child.id.to_string(),
+                late_child.id.to_string(),
+                grandchild.id.to_string()
+            ],
+            "depth first, then created_at; the stranger is not in the tree"
+        );
+        assert_eq!(
+            tree.iter().map(|n| n.depth).collect::<Vec<_>>(),
+            vec![0, 1, 1, 2]
+        );
+        assert_eq!(tree[0].parent_session_id, None, "the root names no parent");
+        assert_eq!(
+            tree[1].parent_session_id.as_deref(),
+            Some(root.id.to_string().as_str())
+        );
+        assert_eq!(tree[1].spawn_type.as_deref(), Some("delegation"));
+        assert_eq!(
+            tree[3].parent_session_id.as_deref(),
+            Some(early_child.id.to_string().as_str())
+        );
+        assert_eq!(tree[3].spawn_type.as_deref(), Some("conversation"));
+    }
+
+    #[tokio::test]
+    async fn the_tree_of_a_child_starts_at_that_child_and_an_unknown_session_has_none() {
+        let t0 = Utc::now();
+        let root = session(None, t0);
+        let child = child_of(&root, "delegation", t0);
+        let grandchild = child_of(&child, "conversation", t0);
+        let mock = store(&[&root, &child, &grandchild]).await;
+
+        let tree = mock.get_session_tree(&child.id.to_string()).await.unwrap();
+        assert_eq!(
+            tree.len(),
+            2,
+            "the child and its own descendant, not its parent"
+        );
+        assert_eq!(tree[0].session_id, child.id.to_string());
+        assert_eq!(tree[0].depth, 0);
+        assert_eq!(tree[1].session_id, grandchild.id.to_string());
+
+        assert!(mock
+            .get_session_tree(&Uuid::new_v4().to_string())
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_root_is_found_by_walking_the_parents_up() {
+        let t0 = Utc::now();
+        let root = session(None, t0);
+        let child = child_of(&root, "delegation", t0);
+        let grandchild = child_of(&child, "conversation", t0);
+        let mock = store(&[&root, &child, &grandchild]).await;
+
+        let root_id = root.id.to_string();
+        assert_eq!(
+            mock.get_session_root(&grandchild.id.to_string())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(root_id.as_str())
+        );
+        assert_eq!(
+            mock.get_session_root(&child.id.to_string())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(root_id.as_str())
+        );
+        assert_eq!(
+            mock.get_session_root(&root_id).await.unwrap().as_deref(),
+            Some(root_id.as_str()),
+            "a root is its own root"
+        );
+        assert_eq!(
+            mock.get_session_root(&Uuid::new_v4().to_string())
+                .await
+                .unwrap(),
+            None,
+            "unknown session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parent_the_store_no_longer_holds_ends_the_walk_and_a_cycle_does_not_hang() {
+        let t0 = Utc::now();
+        let orphan = session(
+            Some(
+                serde_json::json!({"type": "delegation", "parent_session_id": Uuid::new_v4().to_string()}),
+            ),
+            t0,
+        );
+        let mut a = session(None, t0);
+        let mut b = session(None, t0);
+        a.spawned_by = Some(
+            serde_json::json!({"type": "conversation", "parent_session_id": b.id.to_string()})
+                .to_string(),
+        );
+        b.spawned_by = Some(
+            serde_json::json!({"type": "conversation", "parent_session_id": a.id.to_string()})
+                .to_string(),
+        );
+        let mock = store(&[&orphan, &a, &b]).await;
+
+        assert_eq!(
+            mock.get_session_root(&orphan.id.to_string())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(orphan.id.to_string().as_str()),
+            "the last known session of the walk"
+        );
+        let cyclic_root = mock.get_session_root(&a.id.to_string()).await.unwrap();
+        assert!(cyclic_root.is_some(), "a cycle ends, it does not hang");
+        assert_eq!(
+            mock.get_session_tree(&a.id.to_string())
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "a and b once each"
         );
     }
 }

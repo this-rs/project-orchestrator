@@ -347,7 +347,11 @@ fn server_examples() -> Vec<ServerExample> {
                 category: Some(s("read")),
                 canonical: Some(s("read_file")),
                 tool_use_id: Some(s(TOOL_USE_ID)),
-                always: None,
+                always: Some(true),
+                consent: Some(super::types::ConsentSubject {
+                    subject: s("https://docs.rs"),
+                    destinations: vec![s("http://docs.rs"), s("https://docs.rs")],
+                }),
             },
             ChatEvent::PermissionRequest {
                 id: s("perm_0001"),
@@ -358,6 +362,7 @@ fn server_examples() -> Vec<ServerExample> {
                 canonical: None,
                 tool_use_id: None,
                 always: None,
+                consent: None,
             },
         ),
         ServerExample::new(

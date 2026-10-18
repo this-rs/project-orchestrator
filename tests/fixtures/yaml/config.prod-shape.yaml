@@ -1,0 +1,107 @@
+# Shape of a production config.yaml (anonymised): same sections, keys, value
+# kinds, list styles and comments as a real file. Every host, address and path is
+# made up; every secret is a placeholder. Never paste a real value here.
+server:
+  frontend_path: /srv/project-orchestrator/frontend/dist
+  port: 8080
+  public_url: https://po.example.org
+  workspace_path: .
+neo4j:
+  uri: bolt://localhost:7687
+  user: neo4j
+  password: PLACEHOLDER-neo4j-password
+meilisearch:
+  url: http://localhost:7700
+  key: PLACEHOLDER-meilisearch-key
+nats:
+  url: nats://localhost:4222
+chat:
+  default_model: claude-sonnet-5-5
+  max_sessions: 10
+  session_timeout_secs: 1800
+  max_turns: 500
+  prompt_builder_model: claude-sonnet-5-5
+  permissions:
+    mode: bypassPermissions
+    allowed_tools:
+    - mcp__project-orchestrator__*
+    - Bash(git *)
+    - Bash(cargo *)
+    - Bash(npm *)
+    - Read
+    - Edit
+    - WebSearch
+    - Bash(glob *)
+    - Bash(grep *)
+    disallowed_tools: []
+  process_path: /opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/home/someone/.cargo/bin:/home/someone/.local/bin:/home/someone/.nvm/versions/node/v22.17.1/bin
+  auto_update_cli: true
+  auto_update_app: false
+auth:
+  jwt_secret: PLACEHOLDER-jwt-secret-at-least-32-characters
+  jwt_expiry_secs: 28800
+  frontend_url: https://po.example.org
+  additional_origins:
+    - http://localhost:3000
+    - http://localhost:3002
+  allowed_email_domain: example.org
+  allowed_emails:
+      - alice@example.org
+      - bob@example.org
+      - carol@example.net
+      - dave@example.net
+  oidc:
+    provider_name: Google
+    client_id: PLACEHOLDER-oidc-client-id
+    client_secret: PLACEHOLDER-oidc-client-secret
+    redirect_uri: https://po.example.org/auth/callback
+    provider_key: google
+    discovery_url: https://accounts.google.com/.well-known/openid-configuration
+    auth_endpoint: https://accounts.google.com/o/oauth2/v2/auth
+    token_endpoint: https://oauth2.googleapis.com/token
+    userinfo_endpoint: https://openidconnect.googleapis.com/v1/userinfo
+    scopes: openid email profile
+
+neural_routing:
+  enabled: true                    # Master switch (default: true)
+  mode: "nn"                       # "nn" (Nearest Neighbor only) | "full" (Policy Net + NN fallback)
+  training:
+    mode: "manual"                 # "automatic" (cron + threshold) | "manual" (MCP tool / CLI)
+    auto_trigger_threshold: 1000   # Trajectories before auto-training (automatic mode)
+    max_threads: 2                 # Thread pool cap for training
+    schedule: "0 2 * * *"          # Cron for automatic training (2am daily)
+  inference:
+    timeout_ms: 100                 # Max inference budget in ms
+    nn_fallback: true              # Fallback to NN Router if timeout/OOD
+  collection:
+    enabled: false                 # Trajectory collection (opt-in). Env: NEURAL_ROUTING_COLLECT
+    buffer_size: 50                # Flush batch size
+  nn:
+    top_k: 5                       # Number of nearest neighbors
+    min_similarity: 0.7            # Minimum cosine similarity threshold
+    cache_capacity: 500            # moka cache entries
+    cache_ttl_secs: 3600           # Cache TTL (1h)
+    max_route_age_days: 30         # Ignore trajectories older than this
+  cpu_guard:
+    pause_threshold: 80.0          # Pause at CPU > 80%
+    resume_threshold: 50.0         # Resume at CPU < 50%
+    poll_interval_secs: 2          # CPU poll frequency
+
+# ════════════════════════════════════════════════════════════════════
+# Remote MCP — expose /mcp (transport Streamable HTTP) + serveur OAuth 2.1
+# ════════════════════════════════════════════════════════════════════
+# A long comment block with non-ASCII text (é, —, ⚠️) and lines such as
+#   GET  /.well-known/oauth-authorization-server   (RFC 8414)
+#   POST|DELETE /mcp
+# must be skipped like any comment.
+remote_mcp:
+  enabled: false
+  # Origines navigateur autorisées en plus des origines standard du serveur.
+  origin_allowlist:
+    - https://chatgpt.com
+    - https://chat.openai.com
+  # Valeurs sûres, en attente du branchement.
+  session_ttl_secs: 3600
+  rate_limit:
+    window_secs: 60
+    max_requests: 120

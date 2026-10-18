@@ -3,7 +3,7 @@
 //! These commands are called by the frontend setup wizard to:
 //! - Check if a config.yaml already exists
 //! - Generate a config.yaml from wizard input
-//! - Detect if Claude Code CLI is installed
+//! - Detect if Claude Code CLI is installed (optional: only the Claude Code provider needs it)
 
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -463,6 +463,10 @@ pub struct DependencyStatus {
     /// Only ever true with `docker_status == "unresponsive"`.
     pub docker_services_reachable: bool,
     pub claude_code_available: bool,
+    /// The Claude Code CLI is not needed by this install: no config yet (the wizard lets the
+    /// user pick another provider) or a config whose chat provider is not Claude Code.
+    /// The splash then shows a missing CLI as skipped, not as a warning.
+    pub claude_code_optional: bool,
     pub config_exists: bool,
     /// Whether setup has been completed (from config.yaml).
     pub setup_completed: bool,
@@ -493,11 +497,13 @@ pub async fn check_dependencies(
     let config_path = config_path();
     let config_exists = config_path.exists();
 
-    let (setup_completed, infra_mode, nats_enabled, neo4j_password, meilisearch_key) =
+    let (setup_completed, infra_mode, nats_enabled, neo4j_password, meilisearch_key, chat_provider) =
         if config_exists {
             match std::fs::read_to_string(&config_path) {
                 Ok(contents) => {
-                    match serde_yaml::from_str::<project_orchestrator::YamlConfig>(&contents) {
+                    match project_orchestrator::yaml::from_str::<project_orchestrator::YamlConfig>(
+                        &contents,
+                    ) {
                         Ok(yaml) => {
                             let setup = yaml.setup_completed;
                             let mode = yaml
@@ -515,21 +521,28 @@ pub async fn check_dependencies(
                             } else {
                                 Some(yaml.meilisearch.key.clone())
                             };
-                            (setup, mode, nats, neo4j_pw, meili_key)
+                            (
+                                setup,
+                                mode,
+                                nats,
+                                neo4j_pw,
+                                meili_key,
+                                yaml.chat.provider.clone(),
+                            )
                         }
                         Err(e) => {
                             tracing::warn!("Failed to parse config.yaml: {}", e);
-                            (false, "docker".to_string(), true, None, None)
+                            (false, "docker".to_string(), true, None, None, None)
                         }
                     }
                 }
                 Err(e) => {
                     tracing::warn!("Failed to read config.yaml: {}", e);
-                    (false, "docker".to_string(), true, None, None)
+                    (false, "docker".to_string(), true, None, None, None)
                 }
             }
         } else {
-            (false, "docker".to_string(), true, None, None)
+            (false, "docker".to_string(), true, None, None, None)
         };
 
     // Docker status — only when the services are meant to run in Docker, and never for long.
@@ -566,6 +579,7 @@ pub async fn check_dependencies(
 
     // Claude Code CLI check
     let claude_code_available = project_orchestrator::setup_claude::detect_claude_cli().is_some();
+    let claude_code_optional = claude_cli_optional(config_exists, chat_provider.as_deref());
 
     // Platform info
     let os = std::env::consts::OS.to_string();
@@ -576,6 +590,7 @@ pub async fn check_dependencies(
         docker_status: docker_status.to_string(),
         docker_services_reachable,
         claude_code_available,
+        claude_code_optional,
         config_exists,
         setup_completed,
         infra_mode,
@@ -614,6 +629,60 @@ fn chat_provider_is_none(config: &SetupConfig) -> bool {
         .is_some_and(|p| p.trim().eq_ignore_ascii_case("none"))
 }
 
+/// Whether this install can do without the Claude Code CLI.
+///
+/// No config yet: the wizard has not run, and it offers another provider. A config
+/// whose chat provider is `none` (another provider, set up in Settings → Providers).
+/// A config with no provider predates the choice: it is Claude Code, the CLI matters.
+fn claude_cli_optional(config_exists: bool, chat_provider: Option<&str>) -> bool {
+    !config_exists || chat_provider.is_some_and(|p| p.trim().eq_ignore_ascii_case("none"))
+}
+
+/// The `chat:` section of the generated config.
+///
+/// Claude Code (the provider chosen, or no choice on a config written before the
+/// wizard offered one) keeps its model, CLI path and CLI auto-update. Any other
+/// choice writes none of them: no Claude CLI is needed for the file to be valid,
+/// and the provider instance is created later (Settings → Providers).
+fn build_chat_section(config: &SetupConfig) -> ChatSection {
+    let no_claude = chat_provider_is_none(config);
+    let non_empty = |s: &str| {
+        let s = s.trim();
+        (!s.is_empty()).then(|| s.to_string())
+    };
+    ChatSection {
+        provider: config
+            .chat_provider
+            .clone()
+            .filter(|p| !p.trim().is_empty()),
+        // Without a chat provider there is no model to default to.
+        default_model: if no_claude || config.chat_model.trim().is_empty() {
+            None
+        } else {
+            Some(config.chat_model.clone())
+        },
+        max_sessions: config.chat_max_sessions,
+        max_turns: config.chat_max_turns,
+        permissions: if config.chat_permission_mode != "default" {
+            // Only write permissions section if non-default (keeps config.yaml clean)
+            Some(ChatPermissionsSection {
+                mode: config.chat_permission_mode.clone(),
+            })
+        } else {
+            None
+        },
+        process_path: non_empty(&config.chat_process_path),
+        claude_cli_path: if no_claude {
+            None
+        } else {
+            non_empty(&config.chat_claude_cli_path)
+        },
+        // No Claude CLI to keep up to date when Claude Code is not the provider.
+        auto_update_cli: Some(config.chat_auto_update_cli && !no_claude),
+        auto_update_app: Some(config.chat_auto_update_app),
+    }
+}
+
 /// Generate a config.yaml from the wizard configuration.
 ///
 /// - Generates random secrets (JWT, MeiliSearch key) if not provided
@@ -631,7 +700,7 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
     // ── Read existing config for secret preservation (reconfigure mode) ──
     let existing: Option<project_orchestrator::YamlConfig> = std::fs::read_to_string(&path)
         .ok()
-        .and_then(|contents| serde_yaml::from_str(&contents).ok());
+        .and_then(|contents| project_orchestrator::yaml::from_str(&contents).ok());
 
     // Build YAML structure — preserve secrets from existing config when fields are empty
     let neo4j_password = if !config.neo4j_password.is_empty() {
@@ -838,43 +907,7 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
             key: meilisearch_key,
         },
         nats,
-        chat: Some(ChatSection {
-            provider: config
-                .chat_provider
-                .clone()
-                .filter(|p| !p.trim().is_empty()),
-            // Without a chat provider there is no model to default to.
-            default_model: if chat_provider_is_none(&config) || config.chat_model.trim().is_empty()
-            {
-                None
-            } else {
-                Some(config.chat_model.clone())
-            },
-            max_sessions: config.chat_max_sessions,
-            max_turns: config.chat_max_turns,
-            permissions: if config.chat_permission_mode != "default" {
-                // Only write permissions section if non-default (keeps config.yaml clean)
-                Some(ChatPermissionsSection {
-                    mode: config.chat_permission_mode.clone(),
-                })
-            } else {
-                None
-            },
-            process_path: if config.chat_process_path.trim().is_empty() {
-                None
-            } else {
-                Some(config.chat_process_path.trim().to_string())
-            },
-            claude_cli_path: if chat_provider_is_none(&config)
-                || config.chat_claude_cli_path.trim().is_empty()
-            {
-                None
-            } else {
-                Some(config.chat_claude_cli_path.trim().to_string())
-            },
-            auto_update_cli: Some(config.chat_auto_update_cli),
-            auto_update_app: Some(config.chat_auto_update_app),
-        }),
+        chat: Some(build_chat_section(&config)),
         embeddings: {
             // Preserve existing API key when the frontend sends it empty (redacted)
             let existing_embedding_api_key = existing
@@ -931,7 +964,8 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
     };
 
     // Serialize
-    let yaml_str = serde_yaml::to_string(&yaml).map_err(|e| format!("YAML error: {}", e))?;
+    let yaml_str =
+        project_orchestrator::yaml::to_string(&yaml).map_err(|e| format!("YAML error: {}", e))?;
 
     // Add header comment
     let output = format!(
@@ -1036,7 +1070,10 @@ pub fn setup_claude_code(server_url: Option<String>, port: Option<u16>) -> Claud
             std::fs::read_to_string(&config_path)
                 .ok()
                 .and_then(|contents| {
-                    serde_yaml::from_str::<project_orchestrator::YamlConfig>(&contents).ok()
+                    project_orchestrator::yaml::from_str::<project_orchestrator::YamlConfig>(
+                        &contents,
+                    )
+                    .ok()
                 })
                 .and_then(|yaml| yaml.auth.map(|a| a.jwt_secret))
         } else {
@@ -1140,7 +1177,7 @@ pub fn read_config() -> Result<ReadConfigResponse, String> {
     let contents = std::fs::read_to_string(&path)
         .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
 
-    let yaml: project_orchestrator::YamlConfig = serde_yaml::from_str(&contents)
+    let yaml: project_orchestrator::YamlConfig = project_orchestrator::yaml::from_str(&contents)
         .map_err(|e| format!("Cannot parse {}: {}", path.display(), e))?;
 
     // Determine infra mode: read from YAML (new configs), fallback to heuristic (old configs)
@@ -1417,7 +1454,8 @@ pub fn generate_default_config() -> Result<PathBuf, String> {
         remote_mcp: build_remote_mcp_section(false, None),
     };
 
-    let yaml_str = serde_yaml::to_string(&yaml).map_err(|e| format!("YAML error: {}", e))?;
+    let yaml_str =
+        project_orchestrator::yaml::to_string(&yaml).map_err(|e| format!("YAML error: {}", e))?;
     let output = format!(
         "# =============================================================================\n\
          # Project Orchestrator — Default Configuration (not yet configured)\n\
@@ -1664,7 +1702,7 @@ fn fastembed_cache_dir() -> PathBuf {
 #[cfg(feature = "local-embeddings")]
 #[tauri::command]
 pub fn check_embedding_model(model_name: String) -> Result<EmbeddingModelStatus, String> {
-    use fastembed::{EmbeddingModel, TextEmbedding};
+    use fastembed::TextEmbedding;
 
     let model_variant =
         project_orchestrator::embeddings::fastembed::parse_model_name_pub(&model_name);
@@ -2144,12 +2182,55 @@ fn chrono_now() -> String {
 mod remote_mcp_tests {
     use super::*;
 
+    /// The config file the wizard writes reads back into the backend config, and
+    /// secrets that look like numbers or booleans stay strings.
+    #[test]
+    fn the_written_config_reads_back_with_its_secrets_intact() {
+        let yaml = YamlOutput {
+            setup_completed: false,
+            infra_mode: "docker".into(),
+            server: ServerSection {
+                port: DEFAULT_DESKTOP_PORT,
+                workspace_path: ".".into(),
+                serve_frontend: false,
+                frontend_path: "./dist".into(),
+                public_url: None,
+            },
+            neo4j: Neo4jSection {
+                uri: "bolt://localhost:7687".into(),
+                user: "neo4j".into(),
+                password: "0123456789".into(),
+            },
+            meilisearch: MeilisearchSection {
+                url: "http://localhost:7700".into(),
+                key: "true".into(),
+            },
+            nats: None,
+            chat: None,
+            embeddings: None,
+            auth: None,
+            remote_mcp: build_remote_mcp_section(false, None),
+        };
+        let written = project_orchestrator::yaml::to_string(&yaml).unwrap();
+        let read: project_orchestrator::YamlConfig =
+            project_orchestrator::yaml::from_str(&written).unwrap();
+        assert!(!read.setup_completed);
+        assert_eq!(read.infra_mode.as_deref(), Some("docker"));
+        assert_eq!(read.server.port, DEFAULT_DESKTOP_PORT);
+        assert_eq!(read.neo4j.password, "0123456789");
+        assert_eq!(read.meilisearch.key, "true");
+        // And the desktop's own untyped reads see the same file.
+        let tree = project_orchestrator::yaml::value_from_str(&written).unwrap();
+        assert_eq!(tree["infra_mode"].as_str(), Some("docker"));
+        assert_eq!(tree["neo4j"]["password"].as_str(), Some("0123456789"));
+    }
+
     /// Serializing the wizard's RemoteMcpSection must deserialize cleanly into
     /// the backend RemoteMcpConfig — proves the emitted keys align with the
     /// struct that gates the routes.
     fn roundtrip(section: &RemoteMcpSection) -> project_orchestrator::RemoteMcpConfig {
-        let yaml = serde_yaml::to_string(section).unwrap();
-        serde_yaml::from_str(&yaml).unwrap()
+        let yaml = project_orchestrator::yaml::to_string(section).unwrap();
+        project_orchestrator::yaml::from_str(&yaml).unwrap()
     }
 
     #[test]
@@ -2234,7 +2315,8 @@ meilisearch:
   url: "http://localhost:7700"
   key: "meili-kept"
 "#;
-        let yaml: project_orchestrator::YamlConfig = serde_yaml::from_str(legacy).unwrap();
+        let yaml: project_orchestrator::YamlConfig =
+            project_orchestrator::yaml::from_str(legacy).unwrap();
         assert!(!yaml.remote_mcp.enabled);
         // Pre-existing secrets are untouched by the (absent) remote MCP section.
         assert_eq!(yaml.neo4j.password, "secret-kept");
@@ -2286,4 +2368,112 @@ pub async fn download_embedding_model(
                 .to_string(),
         ),
     })
+}
+
+#[cfg(test)]
+mod chat_provider_tests {
+    use super::*;
+
+    /// What the wizard sends, with the chat fields under test.
+    fn wizard(provider: Option<&str>, model: &str, cli_path: &str) -> SetupConfig {
+        serde_json::from_value(serde_json::json!({
+            "infraMode": "docker",
+            "neo4jUri": "bolt://localhost:7687",
+            "neo4jUser": "neo4j",
+            "neo4jPassword": "",
+            "meilisearchUrl": "http://localhost:7700",
+            "meilisearchKey": "",
+            "serverPort": DEFAULT_DESKTOP_PORT,
+            "authMode": "none",
+            "rootEmail": "",
+            "rootPassword": "",
+            "oidcDiscoveryUrl": "",
+            "oidcClientId": "",
+            "oidcClientSecret": "",
+            "chatModel": model,
+            "chatMaxSessions": 3,
+            "chatProcessPath": "/usr/bin:/bin",
+            "chatClaudeCliPath": cli_path,
+            "chatProvider": provider,
+            "chatAutoUpdateCli": true,
+        }))
+        .unwrap()
+    }
+
+    /// The section as the backend reads it back from the written file.
+    fn written_and_read(section: &ChatSection) -> project_orchestrator::ChatYamlConfig {
+        let yaml = project_orchestrator::yaml::to_string(section).unwrap();
+        project_orchestrator::yaml::from_str(&yaml).unwrap()
+    }
+
+    /// Another provider than Claude Code: the file carries nothing that needs
+    /// the Claude CLI (no model, no CLI path, no CLI auto-update), even when the
+    /// wizard still holds leftovers of a Claude Code choice, and the backend
+    /// reads it back.
+    #[test]
+    fn another_provider_writes_nothing_that_needs_the_claude_cli() {
+        let section = build_chat_section(&wizard(
+            Some("none"),
+            "claude-sonnet-5",
+            "/opt/homebrew/bin/claude",
+        ));
+        let read = written_and_read(&section);
+        assert_eq!(read.provider.as_deref(), Some("none"));
+        assert_eq!(read.default_model, None);
+        assert_eq!(read.claude_cli_path, None);
+        assert_eq!(read.auto_update_cli, Some(false));
+        // What is not about Claude Code is kept.
+        assert_eq!(read.max_sessions, Some(3));
+        assert_eq!(read.process_path.as_deref(), Some("/usr/bin:/bin"));
+    }
+
+    /// Claude Code, chosen or implied by a wizard that predates the choice,
+    /// keeps its model, CLI path and CLI auto-update as before.
+    #[test]
+    fn claude_code_keeps_its_model_and_cli() {
+        for provider in [Some("claude-code"), None] {
+            let section = build_chat_section(&wizard(
+                provider,
+                "claude-sonnet-5",
+                " /opt/homebrew/bin/claude ",
+            ));
+            let read = written_and_read(&section);
+            assert_eq!(read.provider.as_deref(), provider);
+            assert_eq!(read.default_model.as_deref(), Some("claude-sonnet-5"));
+            assert_eq!(
+                read.claude_cli_path.as_deref(),
+                Some("/opt/homebrew/bin/claude")
+            );
+            assert_eq!(read.auto_update_cli, Some(true));
+        }
+    }
+
+    /// An empty CLI path means "auto-detect": nothing is written for it.
+    #[test]
+    fn an_empty_cli_path_is_not_written() {
+        let section = build_chat_section(&wizard(Some("claude-code"), "claude-sonnet-5", "  "));
+        assert_eq!(written_and_read(&section).claude_cli_path, None);
+    }
+}
+
+#[cfg(test)]
+mod claude_cli_optional_tests {
+    use super::claude_cli_optional;
+
+    /// The splash shows a missing CLI as a warning only when Claude Code is the
+    /// configured provider (explicitly, or by a config that predates the choice).
+    #[test]
+    fn the_cli_matters_only_for_claude_code() {
+        assert!(
+            claude_cli_optional(false, None),
+            "no config yet: the wizard decides"
+        );
+        assert!(claude_cli_optional(true, Some("none")));
+        assert!(claude_cli_optional(true, Some(" None ")));
+        assert!(!claude_cli_optional(true, Some("claude-code")));
+        assert!(
+            !claude_cli_optional(true, None),
+            "a config without a provider is Claude Code"
+        );
+    }
 }
