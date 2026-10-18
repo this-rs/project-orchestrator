@@ -56,6 +56,9 @@ pub struct MockAnchorStore {
     pub events: Vec<crate::chat::anchor::AnchorEvent>,
 }
 
+/// Shadow state of one directed synapse: `(shadow_weight, last shadow decay)`.
+pub type MockShadowSynapse = (f64, Option<chrono::DateTime<chrono::Utc>>);
+
 pub struct MockGraphStore {
     // Entity stores
     pub projects: RwLock<HashMap<Uuid, ProjectNode>>,
@@ -232,7 +235,7 @@ pub struct MockGraphStore {
     /// Note synapses: bidirectional adjacency list (note_id -> Vec<(neighbor_id, weight)>)
     pub note_synapses: RwLock<HashMap<Uuid, Vec<(Uuid, f64)>>>,
     /// Shadow state of the directed synapses (from, to) -> (shadow_weight, last shadow decay).
-    pub synapse_shadow: RwLock<HashMap<(Uuid, Uuid), (f64, Option<chrono::DateTime<chrono::Utc>>)>>,
+    pub synapse_shadow: RwLock<HashMap<(Uuid, Uuid), MockShadowSynapse>>,
     /// Synaptic shadow traces, in insertion order.
     pub synapse_shadow_traces: RwLock<Vec<crate::neurons::synaptic_shadow::SynapseShadowTrace>>,
     /// Scope argument of every `init_note_energy` call, in order (test probe).

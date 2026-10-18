@@ -177,9 +177,9 @@ async fn shadow_edges_rewards_and_decay_never_touch_the_legacy_weight() {
     // Reading: the project only.
     let rows = e.client.shadow_synapse_edges(p, &[a, b]).await.unwrap();
     let mut seen: Vec<(Uuid, Uuid, f64)> = rows.iter().map(|r| (r.from, r.to, r.weight)).collect();
-    seen.sort_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+    seen.sort_by_key(|x| (x.0, x.1));
     let mut expected = vec![(a, b, 0.8), (b, a, 0.8), (b, c, 0.6)];
-    expected.sort_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+    expected.sort_by_key(|x| (x.0, x.1));
     assert_eq!(seen, expected);
     let to_a = rows.iter().find(|r| r.to == a).unwrap();
     assert!(to_a.target.reachable);
