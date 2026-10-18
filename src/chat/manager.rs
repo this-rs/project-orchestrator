@@ -1566,6 +1566,47 @@ pub(crate) fn spawn_anchor_shadow(
     });
 }
 
+/// One shadow turn of the posture of a session (T7, `chat::posture`): derived from its
+/// focus anchors, fitted to the capability snapshot of its opening, tracked with
+/// hysteresis and journaled (target `posture_shadow`). It changes nothing the turn does:
+/// no prompt, tool or enrichment reads it.
+pub(crate) fn observe_posture(
+    session_id: Uuid,
+    node: &crate::neo4j::models::ChatSessionNode,
+    anchors: &[super::anchor::Anchor],
+    admitted: Option<&super::anchor_resolver::ResolvedScope>,
+) -> super::posture::PostureObservation {
+    let caps: Option<nexus_claude::agent::Capabilities> = node
+        .capabilities
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok());
+    let invariants = super::posture::Invariants {
+        access: node.access,
+        permission_mode: node.permission_mode.clone(),
+    };
+    super::posture::book().observe_turn(session_id, anchors, admitted, &invariants, caps.as_ref())
+}
+
+/// Mode `shadow`: the resolver does not run for the turn, so the posture is observed in
+/// a detached task on the session's anchors (one read), never delaying the turn. The
+/// resolver's admission is not applied there; nothing of it reaches the model.
+fn spawn_posture_shadow(
+    graph: Arc<dyn GraphStore>,
+    session_id: Uuid,
+    node: crate::neo4j::models::ChatSessionNode,
+) {
+    tokio::spawn(async move {
+        match graph.list_session_anchors(session_id).await {
+            Ok(anchors) => {
+                observe_posture(session_id, &node, &anchors, None);
+            }
+            Err(e) => {
+                warn!(target: "posture_shadow", session_id = %session_id, error = %e, "posture shadow: anchors unreadable (ignored)")
+            }
+        }
+    });
+}
+
 /// The knowledge graph's context for one turn whose message is `message`, as the
 /// markdown put in front of it (`None`: nothing to add). Both engines call it
 /// before every turn — the Claude Code engine in `stream_response`, the agent
@@ -1614,6 +1655,8 @@ pub(crate) async fn enrichment_for_turn(
             .await
         {
             Ok((r, _)) => {
+                // Posture, shadow (T7): from the resolver's admitted anchors, no I/O.
+                observe_posture(uuid, &node, &r.anchors, Some(&r.scope));
                 live_block = r.live_block();
                 let mut slug = r.decision.project.as_ref().map(|p| p.slug.clone());
                 // An explicit `project_slug` that does not resolve to a project is
@@ -1649,6 +1692,7 @@ pub(crate) async fn enrichment_for_turn(
         },
     };
     if mode == AnchorContextMode::Shadow {
+        spawn_posture_shadow(graph.clone(), uuid, node.clone());
         spawn_anchor_shadow(
             graph.clone(),
             anchor.cache.clone(),
@@ -19343,6 +19387,80 @@ mod tests {
             assert!(
                 out.is_none_or(|o| !o.contains(crate::chat::anchor_resolver::NOTICE_NO_CONTEXT)),
                 "{mode:?}"
+            );
+        }
+    }
+
+    /// T7: the posture is observed and journaled every turn, in `on` and in `shadow`,
+    /// and the turn's enrichment is the one it would be without it.
+    #[tokio::test]
+    async fn the_posture_is_observed_in_shadow_without_changing_the_turn() {
+        let state = mock_app_state();
+        let graph: Arc<dyn GraphStore> = state.neo4j.clone();
+        let pipeline = crate::chat::enrichment::EnrichmentPipeline::new(Default::default());
+        for mode in [AnchorContextMode::On, AnchorContextMode::Shadow] {
+            let s = crate::test_helpers::test_chat_session(None);
+            state.neo4j.create_chat_session(&s).await.unwrap();
+            let sid = s.id.to_string();
+            let turn = |anchor: crate::chat::anchor_resolver::AnchorSession| {
+                let (graph, pipeline, sid) = (&graph, &pipeline, sid.clone());
+                async move {
+                    enrichment_for_turn(
+                        graph,
+                        pipeline,
+                        &sid,
+                        "hello",
+                        Default::default(),
+                        Default::default(),
+                        &anchor,
+                        None,
+                    )
+                    .await
+                }
+            };
+            // The observation of `turns` turns (shadow: a detached task).
+            let observed = |turns: u64| async move {
+                for _ in 0..10_000 {
+                    match crate::chat::posture::book().tracker(s.id) {
+                        Some(t) if t.turns >= turns => return t,
+                        _ => tokio::task::yield_now().await,
+                    }
+                }
+                panic!("{mode:?}: turn {turns} never observed");
+            };
+            let before = turn(anchor_in(mode)).await;
+            assert_eq!(
+                observed(1).await.effective(),
+                Some(&crate::chat::posture::Posture::neutral())
+            );
+            let project = crate::test_helpers::test_project_named(&format!("posture-{mode:?}"));
+            state.neo4j.create_project(&project).await.unwrap();
+            human_anchors_project(
+                &graph,
+                s.id,
+                project.id,
+                crate::chat::anchor::AnchorActor::User,
+            )
+            .await;
+            let after = turn(anchor_in(mode)).await;
+            for out in [&before, &after].into_iter().flatten() {
+                assert!(
+                    !out.contains("## Posture") && !out.contains("Posture :"),
+                    "{mode:?}: {out}"
+                );
+            }
+            if mode == AnchorContextMode::Shadow {
+                assert_eq!(
+                    before, after,
+                    "shadow: the anchor changes nothing of the turn"
+                );
+            }
+            let tracker = observed(2).await;
+            assert_eq!(tracker.turns, 2, "{mode:?}");
+            assert_eq!(
+                tracker.effective().map(|p| p.persona),
+                Some(crate::chat::posture::Persona::ProjectLead),
+                "{mode:?}: the user's focus anchor switched at once"
             );
         }
     }

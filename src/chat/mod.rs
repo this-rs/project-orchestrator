@@ -47,6 +47,7 @@ pub mod path_detect;
 pub mod pending_queue;
 pub(crate) mod post_stream;
 pub(crate) mod post_tool_hook;
+pub mod posture;
 pub mod prompt;
 pub mod prompt_sections;
 pub mod provider;
