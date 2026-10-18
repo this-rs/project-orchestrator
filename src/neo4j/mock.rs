@@ -7964,30 +7964,86 @@ impl GraphStore for MockGraphStore {
         Ok(rows)
     }
 
+    /// P18-suite (point 12): a real traversal of the mock's `spawned_by`, with the
+    /// semantics of the Neo4j query — the session itself at depth 0, then every
+    /// descendant found through the JSON parent, breadth first, siblings by
+    /// `created_at`; an unknown session is an empty tree. `status`, provider, model
+    /// and costs stay unset here: the API fills them, as it does for the real store.
     async fn get_session_tree(&self, session_id: &str) -> Result<Vec<SessionTreeNode>> {
-        // Mock: return the session itself as root with depth 0
-        Ok(vec![SessionTreeNode {
-            session_id: session_id.to_string(),
-            parent_session_id: None,
-            spawn_type: None,
-            run_id: None,
-            task_id: None,
-            depth: 0,
-            created_at: Some(chrono::Utc::now()),
-            provider_id: None,
-            model: None,
-            cost_usd: None,
-            subtree_cost_usd: None,
-            max_depth: None,
-            max_children: None,
-            status: "closed".to_string(),
-            routed_by: None,
-        }])
+        let sessions = self.chat_sessions.read().await;
+        let Some(root) = sessions.values().find(|s| s.id.to_string() == session_id) else {
+            return Ok(Vec::new());
+        };
+        let node_of = |s: &ChatSessionNode, depth: u32| {
+            let spawn = spawned_by_of(s);
+            SessionTreeNode {
+                session_id: s.id.to_string(),
+                parent_session_id: if depth == 0 { None } else { spawn.parent.clone() },
+                spawn_type: if depth == 0 { None } else { spawn.kind.clone() },
+                run_id: if depth == 0 { None } else { spawn.run_id },
+                task_id: if depth == 0 { None } else { spawn.task_id },
+                depth,
+                created_at: Some(s.created_at),
+                provider_id: None,
+                model: None,
+                cost_usd: None,
+                subtree_cost_usd: None,
+                max_depth: None,
+                max_children: None,
+                status: "closed".to_string(),
+                routed_by: None,
+            }
+        };
+        let mut nodes = vec![node_of(root, 0)];
+        let mut frontier = vec![root.id.to_string()];
+        let mut seen: std::collections::HashSet<String> = frontier.iter().cloned().collect();
+        let mut depth = 0u32;
+        // The real query stops at ten hops (`SPAWNED_BY*0..10`).
+        while !frontier.is_empty() && depth < 10 {
+            depth += 1;
+            let mut next = Vec::new();
+            for parent in &frontier {
+                let mut children: Vec<&ChatSessionNode> = sessions
+                    .values()
+                    .filter(|s| spawned_by_of(s).parent.as_deref() == Some(parent.as_str()))
+                    .filter(|s| !seen.contains(&s.id.to_string()))
+                    .collect();
+                children.sort_by_key(|s| s.created_at);
+                for child in children {
+                    seen.insert(child.id.to_string());
+                    nodes.push(node_of(child, depth));
+                    next.push(child.id.to_string());
+                }
+            }
+            frontier = next;
+        }
+        Ok(nodes)
     }
 
+    /// P18-suite (point 12): follow the JSON parent upward to the session that has
+    /// none — ten hops at most, a cycle stops the walk — or `None` for an unknown
+    /// session, as the Neo4j query answers.
     async fn get_session_root(&self, session_id: &str) -> Result<Option<String>> {
-        // Mock: the session itself is the root
-        Ok(Some(session_id.to_string()))
+        let sessions = self.chat_sessions.read().await;
+        let by_id = |id: &str| sessions.values().find(|s| s.id.to_string() == id);
+        let Some(mut current) = by_id(session_id) else {
+            return Ok(None);
+        };
+        let mut seen = std::collections::HashSet::from([current.id.to_string()]);
+        for _ in 0..10 {
+            let Some(parent_id) = spawned_by_of(current).parent else {
+                break;
+            };
+            if !seen.insert(parent_id.clone()) {
+                break;
+            }
+            match by_id(&parent_id) {
+                Some(parent) => current = parent,
+                // A parent the store no longer holds: the walk ends on the last known session.
+                None => break,
+            }
+        }
+        Ok(Some(current.id.to_string()))
     }
 
     async fn get_run_sessions(&self, _run_id: Uuid) -> Result<Vec<SessionInfo>> {
@@ -18104,5 +18160,153 @@ mod cross_project_parity {
             notes[20..].iter().all(|w| !r.contains(&w.id)),
             "weakly coupled foreign notes cut after the weighting"
         );
+    }
+}
+
+/// What a session's `spawned_by` JSON says about its parent (mock-side reading of the
+/// `SPAWNED_BY` edge): the parent id and the spawn type, plus the run and task when the
+/// JSON names them. Anything unreadable is simply absent.
+struct SpawnedByFields {
+    parent: Option<String>,
+    kind: Option<String>,
+    run_id: Option<Uuid>,
+    task_id: Option<Uuid>,
+}
+
+fn spawned_by_of(session: &ChatSessionNode) -> SpawnedByFields {
+    let value: Option<serde_json::Value> = session
+        .spawned_by
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok());
+    let text = |key: &str| {
+        value
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    SpawnedByFields {
+        parent: text("parent_session_id"),
+        kind: text("type"),
+        run_id: text("run_id").and_then(|s| s.parse().ok()),
+        task_id: text("task_id").and_then(|s| s.parse().ok()),
+    }
+}
+
+#[cfg(test)]
+mod session_tree_tests {
+    //! P18-suite (point 12): the mock's session tree is a real traversal, so the cascade
+    //! and tree tests built on it prove something. Red on the former stubs, which answered
+    //! the session alone (tree) and the session itself (root) whatever the parents.
+    use super::*;
+    use chrono::{DateTime, Utc};
+
+    fn session(spawned_by: Option<serde_json::Value>, created_at: DateTime<Utc>) -> ChatSessionNode {
+        let mut node = crate::test_helpers::test_chat_session(None);
+        node.id = Uuid::new_v4();
+        node.created_at = created_at;
+        node.spawned_by = spawned_by.map(|v| v.to_string());
+        node
+    }
+
+    fn child_of(parent: &ChatSessionNode, kind: &str, created_at: DateTime<Utc>) -> ChatSessionNode {
+        session(
+            Some(serde_json::json!({"type": kind, "parent_session_id": parent.id.to_string()})),
+            created_at,
+        )
+    }
+
+    async fn store(nodes: &[&ChatSessionNode]) -> MockGraphStore {
+        let mock = MockGraphStore::new();
+        for node in nodes {
+            mock.create_chat_session(&(*node).clone()).await.unwrap();
+        }
+        mock
+    }
+
+    #[tokio::test]
+    async fn the_tree_holds_every_descendant_with_its_depth_parent_and_spawn_type() {
+        let t0 = Utc::now();
+        let root = session(None, t0);
+        let late_child = child_of(&root, "conversation", t0 + chrono::Duration::seconds(2));
+        let early_child = child_of(&root, "delegation", t0 + chrono::Duration::seconds(1));
+        let grandchild = child_of(&early_child, "conversation", t0 + chrono::Duration::seconds(3));
+        let stranger = session(None, t0);
+        let mock = store(&[&root, &late_child, &early_child, &grandchild, &stranger]).await;
+
+        let tree = mock.get_session_tree(&root.id.to_string()).await.unwrap();
+        let ids: Vec<&str> = tree.iter().map(|n| n.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                root.id.to_string(),
+                early_child.id.to_string(),
+                late_child.id.to_string(),
+                grandchild.id.to_string()
+            ],
+            "depth first, then created_at; the stranger is not in the tree"
+        );
+        assert_eq!(tree.iter().map(|n| n.depth).collect::<Vec<_>>(), vec![0, 1, 1, 2]);
+        assert_eq!(tree[0].parent_session_id, None, "the root names no parent");
+        assert_eq!(tree[1].parent_session_id.as_deref(), Some(root.id.to_string().as_str()));
+        assert_eq!(tree[1].spawn_type.as_deref(), Some("delegation"));
+        assert_eq!(tree[3].parent_session_id.as_deref(), Some(early_child.id.to_string().as_str()));
+        assert_eq!(tree[3].spawn_type.as_deref(), Some("conversation"));
+    }
+
+    #[tokio::test]
+    async fn the_tree_of_a_child_starts_at_that_child_and_an_unknown_session_has_none() {
+        let t0 = Utc::now();
+        let root = session(None, t0);
+        let child = child_of(&root, "delegation", t0);
+        let grandchild = child_of(&child, "conversation", t0);
+        let mock = store(&[&root, &child, &grandchild]).await;
+
+        let tree = mock.get_session_tree(&child.id.to_string()).await.unwrap();
+        assert_eq!(tree.len(), 2, "the child and its own descendant, not its parent");
+        assert_eq!(tree[0].session_id, child.id.to_string());
+        assert_eq!(tree[0].depth, 0);
+        assert_eq!(tree[1].session_id, grandchild.id.to_string());
+
+        assert!(mock.get_session_tree(&Uuid::new_v4().to_string()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_root_is_found_by_walking_the_parents_up() {
+        let t0 = Utc::now();
+        let root = session(None, t0);
+        let child = child_of(&root, "delegation", t0);
+        let grandchild = child_of(&child, "conversation", t0);
+        let mock = store(&[&root, &child, &grandchild]).await;
+
+        let root_id = root.id.to_string();
+        assert_eq!(mock.get_session_root(&grandchild.id.to_string()).await.unwrap().as_deref(), Some(root_id.as_str()));
+        assert_eq!(mock.get_session_root(&child.id.to_string()).await.unwrap().as_deref(), Some(root_id.as_str()));
+        assert_eq!(mock.get_session_root(&root_id).await.unwrap().as_deref(), Some(root_id.as_str()), "a root is its own root");
+        assert_eq!(mock.get_session_root(&Uuid::new_v4().to_string()).await.unwrap(), None, "unknown session");
+    }
+
+    #[tokio::test]
+    async fn a_parent_the_store_no_longer_holds_ends_the_walk_and_a_cycle_does_not_hang() {
+        let t0 = Utc::now();
+        let orphan = session(
+            Some(serde_json::json!({"type": "delegation", "parent_session_id": Uuid::new_v4().to_string()})),
+            t0,
+        );
+        let mut a = session(None, t0);
+        let mut b = session(None, t0);
+        a.spawned_by = Some(serde_json::json!({"type": "conversation", "parent_session_id": b.id.to_string()}).to_string());
+        b.spawned_by = Some(serde_json::json!({"type": "conversation", "parent_session_id": a.id.to_string()}).to_string());
+        let mock = store(&[&orphan, &a, &b]).await;
+
+        assert_eq!(
+            mock.get_session_root(&orphan.id.to_string()).await.unwrap().as_deref(),
+            Some(orphan.id.to_string().as_str()),
+            "the last known session of the walk"
+        );
+        let cyclic_root = mock.get_session_root(&a.id.to_string()).await.unwrap();
+        assert!(cyclic_root.is_some(), "a cycle ends, it does not hang");
+        assert_eq!(mock.get_session_tree(&a.id.to_string()).await.unwrap().len(), 2, "a and b once each");
     }
 }
