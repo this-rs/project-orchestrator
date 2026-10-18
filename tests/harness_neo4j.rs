@@ -223,6 +223,49 @@ async fn the_provider_fields_of_a_session_are_stored_and_read_back() {
         .unwrap();
 }
 
+/// T1-bis: the place of a session (`execution_place`) through the real CREATE of both
+/// branches (with and without a project) and the real read: `neutral` is stored as the
+/// string `neutral` and read back as such; a session written before the field reads as
+/// `project` (the legacy test below).
+#[tokio::test]
+async fn the_execution_place_is_stored_and_read_back_on_both_create_branches() {
+    use project_orchestrator::neo4j::models::ExecutionPlace;
+    let Some(e) = env().await else { return };
+    let store: &dyn GraphStore = &e.client;
+    let slug = format!("t1bis-{}", Uuid::new_v4());
+    let cases = [
+        (None, ExecutionPlace::Neutral),
+        (Some(slug.clone()), ExecutionPlace::Neutral),
+        (None, ExecutionPlace::Project),
+    ];
+    let mut ids = Vec::new();
+    for (project_slug, place) in cases {
+        let id = Uuid::new_v4();
+        ids.push(id.to_string());
+        let mut n = node(id);
+        n.project_slug = project_slug.clone();
+        n.execution_place = place;
+        store.create_chat_session(&n).await.unwrap();
+
+        let read = store.get_chat_session(id).await.unwrap().expect("stored");
+        assert_eq!(read.execution_place, place, "{project_slug:?}");
+        let mut r = e
+            .raw
+            .execute(
+                query("MATCH (s:ChatSession {id: $id}) RETURN s.execution_place AS p")
+                    .param("id", id.to_string()),
+            )
+            .await
+            .unwrap();
+        let stored: String = r.next().await.unwrap().unwrap().get("p").unwrap();
+        assert_eq!(stored, place.as_str(), "{project_slug:?}");
+    }
+    e.raw
+        .run(query("MATCH (s:ChatSession) WHERE s.id IN $ids DETACH DELETE s").param("ids", ids))
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn a_session_written_before_the_harness_reads_back_without_provider_fields() {
     let Some(e) = env().await else { return };
@@ -250,6 +293,11 @@ async fn a_session_written_before_the_harness_reads_back_without_provider_fields
     assert_eq!(read.routed_by, None);
     assert_eq!(read.capabilities, None);
     assert_eq!(read.resume_token, None);
+    assert_eq!(
+        read.execution_place,
+        project_orchestrator::neo4j::models::ExecutionPlace::Project,
+        "absent = project"
+    );
     e.raw
         .run(query("MATCH (s:ChatSession {id: $id}) DETACH DELETE s").param("id", id.to_string()))
         .await
