@@ -1320,3 +1320,184 @@ async fn after_a_provider_move_the_next_turn_of_the_same_class_is_steady() {
         decision.reason
     );
 }
+
+/// A pool that ticks models on two providers (the menu's `mixed`): `primary/pm` plus the
+/// worker's two models.
+fn cross_provider_pool() -> Vec<super::types::RoutingPoolEntry> {
+    [("primary", "pm"), ("worker", "wa"), ("worker", "wb")]
+        .iter()
+        .map(|(provider, model)| super::types::RoutingPoolEntry {
+            provider: (*provider).into(),
+            model: (*model).into(),
+        })
+        .collect()
+}
+
+/// Waits until the worker served `text` once, then until the session is idle.
+async fn served_by_worker(w: &World, session_id: &str, text: &str) {
+    for _ in 0..400 {
+        if !model_of_turn(&w.worker, text, &[]).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    idle(w, session_id).await;
+}
+
+/// R-S2 (1): a pool ticked across two providers is routed like `full` restricted to the
+/// pool, whatever the settings say (here `primary` + `shadow`: the conversation's own ticks
+/// win, decision R-S1). The opening (EXPLORE, which the arms taught to prefer the primary)
+/// lands on `primary/pm`; a DEBUG turn (which prefers `wb`) moves the conversation to the
+/// worker, in place (`ProviderSwitched` on the SAME thread). Red before R-S2: a mixed pool
+/// kept its provider, so the debug turn stayed on `pm` and no switch happened.
+#[tokio::test]
+async fn a_pool_spanning_two_providers_moves_to_the_other_provider_on_a_turn() {
+    use super::provider::cognitive::ConversationRoutingMode;
+    let w = world("primary", "shadow").await;
+    probe_wb(&w).await;
+    let mut ticked = pilot();
+    ticked.message = EXPLORE.into();
+    ticked.provider = Some("primary".into());
+    ticked.model = Some("pm".into());
+    ticked.routing_mode = Some(ConversationRoutingMode::Mixed);
+    ticked.routing_pool = Some(cross_provider_pool());
+    let p = open(&w, &ticked).await;
+    let opened = node(&w, &p).await;
+    assert_eq!(opened.provider_id.as_deref(), Some("primary"));
+    assert_eq!(
+        opened.model, "pm",
+        "the opening: the explore class prefers pm"
+    );
+
+    w.manager.send_message(&p, DEBUG).await.unwrap();
+    let ChatEvent::ProviderSwitched {
+        session_id,
+        from_provider,
+        to_provider,
+        model,
+        ..
+    } = switched_in_place(&w, &p).await
+    else {
+        unreachable!("the pool spans two providers: the debug turn moves")
+    };
+    assert_eq!(session_id, p, "moved in place, on the same thread");
+    assert_eq!(
+        (from_provider.as_str(), to_provider.as_str(), model.as_str()),
+        ("primary", "worker", "wb")
+    );
+    served_by_worker(&w, &p, DEBUG).await;
+    assert_eq!(model_of_turn(&w.worker, DEBUG, &[]), ["wb"]);
+    assert!(model_of_turn(&w.primary, DEBUG, &[]).is_empty());
+    assert_eq!(node(&w, &p).await.provider_id.as_deref(), Some("worker"));
+}
+
+/// R-S2 (2): a pool on ONE provider keeps today's behaviour: no move, the model is routed
+/// inside the provider (debug → `wb`).
+#[tokio::test]
+async fn a_pool_on_one_provider_never_moves_the_conversation() {
+    use super::provider::cognitive::ConversationRoutingMode;
+    use super::types::RoutingPoolEntry;
+    let w = world("primary", "shadow").await;
+    probe_wb(&w).await;
+    let mut ticked = pilot();
+    ticked.provider = Some("worker".into());
+    ticked.model = Some("wa".into());
+    ticked.routing_mode = Some(ConversationRoutingMode::Mixed);
+    ticked.routing_pool = Some(
+        ["wa", "wb"]
+            .iter()
+            .map(|m| RoutingPoolEntry {
+                provider: "worker".into(),
+                model: (*m).into(),
+            })
+            .collect(),
+    );
+    let p = open(&w, &ticked).await;
+    assert_eq!(node(&w, &p).await.provider_id.as_deref(), Some("worker"));
+    let events = turn_events(&w, &p, DEBUG).await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ChatEvent::ProviderSwitched { .. })),
+        "a pool on one provider never moves: {events:#?}"
+    );
+    assert_eq!(model_of_turn(&w.worker, DEBUG, &[]), ["wb"]);
+    assert!(turns(&w.primary).is_empty());
+    assert_eq!(node(&w, &p).await.provider_id.as_deref(), Some("worker"));
+}
+
+/// R-S2 (3): ONE model ticked is strict — the request names that pair, `routed_by:
+/// request`, and it is never substituted, even when the arms prefer another model.
+#[tokio::test]
+async fn a_single_tick_is_strict_a_pin_never_substituted() {
+    use super::provider::cognitive::ConversationRoutingMode;
+    use super::types::RoutingPoolEntry;
+    let w = world("primary", "shadow").await;
+    probe_wb(&w).await;
+    let mut ticked = pilot();
+    ticked.provider = Some("worker".into());
+    ticked.model = Some("wb".into());
+    ticked.routing_mode = Some(ConversationRoutingMode::Mixed);
+    ticked.routing_pool = Some(vec![RoutingPoolEntry {
+        provider: "worker".into(),
+        model: "wb".into(),
+    }]);
+    let p = open(&w, &ticked).await;
+    let opened = node(&w, &p).await;
+    assert_eq!(opened.provider_id.as_deref(), Some("worker"));
+    assert_eq!(opened.model, "wb");
+    assert_eq!(
+        opened.routed_by.as_deref(),
+        Some("request"),
+        "one tick = strict"
+    );
+    turn(&w, &p, DEBUG).await;
+    assert_eq!(
+        model_of_turn(&w.worker, DEBUG, &[]),
+        ["wb"],
+        "never substituted"
+    );
+    assert!(turns(&w.primary).is_empty());
+}
+
+/// R-S2 (4): a pool spanning two providers moves the conversation once; the turn right
+/// after a move is decided among the new provider's models only (R-S3), even though the
+/// EXPLORE class strongly prefers the provider it just left.
+#[tokio::test]
+async fn a_pool_spanning_two_providers_moves_only_once() {
+    use super::provider::cognitive::ConversationRoutingMode;
+    let w = world("primary", "shadow").await;
+    probe_wb(&w).await;
+    let mut ticked = pilot();
+    ticked.message = EXPLORE.into();
+    ticked.provider = Some("primary".into());
+    ticked.model = Some("pm".into());
+    ticked.routing_mode = Some(ConversationRoutingMode::Mixed);
+    ticked.routing_pool = Some(cross_provider_pool());
+    let p = open(&w, &ticked).await;
+    assert_eq!(node(&w, &p).await.provider_id.as_deref(), Some("primary"));
+
+    w.manager.send_message(&p, DEBUG).await.unwrap();
+    let ChatEvent::ProviderSwitched { to_provider, .. } = switched_in_place(&w, &p).await else {
+        unreachable!()
+    };
+    assert_eq!(to_provider, "worker");
+    served_by_worker(&w, &p, DEBUG).await;
+    assert_eq!(model_of_turn(&w.worker, DEBUG, &[]), ["wb"]);
+
+    // EXPLORE favours the primary it just left: the turn after a move is decided on the
+    // worker only (its model may change, its provider does not).
+    let events = turn_events(&w, &p, EXPLORE).await;
+    let switches = events
+        .iter()
+        .filter(|e| matches!(e, ChatEvent::ProviderSwitched { .. }))
+        .count();
+    assert_eq!(switches, 0, "no second move in a row: {events:#?}");
+    // The opening EXPLORE ran on the primary, so look at what came after the move: a
+    // request carrying DEBUG (the relayed history) never reached the primary again.
+    assert!(
+        model_of_turn(&w.primary, DEBUG, &[]).is_empty(),
+        "the primary never saw the conversation again"
+    );
+    assert_eq!(node(&w, &p).await.provider_id.as_deref(), Some("worker"));
+}

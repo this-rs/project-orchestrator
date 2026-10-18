@@ -313,6 +313,27 @@ pub fn settle_routing_pool(pool: &[RoutingPoolEntry]) -> Result<Vec<RoutingPoolE
     Ok(settled)
 }
 
+/// Whether a pool names models on two providers or more. Such a conversation may be moved
+/// from one provider to another by the per-turn routing, like `full` restricted to the pool
+/// (decision R-S2), whatever the mode its ticks map to. A pool on one provider (or none)
+/// keeps the conversation on its provider: moving it is a `switch-provider` by hand, never a
+/// per-turn change.
+pub fn pool_spans_providers(pool: Option<&[RoutingPoolEntry]>) -> bool {
+    let Some(pool) = pool else {
+        return false;
+    };
+    // A pool that failed `settle_routing_pool` is kept raw (`settled_routing`): a blank
+    // provider is not a provider.
+    let mut providers: Vec<&str> = pool
+        .iter()
+        .map(|e| e.provider.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+    providers.sort_unstable();
+    providers.dedup();
+    providers.len() > 1
+}
+
 impl ChatRequest {
     /// The routing the request asks for, read the way the chat menu means it: the mode
     /// follows the ticks. An empty pool is no pool; a pool of ONE is strict (that
@@ -4171,5 +4192,39 @@ mod tests {
         assert_eq!(json["execution_place"], "neutral");
         let back: CreateSessionResponse = serde_json::from_value(json).unwrap();
         assert_eq!(back.execution_place, ExecutionPlace::Neutral);
+    }
+}
+
+#[cfg(test)]
+mod pool_spans_providers_tests {
+    use super::{pool_spans_providers, RoutingPoolEntry};
+
+    fn entry(provider: &str, model: &str) -> RoutingPoolEntry {
+        RoutingPoolEntry {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+
+    #[test]
+    fn two_providers_span_one_does_not() {
+        assert!(!pool_spans_providers(None), "no pool");
+        assert!(!pool_spans_providers(Some(&[])), "an empty pool");
+        assert!(
+            !pool_spans_providers(Some(&[entry("a", "m")])),
+            "one tick is strict"
+        );
+        assert!(
+            !pool_spans_providers(Some(&[entry("a", "m"), entry("a", "big")])),
+            "two models of ONE provider never move the conversation"
+        );
+        assert!(pool_spans_providers(Some(&[
+            entry("a", "m"),
+            entry("b", "m")
+        ])));
+        assert!(
+            pool_spans_providers(Some(&[entry("a", "m"), entry("a", "big"), entry("b", "m")])),
+            "the count is of providers, not of entries"
+        );
     }
 }

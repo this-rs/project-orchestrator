@@ -100,8 +100,10 @@ impl ConversationRoutingMode {
     /// The settings-level mode this conversation's PILOT decisions are asked with.
     /// `full` is `full`. `primary` is strict. `mixed` routes the pilot only through its
     /// pool: where a decision restricted to the pool is asked, it is asked as `full`
-    /// inside the pool; outside the pool nothing is routed and the provider never moves,
-    /// which is `primary` — never `executors_only`, whose pilot is never routed.
+    /// inside the pool; outside the pool nothing is routed. The provider moves only when
+    /// the pool ticks models on several providers (decision R-S2: the per-turn router
+    /// decides that from the pool, `agent_hooks::routing_of`, not this mode); otherwise
+    /// `mixed` is `primary` here — never `executors_only`, whose pilot is never routed.
     pub fn pilot_mode(self) -> ProviderRoutingMode {
         match self {
             Self::Primary | Self::Mixed => ProviderRoutingMode::Primary,

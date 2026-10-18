@@ -5020,14 +5020,17 @@ mod provider_switch {
             );
         }
 
+        /// Decision R-S2: a `mixed` pool ticked across two providers (here through
+        /// `PUT .../routing` on a live conversation opened on `local`) lets the router move
+        /// the conversation to the other provider of the pool, in place, exactly as `full`
+        /// does — restricted to the pool. Before R-S2 this test asserted the opposite
+        /// ("mixed never leaves the session's provider"): the pool was dropped by
+        /// `reroute` and `routing_of` kept the provider closed under `mixed`. A pool on ONE
+        /// provider still never moves (`routing_modes_e2e_tests`, `provider_move_tests`).
         #[tokio::test]
-        async fn mixed_never_leaves_the_sessions_provider() {
+        async fn a_mixed_pool_spanning_providers_may_leave_the_sessions_provider() {
             let (w, mover) = auto_world("auto", vec!["local2"], false).await;
             let old = first_turn(&w).await;
-            let pair = |provider: &str| RoutingPoolEntry {
-                provider: provider.into(),
-                model: "m".into(),
-            };
             w.manager
                 .set_session_routing(
                     &old,
@@ -5039,8 +5042,40 @@ mod provider_switch {
                 .await
                 .unwrap();
             idle(&w, &old).await;
-            answered_in_place(&w, &old, "second question").await;
-            assert!(mover.checks().is_empty(), "mixed asks no provider question");
+            let to = moved_by_auto(&w, &old, "second question").await;
+            assert_eq!(to, "local2", "moved among the pool's two providers");
+            let checks = mover.checks();
+            assert_eq!(checks.len(), 1, "one provider question, for the pool");
+            let mut providers: Vec<&str> = checks[0]
+                .pool
+                .iter()
+                .map(|f| f.provider_id.as_str())
+                .collect();
+            providers.sort_unstable();
+            providers.dedup();
+            assert_eq!(
+                providers,
+                vec!["local", "local2"],
+                "decided among the pool only: {:?}",
+                checks[0].pool
+            );
+            assert_eq!(
+                (checks[0].settings.mode, checks[0].settings.stage),
+                (ProviderRoutingMode::Full, LearningStage::Auto),
+                "asked as full inside the pool"
+            );
+            let node = w
+                .graph
+                .get_chat_session(Uuid::parse_str(&old).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(node.provider_id.as_deref(), Some("local2"));
+            assert_eq!(
+                node.routing_mode.as_deref(),
+                Some("mixed"),
+                "the ticks stay"
+            );
         }
 
         fn pair(provider: &str) -> RoutingPoolEntry {
