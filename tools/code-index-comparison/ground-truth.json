@@ -1,0 +1,11 @@
+{
+  "source_revision": "cfb58ee2f0927c975f3fe7e19dd60e1cbf646fdf",
+  "verified_at": "2026-10-13",
+  "method": "Comptage syntaxique par grep des fichiers suivis (git ls-files). Meme quantite que le lecteur Tree-sitter (sites d'appel syntaxiques), PAS une cible pour PO (CALLS) ni CBM (graphe) qui resolvent des aretes.",
+  "symbols": {
+    "with_cognitive_routing":      { "def": "src/chat/manager.rs:3798",                         "kind": "methode (builder)",  "call_sites": 12, "note": "surtout des tests (8/12)" },
+    "decision_confidence":         { "def": "src/chat/provider/cognitive/feedback.rs:149",     "kind": "fn",                  "call_sites": 7,  "note": "1 prod + 6 tests" },
+    "build_enrichment_pipeline":   { "def": "src/chat/manager.rs:3191",                         "kind": "fn privee (Self::)", "call_sites": 3,  "note": "3 appels Self:: qualifies" },
+    "close_decision_with":         { "def": "src/chat/provider/cognitive/feedback.rs:256",     "kind": "async fn",            "call_sites": 3,  "note": "2 prod + 1 test" }
+  }
+}

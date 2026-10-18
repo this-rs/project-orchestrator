@@ -1,0 +1,88 @@
+name: Code index comparison
+on:
+  push:
+    branches: ["codex/po-code-index-comparison-*"]
+    paths:
+      - "tools/code-index-comparison/**"
+      - ".github/workflows/code-index-comparison.yml"
+permissions:
+  contents: read
+  packages: read
+concurrency:
+  group: code-index-comparison-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: tools/code-index-comparison
+    env:
+      COMPOSE_FILE: compose.yaml:compose.ci.yaml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Authenticate to existing CI image mirrors
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check scripts and prepare pinned source
+        run: |
+          python3 -m py_compile prepare.py compare.py test_compare.py report.py report_test.py
+          bash -n run.sh
+          python3 test_compare.py
+          python3 report_test.py
+          python3 prepare.py
+          python3 - <<'PY'
+          from pathlib import Path
+          for line in Path('.env').read_text().splitlines():
+              if '=' in line:
+                  print('::add-mask::'+line.split('=',1)[1])
+          PY
+      - name: Run real container indexes and queries
+        run: bash run.sh
+      - name: Generate aligned report
+        if: always()
+        run: python3 report.py
+      - name: Require usable indexes
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          summary=json.loads(Path('results/summary.json').read_text())
+          for name in ['po-index','po-project','cbm-index','cbm-projects','reader-index','po-graph-counts']:
+              assert summary[name]['status']=='ok',(name,summary[name])
+          po=json.loads(Path('results/po-index.json').read_text())['result']
+          assert po.get('files_synced',0)>0,po
+          assert po.get('errors',0)==0,po
+          cbm=json.loads(Path('results/cbm-index.json').read_text())['result']
+          data=cbm.get('structuredContent') or json.loads(cbm['content'][0]['text'])
+          assert data.get('status')=='indexed' and data.get('nodes',0)>0,data
+          note=json.loads(Path('results/po-note-context.json').read_text())
+          assert note['status']=='ok',note
+          assert 'INDEX_COMPARISON_FIXTURE' in json.dumps(note['result']),note
+          print(json.dumps(summary,indent=2))
+          PY
+      - name: Capture diagnostics
+        if: always()
+        run: |
+          mkdir -p results
+          docker compose ps --all > results/container-status.txt || true
+          docker compose logs --no-color --tail=500 > results/container-logs.txt 2>&1 || true
+          docker image inspect po-code-comparison-tools:local --format '{{json .Id}}' > results/tools-image-id.txt || true
+          docker compose exec -T cbm sh -c 'find /root/.cache/codebase-memory-mcp/logs -type f -exec tail -n 100 {} \;' > results/cbm-worker-diagnostics.txt 2>&1 || true
+      - name: Upload raw evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: po-cbm-index-evidence
+          path: tools/code-index-comparison/results/
+          retention-days: 14
+          if-no-files-found: error
+      - name: Stop experiment containers
+        if: always()
+        run: docker compose down
