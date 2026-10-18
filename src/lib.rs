@@ -542,6 +542,9 @@ pub struct EmbeddingsYamlConfig {
     pub fastembed_model: Option<String>,
     /// Cache directory for ONNX model files (default: ".fastembed_cache")
     pub fastembed_cache_dir: Option<String>,
+    /// Number of texts per ONNX inference batch for the local provider (default: 8).
+    /// Bounds the peak attention-score memory; see `fastembed::DEFAULT_BATCH_SIZE`.
+    pub batch_size: Option<usize>,
     /// URL for HTTP embedding provider (default: "http://localhost:11434/v1/embeddings")
     pub url: Option<String>,
     /// Model name for HTTP provider (default: "nomic-embed-text")
@@ -868,6 +871,9 @@ pub struct Config {
     /// Local fastembed ONNX model cache directory.
     /// Priority: env var (FASTEMBED_CACHE_DIR) > YAML (embeddings.fastembed_cache_dir) > None.
     pub embedding_fastembed_cache_dir: Option<String>,
+    /// Local fastembed batch size (texts per ONNX inference call).
+    /// Priority: env var (EMBEDDING_BATCH_SIZE) > YAML (embeddings.batch_size) > 8.
+    pub embedding_fastembed_batch_size: Option<usize>,
     /// HTTP embedding API URL (e.g. "http://localhost:11434/v1/embeddings").
     /// Priority: env var (EMBEDDING_URL) > YAML (embeddings.url) > None.
     pub embedding_url: Option<String>,
@@ -1004,6 +1010,11 @@ impl Config {
             embedding_fastembed_cache_dir: std::env::var("FASTEMBED_CACHE_DIR")
                 .ok()
                 .or(yaml.embeddings.fastembed_cache_dir),
+            embedding_fastembed_batch_size: std::env::var("EMBEDDING_BATCH_SIZE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|n| *n > 0)
+                .or(yaml.embeddings.batch_size),
             embedding_url: std::env::var("EMBEDDING_URL").ok().or(yaml.embeddings.url),
             embedding_model: std::env::var("EMBEDDING_MODEL")
                 .ok()

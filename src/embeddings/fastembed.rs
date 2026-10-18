@@ -7,6 +7,7 @@
 //! Configuration via environment variables:
 //! - `FASTEMBED_MODEL` (default: `multilingual-e5-base`) — model identifier
 //! - `FASTEMBED_CACHE_DIR` (default: `.fastembed_cache`) — ONNX model cache directory
+//! - `EMBEDDING_BATCH_SIZE` (default: `8`) — texts per ONNX inference call
 //!
 //! Default model: `MultilingualE5Base` (768d, multilingual FR/EN/100+ languages)
 //! which matches the existing Neo4j vector index (768d, cosine).
@@ -73,6 +74,16 @@ fn model_dimensions(model: &EmbeddingModel) -> usize {
         .unwrap_or(768)
 }
 
+/// Default number of texts per ONNX inference call.
+///
+/// Bounding the batch is what caps the peak memory of a single inference: with
+/// `BatchLongest` padding to 512 tokens and 12 attention heads, a full batch of
+/// 256 texts (fastembed's own default) allocates ~22 GiB of attention scores
+/// that ONNX Runtime's CPU arena then retains for the life of the process. A
+/// batch of 8 keeps the peak ~7× smaller AND is faster than the default
+/// (measured 18/10/2026, see the MEM-1 note).
+pub const DEFAULT_BATCH_SIZE: usize = 8;
+
 /// Local embedding provider using fastembed-rs ONNX Runtime.
 ///
 /// Thread-safe via `Arc<Mutex<TextEmbedding>>` because `embed()` requires `&mut self`.
@@ -107,6 +118,7 @@ pub struct FastEmbedProvider {
     model: Arc<Mutex<TextEmbedding>>,
     model_name: String,
     dimensions: usize,
+    batch_size: usize,
 }
 
 impl FastEmbedProvider {
@@ -116,14 +128,26 @@ impl FastEmbedProvider {
     ///
     /// * `model_variant` - The fastembed model to use
     /// * `cache_dir` - Optional directory for ONNX model cache (default: `.fastembed_cache`)
+    /// * `batch_size` - Texts per inference call (0 falls back to [`DEFAULT_BATCH_SIZE`])
     ///
     /// # Errors
     ///
     /// Returns an error if the ONNX model cannot be loaded (download failure,
     /// corrupted cache, unsupported platform, etc.)
-    pub fn new(model_variant: EmbeddingModel, cache_dir: Option<PathBuf>) -> Result<Self> {
+    pub fn new(
+        model_variant: EmbeddingModel,
+        cache_dir: Option<PathBuf>,
+        batch_size: usize,
+    ) -> Result<Self> {
         let dimensions = model_dimensions(&model_variant);
         let model_name = format!("{:?}", model_variant);
+
+        // Guard against an accidental 0 that would make `chunks(0)` panic downstream.
+        let batch_size = if batch_size == 0 {
+            DEFAULT_BATCH_SIZE
+        } else {
+            batch_size
+        };
 
         let mut options = TextInitOptions::new(model_variant).with_show_download_progress(true);
 
@@ -137,6 +161,7 @@ impl FastEmbedProvider {
         tracing::info!(
             model = %model_name,
             dimensions,
+            batch_size,
             "FastEmbed provider initialized (local ONNX)"
         );
 
@@ -144,6 +169,7 @@ impl FastEmbedProvider {
             model: Arc::new(Mutex::new(embedding)),
             model_name,
             dimensions,
+            batch_size,
         })
     }
 
@@ -166,21 +192,44 @@ impl FastEmbedProvider {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
 
-        Self::new(model_variant, cache_dir)
+        let batch_size = std::env::var("EMBEDDING_BATCH_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_BATCH_SIZE);
+
+        Self::new(model_variant, cache_dir, batch_size)
     }
+
+    /// Batch size used for ONNX inference (texts per call).
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+}
+
+/// Split `texts` into sub-slices of at most `batch_size` elements each.
+///
+/// `embed_batch` calls the model once per chunk (releasing the in-process lock
+/// between chunks), so the peak attention-score allocation is bounded by
+/// `batch_size` regardless of how many texts the caller submits. Extracted as a
+/// pure function so the batching contract is unit-testable without the ONNX model.
+fn chunk_texts(texts: &[String], batch_size: usize) -> Vec<&[String]> {
+    texts.chunks(batch_size).collect()
 }
 
 #[async_trait]
 impl EmbeddingProvider for FastEmbedProvider {
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
         let text = text.to_string();
+        let batch_size = self.batch_size;
         // Wait for the model as a task, not as a parked OS thread. See the type docs.
         let mut guard = self.model.clone().lock_owned().await;
 
-        let embeddings = tokio::task::spawn_blocking(move || guard.embed(vec![&text], None))
-            .await
-            .context("FastEmbed spawn_blocking panicked")?
-            .context("FastEmbed embed_text failed")?;
+        let embeddings =
+            tokio::task::spawn_blocking(move || guard.embed(vec![&text], Some(batch_size)))
+                .await
+                .context("FastEmbed spawn_blocking panicked")?
+                .context("FastEmbed embed_text failed")?;
 
         embeddings
             .into_iter()
@@ -193,13 +242,24 @@ impl EmbeddingProvider for FastEmbedProvider {
             return Ok(vec![]);
         }
 
-        let texts = texts.to_vec();
-        let mut guard = self.model.clone().lock_owned().await;
+        let batch_size = self.batch_size.max(1);
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
 
-        tokio::task::spawn_blocking(move || guard.embed(texts, None))
-            .await
-            .context("FastEmbed spawn_blocking panicked")?
-            .context("FastEmbed embed_batch failed")
+        for chunk in chunk_texts(texts, batch_size) {
+            let chunk: Vec<String> = chunk.to_vec();
+            // Take the in-process lock per chunk (as a task, not a parked thread),
+            // so a caller with many texts — e.g. `embed_parsed_file` on a 30k-line
+            // file — releases the single embedder between chunks instead of holding
+            // it for the whole set. See the type-level docs.
+            let mut guard = self.model.clone().lock_owned().await;
+            let batch = tokio::task::spawn_blocking(move || guard.embed(chunk, Some(batch_size)))
+                .await
+                .context("FastEmbed spawn_blocking panicked")?
+                .context("FastEmbed embed_batch failed")?;
+            out.extend(batch);
+        }
+
+        Ok(out)
     }
 
     fn dimensions(&self) -> usize {
@@ -248,14 +308,41 @@ mod tests {
         assert_eq!(model_dimensions(&EmbeddingModel::BGEM3), 1024);
     }
 
+    #[test]
+    fn test_chunk_texts_bounds_batch() {
+        let texts: Vec<String> = (0..100).map(|i| format!("text {i}")).collect();
+        let chunks = chunk_texts(&texts, 16);
+
+        // 100 texts / 16 = 7 chunks (6 full + 1 of 4)
+        assert_eq!(chunks.len(), 7);
+        let mut total = 0;
+        for chunk in &chunks {
+            assert!(chunk.len() <= 16, "chunk must not exceed batch_size");
+            total += chunk.len();
+        }
+        assert_eq!(total, 100, "all texts covered exactly once");
+        // order preserved (embed_batch relies on it: file first, then functions)
+        assert_eq!(chunks[0][0], "text 0");
+        assert_eq!(chunks.last().unwrap().last().unwrap(), "text 99");
+    }
+
+    #[test]
+    fn test_chunk_texts_exact_multiple() {
+        let texts: Vec<String> = (0..32).map(|i| format!("text {i}")).collect();
+        let chunks = chunk_texts(&texts, 16);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|c| c.len() == 16));
+    }
+
     // Integration tests that actually load the ONNX model
     // These download the model on first run (~400MB) so they are slow.
     // Run explicitly: cargo test -- fastembed --ignored
     #[tokio::test]
     #[ignore = "requires ONNX model download (~1.1GB)"]
     async fn test_embed_text_dimensions() {
-        let provider = FastEmbedProvider::new(EmbeddingModel::MultilingualE5Base, None)
-            .expect("Failed to init FastEmbed");
+        let provider =
+            FastEmbedProvider::new(EmbeddingModel::MultilingualE5Base, None, DEFAULT_BATCH_SIZE)
+                .expect("Failed to init FastEmbed");
 
         let embedding = provider.embed_text("hello world").await.unwrap();
         assert_eq!(embedding.len(), 768, "MultilingualE5Base must produce 768d");
@@ -264,8 +351,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires ONNX model download (~1.1GB)"]
     async fn test_embed_batch_consistency() {
-        let provider = FastEmbedProvider::new(EmbeddingModel::MultilingualE5Base, None)
-            .expect("Failed to init FastEmbed");
+        let provider =
+            FastEmbedProvider::new(EmbeddingModel::MultilingualE5Base, None, DEFAULT_BATCH_SIZE)
+                .expect("Failed to init FastEmbed");
 
         let texts = vec![
             "hello world".to_string(),
@@ -281,9 +369,26 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires ONNX model download (~1.1GB)"]
-    async fn test_embed_empty_batch() {
-        let provider = FastEmbedProvider::new(EmbeddingModel::MultilingualE5Base, None)
+    async fn test_embed_batch_large_input_bounded() {
+        // 100 texts with batch_size 16 → must still produce 100 vectors, in order,
+        // chunked internally (see `test_chunk_texts_bounds_batch` for the ≤ 16 proof).
+        let provider = FastEmbedProvider::new(EmbeddingModel::MultilingualE5Base, None, 16)
             .expect("Failed to init FastEmbed");
+
+        let texts: Vec<String> = (0..100).map(|i| format!("short sentence {i}")).collect();
+        let batch = provider.embed_batch(&texts).await.unwrap();
+        assert_eq!(batch.len(), 100);
+        for (i, emb) in batch.iter().enumerate() {
+            assert_eq!(emb.len(), 768, "Embedding {i} must be 768d");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ONNX model download (~1.1GB)"]
+    async fn test_embed_empty_batch() {
+        let provider =
+            FastEmbedProvider::new(EmbeddingModel::MultilingualE5Base, None, DEFAULT_BATCH_SIZE)
+                .expect("Failed to init FastEmbed");
 
         let result = provider.embed_batch(&[]).await.unwrap();
         assert!(result.is_empty());
@@ -292,8 +397,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires ONNX model download (~1.1GB)"]
     async fn test_model_name_accessor() {
-        let provider = FastEmbedProvider::new(EmbeddingModel::MultilingualE5Base, None)
-            .expect("Failed to init FastEmbed");
+        let provider =
+            FastEmbedProvider::new(EmbeddingModel::MultilingualE5Base, None, DEFAULT_BATCH_SIZE)
+                .expect("Failed to init FastEmbed");
 
         assert_eq!(provider.model_name(), "MultilingualE5Base");
         assert_eq!(provider.dimensions(), 768);

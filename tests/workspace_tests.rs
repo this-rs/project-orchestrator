@@ -43,6 +43,7 @@ fn test_config() -> Config {
         embedding_provider: None,
         embedding_fastembed_model: None,
         embedding_fastembed_cache_dir: None,
+        embedding_fastembed_batch_size: None,
         embedding_url: None,
         embedding_model: None,
         embedding_api_key: None,
