@@ -827,8 +827,11 @@ pub(crate) type NativeProbers =
     HashMap<String, Arc<nexus_claude::providers::native::NativeProvider>>;
 
 /// A built provider and the stored record it was built from.
+// (record, the deferred tools the provider was built with — CTX2, a changed list
+// rebuilds it —, the provider)
 pub(crate) type NativeCacheEntry = (
     super::provider::settings::InstanceRecord,
+    Arc<Vec<String>>,
     Arc<dyn nexus_claude::agent::AgentProvider>,
 );
 
@@ -1066,6 +1069,9 @@ pub struct ChatManager {
     /// The cap on a parent's live children in force now (PLAFOND-RT): read at every delegation,
     /// replaced at runtime by `set_max_live_children`, seeded from the stored setting at startup.
     pub(crate) live_children_cap: std::sync::atomic::AtomicUsize,
+    /// The tools the native harness defers (CTX2, `chat::deferred_tools`): fixed into a
+    /// native provider when it is built, so a change applies to the sessions opened after it.
+    pub(crate) deferred_tools: std::sync::RwLock<Arc<Vec<String>>>,
     /// The read-only mirrors of Claude Code sub-agents this process wrote (`chat::mirror`,
     /// P18c): idempotency across the taps of a session, and the live view of the open ones.
     pub(crate) mirrors: Arc<super::mirror::MirrorRegistry>,
@@ -3524,6 +3530,9 @@ impl ChatManager {
             live_children_cap: std::sync::atomic::AtomicUsize::new(
                 super::envelope::MAX_LIVE_CHILDREN,
             ),
+            deferred_tools: std::sync::RwLock::new(Arc::new(
+                super::deferred_tools::default_deferred_tools(),
+            )),
             mirrors: Default::default(),
             subagent_mirrors: true,
             session_pool: Arc::new(super::session_pool::SessionPool::from_env()),
@@ -3628,6 +3637,9 @@ impl ChatManager {
             live_children_cap: std::sync::atomic::AtomicUsize::new(
                 super::envelope::MAX_LIVE_CHILDREN,
             ),
+            deferred_tools: std::sync::RwLock::new(Arc::new(
+                super::deferred_tools::default_deferred_tools(),
+            )),
             mirrors: Default::default(),
             subagent_mirrors: true,
             session_pool: Arc::new(super::session_pool::SessionPool::from_env()),
@@ -15842,10 +15854,14 @@ impl ChatManager {
                     provider_id.to_string(),
                 ))
             })?;
+        // The deferred tools are part of what the provider is built with (CTX2): a
+        // changed list rebuilds it for the sessions opened from now on; a running
+        // session keeps the provider, hence the list, it was opened with.
+        let deferred = self.deferred_tools();
         {
             let cache = self.native_cache.read().await;
-            if let Some((cached, provider)) = cache.get(provider_id) {
-                if *cached == record {
+            if let Some((cached, cached_deferred, provider)) = cache.get(provider_id) {
+                if *cached == record && **cached_deferred == *deferred {
                     return Ok(Arc::clone(provider));
                 }
             }
@@ -15855,6 +15871,7 @@ impl ChatManager {
             self.vault.clone(),
             self.native_transcripts.as_deref(),
             &self.acp,
+            &deferred,
         )
         .map_err(anyhow::Error::new)?;
         {
@@ -15871,10 +15888,10 @@ impl ChatManager {
                 provider_id,
             );
         }
-        self.native_cache
-            .write()
-            .await
-            .insert(provider_id.to_string(), (record, Arc::clone(&provider)));
+        self.native_cache.write().await.insert(
+            provider_id.to_string(),
+            (record, deferred, Arc::clone(&provider)),
+        );
         Ok(provider)
     }
 
