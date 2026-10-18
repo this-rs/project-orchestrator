@@ -948,6 +948,54 @@ impl SessionHooks for ToolAccessHooks {
         }
     }
 
+    // Claude Code's own events (contract v7, ISO1) belong to the inner hooks: a wrapper that
+    // dropped them would hide the graph's answers on the agent engine.
+    async fn session_start(
+        &self,
+        info: &nexus_claude::agent::SessionStartInfo,
+    ) -> nexus_claude::agent::HookReply {
+        match &self.inner {
+            Some(inner) => inner.session_start(info).await,
+            None => nexus_claude::agent::HookReply::none(),
+        }
+    }
+
+    async fn user_prompt_submit(
+        &self,
+        prompt: &nexus_claude::agent::PromptInfo,
+    ) -> nexus_claude::agent::HookReply {
+        match &self.inner {
+            Some(inner) => inner.user_prompt_submit(prompt).await,
+            None => nexus_claude::agent::HookReply::none(),
+        }
+    }
+
+    async fn before_stop(
+        &self,
+        info: &nexus_claude::agent::StopInfo,
+    ) -> nexus_claude::agent::HookReply {
+        match &self.inner {
+            Some(inner) => inner.before_stop(info).await,
+            None => nexus_claude::agent::HookReply::none(),
+        }
+    }
+
+    async fn before_subagent_stop(
+        &self,
+        info: &nexus_claude::agent::SubagentStopInfo,
+    ) -> nexus_claude::agent::HookReply {
+        match &self.inner {
+            Some(inner) => inner.before_subagent_stop(info).await,
+            None => nexus_claude::agent::HookReply::none(),
+        }
+    }
+
+    async fn notification(&self, info: &nexus_claude::agent::NotificationInfo) {
+        if let Some(inner) = &self.inner {
+            inner.notification(info).await;
+        }
+    }
+
     // The sub-agents of the session (P18) are the inner hooks' to run: the gate only judges
     // tool calls, and the child session is held to its own gate.
     fn runs_subagents(&self) -> bool {
@@ -1902,6 +1950,45 @@ mod tests {
             HookVerdict::AddContext("inner".into())
         );
         crate::auth::agent_tokens::revoke_session("hook-s1");
+    }
+
+    /// Inner hooks that answer Claude Code's own events (contract v7).
+    struct LifecycleInner;
+
+    #[async_trait]
+    impl SessionHooks for LifecycleInner {
+        async fn user_prompt_submit(
+            &self,
+            _: &nexus_claude::agent::PromptInfo,
+        ) -> nexus_claude::agent::HookReply {
+            nexus_claude::agent::HookReply::context("graph context")
+        }
+        async fn before_stop(
+            &self,
+            _: &nexus_claude::agent::StopInfo,
+        ) -> nexus_claude::agent::HookReply {
+            nexus_claude::agent::HookReply::block("not yet")
+        }
+    }
+
+    #[tokio::test]
+    async fn the_gate_passes_claude_codes_own_events_on_to_the_inner_hooks() {
+        let graph = Arc::new(MockGraphStore::new());
+        let hooks = ToolAccessHooks::new(
+            Some(Arc::new(LifecycleInner)),
+            Arc::new(GraphConsents(graph)),
+            "hook-v7",
+            Some("proj".into()),
+            Vec::new(),
+        );
+        let prompt = hooks
+            .user_prompt_submit(&nexus_claude::agent::PromptInfo::new("go"))
+            .await;
+        assert_eq!(prompt.additional_context.as_deref(), Some("graph context"));
+        let stop = hooks
+            .before_stop(&nexus_claude::agent::StopInfo::new(false, None))
+            .await;
+        assert_eq!(stop.block.as_deref(), Some("not yet"));
     }
 
     // ---- (0a-bis) N23b: a destination without consent is a QUESTION, when a person is there --
