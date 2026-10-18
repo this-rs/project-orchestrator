@@ -817,7 +817,7 @@ Manage the provider instances: the harness/engine a chat session runs on. Action
 |--------|---------------|-------------|
 | list | — | Every stored instance, each naming its credential REFERENCE |
 | get | `id` (req) | One instance, full detail |
-| create | `id`, `kind` (`openai_compatible`\|`codex`\|`acp`\|`claude_code_remote`), `preset`, `label`, `base_url`, `default_model`, `cost_source`, `credential_ref`, `host`, `ssh_user`, `ssh_port`, `host_key`, `remote_cwd`, `allow_trust`, `rate_limit` | Create an instance. A credential is a REFERENCE (`vault:<name>`, `env:<VAR>`), never a value |
+| create | `id`, `kind` (`openai_compatible`\|`anthropic`\|`codex`\|`acp`\|`claude_code_remote`), `preset`, `label`, `base_url`, `default_model`, `cost_source`, `credential_ref`, `host`, `ssh_user`, `ssh_port`, `host_key`, `remote_cwd`, `allow_trust`, `rate_limit` | Create an instance. A credential is a REFERENCE (`vault:<name>`, `env:<VAR>`), never a value |
 | update | `id` (req) + any field of `create` except `id` and `kind` | Change an instance |
 | delete | `id` (req) | Remove an instance (`claude-code` is built in and never written) |
 | test | the fields of `create` | Try a draft BEFORE saving it; the verdict is in the body, always 200 |

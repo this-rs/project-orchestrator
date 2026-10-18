@@ -157,7 +157,7 @@ pub fn parse_credential_ref(
 pub struct InstanceDraft {
     /// Instance identifier (slug).
     pub id: Option<String>,
-    /// Kind: `openai_compatible` (default), `codex` or `acp`.
+    /// Kind: `openai_compatible` (default), `anthropic`, `codex`, `acp` or `claude_code_remote`.
     pub kind: Option<String>,
     /// Preset (deepseek, vllm, ollama, llama_server, nim), informational.
     #[serde(default)]
@@ -304,6 +304,14 @@ impl InstanceRecord {
 
 /// The kind of an instance that runs Claude Code on another machine over SSH.
 pub const KIND_CLAUDE_CODE_REMOTE: &str = "claude_code_remote";
+
+/// The kind of an instance that runs the NATIVE harness over the Anthropic Messages API
+/// (CTX5): Anthropic's own API by default, or a gateway that speaks it. Its key is a
+/// vault reference, never an `env:` variable nor a value.
+pub const KIND_ANTHROPIC: &str = "anthropic";
+
+/// Base URL of an `anthropic` instance that names none: Anthropic's own API.
+pub const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 
 // ============================================================================
 // Rate limits (RL1)
@@ -1212,10 +1220,15 @@ pub fn record_from_draft(
     }
     if !matches!(
         kind.as_str(),
-        "openai_compatible" | "codex" | "acp" | KIND_CLAUDE_CODE_REMOTE
+        "openai_compatible" | "codex" | "acp" | KIND_CLAUDE_CODE_REMOTE | KIND_ANTHROPIC
     ) {
         return Err(invalid(
-            "kind: openai_compatible, codex, acp or claude_code_remote",
+            "kind: openai_compatible, anthropic, codex, acp or claude_code_remote",
+        ));
+    }
+    if kind == KIND_ANTHROPIC && draft.preset.is_some() {
+        return Err(invalid(
+            "preset: an anthropic instance has no dialect preset (it speaks the Messages API)",
         ));
     }
     if !remote && draft_has_remote_fields(draft) {
@@ -1291,6 +1304,7 @@ pub fn record_from_draft(
             .base_url
             .clone()
             .filter(|u| !u.trim().is_empty())
+            .or_else(|| (kind == KIND_ANTHROPIC).then(|| ANTHROPIC_API_BASE.to_string()))
             .ok_or_else(|| invalid("base_url is required"))?;
         let origin = check_url(&base_url, policy)?;
         (base_url, origin)
@@ -1303,6 +1317,8 @@ pub fn record_from_draft(
         // The SSH private key lives in the vault: never an `env:` variable of the
         // server, never a value, never nothing (a remote machine needs a key).
         require_vault_ref(&credential_ref)?;
+    } else if kind == KIND_ANTHROPIC {
+        require_vault_api_key(&credential_ref)?;
     } else {
         parse_credential_ref(&credential_ref, env_allow)?;
     }
@@ -1370,6 +1386,16 @@ fn normalize_host_key(raw: &str) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The key of an `anthropic` instance: `vault:<name>`, nothing else (CTX5).
+fn require_vault_api_key(raw: &str) -> Result<(), SettingsError> {
+    match parse_credential_ref(raw, &[])? {
+        CredentialSource::Vault(_) => Ok(()),
+        _ => Err(invalid(
+            "credential_ref: an anthropic instance needs `vault:<name>` (the API key, stored in the vault)",
+        )),
+    }
+}
+
 /// The credential of a remote instance: `vault:<name>`, nothing else.
 fn require_vault_ref(raw: &str) -> Result<(), SettingsError> {
     match parse_credential_ref(raw, &[])? {
@@ -1393,6 +1419,11 @@ pub fn apply_patch(
         next.label = label.clone();
     }
     if patch.preset.is_some() {
+        if old.kind == KIND_ANTHROPIC {
+            return Err(invalid(
+                "preset: an anthropic instance has no dialect preset (it speaks the Messages API)",
+            ));
+        }
         next.preset = patch.preset.clone();
     }
     if patch.base_url.is_some() && is_process_kind(&old.kind) {
@@ -1467,6 +1498,8 @@ pub fn apply_patch(
     if let Some(cred) = patch.credential_ref.as_ref() {
         if remote {
             require_vault_ref(cred)?;
+        } else if old.kind == KIND_ANTHROPIC {
+            require_vault_api_key(cred)?;
         } else {
             parse_credential_ref(cred, env_allow)?;
         }
@@ -1724,6 +1757,71 @@ pub fn validate_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CTX5: an `anthropic` instance runs the native harness on the Messages API. Its base
+    /// URL defaults to Anthropic's own API; its key is a VAULT reference and nothing else;
+    /// it takes no dialect preset — at creation and at every patch.
+    #[test]
+    fn an_anthropic_instance_defaults_to_the_api_and_takes_its_key_from_the_vault_only() {
+        let policy = EndpointPolicy::default();
+        let anthropic = InstanceDraft {
+            id: Some("claude-api".into()),
+            kind: Some(KIND_ANTHROPIC.into()),
+            label: Some("Claude API".into()),
+            default_model: Some("claude-opus-5-5".into()),
+            credential_ref: Some("vault:anthropic".into()),
+            ..Default::default()
+        };
+        let r = record_from_draft(&anthropic, &policy, &[]).expect("a valid anthropic instance");
+        assert_eq!(
+            (r.kind.as_str(), r.base_url.as_str(), r.origin.as_str()),
+            (KIND_ANTHROPIC, ANTHROPIC_API_BASE, ANTHROPIC_API_BASE)
+        );
+        assert!(
+            !is_process_kind(&r.kind),
+            "an endpoint kind: its consent follows its origin"
+        );
+        let gateway = InstanceDraft {
+            base_url: Some("https://gateway.example.com/v1".into()),
+            ..anthropic.clone()
+        };
+        assert_eq!(
+            record_from_draft(&gateway, &policy, &[]).unwrap().origin,
+            "https://gateway.example.com"
+        );
+        let env = ["ANTHROPIC_API_KEY".to_string()];
+        for bad in ["none", "env:ANTHROPIC_API_KEY", "sk-ant-pasted-value"] {
+            let draft = InstanceDraft {
+                credential_ref: Some(bad.into()),
+                ..anthropic.clone()
+            };
+            let err = record_from_draft(&draft, &policy, &env).expect_err(bad);
+            assert!(!format!("{err:?}{err}").contains("sk-ant"), "{bad}");
+        }
+        let preset = InstanceDraft {
+            preset: Some("deepseek".into()),
+            ..anthropic.clone()
+        };
+        assert!(record_from_draft(&preset, &policy, &[]).is_err());
+        // A patch keeps the rule: the key stays in the vault, no preset appears.
+        let to_env = InstancePatch {
+            credential_ref: Some("env:ANTHROPIC_API_KEY".into()),
+            ..Default::default()
+        };
+        assert!(apply_patch(&r, &to_env, &policy, &env).is_err());
+        let to_preset = InstancePatch {
+            preset: Some("deepseek".into()),
+            ..Default::default()
+        };
+        assert!(apply_patch(&r, &to_preset, &policy, &[]).is_err());
+        let other_vault = InstancePatch {
+            credential_ref: Some("vault:anthropic-2".into()),
+            ..Default::default()
+        };
+        let (next, changed) = apply_patch(&r, &other_vault, &policy, &[]).unwrap();
+        assert!(changed, "another key is another consent");
+        assert_eq!(next.credential_ref, "vault:anthropic-2");
+    }
 
     fn draft() -> InstanceDraft {
         InstanceDraft {
