@@ -191,8 +191,16 @@ pub fn validate_affected_files(affected_files: &[String], cwd: &str) -> (bool, V
 pub static RUNNER_STATE: LazyLock<Arc<RwLock<Option<RunnerState>>>> =
     LazyLock::new(|| Arc::new(RwLock::new(None)));
 
-/// Cancel flag — set to true to request graceful cancellation.
-/// Checked between each task in the execution loop.
+/// Cancel flag of the process's run — set to true to request graceful
+/// cancellation; checked before each wave, each retry and each event a task
+/// listens for.
+///
+/// It is a process-wide flag because the process drives ONE run at a time
+/// (`active_run_refusal`): `cancel`/`force_cancel` identify the run by
+/// `RUNNER_STATE` and raise this flag. Every runner built by [`PlanRunner::new`]
+/// reads it through its own `cancel` handle, so a runner only ever answers for
+/// the run it drives; a test runner gets a flag of its own instead
+/// (`with_own_cancel_flag`) and cannot be cancelled by a neighbour.
 pub static RUNNER_CANCEL: LazyLock<Arc<AtomicBool>> =
     LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 
@@ -584,6 +592,10 @@ pub struct PlanRunner {
     /// resumed after a restart): agents then compare the mark with the run's
     /// start time. See [`Self::claims_for_agent`].
     plan_mark_at_start: Arc<std::sync::Mutex<Option<Option<chrono::DateTime<chrono::Utc>>>>>,
+    /// The cancel flag of the run this runner drives: the only flag its waves,
+    /// retries and listens consult. In production it IS the process flag
+    /// [`RUNNER_CANCEL`] (one run per process); a test runner holds its own.
+    cancel: Arc<AtomicBool>,
     /// Every session request this runner built (tests read what was asked).
     #[cfg(test)]
     request_spy: Arc<std::sync::Mutex<Vec<ChatRequest>>>,
@@ -875,9 +887,18 @@ impl PlanRunner {
             run_max_tokens: None,
             routing: None,
             plan_mark_at_start: Default::default(),
+            cancel: Arc::clone(&RUNNER_CANCEL),
             #[cfg(test)]
             request_spy: Default::default(),
         }
+    }
+
+    /// A cancel flag nobody else holds: this runner answers to no
+    /// `cancel`/`force_cancel` of the process and no neighbouring test.
+    #[cfg(test)]
+    fn with_own_cancel_flag(mut self) -> Self {
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self
     }
 
     /// Routes every attempt of this run through the cognitive decider and
@@ -1268,7 +1289,7 @@ impl PlanRunner {
             let mut global = RUNNER_STATE.write().await;
             *global = Some(saved_state.clone());
         }
-        RUNNER_CANCEL.store(false, Ordering::SeqCst);
+        self.cancel.store(false, Ordering::SeqCst);
         drop(start_guard);
 
         // Emit recovery event
@@ -1387,7 +1408,7 @@ impl PlanRunner {
         }
 
         // Reset cancel flag, budget override, and vector collector
-        RUNNER_CANCEL.store(false, Ordering::SeqCst);
+        self.cancel.store(false, Ordering::SeqCst);
         RUNNER_BUDGET.store(
             self.config.max_cost_usd.to_bits(),
             std::sync::atomic::Ordering::Relaxed,
@@ -1539,6 +1560,10 @@ impl PlanRunner {
     }
 
     /// Cancel the currently running plan execution.
+    ///
+    /// Raises the process flag [`RUNNER_CANCEL`]: the run named is the
+    /// process's only run (`active_run_refusal`), and every runner built by
+    /// [`Self::new`] — the boot one, the one of each dispatch — reads that flag.
     ///
     /// When a `ChatManager` is provided, all active agent sessions are
     /// forcefully closed (interrupt + SIGKILL) so that Claude Code
@@ -1863,7 +1888,7 @@ impl PlanRunner {
             }
 
             // Check cancel flag
-            if RUNNER_CANCEL.load(Ordering::SeqCst) {
+            if self.cancel.load(Ordering::SeqCst) {
                 info!("Runner cancelled at wave {}", wave_number);
                 self.finalize_run(run_id, PlanRunStatus::Cancelled, Some(&cwd))
                     .await?;
@@ -1906,7 +1931,7 @@ impl PlanRunner {
             // If wave was aborted (budget/cancel), finalize accordingly
             if wave_result.aborted {
                 // Check which reason caused the abort
-                if RUNNER_CANCEL.load(Ordering::SeqCst) {
+                if self.cancel.load(Ordering::SeqCst) {
                     self.finalize_run(run_id, PlanRunStatus::Cancelled, Some(&cwd))
                         .await?;
                 } else {
@@ -2248,7 +2273,7 @@ impl PlanRunner {
         }
 
         // Check cancel flag before spawning any agents in this wave
-        if RUNNER_CANCEL.load(Ordering::SeqCst) {
+        if self.cancel.load(Ordering::SeqCst) {
             info!("Cancel detected at wave start — skipping wave");
             wave_result.aborted = true;
             return Ok(wave_result);
@@ -2798,7 +2823,7 @@ impl PlanRunner {
             }
 
             // Cancel check after each agent result
-            if RUNNER_CANCEL.load(Ordering::SeqCst) {
+            if self.cancel.load(Ordering::SeqCst) {
                 info!("Runner cancelled during wave execution");
                 wave_result.aborted = true;
                 join_set.abort_all();
@@ -2881,7 +2906,7 @@ impl PlanRunner {
 
             for (task_id, failure_reason) in &retryable {
                 // Check cancellation before each retry
-                if RUNNER_CANCEL.load(Ordering::SeqCst) {
+                if self.cancel.load(Ordering::SeqCst) {
                     info!("Runner cancelled, skipping remaining retries");
                     break;
                 }
@@ -5470,7 +5495,7 @@ impl PlanRunner {
             }
 
             // Check cancel flag
-            if RUNNER_CANCEL.load(Ordering::SeqCst) {
+            if self.cancel.load(Ordering::SeqCst) {
                 return (EventListenResult::Cancelled { cost_usd }, metrics);
             }
 
@@ -5758,6 +5783,7 @@ impl Clone for PlanRunner {
             run_max_tokens: self.run_max_tokens,
             routing: self.routing.clone(),
             plan_mark_at_start: self.plan_mark_at_start.clone(),
+            cancel: self.cancel.clone(),
             #[cfg(test)]
             request_spy: self.request_spy.clone(),
         }
@@ -6254,6 +6280,7 @@ mod tests {
             RunnerConfig::default(),
             event_tx,
         )
+        .with_own_cancel_flag()
     }
 
     // ---------------------------------------------------------------
@@ -6296,11 +6323,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_listen_for_result_completed() {
-        // RUNNER_CANCEL is global: without the lock this test can clear the flag
-        // test_listen_for_result_cancelled just set, which then waits for the
-        // safety timeout holding TEST_MUTEX (seen in CI: ~50 min, four tests stuck).
-        let _lock = TEST_MUTEX.lock().await;
-        reset_globals().await;
         let runner = test_plan_runner();
         let (tx, rx) = broadcast::channel::<ChatEvent>(16);
         let run_id = Uuid::new_v4();
@@ -6353,7 +6375,6 @@ mod tests {
         })
         .unwrap();
 
-        RUNNER_CANCEL.store(false, Ordering::SeqCst);
         let (result, metrics) = runner.listen_for_result(rx, run_id, None).await;
 
         assert_eq!(metrics.tool_use_count, 3);
@@ -6379,11 +6400,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_listen_for_result_tracks_errors() {
-        // RUNNER_CANCEL is global: without the lock this test can clear the flag
-        // test_listen_for_result_cancelled just set, which then waits for the
-        // safety timeout holding TEST_MUTEX (seen in CI: ~50 min, four tests stuck).
-        let _lock = TEST_MUTEX.lock().await;
-        reset_globals().await;
         let runner = test_plan_runner();
         let (tx, rx) = broadcast::channel::<ChatEvent>(16);
         let run_id = Uuid::new_v4();
@@ -6421,7 +6437,6 @@ mod tests {
         })
         .unwrap();
 
-        RUNNER_CANCEL.store(false, Ordering::SeqCst);
         let (_result, metrics) = runner.listen_for_result(rx, run_id, None).await;
 
         assert_eq!(metrics.error_count, 2);
@@ -6431,11 +6446,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_listen_for_result_error_truncation() {
-        // RUNNER_CANCEL is global: without the lock this test can clear the flag
-        // test_listen_for_result_cancelled just set, which then waits for the
-        // safety timeout holding TEST_MUTEX (seen in CI: ~50 min, four tests stuck).
-        let _lock = TEST_MUTEX.lock().await;
-        reset_globals().await;
         let runner = test_plan_runner();
         let (tx, rx) = broadcast::channel::<ChatEvent>(16);
         let run_id = Uuid::new_v4();
@@ -6466,7 +6476,6 @@ mod tests {
         })
         .unwrap();
 
-        RUNNER_CANCEL.store(false, Ordering::SeqCst);
         let (_result, metrics) = runner.listen_for_result(rx, run_id, None).await;
 
         assert_eq!(metrics.error_count, 1);
@@ -6476,11 +6485,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_listen_for_result_channel_closed() {
-        // RUNNER_CANCEL is global: without the lock this test can clear the flag
-        // test_listen_for_result_cancelled just set, which then waits for the
-        // safety timeout holding TEST_MUTEX (seen in CI: ~50 min, four tests stuck).
-        let _lock = TEST_MUTEX.lock().await;
-        reset_globals().await;
         let runner = test_plan_runner();
         let (tx, rx) = broadcast::channel::<ChatEvent>(16);
         let run_id = Uuid::new_v4();
@@ -6488,7 +6492,6 @@ mod tests {
         // Drop sender to close channel
         drop(tx);
 
-        RUNNER_CANCEL.store(false, Ordering::SeqCst);
         let (result, metrics) = runner.listen_for_result(rx, run_id, None).await;
 
         assert_eq!(metrics.tool_use_count, 0);
@@ -6502,14 +6505,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_listen_for_result_cancelled() {
-        let _lock = TEST_MUTEX.lock().await;
-        reset_globals().await;
         let runner = test_plan_runner();
         let (_tx, rx) = broadcast::channel::<ChatEvent>(16);
         let run_id = Uuid::new_v4();
 
-        // Set cancel flag BEFORE listening
-        RUNNER_CANCEL.store(true, Ordering::SeqCst);
+        // This runner's run is cancelled BEFORE it listens.
+        runner.cancel.store(true, Ordering::SeqCst);
         let (result, _metrics) = runner.listen_for_result(rx, run_id, None).await;
 
         match result {
@@ -6518,7 +6519,6 @@ mod tests {
             }
             _ => panic!("Expected Cancelled variant"),
         }
-        reset_globals().await;
     }
 
     // ---------------------------------------------------------------
@@ -6867,7 +6867,8 @@ mod tests {
             context_builder,
             RunnerConfig::default(),
             event_tx,
-        );
+        )
+        .with_own_cancel_flag();
         (runner, mock_graph)
     }
 
@@ -9325,9 +9326,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_listen_for_result_multibyte_error_truncation_does_not_panic() {
-        // Same global flag as above: a cancelled run would end this listen before the error.
-        let _lock = TEST_MUTEX.lock().await;
-        reset_globals().await;
         let runner = test_plan_runner();
         let (tx, rx) = broadcast::channel::<ChatEvent>(16);
         // 601 bytes: the "last 500 bytes" cut (byte 101) lands inside a 2-byte 'é'.
@@ -11396,11 +11394,6 @@ mod tests {
 
     #[tokio::test]
     async fn listen_for_result_reports_turns_and_whether_a_cost_was_reported() {
-        // RUNNER_CANCEL is global and `listen_for_result` returns `Cancelled` (empty metrics) as
-        // soon as it is set: without the lock, a test that cancelled a run made this one read
-        // `num_turns: None` (seen in CI on #820, red on a branch that did not touch the runner).
-        let _lock = TEST_MUTEX.lock().await;
-        reset_globals().await;
         let runner = test_plan_runner();
 
         let (tx, rx) = broadcast::channel::<ChatEvent>(16);
@@ -11444,6 +11437,70 @@ mod tests {
         let (_r, metrics) = runner.listen_for_result(rx, Uuid::new_v4(), None).await;
         assert_eq!(metrics.num_turns, None);
         assert!(!metrics.cost_reported);
+    }
+
+    /// The process flag raised by another run — or left raised by another test —
+    /// does not end this runner's listen: a runner reads its own flag. Red before
+    /// the per-runner flag: `num_turns` came back `None` (CI on #820, PR #822).
+    #[tokio::test]
+    async fn listen_for_result_reads_the_runners_own_flag_not_the_process_one() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        RUNNER_CANCEL.store(true, Ordering::SeqCst);
+        let runner = test_plan_runner();
+
+        let (tx, rx) = broadcast::channel::<ChatEvent>(16);
+        tx.send(ChatEvent::Result {
+            session_id: "s1".into(),
+            duration_ms: 1,
+            cost_usd: Some(0.05),
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: Some(3),
+            result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: None,
+            error_code: None,
+            error_message: None,
+        })
+        .unwrap();
+        let (result, metrics) = runner.listen_for_result(rx, Uuid::new_v4(), None).await;
+
+        assert!(
+            matches!(result, EventListenResult::Completed { .. }),
+            "the process flag is not this runner's: the listen ended before the Result event"
+        );
+        assert_eq!(metrics.num_turns, Some(3));
+        assert!(
+            RUNNER_CANCEL.load(Ordering::SeqCst),
+            "the process flag was left as it was"
+        );
+        reset_globals().await;
+    }
+
+    /// One run per process (`active_run_refusal`): a runner built for production
+    /// — the boot one, the one of each dispatch — and its clones all drive the
+    /// process flag that `cancel`/`force_cancel` raise. Only a test runner holds
+    /// a flag of its own.
+    #[tokio::test]
+    async fn a_production_runner_shares_the_process_cancel_flag() {
+        let test_runner = test_plan_runner();
+        let production = PlanRunner::new(
+            test_runner.chat_manager.clone(),
+            test_runner.graph.clone(),
+            test_runner.context_builder.clone(),
+            test_runner.config.clone(),
+            test_runner.event_tx.clone(),
+        );
+
+        assert!(Arc::ptr_eq(&production.cancel, &RUNNER_CANCEL));
+        assert!(Arc::ptr_eq(&production.clone().cancel, &RUNNER_CANCEL));
+        assert!(
+            !Arc::ptr_eq(&test_runner.cancel, &RUNNER_CANCEL),
+            "a test runner has its own flag"
+        );
     }
 
     #[tokio::test]
