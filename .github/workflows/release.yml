@@ -197,7 +197,9 @@ jobs:
           # built it, so building on 24.04 (what ubuntu-latest became) produced files that need glibc 2.39 and refuse to start on
           # Ubuntu 22.04 / Debian 12. The promise is in scripts/check-os-floor.sh; the release fails if a build exceeds it.
           # Linux x86_64 (native build — no need for cross since host == target)
-          # ort-sys downloads prebuilt ONNX Runtime from pyke.io and statically links.
+          # ONNX Runtime is linked DYNAMICALLY from Microsoft's official build (step "Download ONNX Runtime
+          # for Linux"), as on ARM64. ort-sys's own prebuilt (pyke.io), linked statically, references glibc
+          # 2.38 symbols (__isoc23_strtol...): it does not link on 22.04 (measured, run 38916923260).
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
             os: linux
@@ -271,8 +273,10 @@ jobs:
       # ONNX Runtime pre-download for targets where ort-sys cannot self-serve:
       #
       # - macOS x86_64: pyke.io has NO prebuilt for this target
-      # - Linux aarch64 (cross): pyke.io download fails silently inside cross
-      #   Docker containers (likely network/cache isolation issue)
+      # - Linux (x86_64 and aarch64): the pyke.io prebuilt is linked statically and
+      #   needs glibc 2.38 (__isoc23_* symbols); the Linux builds run on Ubuntu 22.04
+      #   (glibc 2.35, the promise of scripts/check-os-floor.sh), where it does not
+      #   link. Microsoft's official build needs glibc 2.27 (measured on 1.23.2 x64).
       #
       # We download the official Microsoft ONNX Runtime release and set
       # ORT_LIB_LOCATION + ORT_PREFER_DYNAMIC_LINK so ort-sys links dynamically
@@ -299,13 +303,18 @@ jobs:
           echo "=== ONNX Runtime ${ORT_VERSION} for macOS x86_64 ==="
           ls -la "$RUNNER_TEMP/onnxruntime/lib/"
 
-      - name: Download ONNX Runtime for Linux aarch64
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Download ONNX Runtime for Linux
+        if: matrix.os == 'linux'
         run: |
-          ORT_VERSION="1.23.2"
-          echo "Downloading ONNX Runtime ${ORT_VERSION} for Linux aarch64..."
+          ORT_VERSION="1.24.2"  # API 24, what ort asks for (scripts/check-ort-api.sh); glibc 2.27
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)  ORT_ARCH=x64 ;;
+            aarch64-unknown-linux-gnu) ORT_ARCH=aarch64 ;;
+            *) echo "::error::no ONNX Runtime archive for ${{ matrix.target }}"; exit 1 ;;
+          esac
+          echo "Downloading ONNX Runtime ${ORT_VERSION} for Linux ${ORT_ARCH}..."
           curl -fsSL -o /tmp/onnxruntime.tgz \
-            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-aarch64-${ORT_VERSION}.tgz"
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}.tgz"
           mkdir -p "$RUNNER_TEMP/onnxruntime"
           # GNU tar: --strip-components=1 strips the top-level versioned directory
           tar xzf /tmp/onnxruntime.tgz -C "$RUNNER_TEMP/onnxruntime" --strip-components=1
@@ -313,11 +322,12 @@ jobs:
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
           # Mount ORT dir at same absolute path inside cross container
           echo "CROSS_CONTAINER_OPTS=-v $RUNNER_TEMP/onnxruntime:$RUNNER_TEMP/onnxruntime" >> "$GITHUB_ENV"
-          echo "=== ONNX Runtime ${ORT_VERSION} for Linux aarch64 ==="
+          echo "=== ONNX Runtime ${ORT_VERSION} for Linux ${ORT_ARCH} ==="
           ls -la "$RUNNER_TEMP/onnxruntime/lib/"
+          scripts/check-ort-api.sh "$RUNNER_TEMP/onnxruntime"
 
       - name: Install patchelf (for Linux dynamic ORT bundling)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        if: matrix.os == 'linux'
         run: sudo apt-get update && sudo apt-get install -y patchelf
 
       # nexus-tools: the files, shell and web tools of a NATIVE session (Read, Bash, WebFetch...).
@@ -375,7 +385,7 @@ jobs:
             cp -r queries "staging/${ARCHIVE_NAME}/"
           fi
           # Bundle ONNX Runtime dylib for targets using dynamic linking
-          # (macOS x86_64, Linux aarch64).
+          # (macOS x86_64, Linux x86_64 and aarch64).
           if [ -n "${ORT_LIB_LOCATION:-}" ]; then
             echo "Bundling ONNX Runtime dylib from $ORT_LIB_LOCATION"
             cp -a "${ORT_LIB_LOCATION}"/libonnxruntime* "staging/${ARCHIVE_NAME}/"
@@ -577,24 +587,37 @@ jobs:
           chmod +x target/${{ matrix.target }}/release/*
           # The third-party notices, from the archive (Cargo.toml packages them from target/release/).
           cp "artifact/${ARCHIVE_NAME}/THIRD-PARTY-LICENSES.txt" "target/${{ matrix.target }}/release/THIRD-PARTY-LICENSES.txt"
-          # aarch64 links ONNX Runtime dynamically: the archive ships libonnxruntime*.so
+          # Linux links ONNX Runtime dynamically (both arches): the archive ships libonnxruntime*.so
           # next to the binaries, but cargo-deb only picks up the four binaries above.
-          # Dereference the versioned symlink into stable real files so the arm64-cross
+          # Dereference the versioned symlink into stable real files so the bundled-ort
           # variant's merge-assets.append can package them next to the binary ($ORIGIN).
-          if [ "${{ matrix.arch }}" = "arm64" ]; then
-            cp -L "artifact/${ARCHIVE_NAME}/libonnxruntime.so.1" "target/${{ matrix.target }}/release/libonnxruntime.so.1"
-            cp -L "artifact/${ARCHIVE_NAME}/libonnxruntime_providers_shared.so" "target/${{ matrix.target }}/release/libonnxruntime_providers_shared.so"
-          fi
+          cp -L "artifact/${ARCHIVE_NAME}/libonnxruntime.so.1" "target/${{ matrix.target }}/release/libonnxruntime.so.1"
+          cp -L "artifact/${ARCHIVE_NAME}/libonnxruntime_providers_shared.so" "target/${{ matrix.target }}/release/libonnxruntime_providers_shared.so"
+
+      # The bundled-ort variant declares its Depends by hand (dpkg-shlibdeps, behind `$auto`, fails on a
+      # library shipped inside the package itself, and cannot read ARM64 libraries on this x86_64 runner).
+      # A hand-written list can go stale: fail if a binary needs a library the list does not cover.
+      - name: Check the declared Depends cover every needed library
+        run: |
+          # soname → what covers it: Depends of the bundled-ort variant (Cargo.toml), or the package itself.
+          allowed='^(libc\.so\.6|libm\.so\.6|libdl\.so\.2|libpthread\.so\.0|librt\.so\.1|ld-linux-(x86-64|aarch64)\.so\.[12]|libgcc_s\.so\.1|libstdc\+\+\.so\.6|libssl\.so\.3|libcrypto\.so\.3|libonnxruntime\.so\.1)$'
+          bad=0
+          for f in target/${{ matrix.target }}/release/*; do
+            if [ ! -f "$f" ] || ! head -c4 "$f" | grep -q 'ELF'; then continue; fi
+            for lib in $(readelf -d "$f" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p'); do
+              if ! echo "$lib" | grep -Eq "$allowed"; then
+                echo "::error::$(basename "$f") needs $lib, which the bundled-ort Depends (Cargo.toml) do not cover"
+                bad=1
+              fi
+            done
+          done
+          exit $bad
 
       - name: Build .deb package
         run: |
-          if [ "${{ matrix.arch }}" = "arm64" ]; then
-            # Use arm64-cross variant: explicit depends instead of $auto
-            # (dpkg-shlibdeps can't resolve ARM64 libs on x86_64 runner)
-            cargo deb --no-build --no-strip --variant=arm64-cross --target ${{ matrix.target }}
-          else
-            cargo deb --no-build --target ${{ matrix.target }}
-          fi
+          # bundled-ort variant: explicit Depends + ONNX Runtime next to the binaries (see Cargo.toml).
+          # --no-strip: this x86_64 runner's strip cannot read ARM64 binaries.
+          cargo deb --no-build ${{ matrix.arch == 'arm64' && '--no-strip' || '' }} --variant=bundled-ort --target ${{ matrix.target }}
 
       - name: Find and upload .deb
         run: |
@@ -687,17 +710,30 @@ jobs:
           chmod +x target/${{ matrix.target }}/release/*
           # The third-party notices, from the archive (Cargo.toml packages them from target/release/).
           cp "artifact/${ARCHIVE_NAME}/THIRD-PARTY-LICENSES.txt" "target/${{ matrix.target }}/release/THIRD-PARTY-LICENSES.txt"
-          # aarch64 links ONNX Runtime dynamically: the archive ships libonnxruntime*.so
+          # Linux links ONNX Runtime dynamically (both arches): the archive ships libonnxruntime*.so
           # next to the binaries. Dereference the versioned symlink into stable real
-          # files so the generate-rpm assets (missingok) can package them next to the
-          # binary ($ORIGIN).
-          if [ "${{ matrix.arch }}" = "aarch64" ]; then
-            cp -L "artifact/${ARCHIVE_NAME}/libonnxruntime.so.1" "target/${{ matrix.target }}/release/libonnxruntime.so.1"
-            cp -L "artifact/${ARCHIVE_NAME}/libonnxruntime_providers_shared.so" "target/${{ matrix.target }}/release/libonnxruntime_providers_shared.so"
-          fi
+          # files so the generate-rpm assets can package them next to the binary ($ORIGIN).
+          cp -L "artifact/${ARCHIVE_NAME}/libonnxruntime.so.1" "target/${{ matrix.target }}/release/libonnxruntime.so.1"
+          cp -L "artifact/${ARCHIVE_NAME}/libonnxruntime_providers_shared.so" "target/${{ matrix.target }}/release/libonnxruntime_providers_shared.so"
 
       - name: Build .rpm package
         run: cargo generate-rpm --target ${{ matrix.target }}
+
+      # The automatic Requires name the bundled ONNX Runtime; nothing on the target system provides
+      # it but the package itself (Cargo.toml, generate-rpm.provides). A Requires it does not provide
+      # makes `dnf install` refuse the package, so fail here rather than on the user's machine.
+      - name: Check the package provides its bundled ONNX Runtime
+        run: |
+          sudo apt-get install -y rpm >/dev/null
+          RPM_FILE=$(find target/ -name "*.rpm" | head -1)
+          rpm -qp --requires "$RPM_FILE" | sed 's/ *$//' | sort -u > /tmp/requires.txt
+          rpm -qp --provides "$RPM_FILE" | sed 's/ *$//' | sort -u > /tmp/provides.txt
+          echo "=== Requires ==="; cat /tmp/requires.txt
+          missing=$(grep '^libonnxruntime' /tmp/requires.txt | grep -vxFf /tmp/provides.txt || true)
+          if [ -n "$missing" ]; then
+            echo "::error::the .rpm requires what it does not provide (Cargo.toml generate-rpm.provides): $missing"
+            exit 1
+          fi
 
       - name: Find and upload .rpm
         run: |
@@ -926,6 +962,30 @@ jobs:
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
           ls -la "$RUNNER_TEMP/onnxruntime/lib/"
 
+      # Linux: same reason as build-backend — the pyke.io ONNX Runtime, linked statically, needs glibc
+      # 2.38 and does not link on the 22.04 runners. Link Microsoft's build dynamically; the libraries
+      # ride along as resources (/usr/lib/Project Orchestrator/, next to mcp_server, whose rpath is
+      # $ORIGIN), and the app's own rpath points there from /usr/bin (deb, rpm, and AppImage's usr/).
+      # CARGO_ENCODED_RUSTFLAGS: the path has a space, which RUSTFLAGS would split.
+      - name: Download ONNX Runtime for Linux
+        if: runner.os == 'Linux'
+        run: |
+          ORT_VERSION="1.24.2"  # API 24, what ort asks for (scripts/check-ort-api.sh); glibc 2.27
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)  ORT_ARCH=x64 ;;
+            aarch64-unknown-linux-gnu) ORT_ARCH=aarch64 ;;
+            *) echo "::error::no ONNX Runtime archive for ${{ matrix.target }}"; exit 1 ;;
+          esac
+          curl -fsSL -o /tmp/onnxruntime.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}.tgz"
+          mkdir -p "$RUNNER_TEMP/onnxruntime"
+          tar xzf /tmp/onnxruntime.tgz -C "$RUNNER_TEMP/onnxruntime" --strip-components=1
+          echo "ORT_LIB_LOCATION=$RUNNER_TEMP/onnxruntime/lib" >> "$GITHUB_ENV"
+          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
+          echo 'CARGO_ENCODED_RUSTFLAGS=-Clink-arg=-Wl,-rpath,$ORIGIN/../lib/Project Orchestrator' >> "$GITHUB_ENV"
+          ls -la "$RUNNER_TEMP/onnxruntime/lib/"
+          scripts/check-ort-api.sh "$RUNNER_TEMP/onnxruntime"
+
       # Reuse the mcp_server binary already compiled by build-backend
       # (same code, same target, same release profile — no need to compile again)
       - name: Download pre-built mcp_server
@@ -951,7 +1011,15 @@ jobs:
           chmod +x target/release/nexus-tools
           # The third-party notices ride along too (our LICENSE files are in tauri.conf.json): licenses/ in the app.
           cp "mcp-artifact/${ARCHIVE_NAME}/THIRD-PARTY-LICENSES.txt" target/release/THIRD-PARTY-LICENSES.txt
-          echo '{"bundle":{"resources":{"../../target/release/nexus-tools":"nexus-tools","../../target/release/THIRD-PARTY-LICENSES.txt":"licenses/THIRD-PARTY-LICENSES.txt"}}}' > desktop/src-tauri/tauri.nexus-tools.json
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # ONNX Runtime next to mcp_server (its rpath is $ORIGIN) and where the app's rpath looks.
+            # Real files, not the versioned symlinks (a resource is copied as a file).
+            cp -L "$ORT_LIB_LOCATION/libonnxruntime.so.1" target/release/libonnxruntime.so.1
+            cp -L "$ORT_LIB_LOCATION/libonnxruntime_providers_shared.so" target/release/libonnxruntime_providers_shared.so
+            echo '{"bundle":{"resources":{"../../target/release/nexus-tools":"nexus-tools","../../target/release/THIRD-PARTY-LICENSES.txt":"licenses/THIRD-PARTY-LICENSES.txt","../../target/release/libonnxruntime.so.1":"libonnxruntime.so.1","../../target/release/libonnxruntime_providers_shared.so":"libonnxruntime_providers_shared.so"}}}' > desktop/src-tauri/tauri.nexus-tools.json
+          else
+            echo '{"bundle":{"resources":{"../../target/release/nexus-tools":"nexus-tools","../../target/release/THIRD-PARTY-LICENSES.txt":"licenses/THIRD-PARTY-LICENSES.txt"}}}' > desktop/src-tauri/tauri.nexus-tools.json
+          fi
 
       - name: Extract mcp_server to target/release (Windows)
         if: runner.os == 'Windows'
@@ -1187,6 +1255,21 @@ jobs:
           rm -rf "$RUNNER_TEMP/debx" && mkdir -p "$RUNNER_TEMP/debx"
           dpkg-deb -x target/${{ matrix.target }}/release/bundle/deb/*.deb "$RUNNER_TEMP/debx"
           scripts/check-os-floor.sh "linux-${{ matrix.artifact_arch }}" "$RUNNER_TEMP/debx"
+
+      # ONNX Runtime is linked dynamically and shipped as a resource: prove, on the files as they will be
+      # installed, that the app and mcp_server find it (a missing rpath only shows at launch otherwise).
+      - name: Check the Linux app finds ONNX Runtime
+        if: runner.os == 'Linux'
+        run: |
+          bad=0
+          for f in "$RUNNER_TEMP"/debx/usr/bin/* "$RUNNER_TEMP/debx/usr/lib/Project Orchestrator/mcp_server"; do
+            if [ ! -f "$f" ] || ! head -c4 "$f" | grep -q 'ELF'; then continue; fi
+            echo "=== $f"; ldd "$f" | grep -E 'onnxruntime|not found' || true
+            if ldd "$f" | grep -q 'not found'; then
+              echo "::error::$(basename "$f") does not find a library it needs (see above)"; bad=1
+            fi
+          done
+          exit $bad
 
       # Verify the built bundle contains the correct frontend.
       # This catches any issue where Tauri silently bundles stale frontend files.

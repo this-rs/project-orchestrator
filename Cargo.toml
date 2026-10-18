@@ -337,15 +337,25 @@ conf-files = ["/etc/project-orchestrator/config.yaml"]
 # a dpkg conflict: systemd-units installs to /usr/lib/systemd/system/ while
 # assets installs to /lib/systemd/system/ (same physical path on merged-/usr).
 
-# Variant for cross-compiled ARM64 builds (dpkg-shlibdeps can't resolve
-# ARM64 shared libraries on an x86_64 runner, so we use explicit depends)
-[package.metadata.deb.variants.arm64-cross]
-depends = "libc6 (>= 2.35), libgcc-s1, libstdc++6"
-# aarch64 links ONNX Runtime dynamically (ORT_PREFER_DYNAMIC_LINK=1): the binary's
-# rpath is $ORIGIN (/usr/bin/) and it loads the providers next to itself, so the
-# runtime must be packaged there too. The release copies these next to the
-# binaries before `cargo deb` (package-deb job). x86_64 links ORT statically and
-# never builds this variant.
+# The variant the release builds, for both Linux arches (package-deb job).
+# Linux links ONNX Runtime dynamically (ORT_PREFER_DYNAMIC_LINK=1, Microsoft's official
+# build: the pyke.io one, linked statically, needs glibc 2.38 and does not link on the
+# 22.04 runners). The binary's rpath is $ORIGIN (/usr/bin/) and it loads the providers
+# next to itself, so the runtime is packaged there too; the release copies these next
+# to the binaries before `cargo deb`.
+# Depends are explicit, not `$auto`: dpkg-shlibdeps fails on a library shipped inside
+# the package itself, and cannot read ARM64 libraries on the x86_64 packaging runner.
+# The release checks every NEEDED library of the binaries is covered by this list
+# (step "Check the declared Depends cover every needed library"): keep the two in step.
+# libssl3t64 is the Ubuntu 24.04 / Debian 13 name of libssl3.
+# `name`: without it cargo-deb names the package `project-orchestrator-bundled-ort` and apt
+# no longer upgrades `project-orchestrator`. Up to 0.0.17 the ARM64 package was named
+# `project-orchestrator-arm64-cross` (the old variant): conflicts/replaces let it be replaced.
+[package.metadata.deb.variants.bundled-ort]
+name = "project-orchestrator"
+depends = "libc6 (>= 2.35), libgcc-s1, libstdc++6, libssl3 | libssl3t64"
+conflicts = "project-orchestrator-arm64-cross"
+replaces = "project-orchestrator-arm64-cross"
 merge-assets.append = [
     ["target/release/libonnxruntime.so.1", "/usr/bin/libonnxruntime.so.1", "644"],
     ["target/release/libonnxruntime_providers_shared.so", "/usr/bin/libonnxruntime_providers_shared.so", "644"],
@@ -361,11 +371,11 @@ assets = [
     { source = "target/release/orch", dest = "/usr/bin/orch", mode = "755" },
     { source = "target/release/mcp_server", dest = "/usr/bin/orchestrator-mcp", mode = "755" },
     { source = "target/release/nexus-tools", dest = "/usr/bin/nexus-tools", mode = "755" },
-    # aarch64 links ONNX Runtime dynamically (ORT_PREFER_DYNAMIC_LINK=1): the runtime
-    # must ship next to the binary ($ORIGIN rpath). The release copies these for
-    # aarch64 only; `missingok` skips them on x86_64 (statically linked).
-    { source = "target/release/libonnxruntime.so.1", dest = "/usr/bin/libonnxruntime.so.1", mode = "644", config = "missingok" },
-    { source = "target/release/libonnxruntime_providers_shared.so", dest = "/usr/bin/libonnxruntime_providers_shared.so", mode = "644", config = "missingok" },
+    # Linux links ONNX Runtime dynamically (ORT_PREFER_DYNAMIC_LINK=1, both arches): the
+    # runtime ships next to the binary ($ORIGIN rpath). The release copies these before
+    # `cargo generate-rpm` (package-rpm job). See also `provides` below.
+    { source = "target/release/libonnxruntime.so.1", dest = "/usr/bin/libonnxruntime.so.1", mode = "644" },
+    { source = "target/release/libonnxruntime_providers_shared.so", dest = "/usr/bin/libonnxruntime_providers_shared.so", mode = "644" },
     { source = "config.yaml.example", dest = "/etc/project-orchestrator/config.yaml.example", mode = "644", config = "noreplace" },
     { source = "packaging/debian/project-orchestrator.service", dest = "/lib/systemd/system/project-orchestrator.service", mode = "644" },
     { source = "packaging/debian/docker-compose.services.yml", dest = "/etc/project-orchestrator/docker-compose.services.yml", mode = "644" },
@@ -379,4 +389,14 @@ post_install_script = "packaging/rpm/postinst.sh"
 
 [package.metadata.generate-rpm.requires]
 systemd = "*"
+
+# The automatic Requires (ldd of the binaries) name the bundled ONNX Runtime, which no
+# distribution package provides: the package provides it itself, or `dnf install` refuses
+# it ("nothing provides libonnxruntime.so.1()(64bit)"). VERS_1.24.2 is the symbol version
+# of the Linux ORT_VERSION in release.yml: bump both together. The release checks that every
+# libonnxruntime Requires is among these (step "Check the package provides its bundled
+# ONNX Runtime").
+[package.metadata.generate-rpm.provides]
+"libonnxruntime.so.1()(64bit)" = "*"
+"libonnxruntime.so.1(VERS_1.24.2)(64bit)" = "*"
 
