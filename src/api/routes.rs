@@ -810,6 +810,23 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/plans/{plan_id}/tasks/{task_id}/delegate",
             post(handlers::delegate_task),
         )
+        // T5: a delegated task in an ephemeral worktree waits for a person to confirm its place.
+        .route(
+            "/api/execution-places/{placement_id}",
+            get(super::execution_place_handlers::get_execution_place),
+        )
+        .route(
+            "/api/execution-places/{placement_id}/confirm",
+            post(super::execution_place_handlers::confirm_execution_place),
+        )
+        .route(
+            "/api/execution-places/{placement_id}/reject",
+            post(super::execution_place_handlers::reject_execution_place),
+        )
+        .route(
+            "/api/tasks/{task_id}/execution-places",
+            get(super::execution_place_handlers::list_execution_place_events),
+        )
         // Pre-enrichment pipeline
         .route("/api/plans/{plan_id}/enrich", post(handlers::enrich_plan))
         .route(

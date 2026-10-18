@@ -12628,7 +12628,7 @@ mod schema_drift_tests {
         // CreatePersonaBody / ImportPersonaBody / AutoBuildPersonaBody
         ("persona", "conflict_strategy"), ("persona", "depth"), ("persona", "entry_function"), ("persona", "file_pattern"), ("persona", "origin"), ("persona", "package"),
         // CreatePlanRequest / DelegateTaskRequest (provider, model and task_class are the explicit choice of the delegating agent)
-        ("plan", "constraints"), ("plan", "custom_sections"), ("plan", "model"), ("plan", "parent_session_id"), ("plan", "provider"), ("plan", "task_class"),
+        ("plan", "constraints"), ("plan", "custom_sections"), ("plan", "model"), ("plan", "parent_session_id"), ("plan", "provider"), ("plan", "task_class"), ("plan", "execution_place"),
         // ReasonRequest
         ("reasoning", "depth"), ("reasoning", "include_actions"), ("reasoning", "max_nodes"), ("reasoning", "project_id"), ("reasoning", "request"),
         // CreateReleaseRequest

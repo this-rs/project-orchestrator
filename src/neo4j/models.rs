@@ -188,6 +188,85 @@ impl ExecutionPlace {
     }
 }
 
+/// One step in the life of an ephemeral worktree a delegated task runs in (T5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPlaceEventKind {
+    /// A session (or a person) asked; PO resolved the place; a person must confirm.
+    Requested,
+    /// The person confirmed « exécute dans X ». Written BEFORE the worktree is made.
+    Confirmed,
+    /// The person said no.
+    Rejected,
+    /// The worktree was made and the child session opened in it.
+    Launched,
+    /// The worktree or the session could not be made after the confirmation.
+    LaunchFailed,
+    /// The task is over and the worktree was removed with its branch.
+    Removed,
+    /// The task is over and the worktree was KEPT (work that removing it would lose).
+    Kept,
+}
+
+impl ExecutionPlaceEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::Confirmed => "confirmed",
+            Self::Rejected => "rejected",
+            Self::Launched => "launched",
+            Self::LaunchFailed => "launch_failed",
+            Self::Removed => "removed",
+            Self::Kept => "kept",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Some(match raw {
+            "requested" => Self::Requested,
+            "confirmed" => Self::Confirmed,
+            "rejected" => Self::Rejected,
+            "launched" => Self::Launched,
+            "launch_failed" => Self::LaunchFailed,
+            "removed" => Self::Removed,
+            "kept" => Self::Kept,
+            _ => return None,
+        })
+    }
+}
+
+/// An entry of the append-only audit of execution places (T5): who asked, who confirmed, what
+/// X, when, for which task and session. Never updated, never deleted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionPlaceEvent {
+    pub id: Uuid,
+    /// The placement every event of one request shares.
+    pub placement_id: Uuid,
+    pub kind: ExecutionPlaceEventKind,
+    pub task_id: Uuid,
+    pub plan_id: Uuid,
+    /// `session:<uuid>` or `person:<sub>`.
+    pub requested_by: String,
+    /// The person the placement waits for.
+    pub owner: String,
+    /// The person who answered (confirmed / rejected), when the event is an answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// The child session, once there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
+    /// X, as PO resolved it.
+    pub path: String,
+    pub repository: String,
+    pub base_ref: String,
+    pub base_sha: String,
+    pub branch: String,
+    /// Why a worktree was kept, why a launch failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub at: DateTime<Utc>,
+}
+
 /// A chat session with Claude Code CLI
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatSessionNode {

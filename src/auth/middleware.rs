@@ -349,6 +349,10 @@ const HUMAN_ONLY_MUTATION_PREFIXES: &[&str] = &[
     // The lasting approvals of a person (P11b): an agent that could revoke or touch them
     // would act on its person's decisions (the handlers also refuse an agent's GET).
     "/api/chat/permission-rules",
+    // « Exécute dans X » (T5): confirming or rejecting the place a delegated task writes in is
+    // the person's answer; an agent that could post it would open its own worktree (the handlers
+    // refuse an agent token too).
+    "/api/execution-places",
 ];
 
 /// Per-project settings that decide where a project's content may go
@@ -1260,6 +1264,19 @@ mod tests {
             "/api/chat/auto-models"
         ));
         assert!(!is_human_only_mutation(&Method::GET, "/api/chat/routing"));
+        // T5: « exécute dans X » is answered by a person; reading a pending place is not.
+        assert!(is_human_only_mutation(
+            &Method::POST,
+            "/api/execution-places/p/confirm"
+        ));
+        assert!(is_human_only_mutation(
+            &Method::POST,
+            "/api/execution-places/p/reject"
+        ));
+        assert!(!is_human_only_mutation(
+            &Method::GET,
+            "/api/execution-places/p"
+        ));
         assert!(is_human_only_mutation(
             &Method::DELETE,
             "/api/projects/p/routing"

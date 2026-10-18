@@ -2615,6 +2615,20 @@ impl GraphStore for Neo4jClient {
         self.list_anchor_events(session_id).await
     }
 
+    async fn create_execution_place_event(
+        &self,
+        event: &crate::neo4j::models::ExecutionPlaceEvent,
+    ) -> anyhow::Result<()> {
+        self.create_execution_place_event(event).await
+    }
+
+    async fn list_execution_place_events(
+        &self,
+        task_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::ExecutionPlaceEvent>> {
+        self.list_execution_place_events(task_id).await
+    }
+
     async fn mark_anchors_dangling(
         &self,
         target_type: crate::chat::anchor::AnchorTargetType,

@@ -2333,6 +2333,18 @@ pub trait GraphStore: Send + Sync {
         session_id: Uuid,
     ) -> Result<Vec<crate::chat::anchor::AnchorEvent>>;
 
+    /// Append one entry to the execution-place audit (T5). Never updates an entry.
+    async fn create_execution_place_event(
+        &self,
+        event: &crate::neo4j::models::ExecutionPlaceEvent,
+    ) -> Result<()>;
+
+    /// The execution-place audit of a task, oldest first.
+    async fn list_execution_place_events(
+        &self,
+        task_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::models::ExecutionPlaceEvent>>;
+
     /// Mark every anchor on a (deleted/archived) target `dangling`, with a
     /// journal entry each. Returns how many changed. Not wired to entity
     /// deletion yet. Anchors are never deleted by this.

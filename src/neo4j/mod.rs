@@ -14,6 +14,7 @@ mod decision;
 pub mod document;
 mod environment;
 mod event_trigger;
+mod execution_place;
 mod feature_graph;
 mod impl_graph_store;
 mod lifecycle_hook;

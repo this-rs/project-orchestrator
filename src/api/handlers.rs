@@ -954,6 +954,12 @@ pub struct DelegateTaskRequest {
     /// model policy (A19) so a rule can still pick the model when none is named.
     #[serde(default)]
     pub task_class: Option<String>,
+    /// Where the task writes (T5). Absent or `"project"`: in `cwd`, as always.
+    /// `"ephemeral_worktree"`: in a NEW git worktree of the repository of `cwd`, that PO makes
+    /// from a known base once a PERSON confirmed « exécute dans X » (X resolved by PO, never
+    /// read from this request), and removes when the task is over unless that could lose work.
+    #[serde(default)]
+    pub execution_place: Option<String>,
 }
 
 /// The model-related part of a delegation, as a person or an agent wrote it.
@@ -1005,6 +1011,17 @@ pub struct DelegateTaskResponse {
     pub plan_id: Uuid,
     /// First 200 characters of the prompt (for preview/debugging)
     pub prompt_preview: String,
+    /// The ephemeral worktree the task runs in (T5), when it was asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_place: Option<super::execution_place_handlers::ExecutionPlaceView>,
+}
+
+/// What a delegation request gave: a session opened, or a place a person must confirm first.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum DelegateTaskOutcome {
+    Launched(DelegateTaskResponse),
+    ConfirmationRequired(super::execution_place_handlers::ConfirmationRequired),
 }
 
 /// POST /api/plans/:plan_id/tasks/:task_id/delegate — Delegate a task to a sub-agent.
@@ -1022,7 +1039,7 @@ pub async fn delegate_task(
     headers: axum::http::HeaderMap,
     Path((plan_id, task_id)): Path<(Uuid, Uuid)>,
     Json(req): Json<DelegateTaskRequest>,
-) -> Result<(StatusCode, Json<DelegateTaskResponse>), AppError> {
+) -> Result<(StatusCode, Json<DelegateTaskOutcome>), AppError> {
     use crate::chat::envelope;
 
     let chat_manager = state
@@ -1076,6 +1093,84 @@ pub async fn delegate_task(
     let target = DelegationTarget::new(req.provider, req.model, req.task_class);
     let stated_class = target.task_class.clone();
     target.apply(&mut chat_request);
+    // A person may name the parent in the body; an agent's parent is its token's.
+    let parent_session_id = match &parent_envelope {
+        Some(env) => Some(env.parent_session_id),
+        None => req
+            .parent_session_id
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok()),
+    };
+    let prepared = PreparedDelegation {
+        plan_id,
+        task_id,
+        task_node,
+        task_title,
+        chat_request,
+        stated_class,
+        parent_session_id,
+        custom_sections: req.custom_sections,
+    };
+    // T5: a task asked to run in an ephemeral worktree opens nothing now. PO resolves the place
+    // X itself and keeps it pending until a PERSON confirms « exécute dans X »; a caller nobody
+    // is in front of is refused here, without a question.
+    match super::execution_place_handlers::DelegationPlace::parse(req.execution_place.as_deref())? {
+        super::execution_place_handlers::DelegationPlace::AsGiven => {}
+        super::execution_place_handlers::DelegationPlace::EphemeralWorktree => {
+            let pending = super::execution_place_handlers::request_placement(
+                &state,
+                claims.as_ref().map(|c| &c.0),
+                parent_envelope.as_ref(),
+                prepared,
+            )
+            .await?;
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(DelegateTaskOutcome::ConfirmationRequired(pending)),
+            ));
+        }
+    }
+    let launched = launch_delegation(&state, chat_manager, prepared, None).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(DelegateTaskOutcome::Launched(launched)),
+    ))
+}
+
+/// A delegation checked against its envelope and ready to open: what [`launch_delegation`] opens,
+/// at once or after a person confirmed its place (T5).
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedDelegation {
+    pub plan_id: Uuid,
+    pub task_id: Uuid,
+    pub task_node: crate::neo4j::models::TaskNode,
+    pub task_title: String,
+    pub chat_request: crate::chat::types::ChatRequest,
+    pub stated_class: Option<String>,
+    pub parent_session_id: Option<Uuid>,
+    pub custom_sections: Vec<String>,
+}
+
+/// Open the session of a prepared delegation and send it its prompt. `place`: the ephemeral
+/// worktree it runs in (its `cwd` is already X), released when the task is over or when the
+/// session cannot open.
+pub(crate) async fn launch_delegation(
+    state: &OrchestratorState,
+    chat_manager: &Arc<ChatManager>,
+    prepared: PreparedDelegation,
+    place: Option<super::execution_place_handlers::LaunchedPlace>,
+) -> Result<DelegateTaskResponse, AppError> {
+    let PreparedDelegation {
+        plan_id,
+        task_id,
+        task_node,
+        task_title,
+        mut chat_request,
+        stated_class,
+        parent_session_id,
+        custom_sections,
+    } = prepared;
+    let graph = state.orchestrator.neo4j_arc();
     // The model alias set on THIS task (A16 level "task"): a delegation used to
     // leave it out, so the alias never applied to a delegated task.
     apply_task_alias(graph.as_ref(), &mut chat_request, task_id).await;
@@ -1096,14 +1191,6 @@ pub async fn delegate_task(
     )
     .await;
     let routing_decision_id = routed.as_ref().map(|d| d.id);
-    // A person may name the parent in the body; an agent's parent is its token's.
-    let parent_session_id = match &parent_envelope {
-        Some(env) => Some(env.parent_session_id),
-        None => req
-            .parent_session_id
-            .as_deref()
-            .and_then(|s| Uuid::parse_str(s).ok()),
-    };
     // Nothing named and nothing routed: the child runs on its parent's engine (B18).
     inherit_parent_engine(
         graph.as_ref(),
@@ -1125,10 +1212,19 @@ pub async fn delegate_task(
             Some(&pipeline),
             project_slug.as_deref(),
             None, // project_id resolved from slug if needed
-            req.custom_sections,
+            custom_sections,
         )
-        .await
-        .map_err(AppError::Internal)?;
+        .await;
+    let structured = match structured {
+        Ok(s) => s,
+        Err(e) => {
+            let error = AppError::Internal(e);
+            if let Some(place) = place {
+                place.launch_failed(graph.as_ref(), &error).await;
+            }
+            return Err(error);
+        }
+    };
 
     let prompt = structured.rendered.clone();
     let prompt_preview = {
@@ -1170,15 +1266,26 @@ pub async fn delegate_task(
     );
     chat_request.scaffolding_override = scaffolding_override;
     let chat_request_cwd = chat_request.cwd.clone();
+    let in_place = place.is_some();
 
     // A session that cannot open says why, as the chat route does (status + code): an engine
     // nobody registered, a project that did not consent, a Claude Code that is not installed.
     // Flattened into `Internal`, all of them read as the same bare 500 (DELEG-500).
-    let session = chat_manager
-        .create_session(&chat_request)
-        .await
-        .map_err(|e| AppError::from_open_error(e, chat_request.provider.as_deref()))?;
+    let session = match chat_manager.create_session(&chat_request).await {
+        Ok(session) => session,
+        Err(e) => {
+            let error = AppError::from_open_error(e, chat_request.provider.as_deref());
+            if let Some(place) = place {
+                place.launch_failed(graph.as_ref(), &error).await;
+            }
+            return Err(error);
+        }
+    };
     let session_id = session.session_id.clone();
+    let place_view = match &place {
+        Some(place) => Some(place.launched(graph.as_ref(), &session_id).await),
+        None => None,
+    };
 
     // Step 3: Create AgentExecution node for tracking (fire-and-forget)
     let session_uuid = session_id.parse::<Uuid>().ok();
@@ -1234,69 +1341,82 @@ pub async fn delegate_task(
     let ev_plan_id = plan_id;
     let ev_session_id = session_id.clone();
 
+    let graph_for_place = graph.clone();
     tokio::spawn(async move {
-        // Send the prompt
-        // Task text is not a composed message: no block may ride on it.
-        if let Err(e) = cm
-            .send_message(&sid, &crate::refs::compose::inert(&prompt))
-            .await
-        {
-            tracing::error!(
-                session_id = %sid,
-                task_id = %ev_task_id,
-                "Failed to send delegation prompt: {}", e
-            );
-            // `execution` drops here: it is closed `failed`.
-            return;
-        }
-
-        tracing::info!(
-            session_id = %ev_session_id,
-            task_id = %ev_task_id,
-            plan_id = %ev_plan_id,
-            task_title = %task_title_clone,
-            "Delegation started: sub-agent spawned with enriched prompt"
-        );
-
-        // Listen for completion and emit TaskCompleted event
-        let rx = match cm.subscribe(&sid).await {
-            Ok(rx) => rx,
-            Err(e) => {
-                tracing::warn!("Failed to subscribe to delegated session {}: {}", sid, e);
+        let run = async {
+            // Send the prompt
+            // Task text is not a composed message: no block may ride on it.
+            if let Err(e) = cm
+                .send_message(&sid, &crate::refs::compose::inert(&prompt))
+                .await
+            {
+                tracing::error!(
+                    session_id = %sid,
+                    task_id = %ev_task_id,
+                    "Failed to send delegation prompt: {}", e
+                );
+                // `execution` drops here: it is closed `failed`.
                 return;
             }
-        };
 
-        let delegation_cwd = Some(chat_request_cwd.clone());
-        let close = routing
-            .zip(routing_decision_id)
-            .map(|(handle, id)| DelegationClose {
-                routing: handle,
-                graph: graph_for_close,
-                decision_id: id,
-            });
-        listen_delegation_result(
-            rx,
-            ev_task_id,
-            &task_title_clone,
-            event_bus,
-            delegation_cwd,
-            close,
-            execution,
-            owner,
-        )
-        .await;
+            tracing::info!(
+                session_id = %ev_session_id,
+                task_id = %ev_task_id,
+                plan_id = %ev_plan_id,
+                task_title = %task_title_clone,
+                "Delegation started: sub-agent spawned with enriched prompt"
+            );
+
+            // Listen for completion and emit TaskCompleted event
+            let rx = match cm.subscribe(&sid).await {
+                Ok(rx) => rx,
+                Err(e) => {
+                    tracing::warn!("Failed to subscribe to delegated session {}: {}", sid, e);
+                    return;
+                }
+            };
+
+            // In an ephemeral worktree the child works in X itself: no sibling agent worktree of
+            // the repository is cherry-picked into X's branch (PO's cleanup would then keep X for
+            // commits the task never made).
+            let delegation_cwd = (!in_place).then(|| chat_request_cwd.clone());
+            let close = routing
+                .zip(routing_decision_id)
+                .map(|(handle, id)| DelegationClose {
+                    routing: handle,
+                    graph: graph_for_close,
+                    decision_id: id,
+                });
+            listen_delegation_result(
+                rx,
+                ev_task_id,
+                &task_title_clone,
+                event_bus,
+                delegation_cwd,
+                close,
+                execution,
+                owner,
+            )
+            .await;
+        };
+        run.await;
+        // T5: the task is over (a result, a failure, the 1h safety net): its session is closed
+        // and its worktree released — removed, or kept when that could lose work.
+        if let Some(place) = place {
+            if let Err(e) = cm.close_session(&sid).await {
+                tracing::debug!(session_id = %sid, "closing the delegated session: {e}");
+            }
+            place.finish(graph_for_place.as_ref(), &sid).await;
+        }
     });
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(DelegateTaskResponse {
-            session_id,
-            task_id,
-            plan_id,
-            prompt_preview,
-        }),
-    ))
+    Ok(DelegateTaskResponse {
+        session_id,
+        task_id,
+        plan_id,
+        prompt_preview,
+        execution_place: place_view,
+    })
 }
 
 /// Puts the model alias set on the task (A16 level "task") on the request. A
@@ -7553,6 +7673,7 @@ mod tests {
             provider: None,
             model: None,
             task_class: None,
+            execution_place: None,
         };
 
         let result = delegate_task(
@@ -7619,6 +7740,7 @@ mod tests {
             provider: Some("nobody-registered".to_string()),
             model: None,
             task_class: None,
+            execution_place: None,
         };
 
         let result = delegate_task(
