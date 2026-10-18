@@ -120,10 +120,12 @@ fn reason_of(signature: &TaskSignature, best: &Scored, explored: bool, kept: boo
     )
 }
 
-/// Reason code of a compaction decision: the summary model cannot be chosen. The legacy
-/// engine's summary is written by the Claude Code CLI on the session's model, the native
-/// one by nexus on the session's endpoint and active model (`CompactionConfig` has no model
-/// field): the decision is recorded, never applied.
+/// Reason code of a compaction decision that is recorded, not applied: the summary model
+/// cannot be chosen (the Claude Code CLI summarises on the session's model, measured on
+/// 2.1.296), or the conversation is not in mode `full` / `executors_only` + stage `auto`. A
+/// native session (nexus contract v8, `Capabilities::compaction_model`) in those modes gets
+/// the decision APPLIED through `SessionHooks::compaction_directive` instead
+/// (`agent_hooks::directive_for_compaction`).
 pub const COMPACTION_MODEL_NOT_SELECTABLE: &str = "compaction_model_not_selectable";
 
 /// The decision for `request`, without touching any store.

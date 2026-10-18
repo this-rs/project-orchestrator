@@ -1167,7 +1167,8 @@ impl CompactionNotifier {
     }
 
     /// Records, without holding the compaction back, the cognitive decision about the
-    /// summary (never applied: the summary model cannot be chosen on either engine).
+    /// summary, when it is not applied (`agent_hooks::record_compaction_decision`: an applied
+    /// one is taken by the harness's `compaction_directive`, N-C1).
     fn record_routing_decision(&self) {
         let Some(router) = self
             .routing
@@ -17268,6 +17269,7 @@ impl ChatManager {
         self.warn_if_forced(provider_id, &announced);
         if let Some(router) = self.turn_routing.get(session_id) {
             router.set_model_live(session.capabilities().set_model_live);
+            router.set_compaction_model(session.capabilities().compaction_model);
         }
         // The frozen snapshot keeps what the opening FOUND: a session opened without
         // its MCP servers (`without_mcp`: its provider takes none, it refused them, or

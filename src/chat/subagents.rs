@@ -143,6 +143,16 @@ impl SessionHooks for SubagentHooks {
         }
     }
 
+    async fn compaction_directive(
+        &self,
+        info: &CompactionInfo,
+    ) -> nexus_claude::agent::CompactionDirective {
+        match &self.inner {
+            Some(inner) => inner.compaction_directive(info).await,
+            None => nexus_claude::agent::CompactionDirective::none(),
+        }
+    }
+
     async fn before_turn(&self, ctx: &TurnContext) -> TurnDirective {
         match &self.inner {
             Some(inner) => inner.before_turn(ctx).await,

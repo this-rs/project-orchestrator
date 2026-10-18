@@ -74,7 +74,15 @@ fn answer(text: &str, prompt_tokens: u64) -> Vec<Value> {
 /// asked), so the summary is not looked for there; it answers after 300 ms so that the
 /// decision's requests are over before the next turn is sent.
 fn script(who: &str, models: &[&str]) -> Value {
-    let mut routes = vec![
+    script_signing(who, models, &[])
+}
+
+/// [`script`], plus a summary route per model of `summary_models`: a summary asked on that
+/// model (N-C1, nexus contract v8: the decision names the summary model) signs it
+/// (`summary written by <who>/<model>`). The model alone selects that route; the probes of the
+/// session's model and of each summary model take the probe routes placed before it.
+fn script_signing(who: &str, models: &[&str], summary_models: &[&str]) -> Value {
+    let probe = || {
         sse_route(
             PROBE,
             vec![
@@ -84,7 +92,24 @@ fn script(who: &str, models: &[&str]) -> Value {
                 json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
                 json!("[DONE]"),
             ],
-        ),
+        )
+    };
+    // A probe takes the first route it matches not used yet, and the probe of a model names
+    // it too: one probe route for the session's model and one per summary model come BEFORE
+    // that model's summary route, which is left for the summary.
+    let mut routes: Vec<Value> = std::iter::once(probe())
+        .filter(|_| !summary_models.is_empty())
+        .collect();
+    routes.extend(summary_models.iter().flat_map(|model| {
+        let mut summary = sse_route(
+            &format!("\"model\":\"{model}\""),
+            answer(&format!("summary written by {who}/{model}"), 50),
+        );
+        summary["delay_ms"] = json!(300);
+        [probe(), summary]
+    }));
+    routes.extend([
+        probe(),
         json!({"method": "GET", "path": "/v1/models", "status": 200, "body": {"object": "list",
                "data": models.iter().map(|m| json!({"id": m, "context_length": 32000})).collect::<Vec<_>>()}}),
         {
@@ -95,7 +120,7 @@ fn script(who: &str, models: &[&str]) -> Value {
             summary["delay_ms"] = json!(300);
             summary
         },
-    ];
+    ]);
     // The long conversation reports a prompt close to the 32k window: nexus compacts
     // before a turn once there is enough history to summarise.
     for text in LONG_TURNS.iter().rev() {
@@ -185,7 +210,17 @@ async fn teach_counts(
 }
 
 async fn world(mode: &str, stage: &str) -> World {
-    let primary = FakeOpenAi::start(script("primary", &["pm"]));
+    world_with(mode, stage, &["pm"]).await
+}
+
+/// The world, with the primary serving `primary_models` (the first is its default; a summary
+/// asked on any other signs that model).
+async fn world_with(mode: &str, stage: &str, primary_models: &[&str]) -> World {
+    let primary = FakeOpenAi::start(script_signing(
+        "primary",
+        primary_models,
+        &primary_models[1..],
+    ));
     let worker = FakeOpenAi::start(script("worker", &["wa", "wb"]));
     let graph = Arc::new(MockGraphStore::new());
     for (fake, id, model) in [(&primary, "primary", "pm"), (&worker, "worker", "wa")] {
@@ -748,12 +783,12 @@ async fn full_auto_moves_a_conversation_handed_back_to_po_to_another_provider() 
     assert_eq!(node(&w, &p).await.provider_id.as_deref(), Some("worker"));
 }
 
-/// The compaction summary of a native session goes through a cognitive decision, recorded
-/// in shadow: the router names what it would use (`worker/wb`), but the summary is written
-/// where nexus writes it, by the session's endpoint and model (`primary/pm`).
+/// Stage `shadow`: the compaction summary of a native session goes through a cognitive
+/// decision, recorded and not applied: the router names what it would use (`worker/wb`), but
+/// the summary is written by the session's endpoint and model (`primary/pm`).
 #[tokio::test]
-async fn a_native_compaction_records_its_decision_in_shadow_and_runs_on_the_session_model() {
-    let w = world("full", "auto").await;
+async fn a_native_compaction_in_stage_shadow_records_its_decision_and_runs_on_the_session_model() {
+    let w = world("full", "shadow").await;
     let mut named = pilot();
     named.provider = Some("primary".into());
     named.model = Some("pm".into());
@@ -771,27 +806,17 @@ async fn a_native_compaction_records_its_decision_in_shadow_and_runs_on_the_sess
     assert!(
         after[0]
             .1
-            .contains("[Summary of the earlier conversation]\\nsummary written by primary"),
-        "compacted by the session's endpoint: {}",
+            .contains("[Summary of the earlier conversation]\\nsummary written by primary")
+            && !after[0].1.contains("summary written by primary/"),
+        "compacted by the session's endpoint, on its model: {}",
         after[0].1
     );
     assert!(
         turns(&w.worker).is_empty(),
         "nothing was sent to the router's pick"
     );
-    let mut compaction = None;
-    for _ in 0..200 {
-        compaction = decisions(&w)
-            .await
-            .into_iter()
-            .find(|d| d.signature.class == TaskClass::UtilityCompaction);
-        if compaction.is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    let decision = compaction.expect("the compaction decision is stored");
-    assert!(!decision.applied, "full + auto, yet not applied");
+    let decision = compaction_decision(&w).await;
+    assert!(!decision.applied, "stage shadow: not applied");
     assert!(
         decision
             .reason
@@ -802,6 +827,67 @@ async fn a_native_compaction_records_its_decision_in_shadow_and_runs_on_the_sess
     assert_eq!(decision.chosen, Some(Pick::new("worker", "wb")));
     assert_eq!(decision.used, Some(Pick::new("primary", "pm")));
     assert_eq!(decision.session_id.map(|id| id.to_string()), Some(p));
+}
+
+/// N-C1 (nexus contract v8): `full` + `auto` on a native session, whose harness can write
+/// the summary with another of its provider's models (`compaction_model`): the decision is
+/// taken among the PRIMARY's models (`pm` failed the class sixty times, `ps` is untried),
+/// applied, and the summary is written by `primary/ps`; the conversation stays on `pm`.
+#[tokio::test]
+async fn a_native_compaction_in_full_auto_summarises_with_the_model_of_the_decision() {
+    let w = world_with("full", "auto", &["pm", "ps"]).await;
+    let mut named = pilot();
+    named.provider = Some("primary".into());
+    named.model = Some("pm".into());
+    let p = open(&w, &named).await;
+    for text in LONG_TURNS {
+        turn(&w, &p, text).await;
+    }
+    let after: Vec<(String, String)> = turns(&w.primary)
+        .into_iter()
+        .filter(|(_, body)| body.contains("turn five"))
+        .collect();
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert_eq!(after[0].0, "pm", "the conversation keeps its model");
+    assert!(
+        after[0]
+            .1
+            .contains("[Summary of the earlier conversation]\\nsummary written by primary/ps"),
+        "summarised by the decision's model: {}",
+        after[0].1
+    );
+    assert!(
+        turns(&w.worker).is_empty(),
+        "the summary stays on the session's endpoint"
+    );
+    let decision = compaction_decision(&w).await;
+    assert!(decision.applied, "{}", decision.reason);
+    assert_eq!(decision.chosen, Some(Pick::new("primary", "ps")));
+    assert_eq!(decision.session_id.map(|id| id.to_string()), Some(p));
+    assert_eq!(
+        decisions(&w)
+            .await
+            .iter()
+            .filter(|d| d.signature.class == TaskClass::UtilityCompaction)
+            .count(),
+        1,
+        "one decision for the compaction"
+    );
+}
+
+/// The stored decision of the compaction class, once it is there.
+async fn compaction_decision(w: &World) -> CognitiveDecision {
+    for _ in 0..200 {
+        if let Some(found) = decisions(w)
+            .await
+            .into_iter()
+            .find(|d| d.signature.class == TaskClass::UtilityCompaction)
+        {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the compaction decision is stored");
 }
 
 /// Sends one message and returns every event of its turn, up to its result.
