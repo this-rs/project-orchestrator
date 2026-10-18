@@ -52,8 +52,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use nexus_claude::agent::{
-    CompactionInfo, HookVerdict, SessionHooks, ToolCallInfo, ToolResultInfo, TurnContext,
-    TurnDirective,
+    CompactionDirective, CompactionInfo, HookVerdict, SessionHooks, ToolCallInfo, ToolResultInfo,
+    TurnContext, TurnDirective,
 };
 use nexus_claude::{
     HookContext, HookInput, HookJSONOutput, HookMatcher, PostToolUseHookInput, PreCompactHookInput,
@@ -311,6 +311,13 @@ impl SessionHooks for GraphSessionHooks {
             None => TurnDirective::none(),
         }
     }
+
+    async fn compaction_directive(&self, _info: &CompactionInfo) -> CompactionDirective {
+        match &self.router {
+            Some(router) => directive_for_compaction(router).await,
+            None => CompactionDirective::none(),
+        }
+    }
 }
 
 /// How long the decider may take before the turn goes on without it.
@@ -367,6 +374,9 @@ pub(crate) struct TurnRouter {
     trust: bool,
     /// The session can switch model between turns (known once it is open).
     set_model_live: AtomicBool,
+    /// The session can write a compaction summary with another model of its provider
+    /// (`Capabilities::compaction_model`, nexus contract v8; known once it is open).
+    compaction_model: AtomicBool,
     /// The user changed the model by hand: no more automatic change.
     manual: AtomicBool,
     /// The conversation reached this session by a provider move: the next provider check
@@ -537,6 +547,7 @@ impl TurnRouter {
             project_slug: spec.project_slug,
             trust: spec.trust,
             set_model_live: AtomicBool::new(false),
+            compaction_model: AtomicBool::new(false),
             manual: AtomicBool::new(false),
             moved_in: AtomicBool::new(spec.moved_in),
             predecided: Mutex::new(predecided),
@@ -596,6 +607,11 @@ impl TurnRouter {
     /// Whether the session can switch model between turns.
     pub(crate) fn set_model_live(&self, live: bool) {
         self.set_model_live.store(live, Ordering::SeqCst);
+    }
+
+    /// Whether the session can write a compaction summary with another of its models.
+    pub(crate) fn set_compaction_model(&self, selectable: bool) {
+        self.compaction_model.store(selectable, Ordering::SeqCst);
     }
 
     /// The conversation's routing changed (`PUT .../routing`): from the next turn on, `mode`
@@ -1467,16 +1483,73 @@ async fn effective_images_bounded(router: &TurnRouter, snapshot: bool) -> Effect
     }
 }
 
+/// Whether the compaction decision of this session is APPLIED (N-C1, nexus contract v8):
+/// the session can write its summary with another of its provider's models
+/// (`Capabilities::compaction_model`: the native engine, not the Claude Code CLI, which
+/// summarises with the session's model — measured on 2.1.296), the conversation's mode lets
+/// PO route utilities (`full`, or `executors_only`, written `mixed` before R-S4), and the
+/// stage is `auto`. Otherwise the decision is recorded in shadow by the compaction notifier
+/// ([`record_compaction_decision`]) and the summary runs on the session's model.
+pub(crate) fn compaction_decision_applies(router: &TurnRouter) -> bool {
+    let choice = locked(&router.choice);
+    router.compaction_model.load(Ordering::SeqCst)
+        && matches!(
+            choice.routing.mode,
+            ProviderRoutingMode::Full | ProviderRoutingMode::ExecutorsOnly
+        )
+        && effective_stage(&choice) == LearningStage::Auto
+}
+
 /// Records the cognitive decision for the compaction summary about to be written, in
-/// shadow: what the router would choose to summarise this conversation. It is never
-/// applied, because neither engine lets the caller choose the summary model (the Claude Code
-/// CLI compacts on the session's model; nexus' native compaction calls the session's own
-/// endpoint with its active model, and `CompactionConfig` has no model field). The stored
-/// decision says so (`compaction_model_not_selectable`) and names the pair the summary runs
-/// on (`used`). Every mode records it, like the opening decision; a failing or slow decider
-/// (2 s) only loses the record.
+/// shadow: what the router would choose to summarise this conversation. It is not applied
+/// when the summary model cannot be chosen (the Claude Code CLI compacts on the session's
+/// model, measured on 2.1.296), nor outside mode `full` / `executors_only` + stage `auto`:
+/// the stored decision then says so (`compaction_model_not_selectable`) and names the pair
+/// the summary runs on (`used`). When it CAN be applied ([`compaction_decision_applies`]),
+/// the session's harness asks [`directive_for_compaction`] instead, and this returns `None`
+/// without recording anything: one decision per compaction. Every other mode records it,
+/// like the opening decision; a failing or slow decider (2 s) only loses the record.
 pub(crate) async fn record_compaction_decision(router: &TurnRouter) -> Option<CognitiveDecision> {
     use super::provider::cognitive::decider::COMPACTION_MODEL_NOT_SELECTABLE;
+
+    if compaction_decision_applies(router) {
+        return None;
+    }
+    let mut request = compaction_request(router).await;
+    request.settings.stage = LearningStage::Shadow;
+    request.not_selectable = Some(COMPACTION_MODEL_NOT_SELECTABLE);
+    let decision = router.ask(request).await?;
+    debug!(provider = %router.provider_id, reason = %decision.reason, "compaction decision recorded in shadow");
+    Some(decision)
+}
+
+/// The summary model of the compaction about to start, when the decision is applied
+/// ([`compaction_decision_applies`]): the decider chooses among the session's PROVIDER's
+/// models (the harness writes the summary on its own endpoint), and a pick other than the
+/// current model becomes the directive. The session's model does not change. Nothing is
+/// applied, and nothing is asked, when the decision cannot be: the notifier records it.
+pub(crate) async fn directive_for_compaction(router: &TurnRouter) -> CompactionDirective {
+    if !compaction_decision_applies(router) {
+        return CompactionDirective::none();
+    }
+    let current = locked(&router.state).current_model.clone();
+    let mut request = compaction_request(router).await;
+    request.restrict_provider = Some(router.provider_id.clone());
+    let Some(decision) = router.ask(request).await else {
+        return CompactionDirective::none();
+    };
+    match decision.chosen.filter(|_| decision.applied) {
+        Some(pick) if pick.provider_id == router.provider_id && pick.model != current => {
+            debug!(model = %pick.model, reason = %decision.reason, "compaction summary model decided");
+            CompactionDirective::model(pick.model)
+        }
+        _ => CompactionDirective::none(),
+    }
+}
+
+/// The decision request of a compaction summary: the conversation's settings, the pool the
+/// summary could run on, the current pair.
+async fn compaction_request(router: &TurnRouter) -> DecideRequest {
     use super::provider::cognitive::signature::TaskClass;
 
     let choice = locked(&router.choice).clone();
@@ -1511,16 +1584,11 @@ pub(crate) async fn record_compaction_decision(router: &TurnRouter) -> Option<Co
         need,
         router.project_slug.as_deref(),
     );
-    let mut settings = choice.routing.clone();
-    settings.stage = LearningStage::Shadow;
-    let mut request = DecideRequest::new(signature, settings, pool);
+    let mut request = DecideRequest::new(signature, choice.routing.clone(), pool);
     request.trust = router.trust;
     request.current = Some(current);
     request.session_id = router.session_id;
-    request.not_selectable = Some(COMPACTION_MODEL_NOT_SELECTABLE);
-    let decision = router.ask(request).await?;
-    debug!(provider = %router.provider_id, reason = %decision.reason, "compaction decision recorded in shadow");
-    Some(decision)
+    request
 }
 
 /// The decider shared by the sessions and the pool it chooses in.
@@ -1939,8 +2007,9 @@ mod provider_move_tests {
         }
     }
 
-    /// Picks `pick` with `score`, the current pair scored `current_score`; applied in
-    /// `full` + `auto` like the real decider (pilot role).
+    /// Picks `pick` with `score`, the current pair scored `current_score`; applied like the
+    /// real decider (`decider::is_applied`: `full` + `auto` for the pilot, `executors_only`
+    /// too for an executor such as the compaction summary).
     struct Fake {
         pick: Pick,
         score: f64,
@@ -1992,8 +2061,11 @@ mod provider_move_tests {
                 explored: self.explored,
                 reason: "fake".into(),
                 alternatives,
-                applied: request.settings.mode == ProviderRoutingMode::Full
-                    && request.settings.stage == LearningStage::Auto,
+                applied: crate::chat::provider::cognitive::decider::is_applied(
+                    request.settings.mode,
+                    request.settings.stage,
+                    request.signature.role,
+                ),
                 mode: request.settings.mode,
                 stage: request.settings.stage,
                 session_id: request.session_id,
@@ -2761,6 +2833,180 @@ mod provider_move_tests {
         ));
         router.reroute(ConversationRoutingMode::Full, None, None, false);
         router
+    }
+
+    // -----------------------------------------------------------------------------------
+    // N-C1: the compaction summary model (nexus contract v8, `compaction_directive`)
+    // -----------------------------------------------------------------------------------
+
+    /// `local/m` (the session's), `local/small`, `other/x`.
+    struct SummaryPool;
+
+    #[async_trait]
+    impl PoolSource for SummaryPool {
+        async fn pool(&self, provider_id: &str) -> Vec<ModelFacts> {
+            self.project_pool(None)
+                .await
+                .into_iter()
+                .filter(|f| f.provider_id == provider_id)
+                .collect()
+        }
+        async fn project_pool(&self, _project_slug: Option<&str>) -> Vec<ModelFacts> {
+            vec![
+                facts("local", "m", true),
+                facts("local", "small", true),
+                facts("other", "x", true),
+            ]
+        }
+    }
+
+    fn summary_router(
+        decider: Arc<Fake>,
+        mode: ProviderRoutingMode,
+        stage: LearningStage,
+        compaction_model: bool,
+    ) -> Arc<TurnRouter> {
+        let router = router(spec(decider, Arc::new(SummaryPool), mode, stage));
+        router.set_compaction_model(compaction_model);
+        Arc::new(router)
+    }
+
+    fn hooks_of(router: &Arc<TurnRouter>) -> GraphSessionHooks {
+        GraphSessionHooks::new(HashMap::new(), "s", "/work", None)
+            .with_turn_router(Some(Arc::clone(router)))
+    }
+
+    fn compaction_info() -> CompactionInfo {
+        CompactionInfo {
+            trigger: "auto".into(),
+            custom_instructions: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn full_auto_on_a_session_that_can_choose_names_the_summary_model_of_the_decision() {
+        use crate::chat::provider::cognitive::signature::TaskClass;
+        let decider = picking_model("small");
+        let router = summary_router(
+            decider.clone(),
+            ProviderRoutingMode::Full,
+            LearningStage::Auto,
+            true,
+        );
+        let directive = hooks_of(&router)
+            .compaction_directive(&compaction_info())
+            .await;
+        assert_eq!(directive.model.as_deref(), Some("small"));
+        assert_eq!(decider.calls(), 1);
+        let request = decider.last();
+        assert_eq!(request.signature.class, TaskClass::UtilityCompaction);
+        assert_eq!(request.settings.stage, LearningStage::Auto);
+        assert_eq!(
+            request.restrict_provider.as_deref(),
+            Some("local"),
+            "the harness writes the summary on its own endpoint"
+        );
+        assert_eq!(request.not_selectable, None);
+        assert_eq!(request.current, Some(Pick::new("local", "m")));
+        // The session's model does not move: the next turn is decided from `m`.
+        assert_eq!(locked(&router.state).current_model, "m");
+        // One decision per compaction: the notifier records nothing when the directive decides.
+        assert!(record_compaction_decision(&router).await.is_none());
+        assert_eq!(decider.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn executors_only_auto_applies_the_summary_model_too() {
+        // The summary is a utility, an executor: `executors_only` (`mixed`) routes it.
+        let decider = picking_model("small");
+        let router = summary_router(
+            decider,
+            ProviderRoutingMode::ExecutorsOnly,
+            LearningStage::Auto,
+            true,
+        );
+        let directive = directive_for_compaction(&router).await;
+        assert_eq!(directive.model.as_deref(), Some("small"));
+    }
+
+    #[tokio::test]
+    async fn stage_shadow_records_the_decision_and_leaves_the_summary_model_alone() {
+        use crate::chat::provider::cognitive::decider::COMPACTION_MODEL_NOT_SELECTABLE;
+        let decider = picking_model("small");
+        let router = summary_router(
+            decider.clone(),
+            ProviderRoutingMode::Full,
+            LearningStage::Shadow,
+            true,
+        );
+        let directive = directive_for_compaction(&router).await;
+        assert_eq!(directive, CompactionDirective::none());
+        assert_eq!(decider.calls(), 0, "no directive asks nothing");
+        let recorded = record_compaction_decision(&router).await.expect("recorded");
+        assert!(!recorded.applied);
+        assert_eq!(decider.calls(), 1);
+        let request = decider.last();
+        assert_eq!(request.settings.stage, LearningStage::Shadow);
+        assert_eq!(
+            request.not_selectable,
+            Some(COMPACTION_MODEL_NOT_SELECTABLE)
+        );
+    }
+
+    #[tokio::test]
+    async fn without_the_capability_no_directive_and_the_decision_stays_in_shadow() {
+        // The Claude Code CLI summarises with the session's model (measured on 2.1.296): its
+        // session does not declare `compaction_model`.
+        let decider = picking_model("small");
+        let router = summary_router(
+            decider.clone(),
+            ProviderRoutingMode::Full,
+            LearningStage::Auto,
+            false,
+        );
+        assert_eq!(
+            hooks_of(&router)
+                .compaction_directive(&compaction_info())
+                .await,
+            CompactionDirective::none()
+        );
+        assert_eq!(decider.calls(), 0);
+        let recorded = record_compaction_decision(&router).await.expect("recorded");
+        assert!(!recorded.applied);
+        assert_eq!(decider.last().settings.stage, LearningStage::Shadow);
+    }
+
+    #[tokio::test]
+    async fn primary_mode_never_names_a_summary_model() {
+        let decider = picking_model("small");
+        let router = summary_router(
+            decider.clone(),
+            ProviderRoutingMode::Primary,
+            LearningStage::Auto,
+            true,
+        );
+        assert_eq!(
+            directive_for_compaction(&router).await,
+            CompactionDirective::none()
+        );
+        assert_eq!(decider.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_pick_of_the_current_model_or_of_another_provider_is_no_directive() {
+        for decider in [picking_model("m"), Fake::picking("other", 0.9, 0.1)] {
+            let router = summary_router(
+                decider.clone(),
+                ProviderRoutingMode::Full,
+                LearningStage::Auto,
+                true,
+            );
+            assert_eq!(
+                directive_for_compaction(&router).await,
+                CompactionDirective::none()
+            );
+            assert_eq!(decider.calls(), 1);
+        }
     }
 }
 
