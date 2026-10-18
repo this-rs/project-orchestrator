@@ -111,17 +111,22 @@ impl Neo4jClient {
             "MATCH (t:Trigger) RETURN t ORDER BY t.created_at DESC"
         };
 
-        let mut q = query(cypher);
-        if let Some(tt) = trigger_type {
-            q = q.param("trigger_type", tt.to_string());
-        }
-        let mut result = self.graph.execute(q).await?;
-        let mut triggers = Vec::new();
-        while let Some(row) = result.next().await? {
-            let node: neo4rs::Node = row.get("t")?;
-            triggers.push(self.node_to_trigger(&node)?);
-        }
-        Ok(triggers)
+        // Read-only scan over every Trigger: replayed on a transient error
+        // (e.g. Transaction.Outdated under a concurrent delete).
+        self.read_retrying(cypher, || async move {
+            let mut q = query(cypher);
+            if let Some(tt) = trigger_type {
+                q = q.param("trigger_type", tt.to_string());
+            }
+            let mut result = self.graph.execute(q).await?;
+            let mut triggers = Vec::new();
+            while let Some(row) = result.next().await? {
+                let node: neo4rs::Node = row.get("t")?;
+                triggers.push(self.node_to_trigger(&node)?);
+            }
+            Ok(triggers)
+        })
+        .await
     }
 
     /// Disable a trigger; `reason` when the system does it (`""` stored for

@@ -626,24 +626,31 @@ impl Neo4jClient {
             where_clause, offset, limit
         );
 
-        let mut q = query(&cypher);
-        if let Some(wid) = workspace_id {
-            q = q.param("workspace_id", wid.to_string());
-        }
-        if let Some(st) = status_params {
-            q = q.param("statuses", st);
-        }
-        let mut result = self.graph.execute(q).await?;
-        let mut items = Vec::new();
-        while let Some(row) = result.next().await? {
-            let node: neo4rs::Node = row.get("wm")?;
-            let wid: String = row.get("workspace_id")?;
-            let wname: String = row.get("workspace_name")?;
-            let wslug: String = row.get("workspace_slug")?;
-            items.push((self.node_to_workspace_milestone(&node)?, wid, wname, wslug));
-        }
-
-        Ok(items)
+        // Read-only scan of WorkspaceMilestone nodes: replayed on a transient error.
+        let cypher_str: &str = &cypher;
+        self.read_retrying(cypher_str, || {
+            let status_params = status_params.clone();
+            async move {
+                let mut q = query(cypher_str);
+                if let Some(wid) = workspace_id {
+                    q = q.param("workspace_id", wid.to_string());
+                }
+                if let Some(st) = status_params {
+                    q = q.param("statuses", st);
+                }
+                let mut result = self.graph.execute(q).await?;
+                let mut items = Vec::new();
+                while let Some(row) = result.next().await? {
+                    let node: neo4rs::Node = row.get("wm")?;
+                    let wid: String = row.get("workspace_id")?;
+                    let wname: String = row.get("workspace_name")?;
+                    let wslug: String = row.get("workspace_slug")?;
+                    items.push((self.node_to_workspace_milestone(&node)?, wid, wname, wslug));
+                }
+                Ok(items)
+            }
+        })
+        .await
     }
 
     /// Count all workspace milestones across workspaces with optional filters

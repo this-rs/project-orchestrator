@@ -838,6 +838,186 @@ impl Neo4jClient {
         }
         Ok(rows)
     }
+
+    /// Run a read built by `op`, replaying it on a transient server error.
+    /// `cypher` decides whether replay is allowed: a query that writes runs once.
+    pub(crate) async fn read_retrying<T, F, Fut>(&self, cypher: &str, op: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        retry_transient(is_read_only_cypher(cypher), is_transient_neo4j_error, op).await
+    }
+}
+
+/// Replays a read after `Neo.TransientError.*`: three attempts in total.
+const READ_RETRY_DELAYS: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(50),
+    std::time::Duration::from_millis(150),
+];
+
+/// Clauses that write. A query containing one of them is never replayed.
+const WRITE_KEYWORDS: &[&str] = &[
+    "CREATE", "MERGE", "SET", "DELETE", "DETACH", "REMOVE", "FOREACH", "CALL", "DROP",
+];
+
+/// Heuristic guard: `false` when the Cypher text contains a write keyword.
+/// A false negative only means "no replay", which is the safe default.
+pub(crate) fn is_read_only_cypher(cypher: &str) -> bool {
+    !cypher
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| WRITE_KEYWORDS.iter().any(|k| tok.eq_ignore_ascii_case(k)))
+}
+
+/// Whether a server error code is a `Neo.TransientError.*`, the only class replayed.
+pub(crate) fn is_transient_neo4j_code(code: &str) -> bool {
+    code.starts_with("Neo.TransientError.")
+}
+
+/// Whether `err` carries a neo4rs server error with a transient code.
+/// Client errors (bad query, auth, connection) return `false`.
+pub(crate) fn is_transient_neo4j_error(err: &anyhow::Error) -> bool {
+    match err.downcast_ref::<neo4rs::Error>() {
+        Some(neo4rs::Error::Neo4j(e)) => is_transient_neo4j_code(e.code()),
+        _ => false,
+    }
+}
+
+/// Why replay exists: a read that scans a label (e.g. `:Trigger`) can fail with
+/// `Neo.TransientError.Transaction.Outdated` when a concurrent delete touches the
+/// same data; the server says the attempt is safe to repeat. Any other error would
+/// fail again, so it is returned at once. Writes (`read_only == false`) run once.
+pub(crate) async fn retry_transient<T, E, F, Fut>(
+    read_only: bool,
+    is_transient: impl Fn(&E) -> bool,
+    mut op: F,
+) -> Result<T, E>
+where
+    E: std::fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut delays = READ_RETRY_DELAYS.iter();
+    loop {
+        let err = match op().await {
+            Ok(value) => return Ok(value),
+            Err(err) => err,
+        };
+        match delays.next() {
+            Some(delay) if read_only && is_transient(&err) => {
+                tracing::warn!(
+                    delay_ms = delay.as_millis() as u64,
+                    error = %err,
+                    "transient Neo4j error on a read, replaying"
+                );
+                tokio::time::sleep(*delay).await;
+            }
+            _ => return Err(err),
+        }
+    }
+}
+
+#[cfg(test)]
+mod read_retry_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[derive(Debug, PartialEq)]
+    struct FakeErr {
+        transient: bool,
+    }
+
+    impl std::fmt::Display for FakeErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "fake error (transient: {})", self.transient)
+        }
+    }
+
+    fn transient(e: &FakeErr) -> bool {
+        e.transient
+    }
+
+    #[tokio::test]
+    async fn transient_read_error_is_replayed_then_succeeds() {
+        let calls = Cell::new(0);
+        let out = retry_transient(true, transient, || async {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Err(FakeErr { transient: true })
+            } else {
+                Ok(7)
+            }
+        })
+        .await;
+        assert_eq!(out, Ok(7));
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn transient_read_error_gives_up_after_three_attempts() {
+        let calls = Cell::new(0);
+        let out: Result<(), FakeErr> = retry_transient(true, transient, || async {
+            calls.set(calls.get() + 1);
+            Err(FakeErr { transient: true })
+        })
+        .await;
+        assert_eq!(out, Err(FakeErr { transient: true }));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn client_error_is_not_replayed() {
+        let calls = Cell::new(0);
+        let out: Result<(), FakeErr> = retry_transient(true, transient, || async {
+            calls.set(calls.get() + 1);
+            Err(FakeErr { transient: false })
+        })
+        .await;
+        assert_eq!(out, Err(FakeErr { transient: false }));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_write_error_is_never_replayed() {
+        let calls = Cell::new(0);
+        let out: Result<(), FakeErr> = retry_transient(false, transient, || async {
+            calls.set(calls.get() + 1);
+            Err(FakeErr { transient: true })
+        })
+        .await;
+        assert_eq!(out, Err(FakeErr { transient: true }));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn read_only_guard_rejects_write_keywords() {
+        assert!(is_read_only_cypher(
+            "MATCH (t:Trigger) WHERE t.trigger_type = $trigger_type RETURN t ORDER BY t.created_at DESC"
+        ));
+        assert!(is_read_only_cypher(
+            "MATCH (t:Trigger {created_at: 1}) RETURN t"
+        ));
+        assert!(!is_read_only_cypher(
+            "MATCH (t:Trigger) SET t.enabled = false RETURN t"
+        ));
+        assert!(!is_read_only_cypher("MATCH (n) DETACH DELETE n"));
+        assert!(!is_read_only_cypher("MERGE (x:Trigger {id: $id}) RETURN x"));
+        assert!(!is_read_only_cypher("CREATE (t:Trigger) RETURN t"));
+        assert!(!is_read_only_cypher("CALL db.clearQueryCaches()"));
+    }
+
+    #[test]
+    fn only_transient_codes_are_replayed() {
+        assert!(is_transient_neo4j_code(
+            "Neo.TransientError.Transaction.Outdated"
+        ));
+        assert!(!is_transient_neo4j_code(
+            "Neo.ClientError.Statement.SyntaxError"
+        ));
+        assert!(!is_transient_neo4j_code(
+            "Neo.DatabaseError.General.UnknownError"
+        ));
+    }
 }
 
 #[cfg(test)]
