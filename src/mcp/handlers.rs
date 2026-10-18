@@ -406,6 +406,11 @@ pub(crate) const MEGA_TOOL_ACTIONS: &[(&str, &str, &str)] = &[
     ("chat", "associate_with", "associate_session"),
     ("chat", "team_message", "team_message"),
     ("chat", "team_status", "team_status"),
+    ("chat", "list_anchors", "list_chat_anchors"),
+    ("chat", "add_anchor", "add_chat_anchor"),
+    ("chat", "update_anchor", "update_chat_anchor"),
+    ("chat", "remove_anchor", "remove_chat_anchor"),
+    ("chat", "list_anchored_sessions", "list_anchored_sessions"),
 
     // Feature Graph
     ("feature_graph", "create", "create_feature_graph"),
@@ -4276,6 +4281,109 @@ impl ToolHandler {
                 let body = json!({ "entities": entities });
                 let result = http
                     .post(&format!("/api/chat/sessions/{}/discussed", id), &body)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            // Context anchors. Who places the anchor is the server's business (it
+            // reads the token): this server never sends a `by`.
+            "list_chat_anchors" => {
+                let id = extract_id(args, "session_id")?;
+                let result = http
+                    .get(&format!("/api/chat/sessions/{}/anchors", id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "add_chat_anchor" => {
+                let id = extract_id(args, "session_id")?;
+                let mut body = serde_json::Map::new();
+                body.insert(
+                    "target_type".to_string(),
+                    json!(extract_string(args, "target_type")?),
+                );
+                body.insert(
+                    "target_id".to_string(),
+                    json!(extract_string(args, "target_id")?),
+                );
+                if let Some(v) = args.get("roles") {
+                    body.insert("roles".to_string(), v.clone());
+                }
+                for key in ["snapshot_name", "snapshot_path", "snapshot_type", "rev"] {
+                    if let Some(v) = args.get(key).and_then(|v| v.as_str()) {
+                        body.insert(key.to_string(), json!(v));
+                    }
+                }
+                let result = http
+                    .send_if_match(
+                        reqwest::Method::POST,
+                        &format!("/api/chat/sessions/{}/anchors", id),
+                        Some(&Value::Object(body)),
+                        args.get("if_match").and_then(|v| v.as_u64()),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "update_chat_anchor" => {
+                let id = extract_id(args, "session_id")?;
+                let anchor_id = extract_id(args, "anchor_id")?;
+                let mut body = serde_json::Map::new();
+                body.insert(
+                    "action".to_string(),
+                    json!(extract_string(args, "operation")?),
+                );
+                body.insert("role".to_string(), json!(extract_string(args, "role")?));
+                if let Some(v) = args.get("version").and_then(|v| v.as_u64()) {
+                    body.insert("version".to_string(), json!(v));
+                }
+                let result = http
+                    .send_if_match(
+                        reqwest::Method::PATCH,
+                        &format!("/api/chat/sessions/{}/anchors/{}", id, anchor_id),
+                        Some(&Value::Object(body)),
+                        args.get("if_match").and_then(|v| v.as_u64()),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "remove_chat_anchor" => {
+                let id = extract_id(args, "session_id")?;
+                let anchor_id = extract_id(args, "anchor_id")?;
+                let mut path = format!("/api/chat/sessions/{}/anchors/{}", id, anchor_id);
+                if let Some(v) = args.get("version").and_then(|v| v.as_u64()) {
+                    path.push_str(&format!("?version={v}"));
+                }
+                let result = http
+                    .send_if_match(
+                        reqwest::Method::DELETE,
+                        &path,
+                        None,
+                        args.get("if_match").and_then(|v| v.as_u64()),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "list_anchored_sessions" => {
+                let mut query = vec![
+                    (
+                        "target_type".to_string(),
+                        extract_string(args, "target_type")?,
+                    ),
+                    ("target_id".to_string(), extract_string(args, "target_id")?),
+                ];
+                for key in ["state", "cursor"] {
+                    if let Some(v) = args.get(key).and_then(|v| v.as_str()) {
+                        query.push((key.to_string(), v.to_string()));
+                    }
+                }
+                if let Some(v) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                let result = http
+                    .get_with_query("/api/chat/anchored-sessions", &query)
                     .await?;
                 Ok(Some(result))
             }
@@ -10700,6 +10808,11 @@ mod tests {
             ("associate_with", "associate_session"),
             ("team_message", "team_message"),
             ("team_status", "team_status"),
+            ("list_anchors", "list_chat_anchors"),
+            ("add_anchor", "add_chat_anchor"),
+            ("update_anchor", "update_chat_anchor"),
+            ("remove_anchor", "remove_chat_anchor"),
+            ("list_anchored_sessions", "list_anchored_sessions"),
         ] {
             let args = json!({"action": action});
             let (name, _) = handler.resolve_mega_tool("chat", &args).unwrap();

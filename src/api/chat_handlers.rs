@@ -6128,3 +6128,1274 @@ mod file_scope_lift_tests {
         assert!(!request.file_scope_lifted);
     }
 }
+
+// ============================================================================
+// Context anchors of a conversation (T4 of plan 09c88ffe)
+// ============================================================================
+
+/// The anchors API of a conversation (T4 of plan 09c88ffe): list, add, change
+/// the role of and remove the context anchors of a chat session, and the
+/// reverse read — the conversations anchored on an entity — paginated.
+///
+/// Rules this layer adds to those of [`crate::chat::anchor`]:
+///
+/// - **Who placed the anchor comes from the authenticated principal, never from
+///   the body.** A person's own session token places as `user`; an agent
+///   session's token, an MCP token, a vault token, the server's account and the
+///   anonymous user place as `agent` ([`anchor_principal`]). The body has no
+///   `by` / `placed_by` / `inferred` / `confidence` field: such keys are
+///   ignored. That matters because only a `user` anchor on a project or a
+///   workspace opens that project to the conversation (decision 75e160f4).
+/// - **Idempotent add.** The same target twice is one anchor: the second call
+///   answers `200` with the existing anchor and writes nothing (no journal entry,
+///   no version bump, no event).
+/// - **Optimistic concurrency on the whole set.** Every answer carries the
+///   version of the anchor set in `ETag` (`"<n>"`); a mutation sent with
+///   `If-Match: "<n>"` is refused with `409` and the current set when the set has
+///   changed since. The check and the write are one transaction in the store.
+/// - **Live updates.** Every committed change emits a CRUD event
+///   (`chat_session` / `updated`, payload `anchors`) on `/ws/events`; the channel
+///   is the shared CRUD stream, no entity id in any channel name.
+/// - An agent session's token writes only on its own session or a session it
+///   spawned (the `require_auth` middleware, rule 4d).
+pub mod anchors {
+    use super::{session_node_to_response, stamp_activity};
+    use crate::api::handlers::{AppError, OrchestratorState};
+    use crate::auth::jwt::Claims;
+    use crate::chat::anchor::{
+        validate_target_id, Anchor, AnchorActor, AnchorError, AnchorOp, AnchorRole, AnchorSet,
+        AnchorSetChange, AnchorState, AnchorTargetType, NewAnchor,
+    };
+    use crate::chat::types::ChatSession;
+    use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
+    use axum::extract::{Path, Query, State};
+    use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    use axum::Json;
+    use serde::{Deserialize, Serialize};
+    use std::collections::BTreeSet;
+    use uuid::Uuid;
+
+    /// Largest page of the reverse read.
+    pub const MAX_PAGE: usize = 100;
+    /// Page of the reverse read when the caller names none.
+    pub const DEFAULT_PAGE: usize = 20;
+
+    /// Who is placing or changing an anchor, as recorded on it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct AnchorPrincipal {
+        pub by: AnchorActor,
+        /// Free-form identity journaled with the change (never a secret).
+        pub actor: String,
+    }
+
+    /// The actor of an anchor change, derived from the authenticated principal
+    /// ONLY. `user` for a person signed in with their own session token (with
+    /// authentication off: any caller that does not present itself as a chat
+    /// session through `X-Session-Id`, as [`crate::chat::envelope::identify_caller`]
+    /// does); `agent` for everything else.
+    pub fn anchor_principal(
+        claims: Option<&Claims>,
+        session_header: Option<&str>,
+        auth_enabled: bool,
+    ) -> AnchorPrincipal {
+        let agent = |actor: String| AnchorPrincipal {
+            by: AnchorActor::Agent,
+            actor,
+        };
+        if let Some(c) = claims.filter(|c| c.is_agent_session()) {
+            let sid = crate::auth::jwt::agent_session_binding(c)
+                .map(|b| b.session_id)
+                .unwrap_or_default();
+            return agent(format!("agent_session:{sid}"));
+        }
+        if !auth_enabled {
+            if let Some(sid) = session_header.map(str::trim).filter(|s| !s.is_empty()) {
+                return agent(format!("agent_session:{sid}"));
+            }
+            return AnchorPrincipal {
+                by: AnchorActor::User,
+                actor: format!("user:{}", claims.map(|c| c.sub.as_str()).unwrap_or("local")),
+            };
+        }
+        match claims {
+            Some(c) if c.may_keep_lasting_approvals() => AnchorPrincipal {
+                by: AnchorActor::User,
+                actor: format!("user:{}", c.sub),
+            },
+            Some(c) if c.is_mcp_token() => agent(format!("mcp_token:{}", c.sub)),
+            Some(c) => agent(format!("token:{}", c.sub)),
+            None => agent("unauthenticated".to_string()),
+        }
+    }
+
+    fn principal_of(
+        state: &OrchestratorState,
+        claims: &Option<axum::Extension<Claims>>,
+        headers: &HeaderMap,
+    ) -> AnchorPrincipal {
+        anchor_principal(
+            claims.as_ref().map(|c| &c.0),
+            crate::chat::envelope::session_header(headers),
+            state.auth_config.is_some(),
+        )
+    }
+
+    // ============================================================================
+    // Wire types
+    // ============================================================================
+
+    /// The anchors of a session and the version of the set (also in `ETag`).
+    #[derive(Debug, Serialize)]
+    pub struct AnchorSetResponse {
+        pub session_id: Uuid,
+        pub version: u64,
+        pub anchors: Vec<Anchor>,
+    }
+
+    /// Result of a mutation.
+    #[derive(Debug, Serialize)]
+    pub struct AnchorChangeResponse {
+        /// The anchor after the change (the removed one for a removal).
+        pub anchor: Anchor,
+        /// The anchor did not exist before (add only).
+        pub created: bool,
+        /// Something was written (false: idempotent no-op).
+        pub changed: bool,
+        /// The version of the set after the change.
+        pub version: u64,
+    }
+
+    /// `POST /api/chat/sessions/{id}/anchors`. Who places the anchor is NOT a field:
+    /// it comes from the token.
+    #[derive(Debug, Deserialize)]
+    pub struct AddAnchorBody {
+        pub target_type: String,
+        pub target_id: String,
+        /// Default: `["mention"]`.
+        #[serde(default)]
+        pub roles: Vec<String>,
+        #[serde(default)]
+        pub snapshot_name: Option<String>,
+        #[serde(default)]
+        pub snapshot_path: Option<String>,
+        #[serde(default)]
+        pub snapshot_type: Option<String>,
+        #[serde(default)]
+        pub rev: Option<String>,
+    }
+
+    /// `PATCH /api/chat/sessions/{id}/anchors/{anchor_id}`.
+    #[derive(Debug, Deserialize)]
+    pub struct UpdateAnchorBody {
+        /// `promote` (give the role) or `demote` (take it away).
+        pub action: String,
+        pub role: String,
+        /// Version of the anchor the caller read; default: the current one.
+        #[serde(default)]
+        pub version: Option<u64>,
+    }
+
+    /// Query of `DELETE /api/chat/sessions/{id}/anchors/{anchor_id}`.
+    #[derive(Debug, Default, Deserialize)]
+    pub struct RemoveAnchorQuery {
+        #[serde(default)]
+        pub version: Option<u64>,
+    }
+
+    /// Query of `GET /api/chat/anchored-sessions`.
+    #[derive(Debug, Deserialize)]
+    pub struct AnchoredSessionsQuery {
+        pub target_type: String,
+        pub target_id: String,
+        /// Only the anchors in this state (`live`, `moved`, ...). Default: all.
+        #[serde(default)]
+        pub state: Option<String>,
+        /// Page size, 1..=100 (default 20).
+        #[serde(default)]
+        pub limit: Option<usize>,
+        /// `next_cursor` of the previous page.
+        #[serde(default)]
+        pub cursor: Option<String>,
+    }
+
+    /// One conversation anchored on the entity, with its anchor.
+    #[derive(Debug, Serialize)]
+    pub struct AnchoredSession {
+        pub session: ChatSession,
+        pub anchor: Anchor,
+    }
+
+    /// A page of the reverse read.
+    #[derive(Debug, Serialize)]
+    pub struct AnchoredSessionsPage {
+        pub items: Vec<AnchoredSession>,
+        /// Pass back as `cursor`; absent on the last page.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub next_cursor: Option<String>,
+    }
+
+    // ============================================================================
+    // Helpers
+    // ============================================================================
+
+    fn etag(version: u64) -> HeaderValue {
+        HeaderValue::from_str(&format!("\"{version}\"")).expect("a number is a valid header value")
+    }
+
+    /// `If-Match`: `"<n>"`, `W/"<n>"` or `<n>`; `*` (or absent) = no check.
+    pub fn parse_if_match(headers: &HeaderMap) -> Result<Option<u64>, AppError> {
+        let Some(raw) = headers.get(header::IF_MATCH) else {
+            return Ok(None);
+        };
+        let raw = raw
+            .to_str()
+            .map_err(|_| AppError::BadRequest("If-Match: not a valid header value".into()))?
+            .trim();
+        if raw == "*" {
+            return Ok(None);
+        }
+        let bare = raw.strip_prefix("W/").unwrap_or(raw).trim_matches('"');
+        bare.parse::<u64>().map(Some).map_err(|_| {
+            AppError::BadRequest(format!(
+                "If-Match: expected the ETag of the anchor set (\"<n>\"), got {raw}"
+            ))
+        })
+    }
+
+    fn parse_target_type(raw: &str) -> Result<AnchorTargetType, AppError> {
+        AnchorTargetType::parse(raw).ok_or_else(|| {
+            let known: Vec<&str> = AnchorTargetType::ALL.iter().map(|t| t.as_str()).collect();
+            AppError::BadRequest(format!(
+                "unknown target_type `{raw}` (expected one of {})",
+                known.join(", ")
+            ))
+        })
+    }
+
+    fn parse_role(raw: &str) -> Result<AnchorRole, AppError> {
+        AnchorRole::parse(raw).ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "unknown role `{raw}` (expected focus, mention or origin)"
+            ))
+        })
+    }
+
+    fn json_with_etag(status: StatusCode, version: u64, body: impl Serialize) -> Response {
+        let mut resp = (status, Json(body)).into_response();
+        resp.headers_mut().insert(header::ETAG, etag(version));
+        resp
+    }
+
+    async fn load_set(state: &OrchestratorState, session_id: Uuid) -> Result<AnchorSet, AppError> {
+        state
+            .orchestrator
+            .neo4j()
+            .get_anchor_set(session_id)
+            .await
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::NotFound(format!("Session {session_id} not found")))
+    }
+
+    /// The answer to a refused operation. A conflict (`409`) carries the current
+    /// set and its `ETag`, so the client can rebase without a second read.
+    async fn refusal(state: &OrchestratorState, session_id: Uuid, err: anyhow::Error) -> Response {
+        let Some(e) = err.downcast_ref::<AnchorError>() else {
+            return AppError::Internal(err).into_response();
+        };
+        let status = match e {
+            AnchorError::InvalidTargetId { .. }
+            | AnchorError::EmptyRoles
+            | AnchorError::InvalidConfidence
+            | AnchorError::FieldTooLong { .. }
+            | AnchorError::LastRole => StatusCode::BAD_REQUEST,
+            AnchorError::OriginImmutable
+            | AnchorError::AgentCannotFocus
+            | AnchorError::AgentRoleForbidden(_) => StatusCode::FORBIDDEN,
+            AnchorError::NotFound(_) | AnchorError::SessionNotFound(_) => StatusCode::NOT_FOUND,
+            AnchorError::FocusCapReached { .. }
+            | AnchorError::SessionCapReached { .. }
+            | AnchorError::OriginAlreadyExists
+            | AnchorError::AlreadyAnchored { .. }
+            | AnchorError::VersionConflict { .. }
+            | AnchorError::SetVersionConflict { .. } => StatusCode::CONFLICT,
+        };
+        let mut body = serde_json::json!({ "error": e.to_string(), "code": e.code() });
+        if let AnchorError::AlreadyAnchored { anchor_id } = e {
+            body["anchor_id"] = serde_json::json!(anchor_id);
+        }
+        if status != StatusCode::CONFLICT {
+            return (status, Json(body)).into_response();
+        }
+        match load_set(state, session_id).await {
+            Ok(set) => {
+                body["current"] =
+                    serde_json::json!({ "version": set.version, "anchors": set.anchors });
+                json_with_etag(status, set.version, body)
+            }
+            Err(_) => (status, Json(body)).into_response(),
+        }
+    }
+
+    /// The CRUD event of a committed change, on the shared `/ws/events` stream.
+    fn emit_change(state: &OrchestratorState, session_id: Uuid, applied: &AnchorSetChange) {
+        let Some(ev) = &applied.change.event else {
+            return;
+        };
+        let a = &applied.change.anchor;
+        state.event_bus.emit(
+            CrudEvent::new(
+                EntityType::ChatSession,
+                CrudAction::Updated,
+                session_id.to_string(),
+            )
+            .with_payload(serde_json::json!({
+                "anchors": {
+                    "change": ev.kind.as_str(),
+                    "anchor_id": a.id,
+                    "target_type": a.target_type,
+                    "target_id": a.target_id,
+                    "roles": a.roles,
+                    "state": a.state,
+                    "by": ev.by,
+                    "version": applied.version,
+                }
+            })),
+        );
+    }
+
+    async fn apply(
+        state: &OrchestratorState,
+        session_id: Uuid,
+        op: AnchorOp,
+        if_match: Option<u64>,
+    ) -> Result<AnchorSetChange, Response> {
+        match state
+            .orchestrator
+            .neo4j()
+            .apply_anchor_op_if(session_id, op, if_match)
+            .await
+        {
+            Ok(applied) => {
+                emit_change(state, session_id, &applied);
+                Ok(applied)
+            }
+            Err(e) => Err(refusal(state, session_id, e).await),
+        }
+    }
+
+    fn change_response(status: StatusCode, applied: AnchorSetChange) -> Response {
+        let version = applied.version;
+        json_with_etag(
+            status,
+            version,
+            AnchorChangeResponse {
+                changed: applied.change.event.is_some(),
+                created: applied.change.created,
+                anchor: applied.change.anchor,
+                version,
+            },
+        )
+    }
+
+    /// The current version of `anchor_id` in `set` (the caller's, when given).
+    fn anchor_version(
+        set: &AnchorSet,
+        anchor_id: Uuid,
+        given: Option<u64>,
+    ) -> Result<u64, AppError> {
+        if let Some(v) = given {
+            return Ok(v);
+        }
+        set.anchors
+            .iter()
+            .find(|a| a.id == anchor_id)
+            .map(|a| a.version)
+            .ok_or_else(|| {
+                AppError::NotFound(format!("Anchor {anchor_id} not found in this session"))
+            })
+    }
+
+    // ============================================================================
+    // Handlers
+    // ============================================================================
+
+    /// GET /api/chat/sessions/{id}/anchors — the anchors and the version of the set.
+    pub async fn list_anchors(
+        State(state): State<OrchestratorState>,
+        Path(session_id): Path<Uuid>,
+    ) -> Result<Response, AppError> {
+        let set = load_set(&state, session_id).await?;
+        Ok(json_with_etag(
+            StatusCode::OK,
+            set.version,
+            AnchorSetResponse {
+                session_id,
+                version: set.version,
+                anchors: set.anchors,
+            },
+        ))
+    }
+
+    /// POST /api/chat/sessions/{id}/anchors — anchor the session on an entity.
+    /// `201` when created, `200` when the same target already held those roles.
+    pub async fn add_anchor(
+        State(state): State<OrchestratorState>,
+        claims: Option<axum::Extension<Claims>>,
+        headers: HeaderMap,
+        Path(session_id): Path<Uuid>,
+        Json(body): Json<AddAnchorBody>,
+    ) -> Result<Response, AppError> {
+        let if_match = parse_if_match(&headers)?;
+        let principal = principal_of(&state, &claims, &headers);
+        let target_type = parse_target_type(&body.target_type)?;
+        let roles: BTreeSet<AnchorRole> = if body.roles.is_empty() {
+            [AnchorRole::Mention].into()
+        } else {
+            body.roles
+                .iter()
+                .map(|r| parse_role(r))
+                .collect::<Result<_, _>>()?
+        };
+        let mut new = NewAnchor::new(
+            target_type,
+            body.target_id,
+            roles,
+            principal.by,
+            principal.actor,
+        );
+        new.snapshot_name = body.snapshot_name;
+        new.snapshot_path = body.snapshot_path;
+        new.snapshot_type = body.snapshot_type;
+        new.rev = body.rev;
+        match apply(&state, session_id, AnchorOp::Add(new), if_match).await {
+            Ok(applied) => {
+                let status = if applied.change.created {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::OK
+                };
+                Ok(change_response(status, applied))
+            }
+            Err(resp) => Ok(resp),
+        }
+    }
+
+    /// PATCH /api/chat/sessions/{id}/anchors/{anchor_id} — give (`promote`) or take
+    /// away (`demote`) one role.
+    pub async fn update_anchor(
+        State(state): State<OrchestratorState>,
+        claims: Option<axum::Extension<Claims>>,
+        headers: HeaderMap,
+        Path((session_id, anchor_id)): Path<(Uuid, Uuid)>,
+        Json(body): Json<UpdateAnchorBody>,
+    ) -> Result<Response, AppError> {
+        let if_match = parse_if_match(&headers)?;
+        let principal = principal_of(&state, &claims, &headers);
+        let role = parse_role(&body.role)?;
+        let set = load_set(&state, session_id).await?;
+        let expected_version = anchor_version(&set, anchor_id, body.version)?;
+        let op = match body.action.as_str() {
+            "promote" => AnchorOp::Promote {
+                anchor_id,
+                role,
+                expected_version,
+                by: principal.by,
+                actor: principal.actor,
+            },
+            "demote" => AnchorOp::Demote {
+                anchor_id,
+                role,
+                expected_version,
+                by: principal.by,
+                actor: principal.actor,
+            },
+            other => {
+                return Err(AppError::BadRequest(format!(
+                    "unknown action `{other}` (expected promote or demote)"
+                )))
+            }
+        };
+        match apply(&state, session_id, op, if_match).await {
+            Ok(applied) => Ok(change_response(StatusCode::OK, applied)),
+            Err(resp) => Ok(resp),
+        }
+    }
+
+    /// DELETE /api/chat/sessions/{id}/anchors/{anchor_id} — remove an anchor (never
+    /// the origin one). The target is left alone.
+    pub async fn remove_anchor(
+        State(state): State<OrchestratorState>,
+        claims: Option<axum::Extension<Claims>>,
+        headers: HeaderMap,
+        Path((session_id, anchor_id)): Path<(Uuid, Uuid)>,
+        Query(query): Query<RemoveAnchorQuery>,
+    ) -> Result<Response, AppError> {
+        let if_match = parse_if_match(&headers)?;
+        let principal = principal_of(&state, &claims, &headers);
+        let set = load_set(&state, session_id).await?;
+        let expected_version = anchor_version(&set, anchor_id, query.version)?;
+        let op = AnchorOp::Remove {
+            anchor_id,
+            expected_version,
+            by: principal.by,
+            actor: principal.actor,
+        };
+        match apply(&state, session_id, op, if_match).await {
+            Ok(applied) => Ok(change_response(StatusCode::OK, applied)),
+            Err(resp) => Ok(resp),
+        }
+    }
+
+    /// GET /api/chat/anchored-sessions?target_type=&target_id= — the conversations
+    /// anchored on one entity, keyset-paginated (page ≤ 100, `next_cursor`).
+    pub async fn list_anchored_sessions(
+        State(state): State<OrchestratorState>,
+        Query(q): Query<AnchoredSessionsQuery>,
+    ) -> Result<Json<AnchoredSessionsPage>, AppError> {
+        let target_type = parse_target_type(&q.target_type)?;
+        let target_id = validate_target_id(target_type, &q.target_id)
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        let anchor_state = q
+            .state
+            .as_deref()
+            .map(|s| {
+                AnchorState::parse(s)
+                    .ok_or_else(|| AppError::BadRequest(format!("unknown anchor state `{s}`")))
+            })
+            .transpose()?;
+        let limit = q.limit.unwrap_or(DEFAULT_PAGE);
+        if !(1..=MAX_PAGE).contains(&limit) {
+            return Err(AppError::BadRequest(format!(
+                "limit must be between 1 and {MAX_PAGE}"
+            )));
+        }
+        if let Some(c) = q.cursor.as_deref() {
+            Uuid::parse_str(c).map_err(|_| AppError::BadRequest("invalid cursor".into()))?;
+        }
+        let graph = state.orchestrator.neo4j();
+        let page = graph
+            .list_sessions_for_target(
+                target_type,
+                &target_id,
+                anchor_state,
+                limit,
+                q.cursor.as_deref(),
+            )
+            .await
+            .map_err(AppError::Internal)?;
+        let mut sessions = Vec::with_capacity(page.items.len());
+        let mut anchors = Vec::with_capacity(page.items.len());
+        for anchor in page.items {
+            // A session deleted between the two reads is left out (its anchors go
+            // with it).
+            if let Some(node) = graph
+                .get_chat_session(anchor.session_id)
+                .await
+                .map_err(AppError::Internal)?
+            {
+                sessions.push(session_node_to_response(node));
+                anchors.push(anchor);
+            }
+        }
+        stamp_activity(&state, &mut sessions).await;
+        Ok(Json(AnchoredSessionsPage {
+            items: sessions
+                .into_iter()
+                .zip(anchors)
+                .map(|(session, anchor)| AnchoredSession { session, anchor })
+                .collect(),
+            next_cursor: page.next_cursor,
+        }))
+    }
+
+    // ============================================================================
+    // Tests — through the real router and the authentication middleware
+    // ============================================================================
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::chat::anchor_resolver::resolve_session_scope;
+        use crate::graph::neighborhood::RawNode;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::GraphStore;
+        use crate::test_helpers::{
+            router_with_auth_and_events, test_bearer_token, test_chat_session, test_project_named,
+        };
+        use axum::body::Body;
+        use axum::http::Request;
+        use serde_json::{json, Value};
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        const SECRET: &str = "test-secret-key-minimum-32-chars!!";
+
+        struct Fx {
+            app: axum::Router,
+            bus: Arc<crate::events::HybridEmitter>,
+            graph: Arc<MockGraphStore>,
+            beta: Uuid,
+        }
+
+        /// Projects alpha and beta; the sessions created by [`Fx::session`] belong to alpha.
+        async fn fx() -> Fx {
+            let graph = Arc::new(MockGraphStore::new());
+            let alpha = test_project_named("alpha");
+            let beta = test_project_named("beta");
+            graph.create_project(&alpha).await.unwrap();
+            graph.create_project(&beta).await.unwrap();
+            let (app, bus) = router_with_auth_and_events(graph.clone()).await;
+            Fx {
+                app,
+                bus,
+                graph,
+                beta: beta.id,
+            }
+        }
+
+        impl Fx {
+            async fn session(&self) -> Uuid {
+                let s = test_chat_session(Some("alpha"));
+                self.graph.create_chat_session(&s).await.unwrap();
+                s.id
+            }
+        }
+
+        /// A person's own session token.
+        fn human() -> String {
+            test_bearer_token()
+        }
+
+        /// The token of chat session `id`'s MCP server (an agent).
+        fn agent(id: Uuid) -> String {
+            let bare = test_bearer_token();
+            let person =
+                crate::auth::jwt::decode_jwt(bare.trim_start_matches("Bearer "), SECRET).unwrap();
+            let binding = crate::auth::jwt::AgentSessionBinding {
+                session_id: id.to_string(),
+                ceiling: None,
+                tool_profile: None,
+                third_party: false,
+            };
+            let (token, jti) =
+                crate::auth::jwt::generate_session_token(&person, Some(&binding), SECRET, 600)
+                    .unwrap();
+            crate::auth::agent_tokens::register(&jti, Some(&id.to_string()));
+            format!("Bearer {token}")
+        }
+
+        struct Answer {
+            status: StatusCode,
+            etag: Option<String>,
+            body: Value,
+        }
+
+        async fn call(
+            app: &axum::Router,
+            method: &str,
+            uri: &str,
+            token: &str,
+            if_match: Option<&str>,
+            body: Option<Value>,
+        ) -> Answer {
+            let mut req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", token);
+            if let Some(v) = if_match {
+                req = req.header("if-match", v);
+            }
+            let body = match body {
+                Some(b) => {
+                    req = req.header("content-type", "application/json");
+                    Body::from(b.to_string())
+                }
+                None => Body::empty(),
+            };
+            let resp = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+            let status = resp.status();
+            let etag = resp
+                .headers()
+                .get(header::ETAG)
+                .map(|v| v.to_str().unwrap().to_string());
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            Answer {
+                status,
+                etag,
+                body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            }
+        }
+
+        fn anchors_uri(sid: Uuid) -> String {
+            format!("/api/chat/sessions/{sid}/anchors")
+        }
+
+        /// A note of beta, with one neighbour, in the graph the resolver walks.
+        async fn seed_beta_note(f: &Fx) -> String {
+            let note = Uuid::new_v4().to_string();
+            let near = Uuid::new_v4().to_string();
+            for (id, label) in [(&note, "note de beta"), (&near, "voisin de beta")] {
+                f.graph
+                    .neighborhood_ownership
+                    .write()
+                    .await
+                    .project_of
+                    .insert(id.clone(), f.beta.to_string());
+                f.graph.neighborhood_graph.write().await.add_node(RawNode {
+                    id: id.clone(),
+                    node_type: "note".into(),
+                    label: label.into(),
+                    subtitle: None,
+                    weight: 1.0,
+                });
+            }
+            f.graph
+                .neighborhood_graph
+                .write()
+                .await
+                .add_edge(&note, &near, "RELATES_TO", 1.0);
+            note
+        }
+
+        /// Anchors `sid` on beta's note and on beta itself with `token`, the body
+        /// claiming a human placed them; returns whether the note got admitted
+        /// (beta opened to the conversation) and the stored `by` of the project anchor.
+        async fn place_beta(f: &Fx, sid: Uuid, token: &str) -> (bool, String) {
+            let note = seed_beta_note(f).await;
+            let forged = |t: &str, id: &str| {
+                json!({
+                    "target_type": t, "target_id": id, "roles": ["mention"],
+                    // never read: who placed the anchor is the token's business
+                    "by": "user", "placed_by": "human", "inferred": false, "confidence": 1.0
+                })
+            };
+            let a = call(
+                &f.app,
+                "POST",
+                &anchors_uri(sid),
+                token,
+                None,
+                Some(forged("note", &note)),
+            )
+            .await;
+            assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+            let p = call(
+                &f.app,
+                "POST",
+                &anchors_uri(sid),
+                token,
+                None,
+                Some(forged("project", &f.beta.to_string())),
+            )
+            .await;
+            assert_eq!(p.status, StatusCode::CREATED, "{}", p.body);
+            let by = p.body["anchor"]["by"].as_str().unwrap().to_string();
+            let scope = resolve_session_scope(f.graph.as_ref(), sid, b"secret")
+                .await
+                .unwrap();
+            let admitted = scope
+                .anchors
+                .iter()
+                .any(|x| x.target_type == AnchorTargetType::Note);
+            (admitted, by)
+        }
+
+        /// The security property: an agent's token posting `placed_by: human` (and
+        /// `by: user`) places as `agent`, so its project anchor opens nothing; the
+        /// same request with a person's token opens beta.
+        #[tokio::test]
+        async fn an_agent_token_claiming_a_human_placement_places_as_agent_and_opens_no_project() {
+            let f = fx().await;
+            let by_agent = f.session().await;
+            let (admitted, by) = place_beta(&f, by_agent, &agent(by_agent)).await;
+            assert_eq!(by, "agent");
+            assert!(!admitted, "an agent's project anchor must not open beta");
+            let stored = f.graph.list_session_anchors(by_agent).await.unwrap();
+            assert!(stored.iter().all(|a| a.by == AnchorActor::Agent));
+
+            let by_human = f.session().await;
+            let (admitted, by) = place_beta(&f, by_human, &human()).await;
+            assert_eq!(by, "user");
+            assert!(admitted, "a person's project anchor opens beta");
+        }
+
+        #[test]
+        fn the_actor_comes_from_the_principal_only() {
+            use crate::auth::jwt::{Claims, TOKEN_TYPE_AGENT_SESSION, TOKEN_TYPE_MCP};
+            let person = Claims {
+                sub: Uuid::new_v4().to_string(),
+                email: "me@example.com".into(),
+                ..Claims::anonymous()
+            };
+            let with_type = |t: &str| Claims {
+                token_type: Some(t.into()),
+                ..person.clone()
+            };
+            let by = |c: Option<&Claims>, header: Option<&str>, auth: bool| {
+                anchor_principal(c, header, auth).by
+            };
+            assert_eq!(by(Some(&person), None, true), AnchorActor::User);
+            // a session header changes nothing for a signed-in person
+            assert_eq!(by(Some(&person), Some("s"), true), AnchorActor::User);
+            for c in [
+                with_type(TOKEN_TYPE_AGENT_SESSION),
+                with_type(TOKEN_TYPE_MCP),
+                with_type("vault"),
+                Claims::anonymous(),
+                Claims::service_account("runner-agent:x"),
+            ] {
+                assert_eq!(by(Some(&c), None, true), AnchorActor::Agent, "{c:?}");
+            }
+            assert_eq!(by(None, None, true), AnchorActor::Agent);
+            // authentication off: a chat session presents itself by its header
+            assert_eq!(
+                by(Some(&Claims::anonymous()), None, false),
+                AnchorActor::User
+            );
+            assert_eq!(
+                by(Some(&Claims::anonymous()), Some("sid"), false),
+                AnchorActor::Agent
+            );
+            assert_eq!(
+                by(Some(&with_type(TOKEN_TYPE_AGENT_SESSION)), None, false),
+                AnchorActor::Agent
+            );
+        }
+
+        #[tokio::test]
+        async fn the_same_anchor_twice_is_one_anchor_one_version_and_one_event() {
+            let f = fx().await;
+            let sid = f.session().await;
+            let mut events = f.bus.subscribe();
+            let body =
+                json!({"target_type": "file", "target_id": "src/lib.rs", "roles": ["focus"]});
+            let first = call(
+                &f.app,
+                "POST",
+                &anchors_uri(sid),
+                &human(),
+                None,
+                Some(body.clone()),
+            )
+            .await;
+            assert_eq!(first.status, StatusCode::CREATED);
+            assert_eq!(first.etag.as_deref(), Some("\"1\""));
+            let again = call(
+                &f.app,
+                "POST",
+                &anchors_uri(sid),
+                &human(),
+                None,
+                Some(body),
+            )
+            .await;
+            assert_eq!(again.status, StatusCode::OK);
+            assert_eq!(again.body["changed"], json!(false));
+            assert_eq!(again.body["anchor"]["id"], first.body["anchor"]["id"]);
+            assert_eq!(again.etag.as_deref(), Some("\"1\""));
+            let list = call(&f.app, "GET", &anchors_uri(sid), &human(), None, None).await;
+            assert_eq!(list.body["anchors"].as_array().unwrap().len(), 1);
+            assert_eq!(list.body["version"], json!(1));
+
+            let ev = events.try_recv().expect("one event for the creation");
+            assert_eq!(ev.entity_type, EntityType::ChatSession);
+            assert_eq!(ev.action, CrudAction::Updated);
+            assert_eq!(ev.entity_id, sid.to_string());
+            assert_eq!(ev.payload["anchors"]["change"], json!("added"));
+            assert_eq!(ev.payload["anchors"]["target_id"], json!("src/lib.rs"));
+            assert_eq!(ev.payload["anchors"]["version"], json!(1));
+            assert!(events.try_recv().is_err(), "the no-op emits nothing");
+        }
+
+        #[tokio::test]
+        async fn a_stale_if_match_is_refused_with_409_and_the_current_set() {
+            let f = fx().await;
+            let sid = f.session().await;
+            let v0 = call(&f.app, "GET", &anchors_uri(sid), &human(), None, None).await;
+            assert_eq!(v0.etag.as_deref(), Some("\"0\""));
+            let add = |id: &str| json!({"target_type": "file", "target_id": id});
+            let ok = call(
+                &f.app,
+                "POST",
+                &anchors_uri(sid),
+                &human(),
+                Some("\"0\""),
+                Some(add("a.rs")),
+            )
+            .await;
+            assert_eq!(ok.status, StatusCode::CREATED);
+            let stale = call(
+                &f.app,
+                "POST",
+                &anchors_uri(sid),
+                &human(),
+                Some("\"0\""),
+                Some(add("b.rs")),
+            )
+            .await;
+            assert_eq!(stale.status, StatusCode::CONFLICT);
+            assert_eq!(stale.body["code"], json!("anchor_set_version_conflict"));
+            assert_eq!(stale.body["current"]["version"], json!(1));
+            assert_eq!(
+                stale.body["current"]["anchors"].as_array().unwrap().len(),
+                1
+            );
+            assert_eq!(stale.etag.as_deref(), Some("\"1\""));
+            // a malformed If-Match is a 400, `*` means no check
+            let bad = call(
+                &f.app,
+                "POST",
+                &anchors_uri(sid),
+                &human(),
+                Some("abc"),
+                Some(add("b.rs")),
+            )
+            .await;
+            assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+            let any = call(
+                &f.app,
+                "POST",
+                &anchors_uri(sid),
+                &human(),
+                Some("*"),
+                Some(add("b.rs")),
+            )
+            .await;
+            assert_eq!(any.status, StatusCode::CREATED);
+
+            // promote, demote and remove go through the same check
+            let id = ok.body["anchor"]["id"].as_str().unwrap().to_string();
+            let one = format!("{}/{id}", anchors_uri(sid));
+            let patch = json!({"action": "promote", "role": "focus"});
+            let stale = call(
+                &f.app,
+                "PATCH",
+                &one,
+                &human(),
+                Some("\"1\""),
+                Some(patch.clone()),
+            )
+            .await;
+            assert_eq!(stale.status, StatusCode::CONFLICT);
+            let promoted = call(&f.app, "PATCH", &one, &human(), Some("\"2\""), Some(patch)).await;
+            assert_eq!(promoted.status, StatusCode::OK, "{}", promoted.body);
+            assert!(promoted.body["anchor"]["roles"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("focus")));
+            let gone = call(&f.app, "DELETE", &one, &human(), Some("\"3\""), None).await;
+            assert_eq!(gone.status, StatusCode::OK);
+            assert_eq!(gone.etag.as_deref(), Some("\"4\""));
+            let missing = call(&f.app, "DELETE", &one, &human(), None, None).await;
+            assert_eq!(missing.status, StatusCode::NOT_FOUND);
+        }
+
+        /// Two concurrent changes on the same read: one wins, the other gets 409, and
+        /// the cap of three focus anchors holds whatever the interleaving.
+        #[tokio::test]
+        async fn two_concurrent_changes_one_409_and_the_focus_cap_holds() {
+            let f = fx().await;
+            let sid = f.session().await;
+            let focus =
+                |id: &str| json!({"target_type": "file", "target_id": id, "roles": ["focus"]});
+            for id in ["a.rs", "b.rs"] {
+                let r = call(
+                    &f.app,
+                    "POST",
+                    &anchors_uri(sid),
+                    &human(),
+                    None,
+                    Some(focus(id)),
+                )
+                .await;
+                assert_eq!(r.status, StatusCode::CREATED);
+            }
+            // same If-Match on both: exactly one passes
+            let uri = anchors_uri(sid);
+            let me = human();
+            let (x, y) = tokio::join!(
+                call(
+                    &f.app,
+                    "POST",
+                    &uri,
+                    &me,
+                    Some("\"2\""),
+                    Some(focus("c.rs"))
+                ),
+                call(
+                    &f.app,
+                    "POST",
+                    &uri,
+                    &me,
+                    Some("\"2\""),
+                    Some(focus("d.rs"))
+                ),
+            );
+            let mut statuses = [x.status, y.status];
+            statuses.sort();
+            assert_eq!(statuses, [StatusCode::CREATED, StatusCode::CONFLICT]);
+            // no If-Match, at the cap: the fourth focus is refused
+            let (x, y) = tokio::join!(
+                call(&f.app, "POST", &uri, &me, None, Some(focus("e.rs"))),
+                call(&f.app, "POST", &uri, &me, None, Some(focus("f.rs"))),
+            );
+            for r in [&x, &y] {
+                assert_eq!(r.status, StatusCode::CONFLICT);
+                assert_eq!(r.body["code"], json!("focus_cap_reached"));
+            }
+            let set = f.graph.get_anchor_set(sid).await.unwrap().unwrap();
+            let focus_count = set
+                .anchors
+                .iter()
+                .filter(|a| a.has_role(AnchorRole::Focus))
+                .count();
+            assert_eq!(focus_count, 3);
+        }
+
+        #[tokio::test]
+        async fn an_agent_writes_mentions_on_its_own_session_only() {
+            let f = fx().await;
+            let own = f.session().await;
+            let other = f.session().await;
+            let token = agent(own);
+            let mention = json!({"target_type": "file", "target_id": "src/a.rs"});
+            let ok = call(
+                &f.app,
+                "POST",
+                &anchors_uri(own),
+                &token,
+                None,
+                Some(mention.clone()),
+            )
+            .await;
+            assert_eq!(ok.status, StatusCode::CREATED, "{}", ok.body);
+            // not its session, nor one it spawned
+            let refused = call(
+                &f.app,
+                "POST",
+                &anchors_uri(other),
+                &token,
+                None,
+                Some(mention),
+            )
+            .await;
+            assert!(!refused.status.is_success(), "{}", refused.status);
+            assert!(f
+                .graph
+                .list_session_anchors(other)
+                .await
+                .unwrap()
+                .is_empty());
+            // never focus, nor origin
+            for role in ["focus", "origin"] {
+                let r = call(
+                    &f.app,
+                    "POST",
+                    &anchors_uri(own),
+                    &token,
+                    None,
+                    Some(json!({"target_type": "file", "target_id": "src/b.rs", "roles": [role]})),
+                )
+                .await;
+                assert_eq!(r.status, StatusCode::FORBIDDEN, "{role}: {}", r.body);
+            }
+            // and a focus a person gave stays out of its reach
+            let h = call(
+                &f.app,
+                "POST",
+                &anchors_uri(own),
+                &human(),
+                None,
+                Some(json!({"target_type": "file", "target_id": "src/c.rs", "roles": ["focus"]})),
+            )
+            .await;
+            let id = h.body["anchor"]["id"].as_str().unwrap();
+            let r = call(
+                &f.app,
+                "DELETE",
+                &format!("{}/{id}", anchors_uri(own)),
+                &token,
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::FORBIDDEN);
+            assert_eq!(r.body["code"], json!("agent_role_forbidden"));
+        }
+
+        #[tokio::test]
+        async fn the_reverse_read_is_paginated_by_cursor() {
+            let f = fx().await;
+            let plan = Uuid::new_v4().to_string();
+            let mut expected = BTreeSet::new();
+            for _ in 0..5 {
+                let sid = f.session().await;
+                expected.insert(sid.to_string());
+                let r = call(
+                    &f.app,
+                    "POST",
+                    &anchors_uri(sid),
+                    &human(),
+                    None,
+                    Some(json!({"target_type": "plan", "target_id": plan})),
+                )
+                .await;
+                assert_eq!(r.status, StatusCode::CREATED);
+            }
+            let mut seen = BTreeSet::new();
+            let mut cursor: Option<String> = None;
+            let mut pages = Vec::new();
+            loop {
+                let mut uri = format!(
+                    "/api/chat/anchored-sessions?target_type=plan&target_id={}&limit=2",
+                    plan.to_uppercase()
+                );
+                if let Some(c) = &cursor {
+                    uri.push_str(&format!("&cursor={c}"));
+                }
+                let page = call(&f.app, "GET", &uri, &human(), None, None).await;
+                assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+                let items = page.body["items"].as_array().unwrap().clone();
+                pages.push(items.len());
+                for it in &items {
+                    assert_eq!(it["anchor"]["target_id"], json!(plan));
+                    assert!(seen.insert(it["session"]["id"].as_str().unwrap().to_string()));
+                }
+                match page.body["next_cursor"].as_str() {
+                    Some(c) => cursor = Some(c.to_string()),
+                    None => break,
+                }
+            }
+            assert_eq!(pages, vec![2, 2, 1]);
+            assert_eq!(seen, expected);
+            for bad in [
+                format!("/api/chat/anchored-sessions?target_type=plan&target_id={plan}&limit=101"),
+                format!("/api/chat/anchored-sessions?target_type=plan&target_id={plan}&limit=0"),
+                "/api/chat/anchored-sessions?target_type=plan&target_id=nope".to_string(),
+                format!("/api/chat/anchored-sessions?target_type=reflection&target_id={plan}"),
+                format!("/api/chat/anchored-sessions?target_type=plan&target_id={plan}&cursor=x"),
+            ] {
+                let r = call(&f.app, "GET", &bad, &human(), None, None).await;
+                assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}");
+            }
+        }
+
+        /// The scenario of `harness_neo4j::anchors::the_set_version_and_if_match_on_real_neo4j`,
+        /// same numbers, on the mock: both stores count the version the same way.
+        #[tokio::test]
+        async fn the_set_version_scenario_on_the_mock() {
+            let store = MockGraphStore::new();
+            assert!(store
+                .get_anchor_set(Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none());
+            let s = test_chat_session(None);
+            store.create_chat_session(&s).await.unwrap();
+            let sid = s.id;
+            let user = |id: &str| {
+                NewAnchor::new(
+                    AnchorTargetType::File,
+                    id,
+                    [AnchorRole::Mention],
+                    AnchorActor::User,
+                    "t",
+                )
+            };
+            let typed = |e: anyhow::Error| e.downcast::<AnchorError>().unwrap();
+            assert_eq!(store.get_anchor_set(sid).await.unwrap().unwrap().version, 0);
+            let first = store
+                .apply_anchor_op_if(sid, AnchorOp::Add(user("src/a.rs")), Some(0))
+                .await
+                .unwrap();
+            assert_eq!((first.change.created, first.version), (true, 1));
+            let again = store
+                .apply_anchor_op_if(sid, AnchorOp::Add(user("src/a.rs")), Some(1))
+                .await
+                .unwrap();
+            assert_eq!((again.change.event.is_none(), again.version), (true, 1));
+            let stale = store
+                .apply_anchor_op_if(sid, AnchorOp::Add(user("src/b.rs")), Some(0))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                typed(stale),
+                AnchorError::SetVersionConflict {
+                    expected: 0,
+                    actual: 1
+                }
+            );
+            assert_eq!(store.list_session_anchors(sid).await.unwrap().len(), 1);
+            let second = store
+                .apply_anchor_op_if(sid, AnchorOp::Add(user("src/b.rs")), Some(1))
+                .await
+                .unwrap();
+            assert_eq!(second.version, 2);
+            let promoted = store
+                .apply_anchor_op_if(
+                    sid,
+                    AnchorOp::Promote {
+                        anchor_id: first.change.anchor.id,
+                        role: AnchorRole::Focus,
+                        expected_version: 1,
+                        by: AnchorActor::User,
+                        actor: "t".into(),
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(promoted.version, 3);
+            let set = store.get_anchor_set(sid).await.unwrap().unwrap();
+            assert_eq!(set.version, 3);
+            let ids: Vec<Uuid> = set.anchors.iter().map(|x| x.id).collect();
+            assert_eq!(ids, vec![first.change.anchor.id, second.change.anchor.id]);
+            let seqs: Vec<u64> = store
+                .list_anchor_events(sid)
+                .await
+                .unwrap()
+                .iter()
+                .map(|e| e.seq)
+                .collect();
+            assert_eq!(seqs, vec![1, 2, 3]);
+            let removed = store
+                .apply_anchor_op_if(
+                    sid,
+                    AnchorOp::Remove {
+                        anchor_id: second.change.anchor.id,
+                        expected_version: 1,
+                        by: AnchorActor::User,
+                        actor: "t".into(),
+                    },
+                    Some(3),
+                )
+                .await
+                .unwrap();
+            assert_eq!(removed.version, 4);
+            assert!(store.delete_chat_session(sid).await.unwrap());
+            assert!(store.get_anchor_set(sid).await.unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn an_unknown_session_is_a_404() {
+            let f = fx().await;
+            let sid = Uuid::new_v4();
+            let r = call(&f.app, "GET", &anchors_uri(sid), &human(), None, None).await;
+            assert_eq!(r.status, StatusCode::NOT_FOUND);
+            let r = call(
+                &f.app,
+                "POST",
+                &anchors_uri(sid),
+                &human(),
+                None,
+                Some(json!({"target_type": "file", "target_id": "a.rs"})),
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::NOT_FOUND);
+            assert_eq!(r.body["code"], json!("session_not_found"));
+        }
+    }
+}

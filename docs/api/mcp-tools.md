@@ -348,6 +348,19 @@ Manage chat sessions and messages.
 | `list_messages` | List message history | `session_id`, `limit`, `offset` |
 | `add_discussed` | Mark entities as discussed | `session_id`, `entities` |
 | `get_session_entities` | Get entities discussed in session | `session_id`, `project_id` |
+| `list_anchors` | Context anchors of a session, with the `version` of the set | `session_id` |
+| `add_anchor` | Anchor a session on an entity (idempotent: the same target twice is one anchor) | `session_id`, `target_type`, `target_id`, `roles`, `if_match` |
+| `update_anchor` | Give (`promote`) or take away (`demote`) one role | `session_id`, `anchor_id`, `operation`, `role`, `version`, `if_match` |
+| `remove_anchor` | Remove an anchor (never the origin one) | `session_id`, `anchor_id`, `version`, `if_match` |
+| `list_anchored_sessions` | Reverse read: the conversations anchored on one entity, paged by cursor (`limit` ≤ 100) | `target_type`, `target_id`, `state`, `limit`, `cursor` |
+
+Anchors: who placed an anchor is taken from the caller's token, never from the
+call. A person's own token places as `user`; an agent session's token, an MCP
+token and the anonymous user place as `agent`, and an agent may only add a
+`mention` (never `focus` nor `origin`, never remove or demote a `focus`). Only a
+`user` anchor on a project or a workspace opens that project's content to the
+conversation. `if_match` is the `version` of the anchor set read last: a change
+of the set since then refuses the call with 409 and the current set.
 
 ---
 

@@ -32,6 +32,9 @@ mod engine_parity_tests;
 pub mod enrichment;
 pub mod entity_extractor;
 pub mod envelope;
+/// T9: offline transverse evaluation (labeled fixtures, three arms, leak gate).
+#[cfg(test)]
+mod eval_transverse;
 pub mod feedback;
 pub(crate) mod hook_ledger;
 pub mod lasting_rules;

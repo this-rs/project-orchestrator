@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "about": "T9 — monde synthétique et anonymisé de l'évaluation transverse (aucun contenu de la base vivante). Atelier = projet de session, Brume = projet voisin (consentement mixte), Granit = projet scellé (jamais consenti).",
+  "projects": [
+    { "slug": "atelier", "name": "Atelier", "root": "/srv/fx/atelier" },
+    { "slug": "brume", "name": "Brume", "root": "/srv/fx/brume" },
+    { "slug": "granit", "name": "Granit", "root": "/srv/fx/granit" }
+  ],
+  "workspaces": [
+    { "key": "hub", "name": "Hub", "projects": ["atelier", "brume"] },
+    { "key": "coffre", "name": "Coffre", "projects": ["granit"] }
+  ],
+  "items": [
+    { "id": "pl-migr", "type": "plan", "title": "Plan : migration du stockage des pièces", "project": "atelier", "weight": 0.80 },
+    { "id": "t-migr-1", "type": "task", "title": "Tâche : schéma des pièces v2 (terminée)", "project": "atelier", "weight": 0.60 },
+    { "id": "t-migr-2", "type": "task", "title": "Tâche : script de bascule (en cours)", "project": "atelier", "weight": 0.65 },
+    { "id": "t-migr-3", "type": "task", "title": "Tâche : retrait de l'ancien index (à faire)", "project": "atelier", "weight": 0.55 },
+    { "id": "d-migr", "type": "decision", "title": "Décision : stockage par blocs plutôt que par fichiers", "project": "atelier", "weight": 0.70 },
+    { "id": "n-migr-gotcha", "type": "note", "title": "Piège : la bascule exige un verrou global", "project": "atelier", "weight": 0.60 },
+    { "id": "n-old-index", "type": "note", "title": "Note périmée : l'ancien index par fichiers reste la référence", "project": "atelier", "weight": 0.50, "stale": true },
+    { "id": "pl-rendu", "type": "plan", "title": "Plan : refonte du rendu des fiches", "project": "atelier", "weight": 0.75 },
+    { "id": "t-rendu-1", "type": "task", "title": "Tâche : gabarit de fiche (terminée)", "project": "atelier", "weight": 0.55 },
+    { "id": "t-rendu-2", "type": "task", "title": "Tâche : thème sombre des fiches (bloquée)", "project": "atelier", "weight": 0.55 },
+    { "id": "d-rendu", "type": "decision", "title": "Décision : rendu des fiches côté serveur", "project": "atelier", "weight": 0.65 },
+    { "id": "n-rendu-pattern", "type": "note", "title": "Modèle : un gabarit par type de fiche", "project": "atelier", "weight": 0.55 },
+    { "id": "src/rendu/fiche.rs", "type": "file", "title": "src/rendu/fiche.rs", "project": "atelier", "weight": 0.60 },
+    { "id": "fn-render", "type": "function", "title": "render_fiche", "project": "atelier", "weight": 0.55 },
+    { "id": "src/vue/fiche.rs", "type": "file", "title": "src/vue/fiche.rs (ancien emplacement)", "project": "atelier", "weight": 0.45, "stale": true },
+    { "id": "rel-2", "type": "release", "title": "Version 2.0 de l'Atelier", "project": "atelier", "weight": 0.70 },
+    { "id": "n-rel-check", "type": "note", "title": "Liste de contrôle de la version 2.0", "project": "atelier", "weight": 0.55 },
+    { "id": "feat-export", "type": "feature_graph", "title": "Fonction : export des pièces", "project": "atelier", "weight": 0.60 },
+    { "id": "src/export/mod.rs", "type": "file", "title": "src/export/mod.rs", "project": "atelier", "weight": 0.55 },
+    { "id": "fn-export", "type": "function", "title": "export_pieces", "project": "atelier", "weight": 0.50 },
+    { "id": "n-export-tip", "type": "note", "title": "Astuce : l'export se fait par lots de 500", "project": "atelier", "weight": 0.45 },
+    { "id": "d-auth", "type": "decision", "title": "Décision : jetons courts pour l'API", "project": "atelier", "weight": 0.70 },
+    { "id": "n-auth-ctx", "type": "note", "title": "Contexte : incidents de sessions volées", "project": "atelier", "weight": 0.50 },
+    { "id": "d-old-auth", "type": "decision", "title": "Décision remplacée : sessions longues de 30 jours", "project": "atelier", "weight": 0.50, "stale": true },
+    { "id": "n-cache", "type": "note", "title": "Piège : le cache des fiches expire à minuit", "project": "atelier", "weight": 0.55 },
+    { "id": "n-onboard", "type": "note", "title": "Guide : prise en main de l'Atelier", "project": "atelier", "weight": 0.95 },
+    { "id": "n-style", "type": "note", "title": "Règle : style de code de l'Atelier", "project": "atelier", "weight": 0.90 },
+    { "id": "n-ci", "type": "note", "title": "Note : la CI de l'Atelier tourne sur deux runners", "project": "atelier", "weight": 0.88 },
+    { "id": "n-glossary", "type": "note", "title": "Glossaire de l'Atelier", "project": "atelier", "weight": 0.86 },
+    { "id": "n-deps", "type": "note", "title": "Note : politique des dépendances", "project": "atelier", "weight": 0.85 },
+
+    { "id": "pl-capt", "type": "plan", "title": "Plan : collecte des capteurs", "project": "brume", "weight": 0.70 },
+    { "id": "t-capt", "type": "task", "title": "Tâche : calibrage des capteurs", "project": "brume", "weight": 0.50 },
+    { "id": "d-mqtt", "type": "decision", "title": "Décision : protocole MQTT pour les capteurs", "project": "brume", "weight": 0.60 },
+    { "id": "src/capteurs.rs", "type": "file", "title": "src/capteurs.rs", "project": "brume", "weight": 0.50 },
+    { "id": "n-brume-shared", "type": "note", "title": "Modèle : format d'échange partagé", "project": "brume", "weight": 0.60, "consent": "explicit_allow" },
+    { "id": "n-brume-secret", "type": "note", "title": "Note : clés du banc d'essai", "project": "brume", "weight": 0.80, "consent": "explicit_deny" },
+
+    { "id": "n-granit-contrat", "type": "note", "title": "Note : contrat client confidentiel", "project": "granit", "weight": 0.90, "consent": "explicit_deny" },
+    { "id": "n-granit-cles", "type": "note", "title": "Note : accès au coffre client", "project": "granit", "weight": 0.80, "consent": "explicit_deny" },
+    { "id": "d-tarifs", "type": "decision", "title": "Décision : grille tarifaire", "project": "granit", "weight": 0.70 },
+    { "id": "pl-audit", "type": "plan", "title": "Plan : audit de facturation", "project": "granit", "weight": 0.60 },
+    { "id": "src/facturation.rs", "type": "file", "title": "src/facturation.rs", "project": "granit", "weight": 0.50 }
+  ],
+  "edges": [
+    ["pl-migr", "t-migr-1", 1.0], ["pl-migr", "t-migr-2", 1.0], ["pl-migr", "t-migr-3", 1.0],
+    ["pl-migr", "d-migr", 0.8], ["t-migr-2", "n-migr-gotcha", 0.8], ["t-migr-3", "n-old-index", 0.6],
+    ["d-migr", "n-migr-gotcha", 0.5],
+    ["pl-rendu", "t-rendu-1", 1.0], ["pl-rendu", "t-rendu-2", 1.0], ["pl-rendu", "d-rendu", 0.8],
+    ["t-rendu-1", "src/rendu/fiche.rs", 0.9], ["src/rendu/fiche.rs", "fn-render", 1.0],
+    ["d-rendu", "n-rendu-pattern", 0.7], ["src/rendu/fiche.rs", "n-cache", 0.6], ["t-rendu-1", "n-rendu-pattern", 0.6],
+    ["t-rendu-2", "src/rendu/fiche.rs", 0.5],
+    ["rel-2", "pl-migr", 0.9], ["rel-2", "pl-rendu", 0.9], ["rel-2", "n-rel-check", 0.9],
+    ["feat-export", "src/export/mod.rs", 1.0], ["src/export/mod.rs", "fn-export", 1.0],
+    ["feat-export", "n-export-tip", 0.7], ["fn-export", "n-export-tip", 0.5],
+    ["d-auth", "n-auth-ctx", 0.9], ["d-auth", "d-old-auth", 0.7],
+
+    ["d-migr", "n-brume-shared", 0.7], ["n-cache", "n-brume-secret", 0.8], ["pl-migr", "pl-capt", 0.5],
+    ["n-ci", "n-granit-contrat", 0.9], ["d-auth", "d-tarifs", 0.8], ["src/rendu/fiche.rs", "src/facturation.rs", 0.5],
+
+    ["pl-capt", "t-capt", 1.0], ["pl-capt", "d-mqtt", 0.8], ["t-capt", "src/capteurs.rs", 0.9],
+    ["d-mqtt", "n-brume-shared", 0.7], ["n-brume-secret", "d-mqtt", 0.6],
+
+    ["pl-audit", "d-tarifs", 0.9], ["pl-audit", "src/facturation.rs", 0.8],
+    ["n-granit-contrat", "d-tarifs", 0.8], ["n-granit-cles", "pl-audit", 0.7]
+  ],
+  "leak_replay": { "seed": 9001, "resolutions": 10000 }
+}

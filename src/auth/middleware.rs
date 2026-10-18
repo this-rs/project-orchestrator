@@ -107,9 +107,13 @@ pub async fn require_auth(
         if !read {
             let path = req.uri().path();
             // Annotating its OWN session (the entities it discussed, the plans it
-            // works on) is what the MCP tools do all day; nothing else of its own.
+            // works on, the anchors it mentions) is what the MCP tools do all day;
+            // nothing else of its own. What an agent may do to an anchor (a
+            // mention, never focus nor origin) is the anchor rules' business.
             let own_annotation = chat_session_target(path) == Some(binding.session_id.as_str())
-                && (path.ends_with("/discussed") || path.ends_with("/associate"));
+                && (path.ends_with("/discussed")
+                    || path.ends_with("/associate")
+                    || is_anchor_route(path));
             if let Some(target) = chat_session_target(path).filter(|_| !own_annotation) {
                 crate::chat::envelope::ensure_child_of(
                     state.orchestrator.neo4j(),
@@ -398,6 +402,15 @@ pub fn chat_session_target(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/api/chat/sessions/")?;
     let id = rest.split('/').next()?;
     (!id.is_empty()).then_some(id)
+}
+
+/// `/api/chat/sessions/{id}/anchors` or `/api/chat/sessions/{id}/anchors/{anchor_id}`.
+fn is_anchor_route(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/api/chat/sessions/") else {
+        return false;
+    };
+    let segments: Vec<&str> = rest.split('/').collect();
+    matches!(segments.as_slice(), [id, "anchors"] | [id, "anchors", _] if !id.is_empty())
 }
 
 /// Policy every decoded token must satisfy before it is trusted: the email

@@ -2378,10 +2378,23 @@ impl Neo4jClient {
         session_id: Uuid,
         op: crate::chat::anchor::AnchorOp,
     ) -> Result<crate::chat::anchor::AnchorChange> {
+        Ok(self.apply_anchor_op_if(session_id, op, None).await?.change)
+    }
+
+    /// [`Self::apply_anchor_op`] with the set-version check of `If-Match`. The
+    /// version of the set is `ChatSession.anchor_seq` (the number of the last
+    /// committed change), read under the same lock as the write: a stale
+    /// `if_match` is refused before anything is written.
+    pub async fn apply_anchor_op_if(
+        &self,
+        session_id: Uuid,
+        op: crate::chat::anchor::AnchorOp,
+        if_match: Option<u64>,
+    ) -> Result<crate::chat::anchor::AnchorSetChange> {
         use crate::chat::anchor::*;
         let sid = session_id.to_string();
         let mut txn = self.graph.start_txn().await?;
-        let outcome: Result<AnchorChange> = async {
+        let outcome: Result<(AnchorChange, u64)> = async {
             let locked = txn_rows(
                 &mut txn,
                 query(
@@ -2400,6 +2413,15 @@ impl Neo4jClient {
             // transaction is rolled back below, so the number is not consumed:
             // no gap). The lock above serializes writers, hence no duplicate.
             let seq = locked.get::<i64>("seq")?.max(0) as u64;
+            // The version the set had before this operation.
+            let current = seq.saturating_sub(1);
+            if let Some(expected) = if_match.filter(|v| *v != current) {
+                return Err(AnchorError::SetVersionConflict {
+                    expected,
+                    actual: current,
+                }
+                .into());
+            }
             let rows = txn_rows(
                 &mut txn,
                 query("MATCH (a:Anchor {session_id: $sid}) RETURN a ORDER BY a.created_at, a.id")
@@ -2478,18 +2500,20 @@ impl Neo4jClient {
                 )
                 .await?;
             }
-            Ok(change)
+            Ok((change, seq))
         }
         .await;
         match outcome {
-            Ok(change) => {
-                if change.event.is_some() {
+            Ok((change, seq)) => {
+                let version = if change.event.is_some() {
                     txn.commit().await?;
+                    seq
                 } else {
                     // nothing written: give back the lock and the number
                     txn.rollback().await?;
-                }
-                Ok(change)
+                    seq.saturating_sub(1)
+                };
+                Ok(AnchorSetChange { change, version })
             }
             Err(e) => {
                 let _ = txn.rollback().await;
@@ -2516,6 +2540,37 @@ impl Neo4jClient {
             out.push(anchor_from_node(&node)?);
         }
         Ok(out)
+    }
+
+    /// The anchors of a session and the version of the set, in ONE read: a
+    /// client never gets anchors newer than the version it will send back in
+    /// `If-Match`. `None` when the session does not exist.
+    pub async fn get_anchor_set(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<crate::chat::anchor::AnchorSet>> {
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (s:ChatSession {id: $sid}) \
+                     OPTIONAL MATCH (a:Anchor {session_id: $sid}) \
+                     WITH s, a ORDER BY a.created_at, a.id \
+                     RETURN coalesce(s.anchor_seq, 0) AS version, collect(a) AS anchors",
+                )
+                .param("sid", session_id.to_string()),
+            )
+            .await?;
+        let Some(row) = result.next().await? else {
+            return Ok(None);
+        };
+        let version = row.get::<i64>("version")?.max(0) as u64;
+        let nodes: Vec<neo4rs::Node> = row.get("anchors")?;
+        let anchors = nodes
+            .iter()
+            .map(anchor_from_node)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(crate::chat::anchor::AnchorSet { version, anchors }))
     }
 
     /// Reverse query, keyset-paginated on the anchor id.

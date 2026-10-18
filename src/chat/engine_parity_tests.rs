@@ -606,6 +606,12 @@ const RE_MEASURE: &[(&str, &str, &str, &str)] = &[
         "`docs/parity/gros1b-big-tool-result/` (README)",
         "tâche GROS-1b 4b687177",
     ),
+    (
+        "re-check reprise en lieu neutre : une session ouverte dans le répertoire neutre de l'hôte (`chat-neutral/<id>`), ce répertoire supprimé puis recréé au même chemin, se reprend avec `--resume` sans perte (en 2.1.296 la reprise réussit aussi depuis un AUTRE chemin) ; aucun `CLAUDE.md` ni `.claude/` dans les ancêtres hors `~/.claude`",
+        "Claude Code 2.1.296 (18/10/2026)",
+        "`docs/parity/t1bis-neutral-place/` (README)",
+        "tâche T1-bis 6dae6085",
+    ),
 ];
 
 /// The size of the tool result of the row `tool_result.huge`: about a megabyte.
