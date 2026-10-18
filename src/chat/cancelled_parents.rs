@@ -30,9 +30,21 @@
 //! its provider's opening timeout, far below it. Expired ones are swept on every access, so
 //! the map holds only the cascades of the last few minutes. A session activated again (a
 //! person resumes the cancelled parent) loses its tombstone: its new delegations are not
-//! refused.
+//! refused — nor are the delegations of that parent still opening at that moment (at most
+//! an opening's timeout, `PROVIDER_OPEN_TIMEOUT`): the person took the parent back, its
+//! children may live again.
+//!
+//! WHO is refused (B36-RACE-RESUME). The tombstone stops a DELEGATION that lands late, not
+//! a person: a child of a cancelled run that someone reopens by hand right after the cancel
+//! must open. A session CREATED with a parent is always a delegation (an `Agent` call, a
+//! `delegate_task`, a runner): it is always checked. A RESUME is a delegation only when the
+//! delegation path says so — the warm pool resuming a closed child for a new `Agent` call
+//! ([`as_delegation`]); every other resume (the chat, the API, the NATS RPC) is a person's,
+//! and passes. The marker is a task-local, so it travels down the awaited resume to the
+//! `admit` under the live map's lock without threading a flag through every reopen path.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -148,6 +160,33 @@ impl CancelledParents {
     }
 }
 
+tokio::task_local! {
+    /// Set while a delegation (re)opens its child: see the module documentation.
+    static DELEGATED_OPENING: ();
+}
+
+/// Runs `opening` as a DELEGATION's: a resume inside it is checked against the parent's
+/// tombstone like a fresh child. Only the delegation path wraps its resume in this.
+pub(crate) async fn as_delegation<F: Future>(opening: F) -> F::Output {
+    DELEGATED_OPENING.scope((), opening).await
+}
+
+/// Whether the current task opens a session on behalf of a delegation ([`as_delegation`]).
+pub(crate) fn opening_is_delegation() -> bool {
+    DELEGATED_OPENING.try_with(|_| ()).is_ok()
+}
+
+/// The parent whose tombstone a RESUME of a session is checked against: its `spawned_by`
+/// parent when the resume is a delegation's ([`as_delegation`]), none when a person resumes
+/// it (B36-RACE-RESUME). A creation is always checked: it uses [`parent_of`] directly.
+pub(crate) fn parent_checked_on_resume(spawned_by: Option<&str>) -> Option<String> {
+    if opening_is_delegation() {
+        parent_of(spawned_by)
+    } else {
+        None
+    }
+}
+
 /// The parent a session's `spawned_by` names, if any.
 pub(crate) fn parent_of(spawned_by: Option<&str>) -> Option<String> {
     spawned_by
@@ -159,6 +198,31 @@ pub(crate) fn parent_of(spawned_by: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B36-RACE-RESUME: the resume's parent is checked only inside a delegation, and the
+    /// marker reaches nested awaits (the reopen paths between the caller and `admit`).
+    #[tokio::test]
+    async fn a_resume_checks_the_parent_only_inside_a_delegation() {
+        let spawned_by = r#"{"type":"delegation","parent_session_id":"p"}"#;
+        assert!(!opening_is_delegation());
+        assert_eq!(
+            parent_checked_on_resume(Some(spawned_by)),
+            None,
+            "a person's resume"
+        );
+
+        let inside = as_delegation(async {
+            // A nested await, as on the real reopen paths.
+            tokio::task::yield_now().await;
+            parent_checked_on_resume(Some(spawned_by))
+        })
+        .await;
+        assert_eq!(inside.as_deref(), Some("p"), "a delegation's resume");
+        assert!(
+            !opening_is_delegation(),
+            "the marker does not outlive its scope"
+        );
+    }
 
     #[test]
     fn a_child_of_a_cancelled_parent_is_refused_with_a_typed_error() {

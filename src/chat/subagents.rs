@@ -711,9 +711,14 @@ impl ChatManager {
     ) -> Result<(String, Option<i64>), String> {
         if let Some(warm) = reuse.and_then(|reuse| reuse.warm.as_ref()) {
             let floor = self.last_event_seq(&warm.session_id).await;
-            match self
-                .resume_session(&warm.session_id, &child.message, child.user_claims.as_ref())
-                .await
+            // A delegation's resume: checked against the parent's tombstone like a fresh child
+            // (B36-RACE-RESUME: a person's resume of the same session would pass).
+            match super::cancelled_parents::as_delegation(self.resume_session(
+                &warm.session_id,
+                &child.message,
+                child.user_claims.as_ref(),
+            ))
+            .await
             {
                 Ok(()) => {
                     tracing::info!(
