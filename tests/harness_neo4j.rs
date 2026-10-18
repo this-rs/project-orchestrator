@@ -2243,8 +2243,19 @@ mod anchor_scope {
             .add_anchor(sid, add(AnchorTargetType::Note, &w.uid(), None))
             .await
             .unwrap();
+        // put by an AGENT: a container anchor of another project opens it only
+        // when a human put it (T3-ter); an agent's stays refused
         let refused = store
-            .add_anchor(sid, add(AnchorTargetType::Project, &b.to_string(), None))
+            .add_anchor(
+                sid,
+                NewAnchor::new(
+                    AnchorTargetType::Project,
+                    b.to_string(),
+                    [AnchorRole::Mention],
+                    AnchorActor::Agent,
+                    "h",
+                ),
+            )
             .await
             .unwrap();
         for (an, st) in [
@@ -2297,7 +2308,8 @@ mod anchor_scope {
         );
         assert!(!text.contains("SECRET") && !text.contains("beta-"));
 
-        // a workspace holding the session project and the refused one: admitted, B stays closed
+        // a workspace holding the session project and B, anchored by a human:
+        // admitted, and B is opened by it (T3-ter)
         let ws = project_orchestrator::neo4j::models::WorkspaceNode {
             id: Uuid::new_v4(),
             name: "Hub".into(),
@@ -2329,7 +2341,7 @@ mod anchor_scope {
         .await
         .unwrap();
         assert_eq!(scope.anchors[0].title, "Hub");
-        assert!(scope.extra_projects.is_empty());
+        assert_eq!(scope.extra_projects, vec![b]);
 
         // a session with a project and no anchor: nothing, no notice
         let s2 = Uuid::new_v4();
@@ -2435,35 +2447,255 @@ mod anchor_scope {
             50
         );
 
-        // what the resolver counts is the label it reads back (first line, cut at 80)
-        let reference = |s: &str| (s.split_whitespace().count() as f64 * 1.3).ceil();
-        let (mut est_sum, mut ref_sum, mut est_full, mut ref_full) = (0.0, 0.0, 0.0, 0.0);
-        let (mut lo, mut hi) = (f64::MAX, 0.0_f64);
-        let mut chars_per_word = 0.0;
-        for n in walk.nodes.iter().filter(|n| n.node.node_type == "note") {
-            let (est, rf) = (est_tokens(&n.node.label) as f64, reference(&n.node.label));
-            est_sum += est;
-            ref_sum += rf;
-            lo = lo.min(est / rf);
-            hi = hi.max(est / rf);
-            chars_per_word += n.node.label.chars().count() as f64
-                / n.node.label.split_whitespace().count() as f64;
-        }
-        for t in FRENCH {
-            est_full += est_tokens(t) as f64;
-            ref_full += reference(t);
-        }
+        // Reference: the REAL tokenizer of the models the chat sends this to,
+        // measured on 18/10/2026 through the Claude CLI (input tokens of a prompt
+        // with the corpus minus the same prompt without it; claude-haiku-5-5,
+        // claude-sonnet-5-5 and claude-opus-5-5 agree within 5 tokens):
+        // - the 50 texts below, whole: 2733 tokens for 6945 characters (2.54 per token);
+        // - the 50 lines the resolver renders from them (`  - note «<80 chars>» #<8 hex>`):
+        //   2046 tokens for 4732 characters (2.31 per token).
+        // The old `chars / 4` gave 1755 and 1206: 36 % and 41 % UNDER the real count.
+        const CLAUDE_FULL: f64 = 2733.0;
+        const CLAUDE_RENDERED: f64 = 2046.0;
+        let est_full: f64 = FRENCH.iter().map(|t| est_tokens(t) as f64).sum();
+        let rendered: Vec<String> = FRENCH
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let cut: String = t.chars().take(80).collect();
+                let ell = if t.chars().count() > 80 { "…" } else { "" };
+                let id = format!("{:08x}", (i as u64).wrapping_mul(2654435761) & 0xffff_ffff);
+                format!("  - note «{cut}{ell}» #{id}")
+            })
+            .collect();
+        let est_rendered: f64 = rendered.iter().map(|l| est_tokens(l) as f64).sum();
+        let rendered_chars: usize = rendered.iter().map(|l| l.chars().count()).sum();
         eprintln!(
-            "TOKENS labels: est(chars/4)={est_sum} ref(words*1.3)={ref_sum} ratio={:.3} \
-             per-label min={lo:.2} max={hi:.2} | full texts: est={est_full} ref={ref_full} \
-             ratio={:.3} | mean chars/word={:.2}",
-            est_sum / ref_sum,
-            est_full / ref_full,
-            chars_per_word / 50.0
+            "TOKENS full: est={est_full} claude={CLAUDE_FULL} ratio={:.3} | rendered \
+             ({rendered_chars} chars): est={est_rendered} claude={CLAUDE_RENDERED} ratio={:.3}",
+            est_full / CLAUDE_FULL,
+            est_rendered / CLAUDE_RENDERED
         );
-        // gross error only: the estimate stays within a factor 2 of the reference
-        assert!((0.5..=2.0).contains(&(est_sum / ref_sum)));
-        assert!((0.5..=2.0).contains(&(est_full / ref_full)));
+        // the corpus measured is the corpus estimated (the rendered lines were
+        // measured at 4732 characters)
+        assert_eq!(rendered_chars, 4732);
+        // never under the real count (a budget must hold), at most 30 % over
+        for (est, real) in [(est_full, CLAUDE_FULL), (est_rendered, CLAUDE_RENDERED)] {
+            assert!(est >= real, "under-estimate: {est} < {real}");
+            assert!(est <= real * 1.3, "over-estimate: {est} > 1.3 x {real}");
+        }
+        w.cleanup().await;
+    }
+
+    // (8) containers and owners (T3-ter) --------------------------------------------
+
+    /// The real store links every note to its project (`HAS_NOTE`, weight 1.0):
+    /// the project becomes the strongest neighbour of every note. It is the
+    /// container already named at the head of the map, so it takes neither a
+    /// slot nor budget in an expansion, and is not counted as omitted.
+    #[tokio::test]
+    async fn the_project_node_takes_no_slot_nor_budget_in_an_expansion() {
+        let Some(e) = env().await else { return };
+        let store: &dyn GraphStore = &e.client;
+        let mut w = World::new(&e);
+        let a = w.project("container").await;
+        let slug = format!("container-{}", w.run);
+        let centre = w.store_note(a, "centre", 0.9, SharingConsent::NotSet).await;
+        let mut neighbours = BTreeSet::new();
+        for i in 0..5 {
+            let n = w
+                .store_note(a, &format!("voisin {i}"), 0.5, SharingConsent::NotSet)
+                .await;
+            w.edge(&centre, &n, "SYNAPSE", Some(0.6)).await;
+            neighbours.insert(n);
+        }
+        // the walk does reach the project through HAS_NOTE
+        let walk = w
+            .same(
+                "note",
+                &centre,
+                &mention_params(),
+                &ProjectFilter::only(a.to_string()),
+            )
+            .await;
+        assert!(
+            ids(&walk).contains(&a.to_string()),
+            "HAS_NOTE reaches the project"
+        );
+
+        let scope = resolve_anchors(
+            store,
+            Some(scope_project(a, &slug)),
+            vec![anchor(
+                AnchorTargetType::Note,
+                &centre,
+                AnchorRole::Mention,
+                AnchorState::Live,
+            )],
+            SECRET,
+        )
+        .await
+        .unwrap();
+        let x = &scope.anchors[0].expansion;
+        assert!(
+            x.nodes.iter().all(|n| n.node_type != "project"),
+            "the project took a slot: {x:#?}"
+        );
+        // MENTION_BUDGET keeps 5 nodes: all five notes, nothing omitted
+        let kept: BTreeSet<_> = x.nodes.iter().map(|n| n.id.clone()).collect();
+        assert_eq!(kept, neighbours);
+        assert_eq!(x.omitted, 0);
+        w.cleanup().await;
+    }
+
+    /// A global note as the real store writes it (`project_id = ''`) comes back
+    /// with NO owner, as in memory, not `Some("")`.
+    #[tokio::test]
+    async fn a_global_note_has_no_owner_on_neo4j_as_in_memory() {
+        let Some(e) = env().await else { return };
+        let store: &dyn GraphStore = &e.client;
+        let w = World::new(&e);
+        let g = Note::new(
+            None,
+            NoteType::Observation,
+            "globale".into(),
+            "t3ter".into(),
+        );
+        store.create_note(&g).await.unwrap();
+        w.run_cypher(
+            "MATCH (n:Note {id: $id}) SET n.h_run = $run",
+            vec![("id", V::S(g.id.to_string()))],
+        )
+        .await;
+        let walk = w
+            .neo(
+                "note",
+                &g.id.to_string(),
+                &mention_params(),
+                &ProjectFilter::default(),
+            )
+            .await;
+        assert_eq!(walk.center.unwrap().project_id, None);
+        w.cleanup().await;
+    }
+
+    /// Decision 75e160f4 (T3-ter): a `project` / `workspace` anchor of another
+    /// project put by a HUMAN opens that project's content to this conversation,
+    /// except what its owner marked ExplicitDeny; the same anchor put by an agent
+    /// opens nothing.
+    #[tokio::test]
+    async fn a_human_container_anchor_opens_its_project_except_explicit_deny() {
+        let Some(e) = env().await else { return };
+        let store: &dyn GraphStore = &e.client;
+        let mut w = World::new(&e);
+        let (a, b) = (w.project("home").await, w.project("other").await);
+        let slug_a = format!("home-{}", w.run);
+        // B has no sharing policy: before T3-ter, nothing of B was readable
+        let centre = w
+            .store_note(b, "note de B", 0.9, SharingConsent::NotSet)
+            .await;
+        let open = w
+            .store_note(b, "voisin ouvert", 0.8, SharingConsent::NotSet)
+            .await;
+        let deny = w
+            .store_note(b, "SECRET refusé", 0.8, SharingConsent::ExplicitDeny)
+            .await;
+        w.edge(&centre, &open, "SYNAPSE", Some(0.8)).await;
+        w.edge(&centre, &deny, "SYNAPSE", Some(0.8)).await;
+        let note_anchor = anchor(
+            AnchorTargetType::Note,
+            &centre,
+            AnchorRole::Mention,
+            AnchorState::Live,
+        );
+        let container = |t: AnchorTargetType, id: String, by: AnchorActor| {
+            let mut x = anchor(t, &id, AnchorRole::Mention, AnchorState::Live);
+            x.by = by;
+            x
+        };
+        let resolve = |anchors: Vec<Anchor>| {
+            let p = scope_project(a, &slug_a);
+            async move {
+                resolve_anchors(store, Some(p), anchors, SECRET)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // an agent's project anchor: B stays closed, the note too
+        let scope = resolve(vec![
+            container(AnchorTargetType::Project, b.to_string(), AnchorActor::Agent),
+            note_anchor.clone(),
+        ])
+        .await;
+        assert!(scope.anchors.is_empty(), "{scope:#?}");
+        assert_eq!(scope.excluded.len(), 2);
+        assert!(scope.extra_projects.is_empty());
+
+        // a human's project anchor: B is open, its note is admitted and walked,
+        // the ExplicitDeny neighbour stays out
+        let scope = resolve(vec![
+            container(AnchorTargetType::Project, b.to_string(), AnchorActor::User),
+            note_anchor.clone(),
+        ])
+        .await;
+        assert!(scope.excluded.is_empty(), "{scope:#?}");
+        assert_eq!(scope.extra_projects, vec![b]);
+        let n = scope
+            .anchors
+            .iter()
+            .find(|x| x.target_type == AnchorTargetType::Note)
+            .unwrap();
+        assert!(n.cross_project);
+        let got: Vec<_> = n.expansion.nodes.iter().map(|x| x.id.clone()).collect();
+        assert_eq!(got, vec![open.clone()]);
+        assert_eq!(n.expansion.denied.len(), 1);
+        let text = format!(
+            "{}{}",
+            render_anchor_map(&scope, "k"),
+            render_live_block(&scope)
+        );
+        assert!(!text.contains("SECRET"));
+
+        // a human's workspace anchor holding B (and not the session project) opens B too
+        let ws = project_orchestrator::neo4j::models::WorkspaceNode {
+            id: Uuid::new_v4(),
+            name: "Espace".into(),
+            slug: format!("espace-{}", w.run),
+            description: None,
+            created_at: Utc::now(),
+            updated_at: None,
+            metadata: serde_json::json!({}),
+        };
+        store.create_workspace(&ws).await.unwrap();
+        w.run_cypher(
+            "MATCH (n:Workspace {id: $id}) SET n.h_run = $run",
+            vec![("id", V::S(ws.id.to_string()))],
+        )
+        .await;
+        store.add_project_to_workspace(ws.id, b).await.unwrap();
+        let scope = resolve(vec![
+            container(
+                AnchorTargetType::Workspace,
+                ws.id.to_string(),
+                AnchorActor::User,
+            ),
+            note_anchor.clone(),
+        ])
+        .await;
+        assert!(scope.excluded.is_empty(), "{scope:#?}");
+        assert_eq!(scope.extra_projects, vec![b]);
+        // the same workspace anchored by an agent: out of scope, B closed
+        let scope = resolve(vec![
+            container(
+                AnchorTargetType::Workspace,
+                ws.id.to_string(),
+                AnchorActor::Agent,
+            ),
+            note_anchor,
+        ])
+        .await;
+        assert!(scope.anchors.is_empty() && scope.extra_projects.is_empty());
         w.cleanup().await;
     }
 }
