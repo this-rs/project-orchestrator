@@ -59,7 +59,7 @@ diagrams:
     file: docs/diagrams/po-chat-agent-runtime.mmd
     covers:
       - "backend:src/chat/{agent_runtime,agent_hooks,cancel_relay,session_grants,lasting_rules,spill,team}.rs"
-      - "backend:src/chat/provider/transcripts.rs"
+      - "backend:src/chat/provider/{transcripts,hooks}.rs"
       - "backend:src/api/team_handlers.rs"
   - name: po-provider-settings
     owner: theotime

@@ -13,6 +13,7 @@ pub mod credentials;
 pub mod endpoint_guard;
 pub mod errors;
 pub mod event_map;
+pub mod hooks;
 pub mod limits;
 pub mod listing;
 pub mod native_factory;
