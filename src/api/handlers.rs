@@ -1171,10 +1171,13 @@ pub async fn delegate_task(
     chat_request.scaffolding_override = scaffolding_override;
     let chat_request_cwd = chat_request.cwd.clone();
 
+    // A session that cannot open says why, as the chat route does (status + code): an engine
+    // nobody registered, a project that did not consent, a Claude Code that is not installed.
+    // Flattened into `Internal`, all of them read as the same bare 500 (DELEG-500).
     let session = chat_manager
         .create_session(&chat_request)
         .await
-        .map_err(AppError::Internal)?;
+        .map_err(|e| AppError::from_open_error(e, chat_request.provider.as_deref()))?;
     let session_id = session.session_id.clone();
 
     // Step 3: Create AgentExecution node for tracking (fire-and-forget)
@@ -7573,6 +7576,66 @@ mod tests {
                 );
             }
             other => panic!("expected the configured cap to refuse, got {other:?}"),
+        }
+    }
+
+    /// DELEG-500: a delegation that cannot open its session says WHY. `create_session` fails
+    /// with a typed error (an engine nobody registered here); the handler used to flatten
+    /// every such error into the bare 500 "Internal server error", so nobody — neither the
+    /// agent that delegated nor the operator without the server's terminal — could tell a
+    /// refused engine from a crash. It answers like the chat route does: status and code.
+    #[tokio::test]
+    async fn a_delegation_whose_session_cannot_open_answers_why_not_a_bare_500() {
+        use crate::neo4j::GraphStore;
+
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project = crate::test_helpers::test_project();
+        mock.create_project(&project).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(project.id);
+        mock.create_plan(&plan).await.unwrap();
+        let task = crate::test_helpers::test_task();
+        mock.create_task(plan.id, &task).await.unwrap();
+        let parent = crate::test_helpers::test_chat_session(Some(&project.slug));
+        mock.create_chat_session(&parent).await.unwrap();
+
+        let dyn_graph: Arc<dyn GraphStore> = mock.clone();
+        let manager = Arc::new(crate::chat::manager::ChatManager::new_without_memory(
+            dyn_graph,
+            crate::test_helpers::mock_app_state().meili,
+            Default::default(),
+        ));
+        let state = crate::test_helpers::server_state_with_chat(manager, mock.clone()).await;
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            crate::chat::envelope::SESSION_ID_HEADER,
+            parent.id.to_string().parse().unwrap(),
+        );
+        // Inside the parent's directory, naming an engine nobody registered.
+        let req = DelegateTaskRequest {
+            cwd: parent.cwd.clone(),
+            project_slug: None,
+            custom_sections: Vec::new(),
+            parent_session_id: None,
+            provider: Some("nobody-registered".to_string()),
+            model: None,
+            task_class: None,
+        };
+
+        let result = delegate_task(
+            State(state),
+            None,
+            headers,
+            Path((plan.id, task.id)),
+            Json(req),
+        )
+        .await;
+
+        match result {
+            Err(AppError::Provider(failure)) => {
+                assert_eq!(failure.status, 404, "an unregistered engine is a 404");
+                assert_eq!(failure.provider_id.as_deref(), Some("nobody-registered"));
+            }
+            other => panic!("expected a typed refusal naming the engine, got {other:?}"),
         }
     }
 

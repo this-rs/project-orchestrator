@@ -4274,6 +4274,54 @@ mod provider_switch {
             .to_string()
     }
 
+    /// The session request `delegate_task` builds when the delegation names neither engine
+    /// nor model: `inherit_parent_engine` copies the parent's provider (and model) onto the
+    /// RUN level, the caller is the server's service account, the spawn is a delegation.
+    fn delegation_request(run_model: Option<&str>) -> ChatRequest {
+        let mut req = request(None, Some("proj"), "bypassPermissions");
+        req.run_provider = Some("claude-code".into());
+        req.run_model = run_model.map(str::to_string);
+        req.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Delegation {
+                plan_id: Uuid::new_v4(),
+                task_id: Uuid::new_v4(),
+                parent_session_id: None,
+                scaffolding_level: None,
+            }
+            .to_json_string(),
+        );
+        req.user_claims = Some(crate::auth::jwt::Claims::service_account(
+            "delegate-agent:probe",
+        ));
+        req
+    }
+
+    /// DELEG-500, the control: a delegation that inherits its parent's ENGINE only opens.
+    #[tokio::test]
+    async fn a_delegation_inheriting_its_parents_engine_opens() {
+        let cli = FakeClaude::new();
+        let w = hybrid_world(&cli).await;
+        let opened = w.manager.create_session(&delegation_request(None)).await;
+        assert!(opened.is_ok(), "control failed: {:#}", opened.unwrap_err());
+    }
+
+    /// DELEG-500: a delegation that inherits its parent's engine AND MODEL
+    /// (`claude-fable-5-1`) must open too.
+    #[tokio::test]
+    async fn a_delegation_inheriting_its_parents_engine_and_model_opens() {
+        let cli = FakeClaude::new();
+        let w = hybrid_world(&cli).await;
+        let opened = w
+            .manager
+            .create_session(&delegation_request(Some("claude-fable-5-1")))
+            .await;
+        assert!(
+            opened.is_ok(),
+            "inherited model refused: {:#}",
+            opened.unwrap_err()
+        );
+    }
+
     #[tokio::test]
     async fn claude_code_to_native_and_back_the_target_knows_the_history_and_the_thread_says_so() {
         let cli = FakeClaude::new();

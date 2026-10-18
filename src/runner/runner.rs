@@ -9325,6 +9325,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_listen_for_result_multibyte_error_truncation_does_not_panic() {
+        // Same global flag as above: a cancelled run would end this listen before the error.
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
         let runner = test_plan_runner();
         let (tx, rx) = broadcast::channel::<ChatEvent>(16);
         // 601 bytes: the "last 500 bytes" cut (byte 101) lands inside a 2-byte 'é'.
@@ -11393,6 +11396,11 @@ mod tests {
 
     #[tokio::test]
     async fn listen_for_result_reports_turns_and_whether_a_cost_was_reported() {
+        // RUNNER_CANCEL is global and `listen_for_result` returns `Cancelled` (empty metrics) as
+        // soon as it is set: without the lock, a test that cancelled a run made this one read
+        // `num_turns: None` (seen in CI on #820, red on a branch that did not touch the runner).
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
         let runner = test_plan_runner();
 
         let (tx, rx) = broadcast::channel::<ChatEvent>(16);
