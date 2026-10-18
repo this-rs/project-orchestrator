@@ -25,12 +25,9 @@ env:
   FRONTEND_REPO: this-rs/project-orchestrator-frontend
   # Resolve the release tag: use the workflow_dispatch input if provided, otherwise GITHUB_REF_NAME (from tag push)
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-  # ONNX Runtime linked DYNAMICALLY (Linux, macOS Intel; Windows and macOS arm64 link ort-sys's own,
-  # statically). It must serve the API version `ort` asks for — fastembed turns on `api-24` — or local
-  # embeddings panic at start: scripts/check-ort-api.sh enforces it. Linux takes Microsoft's archive;
-  # macOS Intel is built by scripts/build-onnxruntime-macos.sh (Microsoft stopped osx-x86_64 at 1.23).
-  # Raising it: also VERS_<version> in Cargo.toml (generate-rpm.provides).
-  ORT_VERSION: "1.24.2"
+  # The native library versions are NOT here: scripts/native-libs.env is their single source
+  # (scripts/prebuilt-lib.sh reads it, .github/workflows/prebuilt-libs.yml builds and publishes
+  # them). Raising one there is the whole operation.
 
 jobs:
   # ==========================================================================
@@ -296,60 +293,17 @@ jobs:
         if: matrix.legacy
         run: echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
 
-      # macOS Intel: Microsoft publishes no osx-x86_64 ONNX Runtime from 1.24 on, and 1.23 makes ort panic
-      # (API 24). Built here (host == target, this is the Intel runner), cached per version and script.
-      # The desktop job takes it from the artifact uploaded below instead of building it again.
-      - name: Restore ONNX Runtime for macOS x86_64 (cache)
-        id: ort-macos
-        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
-        uses: actions/cache@v6
-        with:
-          path: ${{ runner.temp }}/onnxruntime
-          key: onnxruntime-${{ env.ORT_VERSION }}-osx-x86_64-${{ hashFiles('scripts/build-onnxruntime-macos.sh') }}
-
-      - name: Build ONNX Runtime for macOS x86_64 (cache miss, ~1 h)
-        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy && steps.ort-macos.outputs.cache-hit != 'true'
-        run: scripts/build-onnxruntime-macos.sh "$ORT_VERSION" "$RUNNER_TEMP/onnxruntime"
-
-      - name: Use ONNX Runtime for macOS x86_64
-        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
-        run: |
-          scripts/check-ort-api.sh "$RUNNER_TEMP/onnxruntime"
-          echo "ORT_LIB_LOCATION=$RUNNER_TEMP/onnxruntime/lib" >> "$GITHUB_ENV"
-          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
-          echo "=== ONNX Runtime ${ORT_VERSION} for macOS x86_64 ==="
-          ls -la "$RUNNER_TEMP/onnxruntime/lib/"
-
-      - name: Upload ONNX Runtime for macOS x86_64 (for the desktop job)
-        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
-        uses: actions/upload-artifact@v7
-        with:
-          name: onnxruntime-osx-x86_64
-          path: ${{ runner.temp }}/onnxruntime/
-          retention-days: 1
-
-      - name: Download ONNX Runtime for Linux
-        if: matrix.os == 'linux'
-        run: |
-          # ORT_VERSION (workflow env): API 24, what ort asks for (scripts/check-ort-api.sh); glibc 2.27
-          case "${{ matrix.target }}" in
-            x86_64-unknown-linux-gnu)  ORT_ARCH=x64 ;;
-            aarch64-unknown-linux-gnu) ORT_ARCH=aarch64 ;;
-            *) echo "::error::no ONNX Runtime archive for ${{ matrix.target }}"; exit 1 ;;
-          esac
-          echo "Downloading ONNX Runtime ${ORT_VERSION} for Linux ${ORT_ARCH}..."
-          curl -fsSL -o /tmp/onnxruntime.tgz \
-            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}.tgz"
-          mkdir -p "$RUNNER_TEMP/onnxruntime"
-          # GNU tar: --strip-components=1 strips the top-level versioned directory
-          tar xzf /tmp/onnxruntime.tgz -C "$RUNNER_TEMP/onnxruntime" --strip-components=1
-          echo "ORT_LIB_LOCATION=$RUNNER_TEMP/onnxruntime/lib" >> "$GITHUB_ENV"
-          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
-          # Mount ORT dir at same absolute path inside cross container
-          echo "CROSS_CONTAINER_OPTS=-v $RUNNER_TEMP/onnxruntime:$RUNNER_TEMP/onnxruntime" >> "$GITHUB_ENV"
-          echo "=== ONNX Runtime ${ORT_VERSION} for Linux ${ORT_ARCH} ==="
-          ls -la "$RUNNER_TEMP/onnxruntime/lib/"
-          scripts/check-ort-api.sh "$RUNNER_TEMP/onnxruntime"
+      # ONNX Runtime, from the versioned prebuilt channel (scripts/prebuilt-lib.sh), in this order:
+      #   1. the library release `lib/ort-<version>` of this repository — durable and versioned, and
+      #      visible to a TAG-triggered run, which actions/cache is not;
+      #   2. Microsoft's own archive;
+      #   3. a local build, only for macOS Intel (upstream stopped osx-x86_64 at 1.23) and only
+      #      where the host IS the Intel target — a cross-built library is the wrong architecture.
+      # scripts/check-ort-api.sh runs on whatever we ended up with: a runtime that does not serve
+      # the API `ort` was compiled for panics at start.
+      - name: ONNX Runtime (prebuilt channel)
+        if: (matrix.target == 'x86_64-apple-darwin' && !matrix.legacy) || matrix.os == 'linux'
+        run: scripts/prebuilt-lib.sh use ort ${{ matrix.target }}
 
       - name: Install patchelf (for Linux dynamic ORT bundling)
         if: matrix.os == 'linux'
@@ -974,50 +928,19 @@ jobs:
         if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
         run: echo 'TAURI_CONFIG={"bundle":{"macOS":{"minimumSystemVersion":"13.4"}}}' >> "$GITHUB_ENV"
 
-      # macOS Intel: the ONNX Runtime build-backend built (or restored) — scripts/build-onnxruntime-macos.sh.
-      - name: Download ONNX Runtime for macOS x86_64 (from build-backend)
-        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
-        uses: actions/download-artifact@v8
-        with:
-          name: onnxruntime-osx-x86_64
-          path: ${{ runner.temp }}/onnxruntime/
-
-      - name: Use ONNX Runtime for macOS x86_64
-        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
+      # ONNX Runtime, from the SAME versioned channel as build-backend (scripts/prebuilt-lib.sh):
+      # the download takes seconds, so this job no longer waits for an artifact another job uploaded.
+      # The app needs the library at runtime, next to mcp_server, whose rpath is $ORIGIN: on Linux
+      # the libraries ride along as resources (/usr/lib/Project Orchestrator/) and the app's own
+      # rpath points there from /usr/bin (deb, rpm, AppImage's usr/).
+      - name: ONNX Runtime (prebuilt channel)
+        if: (matrix.target == 'x86_64-apple-darwin' && !matrix.legacy) || runner.os == 'Linux'
         run: |
-          # upload-artifact stores the libonnxruntime.dylib symlink as a full copy: make it a link again,
-          # or the app would carry the library twice (the binaries load the versioned name, @rpath).
-          cd "$RUNNER_TEMP/onnxruntime/lib"
-          rm -f libonnxruntime.dylib && ln -s "libonnxruntime.${ORT_VERSION}.dylib" libonnxruntime.dylib
-          cd - >/dev/null
-          scripts/check-ort-api.sh "$RUNNER_TEMP/onnxruntime"
-          echo "ORT_LIB_LOCATION=$RUNNER_TEMP/onnxruntime/lib" >> "$GITHUB_ENV"
-          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
-          ls -la "$RUNNER_TEMP/onnxruntime/lib/"
-
-      # Linux: same reason as build-backend — the pyke.io ONNX Runtime, linked statically, needs glibc
-      # 2.38 and does not link on the 22.04 runners. Link Microsoft's build dynamically; the libraries
-      # ride along as resources (/usr/lib/Project Orchestrator/, next to mcp_server, whose rpath is
-      # $ORIGIN), and the app's own rpath points there from /usr/bin (deb, rpm, and AppImage's usr/).
-      # CARGO_ENCODED_RUSTFLAGS: the path has a space, which RUSTFLAGS would split.
-      - name: Download ONNX Runtime for Linux
-        if: runner.os == 'Linux'
-        run: |
-          # ORT_VERSION (workflow env): API 24, what ort asks for (scripts/check-ort-api.sh); glibc 2.27
-          case "${{ matrix.target }}" in
-            x86_64-unknown-linux-gnu)  ORT_ARCH=x64 ;;
-            aarch64-unknown-linux-gnu) ORT_ARCH=aarch64 ;;
-            *) echo "::error::no ONNX Runtime archive for ${{ matrix.target }}"; exit 1 ;;
-          esac
-          curl -fsSL -o /tmp/onnxruntime.tgz \
-            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}.tgz"
-          mkdir -p "$RUNNER_TEMP/onnxruntime"
-          tar xzf /tmp/onnxruntime.tgz -C "$RUNNER_TEMP/onnxruntime" --strip-components=1
-          echo "ORT_LIB_LOCATION=$RUNNER_TEMP/onnxruntime/lib" >> "$GITHUB_ENV"
-          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
-          echo 'CARGO_ENCODED_RUSTFLAGS=-Clink-arg=-Wl,-rpath,$ORIGIN/../lib/Project Orchestrator' >> "$GITHUB_ENV"
-          ls -la "$RUNNER_TEMP/onnxruntime/lib/"
-          scripts/check-ort-api.sh "$RUNNER_TEMP/onnxruntime"
+          scripts/prebuilt-lib.sh use ort ${{ matrix.target }}
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # The path contains a space, which RUSTFLAGS would split: CARGO_ENCODED_RUSTFLAGS.
+            echo 'CARGO_ENCODED_RUSTFLAGS=-Clink-arg=-Wl,-rpath,$ORIGIN/../lib/Project Orchestrator' >> "$GITHUB_ENV"
+          fi
 
       # Reuse the mcp_server binary already compiled by build-backend
       # (same code, same target, same release profile — no need to compile again)
@@ -1970,8 +1893,18 @@ jobs:
             APP_VERSION=${{ env.RELEASE_TAG }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=release-docker
-          cache-to: type=gha,mode=max,scope=release-docker
+          # Two caches, both keyed by variant (the two variants shared one scope and evicted each
+          # other's layers, under a 10 GB cap):
+          #   - gha: the fast path within a branch;
+          #   - a cache IMAGE in GHCR: durable and versioned, with no 10 GB cap and no 7-day
+          #     eviction. This is what makes a release start warm even months later — the Docker
+          #     jobs were the slowest of v0.0.17 (214 min for api-only, 122 min for full).
+          cache-from: |
+            type=gha,scope=release-docker-${{ matrix.variant }}
+            type=registry,ref=ghcr.io/${{ github.repository }}-cache:docker-${{ matrix.variant }}
+          cache-to: |
+            type=gha,mode=max,scope=release-docker-${{ matrix.variant }}
+            type=registry,ref=ghcr.io/${{ github.repository }}-cache:docker-${{ matrix.variant }},mode=max
 
       # GHCR packages default to private, even when the repo is public.
       # Make the package public after the first push so `docker pull` works
