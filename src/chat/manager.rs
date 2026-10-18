@@ -1444,6 +1444,22 @@ fn is_subagent_spawn(request: &ChatRequest) -> bool {
         .is_some_and(|ctx| ctx.spawn_type == "conversation")
 }
 
+/// Whether the opening has a stated fallback in the session that sent it, so Auto on a
+/// locked vault is not refused but opens on that session's pair (`parent_pair_of`):
+/// an `Agent` call PO routes (`route_auto`, AUTO-SUB), or a delegation (`delegate_task`)
+/// sent by an open conversation (DELEG-500 — the vault re-locks at every restart, and
+/// each such delegation answered `credentials_locked`, a bare 500 until #825). A
+/// delegation nobody sent (a person, from the plan page) has no parent: refused as
+/// any Auto opening is.
+fn falls_back_on_parent(request: &ChatRequest) -> bool {
+    request.route_auto
+        || request
+            .spawned_by
+            .as_deref()
+            .and_then(parse_spawned_by)
+            .is_some_and(|ctx| ctx.spawn_type == "delegation" && ctx.parent_session_id.is_some())
+}
+
 /// Project id handed to every enrichment stage, resolved once from the
 /// session's slug. Stages that read only `project_id` (reflex) were skipped
 /// for every chat message when it was left `None`.
@@ -14982,7 +14998,15 @@ impl ChatManager {
         // AUTO-SUB (review point 1): the pair of the session that spawned this child. Read
         // once, applied below ONLY when the router applies nothing — the declared rules
         // must never substitute a default for a child whose parent named its engine.
-        let parent_fallback = if request.route_auto {
+        // Never over an engine the request itself names (DELEG-500): a delegation that
+        // names one keeps it, and its refusal stays the request's own. That includes the
+        // run level, where `inherit_parent_engine` already puts the parent's pair (and the
+        // task and persona levels): the fallback is for an opening that names NOTHING.
+        let names_an_engine = input.request.is_some()
+            || input.task.is_some()
+            || input.persona.is_some()
+            || input.run.is_some();
+        let parent_fallback = if falls_back_on_parent(request) && !names_an_engine {
             self.parent_pair_of(request).await
         } else {
             None
@@ -15819,7 +15843,9 @@ impl ChatManager {
         // is ALREADY open and holds a working pair. The fallback here is not silent, it is
         // that pair (`parent_pair_of`), so the refusal buys nothing: it would only make the
         // tool call fail on a vault that re-locked while the parent idled.
-        if vault_locked && !named && !request.route_auto {
+        // DELEG-500: a delegation sent by a conversation that is already open has the same
+        // stated fallback (`falls_back_on_parent`): it is not refused either.
+        if vault_locked && !named && !falls_back_on_parent(request) {
             let waits = match routing.claude_code_catalog.as_ref() {
                 Some(catalog) => catalog.waits_on_vault().await,
                 None => false,
