@@ -1289,6 +1289,11 @@ mod tests {
             &Method::DELETE,
             "/api/chat/search-engines/brave"
         ));
+        // The order the engines are queried in decides where a query goes first.
+        assert!(is_human_only_mutation(
+            &Method::PUT,
+            "/api/chat/search-engines"
+        ));
         assert!(
             is_human_only_mutation(&Method::POST, "/api/chat/sessions/abc/permissions/req-1"),
             "an agent must not answer permission prompts"
