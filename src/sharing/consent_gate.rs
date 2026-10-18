@@ -894,6 +894,9 @@ mod tests {
         let allow = owned_note(&store, Some(other), SharingConsent::ExplicitAllow, f).await;
         let deny = owned_note(&store, Some(other), SharingConsent::ExplicitDeny, f).await;
         let notset = owned_note(&store, Some(other), SharingConsent::NotSet, f).await;
+        // Above the coupling floor (MIN_COUPLING), which every cross-project
+        // read applies: this test is about consent, not coupling.
+        store.set_pairwise_coupling(me, other, 1.0).await;
 
         let ids = |v: Vec<crate::notes::PropagatedNote>| {
             let mut s: Vec<Uuid> = v.into_iter().map(|p| p.note.id).collect();

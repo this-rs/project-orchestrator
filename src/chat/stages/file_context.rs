@@ -137,34 +137,45 @@ impl FileContextStage {
     /// This closes the neural feedback loop — files that are profiled (surfaced
     /// in context) see their notes gain energy, making them more likely to
     /// survive synapse decay and emerge again in future sessions.
-    fn spawn_energy_boost(&self, file_path: &str) {
+    fn spawn_energy_boost(&self, file_path: &str, project_id: uuid::Uuid) {
         let graph = self.graph_store.clone();
         let path = file_path.to_string();
-        let boost = AutoReinforcementConfig::default().hook_energy_boost;
         tokio::spawn(async move {
-            match graph
-                .get_notes_for_entity(&crate::notes::EntityType::File, &path)
-                .await
-            {
-                Ok(notes) if !notes.is_empty() => {
-                    for note in &notes {
-                        let _ = graph.boost_energy(note.id, boost).await;
-                    }
-                    // If 2+ notes co-surfaced, reinforce their synapses
-                    if notes.len() >= 2 {
-                        let note_ids: Vec<uuid::Uuid> = notes.iter().map(|n| n.id).collect();
-                        let _ = graph.reinforce_synapses(&note_ids, 0.03).await;
-                    }
-                    debug!(
-                        path = %path,
-                        notes = notes.len(),
-                        "FileContextStage: energy boost for profiled file notes"
-                    );
-                }
-                _ => {} // No notes or error → skip silently
-            }
+            boost_profiled_file_notes(graph.as_ref(), &path, project_id).await;
         });
     }
+}
+
+/// Boost the notes anchored on a profiled file, and reinforce their synapses.
+///
+/// Only the notes of the session's project: the same path can anchor notes of
+/// other projects, which this session must not warm.
+async fn boost_profiled_file_notes(graph: &dyn GraphStore, path: &str, project_id: uuid::Uuid) {
+    let boost = AutoReinforcementConfig::default().hook_energy_boost;
+    let notes = match crate::notes::coactivation::project_notes_for_entity(
+        graph,
+        &crate::notes::EntityType::File,
+        path,
+        project_id,
+    )
+    .await
+    {
+        Ok(notes) if !notes.is_empty() => notes,
+        _ => return, // No notes or error → skip silently
+    };
+    for note in &notes {
+        let _ = graph.boost_energy(note.id, boost).await;
+    }
+    // If 2+ notes co-surfaced, reinforce their synapses
+    if notes.len() >= 2 {
+        let note_ids: Vec<uuid::Uuid> = notes.iter().map(|n| n.id).collect();
+        let _ = graph.reinforce_synapses(&note_ids, 0.03).await;
+    }
+    debug!(
+        path = %path,
+        notes = notes.len(),
+        "FileContextStage: energy boost for profiled file notes"
+    );
 }
 
 #[async_trait::async_trait]
@@ -212,7 +223,7 @@ impl ParallelEnrichmentStage for FileContextStage {
                     self.set_cache(path.clone(), formatted.clone());
                     profiles.push(formatted);
                     // Neural feedback: boost energy for notes linked to this file
-                    self.spawn_energy_boost(path);
+                    self.spawn_energy_boost(path, project_id);
                 }
                 Ok(None) => {
                     debug!(path = %path, "No ContextCard found for file");
@@ -333,6 +344,51 @@ mod tests {
         // Set → get returns value
         stage.set_cache("test/path.rs".to_string(), "profile text".to_string());
         assert_eq!(stage.get_cached("test/path.rs").unwrap(), "profile text");
+    }
+
+    /// T0f-bis: the energy boost of a profiled file warms the notes of the
+    /// session's project only (not another project's, not global notes).
+    #[tokio::test]
+    async fn profiled_file_boost_touches_only_the_session_project() {
+        let mock = crate::neo4j::mock::MockGraphStore::new();
+        let (mine, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let mut ids = Vec::new();
+        for owner in [Some(mine), Some(mine), Some(other), None] {
+            let mut n = crate::notes::Note::new(
+                owner,
+                crate::notes::NoteType::Guideline,
+                "n".into(),
+                "t".into(),
+            );
+            n.energy = 0.3;
+            n.last_activated = None;
+            mock.create_note(&n).await.unwrap();
+            mock.link_note_to_entity(
+                n.id,
+                &crate::notes::EntityType::File,
+                "src/shared.rs",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            ids.push(n.id);
+        }
+        boost_profiled_file_notes(&mock, "src/shared.rs", mine).await;
+        for id in &ids[..2] {
+            let n = mock.get_note(*id).await.unwrap().unwrap();
+            assert!(n.energy > 0.3, "own note boosted");
+        }
+        for id in &ids[2..] {
+            let n = mock.get_note(*id).await.unwrap().unwrap();
+            assert!(
+                (n.energy - 0.3).abs() < 1e-9,
+                "foreign/global note untouched"
+            );
+            assert!(n.last_activated.is_none());
+            assert!(mock.get_synapses(*id).await.unwrap().is_empty());
+        }
+        assert_eq!(mock.get_synapses(ids[0]).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -4818,9 +4818,43 @@ impl GraphStore for MockGraphStore {
         Ok((page, total))
     }
 
-    async fn get_decision_project_id(&self, _decision_id: Uuid) -> Result<Option<String>> {
-        // Mock doesn't track Decision→Task→Plan→Project chain
-        Ok(None)
+    async fn get_decision_project_id(&self, decision_id: Uuid) -> Result<Option<String>> {
+        Ok(self
+            .get_decision_project_ids(&[decision_id])
+            .await?
+            .remove(&decision_id)
+            .map(|p| p.to_string()))
+    }
+
+    async fn get_decision_project_ids(&self, decision_ids: &[Uuid]) -> Result<HashMap<Uuid, Uuid>> {
+        // Same chain as the Cypher (Project→Plan→Task→Decision); several
+        // projects → the smallest id, like `min(proj.id)`.
+        let task_decisions = self.task_decisions.read().await;
+        let plan_tasks = self.plan_tasks.read().await;
+        let project_plans = self.project_plans.read().await;
+        let mut out = HashMap::new();
+        for did in decision_ids {
+            let project = task_decisions
+                .iter()
+                .filter(|(_, ds)| ds.contains(did))
+                .flat_map(|(t, _)| {
+                    plan_tasks
+                        .iter()
+                        .filter(move |(_, ts)| ts.contains(t))
+                        .map(|(p, _)| *p)
+                })
+                .flat_map(|plan| {
+                    project_plans
+                        .iter()
+                        .filter(move |(_, ps)| ps.contains(&plan))
+                        .map(|(pr, _)| *pr)
+                })
+                .min_by_key(|p| p.to_string());
+            if let Some(p) = project {
+                out.insert(*did, p);
+            }
+        }
+        Ok(out)
     }
 
     async fn update_decision(
@@ -6679,7 +6713,6 @@ impl GraphStore for MockGraphStore {
                         let weighted = crate::notes::PropagationScope::weigh_foreign(
                             pn.relevance_score,
                             coupling,
-                            force_cross_project,
                             min_score,
                         )?;
                         pn.relevance_score = weighted;

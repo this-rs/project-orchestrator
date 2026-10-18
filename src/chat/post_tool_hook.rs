@@ -11,7 +11,6 @@
 
 use crate::neo4j::traits::GraphStore;
 use crate::neurons::AutoReinforcementConfig;
-use crate::skills::activation::spawn_hook_reinforcement;
 use crate::skills::hook_extractor::{
     enrich_redirect_with_context_card, extract_file_context, generate_redirect_suggestion,
     EnrichedRedirectSuggestion,
@@ -135,7 +134,7 @@ impl PostToolUseRedirectHook {
             None
         } else {
             // Fire-and-forget: reinforce notes linked to this file (Hebbian feedback)
-            self.spawn_file_reinforcement(file_path);
+            self.spawn_file_reinforcement(file_path, project_id);
 
             Some(format!(
                 "## 📝 Post-Edit Intelligence\n{}",
@@ -146,31 +145,48 @@ impl PostToolUseRedirectHook {
 
     /// Fire-and-forget Hebbian reinforcement for notes linked to a file.
     /// Fetches note IDs then reinforces synapses between co-surfaced notes.
-    fn spawn_file_reinforcement(&self, file_path: &str) {
+    fn spawn_file_reinforcement(&self, file_path: &str, project_id: uuid::Uuid) {
         let graph = self.graph_store.clone();
         let path = file_path.to_string();
         tokio::spawn(async move {
-            match graph
-                .get_notes_for_entity(&crate::notes::EntityType::File, &path)
-                .await
-            {
-                Ok(notes) if notes.len() >= 2 => {
-                    let note_ids: Vec<uuid::Uuid> = notes.iter().map(|n| n.id).collect();
-                    let config = AutoReinforcementConfig::default();
-                    spawn_hook_reinforcement(graph, note_ids, config);
-                }
-                Ok(notes) if notes.len() == 1 => {
-                    // Single note: just boost energy, no synapse reinforcement needed
-                    let _ = graph
-                        .boost_energy(
-                            notes[0].id,
-                            AutoReinforcementConfig::default().hook_energy_boost,
-                        )
-                        .await;
-                }
-                _ => {} // No notes or error → skip silently
-            }
+            reinforce_file_notes(graph.as_ref(), &path, project_id).await;
         });
+    }
+}
+
+/// Hebbian reinforcement of the notes anchored on a file the agent touched.
+///
+/// Only the notes of the session's project: the same path can anchor notes of
+/// other projects, which this session must not warm.
+async fn reinforce_file_notes(graph: &dyn GraphStore, path: &str, project_id: uuid::Uuid) {
+    let config = AutoReinforcementConfig::default();
+    match crate::notes::coactivation::project_notes_for_entity(
+        graph,
+        &crate::notes::EntityType::File,
+        path,
+        project_id,
+    )
+    .await
+    {
+        Ok(notes) if notes.len() >= 2 => {
+            if !config.enabled {
+                return;
+            }
+            let note_ids: Vec<uuid::Uuid> = notes.iter().map(|n| n.id).collect();
+            if let Err(e) =
+                crate::skills::activation::reinforce_hook_activation(graph, &note_ids, &config)
+                    .await
+            {
+                debug!(path = %path, error = %e, "PostToolUse file reinforcement failed");
+            }
+        }
+        Ok(notes) if notes.len() == 1 => {
+            // Single note: just boost energy, no synapse reinforcement needed
+            let _ = graph
+                .boost_energy(notes[0].id, config.hook_energy_boost)
+                .await;
+        }
+        _ => {} // No notes or error → skip silently
     }
 }
 
@@ -257,7 +273,7 @@ impl nexus_claude::HookCallback for PostToolUseRedirectHook {
 
                         // Fire-and-forget: reinforce notes linked to the file being searched
                         if let Some(ref fp) = file_path {
-                            self.spawn_file_reinforcement(fp);
+                            self.spawn_file_reinforcement(fp, project_id);
                         }
 
                         debug!(
@@ -312,6 +328,72 @@ mod tests {
 
     fn test_context() -> HookContext {
         HookContext { signal: None }
+    }
+
+    /// T0f-bis: a touched file warms the notes of the session's project only.
+    #[tokio::test]
+    async fn file_reinforcement_touches_only_the_session_project() {
+        let mock = MockGraphStore::new();
+        let (mine, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let mut ids = Vec::new();
+        for owner in [Some(mine), Some(mine), Some(other), Some(other), None] {
+            let mut n = crate::notes::Note::new(
+                owner,
+                crate::notes::NoteType::Guideline,
+                "n".into(),
+                "t".into(),
+            );
+            n.energy = 0.3;
+            n.last_activated = None;
+            mock.create_note(&n).await.unwrap();
+            mock.link_note_to_entity(
+                n.id,
+                &crate::notes::EntityType::File,
+                "src/x.rs",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            ids.push(n.id);
+        }
+        reinforce_file_notes(&mock, "src/x.rs", mine).await;
+        for id in &ids[..2] {
+            assert!(mock.get_note(*id).await.unwrap().unwrap().energy > 0.3);
+        }
+        for id in &ids[2..] {
+            let n = mock.get_note(*id).await.unwrap().unwrap();
+            assert!(
+                (n.energy - 0.3).abs() < 1e-9,
+                "foreign/global note untouched"
+            );
+            assert!(n.last_activated.is_none());
+            assert!(mock.get_synapses(*id).await.unwrap().is_empty());
+        }
+
+        // One own note + foreign ones: the lone own note alone is boosted.
+        let lone = uuid::Uuid::new_v4();
+        let mut n = crate::notes::Note::new(
+            Some(lone),
+            crate::notes::NoteType::Guideline,
+            "n".into(),
+            "t".into(),
+        );
+        n.energy = 0.3;
+        mock.create_note(&n).await.unwrap();
+        mock.link_note_to_entity(
+            n.id,
+            &crate::notes::EntityType::File,
+            "src/x.rs",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        reinforce_file_notes(&mock, "src/x.rs", lone).await;
+        assert!(mock.get_note(n.id).await.unwrap().unwrap().energy > 0.3);
+        let f = mock.get_note(ids[2]).await.unwrap().unwrap();
+        assert!((f.energy - 0.3).abs() < 1e-9);
     }
 
     #[tokio::test]

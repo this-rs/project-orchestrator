@@ -1763,7 +1763,7 @@ impl Neo4jClient {
 
         // Cross-project coupling weighting (biomimicry P2P coupling)
         // If source_project_id is set, weight notes from other projects by coupling_strength.
-        // Projects with coupling < 0.2 are suppressed unless force_cross_project is true.
+        // Projects with coupling < 0.2 are suppressed (PropagationScope::weigh_foreign).
         if let (Some(src_pid), crate::notes::PropagationScope::CrossProject(_)) =
             (source_project_id, scope)
         {
@@ -1814,7 +1814,6 @@ impl Neo4jClient {
                         match crate::notes::PropagationScope::weigh_foreign(
                             pn.relevance_score,
                             coupling,
-                            force_cross_project,
                             min_score,
                         ) {
                             Some(weighted) => {

@@ -8,6 +8,13 @@ use neo4rs::query;
 use std::str::FromStr;
 use uuid::Uuid;
 
+/// The one traversal from a decision to its project, binding `d` and `proj`:
+/// a plan is attached to its project by `(Project)-[:HAS_PLAN]->(Plan)` (no
+/// `(Plan)-[:BELONGS_TO]->(Project)` edge is ever written, and a task carries
+/// no `plan_id` property: a filter written that way matched nothing).
+pub(crate) const DECISION_PROJECT_PATH: &str =
+    "(proj:Project)-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(:Task)-[:INFORMED_BY]->(d:Decision)";
+
 /// Map a client-supplied entity type to its Neo4j label. The label is spliced
 /// into the Cypher (labels cannot be parameters), so anything that is not a
 /// known [`EntityType`] is rejected rather than interpolated.
@@ -410,16 +417,18 @@ impl Neo4jClient {
         };
 
         let cypher = if project_id.is_some() {
-            r#"
+            // Filter by project through the one decision→project traversal
+            // (an EXISTS: a decision informing several tasks is one row).
+            format!(
+                r#"
             CALL db.index.vector.queryNodes('decision_embedding', $fetch_limit, $embedding)
             YIELD node AS d, score
-            // Filter by project: Decision is linked via Task→Plan→Project
-            MATCH (t:Task)-[:INFORMED_BY]->(d)
-            MATCH (p:Plan {id: t.plan_id})-[:BELONGS_TO]->(proj:Project {id: $project_id})
+            WHERE EXISTS {{ MATCH {DECISION_PROJECT_PATH} WHERE proj.id = $project_id }}
             RETURN d, score
             ORDER BY score DESC
             LIMIT $limit
             "#
+            )
         } else {
             r#"
             CALL db.index.vector.queryNodes('decision_embedding', $fetch_limit, $embedding)
@@ -427,9 +436,10 @@ impl Neo4jClient {
             RETURN d, score
             ORDER BY score DESC
             "#
+            .to_string()
         };
 
-        let mut q = query(cypher)
+        let mut q = query(&cypher)
             .param("fetch_limit", fetch_limit as i64)
             .param("limit", limit as i64)
             .param("embedding", embedding_f64);
@@ -510,23 +520,47 @@ impl Neo4jClient {
     ///
     /// Returns `None` if the decision or project chain doesn't exist.
     pub async fn get_decision_project_id(&self, decision_id: Uuid) -> Result<Option<String>> {
-        let q = query(
-            r#"
-            MATCH (proj:Project)-[:HAS_PLAN]->(plan:Plan)
-                  -[:HAS_TASK]->(task:Task)-[:INFORMED_BY]->(d:Decision {id: $id})
-            RETURN proj.id AS project_id
-            LIMIT 1
-            "#,
-        )
-        .param("id", decision_id.to_string());
+        Ok(self
+            .get_decision_project_ids(&[decision_id])
+            .await?
+            .remove(&decision_id)
+            .map(|p| p.to_string()))
+    }
 
-        let mut result = self.graph.execute(q).await?;
-        if let Some(row) = result.next().await? {
-            let pid: String = row.get("project_id")?;
-            Ok(Some(pid))
-        } else {
-            Ok(None)
+    /// Project of each decision, in ONE query (`UNWIND`), through the one
+    /// traversal every decision→project lookup uses
+    /// ([`DECISION_PROJECT_PATH`]). A decision whose plan has no project (or
+    /// an unknown id) is absent from the map: its project is not verifiable.
+    /// A decision informing tasks of several projects maps to the smallest
+    /// project id (deterministic; same rule as the mock).
+    pub async fn get_decision_project_ids(
+        &self,
+        decision_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Uuid>> {
+        let mut out = std::collections::HashMap::new();
+        if decision_ids.is_empty() {
+            return Ok(out);
         }
+        let ids: Vec<String> = decision_ids.iter().map(|id| id.to_string()).collect();
+        let cypher = format!(
+            r#"
+            UNWIND $ids AS did
+            MATCH {DECISION_PROJECT_PATH}
+            WHERE d.id = did
+            WITH did, min(proj.id) AS project_id
+            RETURN did, project_id
+            "#
+        );
+        let q = query(&cypher).param("ids", ids);
+        let mut result = self.graph.execute(q).await?;
+        while let Some(row) = result.next().await? {
+            let did: String = row.get("did")?;
+            let pid: String = row.get("project_id")?;
+            if let (Ok(d), Ok(p)) = (Uuid::parse_str(&did), Uuid::parse_str(&pid)) {
+                out.insert(d, p);
+            }
+        }
+        Ok(out)
     }
 
     /// Create an AFFECTS relation from a Decision to any entity in the graph.

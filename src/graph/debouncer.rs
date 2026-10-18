@@ -360,71 +360,90 @@ impl NeuralReinforcementDebouncer {
 
             // Process each project's accumulated file paths
             for (project_id, file_paths) in &pending {
-                let total_files = file_paths.len();
-                let mut all_note_ids: Vec<Uuid> = Vec::new();
-                let mut boost_count = 0u64;
+                reinforce_project_files(graph_store.as_ref(), &config, *project_id, file_paths)
+                    .await;
+            }
+        }
+    }
+}
 
-                for file_path in file_paths {
-                    match graph_store
-                        .get_notes_for_entity(&crate::notes::EntityType::File, file_path)
+/// One project's batch of the debouncer: boost the notes anchored on the
+/// committed files and reinforce the synapses between them.
+///
+/// Only the notes of the committing project: the same path can anchor notes
+/// of other projects, which a commit of this project must not warm.
+/// Returns `(notes boosted, synapses reinforced)`.
+async fn reinforce_project_files(
+    graph_store: &dyn GraphStore,
+    config: &crate::neurons::AutoReinforcementConfig,
+    project_id: Uuid,
+    file_paths: &HashSet<String>,
+) -> (u64, usize) {
+    let total_files = file_paths.len();
+    let mut all_note_ids: Vec<Uuid> = Vec::new();
+    let mut boost_count = 0u64;
+
+    for file_path in file_paths {
+        match crate::notes::coactivation::project_notes_for_entity(
+            graph_store,
+            &crate::notes::EntityType::File,
+            file_path,
+            project_id,
+        )
+        .await
+        {
+            Ok(notes) => {
+                for note in &notes {
+                    if let Err(e) = graph_store
+                        .boost_energy(note.id, config.commit_energy_boost)
                         .await
                     {
-                        Ok(notes) => {
-                            for note in &notes {
-                                if let Err(e) = graph_store
-                                    .boost_energy(note.id, config.commit_energy_boost)
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        note_id = %note.id, error = %e,
-                                        "Neural reinforcement debouncer: energy boost failed"
-                                    );
-                                } else {
-                                    boost_count += 1;
-                                }
-                                all_note_ids.push(note.id);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                file = %file_path, error = %e,
-                                "Neural reinforcement debouncer: get_entity_notes failed"
-                            );
-                        }
+                        tracing::warn!(
+                            note_id = %note.id, error = %e,
+                            "Neural reinforcement debouncer: energy boost failed"
+                        );
+                    } else {
+                        boost_count += 1;
                     }
+                    all_note_ids.push(note.id);
                 }
-
-                // Hebbian synapse reinforcement
-                let mut synapse_count = 0usize;
-                if all_note_ids.len() >= 2 {
-                    all_note_ids.sort();
-                    all_note_ids.dedup();
-                    if all_note_ids.len() >= 2 {
-                        match graph_store
-                            .reinforce_synapses(&all_note_ids, config.commit_synapse_boost)
-                            .await
-                        {
-                            Ok(count) => synapse_count = count,
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "Neural reinforcement debouncer: synapse reinforcement failed"
-                                );
-                            }
-                        }
-                    }
-                }
-
-                tracing::info!(
-                    project_id = %project_id,
-                    files = total_files,
-                    notes_boosted = boost_count,
-                    synapses_reinforced = synapse_count,
-                    "Neural reinforcement debouncer: batch complete"
+            }
+            Err(e) => {
+                tracing::debug!(
+                    file = %file_path, error = %e,
+                    "Neural reinforcement debouncer: get_entity_notes failed"
                 );
             }
         }
     }
+
+    // Hebbian synapse reinforcement
+    let mut synapse_count = 0usize;
+    all_note_ids.sort();
+    all_note_ids.dedup();
+    if all_note_ids.len() >= 2 {
+        match graph_store
+            .reinforce_synapses(&all_note_ids, config.commit_synapse_boost)
+            .await
+        {
+            Ok(count) => synapse_count = count,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Neural reinforcement debouncer: synapse reinforcement failed"
+                );
+            }
+        }
+    }
+
+    tracing::info!(
+        project_id = %project_id,
+        files = total_files,
+        notes_boosted = boost_count,
+        synapses_reinforced = synapse_count,
+        "Neural reinforcement debouncer: batch complete"
+    );
+    (boost_count, synapse_count)
 }
 
 #[cfg(test)]
@@ -434,6 +453,46 @@ mod tests {
     use crate::graph::models::{CodeHealthReport, GraphAnalytics};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// T0f-bis: a commit of one project warms the notes of that project only.
+    #[tokio::test]
+    async fn commit_reinforcement_touches_only_the_committing_project() {
+        use crate::notes::{EntityType, Note, NoteType};
+        let mock = crate::neo4j::mock::MockGraphStore::new();
+        let (mine, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut ids = Vec::new();
+        for (owner, path) in [
+            (Some(mine), "src/a.rs"),
+            (Some(mine), "src/b.rs"),
+            (Some(other), "src/a.rs"),
+            (None, "src/b.rs"),
+        ] {
+            let mut n = Note::new(owner, NoteType::Guideline, "n".into(), "t".into());
+            n.energy = 0.3;
+            n.last_activated = None;
+            mock.create_note(&n).await.unwrap();
+            mock.link_note_to_entity(n.id, &EntityType::File, path, None, None)
+                .await
+                .unwrap();
+            ids.push(n.id);
+        }
+        let files: HashSet<String> = ["src/a.rs".to_string(), "src/b.rs".to_string()].into();
+        let cfg = crate::neurons::AutoReinforcementConfig::default();
+        let (boosted, synapses) = reinforce_project_files(&mock, &cfg, mine, &files).await;
+        assert_eq!(boosted, 2);
+        assert_eq!(synapses, 2);
+        for id in &ids[..2] {
+            assert!(mock.get_note(*id).await.unwrap().unwrap().energy > 0.3);
+        }
+        for id in &ids[2..] {
+            let n = mock.get_note(*id).await.unwrap().unwrap();
+            assert!(
+                (n.energy - 0.3).abs() < 1e-9,
+                "foreign/global note untouched"
+            );
+            assert!(n.last_activated.is_none());
+        }
+    }
 
     /// MockAnalyticsEngine with a call counter
     struct CountingAnalyticsEngine {
