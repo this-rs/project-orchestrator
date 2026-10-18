@@ -1,0 +1,106 @@
+name: Prebuilt native libraries
+
+# THE PRODUCER of the versioned artifacts release.yml consumes. It never runs during a release:
+# release.yml only downloads what is published here, and builds locally only if it is missing.
+#
+# Why a separate workflow and a library RELEASE rather than actions/cache:
+#   - a tag-triggered run starts with an empty cache, so a release never saw the cache a branch
+#     had warmed — it rebuilt ONNX Runtime for macOS Intel (≈ 1 h) on every release;
+#   - GitHub evicts a cache entry after 7 idle days, which is exactly the gap between releases;
+#   - a release asset lives as long as its tag, is versioned, and is readable by any run.
+#
+# The library release is tagged `lib/<lib>-<version>` and marked PRERELEASE, so it can never
+# become /releases/latest (install.sh and the Homebrew formula read that) and never matches the
+# `v*` tag trigger of release.yml.
+#
+# Triggered by a change of the pins (scripts/native-libs.env), of the resolver or of a build
+# recipe; idempotent on every other run (an existing asset is left alone unless force).
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild and re-upload even when the asset already exists"
+        required: false
+        default: false
+        type: boolean
+  push:
+    # TEMPORARY: the branch of the PR that introduces this file, so the producer can be proven
+    # before it lands on main (Workflow_dispatch only accepts a workflow present on the default
+    # branch). Removed before merge.
+    branches: [main, feat/release-prebuilt-libs]
+    paths:
+      - scripts/native-libs.env
+      - scripts/prebuilt-lib.sh
+      - scripts/build-onnxruntime-macos.sh
+      - .github/workflows/prebuilt-libs.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: prebuilt-libs
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-22.04
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      mirror: ${{ steps.plan.outputs.mirror }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          force=""
+          if [ "${{ inputs.force }}" = "true" ]; then force="--force"; fi
+          build=$(scripts/prebuilt-lib.sh plan-build --json $force)
+          mirror=$(scripts/prebuilt-lib.sh plan-mirror --json $force)
+          echo "to build : $build"
+          echo "to mirror: $mirror"
+          { echo "build=$build"; echo "mirror=$mirror"; } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.lib }} ${{ matrix.version }} ${{ matrix.target }}
+    needs: plan
+    if: needs.plan.outputs.build != '[]'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.build) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Host == target: ONNX Runtime for macOS Intel is built on the Intel runner, so nothing is
+      # cross-compiled (a cross-built library is the wrong architecture at runtime).
+      - name: Build
+        run: scripts/prebuilt-lib.sh build "${{ matrix.lib }}" "${{ matrix.target }}" "$RUNNER_TEMP/lib-artifact"
+
+      - name: Publish to the library release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/prebuilt-lib.sh publish "${{ matrix.lib }}" "${{ matrix.target }}" "$RUNNER_TEMP/lib-artifact" --force
+
+  mirror:
+    name: Mirror ${{ matrix.lib }} ${{ matrix.version }} ${{ matrix.target }}
+    needs: plan
+    if: needs.plan.outputs.mirror != '[]'
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.mirror) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Upstream serves this one today. Copy it into the library release anyway: a release then has
+      # exactly ONE source, and a deletion or a rate-limit upstream cannot break a build.
+      - name: Mirror
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/prebuilt-lib.sh mirror "${{ matrix.lib }}" "${{ matrix.target }}"

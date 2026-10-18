@@ -14,11 +14,20 @@
 # The macOS floor is MACOSX_DEPLOYMENT_TARGET (default 13.4, the promise of check-os-floor.sh
 # for macos-x86_64). Microsoft builds 1.24 for 14.0; if 1.24 stops compiling for 13.4, raising
 # this means raising the promise too (and the Macs below go to the legacy build).
+#
+# Smaller and faster than upstream's own build: ORT_DISABLE_ML_OPS=1 (the default) passes
+# --disable_ml_ops, which drops the ai.onnx.ml kernels (SVM, TreeEnsemble, scalers...). No
+# embedding model fastembed ships uses them — they are transformers, standard ONNX ops — so the
+# only thing lost is the classic-ML surface nobody links. Set ORT_DISABLE_ML_OPS=0 to get the
+# full operator set back if a model ever needs one. Expected, not measured: 15-25 % of the build
+# time and a smaller dylib; the release prints the real duration either way.
 set -euo pipefail
 
 version="${1:?usage: build-onnxruntime-macos.sh <version> <out dir>}"
 out="${2:?usage: build-onnxruntime-macos.sh <version> <out dir>}"
 floor="${MACOSX_DEPLOYMENT_TARGET:-13.4}"
+ml_ops_flag=()
+[ "${ORT_DISABLE_ML_OPS:-1}" = 0 ] || ml_ops_flag=(--disable_ml_ops)
 export MACOSX_DEPLOYMENT_TARGET="$floor"
 
 [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = x86_64 ] \
@@ -29,7 +38,8 @@ rm -rf "$src"
 git clone --quiet --depth 1 --branch "v${version}" --recurse-submodules --shallow-submodules \
   https://github.com/microsoft/onnxruntime "$src"
 
-echo "build-onnxruntime-macos: ONNX Runtime ${version}, x86_64, macOS ${floor}, $(sysctl -n hw.ncpu) cores"
+echo "build-onnxruntime-macos: ONNX Runtime ${version}, x86_64, macOS ${floor}, $(sysctl -n hw.ncpu) cores, ml-ops ${ORT_DISABLE_ML_OPS:-1} (0 = keep the ai.onnx.ml kernels)"
+started=$(date +%s)
 ( cd "$src" && ./build.sh \
     --config Release \
     --build_dir "$src/b" \
@@ -38,10 +48,12 @@ echo "build-onnxruntime-macos: ONNX Runtime ${version}, x86_64, macOS ${floor}, 
     --skip_tests \
     --skip_submodule_sync \
     --compile_no_warning_as_error \
+    ${ml_ops_flag[@]+"${ml_ops_flag[@]}"} \
     --cmake_extra_defines \
       CMAKE_OSX_ARCHITECTURES=x86_64 \
       CMAKE_OSX_DEPLOYMENT_TARGET="$floor" \
       onnxruntime_BUILD_UNIT_TESTS=OFF )
+echo "build-onnxruntime-macos: compiled in $(( ($(date +%s) - started) / 60 )) min"
 
 rel="$src/b/Release"
 lib="$rel/libonnxruntime.${version}.dylib"
