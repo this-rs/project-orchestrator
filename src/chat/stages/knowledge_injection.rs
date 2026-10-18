@@ -37,6 +37,7 @@ use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
 use crate::neurons::intent::{IntentDetector, QueryIntentMode};
 use crate::notes::models::EntityType as NoteEntityType;
+use crate::sharing::consent_gate::ConsentReader;
 
 // ============================================================================
 // Configuration
@@ -200,9 +201,15 @@ fn recency_factor(freshest: chrono::DateTime<chrono::Utc>) -> f64 {
 ///   knowledge wins and an old instruction must not come back;
 /// - a note the user referenced by id is kept but labelled as no longer
 ///   applying (pointing to its replacement when there is one);
-/// - scores get the recency factor.
+/// - scores get the recency factor;
+/// - the consent predicate (`sharing::consent_gate`) is applied to every
+///   note, whatever its source: a note of another project reaches the prompt
+///   only if `may_read` allows it for `reader` (the conversation's project).
+///   Entity lookups by file path or symbol name and UUID references are not
+///   scoped by project, so this is the one place every source goes through.
 async fn keep_current_notes(
     graph: &dyn crate::neo4j::traits::GraphStore,
+    reader: Option<Uuid>,
     notes: Vec<ScoredNote>,
 ) -> Vec<ScoredNote> {
     let lookups = notes.iter().map(|n| async move {
@@ -212,11 +219,20 @@ async fn keep_current_notes(
         }
     });
     let current = futures::future::join_all(lookups).await;
-    notes
+    let mut consent = ConsentReader::new(graph, reader);
+    let mut readable = Vec::with_capacity(current.len());
+    for (scored, note) in notes.into_iter().zip(current) {
+        let Some(note) = note else { continue };
+        let verdict = consent.note(&note).await;
+        if verdict.is_allow() {
+            readable.push((scored, note));
+        } else {
+            debug!(note_id = %note.id, ?verdict, source = scored.source, "Note refused by consent");
+        }
+    }
+    readable
         .into_iter()
-        .zip(current)
         .filter_map(|(mut scored, note)| {
-            let note = note?; // deleted since indexing
             if !crate::notes::is_current_knowledge(&note) {
                 if scored.source != "uuid_reference" {
                     return None;
@@ -237,6 +253,28 @@ async fn keep_current_notes(
             Some(scored)
         })
         .collect()
+}
+
+/// Consent for a decision the user referenced by UUID (BM25 decisions are
+/// already scoped to the project by the index). The owner is the project of
+/// the decision's task chain; a decision whose project is not verifiable is
+/// refused (owner unknown), like any cross-project read without an owner.
+async fn may_inject_referenced_decision(
+    graph: &dyn crate::neo4j::traits::GraphStore,
+    consent: &mut ConsentReader<'_>,
+    decision: &crate::neo4j::models::DecisionNode,
+) -> bool {
+    let owner = match graph.get_decision_project_id(decision.id).await {
+        Ok(p) => p.and_then(|p| Uuid::parse_str(&p).ok()),
+        Err(e) => {
+            warn!(decision_id = %decision.id, error = %e, "consent: decision project unreadable");
+            None
+        }
+    };
+    consent
+        .decision(decision.sharing_consent, owner)
+        .await
+        .is_allow()
 }
 
 /// Same check for decisions: only proposed/accepted decisions are injected
@@ -567,6 +605,9 @@ impl KnowledgeInjectionStage {
         let uuid_lookup_future = async move {
             let mut notes: Vec<ScoredNote> = Vec::new();
             let mut decisions: Vec<ScoredDecision> = Vec::new();
+            // A UUID is not scoped by any index: its decision may belong to
+            // another project (notes are checked in keep_current_notes).
+            let mut consent = ConsentReader::new(graph_clone2.as_ref(), _project_id);
 
             for uuid in &uuids {
                 // Try as note first
@@ -590,6 +631,16 @@ impl KnowledgeInjectionStage {
 
                 // Try as decision
                 match graph_clone2.get_decision(*uuid).await {
+                    Ok(Some(decision))
+                        if !may_inject_referenced_decision(
+                            graph_clone2.as_ref(),
+                            &mut consent,
+                            &decision,
+                        )
+                        .await =>
+                    {
+                        debug!(uuid = %uuid, "Referenced decision refused by consent");
+                    }
                     Ok(Some(decision)) => {
                         decisions.push(ScoredDecision {
                             id: decision.id.to_string(),
@@ -796,7 +847,7 @@ impl KnowledgeInjectionStage {
         // Collect and sort notes by score descending — after the currency
         // check against Neo4j (see keep_current_notes).
         let notes: Vec<ScoredNote> = note_map.into_values().collect();
-        let mut notes = keep_current_notes(self.graph.as_ref(), notes).await;
+        let mut notes = keep_current_notes(self.graph.as_ref(), _project_id, notes).await;
         notes.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -1290,6 +1341,7 @@ mod tests {
 
         let kept = keep_current_notes(
             &store,
+            project,
             vec![
                 scored(old.id, "bm25_search"),
                 scored(archived.id, "bm25_search"),
@@ -1347,6 +1399,81 @@ mod tests {
             kept.iter().map(|d| d.id.clone()).collect::<Vec<_>>(),
             vec![accepted.id.to_string()]
         );
+    }
+
+    /// T0d-bis: entity lookups (file path, symbol name) and UUID references are
+    /// not scoped by project. A note of another project reaches the prompt
+    /// only when the consent predicate allows it; same-project and global
+    /// notes are unaffected (consent protects sharing beyond the project).
+    #[tokio::test]
+    async fn test_a_note_of_another_project_reaches_the_prompt_only_with_consent() {
+        use crate::episodes::distill_models::SharingConsent;
+        use crate::notes::{Note, NoteType};
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (me, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut ids = Vec::new();
+        for (owner, consent, tag) in [
+            (Some(me), SharingConsent::ExplicitDeny, "LOCAL_DENY"),
+            (None, SharingConsent::NotSet, "GLOBAL_NOTSET"),
+            (Some(other), SharingConsent::NotSet, "FOREIGN_NOTSET"),
+            (Some(other), SharingConsent::ExplicitDeny, "FOREIGN_DENY"),
+            (Some(other), SharingConsent::ExplicitAllow, "FOREIGN_ALLOW"),
+        ] {
+            let mut n = Note::new(owner, NoteType::Gotcha, tag.into(), "t".into());
+            n.sharing_consent = consent;
+            graph.create_note(&n).await.unwrap();
+            graph
+                .link_note_to_entity(n.id, &NoteEntityType::File, "src/shared.rs", None, None)
+                .await
+                .unwrap();
+            ids.push(n.id);
+        }
+        // Referenced by UUID too: still refused.
+        let mut by_id = Note::new(
+            Some(other),
+            NoteType::Gotcha,
+            "FOREIGN_BY_UUID".into(),
+            "t".into(),
+        );
+        by_id.sharing_consent = SharingConsent::NotSet;
+        graph.create_note(&by_id).await.unwrap();
+
+        let stage = KnowledgeInjectionStage {
+            graph,
+            search: Arc::new(crate::meilisearch::mock::MockSearchStore::new()),
+            config: KnowledgeInjectionConfig::default(),
+            collector: None,
+        };
+        // all five notes of the file are candidates (no per-entity cut)
+        let config = KnowledgeInjectionConfig {
+            max_entity_notes: 10,
+            ..KnowledgeInjectionConfig::default()
+        };
+        let message = format!("Look at src/shared.rs and note {}", by_id.id);
+        let entities = entity_extractor::extract_entities(&message);
+        let uuids = KnowledgeInjectionStage::extract_uuids(&message);
+        let (notes, ..) = stage
+            .query_knowledge_with_config(&message, Some("me"), Some(me), &entities, &uuids, &config)
+            .await;
+        let text: Vec<&str> = notes.iter().map(|n| n.content.as_str()).collect();
+        for kept in ["LOCAL_DENY", "GLOBAL_NOTSET", "FOREIGN_ALLOW"] {
+            assert!(text.contains(&kept), "{kept} missing from {text:?}");
+        }
+        for refused in ["FOREIGN_NOTSET", "FOREIGN_DENY", "FOREIGN_BY_UUID"] {
+            assert!(!text.contains(&refused), "{refused} leaked into {text:?}");
+        }
+    }
+
+    /// T0d-bis: a decision referenced by UUID whose project is not verifiable
+    /// is refused, whatever its own consent (owner unknown fails closed).
+    #[tokio::test]
+    async fn test_a_referenced_decision_without_verifiable_project_is_refused() {
+        use crate::episodes::distill_models::SharingConsent;
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let mut d = crate::test_helpers::test_decision("use A", "because");
+        d.sharing_consent = SharingConsent::ExplicitAllow;
+        let mut consent = ConsentReader::new(&store, Some(Uuid::new_v4()));
+        assert!(!may_inject_referenced_decision(&store, &mut consent, &d).await);
     }
 
     // ── truncate_content tests ──────────────────────────────────────────
