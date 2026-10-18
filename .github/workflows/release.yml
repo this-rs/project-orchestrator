@@ -25,6 +25,12 @@ env:
   FRONTEND_REPO: this-rs/project-orchestrator-frontend
   # Resolve the release tag: use the workflow_dispatch input if provided, otherwise GITHUB_REF_NAME (from tag push)
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  # ONNX Runtime linked DYNAMICALLY (Linux, macOS Intel; Windows and macOS arm64 link ort-sys's own,
+  # statically). It must serve the API version `ort` asks for — fastembed turns on `api-24` — or local
+  # embeddings panic at start: scripts/check-ort-api.sh enforces it. Linux takes Microsoft's archive;
+  # macOS Intel is built by scripts/build-onnxruntime-macos.sh (Microsoft stopped osx-x86_64 at 1.23).
+  # Raising it: also VERS_<version> in Cargo.toml (generate-rpm.provides).
+  ORT_VERSION: "1.24.2"
 
 jobs:
   # ==========================================================================
@@ -171,9 +177,10 @@ jobs:
           # cross-mksnapshot it looks for (gn_out/clang_arm64_v8_x64/mksnapshot) is never built;
           # the x86_64 binary then carries an arm64 blob and the embedded browser crashes at
           # runtime. Building ON x86_64 makes host == target, so the snapshot is right.
-          # ort-sys has NO prebuilt ONNX Runtime for this target. We download
-          # the official Microsoft release and use dynamic linking via
-          # ORT_LIB_LOCATION + ORT_PREFER_DYNAMIC_LINK (see step below).
+          # ort-sys has NO prebuilt ONNX Runtime for this target, and Microsoft stopped
+          # publishing osx-x86_64 at 1.23 (ort needs API 24, i.e. 1.24+). We BUILD it
+          # (scripts/build-onnxruntime-macos.sh, cached) and link it dynamically via
+          # ORT_LIB_LOCATION + ORT_PREFER_DYNAMIC_LINK (see steps below).
           # The resulting binaries need libonnxruntime.dylib at runtime.
           - target: x86_64-apple-darwin
             runner: macos-15-intel
@@ -276,7 +283,7 @@ jobs:
       # - Linux (x86_64 and aarch64): the pyke.io prebuilt is linked statically and
       #   needs glibc 2.38 (__isoc23_* symbols); the Linux builds run on Ubuntu 22.04
       #   (glibc 2.35, the promise of scripts/check-os-floor.sh), where it does not
-      #   link. Microsoft's official build needs glibc 2.27 (measured on 1.23.2 x64).
+      #   link. Microsoft's official build needs glibc 2.27 (measured on 1.23.2 and 1.24.2 x64).
       #
       # We download the official Microsoft ONNX Runtime release and set
       # ORT_LIB_LOCATION + ORT_PREFER_DYNAMIC_LINK so ort-sys links dynamically
@@ -289,24 +296,42 @@ jobs:
         if: matrix.legacy
         run: echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
 
-      - name: Download ONNX Runtime for macOS x86_64
+      # macOS Intel: Microsoft publishes no osx-x86_64 ONNX Runtime from 1.24 on, and 1.23 makes ort panic
+      # (API 24). Built here (host == target, this is the Intel runner), cached per version and script.
+      # The desktop job takes it from the artifact uploaded below instead of building it again.
+      - name: Restore ONNX Runtime for macOS x86_64 (cache)
+        id: ort-macos
+        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/onnxruntime
+          key: onnxruntime-${{ env.ORT_VERSION }}-osx-x86_64-${{ hashFiles('scripts/build-onnxruntime-macos.sh') }}
+
+      - name: Build ONNX Runtime for macOS x86_64 (cache miss, ~1 h)
+        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy && steps.ort-macos.outputs.cache-hit != 'true'
+        run: scripts/build-onnxruntime-macos.sh "$ORT_VERSION" "$RUNNER_TEMP/onnxruntime"
+
+      - name: Use ONNX Runtime for macOS x86_64
         if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
         run: |
-          ORT_VERSION="1.23.2"
-          echo "Downloading ONNX Runtime ${ORT_VERSION} for macOS x86_64..."
-          curl -fsSL -o /tmp/onnxruntime.tgz \
-            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
-          mkdir -p "$RUNNER_TEMP/onnxruntime"
-          tar xzf /tmp/onnxruntime.tgz -C "$RUNNER_TEMP/onnxruntime" --strip-components=2
+          scripts/check-ort-api.sh "$RUNNER_TEMP/onnxruntime"
           echo "ORT_LIB_LOCATION=$RUNNER_TEMP/onnxruntime/lib" >> "$GITHUB_ENV"
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
           echo "=== ONNX Runtime ${ORT_VERSION} for macOS x86_64 ==="
           ls -la "$RUNNER_TEMP/onnxruntime/lib/"
 
+      - name: Upload ONNX Runtime for macOS x86_64 (for the desktop job)
+        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
+        uses: actions/upload-artifact@v7
+        with:
+          name: onnxruntime-osx-x86_64
+          path: ${{ runner.temp }}/onnxruntime/
+          retention-days: 1
+
       - name: Download ONNX Runtime for Linux
         if: matrix.os == 'linux'
         run: |
-          ORT_VERSION="1.24.2"  # API 24, what ort asks for (scripts/check-ort-api.sh); glibc 2.27
+          # ORT_VERSION (workflow env): API 24, what ort asks for (scripts/check-ort-api.sh); glibc 2.27
           case "${{ matrix.target }}" in
             x86_64-unknown-linux-gnu)  ORT_ARCH=x64 ;;
             aarch64-unknown-linux-gnu) ORT_ARCH=aarch64 ;;
@@ -949,15 +974,23 @@ jobs:
         if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
         run: echo 'TAURI_CONFIG={"bundle":{"macOS":{"minimumSystemVersion":"13.4"}}}' >> "$GITHUB_ENV"
 
-      - name: Download ONNX Runtime for macOS x86_64
+      # macOS Intel: the ONNX Runtime build-backend built (or restored) — scripts/build-onnxruntime-macos.sh.
+      - name: Download ONNX Runtime for macOS x86_64 (from build-backend)
+        if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
+        uses: actions/download-artifact@v8
+        with:
+          name: onnxruntime-osx-x86_64
+          path: ${{ runner.temp }}/onnxruntime/
+
+      - name: Use ONNX Runtime for macOS x86_64
         if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
         run: |
-          ORT_VERSION="1.23.2"
-          echo "Downloading ONNX Runtime ${ORT_VERSION} for macOS x86_64..."
-          curl -fsSL -o /tmp/onnxruntime.tgz \
-            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
-          mkdir -p "$RUNNER_TEMP/onnxruntime"
-          tar xzf /tmp/onnxruntime.tgz -C "$RUNNER_TEMP/onnxruntime" --strip-components=2
+          # upload-artifact stores the libonnxruntime.dylib symlink as a full copy: make it a link again,
+          # or the app would carry the library twice (the binaries load the versioned name, @rpath).
+          cd "$RUNNER_TEMP/onnxruntime/lib"
+          rm -f libonnxruntime.dylib && ln -s "libonnxruntime.${ORT_VERSION}.dylib" libonnxruntime.dylib
+          cd - >/dev/null
+          scripts/check-ort-api.sh "$RUNNER_TEMP/onnxruntime"
           echo "ORT_LIB_LOCATION=$RUNNER_TEMP/onnxruntime/lib" >> "$GITHUB_ENV"
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
           ls -la "$RUNNER_TEMP/onnxruntime/lib/"
@@ -970,7 +1003,7 @@ jobs:
       - name: Download ONNX Runtime for Linux
         if: runner.os == 'Linux'
         run: |
-          ORT_VERSION="1.24.2"  # API 24, what ort asks for (scripts/check-ort-api.sh); glibc 2.27
+          # ORT_VERSION (workflow env): API 24, what ort asks for (scripts/check-ort-api.sh); glibc 2.27
           case "${{ matrix.target }}" in
             x86_64-unknown-linux-gnu)  ORT_ARCH=x64 ;;
             aarch64-unknown-linux-gnu) ORT_ARCH=aarch64 ;;

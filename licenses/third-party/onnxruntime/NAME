@@ -1,1 +1,1 @@
-ONNX Runtime (Microsoft, MIT): linked into the binaries by `ort` (1.24.2, statically: Windows, macOS arm64) or shipped as libonnxruntime (1.24.2 on Linux, 1.23.2 on macOS Intel)
+ONNX Runtime (Microsoft, MIT): linked into the binaries by `ort` (1.24.2, statically: Windows, macOS arm64) or shipped as libonnxruntime (1.24.2: Microsoft's build on Linux, built from the same sources on macOS Intel)
