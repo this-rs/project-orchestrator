@@ -216,22 +216,29 @@ impl Neo4jClient {
         workspace_slug: Option<&str>,
     ) -> Result<Vec<RunnerState>> {
         let cypher = list_all_plan_runs_cypher(workspace_slug.is_some(), status.is_some());
+        let cypher_str: &str = &cypher;
 
-        let mut q = query(&cypher).param("limit", limit).param("offset", offset);
-        if let Some(s) = status {
-            q = q.param("status", s.to_string());
-        }
-        if let Some(ws) = workspace_slug {
-            q = q.param("ws_slug", ws.to_string());
-        }
+        // Read-only scan of PlanRun nodes: replayed on a transient error.
+        self.read_retrying(cypher_str, || async move {
+            let mut q = query(cypher_str)
+                .param("limit", limit)
+                .param("offset", offset);
+            if let Some(s) = status {
+                q = q.param("status", s.to_string());
+            }
+            if let Some(ws) = workspace_slug {
+                q = q.param("ws_slug", ws.to_string());
+            }
 
-        let mut result = self.graph.execute(q).await?;
-        let mut runs = Vec::new();
-        while let Some(row) = result.next().await? {
-            let node: neo4rs::Node = row.get("r")?;
-            runs.push(self.node_to_plan_run(&node)?);
-        }
-        Ok(runs)
+            let mut result = self.graph.execute(q).await?;
+            let mut runs = Vec::new();
+            while let Some(row) = result.next().await? {
+                let node: neo4rs::Node = row.get("r")?;
+                runs.push(self.node_to_plan_run(&node)?);
+            }
+            Ok(runs)
+        })
+        .await
     }
 
     /// List all PlanRuns for a given plan.
