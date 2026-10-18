@@ -14921,8 +14921,14 @@ impl ChatManager {
         // once, applied below ONLY when the router applies nothing — the declared rules
         // must never substitute a default for a child whose parent named its engine.
         // Never over an engine the request itself names (DELEG-500): a delegation that
-        // names one keeps it, and its refusal stays the request's own.
-        let parent_fallback = if falls_back_on_parent(request) && input.request.is_none() {
+        // names one keeps it, and its refusal stays the request's own. That includes the
+        // run level, where `inherit_parent_engine` already puts the parent's pair (and the
+        // task and persona levels): the fallback is for an opening that names NOTHING.
+        let names_an_engine = input.request.is_some()
+            || input.task.is_some()
+            || input.persona.is_some()
+            || input.run.is_some();
+        let parent_fallback = if falls_back_on_parent(request) && !names_an_engine {
             self.parent_pair_of(request).await
         } else {
             None
