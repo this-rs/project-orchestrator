@@ -12710,11 +12710,13 @@ impl ChatManager {
         // Its Claude Code sub-agents are mirrored (P18c): a new tap per resume, the registry
         // keeps one mirror per call.
         let mirror_tap = self.mirror_tap(session_id);
-        let parent = super::cancelled_parents::parent_of(session_node.spawned_by.as_deref());
+        let parent =
+            super::cancelled_parents::parent_checked_on_resume(session_node.spawned_by.as_deref());
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
-            // B36-RACE: a child (a warm one the pool resumes included) whose parent a cascade
-            // closed is refused HERE, under the lock that would make it live.
+            // B36-RACE: a child the warm pool resumes for a new delegation, whose parent a
+            // cascade closed, is refused HERE, under the lock that would make it live. A person
+            // resuming it passes (B36-RACE-RESUME, `parent_checked_on_resume`).
             if let Err(refused) = self.cancelled_parents.admit(session_id, parent.as_deref()) {
                 drop(sessions);
                 self.refuse_legacy_activation(session_id, client, &refused)
@@ -17823,8 +17825,9 @@ impl ChatManager {
             // moved, which would make every `always` command be asked again). Only a plain
             // resume (no relay) may have moved.
             relay.is_none(),
-            // B36-RACE: a warm child the pool resumes is refused like a fresh one.
-            super::cancelled_parents::parent_of(node.spawned_by.as_deref()),
+            // B36-RACE: a warm child the pool resumes for a delegation is refused like a fresh
+            // one; a person resuming it passes (B36-RACE-RESUME).
+            super::cancelled_parents::parent_checked_on_resume(node.spawned_by.as_deref()),
         )
         .await?;
         cleanup.disarm();
@@ -22747,8 +22750,9 @@ mod tests {
         assert!(!manager.agent_runtime.owns(&child).await);
     }
 
-    /// B36-RACE, criterion 2 — the agent engine's RESUME (the path the warm pool takes): a
-    /// closed child of a cancelled parent is refused when it is resumed, not made live.
+    /// B36-RACE, criterion 2 — the agent engine's RESUME on behalf of a DELEGATION (the
+    /// path the warm pool takes, `subagents::open_child`): a closed child of a cancelled
+    /// parent is refused when it is resumed, not made live.
     #[tokio::test]
     async fn resuming_a_child_of_a_cancelled_parent_is_refused() {
         let (manager, graph, _fake) = agent_manager();
@@ -22764,15 +22768,62 @@ mod tests {
             .await
             .unwrap();
 
-        let err = manager
-            .resume_session(&child, "again", None)
-            .await
-            .expect_err("refused");
+        let err = super::super::cancelled_parents::as_delegation(
+            manager.resume_session(&child, "again", None),
+        )
+        .await
+        .expect_err("refused");
         assert!(
             super::super::cancelled_parents::ParentCancelled::in_chain(&err).is_some(),
             "{err:#}"
         );
         assert!(!manager.is_session_active(&child).await);
+    }
+
+    /// B36-RACE-RESUME — the tombstone stops late DELEGATIONS, not people: right after a
+    /// cascade cancelled the run, a person reopens one of its children by hand (the chat,
+    /// the API) and it opens, while a late delegation of the same parent is still refused.
+    #[tokio::test]
+    async fn a_person_reopens_the_child_of_a_cancelled_run_at_once() {
+        let (manager, graph, _fake) = agent_manager();
+        let parent = live_parent(&manager, &graph).await;
+        let child = manager
+            .create_session(&delegation_of(parent.id))
+            .await
+            .expect("the parent is live: the child opens")
+            .session_id;
+        manager.close_session(&child).await.unwrap();
+        manager
+            .close_session_with_cascade(&parent.id.to_string(), true)
+            .await
+            .unwrap();
+
+        manager
+            .resume_session(&child, "let me look at what you did", None)
+            .await
+            .expect("a person's resume is not a late delegation: it opens");
+        assert!(manager.is_session_active(&child).await);
+
+        // The invariant still holds for delegations: a NEW child of the cancelled parent…
+        let late = manager
+            .create_session(&delegation_of(parent.id))
+            .await
+            .expect_err("a late delegation is refused");
+        assert!(
+            super::super::cancelled_parents::ParentCancelled::in_chain(&late).is_some(),
+            "{late:#}"
+        );
+        // …and the warm pool resuming a child for a delegation.
+        manager.close_session(&child).await.unwrap();
+        let warm = super::super::cancelled_parents::as_delegation(
+            manager.resume_session(&child, "again", None),
+        )
+        .await
+        .expect_err("a delegation's resume is refused");
+        assert!(
+            super::super::cancelled_parents::ParentCancelled::in_chain(&warm).is_some(),
+            "{warm:#}"
+        );
     }
 
     /// B36-RACE, criterion 5 — no regression: a session without a parent, a child whose
