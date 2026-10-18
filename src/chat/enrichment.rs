@@ -491,13 +491,29 @@ pub trait ParallelEnrichmentStage: Send + Sync {
 // Pipeline
 // ============================================================================
 
+/// Share of the global pipeline budget (`max_pipeline_ms`) that a single stage
+/// may use, in percent.
+///
+/// Decision (T0c-quater): 75 %. A stage that has not answered by then is cut
+/// and recorded as `name(timeout)`; the remaining 25 % is margin for the
+/// global safety net, which therefore only fires when a stage overruns its own
+/// budget (e.g. it does not yield). Before, the per-stage timeout equalled the
+/// global one, so it was redundant and, when the global one fired first, the
+/// outputs of the fast stages were thrown away with the slow one.
+pub const STAGE_BUDGET_PERCENT: u32 = 75;
+
+/// Per-stage budget derived from the global pipeline budget.
+fn stage_budget(global: Duration) -> Duration {
+    global * STAGE_BUDGET_PERCENT / 100
+}
+
 /// Ordered pipeline of enrichment stages.
 ///
-/// Executes all enabled stages **in parallel** via `futures::join_all`,
-/// then merges their outputs in registration order. Each stage has an
-/// individual timeout; errors and timeouts produce an empty `StageOutput`
-/// and are recorded in `skipped_stages`. A global pipeline timeout
-/// (`max_pipeline_ms`) wraps the entire parallel execution.
+/// Executes all enabled stages **in parallel**, then merges their outputs in
+/// registration order. Each stage has its own budget ([`STAGE_BUDGET_PERCENT`]
+/// of `max_pipeline_ms`); errors and timeouts produce no output and are
+/// recorded in `skipped_stages`. The global budget (`max_pipeline_ms`) is a
+/// safety net: when it fires, the stages already finished keep their outputs.
 pub struct EnrichmentPipeline {
     stages: Vec<Box<dyn ParallelEnrichmentStage>>,
     config: EnrichmentConfig,
@@ -523,12 +539,27 @@ impl EnrichmentPipeline {
     /// and the pipeline continues with the remaining stages' outputs.
     /// Sections are merged in registration order to preserve deterministic output.
     pub async fn execute(&self, input: &EnrichmentInput) -> EnrichmentContext {
+        let global_deadline = Duration::from_millis(self.config.max_pipeline_ms);
+        self.execute_with_budgets(input, stage_budget(global_deadline), global_deadline)
+            .await
+    }
+
+    /// Run the enabled stages with an explicit per-stage budget and global budget.
+    ///
+    /// Each stage is cut at `per_stage_timeout`. The global budget is a safety
+    /// net only: if it fires (a stage overran its own budget), the outputs of the
+    /// stages that already finished are kept, and only the unfinished stages are
+    /// recorded as `name(timeout)`.
+    async fn execute_with_budgets(
+        &self,
+        input: &EnrichmentInput,
+        per_stage_timeout: Duration,
+        global_deadline: Duration,
+    ) -> EnrichmentContext {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
         let pipeline_start = Instant::now();
         let mut ctx = EnrichmentContext::default();
-        let global_deadline = Duration::from_millis(self.config.max_pipeline_ms);
-        // Per-stage timeout: use the global budget (each stage can use the full budget
-        // since they run in parallel; the global timeout wraps everything).
-        let per_stage_timeout = global_deadline;
 
         // Collect indices of enabled stages; record disabled ones as skipped.
         let mut enabled_indices = Vec::new();
@@ -547,7 +578,7 @@ impl EnrichmentPipeline {
         }
 
         // Build futures for all enabled stages.
-        let futures: Vec<_> = enabled_indices
+        let mut pending: FuturesUnordered<_> = enabled_indices
             .iter()
             .map(|&i| {
                 let stage = &self.stages[i];
@@ -562,20 +593,39 @@ impl EnrichmentPipeline {
             })
             .collect();
 
-        // Run all stages in parallel, wrapped in a global timeout.
-        let results =
-            match tokio::time::timeout(global_deadline, futures::future::join_all(futures)).await {
-                Ok(results) => results,
+        // Run all stages in parallel and collect each result as soon as it lands,
+        // so that the global safety net never discards finished stages.
+        let global_at = tokio::time::Instant::now() + global_deadline;
+        let mut results = Vec::with_capacity(enabled_indices.len());
+        loop {
+            match tokio::time::timeout_at(global_at, pending.next()).await {
+                Ok(Some(result)) => results.push(result),
+                Ok(None) => break,
                 Err(_) => {
                     warn!(
-                        "[enrichment] Pipeline hit global time budget ({}ms) after {}ms",
-                        self.config.max_pipeline_ms,
-                        pipeline_start.elapsed().as_millis()
+                        "[enrichment] Pipeline hit global time budget ({}ms) after {}ms; \
+                         keeping {} finished stage(s)",
+                        global_deadline.as_millis(),
+                        pipeline_start.elapsed().as_millis(),
+                        results.len()
                     );
-                    // All stages timed out — return empty results
-                    Vec::new()
+                    break;
                 }
-            };
+            }
+        }
+        drop(pending);
+        // Completion order is nondeterministic; report in registration order.
+        results.sort_by_key(|(idx, ..)| *idx);
+
+        // Stages still running when the global budget fired: recorded as timed out.
+        let elapsed_total = pipeline_start.elapsed().as_millis() as u64;
+        for &i in &enabled_indices {
+            if !results.iter().any(|(idx, ..)| *idx == i) {
+                let stage_name = self.stages[i].name().to_string();
+                ctx.stage_timings.push((stage_name.clone(), elapsed_total));
+                ctx.skipped_stages.push(format!("{}(timeout)", stage_name));
+            }
+        }
 
         // Collect results keyed by registration index for ordered merge.
         let mut outputs: std::collections::BTreeMap<usize, StageOutput> =
@@ -868,51 +918,100 @@ mod tests {
         assert!(json.contains("\"title\":\"Test\""));
     }
 
-    #[tokio::test]
-    async fn test_pipeline_time_budget() {
-        use tokio::time::sleep;
+    /// A stage that sleeps (tokio time) for `ms` before answering.
+    struct SlowStage {
+        ms: u64,
+    }
 
-        /// A slow stage that sleeps for a while.
-        struct SlowStage;
-
-        #[async_trait::async_trait]
-        impl ParallelEnrichmentStage for SlowStage {
-            async fn execute(&self, _input: &EnrichmentInput) -> Result<StageOutput> {
-                sleep(Duration::from_millis(600)).await;
-                let mut output = StageOutput::new("slow_stage");
-                output.add_section("Slow", "should not appear", "slow", EnrichmentSource::Other);
-                Ok(output)
-            }
-
-            fn name(&self) -> &str {
-                "slow_stage"
-            }
-
-            fn is_enabled(&self, _config: &EnrichmentConfig) -> bool {
-                true
-            }
+    #[async_trait::async_trait]
+    impl ParallelEnrichmentStage for SlowStage {
+        async fn execute(&self, _input: &EnrichmentInput) -> Result<StageOutput> {
+            tokio::time::sleep(Duration::from_millis(self.ms)).await;
+            let mut output = StageOutput::new("slow_stage");
+            output.add_section("Slow", "slow result", "slow", EnrichmentSource::Other);
+            Ok(output)
         }
 
+        fn name(&self) -> &str {
+            "slow_stage"
+        }
+
+        fn is_enabled(&self, _config: &EnrichmentConfig) -> bool {
+            true
+        }
+    }
+
+    fn fast_and_slow_pipeline(max_pipeline_ms: u64, slow_ms: u64) -> EnrichmentPipeline {
         let config = EnrichmentConfig {
-            max_pipeline_ms: 50, // very tight budget
+            max_pipeline_ms,
             ..Default::default()
         };
         let mut pipeline = EnrichmentPipeline::new(config);
-
-        // Fast stage first
         pipeline.add_parallel_stage(Box::new(MockStage {
             name: "fast_stage".to_string(),
             enabled: true,
             should_fail: false,
             content: Some(("Fast".to_string(), "quick result".to_string())),
         }));
+        pipeline.add_parallel_stage(Box::new(SlowStage { ms: slow_ms }));
+        pipeline
+    }
 
-        // Slow stage — should either execute (within budget) or be skipped
-        pipeline.add_parallel_stage(Box::new(SlowStage));
-
+    #[tokio::test(start_paused = true)]
+    async fn test_pipeline_time_budget() {
+        // Slow stage far beyond the global budget: cut, fast stage kept.
+        let pipeline = fast_and_slow_pipeline(50, 600);
         let ctx = pipeline.execute(&test_input()).await;
-        // At minimum, the fast stage should have completed
         assert!(ctx.sections.iter().any(|s| s.title == "Fast"));
+        assert!(!ctx.sections.iter().any(|s| s.title == "Slow"));
+        assert!(ctx
+            .skipped_stages
+            .contains(&"slow_stage(timeout)".to_string()));
+    }
+
+    #[test]
+    fn test_stage_budget_is_a_share_of_the_global_budget() {
+        assert_eq!(
+            stage_budget(Duration::from_millis(500)),
+            Duration::from_millis(375)
+        );
+        assert!(stage_budget(Duration::from_millis(100)) < Duration::from_millis(100));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stage_cut_at_its_own_budget_before_the_global_one() {
+        // 100 ms global → 75 ms per stage. A stage answering at 90 ms is past
+        // its own budget although still inside the global one.
+        let pipeline = fast_and_slow_pipeline(100, 90);
+        let start = tokio::time::Instant::now();
+        let ctx = pipeline.execute(&test_input()).await;
+        assert_eq!(start.elapsed(), Duration::from_millis(75));
+        assert!(ctx.sections.iter().any(|s| s.title == "Fast"));
+        assert!(!ctx.sections.iter().any(|s| s.title == "Slow"));
+        assert_eq!(ctx.skipped_stages, vec!["slow_stage(timeout)".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_global_budget_keeps_finished_stage_outputs() {
+        // A stage overrunning its own budget (simulated: per-stage budget above
+        // the global one) makes the global safety net fire. The fast stage's
+        // output must survive; only the unfinished stage is reported.
+        let pipeline = fast_and_slow_pipeline(50, 600);
+        let ctx = pipeline
+            .execute_with_budgets(
+                &test_input(),
+                Duration::from_millis(1_000),
+                Duration::from_millis(50),
+            )
+            .await;
+        assert!(
+            ctx.sections.iter().any(|s| s.title == "Fast"),
+            "fast stage output lost when the global budget fired: {:?}",
+            ctx.skipped_stages
+        );
+        assert!(!ctx.sections.iter().any(|s| s.title == "Slow"));
+        assert_eq!(ctx.skipped_stages, vec!["slow_stage(timeout)".to_string()]);
+        assert!(ctx.stage_timings.iter().any(|(n, _)| n == "fast_stage"));
     }
 
     #[test]
