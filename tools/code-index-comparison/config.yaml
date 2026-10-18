@@ -1,0 +1,9 @@
+setup_completed: true
+server:
+  port: 8080
+  workspace_path: /workspace
+  serve_frontend: false
+embedding:
+  provider: disabled
+chat:
+  provider: none

@@ -1,0 +1,5 @@
+services:
+  neo4j:
+    image: ghcr.io/this-rs/ci-mirror/neo4j:5.26.31@sha256:c7d25c0eeebfe125718d58b72ed5d663c85d0479047733845eb2237c67ce8069
+  meilisearch:
+    image: ghcr.io/this-rs/ci-mirror/meilisearch:v1.34.3@sha256:82767d2afc4fb6c3e4ebadb134ca6ef5687c894ae9e152928619393b1f331681

@@ -1,0 +1,5 @@
+sources
+results
+.env
+__pycache__
+*.zip
