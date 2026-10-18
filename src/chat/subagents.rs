@@ -726,6 +726,13 @@ impl ChatManager {
                     return Ok((warm.session_id.clone(), Some(floor)));
                 }
                 Err(e) => {
+                    // B36-RACE: the parent was cancelled while this delegation was opening:
+                    // the warm child was refused at its activation, and a fresh one would be
+                    // too. The delegation ends on the typed refusal.
+                    if let Some(refused) = super::cancelled_parents::ParentCancelled::in_chain(&e) {
+                        self.session_pool.abandon(&warm.session_id);
+                        return Err(format!("the sub-agent could not start: {refused}"));
+                    }
                     // The prefix is worthless (the provider's session is gone) or the
                     // session can no longer be reopened: never offered again.
                     tracing::info!(
@@ -1893,6 +1900,79 @@ mod tests {
             "a consent that changed since the opening is never inherited"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// B36-RACE, criterion 4 — the warm pool follows the same rule: a delegation handed
+    /// the warm session of a parent that a cascade closed meanwhile does not resume it (the
+    /// child is refused at its activation, under the engine's lock) and does not fall back
+    /// to a fresh session either: it ends on the typed refusal. Red without the tombstone:
+    /// the warm child is resumed, live, after its run was cancelled.
+    #[tokio::test]
+    async fn a_warm_child_of_a_cancelled_parent_is_not_resumed() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = crate::chat::config::ChatConfig {
+            provider_path: crate::chat::config::ProviderPath::Agent,
+            ..Default::default()
+        };
+        let fake = super::super::agent_runtime::fake::FakeProvider::new();
+        let manager = Arc::new(
+            ChatManager::new_without_memory(
+                dyn_graph,
+                crate::test_helpers::mock_app_state().meili,
+                config,
+            )
+            .with_provider_source(Arc::new(fake.clone())),
+        );
+        let parent = crate::test_helpers::test_chat_session(None);
+        graph.create_chat_session(&parent).await.unwrap();
+        let parent_id = parent.id.to_string();
+        super::super::manager::test_support::insert_live_session_without_cli(&manager, &parent_id)
+            .await;
+        let mut child = delegation("proj", "opus");
+        child.provider = None;
+        child.model = None;
+        child.permission_mode = Some("acceptEdits".into());
+        child.spawned_by = Some(
+            serde_json::json!({"type": "conversation", "parent_session_id": parent_id}).to_string(),
+        );
+        // A first delegation ran and went back to the pool, warm.
+        let warm = manager
+            .create_session(&child)
+            .await
+            .expect("the parent is live: the child opens")
+            .session_id;
+        manager.close_session(&warm).await.unwrap();
+        let pinned = delegation("proj", "opus");
+        manager
+            .reuse_for(&pinned, None, &parent_id)
+            .expect("pinned")
+            .release(&manager.session_pool, &warm, std::time::Instant::now());
+
+        // The run is cancelled; a delegation already on its way claims the warm child.
+        manager
+            .close_session_with_cascade(&parent_id, true)
+            .await
+            .unwrap();
+        let reuse = manager
+            .reuse_for(&pinned, None, &parent_id)
+            .expect("pinned");
+        assert_eq!(
+            reuse.warm.as_ref().map(|w| w.session_id.as_str()),
+            Some(warm.as_str())
+        );
+        let err = manager
+            .open_child(&child, Some(&reuse), &parent_id, "tu-1")
+            .await
+            .expect_err("a child of a cancelled parent is not resumed");
+        assert!(err.contains("was cancelled"), "{err}");
+        assert!(!manager.is_session_active(&warm).await, "not live again");
+        assert_eq!(
+            graph.get_session_children(parent.id).await.unwrap().len(),
+            1,
+            "no fresh child opened instead"
+        );
+        assert!(manager.session_pool.is_empty(), "dropped from the pool");
     }
 
     /// A child whose engine and model the cognitive router picks (`route_child`) has no key
