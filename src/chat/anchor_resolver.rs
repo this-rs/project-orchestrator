@@ -190,7 +190,11 @@ pub struct BrokenAnchor {
 pub enum ExclusionReason {
     /// Consent predicate refused (project / workspace / entity of another project).
     ConsentDenied(ReadDenial),
-    /// The target type has no resolver in v1 (e.g. `component`).
+    /// The target type has no resolver in v1. Only `component` today, a decision
+    /// (T3-bis): a `Component` belongs to a workspace, not to a project, it is not
+    /// a node kind of the scoped walk, and its content is the project it maps to
+    /// (`MAPS_TO_PROJECT`), which is anchored as such. The anchor stays in the
+    /// journal and shows as an opaque line; it never gives content.
     UnsupportedType,
     /// The target does not exist (any longer).
     TargetMissing,
@@ -652,6 +656,12 @@ async fn resolve_one(
             let (readable, denied) = admit_nodes(reader, secret, &center.node.id, &walk).await;
             let (nodes, omitted) = select_nodes(&center.node.id, &readable, &walk.edges, budget);
             let mut out = admitted(a, center.node.label.clone(), owner, cross);
+            // A `moved` anchor (decision T3-bis): `target_id` IS the current target
+            // (what was walked above) and `snapshot_path` / `snapshot_name` keep the
+            // old place. Whoever marks an anchor moved must retarget it; a moved
+            // anchor still pointing at a target that no longer exists found no
+            // centre above and is rendered broken, never with stale content. (No
+            // producer of `moved` exists in v1: `SetState` alone cannot retarget.)
             if a.state == AnchorState::Moved {
                 let to = single_line(&center.node.label, TITLE_CHARS);
                 out.moved_note = Some(
@@ -1924,6 +1934,88 @@ mod tests {
         assert_eq!(scope.broken.len(), 3);
         let map = render_anchor_map(&scope, "k");
         assert!(map.contains("ancre archivée") && map.contains("ancre cassée"));
+    }
+
+    /// A moved anchor names its CURRENT target; one still naming the old place
+    /// (the target is gone) is a broken line, with neither the old title nor any
+    /// content, and the old place given as snapshot is what "déplacé de" quotes.
+    #[tokio::test]
+    async fn a_moved_anchor_resolves_its_current_target_and_never_the_old_one() {
+        let f = fx().await;
+        f.seed(node("src/new.rs", "file", "new.rs", 1.0), f.a).await;
+        f.seed(node("n1", "note", "voisin du nouveau", 1.0), f.a)
+            .await;
+        f.edge("src/new.rs", "n1", 1.0).await;
+        let add = |target: &str| {
+            let mut n = NewAnchor::new(
+                AnchorTargetType::File,
+                k(target),
+                [AnchorRole::Mention],
+                AnchorActor::User,
+                "t",
+            );
+            n.snapshot_path = Some("src/old.rs".into());
+            n
+        };
+        let retargeted = add("src/new.rs");
+        let stale = add("src/gone.rs");
+        let mut ids = Vec::new();
+        for n in [retargeted, stale] {
+            let a = f
+                .store
+                .apply_anchor_op(f.session, AnchorOp::Add(n))
+                .await
+                .unwrap()
+                .anchor;
+            f.store
+                .set_anchor_state(
+                    f.session,
+                    a.id,
+                    AnchorState::Moved,
+                    None,
+                    AnchorActor::System,
+                    "t",
+                )
+                .await
+                .unwrap();
+            ids.push(a.id);
+        }
+        let scope = f.resolve().await;
+        assert_eq!(scope.anchors.len(), 1, "{scope:#?}");
+        let m = &scope.anchors[0];
+        assert_eq!(m.anchor_id, ids[0]);
+        assert_eq!(
+            m.moved_note.as_deref(),
+            Some("déplacé de src/old.rs vers new.rs")
+        );
+        assert_eq!(titles(m), vec!["voisin du nouveau"]);
+        assert_eq!(scope.broken.len(), 1);
+        assert_eq!(
+            (scope.broken[0].anchor_id, scope.broken[0].state),
+            (ids[1], AnchorState::Dangling)
+        );
+        assert!(render_anchor_map(&scope, "k").contains("ancre cassée"));
+    }
+
+    /// `component` has no resolver in v1 (documented on `UnsupportedType`): the
+    /// anchor is excluded, rendered opaque, and widens nothing.
+    #[tokio::test]
+    async fn a_component_anchor_is_excluded_as_unsupported_and_shown_opaque() {
+        let f = fx().await;
+        f.seed(node("comp", "component", "SECRET component", 1.0), f.a)
+            .await;
+        f.anchor(AnchorTargetType::Component, "comp", &[AnchorRole::Focus])
+            .await;
+        let scope = f.resolve().await;
+        assert!(scope.anchors.is_empty() && scope.extra_projects.is_empty());
+        assert_eq!(scope.excluded.len(), 1);
+        assert_eq!(scope.excluded[0].reason, ExclusionReason::UnsupportedType);
+        let all = format!(
+            "{}{}",
+            render_anchor_map(&scope, "k"),
+            render_live_block(&scope)
+        );
+        assert!(all.contains("[nœud non autorisé] n-") && !all.contains("SECRET"));
     }
 
     #[tokio::test]
