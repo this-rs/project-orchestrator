@@ -280,7 +280,8 @@ jobs:
       #   routing_metamorphic: RoutingProvider invariance harness
       # Deliberately NOT run here (all #[ignore]d, need live resources):
       #   mcp_federation_integration: real remote MCP servers over the network
-      #   cancel_task_e2e, cancel_tools_e2e: Anthropic API key + Claude Code CLI
+      # (cancel-tools / cancel-task end to end run in the lib step above: src/chat/cancel_e2e_tests.rs,
+      # against fake_claude, on both engines; no CLI, no key.)
       - name: Run service-free integration tests
         run: cargo test --test p2p_integration --test p2p_http_exchange --test prompt_completeness --test routing_metamorphic
 

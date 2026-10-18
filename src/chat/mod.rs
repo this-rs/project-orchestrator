@@ -20,6 +20,8 @@ pub(crate) mod agent_hooks;
 pub mod agent_runtime;
 pub mod anchor;
 pub mod anchor_resolver;
+#[cfg(all(test, unix))]
+mod cancel_e2e_tests;
 pub mod cancel_relay;
 pub(crate) mod cancelled_parents;
 pub mod cost;
