@@ -1,6 +1,6 @@
 %% name: po-provider-settings
 %% covers: backend:src/api/provider_handlers.rs backend:src/api/network_tools_handlers.rs
-%% verified: 459cab6f
+%% verified: 1845c812
 %% ---
 %% PROUVE : les routes de réglages des providers (A15, A19, A24, A25, A28, A32, A37) : instances, test de
 %%   connexion, consentement, rôles, alias, politique de modèle, journal d'envoi. La logique pure est dans
@@ -15,12 +15,19 @@
 %%   src/api/provider_handlers.rs (surface agent) — instance_list/get/create/update/delete/test/status/models/scan_host_key,
 %%                                   agent_grants, Surface, AgentGrant, require_known_caller ; src/auth/tool_profile.rs — /api/agent/providers fermé
 %%   src/api/network_tools_handlers.rs — outils réseau d'une session native (P6) : consentement par origine, navigateur, moteurs de recherche ; écrit les documents que nexus_tools::GraphConsents lit (po-chat-provider)
+%%   src/api/vault_handlers.rs — init/unlock (la phrase de passe dans le corps, rend unlock_proof), require_proof (en-tête x-vault-proof), put_secret, create_grant
+%%                                   (fichier sans propriétaire : montré ici pour la chaîne clé → coffre → instance, V1)
+%%   src/lib.rs — start_setup_server : le serveur d'installation n'expose ni /api/vault ni /api/chat/providers (d'où l'étape coffre APRÈS le premier démarrage)
+%%   frontend@f5401ac (PR frontend #393) — ProviderWizard.tsx + ProviderWizardSteps.tsx (VaultFirst, VaultState, KeyStep), SettingsErrorCard.tsx,
+%%                                   components/chat/VaultUnlock.tsx, services/vault.ts (la preuve en variable de module), pages/setup/LaunchPage.tsx
 %% ---
 %% NON ETABLI :
 %%   aucun essai contre un vrai endpoint ou un vrai Codex ; le test de connexion d'un codex/acp = health du processus ;
 %%   la santé N'EST PAS sondée dans le listing (seulement par /status) ;
 %%   claude_code_remote : jamais exercé contre une vraie machine SSH (seulement un port local fermé et des faux ssh-keyscan) ;
 %%   le serveur ouvre une connexion vers l'hôte que le corps nomme (humain seulement, authentification exigée) : pas de garde d'adresse privée, les machines visées sont souvent sur un LAN.
+%%   V1 : l'assistant d'installation web (serveur setup-only) n'a pas d'étape coffre (B5 reporté en v0.0.19, décision 78a3f4c4) ; la clé d'embedding de l'installation
+%%   est encore écrite en clair dans config.yaml (hors de ce diagramme, à décider).
 %% ---
 %% LEGENDE
 %%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans test / décidé non écrit  ⚪ amont ou autre domaine
@@ -102,3 +109,18 @@ flowchart TD
     HUMAN --> NTBROW
     HUMAN --> NTSE
     NTORIG --> NTE2E
+
+    subgraph vaultfirst["Clés : le coffre d'abord (V1) — la chaîne vue du frontend, gardée par le backend"]
+        VSETUP["⚪ fin d'installation (LaunchPage) : « create the vault and add a chat provider » → /providers ; le serveur setup-only n'a pas /api/vault (start_setup_server), l'étape coffre vient donc après le premier démarrage"]
+        VFIRST["⚪ assistant « Ajouter un provider », étape 1 : coffre absent, illisible ou fermé pour l'onglet ⇒ carte VaultFirst AVANT le formulaire ; POST /api/vault/init | /unlock, phrase de passe dans le CORPS seulement ; unlock_proof gardée en mémoire (variable de module), jamais en stockage<br/>test frontend : ProviderWizard.security « the vault, first (V1) » (ni URL, ni en-tête, ni autre requête, ni stockage, ni DOM)"]
+        VKEY["✅ la clé : PUT /api/vault/secrets/{nom} avec x-vault-proof (require_proof : un login humain forgé sans preuve ne l'écrit pas) ; puis POST /api/chat/providers avec credential_ref vault:&lt;nom&gt; seulement (une valeur dans le corps est refusée) ; puis POST /api/vault/grants portée provider ; puis /providers/test<br/>test : a_forged_login_without_the_unlock_proof_cannot_widen_access, a_secret_in_a_body_or_a_forbidden_endpoint_is_refused, a_provider_grant_must_name_the_instance_key_on_an_existing_instance, no_value_passphrase_or_proof_ever_reaches_the_logs ; frontend : ProviderWizard.security « the API key of the wizard »"]
+        VLOCK["✅ coffre fermé au moment du test : /providers/test répond 200, ok false, health {state auth_required, code credentials_locked} — un verdict, aucune connexion<br/>test : the_test_route_always_answers_200_with_a_verdict"]
+        VPLACE["⚪ au point d'usage : réglages (SettingsErrorCard, test ou vérification d'une instance) ⇒ VaultUnlock en place puis nouvelle vérification ; chat (ProviderStateCard) ⇒ déverrouiller et renvoyer, ou un modèle sans coffre<br/>test frontend : SettingsErrorCard.vault, ProviderStateCard"]
+        VSETUP --> VFIRST
+        VFIRST --> VKEY
+        VKEY --> VLOCK
+        VLOCK --> VPLACE
+    end
+
+    CALLER --> VFIRST
+    VKEY --> CREATE
