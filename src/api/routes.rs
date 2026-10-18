@@ -2187,7 +2187,8 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/chat/search-engines",
             get(network_tools_handlers::list_search_engines)
-                .post(network_tools_handlers::create_search_engine),
+                .post(network_tools_handlers::create_search_engine)
+                .put(network_tools_handlers::put_search_engine_order),
         )
         .route(
             "/api/chat/search-engines/{id}",
