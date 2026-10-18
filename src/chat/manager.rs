@@ -3749,8 +3749,9 @@ impl ChatManager {
 
     /// The models of `provider_id` a pool lets the per-turn decision choose among: `None`
     /// without a pool (or with one model only: strict, a pin), `Some(empty)` when no ticked
-    /// model is on this provider (the conversation then stays on its model: moving to another
-    /// provider is `switch-provider`, never a per-turn change).
+    /// model is on this provider (the conversation then stays on its model here; a pool
+    /// ticked across providers may still move it to another provider before a turn,
+    /// decision R-S2, `agent_hooks::plan_provider_move`).
     fn allowed_models_of(
         pool: Option<&[super::types::RoutingPoolEntry]>,
         provider_id: &str,
@@ -3852,7 +3853,16 @@ impl ChatManager {
                 project_slug: project_slug.map(str::to_owned),
                 trust,
                 explicit_model: pinned,
-                provider_imposed: turn.provider_imposed && !turn.moved_in,
+                // R-S2: a pool ticked across two providers or more (the menu's `mixed`)
+                // makes the provider it names its PILOT, not an imposed provider: PO may
+                // move the conversation to the other provider, like `full` restricted to
+                // the pool. A `full` conversation keeps its named provider explicit
+                // (decision R-S4, `routes_among_pool`).
+                provider_imposed: turn.provider_imposed
+                    && !turn.moved_in
+                    && !(turn.routing_mode
+                        != Some(super::provider::cognitive::ConversationRoutingMode::Full)
+                        && super::types::pool_spans_providers(turn.routing_pool.as_deref())),
                 allowed_models,
                 routing_pool: turn.routing_pool.clone(),
                 auto_models,
@@ -3925,7 +3935,8 @@ impl ChatManager {
         Some(EffectiveCapabilities { images })
     }
 
-    /// Mode `full`, before a turn starts, on both engines: when the router's decision names
+    /// Mode `full` (or a pool ticked across providers, R-S2), before a turn starts, on both
+    /// engines: when the router's decision names
     /// ANOTHER provider (`agent_hooks::plan_provider_move`), the conversation moves there
     /// through the relay (`moved_by: auto`) and `message` is the first message of the new
     /// session. Returns `true` when it moved: this session then starts no turn (it is
@@ -11830,8 +11841,9 @@ impl ChatManager {
     /// * one model ticked: strict (`primary`); that model is imposed (set now if it differs,
     ///   `routed_by` `request`) and never substituted.
     /// * two or more: `mixed`; the per-turn decision chooses among the ticked models of the
-    ///   session's provider only (one session = one provider; another provider's ticks are
-    ///   stored, and only `switch-provider` moves the conversation there).
+    ///   session's provider (one session = one provider); when the ticks span two providers
+    ///   or more, the router may also move the conversation to the other provider before a
+    ///   turn, like `full` restricted to the pool (decision R-S2).
     pub async fn set_session_routing(
         &self,
         session_id: &str,
@@ -11854,7 +11866,7 @@ impl ChatManager {
         let (mode, pool, routed_by) = if body.auto {
             self.unpin_session_model(session_id).await;
             if let Some(router) = &router {
-                router.reroute(Mode::Full, None, false);
+                router.reroute(Mode::Full, None, None, false);
             }
             (Mode::Full, None, "auto")
         } else {
@@ -11873,7 +11885,7 @@ impl ChatManager {
                         self.pin_session_model(session_id).await;
                     }
                     if let Some(router) = &router {
-                        router.reroute(Mode::Primary, None, true);
+                        router.reroute(Mode::Primary, None, None, true);
                     }
                     (Mode::Primary, None, "request")
                 }
@@ -11883,7 +11895,9 @@ impl ChatManager {
                         .ok_or_else(|| anyhow::Error::new(Refused::OtherProvider(provider)))?;
                     self.unpin_session_model(session_id).await;
                     if let Some(router) = &router {
-                        router.reroute(Mode::Mixed, Some(allowed), false);
+                        // The whole pool, every provider: a pool ticked across providers
+                        // may move the conversation from the next turn on (R-S2).
+                        router.reroute(Mode::Mixed, Some(allowed), Some(pool.clone()), false);
                     }
                     (Mode::Mixed, Some(serde_json::to_string(&pool)?), "auto")
                 }

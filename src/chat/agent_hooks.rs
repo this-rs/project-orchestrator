@@ -78,7 +78,9 @@ use super::provider::cognitive::{
     conversation_stage, ConversationRoutingMode, LearningStage, ProviderRoutingMode,
     RoutingSettings,
 };
-use super::types::{EffectiveCapability, EffectiveCause, EffectiveSource, RoutingPoolEntry};
+use super::types::{
+    pool_spans_providers, EffectiveCapability, EffectiveCause, EffectiveSource, RoutingPoolEntry,
+};
 
 /// The table the Claude path hands to its CLI: event name → matchers.
 pub(crate) type HookTable = HashMap<String, Vec<HookMatcher>>;
@@ -598,22 +600,25 @@ impl TurnRouter {
 
     /// The conversation's routing changed (`PUT .../routing`): from the next turn on, `mode`
     /// replaces the one the session opened with, `allowed_models` (this provider's models of
-    /// the pool) restricts the candidates, `explicit_model` pins the current model. Whatever
-    /// was set by hand before is forgotten: this IS the new choice by hand, and a provider
-    /// imposed at the opening is released (`auto` lets PO choose the provider again; the
-    /// other choices never move the conversation).
+    /// the pool) restricts the candidates, `routing_pool` (every ticked pair, whatever its
+    /// provider) is what a provider move among the pool is decided from (R-S2), and
+    /// `explicit_model` pins the current model. Whatever was set by hand before is
+    /// forgotten: this IS the new choice by hand, and a provider imposed at the opening is
+    /// released (`auto` lets PO choose the provider again; a pool ticked across providers
+    /// lets it move among those; the other choices never move the conversation).
     pub(crate) fn reroute(
         &self,
         mode: ConversationRoutingMode,
         allowed_models: Option<Vec<String>>,
+        routing_pool: Option<Vec<RoutingPoolEntry>>,
         explicit_model: bool,
     ) {
         let mut choice = locked(&self.choice);
         choice.routing.mode = mode.pilot_mode();
         choice.allowed_models = allowed_models;
+        choice.routing_pool = routing_pool;
         choice.explicit_model = explicit_model;
         choice.provider_imposed = false;
-        choice.routing_pool = None;
         // Auto, or a pool (`allowed_models` is only given for two models or more): the
         // user's choice, applied at the `auto` stage (decision R-S1).
         let conversation_routes =
@@ -881,12 +886,13 @@ pub(crate) enum ProviderPlan {
 }
 
 /// Whether the turn about to start moves the conversation to ANOTHER provider (mode
-/// `full`). Called before the turn starts, by the host's send path: a session runs on one
-/// provider, so a move is never a [`TurnDirective`].
+/// `full`, or a pool ticked across two providers or more — decision R-S2). Called before
+/// the turn starts, by the host's send path: a session runs on one provider, so a move is
+/// never a [`TurnDirective`].
 ///
-/// * not `full` (`mixed` stays on the session's provider), a model or a provider imposed
-///   (`routed_by: request`, pinned), a model changed by hand, a source that knows one
-///   provider only: nothing is asked, [`ProviderPlan::Stay`];
+/// * neither `full` nor a pool spanning providers (`mixed` on one provider stays there), a
+///   model or a provider imposed (`routed_by: request`, pinned), a model changed by hand, a
+///   source that knows one provider only: nothing is asked, [`ProviderPlan::Stay`];
 /// * otherwise the decider chooses among every model the project consented to (the
 ///   conversation's pool when it has one), the current pair in force. The decision is kept
 ///   for the turn (the hook does not ask again) and recorded applied or not;
@@ -974,7 +980,16 @@ pub(crate) async fn plan_provider_move(router: &TurnRouter) -> ProviderPlan {
     let may_move = blind || !just_moved || direction_changed;
     let apply = routing.auto;
     let current = Pick::new(&router.provider_id, &current_model);
-    let mut request = DecideRequest::new(signature, settings_for(&choice.routing, apply), pool);
+    let mut settings = settings_for(&choice.routing, apply);
+    // A pool ticked across two providers or more is routed like `full` restricted to the
+    // pool (R-S2): the decision is applied (a move) whatever mode the ticks map to, exactly
+    // as a model change inside a pool is (`directive_for_turn`). Without this the decider
+    // answers `applied: false` under `mixed` (`is_applied`: `primary` applies nothing) and
+    // `routing_of`'s opening above would be inert.
+    if pool_spans_providers(choice.routing_pool.as_deref()) {
+        settings.mode = ProviderRoutingMode::Full;
+    }
+    let mut request = DecideRequest::new(signature, settings, pool);
     request.narrowed.extend(person);
     narrow(
         &mut request,
@@ -1185,8 +1200,9 @@ struct Routing {
     /// (with a model of this provider), nothing imposed nor changed by hand, a session that can
     /// switch model live.
     model: bool,
-    /// PO may move the conversation to ANOTHER provider: `full`, neither model nor provider
-    /// imposed, nothing changed by hand.
+    /// PO may move the conversation to ANOTHER provider: `full`, or a pool ticked across two
+    /// providers or more (routed like `full` restricted to the pool, decision R-S2); neither
+    /// model nor provider imposed, nothing changed by hand.
     provider: bool,
     /// The stage in force for this conversation applies the decisions (`auto`); otherwise they
     /// are only recorded.
@@ -1209,7 +1225,9 @@ fn routing_of(router: &TurnRouter, choice: &RouterChoice) -> Routing {
             // A pool none of whose models is on this provider: nothing to route among here.
             && !choice.allowed_models.as_ref().is_some_and(Vec::is_empty)
             && router.set_model_live.load(Ordering::SeqCst),
-        provider: free && full && !choice.provider_imposed,
+        provider: free
+            && !choice.provider_imposed
+            && (full || pool_spans_providers(choice.routing_pool.as_deref())),
         auto: effective_stage(choice) == LearningStage::Auto,
     }
 }
@@ -2071,8 +2089,10 @@ mod provider_move_tests {
         }
     }
 
+    /// `mixed` WITHOUT a pool spanning providers: the conversation stays (R-S2 opens the
+    /// provider only to a pool ticked across providers, see the R-S2 tests below).
     #[tokio::test]
-    async fn mixed_never_leaves_the_sessions_provider() {
+    async fn mixed_without_a_cross_provider_pool_never_leaves_the_sessions_provider() {
         let decider = Fake::picking("local2", 0.9, 0.1);
         let mut s = spec(
             decider.clone(),
@@ -2218,6 +2238,153 @@ mod provider_move_tests {
         );
     }
 
+    /// R-S2, the one lock (`routing_of`): under `mixed` (its pilot mode is `primary`), a
+    /// pool ticked across two providers opens the provider to a move; a pool on ONE
+    /// provider, an imposed model or provider, or a choice by hand keeps it closed; `full`
+    /// is exactly what it was.
+    #[test]
+    fn routing_of_opens_the_provider_to_a_mixed_pool_spanning_two_providers() {
+        let cross = vec![entry("local", "m"), entry("local2", "m")];
+        let mono = vec![entry("local", "m"), entry("local", "big")];
+        let mixed = |pool: Vec<RoutingPoolEntry>| {
+            let mut s = spec(
+                Fake::picking("local2", 0.9, 0.1),
+                Arc::new(ThreeProviders),
+                ProviderRoutingMode::Primary,
+                LearningStage::Auto,
+            );
+            s.allowed_models = Some(vec!["m".into()]);
+            s.routing_pool = Some(pool);
+            s.conversation_routes = true;
+            s
+        };
+        let provider_of = |r: &TurnRouter| routing_of(r, &locked(&r.choice)).provider;
+
+        assert!(
+            provider_of(&router(mixed(cross.clone()))),
+            "two providers: open"
+        );
+        assert!(!provider_of(&router(mixed(mono))), "one provider: closed");
+
+        let mut pinned = mixed(cross.clone());
+        pinned.explicit_model = true;
+        assert!(!provider_of(&router(pinned)), "a model imposed: closed");
+        let mut named = mixed(cross.clone());
+        named.provider_imposed = true;
+        assert!(!provider_of(&router(named)), "a provider imposed: closed");
+        let by_hand = router(mixed(cross));
+        by_hand.mark_manual();
+        assert!(!provider_of(&by_hand), "a choice by hand: closed");
+
+        // `full`: open without any pool, closed when imposed — unchanged.
+        let full = |imposed: bool| {
+            let mut s = spec(
+                Fake::picking("local2", 0.9, 0.1),
+                Arc::new(ThreeProviders),
+                ProviderRoutingMode::Full,
+                LearningStage::Auto,
+            );
+            s.provider_imposed = imposed;
+            router(s)
+        };
+        assert!(provider_of(&full(false)));
+        assert!(!provider_of(&full(true)));
+    }
+
+    /// R-S2 end to end in the router: the move is decided among the pool's two providers,
+    /// asked as `full` (otherwise the decider answers `applied: false` under `primary`),
+    /// and applied. Red before R-S2 on both counts: `routing_of` closed the provider, and
+    /// the request kept the pilot mode.
+    #[tokio::test]
+    async fn a_mixed_pool_spanning_two_providers_moves_the_conversation() {
+        let decider = Fake::picking("local2", 0.9, 0.1);
+        let mut s = spec(
+            decider.clone(),
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Primary,
+            LearningStage::Auto,
+        );
+        s.allowed_models = Some(vec!["m".into()]);
+        s.routing_pool = Some(vec![entry("local", "m"), entry("local2", "m")]);
+        s.conversation_routes = true;
+        let router = router(s);
+        let plan = plan_provider_move(&router).await;
+        assert!(is_move_to(&plan, "local2"), "{plan:?}");
+        let asked = decider.last();
+        assert_eq!(
+            (asked.settings.mode, asked.settings.stage),
+            (ProviderRoutingMode::Full, LearningStage::Auto),
+            "asked as full inside the pool"
+        );
+        let mut providers: Vec<&str> = asked.pool.iter().map(|f| f.provider_id.as_str()).collect();
+        providers.sort_unstable();
+        assert_eq!(
+            providers,
+            vec!["local", "local2"],
+            "the pool, both providers"
+        );
+    }
+
+    /// R-S2: a `mixed` pool on ONE provider never moves — the decider is not even asked
+    /// for a move (the model is routed inside the provider by `directive_for_turn`).
+    #[tokio::test]
+    async fn a_mixed_pool_on_one_provider_never_moves_the_conversation() {
+        let decider = Fake::picking("local2", 0.9, 0.1);
+        let mut s = spec(
+            decider.clone(),
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Primary,
+            LearningStage::Auto,
+        );
+        s.allowed_models = Some(vec!["m".into(), "big".into()]);
+        s.routing_pool = Some(vec![entry("local", "m"), entry("local", "big")]);
+        s.conversation_routes = true;
+        let router = router(s);
+        assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
+        assert_eq!(decider.calls(), 0, "no move is asked");
+    }
+
+    /// R-S2 through `PUT .../routing` (`reroute`): a conversation opened on a provider the
+    /// request named (imposed, strict) is re-ticked with a pool spanning two providers —
+    /// from the next turn on the router may move it. `reroute` must KEEP the pool it is
+    /// given: red when it drops it (`choice.routing_pool = None`, what main did), since
+    /// then no pool spans anything and `mixed` stays closed.
+    #[tokio::test]
+    async fn re_ticking_a_pool_across_providers_opens_a_strict_conversation_to_a_move() {
+        let decider = Fake::picking("local2", 0.9, 0.1);
+        let mut s = spec(
+            decider.clone(),
+            Arc::new(ThreeProviders),
+            ProviderRoutingMode::Primary,
+            LearningStage::Auto,
+        );
+        s.explicit_model = true;
+        s.provider_imposed = true;
+        let router = router(s);
+        assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
+        assert_eq!(decider.calls(), 0, "strict: nothing asked");
+
+        router.reroute(
+            ConversationRoutingMode::Mixed,
+            Some(vec!["m".into()]),
+            Some(vec![entry("local", "m"), entry("local2", "m")]),
+            false,
+        );
+        let plan = plan_provider_move(&router).await;
+        assert!(is_move_to(&plan, "local2"), "{plan:?}");
+        assert_eq!(decider.calls(), 1);
+
+        // Re-ticked on one provider only: closed again.
+        router.reroute(
+            ConversationRoutingMode::Mixed,
+            Some(vec!["m".into(), "big".into()]),
+            Some(vec![entry("local", "m"), entry("local", "big")]),
+            false,
+        );
+        assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
+        assert_eq!(decider.calls(), 1, "one provider: nothing more asked");
+    }
+
     #[tokio::test]
     async fn an_imposed_model_or_provider_is_never_moved_until_auto_is_chosen_again() {
         let decider = Fake::picking("local2", 0.9, 0.1);
@@ -2247,7 +2414,7 @@ mod provider_move_tests {
             "an imposed pair is not even asked about"
         );
         // `PUT .../routing {auto: true}`: PO chooses the provider again.
-        named.reroute(ConversationRoutingMode::Full, None, false);
+        named.reroute(ConversationRoutingMode::Full, None, None, false);
         assert!(is_move_to(&plan_provider_move(&named).await, "local2"));
     }
 
@@ -2543,7 +2710,7 @@ mod provider_move_tests {
         assert_eq!(decider.last().settings.stage, LearningStage::Auto);
 
         // One model ticked: strict, nothing is asked any more, the settings' stage is back.
-        router.reroute(ConversationRoutingMode::Primary, None, true);
+        router.reroute(ConversationRoutingMode::Primary, None, None, true);
         assert_eq!(locked(&router.choice).routing.stage, LearningStage::Shadow);
         let calls = decider.calls();
         assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
@@ -2572,6 +2739,7 @@ mod provider_move_tests {
         router.reroute(
             ConversationRoutingMode::Mixed,
             Some(vec!["m".into(), "big".into()]),
+            Some(vec![entry("local", "m"), entry("local", "big")]),
             false,
         );
         let directive = directive_for_turn(&router, &TurnContext::new(1, "m")).await;
@@ -2591,7 +2759,7 @@ mod provider_move_tests {
             ProviderRoutingMode::Primary,
             LearningStage::Shadow,
         ));
-        router.reroute(ConversationRoutingMode::Full, None, false);
+        router.reroute(ConversationRoutingMode::Full, None, None, false);
         router
     }
 }
