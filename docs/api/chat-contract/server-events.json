@@ -625,8 +625,16 @@
     "permission_request": {
       "examples": {
         "full": {
+          "always": true,
           "canonical": "read_file",
           "category": "read",
+          "consent": {
+            "destinations": [
+              "http://docs.rs",
+              "https://docs.rs"
+            ],
+            "subject": "https://docs.rs"
+          },
           "id": "perm_0001",
           "input": {
             "command": "cargo fmt",
@@ -645,6 +653,10 @@
         }
       },
       "fields": {
+        "always": {
+          "required": false,
+          "type": "boolean"
+        },
         "canonical": {
           "required": false,
           "type": "string"
@@ -652,6 +664,10 @@
         "category": {
           "required": false,
           "type": "string"
+        },
+        "consent": {
+          "required": false,
+          "type": "object"
         },
         "id": {
           "required": true,

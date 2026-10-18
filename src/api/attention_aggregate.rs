@@ -1303,6 +1303,7 @@ mod tests {
                 canonical: None,
                 tool_use_id: None,
                 always: None,
+                consent: None,
             };
             self.store(session, 1, ev, age).await;
         }

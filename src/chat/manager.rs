@@ -18581,6 +18581,7 @@ fn parse_permission_control_msg(
             .map(str::to_string),
         // Set by the session (`mark_always_eligibility`), which knows its lasting rules.
         always: None,
+        consent: None,
     })
 }
 
@@ -24405,6 +24406,7 @@ mod tests {
             canonical: Some("Bash".into()),
             tool_use_id: None,
             always: None,
+            consent: None,
         };
         handle.emit(ask("refused")).await;
         handle.emit(ask("allowed")).await;
@@ -24462,6 +24464,7 @@ mod tests {
             canonical: Some("Bash".into()),
             tool_use_id: None,
             always: None,
+            consent: None,
         };
         handle.emit(ask("won")).await;
         handle.emit(ask("pending")).await;
@@ -24526,6 +24529,7 @@ mod tests {
             canonical: Some("Bash".into()),
             tool_use_id: None,
             always: None,
+            consent: None,
         })
         .unwrap();
         let tail = [
@@ -28407,6 +28411,7 @@ mod tests {
                 canonical: None,
                 tool_use_id: None,
                 always: None,
+                consent: None,
             },
             ChatEvent::Error {
                 message: "Something went wrong".into(),
@@ -35378,6 +35383,7 @@ mod granted_answer_clock_tests {
                 canonical: None,
                 tool_use_id: Some("t1".into()),
                 always: None,
+                consent: None,
             },
             chrono::Utc::now(),
         );
