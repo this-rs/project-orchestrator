@@ -9009,6 +9009,84 @@ mod native_transcripts {
         assert!(graph.get_chat_session(uuid).await.unwrap().is_none());
         assert!(!after.delete_session(uuid).await.unwrap(), "already gone");
     }
+
+    /// The `degraded_features` of the session's `system_init`, as persisted.
+    async fn degraded_of(graph: &MockGraphStore, sid: &str) -> Vec<String> {
+        let uuid = Uuid::parse_str(sid).unwrap();
+        for _ in 0..400 {
+            let found = graph
+                .get_chat_events(uuid, 0, 500)
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|r| serde_json::from_str::<ChatEvent>(&r.data).ok())
+                .find_map(|e| match e {
+                    ChatEvent::SystemInit {
+                        degraded_features, ..
+                    } => Some(degraded_features.unwrap_or_default()),
+                    _ => None,
+                });
+            if let Some(degraded) = found {
+                return degraded;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("no system_init persisted");
+    }
+
+    /// CTX6 follow-up (review of #752, point 1): a transcript root inside a git work tree
+    /// (a versioned HOME) keeps the conversation in memory — and the session SAYS it will
+    /// not resume after a restart, instead of only a server-side `warn!`.
+    #[tokio::test]
+    async fn a_transcript_root_inside_a_git_work_tree_is_declared_on_the_session() {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".git")).unwrap();
+        let root = home.path().join("Library").join("native-transcripts");
+
+        let manager = manager(graph.clone(), true).with_native_transcripts(&root);
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        let degraded = degraded_of(&graph, &sid).await;
+        assert!(
+            degraded
+                .iter()
+                .any(|f| f == super::super::agent_runtime::RESUME_AFTER_RESTART_FEATURE),
+            "the session declares it: {degraded:?}"
+        );
+        assert!(!root.exists(), "nothing written inside the work tree");
+    }
+
+    /// …and a root outside any work tree declares nothing (the transcripts are on disk).
+    #[tokio::test]
+    async fn a_transcript_root_outside_a_work_tree_declares_nothing() {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("native-transcripts");
+
+        let manager = manager(graph.clone(), true).with_native_transcripts(&root);
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        let degraded = degraded_of(&graph, &sid).await;
+        assert!(
+            !degraded
+                .iter()
+                .any(|f| f == super::super::agent_runtime::RESUME_AFTER_RESTART_FEATURE),
+            "{degraded:?}"
+        );
+    }
 }
 
 /// A message sent during a turn of the legacy Claude Code engine interrupts it, then

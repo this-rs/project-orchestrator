@@ -28,11 +28,24 @@
 //! reasoning, never inside a tool-call argument. A native resume reloads THIS
 //! file (the token names it); it is never rebuilt from the graph's chat events.
 //!
+//! SECURITY, what the masking does NOT cover: a known key that the model itself wrote
+//! into a tool-call ARGUMENT (`curl -H "Authorization: Bearer <key>"`) stays in clear in
+//! the file — masking it would change the argument the endpoint's cache and the replay
+//! depend on. The file is owner-only (`0600`), like the vault's; it is still the
+//! conversation, and whoever reads the server's application directory reads it. The
+//! prompt tells agents to use secrets only through `orchestrator secret exec`, which keeps
+//! the value out of every argument.
+//!
 //! Where: the server's application directory (beside the vault), NEVER a project
 //! directory or a git work tree: the files hold the conversation in clear, and a
 //! `git add -A` there would publish it. [`store_for`] refuses a root inside a git work
 //! tree ([`inside_git_worktree`]); `native_factory` then keeps the transcripts in
-//! memory (the session does not resume after a restart) and says so in a warning.
+//! memory (the session does not resume after a restart), says so in a warning, and the
+//! session itself declares it: `resume_after_restart` among its `degraded_features`
+//! (`ChatManager::transcripts_kept_in_memory`), so a person sees it where they work. A
+//! versioned HOME (a dotfiles repository with its `.git` in `~`) is the common case: the
+//! walk is NOT bounded at HOME on purpose — such a repository may well track the
+//! application directory, and a `git add -A` in `~` would then publish every conversation.
 //!
 //! On Windows the `0600`/`0700` modes do not exist: the protection is the ACL of
 //! the user profile (`%APPDATA%`, readable by that user, SYSTEM and the
