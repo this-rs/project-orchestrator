@@ -132,10 +132,33 @@ meilisearch:
 #   # dimensions: 768                                # EMBEDDING_DIMENSIONS env override
 
 # -----------------------------------------------------------------------------
-# Chat — Claude Code integration (optional, uses env vars)
+# Chat — providers (optional, uses env vars)
 # -----------------------------------------------------------------------------
+# Claude Code is ONE provider among others, and optional. Pick one:
+#
+#   provider: "claude-code"   The Claude Code CLI on this machine, signed in to
+#                             your own Claude account. Uses default_model,
+#                             claude_cli_path, auto_update_cli below.
+#                             (Absent `provider` means claude-code, as before.)
+#   provider: "none"          No Claude Code: no Claude CLI is needed, nor looked
+#                             for. Remove default_model. Chat uses a provider
+#                             instance you register once the server runs.
+#
+# Provider instances (OpenAI-compatible endpoint, Codex, ACP agent) are not
+# configured in this file: they are created in Settings → Providers, or with
+# POST /api/chat/providers. Keys live in the vault, never here; the instance
+# names them by reference (credential_ref: "vault:<name>"). Example body:
+#   {"id": "deepseek", "kind": "openai_compatible", "preset": "deepseek",
+#    "label": "DeepSeek", "base_url": "https://api.deepseek.com/v1",
+#    "default_model": "deepseek-chat", "cost_source": "priced",
+#    "credential_ref": "vault:deepseek"}
+#   kind "codex": the `codex` program of the server's PATH.
+#   kind "acp":   an agent declared in CHAT_PROVIDER_ACP_COMMANDS.
+# A third-party provider needs authentication on (section `auth` below).
+# Full walk-through: docs/guides/providers.md
 chat:
-  default_model: "claude-opus-4-7"    # CHAT_DEFAULT_MODEL env override
+  provider: "claude-code"             # "claude-code" | "none" (see above)
+  default_model: "claude-opus-4-7"    # CHAT_DEFAULT_MODEL env override (Claude Code only)
   max_sessions: 10                     # CHAT_MAX_SESSIONS env override
   session_timeout_secs: 1800           # CHAT_SESSION_TIMEOUT_SECS env override
   max_turns: 50                        # CHAT_MAX_TURNS env override

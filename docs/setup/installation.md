@@ -128,9 +128,12 @@ sudo dpkg -i orchestrator_*.deb
 sudo systemctl enable --now project-orchestrator
 ```
 
-### Auto-configure Claude Code
+### Auto-configure Claude Code (optional)
 
-After installation, automatically register the MCP server in Claude Code:
+Claude Code is one chat provider among others, and optional: an OpenAI-compatible
+endpoint, Codex or an ACP agent is added in Settings → Providers
+(see [Providers](../guides/providers.md)). If you use Claude Code, register the MCP
+server in it:
 
 ```bash
 orchestrator setup-claude
