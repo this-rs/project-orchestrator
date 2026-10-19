@@ -430,6 +430,41 @@ pub fn sdk_open_error(context: &str, err: nexus_claude::SdkError) -> anyhow::Err
     }
 }
 
+/// The code a session refused for lack of a slot answers with (HTTP 429).
+pub const SESSION_LIMIT_REACHED: &str = "session_limit_reached";
+
+/// The session table is full: `active` live sessions on both engines, `limit` allowed. A
+/// capacity limit, not a server fault (issue #876): the caller can wait, close a session or
+/// ask a person. The message keeps the historical wording (`Maximum number of active
+/// sessions reached (N)`), which callers and tests match on.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("Maximum number of active sessions reached ({limit})")]
+pub struct SessionLimitReached {
+    pub active: usize,
+    pub limit: usize,
+}
+
+impl SessionLimitReached {
+    /// What the API answers: 429, retryable (a slot frees when a session ends or idles out).
+    pub fn failure(&self) -> OpenFailure {
+        OpenFailure {
+            status: 429,
+            code: SESSION_LIMIT_REACHED,
+            message: format!(
+                "{} ({} active): close a session or wait for one to finish",
+                self, self.active
+            ),
+            provider_id: None,
+            action: Some("close_a_session".to_string()),
+            retryable: true,
+            retry_after_ms: Some(30_000),
+            fallbacks: None,
+            consent_scope: None,
+            candidates: None,
+        }
+    }
+}
+
 /// The typed answer for an error returned by `create_session` /
 /// `resume_session`, when the error chain carries a typed cause. `None` means
 /// "not an opening failure we can name" — the caller answers 500.
@@ -450,6 +485,9 @@ pub fn classify_open_error(err: &anyhow::Error, provider_id: Option<&str>) -> Op
             cause.downcast_ref::<crate::chat::cancelled_parents::ParentCancelled>()
         {
             return Some(refused.failure());
+        }
+        if let Some(full) = cause.downcast_ref::<SessionLimitReached>() {
+            return Some(full.failure());
         }
         if let Some(locked) = cause.downcast_ref::<AutoVaultLocked>() {
             let mut failure = open_failure(&ProviderError::CredentialsLocked, None);
@@ -581,6 +619,24 @@ mod tests {
         assert_eq!(failure.provider_id.as_deref(), Some("claude-code"));
         let body = failure.to_json().to_string();
         assert!(!body.contains("/Users/x"), "searched paths leaked: {body}");
+    }
+
+    #[test]
+    fn a_full_session_table_is_a_429_with_a_stable_code() {
+        let err = anyhow::Error::new(SessionLimitReached {
+            active: 10,
+            limit: 10,
+        })
+        .context("Failed to create session");
+        let failure = classify_open_error(&err, None).expect("typed, not a bare 500");
+        assert_eq!(failure.status, 429);
+        assert_eq!(failure.code, SESSION_LIMIT_REACHED);
+        assert!(failure.retryable);
+        let body = failure.to_json();
+        assert_eq!(body["code"], "session_limit_reached");
+        let message = body["error"].as_str().unwrap();
+        assert!(message.contains("Maximum number of active sessions reached (10)"));
+        assert!(message.contains("10 active"));
     }
 
     #[test]

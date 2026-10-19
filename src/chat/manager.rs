@@ -3499,6 +3499,9 @@ pub(crate) fn server_secrets_to_hide(present: impl Fn(&str) -> bool) -> Vec<&'st
         .collect()
 }
 
+/// How long a session must have done nothing before a full table may close it for a new one.
+const RECLAIM_IDLE_GRACE: Duration = Duration::from_secs(120);
+
 impl ChatManager {
     /// Build the standard enrichment pipeline with optional reasoning engine and trajectory collector.
     ///
@@ -7262,10 +7265,19 @@ impl ChatManager {
         // Check max sessions: both engines' live sessions count.
         {
             if self.active_session_count().await >= self.config.max_sessions {
-                return Err(anyhow!(
-                    "Maximum number of active sessions reached ({})",
-                    self.config.max_sessions
-                ));
+                // Full: an idle session (finished sub-agent, abandoned chat) must not hold a
+                // slot for the half hour the cleanup task waits (issue #876). Free the most
+                // idle one, then count again; refuse, typed (429), only if none can go.
+                self.reclaim_idle_slot(RECLAIM_IDLE_GRACE).await;
+                let active = self.active_session_count().await;
+                if active >= self.config.max_sessions {
+                    return Err(anyhow::Error::new(
+                        super::provider::errors::SessionLimitReached {
+                            active,
+                            limit: self.config.max_sessions,
+                        },
+                    ));
+                }
             }
         }
 
@@ -18354,6 +18366,64 @@ impl ChatManager {
             }
         }
         expired
+    }
+
+    /// Closes the most idle session that is doing nothing (no running turn, no background
+    /// task) and has been for `grace`, on either engine, to make room for a
+    /// new one. Closing is what the idle cleanup does half an hour later: the session stays
+    /// in the graph and resumes on the next message. Returns whether a slot was freed.
+    pub(crate) async fn reclaim_idle_slot(&self, grace: Duration) -> bool {
+        let mut best: Option<(Duration, String)> = None;
+        let mut consider = |idle: Duration, id: &str| {
+            if idle >= grace && best.as_ref().is_none_or(|(b, _)| idle > *b) {
+                best = Some((idle, id.to_string()));
+            }
+        };
+        let legacy: Vec<_> = {
+            let sessions = self.active_sessions.read().await;
+            sessions
+                .iter()
+                .map(|(id, s)| {
+                    (
+                        id.clone(),
+                        s.last_activity.elapsed(),
+                        s.is_streaming.clone(),
+                        s.active_background_tasks.clone(),
+                        s.cli_background_tasks.clone(),
+                    )
+                })
+                .collect()
+        };
+        for (id, idle, streaming, background, cli_background) in legacy {
+            let busy = streaming.load(Ordering::Relaxed)
+                || background
+                    .lock()
+                    .await
+                    .len()
+                    .max(cli_background.load(Ordering::Relaxed))
+                    > 0;
+            if !busy {
+                consider(idle, &id);
+            }
+        }
+        for handle in self.agent_runtime.handles().await {
+            let busy = handle.is_streaming.load(Ordering::SeqCst)
+                || !handle.active_background_tasks().await.is_empty();
+            if !busy {
+                consider(handle.idle_for(), &handle.session_id);
+            }
+        }
+        let Some((idle, id)) = best else {
+            return false;
+        };
+        info!(session_id = %id, idle_secs = idle.as_secs(), "Session table full: closing the most idle session");
+        match self.close_session(&id).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Failed to reclaim idle session {}: {}", id, e);
+                false
+            }
+        }
     }
 
     /// Get the number of currently active sessions, on both engines.
