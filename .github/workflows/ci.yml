@@ -68,7 +68,11 @@ jobs:
     # when that variable is set, for pushes and for PRs from THIS repository only: the repository
     # is public, a fork's code never runs on that machine. Nightly and `fresh` runs stay on a
     # hosted runner, where a cold start is the point. Empty the variable to send every job back.
-    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && vars.CI_SELF_HOSTED_LABEL || 'ubuntu-latest' }}
+    # One runner instance per job (<label>-build, -unit, -cov): cargo fingerprints the
+    # workspace crates by their absolute path, and each instance has its own work dir, so a
+    # job that moved to another instance recompiled the whole workspace (Build: 4 min 53 s
+    # on an empty commit, 19/10/2026).
+    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-build', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -301,7 +305,11 @@ jobs:
     # when that variable is set, for pushes and for PRs from THIS repository only: the repository
     # is public, a fork's code never runs on that machine. Nightly and `fresh` runs stay on a
     # hosted runner, where a cold start is the point. Empty the variable to send every job back.
-    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && vars.CI_SELF_HOSTED_LABEL || 'ubuntu-latest' }}
+    # One runner instance per job (<label>-build, -unit, -cov): cargo fingerprints the
+    # workspace crates by their absolute path, and each instance has its own work dir, so a
+    # job that moved to another instance recompiled the whole workspace (Build: 4 min 53 s
+    # on an empty commit, 19/10/2026).
+    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-unit', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
     # A hung test used to hold a job for 1-2 hours; nextest kills it after 5 min (see
     # .config/nextest.toml), this is the backstop.
     timeout-minutes: 40
@@ -586,7 +594,11 @@ jobs:
     # when that variable is set, for pushes and for PRs from THIS repository only: the repository
     # is public, a fork's code never runs on that machine. Nightly and `fresh` runs stay on a
     # hosted runner, where a cold start is the point. Empty the variable to send every job back.
-    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && vars.CI_SELF_HOSTED_LABEL || 'ubuntu-latest' }}
+    # One runner instance per job (<label>-build, -unit, -cov): cargo fingerprints the
+    # workspace crates by their absolute path, and each instance has its own work dir, so a
+    # job that moved to another instance recompiled the whole workspace (Build: 4 min 53 s
+    # on an empty commit, 19/10/2026).
+    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-cov', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
     # Backstop: a hung test used to keep this job alive for 1-2 hours.
     timeout-minutes: 50
     permissions:
