@@ -148,6 +148,30 @@ impl CandleGnnEncoder {
         let flat: Vec<f32> = features.into_iter().flatten().collect();
         Tensor::from_vec(flat, (num_nodes, TOTAL_FEATURE_DIM), &device)
     }
+
+    /// Build the per-edge weight tensor from the PyG export.
+    ///
+    /// Returns `Some([num_edges])` only when the export actually carries one weight per
+    /// edge; otherwise `None`, which keeps the forward pass at "every edge weighs 1.0".
+    /// Never fails the inference on a weight mismatch — a malformed weight vector is
+    /// ignored rather than fatal.
+    fn build_edge_weights(
+        pyg: &crate::sampler::PyGData,
+        device: &Device,
+    ) -> CandleResult<Option<Tensor>> {
+        if pyg.num_edges == 0 || pyg.edge_weight.len() != pyg.num_edges {
+            debug!(
+                "GNN: no usable edge weights ({} weights for {} edges) — using unit weights",
+                pyg.edge_weight.len(),
+                pyg.num_edges
+            );
+            return Ok(None);
+        }
+
+        let weights: Vec<f32> = pyg.edge_weight.iter().map(|&w| w as f32).collect();
+        let tensor = Tensor::from_vec(weights, pyg.num_edges, device)?;
+        Ok(Some(tensor))
+    }
 }
 
 impl GnnEncoder for CandleGnnEncoder {
@@ -171,7 +195,7 @@ impl GnnEncoder for CandleGnnEncoder {
             let edge_type = Tensor::zeros(0, DType::U8, &device)?;
             let embeddings =
                 self.encoder
-                    .forward(&x, &edge_index, Some(&edge_type), pyg.num_nodes)?;
+                    .forward(&x, &edge_index, Some(&edge_type), None, pyg.num_nodes)?;
             return Ok(embeddings.to_vec2::<f32>()?);
         }
 
@@ -186,10 +210,17 @@ impl GnnEncoder for CandleGnnEncoder {
         let edge_index = Tensor::from_vec(edge_flat, (2, num_edges), &device)?;
         let edge_type = Tensor::from_vec(pyg.edge_type.clone(), num_edges, &device)?;
 
+        // Real edge weights (SYNAPSE edges carry one); None if the export is inconsistent
+        let edge_weight = Self::build_edge_weights(&pyg, &device)?;
+
         // Forward pass
-        let embeddings = self
-            .encoder
-            .forward(&x, &edge_index, Some(&edge_type), pyg.num_nodes)?;
+        let embeddings = self.encoder.forward(
+            &x,
+            &edge_index,
+            Some(&edge_type),
+            edge_weight.as_ref(),
+            pyg.num_nodes,
+        )?;
 
         Ok(embeddings.to_vec2::<f32>()?)
     }
@@ -719,6 +750,72 @@ mod tests {
 
         let embs = encoder.encode_subgraph(&subgraph)?;
         assert_eq!(embs.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_encode_subgraph_consumes_edge_weights() -> Result<(), GnnError> {
+        let config = CandleGnnEncoderConfig {
+            encoder_config: GraphEncoderConfig {
+                input_dim: TOTAL_FEATURE_DIM,
+                hidden_dim: 64,
+                output_dim: 32,
+                num_layers: 2,
+                num_relations: 8,
+                num_bases: 4,
+                dropout: 0.0,
+                architecture: GNNArchitecture::GraphSAGE,
+            },
+            checkpoint_path: None,
+            norm_stats: None,
+        };
+        let encoder = CandleGnnEncoder::new(config)?;
+
+        // Same topology, same encoder — only the edge weights differ.
+        let uniform = make_test_subgraph(20, 40);
+        let mut skewed = make_test_subgraph(20, 40);
+        for (i, edge) in skewed.edges.iter_mut().enumerate() {
+            edge.weight = if i % 3 == 0 { 0.05 } else { 1.0 };
+        }
+
+        let a = encoder.encode_subgraph(&uniform)?;
+        let b = encoder.encode_subgraph(&skewed)?;
+
+        let diff: f32 = a
+            .iter()
+            .zip(b.iter())
+            .flat_map(|(row_a, row_b)| row_a.iter().zip(row_b.iter()).map(|(x, y)| (x - y).abs()))
+            .sum();
+        assert!(
+            diff > 1e-4,
+            "PyG edge weights must reach the forward pass, total diff = {}",
+            diff
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_edge_weights_none_on_mismatch() -> Result<(), GnnError> {
+        let mut subgraph = make_test_subgraph(5, 8);
+        let pyg = export_to_pyg(&subgraph);
+        assert_eq!(pyg.edge_weight.len(), pyg.num_edges);
+
+        let device = Device::Cpu;
+        let tensor = CandleGnnEncoder::build_edge_weights(&pyg, &device)?;
+        assert_eq!(
+            tensor.as_ref().map(|t| t.dims().to_vec()),
+            Some(vec![pyg.num_edges])
+        );
+
+        // A weight vector that does not match the edge count is ignored, not fatal.
+        let mut broken = pyg.clone();
+        broken.edge_weight.pop();
+        assert!(CandleGnnEncoder::build_edge_weights(&broken, &device)?.is_none());
+
+        // No edges → nothing to weigh.
+        subgraph.edges.clear();
+        let empty = export_to_pyg(&subgraph);
+        assert!(CandleGnnEncoder::build_edge_weights(&empty, &device)?.is_none());
         Ok(())
     }
 

@@ -245,17 +245,21 @@ impl RGCN {
     }
 
     /// Forward pass through all layers.
+    ///
+    /// * `edge_weight` — optional `[num_edges]` per-edge weights, forwarded to every
+    ///   layer. `None` keeps the historical behaviour (all edges weigh `1.0`).
     pub fn forward(
         &self,
         x: &Tensor,
         edge_index: &Tensor,
         edge_type: Option<&Tensor>,
+        edge_weight: Option<&Tensor>,
         num_nodes: usize,
     ) -> Result<Tensor> {
         let mut h = x.clone();
 
         for layer in &self.layers {
-            h = layer.forward(&h, edge_index, edge_type, num_nodes)?;
+            h = layer.forward(&h, edge_index, edge_type, edge_weight, num_nodes)?;
         }
 
         Ok(h)
@@ -306,7 +310,7 @@ mod tests {
         };
 
         let layer = RGCNLayer::new(config, vb)?;
-        let output = layer.forward(&x, &edge_index, edge_type.as_ref(), num_nodes)?;
+        let output = layer.forward(&x, &edge_index, edge_type.as_ref(), None, num_nodes)?;
 
         assert_eq!(output.dims(), &[num_nodes, output_dim]);
         Ok(())
@@ -330,7 +334,7 @@ mod tests {
             vb,
         )?;
 
-        let output = model.forward(&x, &edge_index, edge_type.as_ref(), num_nodes)?;
+        let output = model.forward(&x, &edge_index, edge_type.as_ref(), None, num_nodes)?;
         assert_eq!(output.dims(), &[num_nodes, 16]);
         Ok(())
     }
@@ -343,7 +347,7 @@ mod tests {
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
 
         let model = RGCN::new(8, 32, 16, 1, 8, 4, 0.0, vb)?;
-        let output = model.forward(&x, &edge_index, edge_type.as_ref(), num_nodes)?;
+        let output = model.forward(&x, &edge_index, edge_type.as_ref(), None, num_nodes)?;
         assert_eq!(output.dims(), &[num_nodes, 16]);
         Ok(())
     }
@@ -357,7 +361,7 @@ mod tests {
 
         let model = RGCN::new(8, 32, 16, 2, 8, 4, 0.0, vb)?;
         // No edge types — should default to relation 0
-        let output = model.forward(&x, &edge_index, None, num_nodes)?;
+        let output = model.forward(&x, &edge_index, None, None, num_nodes)?;
         assert_eq!(output.dims(), &[num_nodes, 16]);
         Ok(())
     }
@@ -389,13 +393,108 @@ mod tests {
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
         let model = RGCN::new(169, 256, 256, 3, 8, 4, 0.1, vb)?;
-        let output = model.forward(&x, &edge_index, Some(&edge_type), num_nodes)?;
+        let output = model.forward(&x, &edge_index, Some(&edge_type), None, num_nodes)?;
 
         assert_eq!(output.dims(), &[100, 256]);
 
         // Output should have non-trivial values (not all zeros)
         let sum = output.abs()?.sum_all()?.to_scalar::<f32>()?;
         assert!(sum > 0.0, "Output should be non-zero");
+        Ok(())
+    }
+
+    #[test]
+    fn test_rgcn_unit_weights_match_none() -> Result<()> {
+        // The contract that matters: all-ones weights == no weights at all.
+        let (x, edge_index, edge_type, num_nodes) = make_test_graph();
+        let device = Device::Cpu;
+
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = RGCN::new(8, 32, 16, 2, 8, 4, 0.0, vb)?;
+
+        let without = model.forward(&x, &edge_index, edge_type.as_ref(), None, num_nodes)?;
+
+        let num_edges = edge_index.dim(1)?;
+        let unit_weights = Tensor::ones(num_edges, DType::F32, &device)?;
+        let with = model.forward(
+            &x,
+            &edge_index,
+            edge_type.as_ref(),
+            Some(&unit_weights),
+            num_nodes,
+        )?;
+
+        let diff = (without - with)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(
+            diff < 1e-6,
+            "unit edge weights must reproduce the None path exactly, diff = {}",
+            diff
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_rgcn_weights_change_output() -> Result<()> {
+        let (x, edge_index, edge_type, num_nodes) = make_test_graph();
+        let device = Device::Cpu;
+
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = RGCN::new(8, 32, 16, 2, 8, 4, 0.0, vb)?;
+
+        let without = model.forward(&x, &edge_index, edge_type.as_ref(), None, num_nodes)?;
+
+        let weights = Tensor::new(&[1.0f32, 0.5, 1.0, 1.0, 0.1, 1.0], &device)?;
+        let with = model.forward(
+            &x,
+            &edge_index,
+            edge_type.as_ref(),
+            Some(&weights),
+            num_nodes,
+        )?;
+
+        let diff = (without - with)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(
+            diff > 1e-4,
+            "non-unit edge weights must change the output, diff = {}",
+            diff
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_rgcn_zero_weight_edge_equals_removed_edge() -> Result<()> {
+        // R-GCN aggregates with scatter_add, so an edge of weight 0 must contribute
+        // exactly nothing — i.e. be equivalent to deleting that edge from the graph.
+        let (x, edge_index, edge_type, num_nodes) = make_test_graph();
+        let device = Device::Cpu;
+
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = RGCN::new(8, 32, 16, 1, 8, 4, 0.0, vb)?;
+
+        // Drop edge 4 (0 -> 2, relation 3) by giving it weight 0.
+        let weights = Tensor::new(&[1.0f32, 1.0, 1.0, 1.0, 0.0, 1.0], &device)?;
+        let weighted = model.forward(
+            &x,
+            &edge_index,
+            edge_type.as_ref(),
+            Some(&weights),
+            num_nodes,
+        )?;
+
+        // Same graph with edge 4 physically removed.
+        let reduced_index = Tensor::new(&[[0i64, 1, 2, 3, 1], [1, 2, 3, 4, 3]], &device)?;
+        let reduced_types = Tensor::new(&[0u8, 1, 2, 0, 1], &device)?;
+        let reduced = model.forward(&x, &reduced_index, Some(&reduced_types), None, num_nodes)?;
+
+        let diff = (weighted - reduced)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(
+            diff < 1e-5,
+            "a zero-weight edge must not contribute, diff = {}",
+            diff
+        );
         Ok(())
     }
 }

@@ -105,17 +105,24 @@ impl GraphEncoder {
     /// * `x` — [num_nodes, input_dim] node features
     /// * `edge_index` — [2, num_edges] source/target pairs
     /// * `edge_type` — [num_edges] relation type IDs (0-7)
+    /// * `edge_weight` — optional [num_edges] per-edge weights. `Some` scales every
+    ///   message by its edge weight before aggregation (so SYNAPSE edges, which carry a
+    ///   real weight, stop counting as 1.0). `None` means all edges weigh `1.0` — the
+    ///   historical behaviour, unchanged.
     /// * `num_nodes` — total number of nodes
     pub fn forward(
         &self,
         x: &Tensor,
         edge_index: &Tensor,
         edge_type: Option<&Tensor>,
+        edge_weight: Option<&Tensor>,
         num_nodes: usize,
     ) -> Result<Tensor> {
         match self {
-            Self::RGCN(model) => model.forward(x, edge_index, edge_type, num_nodes),
-            Self::GraphSAGE(model) => model.forward(x, edge_index, edge_type, num_nodes),
+            Self::RGCN(model) => model.forward(x, edge_index, edge_type, edge_weight, num_nodes),
+            Self::GraphSAGE(model) => {
+                model.forward(x, edge_index, edge_type, edge_weight, num_nodes)
+            }
         }
     }
 
@@ -166,7 +173,7 @@ mod tests {
         let edge_index = Tensor::new(&[[0i64, 1, 2], [1, 2, 3]], &device)?;
         let edge_type = Tensor::new(&[0u8, 1, 2], &device)?;
 
-        let output = encoder.forward(&x, &edge_index, Some(&edge_type), 5)?;
+        let output = encoder.forward(&x, &edge_index, Some(&edge_type), None, 5)?;
         assert_eq!(output.dims(), &[5, 16]);
         Ok(())
     }
@@ -189,7 +196,7 @@ mod tests {
         let x = Tensor::randn(0.0f32, 1.0, (5, 8), &device)?;
         let edge_index = Tensor::new(&[[0i64, 1, 2], [1, 2, 3]], &device)?;
 
-        let output = encoder.forward(&x, &edge_index, None, 5)?;
+        let output = encoder.forward(&x, &edge_index, None, None, 5)?;
         assert_eq!(output.dims(), &[5, 16]);
         Ok(())
     }

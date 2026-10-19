@@ -10,6 +10,24 @@
 //! Total: 169 dimensions per node.
 //!
 //! Missing features are imputed to 0.0 (simple imputation v1).
+//!
+//! # Which features exist on which node
+//!
+//! The blocks are filled from Neo4j properties, and the property set is not the same
+//! on every label:
+//!
+//! - **GDS block (12d)** — `pagerank`, `betweenness`, `churn_score` and `bridge_score`
+//!   are written on `:File` nodes by the GDS/fabric passes. They do not exist on
+//!   `:Note`, `:Decision` or `:Skill` nodes, so on those nodes these four dimensions
+//!   are always 0.0 (imputed, not measured). That is expected, not a bug: GDS is
+//!   computed on the code graph, not on the knowledge graph.
+//! - **Voyage block (128d)** — the stored embedding must be **exactly 768 dimensions**.
+//!   Anything else (an older 1024d model, a truncated vector, a non-array property) is
+//!   imputed to an all-zero 128d block; it is never resized or padded.
+//! - **Local + temporal blocks** — read from note-level properties, whose spelling
+//!   differs from the code graph: see `RawNodeData::from_properties` for the
+//!   `staleness` / `staleness_score`, `clustering_coeff` / `clustering_coefficient`
+//!   and `created_at_epoch` / `created_at` translations.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -88,8 +106,13 @@ pub struct RawNodeData {
     pub voyage_embedding: Option<Vec<f32>>,
 
     // GDS features (12d)
+    /// PageRank. Written on `:File` nodes only — always 0.0 on `:Note`, `:Decision`
+    /// and `:Skill` nodes (GDS is computed on the code graph, not the knowledge graph).
     pub pagerank: Option<f64>,
+    /// Betweenness centrality. `:File` nodes only, like `pagerank` — 0.0 on notes.
     pub betweenness: Option<f64>,
+    /// Clustering coefficient. Read from `clustering_coeff`, falling back to the
+    /// `clustering_coefficient` spelling that `:Note` nodes actually carry.
     pub clustering_coeff: Option<f64>,
     pub community_id: Option<i64>,
     pub degree_in: Option<i64>,
@@ -106,12 +129,18 @@ pub struct RawNodeData {
     pub synapse_count: Option<i64>,
     pub energy: Option<f64>,
     pub scar_intensity: Option<f64>,
+    /// Note staleness. Read from `staleness`, falling back to the `staleness_score`
+    /// spelling that `:Note` nodes actually carry.
     pub staleness: Option<f64>,
     pub knowledge_density: Option<f64>,
+    /// Churn score. Written on `:File` nodes only — always 0.0 on `:Note` nodes.
     pub churn_score: Option<f64>,
+    /// Bridge score. Written on `:File` nodes only — always 0.0 on `:Note` nodes.
     pub bridge_score: Option<f64>,
 
     // Temporal
+    /// Creation time, in epoch seconds. Read from `created_at_epoch` when present;
+    /// otherwise derived from a RFC 3339 `created_at` (the Neo4j `datetime` form).
     pub created_at_epoch: Option<f64>,
     pub last_accessed_epoch: Option<f64>,
     pub modification_count: Option<i64>,
@@ -119,6 +148,14 @@ pub struct RawNodeData {
 
 impl RawNodeData {
     /// Extract RawNodeData from a SubGraphNode's properties map.
+    ///
+    /// Property names differ between the code graph and the knowledge graph: GDS
+    /// metrics (`pagerank`, `betweenness`, `churn_score`, `bridge_score`) are written
+    /// on `:File` nodes and are absent — hence 0.0 — on `:Note` nodes, while staleness,
+    /// clustering and creation time are spelled `staleness_score`,
+    /// `clustering_coefficient` and `created_at` (a Neo4j `datetime`) on notes. Each
+    /// translated field is read under its legacy name first, so nothing changes for
+    /// properties that were already correct.
     pub fn from_properties(labels: &[String], props: &HashMap<String, serde_json::Value>) -> Self {
         let node_type = labels.first().cloned();
 
@@ -129,7 +166,8 @@ impl RawNodeData {
                 .and_then(|v| serde_json::from_value(v.clone()).ok()),
             pagerank: get_f64(props, "pagerank"),
             betweenness: get_f64(props, "betweenness"),
-            clustering_coeff: get_f64(props, "clustering_coeff"),
+            clustering_coeff: get_f64(props, "clustering_coeff")
+                .or_else(|| get_f64(props, "clustering_coefficient")),
             community_id: get_i64(props, "community_id"),
             degree_in: get_i64(props, "degree_in"),
             degree_out: get_i64(props, "degree_out"),
@@ -143,11 +181,12 @@ impl RawNodeData {
             synapse_count: get_i64(props, "synapse_count"),
             energy: get_f64(props, "energy"),
             scar_intensity: get_f64(props, "scar_intensity"),
-            staleness: get_f64(props, "staleness"),
+            staleness: get_f64(props, "staleness").or_else(|| get_f64(props, "staleness_score")),
             knowledge_density: get_f64(props, "knowledge_density"),
             churn_score: get_f64(props, "churn_score"),
             bridge_score: get_f64(props, "bridge_score"),
-            created_at_epoch: get_f64(props, "created_at_epoch"),
+            created_at_epoch: get_f64(props, "created_at_epoch")
+                .or_else(|| get_epoch_from_rfc3339(props, "created_at")),
             last_accessed_epoch: get_f64(props, "last_accessed_epoch"),
             modification_count: get_i64(props, "modification_count"),
         }
@@ -160,6 +199,19 @@ fn get_f64(props: &HashMap<String, serde_json::Value>, key: &str) -> Option<f64>
 
 fn get_i64(props: &HashMap<String, serde_json::Value>, key: &str) -> Option<i64> {
     props.get(key).and_then(|v| v.as_i64())
+}
+
+/// Parse a RFC 3339 datetime string property into epoch seconds.
+///
+/// `:Note.created_at` is a Neo4j `datetime`, which the driver hands back as an ISO 8601
+/// / RFC 3339 string (e.g. `2026-01-15T10:30:00Z`). Anything unparsable — a different
+/// format, a non-string value — yields `None` so the temporal block is imputed to 0.0
+/// rather than filled with garbage.
+fn get_epoch_from_rfc3339(props: &HashMap<String, serde_json::Value>, key: &str) -> Option<f64> {
+    let raw = props.get(key)?.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.timestamp() as f64 + f64::from(dt.timestamp_subsec_nanos()) / 1_000_000_000.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +391,9 @@ impl NodeFeatureBuilder {
         let mut features = Vec::with_capacity(TOTAL_FEATURE_DIM);
 
         // Block 1: Voyage embedding projected (128d)
+        // The embedding must be exactly 768d — any other length is imputed to zeros
+        // (no resize, no padding): a wrong-dimension vector would otherwise project
+        // into a meaningless 128d block.
         if let Some(ref emb) = data.voyage_embedding {
             if emb.len() == 768 {
                 features.extend(self.projection.project(emb));
@@ -681,6 +736,108 @@ mod tests {
         // Missing fields should be None
         assert!(data.betweenness.is_none());
         assert!(data.voyage_embedding.is_none());
+    }
+
+    #[test]
+    fn test_from_properties_neo4j_note_names() {
+        // A `:Note` node as Neo4j actually stores it: staleness_score,
+        // clustering_coefficient and created_at (a RFC 3339 datetime string).
+        let labels = vec!["Note".to_string()];
+        let mut props = HashMap::new();
+        props.insert("staleness_score".to_string(), serde_json::json!(0.42));
+        props.insert(
+            "clustering_coefficient".to_string(),
+            serde_json::json!(0.25),
+        );
+        props.insert(
+            "created_at".to_string(),
+            serde_json::json!("2023-11-14T22:13:20Z"),
+        );
+
+        let data = RawNodeData::from_properties(&labels, &props);
+
+        assert!(
+            (data.staleness.unwrap() - 0.42).abs() < 1e-10,
+            "staleness_score should fill staleness, got {:?}",
+            data.staleness
+        );
+        assert!(
+            (data.clustering_coeff.unwrap() - 0.25).abs() < 1e-10,
+            "clustering_coefficient should fill clustering_coeff, got {:?}",
+            data.clustering_coeff
+        );
+        assert!(
+            (data.created_at_epoch.unwrap() - 1_700_000_000.0).abs() < 1e-6,
+            "created_at (RFC 3339) should fill created_at_epoch, got {:?}",
+            data.created_at_epoch
+        );
+
+        // And the three blocks are actually non-zero in the built vector.
+        let builder = NodeFeatureBuilder::new();
+        let features = builder.build(&data);
+        assert_eq!(features.len(), TOTAL_FEATURE_DIM);
+
+        let gds_start = VOYAGE_DIM;
+        assert!((features[gds_start + 2] - 0.25).abs() < 1e-5); // clustering_coeff
+        let local_start = VOYAGE_DIM + GDS_DIM + TYPE_DIM;
+        assert!((features[local_start + 4] - 0.42).abs() < 1e-5); // staleness
+        let temp_start = local_start + LOCAL_DIM;
+        assert!(features[temp_start] > 0.0); // log(age + 1) is no longer 0
+    }
+
+    #[test]
+    fn test_from_properties_keeps_legacy_names_when_both_present() {
+        // When both spellings exist, the historical names win — no behaviour change.
+        let mut props = HashMap::new();
+        props.insert("staleness".to_string(), serde_json::json!(0.1));
+        props.insert("staleness_score".to_string(), serde_json::json!(0.9));
+        props.insert("clustering_coeff".to_string(), serde_json::json!(0.2));
+        props.insert("clustering_coefficient".to_string(), serde_json::json!(0.8));
+        props.insert(
+            "created_at_epoch".to_string(),
+            serde_json::json!(1600000000.0),
+        );
+        props.insert(
+            "created_at".to_string(),
+            serde_json::json!("2023-11-14T22:13:20Z"),
+        );
+
+        let data = RawNodeData::from_properties(&[], &props);
+
+        assert!((data.staleness.unwrap() - 0.1).abs() < 1e-10);
+        assert!((data.clustering_coeff.unwrap() - 0.2).abs() < 1e-10);
+        assert!((data.created_at_epoch.unwrap() - 1_600_000_000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_from_properties_unparsable_created_at_is_none() {
+        let mut props = HashMap::new();
+        props.insert("created_at".to_string(), serde_json::json!("not a date"));
+
+        let data = RawNodeData::from_properties(&[], &props);
+        assert!(data.created_at_epoch.is_none());
+
+        // A numeric created_at (epoch already) is accepted via the f64 path.
+        let mut props = HashMap::new();
+        props.insert(
+            "created_at_epoch".to_string(),
+            serde_json::json!(1700000000),
+        );
+        let data = RawNodeData::from_properties(&[], &props);
+        assert!((data.created_at_epoch.unwrap() - 1_700_000_000.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_from_properties_created_at_with_offset() {
+        // Neo4j datetimes may carry a numeric offset instead of `Z`.
+        let mut props = HashMap::new();
+        props.insert(
+            "created_at".to_string(),
+            serde_json::json!("2023-11-14T23:13:20+01:00"),
+        );
+
+        let data = RawNodeData::from_properties(&[], &props);
+        assert!((data.created_at_epoch.unwrap() - 1_700_000_000.0).abs() < 1e-6);
     }
 
     #[test]

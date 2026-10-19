@@ -223,17 +223,21 @@ impl GraphSAGE {
     }
 
     /// Forward pass through all layers.
+    ///
+    /// * `edge_weight` — optional `[num_edges]` per-edge weights, forwarded to every
+    ///   layer. `None` keeps the historical behaviour (all edges weigh `1.0`).
     pub fn forward(
         &self,
         x: &Tensor,
         edge_index: &Tensor,
         edge_type: Option<&Tensor>,
+        edge_weight: Option<&Tensor>,
         num_nodes: usize,
     ) -> Result<Tensor> {
         let mut h = x.clone();
 
         for layer in &self.layers {
-            h = layer.forward(&h, edge_index, edge_type, num_nodes)?;
+            h = layer.forward(&h, edge_index, edge_type, edge_weight, num_nodes)?;
         }
 
         Ok(h)
@@ -303,7 +307,7 @@ mod tests {
         };
 
         let layer = GraphSAGELayer::new(config, vb)?;
-        let output = layer.forward(&x, &edge_index, edge_type.as_ref(), num_nodes)?;
+        let output = layer.forward(&x, &edge_index, edge_type.as_ref(), None, num_nodes)?;
 
         assert_eq!(output.dims(), &[num_nodes, 16]);
 
@@ -329,7 +333,7 @@ mod tests {
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
 
         let model = GraphSAGE::new(8, 32, 16, 3, 8, 0.0, vb)?;
-        let output = model.forward(&x, &edge_index, edge_type.as_ref(), num_nodes)?;
+        let output = model.forward(&x, &edge_index, edge_type.as_ref(), None, num_nodes)?;
 
         assert_eq!(output.dims(), &[num_nodes, 16]);
         Ok(())
@@ -352,7 +356,7 @@ mod tests {
         };
 
         let layer = GraphSAGELayer::new(config, vb)?;
-        let output = layer.forward(&x, &edge_index, None, num_nodes)?;
+        let output = layer.forward(&x, &edge_index, None, None, num_nodes)?;
 
         assert_eq!(output.dims(), &[num_nodes, 16]);
         Ok(())
@@ -406,9 +410,102 @@ mod tests {
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
         let model = GraphSAGE::new(169, 256, 256, 3, 8, 0.0, vb)?;
-        let output = model.forward(&x, &edge_index, Some(&edge_type), num_nodes)?;
+        let output = model.forward(&x, &edge_index, Some(&edge_type), None, num_nodes)?;
 
         assert_eq!(output.dims(), &[100, 256]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_graphsage_unit_weights_match_none() -> Result<()> {
+        // The contract that matters: all-ones weights == no weights at all.
+        let (x, edge_index, edge_type, num_nodes) = make_test_graph();
+        let device = Device::Cpu;
+
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = GraphSAGE::new(8, 32, 16, 2, 8, 0.0, vb)?;
+
+        let without = model.forward(&x, &edge_index, edge_type.as_ref(), None, num_nodes)?;
+
+        let num_edges = edge_index.dim(1)?;
+        let unit_weights = Tensor::ones(num_edges, DType::F32, &device)?;
+        let with = model.forward(
+            &x,
+            &edge_index,
+            edge_type.as_ref(),
+            Some(&unit_weights),
+            num_nodes,
+        )?;
+
+        let diff = (without - with)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(
+            diff < 1e-6,
+            "unit edge weights must reproduce the None path exactly, diff = {}",
+            diff
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_graphsage_weights_change_output() -> Result<()> {
+        let (x, edge_index, edge_type, num_nodes) = make_test_graph();
+        let device = Device::Cpu;
+
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = GraphSAGE::new(8, 32, 16, 2, 8, 0.0, vb)?;
+
+        let without = model.forward(&x, &edge_index, edge_type.as_ref(), None, num_nodes)?;
+
+        // Down-weight one edge of six.
+        let weights = Tensor::new(&[1.0f32, 1.0, 1.0, 1.0, 0.05, 1.0], &device)?;
+        let with = model.forward(
+            &x,
+            &edge_index,
+            edge_type.as_ref(),
+            Some(&weights),
+            num_nodes,
+        )?;
+
+        let diff = (without - with)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(
+            diff > 1e-4,
+            "non-unit edge weights must change the output, diff = {}",
+            diff
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_graphsage_layer_accepts_f64_weights() -> Result<()> {
+        // PyGData carries f64 weights; the layer must accept them (cast to f32).
+        let (x, edge_index, edge_type, num_nodes) = make_test_graph();
+        let device = Device::Cpu;
+
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
+        let config = GraphSAGEConfig {
+            input_dim: 8,
+            output_dim: 16,
+            num_relations: 8,
+            dropout: 0.0,
+            use_attention: false,
+            normalize: false,
+        };
+        let layer = GraphSAGELayer::new(config, vb)?;
+
+        let weights = Tensor::new(&[1.0f64, 0.9, 0.75, 1.0, 0.5, 0.3], &device)?;
+        let output = layer.forward(
+            &x,
+            &edge_index,
+            edge_type.as_ref(),
+            Some(&weights),
+            num_nodes,
+        )?;
+
+        assert_eq!(output.dims(), &[num_nodes, 16]);
         Ok(())
     }
 }
