@@ -21,6 +21,8 @@ Périmètre à la date de la mesure : la CI exécutait `cargo llvm-cov --lib --t
 
 **Depuis B19**, le chat n'est plus exclu (`src/chat/**`, `src/api/chat_handlers.rs`, `src/api/ws_chat_handler.rs`, `src/neo4j/chat.rs`) et la passe Neo4j inclut `harness_neo4j` ; les lignes du tableau ci-dessous qui les concernent datent d'avant. Chiffres avant/après dans [COVERAGE_EXCLUSIONS.md](COVERAGE_EXCLUSIONS.md).
 
+**Depuis P0.1 (abstraction de stockage)**, la passe Neo4j inclut aussi `store_conformance` : une suite de conformité générique du trait `GraphStore` (unicité, idempotence MERGE, CAS, incréments atomiques, entité absente, cascade, tri, pagination, filtres, NULL/chaîne vide, traversée, classement vectoriel), instanciée par backend (`mock::*`, `neo4j::*`). Sa moitié Neo4j est exigée (`HARNESS_NEO4J_REQUIRED=1`) ; les divergences mock/Neo4j connues sont listées dans `EXPECTED_DIVERGENCES` et corrigées par P0.2 (le mock converge vers Neo4j).
+
 Le registre des exclusions, avec le propriétaire de chacune et le compteur qui ne peut que baisser, est dans [COVERAGE_EXCLUSIONS.md](COVERAGE_EXCLUSIONS.md).
 
 ## Par module (run CI-équivalent, avec Neo4j)

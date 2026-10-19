@@ -2,7 +2,8 @@
 //!
 //! Provides a complete mock of all graph operations using
 //! `tokio::sync::RwLock<HashMap<K, V>>` collections.
-//! Conditionally compiled with `#[cfg(test)]`.
+//! Compiled under `#[cfg(test)]` and under the `mock-store` feature (the
+//! integration test targets, see tests/store_conformance.rs); never in a binary.
 
 use crate::events::trigger::EventTrigger;
 use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
@@ -338,6 +339,12 @@ pub struct MockGraphStore {
 }
 
 #[allow(dead_code)]
+impl Default for MockGraphStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockGraphStore {
     /// One counted read of a store the anchor resolver goes through.
     pub fn count_read(&self) {

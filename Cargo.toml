@@ -272,8 +272,17 @@ xlsx = ["dep:calamine"]
 embedded-frontend = ["dep:rust-embed", "dep:mime_guess"]
 vendored-openssl = ["dep:openssl-sys"]
 pdf = ["dep:pdf_oxide", "dep:office_oxide"]
+# The in-memory GraphStore (src/neo4j/mock.rs) outside cfg(test): the integration test targets
+# (tests/store_conformance.rs runs one conformance suite against the mock AND Neo4j) need it.
+# Not a shipping feature: the dev-dependency of the crate on itself (below) turns it on for every
+# test build, and nothing else does.
+mock-store = []
 
 [dev-dependencies]
+# The crate itself, with the in-memory GraphStore compiled in for the test targets (see the
+# `mock-store` feature above). A dev-dependency on self is how Cargo enables a feature for
+# tests only; binaries and `cargo build` never see it.
+project-orchestrator = { path = ".", features = ["mock-store"] }
 tokio-test = "0.4"
 # Paused clock for the periodic update-check test
 tokio = { workspace = true, features = ["test-util"] }

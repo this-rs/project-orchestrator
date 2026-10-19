@@ -386,7 +386,7 @@ pub struct CostBreakdownRow {
 
 /// Whether an execution belongs to the breakdown of `[from, to)` (the mock's
 /// side of the Cypher `WHERE`).
-#[cfg(test)]
+#[cfg(any(test, feature = "mock-store"))]
 pub fn in_breakdown_window(
     ae: &AgentExecutionNode,
     from: DateTime<Utc>,
@@ -398,7 +398,7 @@ pub fn in_breakdown_window(
 /// The breakdown of `executions` by `group_by`, in memory: what the Cypher of
 /// [`Neo4jClient::agent_execution_cost_breakdown_impl`] computes, for the mock
 /// store and for the tests that pin the semantics. Sorted by key.
-#[cfg(test)]
+#[cfg(any(test, feature = "mock-store"))]
 pub fn breakdown<'a>(
     executions: impl IntoIterator<Item = &'a AgentExecutionNode>,
     group_by: CostGroupBy,

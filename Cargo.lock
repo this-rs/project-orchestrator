@@ -6618,6 +6618,7 @@ dependencies = [
  "pasetors",
  "pdf_oxide",
  "petgraph",
+ "project-orchestrator",
  "proptest",
  "quick-xml 0.39.4",
  "rag-umap",

@@ -486,10 +486,12 @@ jobs:
           # vector index the NN router queries, plus the behavioural half against a real
           # Neo4j (a stored trajectory is found above the 0.7 threshold). The offline half
           # is the one that keeps the fix from being undone — it must run somewhere.
+          # store_conformance: the one GraphStore conformance suite, instantiated per backend
+          # (mock AND this Neo4j); REQUIRED, so its neo4j:: half never skips silently.
           HARNESS_NEO4J_REQUIRED=1 cargo test --test integration_tests --test data_migrations \
             --test workspace_tests --test neo4j_store_tests --test harness_neo4j \
             --test neo4j_note_consent --test neo4j_decision_project --test neural_routing_indexes \
-            --test neo4j_synapse_shadow
+            --test neo4j_synapse_shadow --test store_conformance
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
@@ -761,7 +763,8 @@ jobs:
             --test workspace_tests \
             --test neo4j_store_tests \
             --test harness_neo4j \
-            --test neo4j_decision_project
+            --test neo4j_decision_project \
+            --test store_conformance
 
       # (4) Merge every run above into one lcov.
       - name: Merge coverage runs into a single lcov
