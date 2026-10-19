@@ -38,6 +38,99 @@ pub const MAX_LIVE_CHILDREN: usize = 4;
 /// turn is seen running.
 const CHILD_STARTUP_GRACE: chrono::Duration = chrono::Duration::seconds(120);
 
+/// The openings of children in flight, per parent, whatever path opens them (P18-suite,
+/// point 6): the `Agent` tool of a native session (`subagents.rs`), `chat(send_message)` and
+/// `plan(delegate_task)` (REST). A child counts toward its parent's cap only once it is live
+/// ([`resolve_envelope`] counts live children); between the count and that moment — the
+/// provider's whole opening — another opening of the same parent would count the same
+/// children and pass the cap with it. Each opening therefore takes an [`OpeningTicket`]
+/// BEFORE it counts, and holds it until its child is live (or its opening failed); a count
+/// adds the tickets of the same parent taken BEFORE its own.
+///
+/// Why "taken before": two openings that each counted ALL the others' tickets would refuse
+/// each other when only one is over the cap. Ordering them gives the room to the first, and
+/// a later one never counts a child twice for longer than the instant between its earlier
+/// sibling's child becoming live and that sibling dropping its ticket (an over-count: a
+/// refusal, never a child too many). The earlier tickets are read BEFORE the live children:
+/// a sibling whose ticket is gone by then has its child live already.
+#[derive(Default)]
+pub struct ChildOpenings {
+    inner: std::sync::Arc<std::sync::Mutex<OpeningsInner>>,
+}
+
+#[derive(Default)]
+struct OpeningsInner {
+    next: u64,
+    by_parent: std::collections::HashMap<String, std::collections::BTreeSet<u64>>,
+}
+
+impl ChildOpenings {
+    /// An opening of a child of `parent`, held until the child is live.
+    pub fn reserve(&self, parent: &str) -> OpeningTicket {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.next += 1;
+        let ticket = inner.next;
+        inner
+            .by_parent
+            .entry(parent.to_string())
+            .or_default()
+            .insert(ticket);
+        OpeningTicket {
+            openings: std::sync::Arc::clone(&self.inner),
+            parent: parent.to_string(),
+            ticket,
+        }
+    }
+
+    /// How many openings of `parent` are in flight.
+    pub fn in_flight(&self, parent: &str) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_parent
+            .get(parent)
+            .map_or(0, std::collections::BTreeSet::len)
+    }
+}
+
+/// One opening of a child in flight ([`ChildOpenings`]); dropped once the child is live or its
+/// opening failed.
+pub struct OpeningTicket {
+    openings: std::sync::Arc<std::sync::Mutex<OpeningsInner>>,
+    parent: String,
+    ticket: u64,
+}
+
+impl OpeningTicket {
+    /// The openings of the same parent still in flight that were taken before this one.
+    fn earlier(&self) -> usize {
+        self.openings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_parent
+            .get(&self.parent)
+            .map_or(0, |tickets| tickets.range(..self.ticket).count())
+    }
+}
+
+impl Drop for OpeningTicket {
+    fn drop(&mut self) {
+        let mut inner = self
+            .openings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(tickets) = inner.by_parent.get_mut(&self.parent) {
+            tickets.remove(&self.ticket);
+            if tickets.is_empty() {
+                inner.by_parent.remove(&self.parent);
+            }
+        }
+    }
+}
+
 /// Header the MCP client sets from `PO_SESSION_ID`. Only read when the server
 /// runs WITHOUT authentication (no signing key, hence no signed token): in that
 /// mode nothing is a boundary and the header is the best available hint.
@@ -398,6 +491,18 @@ pub enum SpawnCaller {
     },
 }
 
+impl SpawnCaller {
+    /// The ticket of an agent caller's opening of a child ([`ChildOpenings`]); a person has
+    /// no envelope, so no cap and no ticket. Taken BEFORE [`envelope_for_caller`] counts,
+    /// held until the child is live.
+    pub fn reserve_opening(&self, openings: &ChildOpenings) -> Option<OpeningTicket> {
+        match self {
+            Self::Human => None,
+            Self::Agent { session_id, .. } => Some(openings.reserve(session_id)),
+        }
+    }
+}
+
 /// Identify the caller from what the server can trust.
 ///
 /// * an `agent_session` token → the session signed into it (an unbound agent
@@ -475,6 +580,28 @@ pub async fn resolve_envelope(
     token_ceiling: Option<&str>,
     max_live_children: usize,
 ) -> Result<ParentEnvelope, EnvelopeError> {
+    resolve_envelope_for_opening(
+        graph,
+        live,
+        parent_session_id,
+        token_ceiling,
+        max_live_children,
+        None,
+    )
+    .await
+}
+
+/// [`resolve_envelope`] for an opening that holds `opening` ([`ChildOpenings`]): the
+/// openings of the same parent in flight before it count toward the cap with its live
+/// children. Every path that opens a child passes its ticket.
+pub async fn resolve_envelope_for_opening(
+    graph: &dyn GraphStore,
+    live: &dyn LiveSessions,
+    parent_session_id: &str,
+    token_ceiling: Option<&str>,
+    max_live_children: usize,
+    opening: Option<&OpeningTicket>,
+) -> Result<ParentEnvelope, EnvelopeError> {
     let not_found = || EnvelopeError::ParentNotFound(parent_session_id.to_string());
     let parent_uuid = Uuid::parse_str(parent_session_id).map_err(|_| not_found())?;
     let parent = graph
@@ -499,7 +626,9 @@ pub async fn resolve_envelope(
     // Fan-out: count the children that are still working (a turn running, a background
     // task). A child that has answered and sits idle until the cleanup closes it does not
     // count. A store error counts as "full": refusing a spawn is recoverable, a runaway
-    // is not.
+    // is not. The openings of the same parent in flight before this one count too
+    // ([`ChildOpenings`]) — read FIRST: one that ends meanwhile has its child live already.
+    let earlier_openings = opening.map_or(0, OpeningTicket::earlier);
     let live_children = match graph.get_session_children(parent_uuid).await {
         Ok(children) => {
             let mut n = 0;
@@ -517,7 +646,7 @@ pub async fn resolve_envelope(
             n
         }
         Err(_) => max_live_children,
-    };
+    } + earlier_openings;
     if live_children >= max_live_children {
         return Err(EnvelopeError::TooManyChildren {
             max: max_live_children,
@@ -577,24 +706,27 @@ async fn workspace_project_slugs(graph: &dyn GraphStore, workspace_slug: &str) -
 /// Identify the caller of a spawn request and, for an agent, resolve its
 /// envelope. `None` = a human caller, no envelope.
 ///
-/// `max_live_children`: see [`resolve_envelope`].
+/// `max_live_children`: see [`resolve_envelope`]. `opening`: the ticket the caller took for
+/// this opening ([`ChildOpenings`], [`SpawnCaller::reserve_opening`]).
 pub async fn envelope_for_caller(
     graph: &dyn GraphStore,
     live: &dyn LiveSessions,
     caller: &SpawnCaller,
     max_live_children: usize,
+    opening: Option<&OpeningTicket>,
 ) -> Result<Option<ParentEnvelope>, EnvelopeError> {
     match caller {
         SpawnCaller::Human => Ok(None),
         SpawnCaller::Agent {
             session_id,
             token_ceiling,
-        } => resolve_envelope(
+        } => resolve_envelope_for_opening(
             graph,
             live,
             session_id,
             token_ceiling.as_deref(),
             max_live_children,
+            opening,
         )
         .await
         .map(Some),
@@ -1258,6 +1390,72 @@ mod tests {
         resolve_envelope(&graph, &l, &parent.to_string(), None, MAX_LIVE_CHILDREN)
             .await
             .unwrap();
+    }
+
+    /// P18-suite, point 6: the openings in flight of the same parent count toward its cap,
+    /// whichever path holds them (`chat(send_message)`, `delegate_task`, the `Agent` tool):
+    /// three children live and two openings in flight at once — the first opening fits the
+    /// cap of four, the second is refused, and once the first is over (its child live) the
+    /// count is its live children again.
+    #[tokio::test]
+    async fn openings_in_flight_count_toward_the_cap_in_the_order_they_were_taken() {
+        let (graph, parent) = store_with_parent(Some("default")).await;
+        let mut children = Vec::new();
+        for _ in 0..3 {
+            children.push(add_child(&graph, parent).await.to_string());
+        }
+        let mut l = live("default");
+        l.active = children.clone();
+        let openings = ChildOpenings::default();
+        let pid = parent.to_string();
+        let first = openings.reserve(&pid);
+        let second = openings.reserve(&pid);
+        let other_parent = openings.reserve(&Uuid::new_v4().to_string());
+        assert_eq!(openings.in_flight(&pid), 2);
+
+        // The later opening counts the earlier one: 3 live + 1 in flight = the cap.
+        assert_eq!(
+            resolve_envelope_for_opening(&graph, &l, &pid, None, MAX_LIVE_CHILDREN, Some(&second))
+                .await
+                .unwrap_err(),
+            EnvelopeError::TooManyChildren {
+                max: MAX_LIVE_CHILDREN,
+                live: MAX_LIVE_CHILDREN
+            }
+        );
+        // The earlier one does not count the later one (nor another parent's): it fits.
+        resolve_envelope_for_opening(&graph, &l, &pid, None, MAX_LIVE_CHILDREN, Some(&first))
+            .await
+            .unwrap();
+
+        // The first child is live, its opening over: the second still finds the cap full.
+        children.push(add_child(&graph, parent).await.to_string());
+        l.active = children.clone();
+        drop(first);
+        assert!(matches!(
+            resolve_envelope_for_opening(&graph, &l, &pid, None, MAX_LIVE_CHILDREN, Some(&second))
+                .await,
+            Err(EnvelopeError::TooManyChildren { .. })
+        ));
+        drop(second);
+        drop(other_parent);
+        assert_eq!(openings.in_flight(&pid), 0);
+    }
+
+    /// A person has no envelope: no ticket either.
+    #[test]
+    fn only_an_agent_caller_reserves_an_opening() {
+        let openings = ChildOpenings::default();
+        assert!(SpawnCaller::Human.reserve_opening(&openings).is_none());
+        let agent = SpawnCaller::Agent {
+            session_id: "p".into(),
+            token_ceiling: None,
+        };
+        let ticket = agent.reserve_opening(&openings);
+        assert!(ticket.is_some());
+        assert_eq!(openings.in_flight("p"), 1);
+        drop(ticket);
+        assert_eq!(openings.in_flight("p"), 0);
     }
 
     /// A child opened `age_secs` ago.
