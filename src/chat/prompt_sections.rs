@@ -1391,6 +1391,122 @@ pub fn floor_char_boundary_pub(s: &str, index: usize) -> usize {
 }
 
 // ============================================================================
+// Audience — the engine's sub-agent vocabulary, and the frame of a child session
+// ============================================================================
+
+/// The Wave Dispatch steps as Claude Code understands them (`Task`, `TaskOutput`,
+/// `run_in_background`), byte for byte as they stand in the advanced best-practices
+/// section: what [`adapt_subagent_vocabulary`] replaces on another engine. A test keeps
+/// the two texts from drifting apart.
+pub const WAVE_DISPATCH_CLAUDE_CODE: &str = r#"2. For each wave, launch tasks with `Task(subagent_type: "general-purpose", run_in_background: true)` — one agent per task
+3. Each sub-agent receives the full task context via `task(action: "get_prompt")` and AUTONOMOUSLY updates its steps, creates notes/decisions via MCP
+4. `TaskOutput(block: true)` on ALL agent IDs in the wave before proceeding to the next wave
+5. **Gotcha**: multiple Bash calls in the same message are SERIALIZED — use `run_in_background: true` for true parallelism"#;
+
+/// The same steps for an engine whose sub-agent tool is `Agent` (the native harness,
+/// Codex, ACP): the call returns with the child's answer, several calls in one message
+/// run side by side, there is no background mode and nothing to collect afterwards.
+pub const WAVE_DISPATCH_AGENT: &str = r#"2. For each wave, launch its tasks with one `Agent(description, prompt)` call per task, all in the SAME message: they run side by side, and each call returns with its agent's final answer (no background mode, nothing to collect afterwards)
+3. Each sub-agent receives the full task context via `task(action: "get_prompt")` and AUTONOMOUSLY updates its steps, creates notes/decisions via MCP
+4. Read every answer of the wave before launching the next wave
+5. **Gotcha**: a sub-agent starts with no memory of this conversation and cannot start sub-agents of its own — its prompt must say everything it needs"#;
+
+/// The compact line of the same subsection (the compact variant of the section).
+pub const WAVE_DISPATCH_CLAUDE_CODE_COMPACT: &str = "- `plan(action: \"get_waves\")` → launch sub-agents per wave (one per task, `run_in_background: true`) → `TaskOutput(block: true)` before next wave";
+/// Its `Agent` counterpart.
+pub const WAVE_DISPATCH_AGENT_COMPACT: &str = "- `plan(action: \"get_waves\")` → one `Agent(description, prompt)` call per task of the wave, all in the same message (they run side by side, each returns its agent's answer) → read every answer before the next wave";
+
+/// The search section's mention of Claude Code's exploring agent, and its `Agent` form
+/// (the native `Agent` takes a `subagent_type` too).
+pub const EXPLORE_CLAUDE_CODE: &str = "Task(Explore) for exploring";
+/// Its `Agent` counterpart.
+pub const EXPLORE_AGENT: &str = "Agent(subagent_type: \"Explore\") for exploring";
+
+/// Which words an engine has for sub-agents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubagentVocabulary {
+    /// Claude Code: `Task(subagent_type, run_in_background)`, then `TaskOutput(block)`.
+    /// The words written in the sections: this vocabulary changes nothing.
+    #[default]
+    ClaudeCode,
+    /// `Agent(description, prompt)`, synchronous: the native harness, Codex, ACP.
+    Agent,
+}
+
+impl SubagentVocabulary {
+    /// The vocabulary of the engine a session runs on. Claude Code (also an empty id,
+    /// which the stored sessions use for it) keeps its own words; every other provider
+    /// gets `Agent`.
+    pub fn of_provider(provider_id: &str) -> Self {
+        if provider_id.is_empty() || provider_id == super::provider::resolver::CLAUDE_CODE {
+            Self::ClaudeCode
+        } else {
+            Self::Agent
+        }
+    }
+}
+
+/// Rewrite the sub-agent vocabulary of an assembled base prompt for `vocabulary`.
+/// Claude Code's is the one written in the sections: for it the prompt comes back as
+/// it went in.
+pub fn adapt_subagent_vocabulary(prompt: String, vocabulary: SubagentVocabulary) -> String {
+    match vocabulary {
+        SubagentVocabulary::ClaudeCode => prompt,
+        SubagentVocabulary::Agent => prompt
+            .replace(WAVE_DISPATCH_CLAUDE_CODE, WAVE_DISPATCH_AGENT)
+            .replace(
+                WAVE_DISPATCH_CLAUDE_CODE_COMPACT,
+                WAVE_DISPATCH_AGENT_COMPACT,
+            )
+            .replace(EXPLORE_CLAUDE_CODE, EXPLORE_AGENT),
+    }
+}
+
+/// How a child of a conversation was opened, for its prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildFrame {
+    /// The session that opened it.
+    pub parent_session_id: String,
+    /// `true`: it answers one sub-agent call of the parent, and its final message is
+    /// that call's result; `false`: a sub-conversation opened beside the parent, read
+    /// by whoever opened it.
+    pub answers_a_call: bool,
+}
+
+/// The section a child session gets and a root session never does: who opened it,
+/// where its answer goes, what nobody will do for it. Not a routed section: it is
+/// appended after the base sections and never weighted away.
+pub fn child_section(frame: &ChildFrame) -> String {
+    let parent = &frame.parent_session_id;
+    if frame.answers_a_call {
+        format!(
+            "## You are a sub-agent\n\n\
+             This session was opened by session `{parent}` through its sub-agent call. Your \
+             final message is returned to that session, verbatim, as the result of its call: \
+             it sees nothing else of your work.\n\
+             - No human reads this conversation as it happens, and nobody will answer a \
+             question asked here: decide, or report what you could not decide. A permission \
+             the parent did not already grant fails at once.\n\
+             - End with a complete, self-contained answer: findings with their file paths, \
+             what you changed, what remains.\n\
+             - You cannot start sub-agents of your own (one level only).\n\
+             - Keep the usual tracking (steps, notes, decisions through the MCP tools): it is \
+             how the parent, and the people behind it, see what you did."
+        )
+    } else {
+        format!(
+            "## You are a sub-conversation\n\n\
+             This session was opened beside session `{parent}`, as a sub-conversation of it. \
+             Whoever opened it (that session, or a person watching it) reads your answers: \
+             write each one complete and self-contained.\n\
+             - You cannot start sub-agents of your own (one level only).\n\
+             - Keep the usual tracking (steps, notes, decisions through the MCP tools): it is \
+             how the parent, and the people behind it, see what you did."
+        )
+    }
+}
+
+// ============================================================================
 // Tool Reference Groups — selective rendering of TOOL_REFERENCE
 // ============================================================================
 
@@ -1830,6 +1946,77 @@ pub fn extract_tool_reference(tool_reference: &str, groups: &[ToolRefGroupId]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Claude Code needles are the sections' own text, and the `Agent` vocabulary
+    /// leaves no Claude Code sub-agent word behind, in the full and compact variants.
+    #[test]
+    fn the_wave_dispatch_needles_match_the_sections_and_agent_leaves_no_claude_code_word() {
+        let all: String = all_base_sections()
+            .iter()
+            .flat_map(|s| [Some(s.content), s.compact_content])
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains(WAVE_DISPATCH_CLAUDE_CODE),
+            "WAVE_DISPATCH_CLAUDE_CODE drifted from the full section"
+        );
+        assert!(
+            all.contains(WAVE_DISPATCH_CLAUDE_CODE_COMPACT),
+            "WAVE_DISPATCH_CLAUDE_CODE_COMPACT drifted from the compact section"
+        );
+        assert!(
+            all.contains(EXPLORE_CLAUDE_CODE),
+            "EXPLORE_CLAUDE_CODE drifted from the search section"
+        );
+        let agent = adapt_subagent_vocabulary(all.clone(), SubagentVocabulary::Agent);
+        assert!(
+            !agent.contains("TaskOutput")
+                && !agent.contains("run_in_background")
+                && !agent.contains("Task("),
+            "a Claude Code sub-agent word survives on the Agent engine"
+        );
+        assert!(agent.contains(WAVE_DISPATCH_AGENT) && agent.contains(WAVE_DISPATCH_AGENT_COMPACT));
+        assert_eq!(
+            adapt_subagent_vocabulary(all.clone(), SubagentVocabulary::ClaudeCode),
+            all,
+            "Claude Code's vocabulary changes nothing"
+        );
+        assert_eq!(
+            SubagentVocabulary::of_provider("claude-code"),
+            SubagentVocabulary::ClaudeCode
+        );
+        assert_eq!(
+            SubagentVocabulary::of_provider(""),
+            SubagentVocabulary::ClaudeCode
+        );
+        assert_eq!(
+            SubagentVocabulary::of_provider("deepseek"),
+            SubagentVocabulary::Agent
+        );
+    }
+
+    #[test]
+    fn the_child_section_names_the_parent_and_tells_a_call_child_from_a_sub_conversation() {
+        let call = child_section(&ChildFrame {
+            parent_session_id: "p-1".into(),
+            answers_a_call: true,
+        });
+        assert!(call.starts_with("## You are a sub-agent"));
+        assert!(call.contains("`p-1`") && call.contains("nobody will answer a question"));
+        let beside = child_section(&ChildFrame {
+            parent_session_id: "p-2".into(),
+            answers_a_call: false,
+        });
+        assert!(beside.starts_with("## You are a sub-conversation"));
+        assert!(beside.contains("`p-2`") && !beside.contains("nobody will answer"));
+        for s in [&call, &beside] {
+            assert!(
+                s.contains("sub-agents of your own"),
+                "the depth rule is in both"
+            );
+        }
+    }
 
     #[test]
     fn test_all_sections_count() {

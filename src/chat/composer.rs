@@ -40,13 +40,56 @@
 
 use super::prompt::TOOL_REFERENCE;
 use super::prompt_sections::{
-    assemble_sections, assemble_sections_weighted, extract_tool_reference,
+    adapt_subagent_vocabulary, assemble_sections, assemble_sections_weighted, child_section,
+    extract_tool_reference,
 };
 use super::routing::{HeuristicRouter, RoutingContext, RoutingDecisionRecord, RoutingProvider};
 use super::stages::status_injection::ProtocolRunStatus;
 
 // Re-export SectionHint from routing for backward compatibility
+pub use super::prompt_sections::{ChildFrame, SubagentVocabulary};
 pub use super::routing::SectionHint;
+
+/// Who the prompt is for: the words its engine has for sub-agents, and, for the child
+/// of a conversation, how it was opened. The default (a root session on Claude Code)
+/// leaves the prompt unchanged byte for byte.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptAudience {
+    /// The engine's sub-agent vocabulary ([`SubagentVocabulary::of_provider`]).
+    pub vocabulary: SubagentVocabulary,
+    /// `Some` for the child of a conversation: it gets the child section.
+    pub child: Option<ChildFrame>,
+}
+
+impl PromptAudience {
+    /// From a session's `spawned_by` JSON and the id of the provider it runs on.
+    ///
+    /// Only a `conversation` spawn is framed as a child: with a `tool_use_id` it answers
+    /// the parent's sub-agent call, without one it is a sub-conversation opened beside the
+    /// parent. The runner, pipeline, gate and trigger spawns have a prompt of their own
+    /// (`runner::prompt`), a delegation carries its task: none of them is framed here.
+    /// Malformed JSON frames nothing.
+    pub fn of(spawned_by: Option<&str>, provider_id: &str) -> Self {
+        let child = spawned_by
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("conversation"))
+            .and_then(|v| {
+                let parent_session_id = v.get("parent_session_id")?.as_str()?.to_owned();
+                let answers_a_call = v
+                    .get("tool_use_id")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| !t.is_empty());
+                Some(ChildFrame {
+                    parent_session_id,
+                    answers_a_call,
+                })
+            });
+        Self {
+            vocabulary: SubagentVocabulary::of_provider(provider_id),
+            child,
+        }
+    }
+}
 
 // ============================================================================
 // FsmPromptComposer — the central prompt assembly engine
@@ -94,6 +137,9 @@ pub struct ComposerInput<'a> {
     /// `refs_v1` is on: teach the agent to cite entities as `#kind:uuid`.
     /// Off (the default) the prompt is unchanged byte for byte.
     pub cite_refs: bool,
+    /// Who the prompt is for: the engine's sub-agent words, the frame of a child of a
+    /// conversation. The default (root session, Claude Code) changes nothing.
+    pub audience: PromptAudience,
 }
 
 // Default is derived — all numeric fields default to 0, bools to false,
@@ -279,6 +325,8 @@ impl FsmPromptComposer {
         } else {
             assemble_sections(&decision.sections)
         };
+        // The sections are written in Claude Code's words; another engine gets its own.
+        let base_prompt = adapt_subagent_vocabulary(base_prompt, input.audience.vocabulary);
 
         // ── Step 4: Inject FSM prompt fragments ───────────────────────
         let fsm_section = Self::build_fsm_section(input.protocol_runs);
@@ -301,8 +349,16 @@ impl FsmPromptComposer {
         let routing_record = decision.to_trajectory_record(&routing_ctx);
 
         // ── Step 8: Assemble final prompt ─────────────────────────────
-        let mut parts: Vec<&str> = Vec::with_capacity(4);
+        let mut parts: Vec<&str> = Vec::with_capacity(5);
         parts.push(&base_prompt);
+
+        // A child of a conversation: who opened it, where its answer goes. Right after
+        // the base sections, before anything that changes from one turn to the next.
+        let child_owned;
+        if let Some(frame) = &input.audience.child {
+            child_owned = child_section(frame);
+            parts.push(&child_owned);
+        }
 
         let cite_owned;
         if input.cite_refs {
@@ -819,6 +875,136 @@ fn truncate_markdown_semantically(text: &str, char_budget: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PARENT: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// The audience of a `conversation` child of [`PARENT`] on `provider` (P18-suite, point 7).
+    fn audience_of_child(provider: &str, tool_use_id: Option<&str>) -> PromptAudience {
+        let mut spawned = serde_json::json!({"type": "conversation", "parent_session_id": PARENT});
+        if let Some(id) = tool_use_id {
+            spawned["tool_use_id"] = serde_json::json!(id);
+        }
+        PromptAudience::of(Some(&spawned.to_string()), provider)
+    }
+
+    fn plan_input() -> ComposerInput<'static> {
+        ComposerInput {
+            scaffolding_level: 0,
+            has_active_plan: true,
+            task_count: 10,
+            user_message: "montre le plan",
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_audience_frames_only_a_conversation_child_and_reads_the_engine_from_the_provider() {
+        let agent_child = audience_of_child("deepseek", Some("toolu_1"));
+        assert_eq!(agent_child.vocabulary, SubagentVocabulary::Agent);
+        assert_eq!(
+            agent_child.child,
+            Some(ChildFrame {
+                parent_session_id: PARENT.to_owned(),
+                answers_a_call: true
+            })
+        );
+        let sub_conversation = audience_of_child("claude-code", None);
+        assert_eq!(sub_conversation.vocabulary, SubagentVocabulary::ClaudeCode);
+        assert!(
+            matches!(
+                sub_conversation.child,
+                Some(ChildFrame {
+                    answers_a_call: false,
+                    ..
+                })
+            ),
+            "{sub_conversation:?}"
+        );
+        // The stored sessions keep an empty provider id for Claude Code.
+        assert_eq!(
+            PromptAudience::of(None, ""),
+            PromptAudience::default(),
+            "a root session on Claude Code is the default audience"
+        );
+        // A delegation, a runner child, junk and a root session are not framed.
+        for spawned in [
+            Some(r#"{"type":"delegation","parent_session_id":"x","task_id":"y"}"#),
+            Some(r#"{"type":"runner","run_id":"a","task_id":"b"}"#),
+            Some(r#"{"type":"conversation"}"#),
+            Some("not json"),
+            None,
+        ] {
+            assert_eq!(
+                PromptAudience::of(spawned, "deepseek").child,
+                None,
+                "{spawned:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_native_child_prompt_speaks_agent_and_never_task_output_a_claude_code_one_keeps_task() {
+        let claude = FsmPromptComposer::compose(&ComposerInput {
+            audience: audience_of_child("claude-code", Some("toolu_1")),
+            ..plan_input()
+        });
+        let native = FsmPromptComposer::compose(&ComposerInput {
+            audience: audience_of_child("deepseek", Some("toolu_1")),
+            ..plan_input()
+        });
+        assert!(
+            claude.contains("Wave Dispatch"),
+            "the test needs the wave dispatch subsection in the prompt"
+        );
+        assert!(
+            claude.contains("TaskOutput(block: true)") && claude.contains("Task(subagent_type"),
+            "Claude Code keeps its own words"
+        );
+        assert!(
+            !native.contains("TaskOutput") && !native.contains("run_in_background"),
+            "no Claude Code sub-agent word reaches the native engine:\n{native}"
+        );
+        assert!(
+            native.contains("`Agent(description, prompt)`"),
+            "the native engine is told about Agent"
+        );
+        for prompt in [&claude, &native] {
+            assert!(
+                prompt.contains("## You are a sub-agent") && prompt.contains(PARENT),
+                "a child is told it is one, and by whom"
+            );
+        }
+    }
+
+    #[test]
+    fn a_root_session_prompt_is_unchanged_and_a_child_only_gains_its_section() {
+        let root = FsmPromptComposer::compose(&plan_input());
+        assert!(
+            !root.contains("You are a sub-agent") && !root.contains("You are a sub-conversation"),
+            "a root session is never framed as a child"
+        );
+        let child = FsmPromptComposer::compose(&ComposerInput {
+            audience: audience_of_child("claude-code", Some("toolu_1")),
+            ..plan_input()
+        });
+        let section = child_section(&ChildFrame {
+            parent_session_id: PARENT.to_owned(),
+            answers_a_call: true,
+        });
+        assert_eq!(
+            child.replacen(&format!("\n\n---\n\n{section}"), "", 1),
+            root,
+            "child = root + its section, nothing else moved"
+        );
+        let sub = FsmPromptComposer::compose(&ComposerInput {
+            audience: audience_of_child("claude-code", None),
+            ..plan_input()
+        });
+        assert!(
+            sub.contains("## You are a sub-conversation") && !sub.contains("nobody will answer"),
+            "a sub-conversation is framed as one, and not told that no one reads it"
+        );
+    }
 
     #[test]
     fn test_compose_no_project_no_fsm() {
