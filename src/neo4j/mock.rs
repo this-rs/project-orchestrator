@@ -174,6 +174,10 @@ pub struct MockGraphStore {
     pub trigger_reservations: RwLock<HashMap<(Uuid, String), chrono::DateTime<chrono::Utc>>>,
     /// `third_party_written_at` per plan (`mark_third_party_write`).
     pub plan_third_party_writes: RwLock<HashMap<Uuid, chrono::DateTime<chrono::Utc>>>,
+    /// External events journal (`record_external_event`), in arrival order.
+    pub external_events: RwLock<Vec<crate::ingress::ExternalEvent>>,
+    /// Claimed deliveries `(trigger, delivery key)` (`claim_external_delivery`).
+    pub external_deliveries: RwLock<std::collections::HashSet<(Uuid, String)>>,
     /// Makes `plan_third_party_written_at` fail (a graph error).
     pub fail_mark_read: std::sync::atomic::AtomicBool,
     /// Makes `update_chat_session_harness` fail (the capability snapshot is not stored).
@@ -415,6 +419,8 @@ impl MockGraphStore {
             llm_setting_writes_released: tokio::sync::Notify::new(),
             triggers: RwLock::new(HashMap::new()),
             trigger_firings: RwLock::new(HashMap::new()),
+            external_events: RwLock::new(Vec::new()),
+            external_deliveries: RwLock::new(std::collections::HashSet::new()),
             trigger_reservations: RwLock::new(HashMap::new()),
             plan_third_party_writes: RwLock::new(HashMap::new()),
             fail_mark_read: std::sync::atomic::AtomicBool::new(false),
@@ -12876,6 +12882,42 @@ impl GraphStore for MockGraphStore {
         result.sort_by(|a, b| b.fired_at.cmp(&a.fired_at));
         result.truncate(limit as usize);
         Ok(result)
+    }
+
+    async fn record_external_event(
+        &self,
+        event: &crate::ingress::ExternalEvent,
+    ) -> anyhow::Result<()> {
+        self.external_events.write().await.push(event.clone());
+        Ok(())
+    }
+
+    async fn list_external_events(
+        &self,
+        trigger_id: Uuid,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::ingress::ExternalEvent>> {
+        let events = self.external_events.read().await;
+        let mut result: Vec<_> = events
+            .iter()
+            .filter(|e| e.trigger_id == trigger_id)
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| b.received_at.cmp(&a.received_at));
+        result.truncate(limit.max(0) as usize);
+        Ok(result)
+    }
+
+    async fn claim_external_delivery(
+        &self,
+        trigger_id: Uuid,
+        delivery_key: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .external_deliveries
+            .write()
+            .await
+            .insert((trigger_id, delivery_key.to_string())))
     }
 
     // ── Cognitive routing (in-memory mock) ──────────────────────────────────

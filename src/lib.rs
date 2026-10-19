@@ -26,6 +26,7 @@ pub mod graph;
 pub mod heartbeat;
 pub mod homeostasis;
 pub mod identity;
+pub mod ingress;
 pub mod lifecycle;
 pub mod mcp;
 pub mod mcp_federation;

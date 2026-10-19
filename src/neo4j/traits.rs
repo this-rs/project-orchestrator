@@ -3932,6 +3932,19 @@ pub trait GraphStore: Send + Sync {
         limit: i64,
     ) -> Result<Vec<crate::runner::TriggerFiring>>;
 
+    /// Journalise une livraison reçue (accepted ou rejected), sans son corps.
+    async fn record_external_event(&self, event: &crate::ingress::ExternalEvent) -> Result<()>;
+
+    /// Derniers événements externes journalisés pour un déclencheur, le plus récent d'abord.
+    async fn list_external_events(
+        &self,
+        trigger_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<crate::ingress::ExternalEvent>>;
+
+    /// Réserve la livraison `delivery_key` pour `trigger_id`: `true` au premier appel, `false` au rejeu.
+    async fn claim_external_delivery(&self, trigger_id: Uuid, delivery_key: &str) -> Result<bool>;
+
     // ── AgentExecution ──────────────────────────────────────────────────────
 
     /// Create an AgentExecution node linked to a PlanRun and Task.
