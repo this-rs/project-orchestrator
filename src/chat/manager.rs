@@ -16690,11 +16690,14 @@ impl ChatManager {
                             program,
                             browser,
                             // The same rule as the others: an absolute, executable path.
-                            obscura: self
-                                .config
-                                .obscura_path
-                                .as_deref()
-                                .and_then(runnable_nexus_tools),
+                            // Unconfigured, the engine embedded in nexus-tools is the default
+                            // and `dsh-obscura-nav` on the PATH only the fallback (OBS-R).
+                            obscura: super::config::obscura_engine_program(
+                                self.config.obscura_path.as_deref(),
+                                embedded_obscura,
+                                super::config::ChatConfig::obscura_on_path,
+                                runnable_nexus_tools,
+                            ),
                             embedded_obscura,
                             deny_paths: nt::host_deny_paths(self.config_yaml_path.as_deref()),
                         },
