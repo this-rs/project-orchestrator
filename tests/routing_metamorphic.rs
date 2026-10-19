@@ -194,7 +194,12 @@ fn metamorphic_language_invariance() {
     for (grp, fr, en) in PAIRS {
         let a = decide(&router, fr, 4);
         let b = decide(&router, en, 4);
-        observe_sets(&mut report, &format!("[{grp}] \"{fr}\"  vs  \"{en}\""), &a, &b);
+        observe_sets(
+            &mut report,
+            &format!("[{grp}] \"{fr}\"  vs  \"{en}\""),
+            &a,
+            &b,
+        );
     }
 
     report.print();
