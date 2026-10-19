@@ -12112,6 +12112,25 @@ mod agent_lifecycle {
     }
 
     #[tokio::test]
+    async fn a_full_table_frees_its_most_idle_session_instead_of_refusing() {
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |c| c.max_sessions = 1);
+        let first = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        idle(&manager, &first).await;
+        // Too recent for the default grace: still refused, typed.
+        assert!(!manager.reclaim_idle_slot(Duration::from_secs(3600)).await);
+        assert_eq!(manager.active_session_count().await, 1);
+        // Idle past the grace: its slot is freed for the next session.
+        assert!(manager.reclaim_idle_slot(Duration::ZERO).await);
+        assert_eq!(manager.active_session_count().await, 0);
+        assert!(!manager.agent_runtime.owns(&first).await);
+    }
+
+    #[tokio::test]
     async fn native_sessions_count_toward_max_sessions_and_get_the_chat_retry_config() {
         let (_fake, graph) = native_world().await;
         let manager = configured(graph, |c| {
@@ -12141,6 +12160,13 @@ mod agent_lifecycle {
             err.to_string()
                 .contains("Maximum number of active sessions"),
             "{err:#}"
+        );
+        // Typed: a capacity limit is a 429 with a code, never a bare 500 (issue #876).
+        let failure = crate::chat::provider::errors::classify_open_error(&err, None)
+            .expect("the limit is a typed refusal");
+        assert_eq!(
+            (failure.status, failure.code),
+            (429, "session_limit_reached")
         );
         let retry = manager
             .agent_runtime
