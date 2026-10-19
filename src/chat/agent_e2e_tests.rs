@@ -5184,6 +5184,73 @@ mod provider_switch {
             );
         }
 
+        /// Anti-flapping under a mixed pool (R-S3): the turn right after a move is decided
+        /// among the models of the provider it moved to, so no second provider move follows.
+        #[tokio::test]
+        async fn a_mixed_pool_move_is_not_flipped_back_on_the_next_turn() {
+            let (w, mover) = auto_world("auto", vec!["local2", "local"], false).await;
+            let old = first_turn(&w).await;
+            w.manager
+                .set_session_routing(
+                    &old,
+                    &SessionRoutingRequest {
+                        auto: false,
+                        routing_pool: vec![pair("local"), pair("local2")],
+                    },
+                )
+                .await
+                .unwrap();
+            idle(&w, &old).await;
+            assert_eq!(moved_by_auto(&w, &old, "second question").await, "local2");
+            idle(&w, &old).await;
+            answered_in_place(&w, &old, "second question, again").await;
+            assert_eq!(
+                switched_of(&stored_events(&w, &old).await).len(),
+                1,
+                "the move in only: no flip back"
+            );
+            assert_eq!(
+                mover.checks().len(),
+                1,
+                "no provider question right after a move"
+            );
+        }
+
+        /// Consent (`allowed_for_project`): a provider the project did not consent to (`local3`)
+        /// is never in the pool the decider sees, and a decision naming it moves nothing: the
+        /// conversation answers in place on its own provider.
+        #[tokio::test]
+        async fn a_mixed_pool_never_moves_to_a_provider_the_project_did_not_consent_to() {
+            let (w, mover) = auto_world("auto", vec!["local3"], false).await;
+            let old = first_turn(&w).await;
+            w.manager
+                .set_session_routing(
+                    &old,
+                    &SessionRoutingRequest {
+                        auto: false,
+                        routing_pool: vec![pair("local"), pair("local2")],
+                    },
+                )
+                .await
+                .unwrap();
+            idle(&w, &old).await;
+            answered_in_place(&w, &old, "second question").await;
+            for check in mover.checks() {
+                assert!(
+                    check.pool.iter().all(|f| f.provider_id != "local3"),
+                    "a non-consented provider is never offered: {:?}",
+                    check.pool
+                );
+            }
+            let node = w
+                .graph
+                .get_chat_session(Uuid::parse_str(&old).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(node.provider_id.as_deref(), Some("local"));
+        }
+
         fn pair(provider: &str) -> RoutingPoolEntry {
             RoutingPoolEntry {
                 provider: provider.into(),
