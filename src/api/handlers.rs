@@ -3538,9 +3538,11 @@ pub async fn create_commit(
         // Side-effect 1 & 2: Incremental sync + analytics debounce
         let orch2 = orchestrator.clone();
         tokio::spawn(async move {
+            let mut synced_any = false;
             for file_path in &file_paths {
                 let path = std::path::Path::new(file_path.as_str());
                 if path.exists() {
+                    synced_any = true;
                     if let Err(e) = orch2
                         .sync_file_for_project(path, Some(pid), project_slug.as_deref())
                         .await
@@ -3548,6 +3550,13 @@ pub async fn create_commit(
                         tracing::warn!("Incremental sync failed for {}: {}", file_path, e);
                     }
                 }
+            }
+            // A commit none of whose files exists under this project's root (an agent's
+            // worktree, another checkout) changes nothing in its graph: no sync mark, no
+            // analytics, no reconstruction.
+            if !synced_any {
+                tracing::debug!(%pid, "Post-commit: no changed file under the project root, nothing to refresh");
+                return;
             }
             if let Err(e) = orch2.neo4j().update_project_synced(pid).await {
                 tracing::warn!("Failed to update last_synced: {}", e);
