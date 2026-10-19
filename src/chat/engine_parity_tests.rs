@@ -1764,6 +1764,9 @@ fn transcript_switched_back() -> Vec<Value> {
 #[derive(Default)]
 struct Answers {
     before_tool: StdMutex<Vec<(String, HookVerdict)>>,
+    /// The tools `after_tool` was CALLED for, recorded before the hook runs: an empty
+    /// `after_tool` then says whether the hook was never called or has not answered yet.
+    after_tool_called: StdMutex<Vec<String>>,
     after_tool: StdMutex<Vec<Option<String>>>,
     before_compaction: StdMutex<Vec<Option<String>>>,
     /// The limits every session was opened or resumed with, by provider kind (ISO5).
@@ -1788,6 +1791,11 @@ impl SessionHooks for Recording {
         verdict
     }
     async fn after_tool(&self, result: &ToolResultInfo) -> Option<String> {
+        self.answers
+            .after_tool_called
+            .lock()
+            .unwrap()
+            .push(result.call.name.clone());
         let said = self.inner.after_tool(result).await;
         self.answers.after_tool.lock().unwrap().push(said.clone());
         said
@@ -3515,15 +3523,33 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         Cause::Harness,
         format!("before_tool appelé : {pre:?}"),
     );
+    // The answer is recorded when the graph hook RETURNS. Read once, it was `[]` three times on
+    // 19/10/2026 on CI runners (Coverage of #880 and of main, Unit Tests of main) while the turn
+    // had answered and `before_tool` had seen the Grep; the cause is not established (the
+    // native loop awaits `after_tool` within the turn, and no `hook_timeout` was logged). The
+    // cell now waits for the answer like any other observation, within WAIT, and its message
+    // says whether the hook was CALLED, so the next failure tells "never called" from "called,
+    // no answer". A hook never called still fails.
+    let after_tool_answered = || {
+        answers
+            .after_tool
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .any(|a| a.contains("find_references") && a.contains("build_agent_spec"))
+    };
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !after_tool_answered() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let called = answers.after_tool_called.lock().unwrap().clone();
     let after = answers.after_tool.lock().unwrap().clone();
     na.check(
         "hooks.after_tool",
-        after
-            .iter()
-            .flatten()
-            .any(|a| a.contains("find_references") && a.contains("build_agent_spec")),
+        after_tool_answered(),
         Cause::Harness,
-        format!("after_tool a répondu : {after:?}"),
+        format!("after_tool appelé pour : {called:?}, a répondu : {after:?}"),
     );
     eprintln!("parity: native tools offered: {tools:?}, turn one answered={answered_one}");
     wn.settle(ends, &manager).await;
