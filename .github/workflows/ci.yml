@@ -295,7 +295,12 @@ jobs:
         with:
           shared-key: "ci-test-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
           save-if: ${{ env.CACHE_SAVE == 'true' && env.CACHE_FRESH == '' }}
-          cache-workspace-crates: true
+          # Not the workspace's own crates: their debug test binaries made this entry 4.45 GB
+          # (19/10/2026), and a PR recompiles the top crate anyway. With them, two entries of this
+          # profile plus coverage passed GitHub's 10 GB per repo and evicted ci-release, ci-clippy
+          # and ci-desktop: Build recompiled from scratch (10-15 min), API Tests found no cache and
+          # spent 14 min compiling for 29 s of tests.
+          cache-workspace-crates: false
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -782,3 +787,39 @@ jobs:
               | sort -rn | head -15
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ==========================================================================
+  # Cache prune - one entry per profile, so the profiles stop evicting each other
+  # ==========================================================================
+  # GitHub keeps 10 GB of cache per repository and evicts the least recently used entries.
+  # Every push to main whose Cargo.lock/Cargo.toml hash differs writes NEW entries next to the
+  # old ones; measured 19/10/2026: 11.7 GB in 4 entries (three of them ci-test/ci-cov), every
+  # ci-release, ci-clippy and ci-desktop entry evicted. After the jobs that save, keep only the
+  # newest entry of each profile written by main. PRs never save, so they have nothing to prune.
+  cache-prune:
+    name: Cache prune
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build, lint, desktop, unit-tests, coverage]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete superseded cache entries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh cache list --repo "$REPO" --ref refs/heads/main --limit 100 \
+              --sort created_at --order desc --json id,key,createdAt,sizeInBytes > caches.json
+          # Newest first: the first entry of each profile (v0-rust-ci-<profile>-...) is kept.
+          jq -r '[.[] | select(.key | test("^v0-rust-ci-[a-z]+-"))]
+                 | group_by(.key | capture("^v0-rust-(?<p>ci-[a-z]+)-").p)
+                 | map(sort_by(.createdAt) | reverse | .[1:][]) | .[]
+                 | "\(.id) \(.key) \(.sizeInBytes)"' caches.json > stale.txt
+          echo "Keeping:"; jq -r '[.[] | select(.key | test("^v0-rust-ci-[a-z]+-"))]
+                 | group_by(.key | capture("^v0-rust-(?<p>ci-[a-z]+)-").p)
+                 | map(max_by(.createdAt)) | .[] | "  \(.key) \(.sizeInBytes)"' caches.json
+          echo "Deleting:"; cat stale.txt
+          while read -r id key size; do
+            gh cache delete "$id" --repo "$REPO" || echo "::warning::could not delete $key"
+          done < stale.txt
