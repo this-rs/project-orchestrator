@@ -1,0 +1,661 @@
+{
+  "classifier": "recall_selection",
+  "version": 1,
+  "catalog": {
+    "note": "Language-neutral by construction: the classifier reads candidates and a slot count, not text. The lang field only satisfies the bench shape (>=30 cases, >=10 fr); lang_agreement is n/a because no pair ids are declared. Tie cases list their candidates in NON-ascending name order on purpose: a stable sort without the id tie-break would keep that order and disagree with the label."
+  },
+  "cases": [
+    {
+      "id": "selection-01-fr",
+      "lang": "fr",
+      "input": {
+        "max_results": 2,
+        "candidates": [
+          {
+            "id": "n1",
+            "score": 0.9
+          },
+          {
+            "id": "n2",
+            "score": 0.5
+          },
+          {
+            "id": "n3",
+            "score": 0.7
+          }
+        ]
+      },
+      "label": "n1+n3"
+    },
+    {
+      "id": "selection-01-en",
+      "lang": "en",
+      "input": {
+        "max_results": 2,
+        "candidates": [
+          {
+            "id": "n1",
+            "score": 0.9
+          },
+          {
+            "id": "n2",
+            "score": 0.5
+          },
+          {
+            "id": "n3",
+            "score": 0.7
+          }
+        ]
+      },
+      "label": "n1+n3"
+    },
+    {
+      "id": "selection-02-fr",
+      "lang": "fr",
+      "input": {
+        "max_results": 2,
+        "candidates": [
+          {
+            "id": "n3",
+            "score": 0.5
+          },
+          {
+            "id": "n2",
+            "score": 0.5
+          },
+          {
+            "id": "n1",
+            "score": 0.5
+          }
+        ]
+      },
+      "label": "n1+n2"
+    },
+    {
+      "id": "selection-02-en",
+      "lang": "en",
+      "input": {
+        "max_results": 2,
+        "candidates": [
+          {
+            "id": "n3",
+            "score": 0.5
+          },
+          {
+            "id": "n2",
+            "score": 0.5
+          },
+          {
+            "id": "n1",
+            "score": 0.5
+          }
+        ]
+      },
+      "label": "n1+n2"
+    },
+    {
+      "id": "selection-03-fr",
+      "lang": "fr",
+      "input": {
+        "max_results": 5,
+        "candidates": [
+          {
+            "id": "n1",
+            "score": 0.2
+          }
+        ]
+      },
+      "label": "n1"
+    },
+    {
+      "id": "selection-03-en",
+      "lang": "en",
+      "input": {
+        "max_results": 5,
+        "candidates": [
+          {
+            "id": "n1",
+            "score": 0.2
+          }
+        ]
+      },
+      "label": "n1"
+    },
+    {
+      "id": "selection-04-fr",
+      "lang": "fr",
+      "input": {
+        "max_results": 2,
+        "candidates": [
+          {
+            "id": "n1",
+            "score": 0.9
+          },
+          {
+            "id": "n3",
+            "score": 0.5
+          },
+          {
+            "id": "n2",
+            "score": 0.5
+          }
+        ]
+      },
+      "label": "n1+n2"
+    },
+    {
+      "id": "selection-04-en",
+      "lang": "en",
+      "input": {
+        "max_results": 2,
+        "candidates": [
+          {
+            "id": "n1",
+            "score": 0.9
+          },
+          {
+            "id": "n3",
+            "score": 0.5
+          },
+          {
+            "id": "n2",
+            "score": 0.5
+          }
+        ]
+      },
+      "label": "n1+n2"
+    },
+    {
+      "id": "selection-05-fr",
+      "lang": "fr",
+      "input": {
+        "max_results": 1,
+        "candidates": [
+          {
+            "id": "n1",
+            "score": -0.3
+          },
+          {
+            "id": "n2",
+            "score": 0.1
+          }
+        ]
+      },
+      "label": "n2"
+    },
+    {
+      "id": "selection-05-en",
+      "lang": "en",
+      "input": {
+        "max_results": 1,
+        "candidates": [
+          {
+            "id": "n1",
+            "score": -0.3
+          },
+          {
+            "id": "n2",
+            "score": 0.1
+          }
+        ]
+      },
+      "label": "n2"
+    },
+    {
+      "id": "selection-06-fr",
+      "lang": "fr",
+      "input": {
+        "max_results": 1,
+        "candidates": [
+          {
+            "id": "n2",
+            "score": 0.0
+          },
+          {
+            "id": "n1",
+            "score": 0.0
+          }
+        ]
+      },
+      "label": "n1"
+    },
+    {
+      "id": "selection-06-en",
+      "lang": "en",
+      "input": {
+        "max_results": 1,
+        "candidates": [
+          {
+            "id": "n2",
+            "score": 0.0
+          },
+          {
+            "id": "n1",
+            "score": 0.0
+          }
+        ]
+      },
+      "label": "n1"
+    },
+    {
+      "id": "selection-07-fr",
+      "lang": "fr",
+      "input": {
+        "max_results": 2,
+        "candidates": [
+          {
+            "id": "n3",
+            "score": 0.1
+          },
+          {
+            "id": "n2",
+            "score": 0.5
+          },
+          {
+            "id": "n1",
+            "score": 0.9
+          }
+        ]
+      },
+      "label": "n1+n2"
+    },
+    {
+      "id": "selection-07-en",
+      "lang": "en",
+      "input": {
+        "max_results": 2,
+        "candidates": [
+          {
+            "id": "n3",
+            "score": 0.1
+          },
+          {
+            "id": "n2",
+            "score": 0.5
+          },
+          {
+            "id": "n1",
+            "score": 0.9
+          }
+        ]
+      },
+      "label": "n1+n2"
+    },
+    {
+      "id": "selection-08-fr",
+      "lang": "fr",
+      "input": {
+        "max_results": 3,
+        "candidates": [
+          {
+            "id": "n5",
+            "score": 0.4
+          },
+          {
+            "id": "n4",
+            "score": 0.4
+          },
+          {
+            "id": "n3",
+            "score": 0.4
+          },
+          {
+            "id": "n2",
+            "score": 0.4
+          },
+          {
+            "id": "n1",
+            "score": 0.4
+          }
+        ]
+      },
+      "label": "n1+n2+n3"
+    },
+    {
+      "id": "selection-08-en",
+      "lang": "en",
+      "input": {
+        "max_results": 3,
+        "candidates": [
+          {
+            "id": "n5",
+            "score": 0.4
+          },
+          {
+            "id": "n4",
+            "score": 0.4
+          },
+          {
+            "id": "n3",
+            "score": 0.4
+          },
+          {
+            "id": "n2",
+            "score": 0.4
+          },
+          {
+            "id": "n1",
+            "score": 0.4
+          }
+        ]
+      },
+      "label": "n1+n2+n3"
+    },
+    {
+      "id": "selection-09-fr",
+      "lang": "fr",
+      "input": {
+        "max_results": 1,
+        "candidates": [
+          {
+            "id": "n2",
+            "score": 0.95
+          },
+          {
+            "id": "n1",
+            "score": 0.95
+          },
+          {
+            "id": "n3",
+            "score": 0.1
+          }
+        ]
+      },
+      "label": "n1"
+    },
+    {
+      "id": "selection-09-en",
+      "lang": "en",
+      "input": {
+        "max_results": 1,
+        "candidates": [
+          {
+            "id": "n2",
+            "score": 0.95
+          },
+          {
+            "id": "n1",
+            "score": 0.95
+          },
+          {
+            "id": "n3",
+            "score": 0.1
+          }
+        ]
+      },
+      "label": "n1"
+    },
+    {
+      "id": "selection-10-fr",
+      "lang": "fr",
+      "input": {
+        "max_results": 0,
+        "candidates": [
+          {
+            "id": "n1",
+            "score": 0.9
+          }
+        ]
+      },
+      "label": "none"
+    },
+    {
+      "id": "selection-10-en",
+      "lang": "en",
+      "input": {
+        "max_results": 0,
+        "candidates": [
+          {
+            "id": "n1",
+            "score": 0.9
+          }
+        ]
+      },
+      "label": "none"
+    },
+    {
+      "id": "selection-11-fr",
+      "lang": "fr",
+      "input": {
+        "max_results": 1,
+        "candidates": [
+          {
+            "id": "n1",
+            "score": 0.7
+          }
+        ]
+      },
+      "label": "n1"
+    },
+    {
+      "id": "selection-11-en",
+      "lang": "en",
+      "input": {
+        "max_results": 1,
+        "candidates": [
+          {
+            "id": "n1",
+            "score": 0.7
+          }
+        ]
+      },
+      "label": "n1"
+    },
+    {
+      "id": "selection-12-fr",
+      "lang": "fr",
+      "input": {
+        "max_results": 2,
+        "candidates": [
+          {
+            "id": "n3",
+            "score": 0.8
+          },
+          {
+            "id": "n2",
+            "score": 0.8
+          },
+          {
+            "id": "n1",
+            "score": 0.8
+          },
+          {
+            "id": "n4",
+            "score": 0.2
+          }
+        ]
+      },
+      "label": "n1+n2"
+    },
+    {
+      "id": "selection-12-en",
+      "lang": "en",
+      "input": {
+        "max_results": 2,
+        "candidates": [
+          {
+            "id": "n3",
+            "score": 0.8
+          },
+          {
+            "id": "n2",
+            "score": 0.8
+          },
+          {
+            "id": "n1",
+            "score": 0.8
+          },
+          {
+            "id": "n4",
+            "score": 0.2
+          }
+        ]
+      },
+      "label": "n1+n2"
+    },
+    {
+      "id": "selection-13-fr",
+      "lang": "fr",
+      "input": {
+        "max_results": 3,
+        "candidates": [
+          {
+            "id": "n1",
+            "score": 0.3
+          },
+          {
+            "id": "n2",
+            "score": 0.6
+          },
+          {
+            "id": "n3",
+            "score": 0.9
+          }
+        ]
+      },
+      "label": "n3+n2+n1"
+    },
+    {
+      "id": "selection-13-en",
+      "lang": "en",
+      "input": {
+        "max_results": 3,
+        "candidates": [
+          {
+            "id": "n1",
+            "score": 0.3
+          },
+          {
+            "id": "n2",
+            "score": 0.6
+          },
+          {
+            "id": "n3",
+            "score": 0.9
+          }
+        ]
+      },
+      "label": "n3+n2+n1"
+    },
+    {
+      "id": "selection-14-fr",
+      "lang": "fr",
+      "input": {
+        "max_results": 4,
+        "candidates": [
+          {
+            "id": "n6",
+            "score": 0.7
+          },
+          {
+            "id": "n5",
+            "score": 0.7
+          },
+          {
+            "id": "n4",
+            "score": 0.7
+          },
+          {
+            "id": "n3",
+            "score": 0.7
+          },
+          {
+            "id": "n2",
+            "score": 0.7
+          },
+          {
+            "id": "n1",
+            "score": 0.7
+          }
+        ]
+      },
+      "label": "n1+n2+n3+n4"
+    },
+    {
+      "id": "selection-14-en",
+      "lang": "en",
+      "input": {
+        "max_results": 4,
+        "candidates": [
+          {
+            "id": "n6",
+            "score": 0.7
+          },
+          {
+            "id": "n5",
+            "score": 0.7
+          },
+          {
+            "id": "n4",
+            "score": 0.7
+          },
+          {
+            "id": "n3",
+            "score": 0.7
+          },
+          {
+            "id": "n2",
+            "score": 0.7
+          },
+          {
+            "id": "n1",
+            "score": 0.7
+          }
+        ]
+      },
+      "label": "n1+n2+n3+n4"
+    },
+    {
+      "id": "selection-15-fr",
+      "lang": "fr",
+      "input": {
+        "max_results": 3,
+        "candidates": [
+          {
+            "id": "n2",
+            "score": 0.2
+          },
+          {
+            "id": "n1",
+            "score": 0.2
+          },
+          {
+            "id": "n4",
+            "score": 0.9
+          },
+          {
+            "id": "n3",
+            "score": 0.9
+          }
+        ]
+      },
+      "label": "n3+n4+n1"
+    },
+    {
+      "id": "selection-15-en",
+      "lang": "en",
+      "input": {
+        "max_results": 3,
+        "candidates": [
+          {
+            "id": "n2",
+            "score": 0.2
+          },
+          {
+            "id": "n1",
+            "score": 0.2
+          },
+          {
+            "id": "n4",
+            "score": 0.9
+          },
+          {
+            "id": "n3",
+            "score": 0.9
+          }
+        ]
+      },
+      "label": "n3+n4+n1"
+    }
+  ]
+}

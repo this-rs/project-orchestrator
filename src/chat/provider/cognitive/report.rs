@@ -682,6 +682,7 @@ mod tests {
                 "skills",
                 "triggers",
                 "recall_ranking",
+                "recall_selection",
             ]
         );
 

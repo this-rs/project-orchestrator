@@ -1,12 +1,13 @@
 //! Offline evaluation bench for the backend classifiers.
 //!
-//! Six classifiers decide things the backend acts on: which tool groups a
+//! Seven classifiers decide things the backend acts on: which tool groups a
 //! message needs, the intent of a message, the class of a chat turn, which
-//! skill a message or file activates, which event trigger fires, and which note
-//! the recall rule surfaces. Until now none of them had an accuracy number.
-//! This module measures each one against a hand-labelled fixture
-//! (`tests/fixtures/classifiers/*.json`) and against the majority-class
-//! baseline, which is the score a classifier that ignores its input would get.
+//! skill a message or file activates, which event trigger fires, which note the
+//! recall rule surfaces, and which notes the ranking keeps. Until now none of
+//! them had an accuracy number. This module measures each one against a
+//! hand-labelled fixture (`tests/fixtures/classifiers/*.json`) and against the
+//! majority-class baseline, which is the score a classifier that ignores its
+//! input would get.
 //!
 //! The bench is offline, deterministic and fast: no network, no Neo4j, no clock
 //! in the predictions. Its figures are published in the shadow routing report
@@ -208,6 +209,10 @@ pub fn embedded_fixtures() -> Result<Vec<Fixture>> {
             "recall_ranking",
             include_str!("../../tests/fixtures/classifiers/recall_ranking.json"),
         ),
+        (
+            "recall_selection",
+            include_str!("../../tests/fixtures/classifiers/recall_selection.json"),
+        ),
     ];
     SOURCES
         .iter()
@@ -218,7 +223,7 @@ pub fn embedded_fixtures() -> Result<Vec<Fixture>> {
         .collect()
 }
 
-/// Scores of the six classifiers on the embedded fixtures.
+/// Scores of the seven classifiers on the embedded fixtures.
 pub fn run_embedded() -> Result<Vec<ClassifierScore>> {
     run(&embedded_fixtures()?)
 }
@@ -296,6 +301,7 @@ mod tests {
             BTreeSet::from([
                 "intent",
                 "recall_ranking",
+                "recall_selection",
                 "skills",
                 "task_class",
                 "tool_groups",
