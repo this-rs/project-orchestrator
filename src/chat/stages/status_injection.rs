@@ -610,6 +610,8 @@ impl ParallelEnrichmentStage for StatusInjectionStage {
 mod tests {
     use super::*;
     use crate::chat::enrichment::ParallelEnrichmentStage;
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::models::PlanStatus;
 
     // ── Config tests ────────────────────────────────────────────────────
 
@@ -803,6 +805,45 @@ mod tests {
         assert!(runs.is_empty());
     }
 
+    /// The runs of every protocol are asked for concurrently, and the states only of the
+    /// protocols that have one: a protocol with no running run costs nothing more than
+    /// its (empty) run list, and a protocol with one reports its current state's name.
+    #[tokio::test]
+    async fn test_graph_provider_queries_every_protocol_concurrently() {
+        let mock = MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("concurrent");
+        let project_id = project.id;
+        mock.create_project(&project).await.unwrap();
+
+        // A protocol with a running run...
+        let mut busy = crate::protocol::Protocol::new(project_id, "busy", Uuid::new_v4());
+        let busy_state = crate::protocol::ProtocolState::start(busy.id, "running");
+        let busy_done = crate::protocol::ProtocolState::terminal(busy.id, "done");
+        busy.entry_state = busy_state.id;
+        busy.terminal_states = vec![busy_done.id];
+        mock.upsert_protocol(&busy).await.unwrap();
+        mock.upsert_protocol_state(&busy_state).await.unwrap();
+        mock.upsert_protocol_state(&busy_done).await.unwrap();
+        mock.create_protocol_run(&running_run(busy.id, busy_state.id))
+            .await
+            .unwrap();
+
+        // ... and one with none (its states are never read).
+        let mut quiet = crate::protocol::Protocol::new(project_id, "quiet", Uuid::new_v4());
+        let quiet_state = crate::protocol::ProtocolState::start(quiet.id, "waiting");
+        quiet.entry_state = quiet_state.id;
+        mock.upsert_protocol(&quiet).await.unwrap();
+        mock.upsert_protocol_state(&quiet_state).await.unwrap();
+
+        let provider = GraphProtocolProvider::new(Arc::new(mock));
+        let runs = provider.get_active_runs(project_id).await.unwrap();
+
+        assert_eq!(runs.len(), 1, "only the busy protocol has a run");
+        assert_eq!(runs[0].protocol_name, "busy");
+        assert_eq!(runs[0].current_state, "running");
+        assert_eq!(runs[0].progress, 50, "one of its two states is visited");
+    }
+
     // ── truncate tests ──────────────────────────────────────────────────
 
     #[test]
@@ -886,6 +927,413 @@ mod tests {
         assert!(result.is_ok(), "Stage should not error with mock graph");
     }
 
+    // ── Stage with a graph that has content ─────────────────────────────
+
+    /// Every in-progress plan's tasks are fetched concurrently (one query per plan) and
+    /// the section lists each plan with its progress and its active tasks, completed
+    /// ones being counted but not listed.
+    #[tokio::test]
+    async fn test_stage_injects_work_status_for_several_plans() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project = crate::test_helpers::test_project_named("work-status");
+        let project_id = project.id;
+        mock.create_project(&project).await.unwrap();
+
+        let mut first = crate::test_helpers::test_plan_for_project(project_id);
+        first.title = "First plan".to_string();
+        first.status = PlanStatus::InProgress;
+        mock.create_plan(&first).await.unwrap();
+        mock.create_task(
+            first.id,
+            &task_with_status("Wire the stage", TaskStatus::InProgress),
+        )
+        .await
+        .unwrap();
+        mock.create_task(
+            first.id,
+            &task_with_status("Settle the config", TaskStatus::Completed),
+        )
+        .await
+        .unwrap();
+
+        let mut second = crate::test_helpers::test_plan_for_project(project_id);
+        second.title = "Second plan".to_string();
+        second.status = PlanStatus::InProgress;
+        mock.create_plan(&second).await.unwrap();
+        mock.create_task(
+            second.id,
+            &task_with_status("Await a decision", TaskStatus::Blocked),
+        )
+        .await
+        .unwrap();
+
+        let stage = StatusInjectionStage::new(mock);
+        let output = stage
+            .execute(&input_for(Some(project_id), "What is in progress?"))
+            .await
+            .unwrap();
+
+        let section = output
+            .sections
+            .iter()
+            .find(|s| s.title == "Work In Progress")
+            .expect("a work-status section");
+        let content = &section.content;
+        assert!(content.contains("**Plan:** First plan"), "{content}");
+        assert!(content.contains("**Plan:** Second plan"), "{content}");
+        assert!(content.contains("Progress: 1/2  (50%)"), "{content}");
+        assert!(content.contains("Wire the stage"), "{content}");
+        assert!(content.contains("Await a decision"), "{content}");
+        assert!(
+            !content.contains("Settle the config"),
+            "a completed task is counted, not listed: {content}"
+        );
+    }
+
+    /// A running protocol run is rendered twice: its status line, and its current
+    /// state's context (prompt fragment, forbidden actions), through the real graph
+    /// provider.
+    #[tokio::test]
+    async fn test_stage_injects_active_protocol_and_its_context() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project = crate::test_helpers::test_project_named("protocols");
+        let project_id = project.id;
+        mock.create_project(&project).await.unwrap();
+
+        let mut proto = crate::protocol::Protocol::new(project_id, "code-review", Uuid::new_v4());
+        let mut state = crate::protocol::ProtocolState::start(proto.id, "analyze");
+        state.prompt_fragment = Some("Read the diff before you review it.".to_string());
+        state.forbidden_actions = Some(vec!["git push".to_string()]);
+        proto.entry_state = state.id;
+        mock.upsert_protocol(&proto).await.unwrap();
+        mock.upsert_protocol_state(&state).await.unwrap();
+        mock.create_protocol_run(&running_run(proto.id, state.id))
+            .await
+            .unwrap();
+
+        let stage = StatusInjectionStage::with_config(
+            Arc::clone(&mock) as Arc<dyn GraphStore>,
+            None,
+            Arc::new(GraphProtocolProvider::new(mock)),
+            StatusInjectionConfig::default(),
+        );
+        let output = stage
+            .execute(&input_for(Some(project_id), "Where are we?"))
+            .await
+            .unwrap();
+
+        let status = output
+            .sections
+            .iter()
+            .find(|s| s.title == "Active Protocols")
+            .expect("a protocol-status section");
+        assert!(status.content.contains("code-review"), "{}", status.content);
+        assert!(status.content.contains("analyze"), "{}", status.content);
+
+        let context = output
+            .sections
+            .iter()
+            .find(|s| s.title == "Active Protocol Context")
+            .expect("a protocol-context section");
+        assert!(
+            context
+                .content
+                .contains("Read the diff before you review it."),
+            "{}",
+            context.content
+        );
+        assert!(context.content.contains("git push"), "{}", context.content);
+    }
+
+    /// A run whose state carries neither a prompt fragment nor forbidden actions has no
+    /// context to inject: the status line stands alone, no empty context section.
+    #[tokio::test]
+    async fn test_stage_skips_protocol_context_when_the_state_brings_none() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project = crate::test_helpers::test_project_named("bare-protocol");
+        let project_id = project.id;
+        mock.create_project(&project).await.unwrap();
+
+        let mut proto = crate::protocol::Protocol::new(project_id, "deploy", Uuid::new_v4());
+        let state = crate::protocol::ProtocolState::start(proto.id, "uploading");
+        proto.entry_state = state.id;
+        mock.upsert_protocol(&proto).await.unwrap();
+        mock.upsert_protocol_state(&state).await.unwrap();
+        mock.create_protocol_run(&running_run(proto.id, state.id))
+            .await
+            .unwrap();
+
+        let stage = StatusInjectionStage::with_config(
+            Arc::clone(&mock) as Arc<dyn GraphStore>,
+            None,
+            Arc::new(GraphProtocolProvider::new(mock)),
+            StatusInjectionConfig::default(),
+        );
+        let output = stage
+            .execute(&input_for(Some(project_id), "Where are we?"))
+            .await
+            .unwrap();
+
+        let status = output
+            .sections
+            .iter()
+            .find(|s| s.title == "Active Protocols")
+            .expect("a protocol-status section");
+        assert!(status.content.contains("deploy"), "{}", status.content);
+        assert!(
+            output
+                .sections
+                .iter()
+                .all(|s| s.title != "Active Protocol Context"),
+            "nothing to inject as context"
+        );
+    }
+
+    /// A protocol query that answers with no run adds no section at all: an empty
+    /// answer is not an empty section.
+    #[tokio::test]
+    async fn test_stage_skips_protocol_sections_when_no_run_is_active() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project = crate::test_helpers::test_project_named("quiet");
+        mock.create_project(&project).await.unwrap();
+
+        let stage = StatusInjectionStage::new(mock);
+        let output = stage
+            .execute(&input_for(Some(project.id), "Where are we?"))
+            .await
+            .unwrap();
+
+        assert!(
+            output.sections.is_empty(),
+            "nothing to say: {:?}",
+            output.sections.iter().map(|s| &s.title).collect::<Vec<_>>()
+        );
+    }
+
+    /// A provider that fails costs its section, not the stage.
+    #[tokio::test]
+    async fn test_stage_survives_a_failing_protocol_provider() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project = crate::test_helpers::test_project_named("failing-protocol");
+        let project_id = project.id;
+        mock.create_project(&project).await.unwrap();
+
+        let mut plan = crate::test_helpers::test_plan_for_project(project_id);
+        plan.title = "Still worth saying".to_string();
+        plan.status = PlanStatus::InProgress;
+        mock.create_plan(&plan).await.unwrap();
+
+        let stage = StatusInjectionStage::with_config(
+            mock,
+            None,
+            Arc::new(FailingProvider),
+            StatusInjectionConfig::default(),
+        );
+        let output = stage
+            .execute(&input_for(Some(project_id), "Where are we?"))
+            .await
+            .unwrap();
+
+        assert!(
+            output
+                .sections
+                .iter()
+                .all(|s| s.title != "Active Protocols"),
+            "the failed query adds nothing"
+        );
+        let work = output
+            .sections
+            .iter()
+            .find(|s| s.title == "Work In Progress")
+            .expect("the other queries still answered");
+        assert!(
+            work.content.contains("Still worth saying"),
+            "{}",
+            work.content
+        );
+    }
+
+    /// A protocol query slower than its own limit is dropped at that limit: the stage
+    /// returns without protocol sections instead of waiting for it.
+    #[tokio::test]
+    async fn test_stage_protocol_query_times_out() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project = crate::test_helpers::test_project_named("slow-protocol");
+        mock.create_project(&project).await.unwrap();
+
+        let stage = StatusInjectionStage::with_config(
+            mock,
+            None,
+            Arc::new(SlowProvider {
+                delay: Duration::from_secs(5),
+            }),
+            StatusInjectionConfig {
+                query_timeout_ms: 10,
+                ..Default::default()
+            },
+        );
+        let started = std::time::Instant::now();
+        let output = stage
+            .execute(&input_for(Some(project.id), "Where are we?"))
+            .await
+            .unwrap();
+
+        assert!(output.sections.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the stage did not wait for the slow query"
+        );
+    }
+
+    /// The work-status query has a limit of its own: blocked on the plans store, it is
+    /// dropped there and the stage still answers.
+    #[tokio::test]
+    async fn test_stage_work_status_query_times_out() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project = crate::test_helpers::test_project_named("slow-plans");
+        let project_id = project.id;
+        mock.create_project(&project).await.unwrap();
+        let mut plan = crate::test_helpers::test_plan_for_project(project_id);
+        plan.title = "Never read in time".to_string();
+        plan.status = PlanStatus::InProgress;
+        mock.create_plan(&plan).await.unwrap();
+
+        let stage = StatusInjectionStage::with_config(
+            Arc::clone(&mock) as Arc<dyn GraphStore>,
+            None,
+            Arc::new(GraphProtocolProvider::new(
+                Arc::clone(&mock) as Arc<dyn GraphStore>
+            )),
+            StatusInjectionConfig {
+                query_timeout_ms: 10,
+                ..Default::default()
+            },
+        );
+
+        // Holding the plans store keeps the work-status query pending past its limit.
+        let held = mock.plans.write().await;
+        let started = std::time::Instant::now();
+        let output = stage
+            .execute(&input_for(Some(project_id), "Where are we?"))
+            .await
+            .unwrap();
+        drop(held);
+
+        assert!(output.sections.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the stage did not wait for the blocked query"
+        );
+    }
+
+    /// With an engine available, the stage renders its tree: high-confidence trees are
+    /// injected, ones under the threshold are not.
+    #[tokio::test]
+    async fn test_stage_injects_a_reasoning_tree() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project = crate::test_helpers::test_project_named("reasoning");
+        mock.create_project(&project).await.unwrap();
+
+        let stage = StatusInjectionStage::with_config(
+            Arc::clone(&mock) as Arc<dyn GraphStore>,
+            Some(reasoning_engine(
+                Arc::clone(&mock) as Arc<dyn GraphStore>,
+                Arc::new(crate::embeddings::MockEmbeddingProvider::new(768)),
+            )),
+            Arc::new(GraphProtocolProvider::new(mock)),
+            StatusInjectionConfig {
+                // An empty graph makes a confidence-0 tree: the threshold decides.
+                reasoning_confidence_threshold: 0.0,
+                ..Default::default()
+            },
+        );
+        let output = stage
+            .execute(&input_for(Some(project.id), "How does the chat work?"))
+            .await
+            .unwrap();
+
+        let section = output
+            .sections
+            .iter()
+            .find(|s| s.title == "Suggested Reasoning Plan")
+            .expect("a reasoning section");
+        assert!(
+            section.content.contains("**Confidence:** 0%"),
+            "{}",
+            section.content
+        );
+        assert!(
+            section.content.contains("**Nodes:** 0"),
+            "{}",
+            section.content
+        );
+    }
+
+    /// The same tree, under the default threshold: no section.
+    #[tokio::test]
+    async fn test_stage_skips_a_reasoning_tree_under_the_threshold() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project = crate::test_helpers::test_project_named("reasoning-quiet");
+        mock.create_project(&project).await.unwrap();
+
+        let stage = StatusInjectionStage::with_config(
+            Arc::clone(&mock) as Arc<dyn GraphStore>,
+            Some(reasoning_engine(
+                Arc::clone(&mock) as Arc<dyn GraphStore>,
+                Arc::new(crate::embeddings::MockEmbeddingProvider::new(768)),
+            )),
+            Arc::new(GraphProtocolProvider::new(mock)),
+            StatusInjectionConfig::default(),
+        );
+        let output = stage
+            .execute(&input_for(Some(project.id), "How does the chat work?"))
+            .await
+            .unwrap();
+
+        assert!(
+            output
+                .sections
+                .iter()
+                .all(|s| s.title != "Suggested Reasoning Plan"),
+            "a tree under the threshold is not injected"
+        );
+    }
+
+    /// A slow embedding holds the tree past the reasoning limit: the tree is dropped,
+    /// the stage answers.
+    #[tokio::test]
+    async fn test_stage_reasoning_query_times_out() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project = crate::test_helpers::test_project_named("slow-reasoning");
+        mock.create_project(&project).await.unwrap();
+
+        let stage = StatusInjectionStage::with_config(
+            Arc::clone(&mock) as Arc<dyn GraphStore>,
+            Some(reasoning_engine(
+                Arc::clone(&mock) as Arc<dyn GraphStore>,
+                Arc::new(SlowEmbedder {
+                    delay: Duration::from_secs(5),
+                }),
+            )),
+            Arc::new(GraphProtocolProvider::new(mock)),
+            StatusInjectionConfig {
+                reasoning_timeout_ms: 10,
+                ..Default::default()
+            },
+        );
+        let started = std::time::Instant::now();
+        let output = stage
+            .execute(&input_for(Some(project.id), "How does the chat work?"))
+            .await
+            .unwrap();
+
+        assert!(output.sections.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the stage did not wait for the slow tree"
+        );
+    }
+
     // ── ReasoningTree rendering tests ───────────────────────────────────
 
     #[test]
@@ -953,6 +1401,116 @@ mod tests {
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
+
+    /// A running run of `protocol_id`, its current state being `current_state`.
+    fn running_run(protocol_id: Uuid, current_state: Uuid) -> crate::protocol::ProtocolRun {
+        crate::protocol::ProtocolRun {
+            id: Uuid::new_v4(),
+            protocol_id,
+            plan_id: None,
+            task_id: None,
+            parent_run_id: None,
+            current_state,
+            states_visited: vec![crate::protocol::StateVisit {
+                state_id: current_state,
+                state_name: "running".to_string(),
+                entered_at: chrono::Utc::now(),
+                exited_at: None,
+                duration_ms: None,
+                trigger: None,
+                progress_snapshot: None,
+            }],
+            status: crate::protocol::RunStatus::Running,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            error: None,
+            triggered_by: "manual".to_string(),
+            depth: 0,
+            version: 1,
+            runner_managed: false,
+        }
+    }
+
+    /// The input of a stage call already scoped to `project_id` (no slug resolution).
+    fn input_for(project_id: Option<Uuid>, message: &str) -> EnrichmentInput {
+        EnrichmentInput {
+            message: message.to_string(),
+            session_id: Uuid::new_v4(),
+            project_slug: Some("test-project".to_string()),
+            project_id,
+            cwd: None,
+            protocol_run_id: None,
+            protocol_state: None,
+            excluded_note_ids: Default::default(),
+            reasoning_path_tracker: None,
+        }
+    }
+
+    fn task_with_status(title: &str, status: TaskStatus) -> crate::neo4j::models::TaskNode {
+        let mut task = crate::test_helpers::test_task_titled(title);
+        task.status = status;
+        task
+    }
+
+    fn reasoning_engine(
+        graph: Arc<dyn GraphStore>,
+        embedder: Arc<dyn crate::embeddings::EmbeddingProvider>,
+    ) -> Arc<ReasoningTreeEngine> {
+        Arc::new(ReasoningTreeEngine::new(
+            graph,
+            embedder,
+            crate::reasoning::ReasoningTreeCache::with_config(10, Duration::from_secs(60)),
+        ))
+    }
+
+    /// A protocol provider that always fails.
+    struct FailingProvider;
+
+    #[async_trait::async_trait]
+    impl ProtocolStatusProvider for FailingProvider {
+        async fn get_active_runs(&self, _project_id: Uuid) -> Result<Vec<ProtocolRunStatus>> {
+            anyhow::bail!("the graph is unreachable")
+        }
+    }
+
+    /// A protocol provider that answers after `delay`.
+    struct SlowProvider {
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl ProtocolStatusProvider for SlowProvider {
+        async fn get_active_runs(&self, _project_id: Uuid) -> Result<Vec<ProtocolRunStatus>> {
+            tokio::time::sleep(self.delay).await;
+            Ok(Vec::new())
+        }
+    }
+
+    /// An embedding provider that answers after `delay` (to hold a tree past its limit).
+    struct SlowEmbedder {
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::embeddings::EmbeddingProvider for SlowEmbedder {
+        async fn embed_text(&self, _text: &str) -> Result<Vec<f32>> {
+            tokio::time::sleep(self.delay).await;
+            Ok(vec![0.0; 8])
+        }
+
+        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            tokio::time::sleep(self.delay).await;
+            Ok(texts.iter().map(|_| vec![0.0; 8]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            8
+        }
+
+        fn model_name(&self) -> &str {
+            "slow-test-embedding"
+        }
+    }
 
     fn make_test_stage() -> StatusInjectionStage {
         use crate::neo4j::mock::MockGraphStore;

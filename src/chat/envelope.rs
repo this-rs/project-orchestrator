@@ -1319,6 +1319,55 @@ mod tests {
         ));
     }
 
+    /// A live-session source that does NOT override `is_working`: the trait's default
+    /// (working = active) is the shape every implementation but the chat manager keeps,
+    /// and it must keep answering for them.
+    struct PlainLive {
+        active: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl LiveSessions for PlainLive {
+        async fn is_active(&self, session_id: &str) -> bool {
+            self.active.iter().any(|s| s == session_id)
+        }
+        async fn live_permission_mode(&self, _session_id: &str) -> Option<String> {
+            None
+        }
+        async fn default_permission_mode(&self) -> String {
+            "default".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_that_does_not_say_who_works_counts_every_active_session() {
+        let l = PlainLive {
+            active: vec!["s-open".to_string()],
+        };
+        assert!(LiveSessions::is_working(&l, "s-open").await);
+        assert!(!LiveSessions::is_working(&l, "s-gone").await);
+
+        // Through the rule, with no child: the envelope is built from what this source
+        // says (no live mode, so its global default), the fan-out being under the cap.
+        let (graph, parent) = store_with_parent(None).await;
+        let envelope = resolve_envelope(&graph, &l, &parent.to_string(), None, MAX_LIVE_CHILDREN)
+            .await
+            .expect("no live child");
+        assert_eq!(envelope.ceiling, "default");
+
+        // And a source that says nothing about work counts every active session as
+        // working: four of them fill the parent's fan-out.
+        let mut l = PlainLive { active: vec![] };
+        for _ in 0..MAX_LIVE_CHILDREN {
+            l.active
+                .push(add_aged_child(&graph, parent, 600).await.to_string());
+        }
+        assert!(matches!(
+            resolve_envelope(&graph, &l, &parent.to_string(), None, MAX_LIVE_CHILDREN).await,
+            Err(EnvelopeError::TooManyChildren { .. })
+        ));
+    }
+
     // ── ENV-WS: a project deduced in a workspace is context, not a boundary ────
 
     /// A parent in workspace `ws` (projects `demo` and `backend`) whose project is `demo`,
