@@ -28,8 +28,14 @@ runs:
         TOML
         fi
         {
-          # A clean checkout never reads incremental state; it only bloats the cache.
-          echo "CARGO_INCREMENTAL=0"
+          # A hosted runner starts from a clean checkout and never reads incremental state; it
+          # only bloats the cache. The self-hosted runner keeps its target/ (CARGO_TARGET_DIR)
+          # between runs: there, incremental state is what makes the next build fast.
+          if [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            echo "CARGO_INCREMENTAL=1"
+          else
+            echo "CARGO_INCREMENTAL=0"
+          fi
           # File and line of a panic are all a CI log needs; full debug info is what makes the
           # link of each large test binary slow.
           echo "CARGO_PROFILE_DEV_DEBUG=line-tables-only"

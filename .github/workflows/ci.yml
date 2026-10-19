@@ -64,14 +64,37 @@ jobs:
     # A DRAFT PR into main (an integration branch accumulating its lot) runs the fast tier only;
     # "Ready for review" starts the full tier once.
     if: (github.base_ref == 'main' && !github.event.pull_request.draft) || github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    # On the self-hosted runner (ffs-n2, label in the repository variable CI_SELF_HOSTED_LABEL)
+    # when that variable is set, for pushes and for PRs from THIS repository only: the repository
+    # is public, a fork's code never runs on that machine. Nightly and `fresh` runs stay on a
+    # hosted runner, where a cold start is the point. Empty the variable to send every job back.
+    # One runner instance per job (<label>-build, -unit, -cov): cargo fingerprints the
+    # workspace crates by their absolute path, and each instance has its own work dir, so a
+    # job that moved to another instance recompiled the whole workspace (Build: 4 min 53 s
+    # on an empty commit, 19/10/2026).
+    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-build', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v7
+
+      # Outside the workspace (`checkout` cleans it) and kept between runs: the point of the
+      # self-hosted runner is a warm, incremental target/ (measured on ffs-n2: the crate in
+      # 45 s incremental against 6 min 45 s from the cache on a hosted runner).
+      - name: Persistent target dir (self-hosted runner)
+        if: runner.environment == 'self-hosted'
+        run: echo "CARGO_TARGET_DIR=${RUNNER_TARGETS:?RUNNER_TARGETS missing, see the runner .env}/build" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
+      # rust-toolchain sets CARGO_INCREMENTAL=0. These binaries only serve API Tests (release.yml
+      # builds what ships): on the self-hosted runner, keep the crate's incremental state, which
+      # build.rs invalidates at every commit anyway (it embeds `git describe`).
+      - name: Incremental release build (self-hosted runner)
+        if: runner.environment == 'self-hosted'
+        run: echo "CARGO_INCREMENTAL=1" >> "$GITHUB_ENV"
+
       - name: Cache cargo registry
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "ci-release-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
@@ -81,14 +104,21 @@ jobs:
       - name: Build release binaries
         run: cargo build --release
 
+      # CARGO_TARGET_DIR on the self-hosted runner, target/ otherwise; dist/ keeps the artifact's
+      # flat layout, which API Tests downloads into target/release/.
+      - name: Collect the binaries
+        run: |
+          mkdir -p dist
+          cp "${CARGO_TARGET_DIR:-target}"/release/{orchestrator,orch,mcp_server} dist/
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
           name: build-artifacts
           path: |
-            target/release/orchestrator
-            target/release/orch
-            target/release/mcp_server
+            dist/orchestrator
+            dist/orch
+            dist/mcp_server
           retention-days: 1
 
   # ==========================================================================
@@ -278,12 +308,27 @@ jobs:
   # ==========================================================================
   unit-tests:
     name: Unit Tests
-    runs-on: ubuntu-latest
+    # On the self-hosted runner (ffs-n2, label in the repository variable CI_SELF_HOSTED_LABEL)
+    # when that variable is set, for pushes and for PRs from THIS repository only: the repository
+    # is public, a fork's code never runs on that machine. Nightly and `fresh` runs stay on a
+    # hosted runner, where a cold start is the point. Empty the variable to send every job back.
+    # One runner instance per job (<label>-build, -unit, -cov): cargo fingerprints the
+    # workspace crates by their absolute path, and each instance has its own work dir, so a
+    # job that moved to another instance recompiled the whole workspace (Build: 4 min 53 s
+    # on an empty commit, 19/10/2026).
+    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-unit', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
     # A hung test used to hold a job for 1-2 hours; nextest kills it after 5 min (see
     # .config/nextest.toml), this is the backstop.
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
+
+      # Outside the workspace (`checkout` cleans it) and kept between runs: the point of the
+      # self-hosted runner is a warm, incremental target/ (measured on ffs-n2: the crate in
+      # 45 s incremental against 6 min 45 s from the cache on a hosted runner).
+      - name: Persistent target dir (self-hosted runner)
+        if: runner.environment == 'self-hosted'
+        run: echo "CARGO_TARGET_DIR=${RUNNER_TARGETS:?RUNNER_TARGETS missing, see the runner .env}/unit-tests" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
@@ -291,6 +336,7 @@ jobs:
       - uses: ./.github/actions/test-profile
 
       - name: Cache cargo registry
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "ci-test-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
@@ -551,7 +597,15 @@ jobs:
     # A DRAFT PR into main (an integration branch accumulating its lot) runs the fast tier only;
     # "Ready for review" starts the full tier once.
     if: (github.base_ref == 'main' && !github.event.pull_request.draft) || github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    # On the self-hosted runner (ffs-n2, label in the repository variable CI_SELF_HOSTED_LABEL)
+    # when that variable is set, for pushes and for PRs from THIS repository only: the repository
+    # is public, a fork's code never runs on that machine. Nightly and `fresh` runs stay on a
+    # hosted runner, where a cold start is the point. Empty the variable to send every job back.
+    # One runner instance per job (<label>-build, -unit, -cov): cargo fingerprints the
+    # workspace crates by their absolute path, and each instance has its own work dir, so a
+    # job that moved to another instance recompiled the whole workspace (Build: 4 min 53 s
+    # on an empty commit, 19/10/2026).
+    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-cov', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
     # Backstop: a hung test used to keep this job alive for 1-2 hours.
     timeout-minutes: 50
     permissions:
@@ -593,6 +647,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Outside the workspace (`checkout` cleans it) and kept between runs: the point of the
+      # self-hosted runner is a warm, incremental target/ (measured on ffs-n2: the crate in
+      # 45 s incremental against 6 min 45 s from the cache on a hosted runner).
+      - name: Persistent target dir (self-hosted runner)
+        if: runner.environment == 'self-hosted'
+        run: echo "CARGO_TARGET_DIR=${RUNNER_TARGETS:?RUNNER_TARGETS missing, see the runner .env}/coverage" >> "$GITHUB_ENV"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
         with:
@@ -601,6 +662,7 @@ jobs:
       - uses: ./.github/actions/test-profile
 
       - name: Cache cargo registry
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "ci-cov-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
@@ -624,8 +686,16 @@ jobs:
       #
       # `clean --workspace` first, so stale profraw from the cargo cache cannot
       # inflate the numbers.
+      # A hosted runner starts empty: `--workspace` is the documented reset. The self-hosted
+      # runner keeps its instrumented build between runs; removing the profiles only keeps the
+      # crate's incremental state (`--workspace` would recompile it from scratch every time).
       - name: Reset coverage profile data
-        run: cargo llvm-cov clean --workspace
+        run: |
+          if [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
+            cargo llvm-cov clean --profraw-only
+          else
+            cargo llvm-cov clean --workspace
+          fi
 
       # (1) Unit tests, whole workspace (member crates carry their own suites).
       # `test_large_index_performance` is a wall-clock assertion that does not
