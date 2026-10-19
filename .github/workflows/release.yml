@@ -1494,8 +1494,23 @@ jobs:
           SUBMISSION_ID=$(echo "$SUBMIT_OUTPUT" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
           if echo "$SUBMIT_OUTPUT" | grep -qE "status: Accepted"; then
             echo "✅ Notarization accepted!"
-            xcrun stapler staple "$DMG_PATH"
-            xcrun stapler validate "$DMG_PATH"
+            # Stapling fetches the ticket from Apple's CloudKit. That fetch can
+            # drop (NSURLErrorDomain -1005, "Error 68") AFTER an accepted
+            # notarization — measured on run 39244961960. The ticket exists,
+            # so retrying is safe; a real failure still fails after 5 tries.
+            for cmd in staple validate; do
+              for attempt in 1 2 3 4 5; do
+                if xcrun stapler "$cmd" "$DMG_PATH"; then
+                  break
+                fi
+                if [ "$attempt" = 5 ]; then
+                  echo "::error::xcrun stapler $cmd failed 5 times"
+                  exit 1
+                fi
+                echo "::warning::xcrun stapler $cmd failed (attempt $attempt/5), retrying in $((attempt * 15))s"
+                sleep $((attempt * 15))
+              done
+            done
             spctl --assess --type open --context context:primary-signature -v "$DMG_PATH"
           else
             if [ -n "$SUBMISSION_ID" ]; then
