@@ -7555,7 +7555,7 @@ impl From<anyhow::Error> for AppError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // ── delegate_task: the spawn envelope (decision A17) ───────────────────
@@ -11235,7 +11235,7 @@ mod tests {
         mock_server_state_from(crate::test_helpers::mock_app_state()).await
     }
 
-    async fn mock_server_state_from(state: crate::AppState) -> OrchestratorState {
+    pub(crate) async fn mock_server_state_from(state: crate::AppState) -> OrchestratorState {
         let event_bus = Arc::new(crate::events::HybridEmitter::new(Arc::new(
             crate::events::EventBus::default(),
         )));
