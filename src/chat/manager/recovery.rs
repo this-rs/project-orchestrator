@@ -1,10 +1,10 @@
 //! Agent turns cut by a restart of the server.
 //!
-//! A session of the agent engine lives in the memory of the server: its provider process, its
-//! stream, its turn. A restart ends all of it, and nothing used to notice: the session stayed
-//! "streaming" in the interface until the user typed again. The events of a session are
-//! persisted, so a cut turn is READ from them: the last meaningful event is neither a `result`
-//! nor an `error` (nor a deliberate `session_closed`).
+//! A session lives in the memory of the server: its provider process (or its Claude Code CLI),
+//! its stream, its turn. A restart ends all of it, and nothing used to notice: the session
+//! stayed "streaming" in the interface until the user typed again. The events of a session
+//! are persisted, so a cut turn is READ from them: the last meaningful event is neither a
+//! `result` nor an `error` (nor a deliberate `session_closed`).
 //!
 //! What it does, in two steps:
 //!
@@ -12,10 +12,11 @@
 //!    its tail ([`judge`]). A turn that cannot be continued by itself (it was waiting for an
 //!    unanswered question or approval) is CLOSED with an `error` event, so the interface shows
 //!    it and the next boot does not look at it again. So is every cut turn recovery does not
-//!    resume: Claude Code CLI sessions, orchestrator children (the plan runner, pipeline,
-//!    gate-retry and delegation relaunch the TASK in a new session), turns cut more than
-//!    [`RECOVERY_WINDOW`] ago. A turn that can be continued is queued, with a context
-//!    reconstructed from the stored events so the model knows what it was doing.
+//!    resume: orchestrator children (the plan runner, pipeline, gate-retry and delegation
+//!    relaunch the TASK in a new session), read-only mirrors, the Claude Code sessions that
+//!    cannot be resumed safely (below), turns cut more than [`RECOVERY_WINDOW`] ago. A turn
+//!    that can be continued is queued, with a context reconstructed from the stored events so
+//!    the model knows what it was doing.
 //! 2. [`ChatManager::drive_recovery`] (in the background): reopens each queued session and tells
 //!    the model what happened. A session whose provider reads its key from the vault
 //!    (`vault:<name>`) waits while the vault is locked; the others resume at once. Each attempt
@@ -26,13 +27,54 @@
 //! A session cut again and again does not resume for ever: past [`MAX_AUTO_RESUMES`] it is
 //! closed with an `error` event.
 //!
+//! Messages a person queued for after the cut turn (`PendingQueue`) lived in memory only: they
+//! are lost with the restart, and the resume message says so instead of pretending otherwise.
+//!
+//! # Claude Code sessions (P20-suite-2)
+//!
+//! A Claude Code session, of either engine, is resumed like the others — same resume lock,
+//! window, cap and vault wait — through the CLI's own `--resume` of the conversation the
+//! session stored (the agent engine's `resume_token`, the historical engine's
+//! `cli_session_id`), with two limits:
+//!
+//! - Only when its CLI ASKS before it runs a tool (`default`, `plan`; the server's mode when
+//!   the session names none). In `acceptEdits` or `bypassPermissions` the CLI runs tools with
+//!   nobody there: the turn is closed (`CLOSED_CLAUDE_CODE`), the rule of the review of #726
+//!   (point 3), which still holds — a resumed turn that only asks waits for a person, one that
+//!   does not ask would act alone.
+//! - Only when the CLI named its conversation: without a stored id there is nothing for
+//!   `--resume`, and a fresh CLI would continue blind; the turn is closed. A `--resume` the CLI
+//!   refuses (expired conversation) or a CLI that is gone ends in the same `error` event: the
+//!   historical engine does NOT fall back to a fresh CLI here (it does for a person, who sees
+//!   the conversation start again).
+//!
+//! "Claude Code" is the built-in instance (`served_by_claude_code`); a REMOTE Claude Code
+//! instance (`claude_code_remote`, its own provider id) is still resumed like any provider of
+//! the agent engine, without the mode condition.
+//!
+//! The historical engine takes no resume lock on a person's resume; the recovery's look under
+//! its own lock (live here, newer events) is what keeps the two apart.
+//!
+//! # Several instances
+//!
+//! The scan sees the sessions live on THIS server only (`is_session_active`). With NATS, a
+//! session whose last events look cut is first asked about on the bus (the snapshot request
+//! every live session of either engine answers, the one a mid-stream join uses): a session
+//! another instance answers for is live there, and is neither closed nor resumed. The look is
+//! asked again under the resume lock before each attempt. What it does not cover: an instance
+//! that restarts at the same time (both see the session dead; the resume lock is per process,
+//! so two instances could both resume it — the event `seq` check of the second one usually sees
+//! the first's resume message, not always), and a bus that does not answer within its timeout
+//! (taken as "not live elsewhere", the single-server behaviour).
+//!
 //! # User identity
 //!
-//! `ChatSessionNode` does not persist the owner's JWT claims (a schema limitation). Recovery
-//! reopens with `user_claims: None`, which is accepted by `authorize_provider_use`. The PO MCP
-//! server then gets no session token: when the server signs its tokens, the resumed session
-//! says it lacks the PO tools (`degraded_features`) instead of losing them silently. Replaying
-//! the owner's identity requires storing it on the session node (a future schema migration).
+//! The owner's identity is replayed (#767): a reopen with no caller claims re-derives them from
+//! `ChatSessionNode.owner` (`resume_identity`), on both engines, so the resumed session gets its
+//! PO session token again and keeps the PO tools. A session with no owner, or whose owner is
+//! gone, stays without one (its tools run unauthorised rather than under a forged identity);
+//! when the server signs its tokens, such a session says it lacks the PO tools
+//! (`degraded_features`) instead of losing them silently.
 
 use super::*;
 
@@ -365,9 +407,14 @@ pub(crate) fn resume_message(dangling_tool: Option<&str>, cut_turn_context: &str
     format!(
         "{RESUME_MARKER} The server restarted while you were working, so your turn was cut.\
          {context}\n\
-         Continue from where you were; do not start over, and do not repeat what is already done.{tool}"
+         Continue from where you were; do not start over, and do not repeat what is already done.{tool}\n\
+         {QUEUED_MESSAGES_LOST}"
     )
 }
+
+/// Part of every resume message: the queue of messages held for after the turn lived in
+/// memory only (`PendingQueue`), so the restart dropped it.
+pub(crate) const QUEUED_MESSAGES_LOST: &str = "Messages the user queued for after this turn, if any, were held in memory and are lost with the restart: they were not delivered, and will come again only if the user sends them again.";
 
 /// A session found cut and queued for resume.
 #[derive(Debug, Clone)]
@@ -390,7 +437,8 @@ pub(crate) const MAX_TRANSIENT_RETRIES: u32 = 3;
 const CLOSED_LEFT_TO_OWNER: &str = "The server restarted while this turn was running. This session is driven by its owner (plan run, pipeline, delegation, or the `Agent` call of a parent session), which relaunches the work itself: it is not resumed here.";
 const CLOSED_MIRROR: &str = "The server restarted while the Claude Code sub-agent this conversation mirrors was running. A mirror is read-only and is never resumed: its parent conversation shows what happened.";
 const CLOSED_LEGACY: &str = "The server restarted while this turn was running, and this session is not resumed automatically: send your message again to continue.";
-const CLOSED_CLAUDE_CODE: &str = "The server restarted while this Claude Code turn was running. It is not resumed without you (it could run tools unattended): send your message again to continue.";
+const CLOSED_CLAUDE_CODE: &str = "The server restarted while this Claude Code turn was running. Its CLI runs tools without asking (acceptEdits or bypassPermissions), so it is not resumed without you: send your message again to continue.";
+const CLOSED_CLAUDE_CODE_NO_CONVERSATION: &str = "The server restarted while this Claude Code turn was running, before its CLI named its conversation: there is nothing to resume it from (--resume). Send your message again to continue.";
 const CLOSED_STALE: &str = "The server restarted while this turn was running, too long ago to resume it automatically: send your message again to continue.";
 const CLOSED_ABANDONED: &str = "The server restarted while this turn was running, and the vault stayed locked, so it could not be resumed: send your message again.";
 const CLOSED_FAILED: &str = "The server restarted while this turn was running, and the session could not be resumed: send your message again.";
@@ -410,9 +458,12 @@ pub(crate) const CLOSE_HORIZON: chrono::Duration = chrono::Duration::days(7);
 pub struct ScanReport {
     pub scanned: usize,
     /// Cut turns closed with an `error` event: waiting for a person, resumed too often, or
-    /// in a session recovery does not resume (Claude Code CLI, orchestrator child, out of
-    /// the window).
+    /// in a session recovery does not resume (a Claude Code CLI that runs tools without
+    /// asking or named no conversation, orchestrator child, out of the window).
     pub closed: usize,
+    /// Sessions that looked cut but another instance answered for (NATS): live there, left
+    /// alone.
+    pub live_elsewhere: usize,
 }
 
 /// How a recovery ended.
@@ -445,10 +496,12 @@ impl ChatManager {
     /// Reads the recent sessions and queues the cut turns that can be resumed (step 1).
     ///
     /// Every cut turn recovery does not resume is CLOSED with an `error` event, so it no
-    /// longer shows "streaming": the sessions of the Claude Code CLI (nothing reopens them
-    /// at boot), the children of an orchestrator (it relaunches the TASK, in a new session),
-    /// and turns cut longer than [`RECOVERY_WINDOW`] ago. A session opened after the scan
-    /// began, or live on this server (a run relaunched meanwhile), is not looked at.
+    /// longer shows "streaming": a Claude Code session whose CLI runs tools without asking
+    /// or never named its conversation (module doc), the children of an orchestrator (it
+    /// relaunches the TASK, in a new session), and turns cut longer than [`RECOVERY_WINDOW`]
+    /// ago. A session opened after the scan began, or live on this server (a run relaunched
+    /// meanwhile), is not looked at; one that looks cut but is live on another instance
+    /// (it answers on NATS) is left alone.
     pub(crate) async fn scan_interrupted_turns(&self) -> Result<(Vec<PendingResume>, ScanReport)> {
         let (sessions, _) = self
             .graph
@@ -468,27 +521,27 @@ impl ChatManager {
             if node.updated_at < started - CLOSE_HORIZON {
                 continue;
             }
-            // Not resumed here, closed when cut: a session of the historical engine (the
-            // Claude Code CLI); a Claude Code session of the agent engine, unless this server
-            // was told otherwise (M2: unattended, its CLI could run tools in `acceptEdits` or
-            // `bypassPermissions` with nobody there; kept closed until decided explicitly);
-            // an owner-managed one (runner, pipeline, gate-retry, delegation, or a sub-agent
-            // of an `Agent` call) is relaunched by its owner. A `chat(send_message)`
-            // sub-session and a trigger-spawned session have no owner: resumed.
+            // Not resumed here, closed when cut: an owner-managed session (runner, pipeline,
+            // gate-retry, delegation, or a sub-agent of an `Agent` call) is relaunched by its
+            // owner; a Claude Code session whose CLI would run tools with nobody there, or
+            // that has no conversation for `--resume` ([`Self::claude_code_left_alone`]); a
+            // session of the historical engine served by another provider (it cannot resume
+            // there). A `chat(send_message)` sub-session and a trigger-spawned session have
+            // no owner: resumed.
             let left_alone = if node.mirror_of.is_some() {
                 // A read-only mirror of a Claude Code sub-agent (P18c) has no process: never
                 // resumed, only closed when cut.
                 Some(CLOSED_MIRROR)
-            } else if !node.opened_on_agent() {
-                Some(CLOSED_LEGACY)
-            } else if node.served_by_claude_code() && !self.recovery_resumes_claude_code {
-                Some(CLOSED_CLAUDE_CODE)
             } else if node
                 .spawned_by
                 .as_deref()
                 .is_some_and(is_orchestrator_child)
             {
                 Some(CLOSED_LEFT_TO_OWNER)
+            } else if node.served_by_claude_code() {
+                self.claude_code_left_alone(&node).await
+            } else if !node.opened_on_agent() {
+                Some(CLOSED_LEGACY)
             } else {
                 None
             };
@@ -520,7 +573,15 @@ impl ChatManager {
             if last_event_at < started - CLOSE_HORIZON {
                 continue;
             }
-            match judge(&tail) {
+            let verdict = judge(&tail);
+            // A tail that looks cut may belong to a turn running on another instance: asked
+            // only then (one bus request per such session, not per session read).
+            if verdict != Verdict::Settled && self.live_on_another_instance(&sid).await {
+                info!("recovery: session {sid} is live on another instance, left alone");
+                report.live_elsewhere += 1;
+                continue;
+            }
+            match verdict {
                 Verdict::Settled => {}
                 Verdict::Close(reason) => {
                     self.close_cut_session(&node, reason).await;
@@ -545,6 +606,45 @@ impl ChatManager {
             }
         }
         Ok((pending, report))
+    }
+
+    /// Why a cut turn of a Claude Code session (either engine) is closed rather than resumed
+    /// through its CLI's `--resume`, or `None` when it is resumed (module doc).
+    ///
+    /// The review of #726 (point 3) kept these turns closed because the CLI could run tools
+    /// with nobody there. That still holds in `acceptEdits` and `bypassPermissions` (and in
+    /// any mode the server maps to them): closed. In `default` or `plan` the resumed CLI asks
+    /// before each tool, and the request waits for a person like any other: resumed.
+    async fn claude_code_left_alone(&self, node: &ChatSessionNode) -> Option<&'static str> {
+        // The recovery tests whose fake provider (agent engine) answers as `claude-code` but
+        // is no CLI.
+        if self.recovery_resumes_claude_code && node.opened_on_agent() {
+            return None;
+        }
+        let mode = match node.permission_mode.as_deref().filter(|m| !m.is_empty()) {
+            Some(mode) => mode.to_string(),
+            None => self.default_permission_mode().await,
+        };
+        if !cli_asks_before_tools(&mode) {
+            return Some(CLOSED_CLAUDE_CODE);
+        }
+        let conversation = if node.opened_on_agent() {
+            node.resume_token.as_deref()
+        } else {
+            node.cli_session_id.as_deref()
+        };
+        conversation
+            .is_none_or(str::is_empty)
+            .then_some(CLOSED_CLAUDE_CODE_NO_CONVERSATION)
+    }
+
+    /// Whether another instance answers for this session on NATS: it is live there. No bus,
+    /// or no answer within the request's timeout: not live elsewhere.
+    async fn live_on_another_instance(&self, session_id: &str) -> bool {
+        match &self.nats {
+            Some(nats) => nats.request_streaming_snapshot(session_id).await.is_some(),
+            None => false,
+        }
     }
 
     /// [`Self::close_cut_turn`] for the session `node`. A sub-agent of an `Agent` call first
@@ -617,9 +717,8 @@ impl ChatManager {
     /// transient provider error is tried again, [`MAX_TRANSIENT_RETRIES`] times. What still
     /// waits at the deadline is closed with an `error` event.
     ///
-    /// Note: the session is reopened with `user_claims: None` because the session owner's
-    /// identity is not persisted (see module doc); the session says it lacks the PO tools
-    /// when the server signs its tokens.
+    /// The session is reopened with no caller claims: the reopen re-derives the owner's
+    /// identity from `ChatSessionNode.owner` (#767, module doc).
     pub(crate) async fn drive_recovery(
         &self,
         mut pending: Vec<PendingResume>,
@@ -687,8 +786,17 @@ impl ChatManager {
         }
         // The checks of a person's resume (engine still switched on, project slug).
         let mut node = item.node.clone();
+        // No caller claims: both reopens re-derive the owner's identity (#767). A session of
+        // the historical engine (only Claude Code runs there) resumes its CLI conversation
+        // with no fallback to a fresh CLI: a refused `--resume` closes the turn.
         let result = match self.ready_for_resume(&mut node).await {
-            Ok(()) => self.reopen_agent_session(&node, &item.message, None).await,
+            Ok(()) if node.opened_on_agent() => {
+                self.reopen_agent_session(&node, &item.message, None).await
+            }
+            Ok(()) => {
+                self.reopen_legacy_session_with(&node, &item.message, None, None, false)
+                    .await
+            }
             Err(e) => Err(e),
         };
         let Err(error) = result else {
@@ -697,7 +805,7 @@ impl ChatManager {
         // An attempt that got as far as adopting the session (its first message refused)
         // ends it: a live session is never written into from here, and what this recovery
         // writes next goes after the events the attempt stored (review of #697, finding 9).
-        if self.agent_runtime.owns(&sid).await {
+        if self.is_session_active(&sid).await {
             let _ = self.close_session(&sid).await;
         }
         // `credentials_locked` waits only while the vault IS locked. With the vault open it
@@ -740,16 +848,18 @@ impl ChatManager {
         true
     }
 
-    /// Whether somebody acted on the session since it was queued: it is live here, or it
-    /// has newer events.
+    /// Whether somebody acted on the session since it was queued: it is live here, it has
+    /// newer events, or another instance answers for it (a person resumed it there).
     async fn moved_on(&self, item: &PendingResume) -> bool {
-        self.is_session_active(&item.node.id.to_string()).await
+        let sid = item.node.id.to_string();
+        self.is_session_active(&sid).await
             || self
                 .graph
                 .get_latest_chat_event_seq(item.node.id)
                 .await
                 .map(|seq| seq != item.seen_seq)
                 .unwrap_or(false)
+            || self.live_on_another_instance(&sid).await
     }
 
     /// Whether the session's provider reads its key from the vault: a registered instance
@@ -769,6 +879,20 @@ impl ChatManager {
             Err(_) => true,
         }
     }
+}
+
+/// Whether a Claude Code CLI in `mode` asks before it runs a tool (`default`, `plan`, and
+/// their neutral names), read as the CLI is given it (`PermissionConfig::to_nexus_mode`).
+fn cli_asks_before_tools(mode: &str) -> bool {
+    let config = crate::chat::config::PermissionConfig {
+        mode: mode.to_string(),
+        allowed_tools: Vec::new(),
+        disallowed_tools: Vec::new(),
+    };
+    matches!(
+        config.to_nexus_mode(),
+        nexus_claude::PermissionMode::Default | nexus_claude::PermissionMode::Plan
+    )
 }
 
 /// A provider error worth trying again (`ProviderError::retryable`).

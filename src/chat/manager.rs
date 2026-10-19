@@ -972,10 +972,11 @@ pub struct ChatManager {
     /// The CLI path the built-in Claude Code of the agent engine opens with: the one
     /// `update_claude_cli_path` sets, as the historical engine reads it (M2).
     builtin_cli_path: super::agent_runtime::ClaudeCliPath,
-    /// Whether the restart recovery resumes a cut Claude Code turn of the agent engine.
-    /// `false` on every server (M2, review of #726): unattended, the CLI could run tools
-    /// in `acceptEdits` or `bypassPermissions`, so the turn is closed, as the historical
-    /// engine's always were. Only the recovery tests set it, their fake being `claude-code`.
+    /// Whether the restart recovery resumes a cut Claude Code turn of the agent engine
+    /// whatever its permission mode and stored conversation. `false` on every server: there a turn is resumed
+    /// through `--resume` only when its CLI asks before each tool and named its
+    /// conversation (`recovery::claude_code_left_alone`; review of #726, point 3). Only the
+    /// recovery tests set it, their fake being `claude-code` but no CLI.
     recovery_resumes_claude_code: bool,
     /// The cognitive router (R2), when wired. `None` keeps the declarative
     /// resolution exactly as it was.
@@ -4615,8 +4616,9 @@ impl ChatManager {
         self
     }
 
-    /// The recovery resumes cut Claude Code turns too: for the recovery tests, whose fake
-    /// provider answers as `claude-code` (the field `recovery_resumes_claude_code`).
+    /// The recovery resumes cut Claude Code turns of the agent engine like any other,
+    /// whatever their permission mode and stored conversation: for the recovery tests, whose fake provider answers as
+    /// `claude-code` but is no CLI (the field `recovery_resumes_claude_code`).
     #[cfg(test)]
     pub(crate) fn resuming_claude_code_at_boot(mut self) -> Self {
         self.recovery_resumes_claude_code = true;
@@ -12630,6 +12632,21 @@ impl ChatManager {
         user_claims: Option<&crate::auth::jwt::Claims>,
         relay: Option<&super::relay::RelayedFrom>,
     ) -> Result<()> {
+        self.reopen_legacy_session_with(node, message, user_claims, relay, true)
+            .await
+    }
+
+    /// [`Self::reopen_legacy_session`]; `fresh_if_refused == false` (the restart recovery)
+    /// refuses to fall back to a fresh CLI when `--resume` is refused: a cut turn handed to
+    /// a CLI that lost the conversation would continue blind, so the caller closes it.
+    pub(super) async fn reopen_legacy_session_with(
+        &self,
+        node: &ChatSessionNode,
+        message: &str,
+        user_claims: Option<&crate::auth::jwt::Claims>,
+        relay: Option<&super::relay::RelayedFrom>,
+        fresh_if_refused: bool,
+    ) -> Result<()> {
         let sid = node.id.to_string();
         let session_id: &str = sid.as_str();
         let uuid = node.id;
@@ -12779,7 +12796,7 @@ impl ChatManager {
 
             let connected = candidate.connect().await;
             if let Err(e) = connected {
-                if resume_with.is_some() {
+                if resume_with.is_some() && fresh_if_refused {
                     warn!(
                         session_id = %session_id,
                         error = %e,
@@ -12806,6 +12823,12 @@ impl ChatManager {
             }
 
             if resume_with.is_some() && !Self::stays_alive(&candidate, RESUME_GRACE).await {
+                if !fresh_if_refused {
+                    let _ = candidate.disconnect().await;
+                    return Err(anyhow!(
+                        "the Claude CLI refused to resume its conversation (--resume)"
+                    ));
+                }
                 warn!(
                     session_id = %session_id,
                     "Resumed CLI exited right after its handshake, falling back to a fresh CLI \
@@ -24453,9 +24476,10 @@ mod tests {
         assert!(fake.state.turns_started.lock().unwrap().is_empty());
     }
 
-    /// Review of #726, point 3: a cut turn of a Claude Code session of the agent engine is
-    /// CLOSED at boot, as the historical engine's always were — not resumed with nobody
-    /// there (its CLI could run tools in `acceptEdits` or `bypassPermissions`).
+    /// Review of #726, point 3 (still the rule since P20-suite-2): a cut turn of a Claude
+    /// Code session whose CLI runs tools without asking (here `acceptEdits`) is CLOSED at
+    /// boot — not resumed with nobody there. In `default` it is resumed through `--resume`
+    /// (`claude_code_recovery_at_boot` in `agent_e2e_tests`).
     #[tokio::test]
     async fn a_cut_claude_code_turn_of_the_agent_engine_is_closed_at_boot_not_resumed() {
         let (resuming, graph, _fake, sid) =
