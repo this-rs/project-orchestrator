@@ -5442,6 +5442,7 @@ impl ChatManager {
     ///
     /// `project_slug` is the project already decided by the caller.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) async fn build_system_prompt_anchored(
         &self,
         place: super::neutral_place::ExecutionPlace,
@@ -5453,9 +5454,42 @@ impl ChatManager {
         session_id: &str,
         scaffolding_override: Option<u8>,
     ) -> (String, std::collections::HashSet<String>) {
+        self.build_system_prompt_anchored_for(
+            &super::composer::PromptAudience::default(),
+            place,
+            cwd,
+            project_slug,
+            user_message,
+            model,
+            context_window,
+            session_id,
+            scaffolding_override,
+        )
+        .await
+    }
+
+    /// Build the anchored system prompt for a given audience
+    /// (`PromptAudience::of` the session's `spawned_by` and provider): the child of a
+    /// conversation gets its frame, an engine other than Claude Code its own sub-agent
+    /// words. The production openings (open, resume, reopen) pass it; the default is
+    /// a root session on Claude Code.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn build_system_prompt_anchored_for(
+        &self,
+        audience: &super::composer::PromptAudience,
+        place: super::neutral_place::ExecutionPlace,
+        cwd: &str,
+        project_slug: Option<&str>,
+        user_message: &str,
+        model: Option<&str>,
+        context_window: Option<u64>,
+        session_id: &str,
+        scaffolding_override: Option<u8>,
+    ) -> (String, std::collections::HashSet<String>) {
         use super::anchor_resolver::AnchorContextMode;
         let (prompt, ids) = self
-            .build_system_prompt(
+            .build_system_prompt_for(
+                audience,
                 project_slug,
                 user_message,
                 model,
@@ -5530,6 +5564,32 @@ impl ChatManager {
         session_id: Option<&str>,
         scaffolding_override: Option<u8>,
     ) -> (String, std::collections::HashSet<String>) {
+        self.build_system_prompt_for(
+            &super::composer::PromptAudience::default(),
+            project_slug,
+            user_message,
+            model,
+            context_window,
+            session_id,
+            scaffolding_override,
+        )
+        .await
+    }
+
+    /// [`Self::build_system_prompt`] for a given audience (a child of a conversation,
+    /// an engine with its own sub-agent words); the default audience is a root session
+    /// on Claude Code and leaves the prompt as it always was.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn build_system_prompt_for(
+        &self,
+        audience: &super::composer::PromptAudience,
+        project_slug: Option<&str>,
+        user_message: &str,
+        model: Option<&str>,
+        context_window: Option<u64>,
+        session_id: Option<&str>,
+        scaffolding_override: Option<u8>,
+    ) -> (String, std::collections::HashSet<String>) {
         use super::composer::{ComposerInput, FsmPromptComposer};
         use super::prompt::{context_to_markdown, fetch_project_context};
         use super::routing::HeuristicRouter;
@@ -5543,6 +5603,7 @@ impl ChatManager {
             let input = ComposerInput {
                 cite_refs: self.refs_v1,
                 context_window,
+                audience: audience.clone(),
                 ..Default::default()
             };
             return (FsmPromptComposer::compose(&input), empty_ids);
@@ -5559,6 +5620,7 @@ impl ChatManager {
                 let input = ComposerInput {
                     cite_refs: self.refs_v1,
                     context_window,
+                    audience: audience.clone(),
                     ..Default::default()
                 };
                 return (FsmPromptComposer::compose(&input), empty_ids);
@@ -5739,6 +5801,7 @@ impl ChatManager {
             message_embedding: message_embedding.as_ref(),
             external_tools_available,
             cite_refs: self.refs_v1,
+            audience: audience.clone(),
         };
 
         // Use compose_with_record to get the routing decision for trajectory tracking.
@@ -7309,7 +7372,14 @@ impl ChatManager {
                 } else {
                     &typed_message
                 };
-                self.build_system_prompt_anchored(
+                // A child of a conversation is told so, and an engine other than Claude
+                // Code gets its own sub-agent words (P18-suite, point 7).
+                let audience = super::composer::PromptAudience::of(
+                    request.spawned_by.as_deref(),
+                    &provider_choice.provider_id,
+                );
+                self.build_system_prompt_anchored_for(
+                    &audience,
                     if super::neutral_place::is_neutral_path(&request.cwd) {
                         super::neutral_place::ExecutionPlace::Neutral
                     } else {
@@ -12554,7 +12624,11 @@ impl ChatManager {
             .await;
         // Build options - with resume flag only if we have a cli_session_id
         let (system_prompt, _included_note_ids) = self
-            .build_system_prompt_anchored(
+            .build_system_prompt_anchored_for(
+                &super::composer::PromptAudience::of(
+                    session_node.spawned_by.as_deref(),
+                    session_node.provider_id.as_deref().unwrap_or(""),
+                ),
                 session_node.execution_place,
                 &session_node.cwd,
                 session_node.project_slug.as_deref(),
@@ -17715,7 +17789,8 @@ impl ChatManager {
             node.capabilities.as_deref(),
         );
         let (system_prompt, _) = self
-            .build_system_prompt_anchored(
+            .build_system_prompt_anchored_for(
+                &super::composer::PromptAudience::of(node.spawned_by.as_deref(), &provider_id),
                 node.execution_place,
                 &node.cwd,
                 node.project_slug.as_deref(),
