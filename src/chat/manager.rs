@@ -13640,6 +13640,33 @@ impl ChatManager {
     }
 
     /// Check if a session is currently streaming
+    /// Whether the session is working: a turn running (or a mirrored turn) or a background
+    /// task its provider still reports. An active session that does neither has answered
+    /// and only waits for its next message or for the idle cleanup.
+    pub async fn is_session_working(&self, session_id: &str) -> bool {
+        if self.is_session_streaming(session_id).await {
+            return true;
+        }
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return !handle.active_background_tasks().await.is_empty();
+        }
+        let tasks = {
+            let sessions = self.active_sessions.read().await;
+            sessions.get(session_id).map(|s| {
+                (
+                    s.active_background_tasks.clone(),
+                    s.cli_background_tasks.clone(),
+                )
+            })
+        };
+        match tasks {
+            Some((background, cli_background)) => {
+                background.lock().await.len() > 0 || cli_background.load(Ordering::Relaxed) > 0
+            }
+            None => false,
+        }
+    }
+
     pub async fn is_session_streaming(&self, session_id: &str) -> bool {
         if self.mirrors.is_open(session_id) {
             return true;

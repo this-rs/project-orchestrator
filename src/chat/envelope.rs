@@ -34,6 +34,10 @@ pub const MAX_DELEGATION_DEPTH: u32 = 1;
 /// How many children of one parent may be alive at once.
 pub const MAX_LIVE_CHILDREN: usize = 4;
 
+/// How long a freshly opened child counts toward its parent's fan-out even before its first
+/// turn is seen running.
+const CHILD_STARTUP_GRACE: chrono::Duration = chrono::Duration::seconds(120);
+
 /// Header the MCP client sets from `PO_SESSION_ID`. Only read when the server
 /// runs WITHOUT authentication (no signing key, hence no signed token): in that
 /// mode nothing is a boundary and the header is the best available hint.
@@ -431,6 +435,13 @@ pub fn identify_caller(
 pub trait LiveSessions: Send + Sync {
     /// Whether the session currently has a running agent.
     async fn is_active(&self, session_id: &str) -> bool;
+    /// Whether the session is DOING something: a turn running or a background task. A
+    /// delegated child that answered stays active (in the live table) until the idle
+    /// cleanup closes it, half an hour later, but it is no longer working: it must not
+    /// hold one of its parent's slots (issue #876). Defaults to [`Self::is_active`].
+    async fn is_working(&self, session_id: &str) -> bool {
+        self.is_active(session_id).await
+    }
     /// The session's current permission mode if it is live and has one.
     async fn live_permission_mode(&self, session_id: &str) -> Option<String>;
     /// The mode a session gets when none is specified (global config).
@@ -441,6 +452,9 @@ pub trait LiveSessions: Send + Sync {
 impl LiveSessions for ChatManager {
     async fn is_active(&self, session_id: &str) -> bool {
         self.is_session_active(session_id).await
+    }
+    async fn is_working(&self, session_id: &str) -> bool {
+        self.is_session_working(session_id).await
     }
     async fn live_permission_mode(&self, session_id: &str) -> Option<String> {
         self.live_session_permission_mode(session_id).await
@@ -482,13 +496,21 @@ pub async fn resolve_envelope(
         });
     }
 
-    // Fan-out: count the children that still have a running agent. A store
-    // error counts as "full": refusing a spawn is recoverable, a runaway is not.
+    // Fan-out: count the children that are still working (a turn running, a background
+    // task). A child that has answered and sits idle until the cleanup closes it does not
+    // count. A store error counts as "full": refusing a spawn is recoverable, a runaway
+    // is not.
     let live_children = match graph.get_session_children(parent_uuid).await {
         Ok(children) => {
             let mut n = 0;
+            let now = chrono::Utc::now();
             for child in &children {
-                if live.is_active(&child.id.to_string()).await {
+                let id = child.id.to_string();
+                // Just opened: its first turn may not have started yet (the flag is set by
+                // the stream task), so it counts while it is young, or two delegations in a
+                // row would both see room.
+                let young = now.signed_duration_since(child.created_at) < CHILD_STARTUP_GRACE;
+                if live.is_working(&id).await || (young && live.is_active(&id).await) {
                     n += 1;
                 }
             }
@@ -625,6 +647,8 @@ mod tests {
 
     struct FakeLive {
         active: Vec<String>,
+        /// Active sessions that are idle (answered, nothing running).
+        idle: Vec<String>,
         live_mode: Option<String>,
         default_mode: String,
     }
@@ -633,6 +657,9 @@ mod tests {
     impl LiveSessions for FakeLive {
         async fn is_active(&self, session_id: &str) -> bool {
             self.active.iter().any(|s| s == session_id)
+        }
+        async fn is_working(&self, session_id: &str) -> bool {
+            self.is_active(session_id).await && !self.idle.iter().any(|s| s == session_id)
         }
         async fn live_permission_mode(&self, _session_id: &str) -> Option<String> {
             self.live_mode.clone()
@@ -645,6 +672,7 @@ mod tests {
     fn live(default_mode: &str) -> FakeLive {
         FakeLive {
             active: vec![],
+            idle: vec![],
             live_mode: None,
             default_mode: default_mode.to_string(),
         }
@@ -1230,6 +1258,65 @@ mod tests {
         resolve_envelope(&graph, &l, &parent.to_string(), None, MAX_LIVE_CHILDREN)
             .await
             .unwrap();
+    }
+
+    /// A child opened `age_secs` ago.
+    async fn add_aged_child(graph: &MockGraphStore, parent: Uuid, age_secs: i64) -> Uuid {
+        let mut child = test_chat_session(Some("demo"));
+        child.spawned_by = Some(conversation_spawned_by(parent));
+        child.created_at = chrono::Utc::now() - chrono::Duration::seconds(age_secs);
+        let id = child.id;
+        graph.create_chat_session(&child).await.unwrap();
+        graph
+            .create_spawned_by_relation(
+                &id.to_string(),
+                &parent.to_string(),
+                "conversation",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn a_child_just_opened_counts_before_its_first_turn_is_seen() {
+        let (graph, parent) = store_with_parent(Some("default")).await;
+        let mut children = Vec::new();
+        for _ in 0..MAX_LIVE_CHILDREN {
+            children.push(add_child(&graph, parent).await.to_string());
+        }
+        // Not streaming yet (idle), but opened seconds ago: they all count.
+        let mut l = live("default");
+        l.active = children.clone();
+        l.idle = children.clone();
+        assert!(matches!(
+            resolve_envelope(&graph, &l, &parent.to_string(), None, MAX_LIVE_CHILDREN).await,
+            Err(EnvelopeError::TooManyChildren { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_child_that_answered_and_sits_idle_does_not_hold_a_slot() {
+        let (graph, parent) = store_with_parent(Some("default")).await;
+        let mut children = Vec::new();
+        for _ in 0..MAX_LIVE_CHILDREN {
+            children.push(add_aged_child(&graph, parent, 600).await.to_string());
+        }
+        // All four still in the live table, but three of them have answered: idle.
+        let mut l = live("default");
+        l.active = children.clone();
+        l.idle = children[..3].to_vec();
+        resolve_envelope(&graph, &l, &parent.to_string(), None, MAX_LIVE_CHILDREN)
+            .await
+            .expect("only one child is working: three slots are free");
+        // All four working again: refused.
+        l.idle.clear();
+        assert!(matches!(
+            resolve_envelope(&graph, &l, &parent.to_string(), None, MAX_LIVE_CHILDREN).await,
+            Err(EnvelopeError::TooManyChildren { .. })
+        ));
     }
 
     // ── ENV-WS: a project deduced in a workspace is context, not a boundary ────
