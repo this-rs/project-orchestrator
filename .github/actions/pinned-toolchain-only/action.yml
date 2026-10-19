@@ -1,0 +1,28 @@
+name: Keep only the pinned Rust toolchain
+description: >
+  Uninstalls every Rust toolchain other than the one rust-toolchain.toml pins, on a hosted
+  runner, BEFORE Swatinem/rust-cache computes its key. rust-cache hashes the version of EVERY
+  installed toolchain into the key, and the hosted image preinstalls a `stable` this
+  repository never uses. During an image rollout two images coexist (measured 19/10/2026:
+  image 20261012 with stable 1.99.0, image 20261015 with 1.99.1): a job on the other image
+  computed another key, found no cache, and recompiled for 13-15 min (Integration Tests,
+  API Tests), and the cache-prune job then deleted the other image's entry. With only the
+  pinned toolchain left, the key no longer depends on the image. A self-hosted runner has
+  only the pinned toolchain already: nothing to do there.
+runs:
+  using: composite
+  steps:
+    - name: Uninstall the toolchains rust-toolchain.toml does not pin
+      shell: bash
+      run: |
+        [ "$RUNNER_ENVIRONMENT" = github-hosted ] || exit 0
+        pin=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n1)
+        test -n "$pin"
+        rustup toolchain list | awk '{print $1}' | while read -r t; do
+          case "$t" in
+            "$pin"|"$pin"-*) ;;
+            *) echo "uninstalling $t (not the pinned $pin)"; rustup toolchain uninstall "$t" ;;
+          esac
+        done
+        rustup default "$pin" >/dev/null
+        rustup toolchain list
