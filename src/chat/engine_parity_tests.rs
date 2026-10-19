@@ -1285,12 +1285,15 @@ impl FakeClaude {
         std::fs::write(self.dir.path().join(format!("transcript.{n}.jsonl")), body).unwrap();
     }
 
+    /// The lines the fake has read on its stdin so far: only the ones whose `\n` has
+    /// landed. The fake appends while the test polls every 50 ms, and a read in the
+    /// middle of a write returned a truncated `control_response` (CI, 19/10/2026:
+    /// `permissions.once` measured as a gap on a line cut after 52 characters).
     fn stdin_lines(&self, n: usize) -> Vec<String> {
-        std::fs::read_to_string(self.dir.path().join(format!("stdin.{n}.jsonl")))
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect()
+        let text = std::fs::read_to_string(self.dir.path().join(format!("stdin.{n}.jsonl")))
+            .unwrap_or_default();
+        let complete = text.rfind('\n').map_or("", |i| &text[..i]);
+        complete.lines().map(str::to_string).collect()
     }
 
     fn line(&self, n: usize, needle: &str) -> Option<String> {
