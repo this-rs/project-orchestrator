@@ -13639,6 +13639,33 @@ impl ChatManager {
             .await
     }
 
+    /// Whether the session is working: a turn running (or a mirrored turn) or a background
+    /// task its provider still reports. An active session that does neither has answered
+    /// and only waits for its next message or for the idle cleanup.
+    pub async fn is_session_working(&self, session_id: &str) -> bool {
+        if self.is_session_streaming(session_id).await {
+            return true;
+        }
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return !handle.active_background_tasks().await.is_empty();
+        }
+        let tasks = {
+            let sessions = self.active_sessions.read().await;
+            sessions.get(session_id).map(|s| {
+                (
+                    s.active_background_tasks.clone(),
+                    s.cli_background_tasks.clone(),
+                )
+            })
+        };
+        match tasks {
+            Some((background, cli_background)) => {
+                !background.lock().await.is_empty() || cli_background.load(Ordering::Relaxed) > 0
+            }
+            None => false,
+        }
+    }
+
     /// Check if a session is currently streaming
     pub async fn is_session_streaming(&self, session_id: &str) -> bool {
         if self.mirrors.is_open(session_id) {
@@ -34515,6 +34542,131 @@ mod tests {
         )
         .await;
         assert!(!inserted);
+    }
+
+    // ── is_session_working: who still holds a delegation slot (issue #876) ─────
+
+    /// A Claude Code session entry's own background task, as the OOB listener tracks it.
+    fn a_cli_background_task() -> crate::chat::types::BackgroundTaskInfo {
+        use crate::chat::types::BackgroundTaskKind;
+        let now = chrono::Utc::now();
+        crate::chat::types::BackgroundTaskInfo {
+            id: "tool_W1".to_string(),
+            kind: BackgroundTaskKind::BashBackground,
+            description: "cargo test".to_string(),
+            started_at: now,
+            last_seen_at: now,
+            pid: Some(4242),
+            parent_tool_use_id: None,
+            pending_removal_at: None,
+            signalled: false,
+        }
+    }
+
+    /// A turn running is work: the session must not give up its slot.
+    #[tokio::test]
+    async fn a_streaming_session_is_working() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let (session, _) = create_dummy_session(true, "half an answer", vec![]);
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-streaming".into(), session);
+
+        assert!(manager.is_session_working("s-streaming").await);
+    }
+
+    /// An agent session is working while its provider reports a background task, and
+    /// not once it has answered (`is_session_active` still says it is live).
+    #[tokio::test]
+    async fn an_agent_session_is_working_while_its_provider_reports_a_task() {
+        use nexus_claude::agent::{BackgroundTaskKind as Kind, BackgroundTaskStatus as Status};
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let busy = idle_agent_session(&manager, Duration::ZERO).await;
+        busy.set_background_tasks(vec![native_bg_task("nt-1", Kind::Shell, Status::Running)])
+            .await;
+        assert!(
+            manager.is_session_working(&busy.session_id).await,
+            "a background task its provider reports is work"
+        );
+
+        let answered = idle_agent_session(&manager, Duration::ZERO).await;
+        assert!(
+            manager.is_session_active(&answered.session_id).await,
+            "answered but still live"
+        );
+        assert!(
+            !manager.is_session_working(&answered.session_id).await,
+            "answered and nothing running: not working"
+        );
+    }
+
+    /// A Claude Code session entry is working while one of its background tasks is
+    /// tracked, or while the CLI itself reports one — and not otherwise.
+    #[tokio::test]
+    async fn a_cli_session_is_working_while_a_background_task_runs() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let (answered, _) = create_dummy_session(false, "", vec![]);
+        let (tracked, _) = create_dummy_session(false, "", vec![]);
+        tracked
+            .active_background_tasks
+            .lock()
+            .await
+            .insert("tool_W1".into(), a_cli_background_task());
+        let (reported_by_cli, _) = create_dummy_session(false, "", vec![]);
+        reported_by_cli
+            .cli_background_tasks
+            .store(1, Ordering::Relaxed);
+
+        {
+            let mut sessions = manager.active_sessions.write().await;
+            sessions.insert("s-answered".into(), answered);
+            sessions.insert("s-tracked".into(), tracked);
+            sessions.insert("s-cli".into(), reported_by_cli);
+        }
+
+        assert!(
+            !manager.is_session_working("s-answered").await,
+            "answered and nothing running: not working"
+        );
+        assert!(
+            manager.is_session_working("s-tracked").await,
+            "a task this server tracks is work"
+        );
+        assert!(
+            manager.is_session_working("s-cli").await,
+            "a task the CLI reports is work"
+        );
+        // A session nobody knows is not working.
+        assert!(!manager.is_session_working("s-nowhere").await);
+    }
+
+    /// The envelope's `LiveSessions` view is that same verdict: through the trait, a
+    /// session that answered is live but not working (so it frees a child slot).
+    #[tokio::test]
+    async fn the_envelope_asks_the_manager_who_is_working() {
+        use crate::chat::envelope::LiveSessions;
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let (answered, _) = create_dummy_session(false, "", vec![]);
+        let (streaming, _) = create_dummy_session(true, "half an answer", vec![]);
+        {
+            let mut sessions = manager.active_sessions.write().await;
+            sessions.insert("s-answered".into(), answered);
+            sessions.insert("s-streaming".into(), streaming);
+        }
+
+        assert!(LiveSessions::is_active(&manager, "s-answered").await);
+        assert!(!LiveSessions::is_working(&manager, "s-answered").await);
+        assert!(LiveSessions::is_working(&manager, "s-streaming").await);
+        assert!(!LiveSessions::is_working(&manager, "s-nowhere").await);
     }
 }
 
