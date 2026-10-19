@@ -13661,7 +13661,7 @@ impl ChatManager {
         };
         match tasks {
             Some((background, cli_background)) => {
-                background.lock().await.len() > 0 || cli_background.load(Ordering::Relaxed) > 0
+                !background.lock().await.is_empty() || cli_background.load(Ordering::Relaxed) > 0
             }
             None => false,
         }
