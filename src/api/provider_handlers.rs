@@ -192,6 +192,7 @@ pub async fn stored_entries(
                 kind: match i.kind.as_str() {
                     "codex" => "codex",
                     "acp" => "acp",
+                    st::KIND_ANTHROPIC => "anthropic",
                     st::KIND_CLAUDE_CODE_REMOTE => "claude_code_remote",
                     _ => "openai_compatible",
                 },

@@ -1911,6 +1911,76 @@ pub trait GraphStore: Send + Sync {
         prune_threshold: f64,
     ) -> Result<(usize, usize)>;
 
+    // ------------------------------------------------------------------
+    // Synaptic layer in shadow mode (`crate::neurons::synaptic_shadow`).
+    // Only the `shadow_*` properties of EXISTING `SYNAPSE` edges between two
+    // notes of one project: never `weight`, never an edge created or deleted.
+    // ------------------------------------------------------------------
+
+    /// Outgoing `SYNAPSE` edges of `from` towards notes of `project_id` (both
+    /// ends in the project), with `shadow_weight` (the legacy `weight` while the
+    /// edge has none) and the target's metadata.
+    async fn shadow_synapse_edges(
+        &self,
+        project_id: Uuid,
+        from: &[Uuid],
+    ) -> Result<Vec<crate::neurons::synaptic_shadow::ShadowEdgeRow>>;
+
+    /// Add `delta` to the shadow weight of the existing edges (both directions)
+    /// of each unordered pair, both notes in `project_id`, clamped to [0, 1].
+    /// Returns the number of directed edges written.
+    async fn reward_shadow_synapses(
+        &self,
+        project_id: Uuid,
+        pairs: &[(Uuid, Uuid)],
+        delta: f64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize>;
+
+    /// Proportional decay of the shadow weights of the projects in `scope`:
+    /// `w · 2^(−Δt / half_life)` since the edge's last shadow decay (an edge
+    /// seen for the first time starts from its legacy weight, undecayed). A
+    /// dormant project's edges are frozen (their clock advances, their weight
+    /// does not). Returns the number of edges visited.
+    async fn decay_shadow_synapses(
+        &self,
+        scope: &crate::neurons::synaptic_shadow::ShadowDecayScope,
+        half_life_days: f64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize>;
+
+    /// Persist a shadow trace; keeps the latest `keep` traces of its session.
+    async fn record_synapse_shadow_trace(
+        &self,
+        trace: &crate::neurons::synaptic_shadow::SynapseShadowTrace,
+        keep: usize,
+    ) -> Result<()>;
+
+    /// Read shadow traces.
+    async fn list_synapse_shadow_traces(
+        &self,
+        filter: &crate::neurons::synaptic_shadow::ShadowTraceFilter,
+    ) -> Result<Vec<crate::neurons::synaptic_shadow::SynapseShadowTrace>>;
+
+    /// One shadow trace by id.
+    async fn get_synapse_shadow_trace(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<crate::neurons::synaptic_shadow::SynapseShadowTrace>>;
+
+    /// Claim the reward `key` of a trace: `true` the first time only (the lock
+    /// is taken before the check, so two concurrent claims cannot both win).
+    async fn claim_shadow_trace_reward(&self, trace_id: Uuid, key: &str) -> Result<bool>;
+
+    /// Traces not yet judged on their task's closure whose session's attempt
+    /// closed before `cutoff`: `Restarted` when a later attempt of the task
+    /// exists, `Quiet` when the task is completed (others are left for later).
+    async fn shadow_trace_closures(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, crate::neurons::synaptic_shadow::TaskClosure)>>;
+
     /// Apply knowledge scars to notes/decisions after failed reasoning feedback.
     /// Biomimicry: Elun HypersphereIdentity.Scar — penalizes nodes in search scoring.
     /// `increment` is added to existing scar_intensity, capped at 1.0.
@@ -2198,7 +2268,29 @@ pub trait GraphStore: Send + Sync {
         &self,
         session_id: Uuid,
         op: crate::chat::anchor::AnchorOp,
-    ) -> Result<crate::chat::anchor::AnchorChange>;
+    ) -> Result<crate::chat::anchor::AnchorChange> {
+        Ok(self.apply_anchor_op_if(session_id, op, None).await?.change)
+    }
+
+    /// [`Self::apply_anchor_op`] with an optimistic check on the whole anchor
+    /// set: when `if_match` is `Some(v)` and the set of the session is no longer
+    /// at version `v`, nothing is written and the error is
+    /// `AnchorError::SetVersionConflict`. The check and the write happen in the
+    /// same transaction, under the session's lock. Returns the version of the
+    /// set after the operation.
+    async fn apply_anchor_op_if(
+        &self,
+        session_id: Uuid,
+        op: crate::chat::anchor::AnchorOp,
+        if_match: Option<u64>,
+    ) -> Result<crate::chat::anchor::AnchorSetChange>;
+
+    /// The anchors of a session (oldest first) and the version of the set, read
+    /// together. `None` when the session does not exist.
+    async fn get_anchor_set(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<crate::chat::anchor::AnchorSet>>;
 
     /// Anchor a session on an entity (idempotent for a role set already held).
     async fn add_anchor(

@@ -312,6 +312,18 @@ jobs:
         # nextest: one process per test (no shared globals between tests), all cores, and a
         # per-test timeout that NAMES a hung test instead of letting it hold the job.
         run: cargo nextest run --profile ci --workspace --exclude project-orchestrator-desktop --lib
+        env:
+          # T9: the offline transverse evaluation (src/chat/eval_transverse.rs) runs in
+          # this step and fails it on any leak; its report is kept below.
+          PO_EVAL_REPORT: ${{ github.workspace }}/target/eval-transverse/report.json
+
+      - name: Keep the T9 evaluation report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: eval-transverse-report
+          path: target/eval-transverse/report.json
+          if-no-files-found: ignore
 
       - name: Run parser tests
         run: cargo test --test parser_tests
@@ -412,7 +424,8 @@ jobs:
           # is the one that keeps the fix from being undone — it must run somewhere.
           HARNESS_NEO4J_REQUIRED=1 cargo test --test integration_tests --test data_migrations \
             --test workspace_tests --test neo4j_store_tests --test harness_neo4j \
-            --test neo4j_note_consent --test neo4j_decision_project --test neural_routing_indexes
+            --test neo4j_note_consent --test neo4j_decision_project --test neural_routing_indexes \
+            --test neo4j_synapse_shadow
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch

@@ -12,6 +12,7 @@ pub mod activation;
 pub mod config;
 pub mod intent;
 pub mod search;
+pub mod synaptic_shadow;
 
 pub use activation::{
     ActivatedNote, ActivationSearchConfig, ActivationSearchResult, ActivationSource,

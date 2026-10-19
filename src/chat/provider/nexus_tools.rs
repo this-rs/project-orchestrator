@@ -317,6 +317,56 @@ impl SearchProviderRecord {
     }
 }
 
+/// Key of the order a person chose for the search engines (scope `global`), written by
+/// `PUT /api/chat/search-engines`. `nexus-tools` tries its engines in the order of its
+/// `--search-engine` flags, so this order is the order a `WebSearch` queries them in.
+pub const SEARCH_ENGINE_ORDER_KEY: &str = "search_engine_order";
+
+/// The order a person chose for the search engines: ids, first tried first.
+///
+/// An engine the list does not name comes after those it names, in the order it had without the
+/// list (by id): no document — every installation before this one — is today's order, and an
+/// engine declared after the choice goes last. An id the list names that no engine has (one
+/// removed since) is ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchEngineOrder {
+    /// Engine ids, first tried first.
+    pub order: Vec<String>,
+    /// Who chose it (a human login).
+    #[serde(default)]
+    pub ordered_by: String,
+    /// RFC 3339 time.
+    #[serde(default)]
+    pub ordered_at: String,
+}
+
+/// The stored order, if any. An unreadable or undecodable document is no order: the engines keep
+/// their order by id, the order they had before anyone chose one.
+pub async fn read_search_engine_order(graph: &dyn GraphStore) -> Vec<String> {
+    graph
+        .get_llm_setting(super::settings::GLOBAL, SEARCH_ENGINE_ORDER_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<SearchEngineOrder>(&raw).ok())
+        .map(|o| o.order)
+        .unwrap_or_default()
+}
+
+/// Puts `engines` in the chosen `order`. A STABLE sort on the rank alone: the engines the order
+/// does not name keep the order they came in (by id), after the named ones.
+pub fn order_search_providers(engines: &mut [SearchProviderRecord], order: &[String]) {
+    if order.is_empty() {
+        return;
+    }
+    engines.sort_by_key(|e| {
+        order
+            .iter()
+            .position(|id| *id == e.id)
+            .unwrap_or(usize::MAX)
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Consent reads
 // ---------------------------------------------------------------------------
@@ -331,7 +381,7 @@ pub trait ToolConsents: Send + Sync {
     async fn any_origin_consented(&self, project: &str) -> Result<bool, ToolAccessError>;
     /// Whether the browser is authorised for the project.
     async fn browser_authorized(&self, project: &str) -> Result<bool, ToolAccessError>;
-    /// The search providers declared on the server.
+    /// The search providers declared on the server, first tried first.
     async fn search_providers(&self) -> Vec<SearchProviderRecord>;
 }
 
@@ -378,14 +428,19 @@ impl ToolConsents for GraphConsents {
         Ok(raw.is_some_and(|raw| serde_json::from_str::<BrowserAuthorization>(&raw).is_ok()))
     }
 
+    /// In the order a person chose ([`SEARCH_ENGINE_ORDER_KEY`]); without one, by id (the order
+    /// the store lists them in): the order of the `--search-engine` flags, so of the queries.
     async fn search_providers(&self) -> Vec<SearchProviderRecord> {
-        self.0
+        let mut engines: Vec<SearchProviderRecord> = self
+            .0
             .list_llm_settings(super::settings::GLOBAL, SEARCH_PROVIDER_PREFIX)
             .await
             .unwrap_or_default()
             .iter()
             .filter_map(|(_, raw)| serde_json::from_str(raw).ok())
-            .collect()
+            .collect();
+        order_search_providers(&mut engines, &read_search_engine_order(&*self.0).await);
+        engines
     }
 }
 
@@ -886,10 +941,68 @@ impl SessionHooks for ToolAccessHooks {
         }
     }
 
+    async fn compaction_directive(
+        &self,
+        info: &CompactionInfo,
+    ) -> nexus_claude::agent::CompactionDirective {
+        match &self.inner {
+            Some(inner) => inner.compaction_directive(info).await,
+            None => nexus_claude::agent::CompactionDirective::none(),
+        }
+    }
+
     async fn before_turn(&self, ctx: &TurnContext) -> TurnDirective {
         match &self.inner {
             Some(inner) => inner.before_turn(ctx).await,
             None => TurnDirective::default(),
+        }
+    }
+
+    // Claude Code's own events (contract v7, ISO1) belong to the inner hooks: a wrapper that
+    // dropped them would hide the graph's answers on the agent engine.
+    async fn session_start(
+        &self,
+        info: &nexus_claude::agent::SessionStartInfo,
+    ) -> nexus_claude::agent::HookReply {
+        match &self.inner {
+            Some(inner) => inner.session_start(info).await,
+            None => nexus_claude::agent::HookReply::none(),
+        }
+    }
+
+    async fn user_prompt_submit(
+        &self,
+        prompt: &nexus_claude::agent::PromptInfo,
+    ) -> nexus_claude::agent::HookReply {
+        match &self.inner {
+            Some(inner) => inner.user_prompt_submit(prompt).await,
+            None => nexus_claude::agent::HookReply::none(),
+        }
+    }
+
+    async fn before_stop(
+        &self,
+        info: &nexus_claude::agent::StopInfo,
+    ) -> nexus_claude::agent::HookReply {
+        match &self.inner {
+            Some(inner) => inner.before_stop(info).await,
+            None => nexus_claude::agent::HookReply::none(),
+        }
+    }
+
+    async fn before_subagent_stop(
+        &self,
+        info: &nexus_claude::agent::SubagentStopInfo,
+    ) -> nexus_claude::agent::HookReply {
+        match &self.inner {
+            Some(inner) => inner.before_subagent_stop(info).await,
+            None => nexus_claude::agent::HookReply::none(),
+        }
+    }
+
+    async fn notification(&self, info: &nexus_claude::agent::NotificationInfo) {
+        if let Some(inner) = &self.inner {
+            inner.notification(info).await;
         }
     }
 
@@ -1847,6 +1960,45 @@ mod tests {
             HookVerdict::AddContext("inner".into())
         );
         crate::auth::agent_tokens::revoke_session("hook-s1");
+    }
+
+    /// Inner hooks that answer Claude Code's own events (contract v7).
+    struct LifecycleInner;
+
+    #[async_trait]
+    impl SessionHooks for LifecycleInner {
+        async fn user_prompt_submit(
+            &self,
+            _: &nexus_claude::agent::PromptInfo,
+        ) -> nexus_claude::agent::HookReply {
+            nexus_claude::agent::HookReply::context("graph context")
+        }
+        async fn before_stop(
+            &self,
+            _: &nexus_claude::agent::StopInfo,
+        ) -> nexus_claude::agent::HookReply {
+            nexus_claude::agent::HookReply::block("not yet")
+        }
+    }
+
+    #[tokio::test]
+    async fn the_gate_passes_claude_codes_own_events_on_to_the_inner_hooks() {
+        let graph = Arc::new(MockGraphStore::new());
+        let hooks = ToolAccessHooks::new(
+            Some(Arc::new(LifecycleInner)),
+            Arc::new(GraphConsents(graph)),
+            "hook-v7",
+            Some("proj".into()),
+            Vec::new(),
+        );
+        let prompt = hooks
+            .user_prompt_submit(&nexus_claude::agent::PromptInfo::new("go"))
+            .await;
+        assert_eq!(prompt.additional_context.as_deref(), Some("graph context"));
+        let stop = hooks
+            .before_stop(&nexus_claude::agent::StopInfo::new(false, None))
+            .await;
+        assert_eq!(stop.block.as_deref(), Some("not yet"));
     }
 
     // ---- (0a-bis) N23b: a destination without consent is a QUESTION, when a person is there --
@@ -3159,6 +3311,110 @@ mod tests {
         assert!(args.iter().all(|a| a != "obscura"));
         assert_eq!(attachment.search_origins, [BRAVE_ORIGIN]);
         crate::auth::agent_tokens::revoke_session("bi-s4");
+    }
+
+    fn searxng(id: &str, url: &str) -> SearchProviderRecord {
+        SearchProviderRecord {
+            id: id.into(),
+            engine: "searxng".into(),
+            base_url: Some(url.into()),
+            credential_ref: "none".into(),
+        }
+    }
+
+    /// The `--search-engine` values, in argv order: the order nexus-tools tries them in.
+    fn engine_flags(args: &[String]) -> Vec<String> {
+        args.windows(2)
+            .filter(|w| w[0] == "--search-engine")
+            .map(|w| w[1].clone())
+            .collect()
+    }
+
+    /// The engine flags and search origins a native session of `proj` is attached with.
+    async fn engines_of(graph: &Arc<MockGraphStore>, sid: &str) -> (Vec<String>, Vec<String>) {
+        let policy = ask();
+        let attachment = attach(
+            &config(),
+            &GraphConsents(graph.clone()),
+            None,
+            input(sid, &policy, Some("proj")),
+        )
+        .await;
+        let (_, args, _) = stdio(&attachment, "nexus");
+        crate::auth::agent_tokens::revoke_session(sid);
+        (engine_flags(&args), attachment.search_origins)
+    }
+
+    #[tokio::test]
+    async fn search_engines_reach_nexus_tools_in_the_chosen_order_and_by_id_without_one() {
+        let graph = Arc::new(MockGraphStore::new());
+        for record in [
+            searxng("a-sx", "https://a.example"),
+            searxng("b-sx", "https://b.example"),
+            searxng("c-sx", "https://c.example"),
+        ] {
+            store_provider(&graph, &record).await;
+        }
+        for origin in [
+            "https://a.example",
+            "https://b.example",
+            "https://c.example",
+        ] {
+            store_consent(&graph, "proj", origin).await;
+        }
+        // No order stored (every installation so far): by id, as before.
+        let (before, _) = engines_of(&graph, "ord-s1").await;
+        assert_eq!(
+            before,
+            [
+                "searxng:https://a.example",
+                "searxng:https://b.example",
+                "searxng:https://c.example"
+            ]
+        );
+        // A chosen order: the named engines first, in that order; the unnamed one after them;
+        // an id no engine has is ignored.
+        let order = SearchEngineOrder {
+            order: vec!["c-sx".into(), "gone".into(), "a-sx".into()],
+            ordered_by: "me@example.com".into(),
+            ordered_at: "2026-10-18T10:00:00Z".into(),
+        };
+        graph
+            .put_llm_setting(
+                super::super::settings::GLOBAL,
+                SEARCH_ENGINE_ORDER_KEY,
+                &serde_json::to_string(&order).unwrap(),
+            )
+            .await
+            .unwrap();
+        let (after, origins) = engines_of(&graph, "ord-s2").await;
+        assert_eq!(
+            after,
+            [
+                "searxng:https://c.example",
+                "searxng:https://a.example",
+                "searxng:https://b.example"
+            ]
+        );
+        assert_eq!(
+            origins,
+            [
+                "https://c.example",
+                "https://a.example",
+                "https://b.example"
+            ]
+        );
+        // A document that does not decode is no order: by id again, never a refusal.
+        graph
+            .put_llm_setting(
+                super::super::settings::GLOBAL,
+                SEARCH_ENGINE_ORDER_KEY,
+                "not json",
+            )
+            .await
+            .unwrap();
+        let (garbled, _) = engines_of(&graph, "ord-s3").await;
+        assert_eq!(garbled, before);
     }
 
     #[tokio::test]

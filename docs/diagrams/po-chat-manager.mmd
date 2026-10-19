@@ -1,5 +1,5 @@
 %% name: po-chat-manager
-%% covers: backend:src/chat/manager/recovery.rs backend:src/chat/{mod,manager,cost,anchor,anchor_resolver,agent_e2e_tests,tree,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments,pending_queue,relay,refs_wiring_tests,untrusted,neutral_place,session_record,tool_clock}.rs backend:src/notes/coactivation.rs
+%% covers: backend:src/chat/manager/recovery.rs backend:src/chat/{mod,manager,cost,anchor,anchor_resolver,eval_transverse,agent_e2e_tests,tree,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments,pending_queue,posture,relay,refs_wiring_tests,untrusted,neutral_place,session_record,tool_clock}.rs backend:src/notes/coactivation.rs
 %% verified: c15efef6
 %% ---
 %% PROUVE : le harness de chat côté serveur — comment ChatManager lance, pilote et
@@ -23,6 +23,7 @@
 %%   src/chat/skill_hook.rs     — SkillActivationHook ; src/chat/post_tool_hook.rs — PostToolUseRedirectHook
 %%   src/chat/hook_ledger.rs    — HookLedger, HookLedgerReset
 %%   src/chat/tool_clock.rs     — ToolClock (taken_up, observe, decided/undecided), ToolClockHook, clock_the_table (T2, relu sur feat/chat-tool-times)
+%%   src/chat/posture.rs        — Posture, Invariants, derive, Posture::fit, PostureTracker (hystérésis), PostureOverride, PostureBook ; mode ombre : journal posture_shadow, rien n'atteint le prompt (T7)
 %%   src/chat/config.rs         — PermissionConfig::to_nexus_mode, DEFAULT_ALLOWED_TOOLS, ChatConfig,
 %%                                build_options (seule source de la config MCP du CLI)
 %%   src/chat/types.rs          — ChatEvent (33 variantes, champs additifs facultatifs du harness), classify_api_error, RETRYABLE_ERROR_TYPES

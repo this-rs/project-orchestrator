@@ -347,6 +347,8 @@ pub(crate) const ACTION_CLASSES: &[(&str, &[&str], &[&str])] = &[
             "get_session_tree",
             "get_run_sessions",
             "team_status",
+            "list_anchors",
+            "list_anchored_sessions",
         ],
         &[
             "delete_session",
@@ -354,6 +356,9 @@ pub(crate) const ACTION_CLASSES: &[(&str, &[&str], &[&str])] = &[
             "add_discussed",
             "associate_with",
             "team_message",
+            "add_anchor",
+            "update_anchor",
+            "remove_anchor",
         ],
     ),
     (

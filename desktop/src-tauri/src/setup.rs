@@ -1702,7 +1702,7 @@ fn fastembed_cache_dir() -> PathBuf {
 #[cfg(feature = "local-embeddings")]
 #[tauri::command]
 pub fn check_embedding_model(model_name: String) -> Result<EmbeddingModelStatus, String> {
-    use fastembed::{EmbeddingModel, TextEmbedding};
+    use fastembed::TextEmbedding;
 
     let model_variant =
         project_orchestrator::embeddings::fastembed::parse_model_name_pub(&model_name);

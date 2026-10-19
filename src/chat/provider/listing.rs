@@ -136,7 +136,7 @@ impl HealthEntry {
 pub struct ProviderEntry {
     /// Instance identifier.
     pub id: String,
-    /// `claude_code | openai_compatible | codex | acp | claude_code_remote`.
+    /// `claude_code | openai_compatible | anthropic | codex | acp | claude_code_remote`.
     pub kind: &'static str,
     /// Display label.
     pub label: String,

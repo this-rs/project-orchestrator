@@ -13,7 +13,10 @@ use nexus_claude::agent::{
     AgentProvider, CostBasis, CredentialRef, CredentialResolver, EnvCredentialResolver,
     KnownSecrets, ProviderError, SessionLimits,
 };
-use nexus_claude::model::{EndpointQuirks, OpenAiEndpoint, OpenAiEndpointConfig};
+use nexus_claude::model::{
+    AnthropicAuth, AnthropicEndpoint, AnthropicEndpointConfig, EndpointQuirks, ModelEndpoint,
+    OpenAiEndpoint, OpenAiEndpointConfig,
+};
 use nexus_claude::providers::native::{NativeConfig, NativeProvider};
 
 use super::credentials::VaultCredentialResolver;
@@ -190,18 +193,24 @@ fn native_provider_with(
     )
     .map_err(|_| ProviderError::invalid("credential reference not allowed"))?;
     let credential = CredentialRef::from_str(&record.credential_ref)?;
-    let mut endpoint = OpenAiEndpointConfig::new(record.id.clone(), record.base_url.clone());
-    endpoint.credential = credential;
-    endpoint.quirks = record
-        .preset
-        .as_deref()
-        .and_then(EndpointQuirks::preset)
-        .unwrap_or_else(EndpointQuirks::generic);
     // A private-range endpoint needs an operator decision that this API does
-    // not offer: the strict default stays.
-    endpoint.allow_private_network = false;
-
-    let model_endpoint = Arc::new(OpenAiEndpoint::new(endpoint, resolver));
+    // not offer: the strict default stays (both protocols).
+    let model_endpoint: Arc<dyn ModelEndpoint> = if record.kind == super::settings::KIND_ANTHROPIC {
+        Arc::new(AnthropicEndpoint::new(
+            anthropic_endpoint(record, credential)?,
+            resolver,
+        ))
+    } else {
+        let mut endpoint = OpenAiEndpointConfig::new(record.id.clone(), record.base_url.clone());
+        endpoint.credential = credential;
+        endpoint.quirks = record
+            .preset
+            .as_deref()
+            .and_then(EndpointQuirks::preset)
+            .unwrap_or_else(EndpointQuirks::generic);
+        endpoint.allow_private_network = false;
+        Arc::new(OpenAiEndpoint::new(endpoint, resolver))
+    };
 
     let mut config = NativeConfig::new(record.id.clone());
     config.default_model = record.default_model.clone();
@@ -224,6 +233,34 @@ fn native_provider_with(
         config.cost_basis = CostBasis::Free;
     }
     Ok(NativeProvider::new(config, model_endpoint))
+}
+
+/// The endpoint of an `anthropic` instance (CTX5): the native harness speaks the Messages
+/// API itself, with its three `cache_control` points (tools, system, last turn). The key
+/// is a VAULT reference, checked again here whenever the record was stored: an `env:`
+/// variable or nothing is refused. Anthropic's own origin gets the key as `x-api-key`;
+/// any other origin is a gateway, which gets it as `Authorization: Bearer` (what Claude
+/// Code sends a gateway too).
+fn anthropic_endpoint(
+    record: &InstanceRecord,
+    credential: CredentialRef,
+) -> Result<AnthropicEndpointConfig, ProviderError> {
+    if !matches!(credential, CredentialRef::Vault(_)) {
+        return Err(ProviderError::invalid(
+            "an anthropic instance needs a vault reference for its key",
+        ));
+    }
+    let mut endpoint = if record.base_url.trim().is_empty() {
+        AnthropicEndpointConfig::new(record.id.clone())
+    } else {
+        AnthropicEndpointConfig::gateway(record.id.clone(), record.base_url.clone())
+    };
+    if record.origin == super::settings::ANTHROPIC_API_BASE || record.base_url.trim().is_empty() {
+        endpoint.auth = AnthropicAuth::ApiKey;
+    }
+    endpoint.credential = credential;
+    endpoint.allow_private_network = false;
+    Ok(endpoint)
 }
 
 /// The native harness of a record that runs SESSIONS: its transcripts are kept in
@@ -943,5 +980,173 @@ mod tests {
         for leak in ["nexus-", "id_ssh", "PRIVATE KEY", "known_hosts"] {
             assert!(!body.contains(leak), "{leak} in {body}");
         }
+    }
+
+    // ── anthropic (CTX5) ──────────────────────────────────────────────────
+
+    const ANTHROPIC_KEY: &str = "sk-ant-ctx5-test-0123456789";
+
+    fn anthropic_record(base_url: &str, origin: &str, credential_ref: &str) -> InstanceRecord {
+        InstanceRecord {
+            id: "claude-api".into(),
+            kind: super::super::settings::KIND_ANTHROPIC.into(),
+            label: "Claude API".into(),
+            base_url: base_url.into(),
+            origin: origin.into(),
+            default_model: Some("m".into()),
+            cost_source: "unknown".into(),
+            credential_ref: credential_ref.into(),
+            ..Default::default()
+        }
+    }
+
+    async fn vault_with_api_key() -> Arc<VaultService> {
+        use crate::vault::grants::{GrantScope, SecretSelector};
+        let vault = VaultService::ephemeral();
+        vault
+            .init(
+                "correct horse battery staple".into(),
+                chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        vault
+            .put("anthropic-key", ANTHROPIC_KEY, None, now)
+            .unwrap();
+        vault
+            .grant(
+                SecretSelector::Names(["anthropic-key".to_string()].into()),
+                GrantScope::Provider("claude-api".to_string()),
+                chrono::Duration::hours(1),
+                None,
+                now,
+            )
+            .unwrap();
+        vault
+    }
+
+    /// The SSE body of a Messages API answer: `text`, then the end of the message.
+    fn messages_sse(text: &str) -> String {
+        let events = [
+            serde_json::json!({"type": "message_start", "message": {"id": "msg_1", "type": "message",
+                "role": "assistant", "content": [], "model": "m",
+                "usage": {"input_tokens": 12, "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 30, "output_tokens": 1}}}),
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": text}}),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+            serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 4}}),
+            serde_json::json!({"type": "message_stop"}),
+        ];
+        events
+            .iter()
+            .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+            .collect()
+    }
+
+    /// An `anthropic` instance runs the native harness over the Messages API: the turn
+    /// reaches `/v1/messages` with the version header, the key read from the VAULT under
+    /// the instance's grant (a gateway origin: `Bearer`), and the three cache points —
+    /// tools, system, last turn — in the request itself.
+    #[tokio::test]
+    async fn an_anthropic_instance_speaks_the_messages_api_with_three_cache_points() {
+        use futures::StreamExt;
+        use nexus_claude::agent::{SessionSpec, SystemPromptMode, SystemPromptSpec, TurnInput};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "m", "max_input_tokens": 200000,
+                    "capabilities": {"image_input": {"supported": true}}}],
+                "has_more": false})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(messages_sse("hello from claude")),
+            )
+            .mount(&server)
+            .await;
+
+        let record = anthropic_record(&server.uri(), &server.uri(), "vault:anthropic-key");
+        let provider = build_native_provider(&record, Some(vault_with_api_key().await)).unwrap();
+        assert_eq!(provider.kind(), nexus_claude::agent::ProviderKind::Native);
+        let cwd = tempfile::tempdir().unwrap();
+        let mut spec = SessionSpec::new(cwd.path());
+        spec.model = Some("m".into());
+        spec.system_prompt = Some(SystemPromptSpec {
+            text: "stable system prompt".into(),
+            mode: SystemPromptMode::Replace,
+        });
+        let session = provider.open(spec).await.expect("the session opens");
+        let mut stream = session.send_turn(TurnInput::text("hi")).await.unwrap();
+        let mut texts = String::new();
+        while let Some(event) = stream.next().await {
+            if let nexus_claude::agent::AgentEvent::Text { text, .. } = &event {
+                texts.push_str(text);
+            }
+        }
+        assert_eq!(texts, "hello from claude");
+
+        let received = server.received_requests().await.unwrap();
+        let post = received
+            .iter()
+            .find(|r| r.url.path() == "/v1/messages")
+            .expect("the turn reached the Messages API");
+        let header = |name: &str| {
+            post.headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        assert_eq!(header("anthropic-version").as_deref(), Some("2023-06-01"));
+        assert_eq!(
+            header("authorization"),
+            Some(format!("Bearer {ANTHROPIC_KEY}")),
+            "the key from the vault, as a gateway takes it"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+        let ephemeral = serde_json::json!({"type": "ephemeral"});
+        let tools = body["tools"].as_array().expect("tools are offered");
+        assert_eq!(tools.last().unwrap()["cache_control"], ephemeral);
+        assert_eq!(body["system"][0]["cache_control"], ephemeral);
+        let last = body["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(
+            last["content"].as_array().unwrap().last().unwrap()["cache_control"],
+            ephemeral
+        );
+        assert_eq!(body.to_string().matches("cache_control").count(), 3);
+    }
+
+    /// The key of an `anthropic` instance is a vault reference: anything else is refused
+    /// by the factory too, whatever was stored, and never echoed.
+    #[test]
+    fn an_anthropic_instance_without_a_vault_reference_is_refused() {
+        for bad in ["none", "env:ANTHROPIC_API_KEY", "sk-ant-pasted-value"] {
+            let record = anthropic_record(
+                "https://api.anthropic.com",
+                "https://api.anthropic.com",
+                bad,
+            );
+            let err = build_native_provider(&record, None).err().expect("refused");
+            assert_eq!(err.kind(), "invalid_request", "{bad}");
+            assert!(!format!("{err:?}{err}").contains("sk-ant"), "{bad}");
+        }
+        let ok = anthropic_record(
+            "https://api.anthropic.com",
+            "https://api.anthropic.com",
+            "vault:anthropic-key",
+        );
+        assert!(build_native_provider(&ok, None).is_ok());
     }
 }

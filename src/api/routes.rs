@@ -43,7 +43,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::{header, Method};
 use axum::{
     middleware::from_fn_with_state,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use tower_http::cors::CorsLayer;
@@ -249,7 +249,10 @@ fn build_cors(state: &OrchestratorState) -> CorsLayer {
             header::CONTENT_TYPE,
             header::ACCEPT,
             header::COOKIE,
+            // optimistic concurrency of the anchors API
+            header::IF_MATCH,
         ])
+        .expose_headers([header::ETAG])
         .allow_credentials(true)
 }
 
@@ -2016,6 +2019,22 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/sessions/{id}/discussed",
             post(chat_handlers::add_discussed).get(chat_handlers::get_session_entities),
         )
+        // Context anchors of a conversation (T4 of plan 09c88ffe): who placed an
+        // anchor comes from the token; ETag / If-Match on the anchor set.
+        .route(
+            "/api/chat/sessions/{id}/anchors",
+            get(chat_handlers::anchors::list_anchors).post(chat_handlers::anchors::add_anchor),
+        )
+        .route(
+            "/api/chat/sessions/{id}/anchors/{anchor_id}",
+            patch(chat_handlers::anchors::update_anchor)
+                .delete(chat_handlers::anchors::remove_anchor),
+        )
+        // Reverse read: the conversations anchored on one entity, paginated.
+        .route(
+            "/api/chat/anchored-sessions",
+            get(chat_handlers::anchors::list_anchored_sessions),
+        )
         // ASSOCIATED_WITH relation (ChatSession → Plan/Task)
         .route(
             "/api/chat/sessions/{id}/associate",
@@ -2204,7 +2223,8 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/chat/search-engines",
             get(network_tools_handlers::list_search_engines)
-                .post(network_tools_handlers::create_search_engine),
+                .post(network_tools_handlers::create_search_engine)
+                .put(network_tools_handlers::put_search_engine_order),
         )
         .route(
             "/api/chat/search-engines/{id}",

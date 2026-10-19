@@ -223,6 +223,49 @@ async fn the_provider_fields_of_a_session_are_stored_and_read_back() {
         .unwrap();
 }
 
+/// T1-bis: the place of a session (`execution_place`) through the real CREATE of both
+/// branches (with and without a project) and the real read: `neutral` is stored as the
+/// string `neutral` and read back as such; a session written before the field reads as
+/// `project` (the legacy test below).
+#[tokio::test]
+async fn the_execution_place_is_stored_and_read_back_on_both_create_branches() {
+    use project_orchestrator::neo4j::models::ExecutionPlace;
+    let Some(e) = env().await else { return };
+    let store: &dyn GraphStore = &e.client;
+    let slug = format!("t1bis-{}", Uuid::new_v4());
+    let cases = [
+        (None, ExecutionPlace::Neutral),
+        (Some(slug.clone()), ExecutionPlace::Neutral),
+        (None, ExecutionPlace::Project),
+    ];
+    let mut ids = Vec::new();
+    for (project_slug, place) in cases {
+        let id = Uuid::new_v4();
+        ids.push(id.to_string());
+        let mut n = node(id);
+        n.project_slug = project_slug.clone();
+        n.execution_place = place;
+        store.create_chat_session(&n).await.unwrap();
+
+        let read = store.get_chat_session(id).await.unwrap().expect("stored");
+        assert_eq!(read.execution_place, place, "{project_slug:?}");
+        let mut r = e
+            .raw
+            .execute(
+                query("MATCH (s:ChatSession {id: $id}) RETURN s.execution_place AS p")
+                    .param("id", id.to_string()),
+            )
+            .await
+            .unwrap();
+        let stored: String = r.next().await.unwrap().unwrap().get("p").unwrap();
+        assert_eq!(stored, place.as_str(), "{project_slug:?}");
+    }
+    e.raw
+        .run(query("MATCH (s:ChatSession) WHERE s.id IN $ids DETACH DELETE s").param("ids", ids))
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn a_session_written_before_the_harness_reads_back_without_provider_fields() {
     let Some(e) = env().await else { return };
@@ -250,6 +293,11 @@ async fn a_session_written_before_the_harness_reads_back_without_provider_fields
     assert_eq!(read.routed_by, None);
     assert_eq!(read.capabilities, None);
     assert_eq!(read.resume_token, None);
+    assert_eq!(
+        read.execution_place,
+        project_orchestrator::neo4j::models::ExecutionPlace::Project,
+        "absent = project"
+    );
     e.raw
         .run(query("MATCH (s:ChatSession {id: $id}) DETACH DELETE s").param("id", id.to_string()))
         .await
@@ -470,6 +518,107 @@ mod anchors {
         assert!(store.delete_chat_session(sid).await.unwrap());
         assert!(store.list_session_anchors(sid).await.unwrap().is_empty());
         assert!(store.list_anchor_events(sid).await.unwrap().is_empty());
+    }
+
+    /// The version of the anchor set (`ChatSession.anchor_seq`) and the
+    /// `If-Match` check, read and written in one transaction. The same scenario
+    /// runs on the mock (`api::chat_handlers::anchors::tests::the_set_version_scenario_on_the_mock`)
+    /// with the same numbers.
+    #[tokio::test]
+    async fn the_set_version_and_if_match_on_real_neo4j() {
+        let Some(e) = env().await else { return };
+        let store: &dyn GraphStore = &e.client;
+        assert!(store
+            .get_anchor_set(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none());
+        let sid = Uuid::new_v4();
+        store.create_chat_session(&node(sid)).await.unwrap();
+        let empty = store.get_anchor_set(sid).await.unwrap().unwrap();
+        assert_eq!((empty.version, empty.anchors.len()), (0, 0));
+
+        let a = user(AnchorTargetType::File, "src/a.rs", &[AnchorRole::Mention]);
+        let first = store
+            .apply_anchor_op_if(sid, AnchorOp::Add(a.clone()), Some(0))
+            .await
+            .unwrap();
+        assert!(first.change.created);
+        assert_eq!(first.version, 1);
+        // the same anchor again: nothing written, the version stays
+        let again = store
+            .apply_anchor_op_if(sid, AnchorOp::Add(a), Some(1))
+            .await
+            .unwrap();
+        assert!(again.change.event.is_none());
+        assert_eq!(again.version, 1);
+
+        let b = user(AnchorTargetType::File, "src/b.rs", &[AnchorRole::Mention]);
+        let stale = store
+            .apply_anchor_op_if(sid, AnchorOp::Add(b.clone()), Some(0))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            typed(stale),
+            AnchorError::SetVersionConflict {
+                expected: 0,
+                actual: 1
+            }
+        );
+        assert_eq!(store.list_session_anchors(sid).await.unwrap().len(), 1);
+        let second = store
+            .apply_anchor_op_if(sid, AnchorOp::Add(b), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(second.version, 2);
+        let promoted = store
+            .apply_anchor_op_if(
+                sid,
+                AnchorOp::Promote {
+                    anchor_id: first.change.anchor.id,
+                    role: AnchorRole::Focus,
+                    expected_version: 1,
+                    by: AnchorActor::User,
+                    actor: "harness".into(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(promoted.version, 3);
+
+        let set = store.get_anchor_set(sid).await.unwrap().unwrap();
+        assert_eq!(set.version, 3);
+        let ids: Vec<Uuid> = set.anchors.iter().map(|x| x.id).collect();
+        assert_eq!(ids, vec![first.change.anchor.id, second.change.anchor.id]);
+        assert!(set.anchors[0].has_role(AnchorRole::Focus));
+        let seqs: Vec<u64> = store
+            .list_anchor_events(sid)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+
+        let removed = store
+            .apply_anchor_op_if(
+                sid,
+                AnchorOp::Remove {
+                    anchor_id: second.change.anchor.id,
+                    expected_version: 1,
+                    by: AnchorActor::User,
+                    actor: "harness".into(),
+                },
+                Some(3),
+            )
+            .await
+            .unwrap();
+        assert_eq!(removed.version, 4);
+        assert_eq!(store.get_anchor_set(sid).await.unwrap().unwrap().version, 4);
+
+        assert!(store.delete_chat_session(sid).await.unwrap());
+        assert!(store.get_anchor_set(sid).await.unwrap().is_none());
     }
 
     #[tokio::test]
