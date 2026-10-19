@@ -5729,6 +5729,29 @@ mod tests {
         }
     }
 
+    /// AM-1: the endpoint says which commit runs (`build.git_sha`, baked by
+    /// build.rs), so `cargo xtask in-service` can compare it with main. The
+    /// key is always present: a full sha from a checkout, `null` without git.
+    #[tokio::test]
+    async fn the_version_endpoint_exposes_the_commit_it_was_built_from() {
+        let h = action_harness_with(None, true).await;
+        let req = Request::builder()
+            .uri("/api/version")
+            .body(Body::empty())
+            .unwrap();
+        let (status, resp) = call(&h.app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        let build = resp["build"].as_object().expect("build object");
+        assert!(build.contains_key("git_sha"), "{resp}");
+        match crate::update::version::git_sha() {
+            Some(sha) => {
+                assert_eq!(resp["build"]["git_sha"], sha, "{resp}");
+                assert_eq!(sha.len(), 40, "{sha}");
+            }
+            None => assert!(resp["build"]["git_sha"].is_null(), "{resp}"),
+        }
+    }
+
     #[tokio::test]
     async fn first_message_naming_an_unknown_attachment_creates_no_session() {
         let h = action_harness(Some("/nonexistent/claude-cli")).await;

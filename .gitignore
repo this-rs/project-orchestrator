@@ -1,5 +1,7 @@
 # Rust
 /target/
+# xtask/ is outside the workspace: its own target dir when run without CARGO_TARGET_DIR
+/xtask/target/
 
 # Environment
 .env

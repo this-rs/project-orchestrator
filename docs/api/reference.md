@@ -576,10 +576,19 @@ curl http://localhost:8080/api/version
   "version": "0.1.0",
   "features": {
     "embedded_frontend": true,
-    "nats": true
-  }
+    "serve_frontend": true,
+    "refs_v1": true
+  },
+  "build": {
+    "target": "aarch64-macos",
+    "profile": "release",
+    "git_sha": "0ab7a21f5c0e4c4a9b2d3e6f7a8b9c0d1e2f3a4b"
+  },
+  "update": { "current": "0.0.17", "current_build": "0.0.17+359 (0ab7a21f)", "...": "..." }
 }
 ```
+
+`build.git_sha` is the full sha of the commit the binary was built from (`git rev-parse HEAD` at build time); `null` when the build had no git (Docker image without `.git`). It is what `cargo xtask in-service` compares with `origin/main` to say whether what runs is main — see [Operations: after-merge checks](../guides/operations.md). `update` is present only while the update service runs.
 
 ---
 

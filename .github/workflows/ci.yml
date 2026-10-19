@@ -222,6 +222,18 @@ jobs:
         # compiles and tests it.
         run: cargo clippy --workspace --exclude project-orchestrator-desktop --all-targets --all-features -- -D warnings
 
+      # xtask/ (`cargo xtask in-service|pins`, the after-merge checks) is
+      # OUTSIDE the workspace, so the three commands above never see it.
+      # Std-only: a few seconds, no cache. The last line is a smoke test of
+      # the alias and of the whole path (HEAD against HEAD, offline): the
+      # verdict must be « identiques : oui », exit 0.
+      - name: xtask (after-merge checks) — format, clippy, tests, smoke
+        run: |
+          cargo fmt --manifest-path xtask/Cargo.toml --check
+          cargo clippy --manifest-path xtask/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path xtask/Cargo.toml
+          cargo xtask in-service --no-fetch --ref HEAD --service-sha "$(git rev-parse HEAD)"
+
       # Index des diagrammes (docs/diagrams/INDEX.yml). Node est deja sur les
       # runners ubuntu-latest : pas de setup-node, pas de package.json, pas de
       # nouvelle chaine d'outils dans un depot Rust.

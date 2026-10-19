@@ -305,6 +305,11 @@ pub struct VersionFeatures {
 pub struct VersionBuild {
     pub target: String,
     pub profile: &'static str,
+    /// Full sha of the commit this binary was built from (`git rev-parse
+    /// HEAD` in build.rs); `null` when the build had no git (Docker without
+    /// `.git`, crates tarball). Read by `cargo xtask in-service` to CONSTATE
+    /// whether what runs is main — the answer that was missing on 15/10.
+    pub git_sha: Option<&'static str>,
 }
 
 /// Full version response
@@ -337,6 +342,7 @@ pub async fn get_version(State(state): State<OrchestratorState>) -> Json<Version
             } else {
                 "release"
             },
+            git_sha: crate::update::version::git_sha(),
         },
         update: crate::update::global().map(|svc| svc.status()),
     })
