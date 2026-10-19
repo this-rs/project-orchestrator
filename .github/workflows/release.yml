@@ -1192,8 +1192,12 @@ jobs:
           MCP_SERVER="$APP_PATH/Contents/Resources/mcp_server"
           if [ -f "$MCP_SERVER" ]; then
             if otool -l "$MCP_SERVER" | grep -q 'path @executable_path (offset'; then
-              echo "  mcp_server: dylib next to it (rpath @executable_path)"
-              cp -a "${ORT_LIB_LOCATION}"/libonnxruntime* "$APP_PATH/Contents/Resources/"
+              echo "  mcp_server: symlinks to the signed dylib in Frameworks (rpath @executable_path)"
+              # A symlink, not a copy: the Frameworks copy is the one codesign signs; a second
+              # unsigned Mach-O in Resources would break signing and notarization.
+              for dylib in "$FRAMEWORKS_DIR"/libonnxruntime*; do
+                ln -sfn "../Frameworks/$(basename "$dylib")" "$APP_PATH/Contents/Resources/$(basename "$dylib")"
+              done
             else
               echo "  rpath → mcp_server (resource)"
               install_name_tool -add_rpath @executable_path/../Frameworks "$MCP_SERVER"
