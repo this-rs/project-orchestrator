@@ -339,14 +339,18 @@ impl Orchestrator {
             planner = planner.with_embedding_provider(provider.clone());
         }
         let planner = Arc::new(planner);
-        let analytics: Arc<dyn AnalyticsEngine> = Arc::new(GraphAnalyticsEngine::new(
-            state.neo4j.clone(),
-            AnalyticsConfig::default(),
-        ));
-        let analytics_debouncer = AnalyticsDebouncer::with_graph_store(
+        // Every analytics path goes through the guard: one pass per project at a time, a
+        // bounded number overall, a deadline (issue: large projects froze the server).
+        let analytics: Arc<dyn AnalyticsEngine> = Arc::new(
+            crate::graph::guard::GuardedAnalyticsEngine::from_env(Arc::new(
+                GraphAnalyticsEngine::new(state.neo4j.clone(), AnalyticsConfig::default()),
+            )),
+        );
+        let analytics_debouncer = AnalyticsDebouncer::with_min_interval(
             analytics.clone(),
             2000,
             Some(state.neo4j.clone()),
+            crate::graph::guard::min_interval_from_env(),
         );
         let co_change_debouncer = CoChangeDebouncer::new(state.neo4j.clone(), 30_000);
         let ar_config = AutoReinforcementConfig::default();
@@ -437,14 +441,18 @@ impl Orchestrator {
             planner = planner.with_embedding_provider(provider.clone());
         }
         let planner = Arc::new(planner);
-        let analytics: Arc<dyn AnalyticsEngine> = Arc::new(GraphAnalyticsEngine::new(
-            state.neo4j.clone(),
-            AnalyticsConfig::default(),
-        ));
-        let analytics_debouncer = AnalyticsDebouncer::with_graph_store(
+        // Every analytics path goes through the guard: one pass per project at a time, a
+        // bounded number overall, a deadline (issue: large projects froze the server).
+        let analytics: Arc<dyn AnalyticsEngine> = Arc::new(
+            crate::graph::guard::GuardedAnalyticsEngine::from_env(Arc::new(
+                GraphAnalyticsEngine::new(state.neo4j.clone(), AnalyticsConfig::default()),
+            )),
+        );
+        let analytics_debouncer = AnalyticsDebouncer::with_min_interval(
             analytics.clone(),
             2000,
             Some(state.neo4j.clone()),
+            crate::graph::guard::min_interval_from_env(),
         );
         let co_change_debouncer = CoChangeDebouncer::new(state.neo4j.clone(), 30_000);
         let ar_config = AutoReinforcementConfig::default();
@@ -537,14 +545,18 @@ impl Orchestrator {
             planner = planner.with_embedding_provider(provider.clone());
         }
         let planner = Arc::new(planner);
-        let analytics: Arc<dyn AnalyticsEngine> = Arc::new(GraphAnalyticsEngine::new(
-            state.neo4j.clone(),
-            AnalyticsConfig::default(),
-        ));
-        let analytics_debouncer = AnalyticsDebouncer::with_graph_store(
+        // Every analytics path goes through the guard: one pass per project at a time, a
+        // bounded number overall, a deadline (issue: large projects froze the server).
+        let analytics: Arc<dyn AnalyticsEngine> = Arc::new(
+            crate::graph::guard::GuardedAnalyticsEngine::from_env(Arc::new(
+                GraphAnalyticsEngine::new(state.neo4j.clone(), AnalyticsConfig::default()),
+            )),
+        );
+        let analytics_debouncer = AnalyticsDebouncer::with_min_interval(
             analytics.clone(),
             2000,
             Some(state.neo4j.clone()),
+            crate::graph::guard::min_interval_from_env(),
         );
         let co_change_debouncer = CoChangeDebouncer::new(state.neo4j.clone(), 30_000);
         let ar_config = AutoReinforcementConfig::default();

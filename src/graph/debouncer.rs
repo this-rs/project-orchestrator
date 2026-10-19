@@ -53,8 +53,28 @@ impl AnalyticsDebouncer {
         debounce_ms: u64,
         graph_store: Option<Arc<dyn GraphStore>>,
     ) -> Self {
+        Self::with_min_interval(analytics, debounce_ms, graph_store, Duration::ZERO)
+    }
+
+    /// Like [`Self::with_graph_store`], and a project that was analysed less than
+    /// `min_interval` ago is not analysed again by a trigger: the trigger is deferred to the
+    /// end of the interval (once, however many arrive), never dropped. On a large project a
+    /// pass costs minutes of CPU, and every commit used to start one.
+    pub fn with_min_interval(
+        analytics: Arc<dyn AnalyticsEngine>,
+        debounce_ms: u64,
+        graph_store: Option<Arc<dyn GraphStore>>,
+        min_interval: Duration,
+    ) -> Self {
         let (tx, rx) = mpsc::channel::<Uuid>(64);
-        tokio::spawn(Self::run_loop(analytics, rx, debounce_ms, graph_store));
+        tokio::spawn(Self::run_loop(
+            analytics,
+            rx,
+            debounce_ms,
+            graph_store,
+            min_interval,
+            tx.clone(),
+        ));
         Self { trigger_tx: tx }
     }
 
@@ -77,8 +97,13 @@ impl AnalyticsDebouncer {
         mut rx: mpsc::Receiver<Uuid>,
         debounce_ms: u64,
         graph_store: Option<Arc<dyn GraphStore>>,
+        min_interval: Duration,
+        trigger_tx: mpsc::Sender<Uuid>,
     ) {
         let debounce = Duration::from_millis(debounce_ms);
+        let mut last_done: std::collections::HashMap<Uuid, std::time::Instant> =
+            std::collections::HashMap::new();
+        let deferred: Arc<std::sync::Mutex<HashSet<Uuid>>> = Arc::default();
 
         loop {
             // Wait for the first trigger
@@ -111,9 +136,33 @@ impl AnalyticsDebouncer {
             }
 
             for project_id in &pending_projects {
+                if let Some(done) = last_done.get(project_id) {
+                    let since = done.elapsed();
+                    if since < min_interval {
+                        let mut waiting = deferred.lock().unwrap_or_else(|e| e.into_inner());
+                        if waiting.insert(*project_id) {
+                            let (pid, tx, set) =
+                                (*project_id, trigger_tx.clone(), deferred.clone());
+                            let wait = min_interval - since;
+                            tracing::info!(
+                                project_id = %pid,
+                                wait_secs = wait.as_secs(),
+                                "Analytics deferred: the project was analysed less than {:?} ago",
+                                min_interval
+                            );
+                            tokio::spawn(async move {
+                                tokio::time::sleep(wait).await;
+                                set.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
+                                let _ = tx.send(pid).await;
+                            });
+                        }
+                        continue;
+                    }
+                }
                 let start = std::time::Instant::now();
                 match analytics.analyze_project(*project_id).await {
                     Ok(result) => {
+                        last_done.insert(*project_id, std::time::Instant::now());
                         tracing::info!(
                             "Debounced analytics computed for project {} in {:?} (files: {} nodes, functions: {} nodes)",
                             project_id,
@@ -613,6 +662,29 @@ mod tests {
             2,
             "Two separate bursts should produce 2 analytics calls"
         );
+    }
+
+    #[tokio::test]
+    async fn a_trigger_inside_the_min_interval_is_deferred_not_dropped() {
+        let count = Arc::new(AtomicU32::new(0));
+        let engine: Arc<dyn AnalyticsEngine> =
+            Arc::new(CountingAnalyticsEngine::new(count.clone()));
+        let calls = || count.load(std::sync::atomic::Ordering::SeqCst);
+        let debouncer =
+            AnalyticsDebouncer::with_min_interval(engine, 20, None, Duration::from_millis(400));
+        let pid = Uuid::new_v4();
+        debouncer.trigger(pid);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(calls(), 1);
+        // Three more triggers inside the interval: none runs now...
+        for _ in 0..3 {
+            debouncer.trigger(pid);
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+        assert_eq!(calls(), 1, "inside the interval");
+        // ...and ONE runs when the interval is over.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(calls(), 2, "one deferred pass for the burst");
     }
 
     #[tokio::test]

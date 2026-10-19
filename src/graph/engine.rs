@@ -21,6 +21,7 @@ use super::algorithms::{
     compute_all, compute_context_cards, compute_structural_fingerprint, structural_dna,
     wl_subgraph_hash_all,
 };
+use super::cpu::run_cpu;
 use super::enrichment::{CommunityEnricher, NoopCommunityEnricher};
 use super::extraction::GraphExtractor;
 use super::models::{AnalyticsConfig, FabricWeights, GraphAnalytics};
@@ -145,10 +146,13 @@ impl GraphAnalyticsEngine {
 impl AnalyticsEngine for GraphAnalyticsEngine {
     async fn analyze_file_graph(&self, project_id: Uuid) -> Result<GraphAnalytics> {
         // 1. Extract
-        let graph = self.extractor.extract_file_graph(project_id).await?;
+        let graph = Arc::new(self.extractor.extract_file_graph(project_id).await?);
 
-        // 2. Compute
-        let mut analytics = compute_all(&graph, &self.config);
+        // 2. Compute (off the async workers, in the bounded analytics pool)
+        let mut analytics = {
+            let (g, c) = (graph.clone(), self.config.clone());
+            run_cpu(move || compute_all(&g, &c)).await?
+        };
 
         // 2b. Enrich community labels (LLM or noop)
         if let Err(e) = self
@@ -174,7 +178,11 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
 
         let mut dna_map_for_cards = std::collections::HashMap::new();
 
-        match structural_dna(&graph, &pr_scores, 10) {
+        let dna_result = {
+            let g = graph.clone();
+            run_cpu(move || structural_dna(&g, &pr_scores, 10)).await?
+        };
+        match dna_result {
             Ok(dna_map) if !dna_map.is_empty() => {
                 if let Err(e) = self.writer.write_structural_dna(&dna_map, &graph).await {
                     tracing::warn!(
@@ -200,7 +208,11 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
         }
 
         // 4b. Compute and persist Structural Fingerprints (depends on analytics)
-        let fp_map = compute_structural_fingerprint(&graph, &analytics);
+        let analytics = Arc::new(analytics);
+        let fp_map = {
+            let (g, a) = (graph.clone(), analytics.clone());
+            run_cpu(move || compute_structural_fingerprint(&g, &a)).await?
+        };
         let fp_map_for_cards = if !fp_map.is_empty() {
             if let Err(e) = self
                 .writer
@@ -226,7 +238,11 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
         };
 
         // 5. Compute WL subgraph hashes (Plan 7)
-        let wl_hashes = match wl_subgraph_hash_all(&graph, 2, 3) {
+        let wl_result = {
+            let g = graph.clone();
+            run_cpu(move || wl_subgraph_hash_all(&g, 2, 3)).await?
+        };
+        let wl_hashes = match wl_result {
             Ok(hashes) => {
                 tracing::debug!(
                     project_id = %project_id,
@@ -242,13 +258,13 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
         };
 
         // 6. Compute and persist Context Cards (aggregates analytics + DNA + WL hash)
-        let context_cards = compute_context_cards(
-            &graph,
-            &analytics,
-            &dna_map_for_cards,
-            &wl_hashes,
-            &fp_map_for_cards,
-        );
+        let context_cards = {
+            let (g, a) = (graph.clone(), analytics.clone());
+            run_cpu(move || {
+                compute_context_cards(&g, &a, &dna_map_for_cards, &wl_hashes, &fp_map_for_cards)
+            })
+            .await?
+        };
         if !context_cards.is_empty() {
             if let Err(e) = self.store.batch_save_context_cards(&context_cards).await {
                 tracing::warn!(
@@ -265,15 +281,19 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
             }
         }
 
-        Ok(analytics)
+        // Every computation holding a clone is done: this is the last owner.
+        Ok(Arc::try_unwrap(analytics).unwrap_or_else(|shared| (*shared).clone()))
     }
 
     async fn analyze_function_graph(&self, project_id: Uuid) -> Result<GraphAnalytics> {
         // 1. Extract
-        let graph = self.extractor.extract_function_graph(project_id).await?;
+        let graph = Arc::new(self.extractor.extract_function_graph(project_id).await?);
 
-        // 2. Compute
-        let mut analytics = compute_all(&graph, &self.config);
+        // 2. Compute (off the async workers, in the bounded analytics pool)
+        let mut analytics = {
+            let (g, c) = (graph.clone(), self.config.clone());
+            run_cpu(move || compute_all(&g, &c)).await?
+        };
 
         // 2b. Enrich community labels (LLM or noop)
         if let Err(e) = self
@@ -294,11 +314,16 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
     }
 
     async fn analyze_project(&self, project_id: Uuid) -> Result<ProjectAnalytics> {
+        let t = std::time::Instant::now();
         let file_analytics = self.analyze_file_graph(project_id).await?;
+        let file_ms = t.elapsed().as_millis() as u64;
+        let t = std::time::Instant::now();
         let function_analytics = self.analyze_function_graph(project_id).await?;
+        let function_ms = t.elapsed().as_millis() as u64;
 
         // Keep the fabric_* scores in step with the code-only ones. A failure
         // here must not discard the file/function results already persisted.
+        let t = std::time::Instant::now();
         if let Err(e) = self
             .analyze_fabric_graph(project_id, &FabricWeights::default())
             .await
@@ -309,6 +334,13 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
                 "analyze_project: fabric analytics refresh failed"
             );
         }
+        tracing::info!(
+            project_id = %project_id,
+            file_ms,
+            function_ms,
+            fabric_ms = t.elapsed().as_millis() as u64,
+            "analytics phase timings"
+        );
 
         Ok(ProjectAnalytics {
             file_analytics,
@@ -323,13 +355,26 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
         weights: &FabricWeights,
     ) -> Result<GraphAnalytics> {
         // 1. Extract multi-layer graph
+        let extract_started = std::time::Instant::now();
         let graph = self
             .extractor
             .extract_fabric_graph(project_id, weights)
             .await?;
+        tracing::info!(
+            project_id = %project_id,
+            nodes = graph.graph.node_count(),
+            edges = graph.graph.edge_count(),
+            extract_ms = extract_started.elapsed().as_millis() as u64,
+            "fabric graph extracted"
+        );
+        let graph = Arc::new(graph);
 
-        // 2. Compute analytics (PageRank, Louvain, Betweenness all use edge weights)
-        let mut analytics = compute_all(&graph, &self.config);
+        // 2. Compute analytics (PageRank, Louvain, Betweenness all use edge weights), off the
+        // async workers and in the bounded analytics pool.
+        let mut analytics = {
+            let (g, c) = (graph.clone(), self.config.clone());
+            run_cpu(move || compute_all(&g, &c)).await?
+        };
 
         // 2b. Enrich community labels (LLM or noop)
         if let Err(e) = self
@@ -359,7 +404,7 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
         use crate::neo4j::models::ProcessNode;
 
         // 1. Extract function CALLS graph
-        let graph = self.extractor.extract_function_graph(project_id).await?;
+        let graph = Arc::new(self.extractor.extract_function_graph(project_id).await?);
 
         // Purge previously detected processes first: an empty graph or an empty
         // detection result must not leave stale processes behind.
@@ -370,11 +415,17 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
         }
 
         // 2. Compute metrics (PageRank, communities, in/out degree)
-        let analytics = compute_all(&graph, &self.config);
-
-        // 3. Run process detection pipeline
-        let config = ProcessConfig::default();
-        let processes = process::detect_processes(&graph, &analytics.metrics, &config);
+        let (processes, _analytics) = {
+            let (g, c) = (graph.clone(), self.config.clone());
+            run_cpu(move || {
+                let analytics = compute_all(&g, &c);
+                // 3. Run process detection pipeline
+                let processes =
+                    process::detect_processes(&g, &analytics.metrics, &ProcessConfig::default());
+                (processes, analytics)
+            })
+            .await?
+        };
 
         if processes.is_empty() {
             return Ok(processes);
