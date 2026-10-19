@@ -142,18 +142,28 @@ impl ProtocolStatusProvider for GraphProtocolProvider {
             return Ok(Vec::new());
         }
 
-        let mut results = Vec::new();
-
-        // 2. For each protocol, check for running runs
-        for proto in &protocols {
+        // 2. Running runs of every protocol, concurrently (one round trip each, not one
+        //    after the other: on a project with many protocols the sequential loop alone
+        //    exceeded the stage's budget), and the states once per protocol that has runs.
+        let per_protocol = futures::future::join_all(protocols.iter().map(|proto| async move {
             let (runs, _) = self
                 .graph
                 .list_protocol_runs(proto.id, Some(crate::protocol::RunStatus::Running), 10, 0)
                 .await?;
+            let states = if runs.is_empty() {
+                Vec::new()
+            } else {
+                self.graph.get_protocol_states(proto.id).await?
+            };
+            anyhow::Ok((proto, runs, states))
+        }))
+        .await;
 
+        let mut results = Vec::new();
+        for outcome in per_protocol {
+            let (proto, runs, states) = outcome?;
             for run in &runs {
-                // 3. Get the current state to extract prompt fields
-                let states = self.graph.get_protocol_states(proto.id).await?;
+                // 3. The current state's prompt fields
                 let current = states.iter().find(|s| s.id == run.current_state);
 
                 let (state_name, prompt_fragment, available_tools, forbidden_actions) =
@@ -270,14 +280,18 @@ impl StatusInjectionStage {
 
         let mut content = String::new();
 
-        for plan in &plans {
+        // The tasks of every plan, concurrently.
+        let tasks_per_plan =
+            futures::future::join_all(plans.iter().map(|plan| self.graph.get_plan_tasks(plan.id)))
+                .await;
+
+        for (plan, plan_tasks) in plans.iter().zip(tasks_per_plan) {
             content.push_str(&format!(
                 "- **Plan:** {} (priority: {})\n",
                 plan.title, plan.priority
             ));
 
-            // Get tasks for this plan
-            match self.graph.get_plan_tasks(plan.id).await {
+            match plan_tasks {
                 Ok(tasks) => {
                     let active_tasks: Vec<_> = tasks
                         .iter()
@@ -431,94 +445,103 @@ impl ParallelEnrichmentStage for StatusInjectionStage {
         let query_timeout = Duration::from_millis(self.config.query_timeout_ms);
         let reasoning_timeout = Duration::from_millis(self.config.reasoning_timeout_ms);
 
-        // ── Query 1: Work status (plans + tasks) ────────────────────────
-        let status_content = if let Some(pid) = project_id {
-            match timeout(query_timeout, self.query_work_status(pid)).await {
-                Ok(content) => content,
-                Err(_) => {
-                    debug!("[status_injection] Work status query timed out");
-                    None
+        // The three queries run CONCURRENTLY, each under its own limit. One after the other
+        // their limits added up (200 + 200 + 300 ms) to more than the stage's own budget, so
+        // a slow graph timed the whole stage out and every section was lost.
+        let work_status = async {
+            if let Some(pid) = project_id {
+                match timeout(query_timeout, self.query_work_status(pid)).await {
+                    Ok(content) => content,
+                    Err(_) => {
+                        debug!("[status_injection] Work status query timed out");
+                        None
+                    }
                 }
+            } else {
+                None
             }
-        } else {
-            None
         };
+        let protocol_status = async {
+            if let Some(pid) = project_id {
+                match timeout(query_timeout, self.protocol_provider.get_active_runs(pid)).await {
+                    Ok(Ok(runs)) if !runs.is_empty() => {
+                        let mut status_content = String::new();
+                        let mut context_content = String::new();
 
-        // ── Query 2: Protocol status ─────────────────────────────────────
-        let (protocol_content, protocol_context) = if let Some(pid) = project_id {
-            match timeout(query_timeout, self.protocol_provider.get_active_runs(pid)).await {
-                Ok(Ok(runs)) if !runs.is_empty() => {
-                    let mut status_content = String::new();
-                    let mut context_content = String::new();
+                        for run in &runs {
+                            status_content.push_str(&format!(
+                                "- **{}**: {} ({}%) — {}\n",
+                                run.protocol_name,
+                                run.current_state,
+                                run.progress,
+                                run.status_message,
+                            ));
 
-                    for run in &runs {
-                        status_content.push_str(&format!(
-                            "- **{}**: {} ({}%) — {}\n",
-                            run.protocol_name, run.current_state, run.progress, run.status_message,
-                        ));
-
-                        // Render prompt_fragment as protocol context
-                        if let Some(ref fragment) = run.prompt_fragment {
-                            context_content.push_str(&format!(
+                            // Render prompt_fragment as protocol context
+                            if let Some(ref fragment) = run.prompt_fragment {
+                                context_content.push_str(&format!(
                                 "<protocol_context state=\"{}\" protocol=\"{}\">\n{}\n</protocol_context>\n",
                                 crate::chat::untrusted::escape_attr(&run.current_state),
                                 crate::chat::untrusted::escape_attr(&run.protocol_name),
                                 fragment,
                             ));
-                        }
-                        // Render forbidden_actions as warnings
-                        if let Some(ref actions) = run.forbidden_actions {
-                            if !actions.is_empty() {
-                                context_content.push_str(&format!(
-                                    "\n⚠️ **Forbidden in state '{}'**: {}\n",
-                                    crate::chat::untrusted::escape_attr(&run.current_state),
-                                    actions.join(", "),
-                                ));
+                            }
+                            // Render forbidden_actions as warnings
+                            if let Some(ref actions) = run.forbidden_actions {
+                                if !actions.is_empty() {
+                                    context_content.push_str(&format!(
+                                        "\n⚠️ **Forbidden in state '{}'**: {}\n",
+                                        crate::chat::untrusted::escape_attr(&run.current_state),
+                                        actions.join(", "),
+                                    ));
+                                }
                             }
                         }
+
+                        (
+                            Some(status_content),
+                            if context_content.is_empty() {
+                                None
+                            } else {
+                                Some(context_content)
+                            },
+                        )
                     }
-
-                    (
-                        Some(status_content),
-                        if context_content.is_empty() {
-                            None
-                        } else {
-                            Some(context_content)
-                        },
-                    )
+                    Ok(Ok(_)) => (None, None),
+                    Ok(Err(e)) => {
+                        debug!("[status_injection] Protocol status query failed: {}", e);
+                        (None, None)
+                    }
+                    Err(_) => {
+                        debug!("[status_injection] Protocol status query timed out");
+                        (None, None)
+                    }
                 }
-                Ok(Ok(_)) => (None, None),
-                Ok(Err(e)) => {
-                    debug!("[status_injection] Protocol status query failed: {}", e);
-                    (None, None)
-                }
-                Err(_) => {
-                    debug!("[status_injection] Protocol status query timed out");
-                    (None, None)
-                }
+            } else {
+                (None, None)
             }
-        } else {
-            (None, None)
         };
-
-        // ── Query 3: ReasoningTree (optional) ───────────────────────────
-        let reasoning_content = if self.reasoning_engine.is_some() {
-            match timeout(
-                reasoning_timeout,
-                self.generate_reasoning_tree(&input.message, project_id),
-            )
-            .await
-            {
-                Ok(Some(tree)) => Some(Self::render_reasoning_tree(&tree)),
-                Ok(None) => None,
-                Err(_) => {
-                    debug!("[status_injection] ReasoningTree generation timed out");
-                    None
+        let reasoning = async {
+            if self.reasoning_engine.is_some() {
+                match timeout(
+                    reasoning_timeout,
+                    self.generate_reasoning_tree(&input.message, project_id),
+                )
+                .await
+                {
+                    Ok(Some(tree)) => Some(Self::render_reasoning_tree(&tree)),
+                    Ok(None) => None,
+                    Err(_) => {
+                        debug!("[status_injection] ReasoningTree generation timed out");
+                        None
+                    }
                 }
+            } else {
+                None
             }
-        } else {
-            None
         };
+        let (status_content, (protocol_content, protocol_context), reasoning_content) =
+            tokio::join!(work_status, protocol_status, reasoning);
 
         // ── Inject sections ─────────────────────────────────────────────
         if let Some(content) = status_content {
