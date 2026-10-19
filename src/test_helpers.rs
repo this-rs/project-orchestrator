@@ -123,7 +123,9 @@ pub fn mock_app_state() -> AppState {
             chat_native_session_max_tokens: None,
             chat_obscura_path: None,
             chat_obscura_browser: None,
-            embedding_provider: None,
+            // Never the local fastembed default in tests: it loads (or downloads, 1.1 GB) the
+            // ONNX model in every Orchestrator::new — measured 3.4 s per test cached, 16 s cold.
+            embedding_provider: Some("disabled".to_string()),
             embedding_fastembed_model: None,
             embedding_fastembed_cache_dir: None,
             embedding_fastembed_batch_size: None,
@@ -179,7 +181,9 @@ pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> Ap
             chat_native_session_max_tokens: None,
             chat_obscura_path: None,
             chat_obscura_browser: None,
-            embedding_provider: None,
+            // Never the local fastembed default in tests: it loads (or downloads, 1.1 GB) the
+            // ONNX model in every Orchestrator::new — measured 3.4 s per test cached, 16 s cold.
+            embedding_provider: Some("disabled".to_string()),
             embedding_fastembed_model: None,
             embedding_fastembed_cache_dir: None,
             embedding_fastembed_batch_size: None,
@@ -235,7 +239,9 @@ pub fn mock_app_state_with_graph(graph: Arc<MockGraphStore>) -> AppState {
             chat_native_session_max_tokens: None,
             chat_obscura_path: None,
             chat_obscura_browser: None,
-            embedding_provider: None,
+            // Never the local fastembed default in tests: it loads (or downloads, 1.1 GB) the
+            // ONNX model in every Orchestrator::new — measured 3.4 s per test cached, 16 s cold.
+            embedding_provider: Some("disabled".to_string()),
             embedding_fastembed_model: None,
             embedding_fastembed_cache_dir: None,
             embedding_fastembed_batch_size: None,
@@ -296,7 +302,9 @@ pub fn mock_app_state_with_stores() -> (AppState, Arc<MockGraphStore>, Arc<MockS
             chat_native_session_max_tokens: None,
             chat_obscura_path: None,
             chat_obscura_browser: None,
-            embedding_provider: None,
+            // Never the local fastembed default in tests: it loads (or downloads, 1.1 GB) the
+            // ONNX model in every Orchestrator::new — measured 3.4 s per test cached, 16 s cold.
+            embedding_provider: Some("disabled".to_string()),
             embedding_fastembed_model: None,
             embedding_fastembed_cache_dir: None,
             embedding_fastembed_batch_size: None,
