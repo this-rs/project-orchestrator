@@ -27,6 +27,7 @@ struct Footprint {
     peak_mb: f64,
 }
 
+#[cfg(target_os = "macos")]
 fn to_mb(value: f64, unit: &str) -> f64 {
     match unit.to_ascii_uppercase().as_str() {
         "KB" => value / 1024.0,
