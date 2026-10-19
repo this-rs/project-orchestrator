@@ -311,6 +311,12 @@ fn public_routes() -> Router<OrchestratorState> {
         .route("/health", get(handlers::health))
         .route("/api/version", get(handlers::get_version))
         .route("/api/setup-status", get(handlers::setup_status))
+        // Réception publique d'événements externes : gardée par le secret du déclencheur,
+        // jamais derrière require_auth (voir src/api/ingress_handlers.rs).
+        .route(
+            "/hooks/events/{source}/{trigger_id}",
+            post(crate::api::ingress_handlers::receive_external_event),
+        )
         // Live Claude model catalog (Anthropic Models API + local curation, cached).
         // PUBLIC on purpose: the setup wizard at /setup runs before login and
         // needs the real list — while it was authenticated, that screen could
