@@ -39,9 +39,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use nexus_claude::agent::{
-    AgentProvider, AgentSession, Capabilities, CompactionInfo, HookVerdict, ModelInfo,
-    ProviderError, ProviderHealth, ProviderKind, ResumeToken, SessionHooks, SessionLimits,
-    SessionSpec, SubagentRequest, ToolCallInfo, ToolResultInfo, TurnContext, TurnDirective,
+    AgentProvider, AgentSession, Capabilities, CompactionInfo, HookReply, HookVerdict, ModelInfo,
+    NotificationInfo, PromptInfo, ProviderError, ProviderHealth, ProviderKind, ResumeToken,
+    SessionHooks, SessionLimits, SessionSpec, SessionStartInfo, StopInfo, SubagentRequest,
+    SubagentStopInfo, ToolCallInfo, ToolResultInfo, TurnContext, TurnDirective,
 };
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -163,6 +164,26 @@ const FUNCTIONS: &[(&str, &str)] = &[
     (
         "hooks.before_compaction",
         "le hook PreCompact du graphe nomme le projet dans les instructions du résumé (Claude Code : `systemMessage`, le champ que lit le CLI)",
+    ),
+    (
+        "hooks.session_start",
+        "le hook SessionStart du graphe est consulté à l'ouverture de la session (contract v7)",
+    ),
+    (
+        "hooks.user_prompt_submit",
+        "le hook UserPromptSubmit du graphe est consulté avant chaque tour (contract v7)",
+    ),
+    (
+        "hooks.stop",
+        "le hook Stop du graphe est consulté avant la fin du tour ; un block fait continuer le tour avec la raison (contract v7)",
+    ),
+    (
+        "hooks.subagent_stop",
+        "le hook SubagentStop du graphe est consulté quand un sous-agent s'arrête (contract v7)",
+    ),
+    (
+        "hooks.notification",
+        "le hook Notification du graphe est appelé quand une permission est attendue (contract v7)",
     ),
     (
         "compaction",
@@ -329,6 +350,54 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
             why: CLI_PROMPT_CACHE,
         },
     ),
+    // ISO1: the 5 contract-v7 hooks on CC Legacy. graph_hook_table() only registers
+    // PreCompact / PreToolUse / PostToolUse; the new events go through neutral_hooks()
+    // on the Agent Engine path and through direct SessionHooks calls on Native.
+    (
+        Engine::ClaudeCode,
+        "hooks.session_start",
+        Expect::Gap {
+            cause: Cause::Harness,
+            task: "ISO1",
+            why: CC_LEGACY_NO_V7_HOOKS,
+        },
+    ),
+    (
+        Engine::ClaudeCode,
+        "hooks.user_prompt_submit",
+        Expect::Gap {
+            cause: Cause::Harness,
+            task: "ISO1",
+            why: CC_LEGACY_NO_V7_HOOKS,
+        },
+    ),
+    (
+        Engine::ClaudeCode,
+        "hooks.stop",
+        Expect::Gap {
+            cause: Cause::Harness,
+            task: "ISO1",
+            why: CC_LEGACY_NO_V7_HOOKS,
+        },
+    ),
+    (
+        Engine::ClaudeCode,
+        "hooks.subagent_stop",
+        Expect::Gap {
+            cause: Cause::Harness,
+            task: "ISO1",
+            why: CC_LEGACY_NO_V7_HOOKS,
+        },
+    ),
+    (
+        Engine::ClaudeCode,
+        "hooks.notification",
+        Expect::Gap {
+            cause: Cause::Harness,
+            task: "ISO1",
+            why: CC_LEGACY_NO_V7_HOOKS,
+        },
+    ),
 ];
 
 /// Why `nexus_tools` is not measured on Claude Code, whatever its engine.
@@ -345,6 +414,17 @@ const CLI_PROMPT_CACHE: &str =
     "le CLI Claude parle lui-même l'API Messages et pose ses propres points \
                                 de cache : fake_claude rejoue un transcript, la requête au modèle \
                                 n'est pas visible du harnais";
+
+/// Why the 5 contract-v7 hooks are gaps on the CC Legacy engine. `graph_hook_table()`
+/// only registers PreCompact, PreToolUse and PostToolUse hook callbacks; the CLI never
+/// sends hook_callbacks for the new events (`UserPromptSubmit`, `Stop`, `SubagentStop`,
+/// `Notification`). The Agent Engine path uses `neutral_hooks()` which registers all 7,
+/// and the Native path calls `SessionHooks` directly.
+const CC_LEGACY_NO_V7_HOOKS: &str =
+    "le chemin CC Legacy (InteractiveClient direct) enregistre les hooks via \
+     graph_hook_table() qui ne couvre que PreCompact / PreToolUse / PostToolUse ; \
+     les 5 événements du contrat v7 ne sont pas envoyés au CLI — ils fonctionnent \
+     sur le moteur agent (neutral_hooks) et sur le natif (appels SessionHooks directs)";
 
 /// Why every function is `not_measured` on Codex (YARDSTICK, task 87eb345e).
 const CODEX_NOT_MEASURED: &str =
@@ -1490,10 +1570,25 @@ fn transcript_main(k: Keys, cwd: &str, path: ProviderPath) -> Vec<Value> {
         // The SDK registers its hooks at connect; their callback ids are minted at
         // run time: the fake remembers them.
         capture_hooks(),
+        // ISO1: SessionStart (contract v7) is NOT emitted by the CLI — the façade
+        // calls hooks.session_start() directly (see ClaudeCodeSession::session_start in
+        // nexus). Verified through the answers struct in the cc/na checks below.
+        //
         // TURN-ONE: a Grep (before_tool hook, then after_tool hook on its noisy
         // result), a compaction announced by the CLI (before_compaction hook), its
         // boundary, then an answer.
         await_in(&k.k("TURN-ONE")),
+        // ISO1: UserPromptSubmit fires when the user's input arrives (contract v7).
+        hook(
+            "UserPromptSubmit",
+            "hook-prompt",
+            hook_input(
+                "UserPromptSubmit",
+                cwd,
+                json!({"prompt": k.k("TURN-ONE")}),
+            ),
+            None,
+        ),
         sleep_ms(200),
         init("cc-sess-1"),
         cc_tool_use("t1", "Grep", grep_input.clone()),
@@ -1547,7 +1642,25 @@ fn transcript_main(k: Keys, cwd: &str, path: ProviderPath) -> Vec<Value> {
         await_in("\"interrupt\""),
         result("error_during_execution", "", true),
     ]);
-    t.extend(answer(&k.k("TURN-THREE"), "answered three"));
+    // ISO1: TURN-THREE answers with text (no tools); the Stop hook fires before the
+    // turn ends (contract v7). On the fake the response is not acted on — the blocking
+    // behaviour is tested on the agent engine and the native harness.
+    t.extend(vec![
+        await_in(&k.k("TURN-THREE")),
+        text("answered three"),
+        hook(
+            "Stop",
+            "hook-stop",
+            hook_input(
+                "Stop",
+                cwd,
+                json!({"stop_hook_active": false,
+                       "last_assistant_message": "answered three"}),
+            ),
+            None,
+        ),
+        result_ok("answered three"),
+    ]);
     // TURN-FOUR stops on the turn limit; auto-continue sends the continuation.
     t.extend(vec![
         await_in(&k.k("TURN-FOUR")),
@@ -1573,6 +1686,21 @@ fn transcript_main(k: Keys, cwd: &str, path: ProviderPath) -> Vec<Value> {
         ),
         permission_request("req-perm", "Bash", json!({"command": "ls"}), "t5"),
         await_in("req-perm"),
+        // ISO1: Notification fires when a tool waits for permission (contract v7).
+        // Placed AFTER await_in("req-perm"): the Notification hook wait in next_line
+        // would consume the permission response otherwise (next_line discards lines
+        // that don't match the needle).
+        hook(
+            "Notification",
+            "hook-notify",
+            hook_input(
+                "Notification",
+                cwd,
+                json!({"notification_type": "permission_prompt",
+                       "message": "Bash needs permission", "title": ""}),
+            ),
+            None,
+        ),
         cc_tool_result("t5", "a.rs", false),
         text("answered five"),
         result_ok("answered five"),
@@ -1694,6 +1822,19 @@ fn transcript_main(k: Keys, cwd: &str, path: ProviderPath) -> Vec<Value> {
             json!({"description": "find the spec", "prompt": k.k("SUB-PROMPT")}),
         ),
         sub_agent_text("t-agent", &k.k("SUB-SAID")),
+        // ISO1: SubagentStop fires when the sub-agent finishes (contract v7).
+        hook(
+            "SubagentStop",
+            "hook-subagent-stop",
+            hook_input(
+                "SubagentStop",
+                cwd,
+                json!({"stop_hook_active": false,
+                       "last_assistant_message": k.k("SUB-SAID"),
+                       "agent_id": "", "agent_type": ""}),
+            ),
+            None,
+        ),
         cc_tool_result("t-agent", &k.k("SUB-ANSWER"), false),
         text("answered agent"),
         result_ok("answered agent"),
@@ -1771,6 +1912,19 @@ struct Answers {
     before_compaction: StdMutex<Vec<Option<String>>>,
     /// The limits every session was opened or resumed with, by provider kind (ISO5).
     limits: StdMutex<Vec<(ProviderKind, SessionLimits)>>,
+    /// ISO1: `session_start` calls, recording the source string.
+    session_start_sources: StdMutex<Vec<String>>,
+    /// ISO1: `user_prompt_submit` calls, recording the prompt.
+    user_prompt_submit_prompts: StdMutex<Vec<String>>,
+    /// ISO1: `before_stop` calls, recording the reply that was returned.
+    stop_replies: StdMutex<Vec<HookReply>>,
+    /// ISO1: when set, the next `before_stop` call blocks with this reason and clears
+    /// the flag (the inner hooks are not called). Used to test the stop-hook-blocks path.
+    stop_block_once: StdMutex<Option<String>>,
+    /// ISO1: `before_subagent_stop` was called.
+    subagent_stop_called: StdMutex<bool>,
+    /// ISO1: `notification` calls, recording the notification type.
+    notification_types: StdMutex<Vec<String>>,
 }
 
 /// The hooks the engine gave the session, every answer recorded.
@@ -1817,6 +1971,48 @@ impl SessionHooks for Recording {
     }
     async fn run_subagent(&self, request: &SubagentRequest) -> Result<String, String> {
         self.inner.run_subagent(request).await
+    }
+    async fn session_start(&self, info: &SessionStartInfo) -> HookReply {
+        let reply = self.inner.session_start(info).await;
+        self.answers
+            .session_start_sources
+            .lock()
+            .unwrap()
+            .push(info.source.clone());
+        reply
+    }
+    async fn user_prompt_submit(&self, prompt: &PromptInfo) -> HookReply {
+        let reply = self.inner.user_prompt_submit(prompt).await;
+        self.answers
+            .user_prompt_submit_prompts
+            .lock()
+            .unwrap()
+            .push(prompt.prompt.clone());
+        reply
+    }
+    async fn before_stop(&self, info: &StopInfo) -> HookReply {
+        // When the test sets stop_block_once, override the inner hooks with a block.
+        let override_reason = self.answers.stop_block_once.lock().unwrap().take();
+        let reply = if let Some(reason) = override_reason {
+            HookReply::block(reason)
+        } else {
+            self.inner.before_stop(info).await
+        };
+        self.answers.stop_replies.lock().unwrap().push(reply.clone());
+        reply
+    }
+    async fn before_subagent_stop(&self, info: &SubagentStopInfo) -> HookReply {
+        let reply = self.inner.before_subagent_stop(info).await;
+        *self.answers.subagent_stop_called.lock().unwrap() = true;
+        reply
+    }
+    async fn notification(&self, info: &NotificationInfo) {
+        self.answers
+            .notification_types
+            .lock()
+            .unwrap()
+            .push(info.notification_type.clone());
+        self.inner.notification(info).await;
     }
 }
 
@@ -2132,6 +2328,10 @@ fn native_script(k: Keys, cwd: &str) -> Value {
         ),
         says(&k.k("SUB-PROMPT"), &k.k("SUB-ANSWER")),
         says(&k.k("TURN-AGENT"), "answered agent"),
+        // ISO1: TURN-STOP: the model answers, the stop hook blocks once (via
+        // stop_block_once), the model continues with the feedback and answers again.
+        says(&k.k("TURN-STOP"), "partially done"),
+        says("Stop hook feedback", "answered stop"),
         // TURN-HUGE: a PO tool answers about a megabyte (fake_mcp `big`); the model then
         // answers; the next turn (TURN-AFTER-HUGE) starts on that history.
         calls(
@@ -2838,6 +3038,60 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         format!(
             "réponse au hook PreCompact : {:?}",
             compact.as_deref().map(excerpt)
+        ),
+    );
+    // ISO1: SessionStart — the façade calls hooks.session_start() directly (not through
+    // the CLI hook protocol). Verified through the Recording / answers struct.
+    let ss = answers.session_start_sources.lock().unwrap().clone();
+    cc.check(
+        "hooks.session_start",
+        !ss.is_empty(),
+        Cause::Harness,
+        format!("session_start appelé {} fois, sources={ss:?}", ss.len()),
+    );
+    // ISO1: UserPromptSubmit — the hook fires before each turn (contract v7).
+    let prompt_hook = cli.wait_line(0, "hook-prompt", WAIT).await;
+    cc.check(
+        "hooks.user_prompt_submit",
+        prompt_hook.is_some(),
+        Cause::Harness,
+        format!(
+            "réponse au hook UserPromptSubmit : {:?}",
+            prompt_hook.as_deref().map(excerpt)
+        ),
+    );
+    // ISO1: Stop — the hook fires before the turn ends (contract v7). On the fake the
+    // response is not acted on: the blocking path is tested on agent engine and native.
+    let stop_hook = cli.wait_line(0, "hook-stop", WAIT).await;
+    cc.check(
+        "hooks.stop",
+        stop_hook.is_some(),
+        Cause::Harness,
+        format!(
+            "réponse au hook Stop : {:?}",
+            stop_hook.as_deref().map(excerpt)
+        ),
+    );
+    // ISO1: SubagentStop — the hook fires when a sub-agent finishes (contract v7).
+    let subagent_stop = cli.wait_line(0, "hook-subagent-stop", WAIT).await;
+    cc.check(
+        "hooks.subagent_stop",
+        subagent_stop.is_some(),
+        Cause::Harness,
+        format!(
+            "réponse au hook SubagentStop : {:?}",
+            subagent_stop.as_deref().map(excerpt)
+        ),
+    );
+    // ISO1: Notification — the hook fires when a permission is pending (contract v7).
+    let notify = cli.wait_line(0, "hook-notify", WAIT).await;
+    cc.check(
+        "hooks.notification",
+        notify.is_some(),
+        Cause::Harness,
+        format!(
+            "réponse au hook Notification : {:?}",
+            notify.as_deref().map(excerpt)
         ),
     );
     assert!(
@@ -4198,6 +4452,34 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     );
     wn.settle(ends, &manager).await;
 
+    // ISO1: TURN-STOP — the model answers, the stop hook blocks once, the model receives
+    // the feedback as a user message and answers again.
+    *answers.stop_block_once.lock().unwrap() = Some("keep going".to_string());
+    let ends = wn.turn_ends();
+    manager
+        .send_message(&nid, &kn.k("TURN-STOP"))
+        .await
+        .unwrap();
+    na_sent += 1;
+    // The first model call answers "partially done"; the stop hook blocks with "keep going";
+    // the native loop pushes stop_hook_feedback("keep going") as a user message and calls
+    // the model again; the second call answers "answered stop" (keyed on "Stop hook feedback").
+    let stop_answered = wn.said(WAIT, "answered stop").await;
+    let stop_replies = answers.stop_replies.lock().unwrap().clone();
+    let blocked_once = stop_replies.iter().any(|r| r.block_reason().is_some());
+    // The feedback must have reached the model: the second request contains the feedback.
+    let feedback_sent = wait_body(&fake, "Stop hook feedback").await.is_some();
+    na.check(
+        "hooks.stop",
+        stop_answered && blocked_once && feedback_sent,
+        Cause::Harness,
+        format!(
+            "answered={stop_answered}, hook a bloqué={blocked_once}, feedback envoyé au modèle={feedback_sent}, \
+             stop_replies={stop_replies:?}"
+        ),
+    );
+    wn.settle(ends, &manager).await;
+
     // A tool result of about a megabyte: persisted, a bounded preview reaches the model, the
     // turn closes and the next one starts.
     let (ok, seen) = Box::pin(native_huge(&manager, &wn, &fake, kn, &nid)).await;
@@ -4259,6 +4541,43 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     .await;
     na_sent += 1;
     na.check("compaction.manual", ok, Cause::Harness, seen);
+
+    // ISO1: SessionStart — the hook fired at session open (contract v7).
+    let ss = answers.session_start_sources.lock().unwrap().clone();
+    na.check(
+        "hooks.session_start",
+        !ss.is_empty(),
+        Cause::Harness,
+        format!("session_start appelé {} fois, sources={ss:?}", ss.len()),
+    );
+    // ISO1: UserPromptSubmit — the hook fired before each turn (contract v7).
+    let prompts = answers.user_prompt_submit_prompts.lock().unwrap().clone();
+    na.check(
+        "hooks.user_prompt_submit",
+        !prompts.is_empty(),
+        Cause::Harness,
+        format!(
+            "user_prompt_submit appelé {} fois, prompts={:?}",
+            prompts.len(),
+            prompts.iter().map(|p| excerpt(p)).collect::<Vec<_>>()
+        ),
+    );
+    // ISO1: SubagentStop — the hook fired when the sub-agent finished (contract v7).
+    let sub_called = *answers.subagent_stop_called.lock().unwrap();
+    na.check(
+        "hooks.subagent_stop",
+        sub_called,
+        Cause::Harness,
+        format!("before_subagent_stop appelé={sub_called}"),
+    );
+    // ISO1: Notification — the hook fired when a permission was pending (contract v7).
+    let notif = answers.notification_types.lock().unwrap().clone();
+    na.check(
+        "hooks.notification",
+        notif.iter().any(|t| t == "permission_prompt"),
+        Cause::Harness,
+        format!("notification appelé {} fois, types={notif:?}", notif.len()),
+    );
 
     // The announcement (hard rule, below) and the record.
     let unduly = init.as_ref().map(not_model_limits);
