@@ -559,12 +559,124 @@ pub fn compute_cohesion(
 // Clustering Coefficient
 // ============================================================================
 
+/// Largest node count for which neighbour sets are kept as bitsets (`n²/8` bytes: 32 MiB
+/// at the limit). Above it, a marks array is used.
+const CLUSTERING_BITSET_MAX_NODES: usize = 16_384;
+
 /// Compute the local clustering coefficient for each node.
 ///
 /// For directed graphs, we consider the undirected neighborhood:
 /// coefficient = triangles / possible_triangles, where
 /// possible_triangles = k * (k-1) / 2 for k = number of unique neighbors.
+///
+/// Exact triangle counting on precomputed neighbour lists. The first version tested
+/// every pair of neighbours with `contains_edge` (a linear scan of an adjacency list):
+/// quadratic in the degree times the degree again, ~5·10¹¹ operations on a 1 344-node
+/// graph with a million edges (586 s, one thread). Here the triangles of `v` are
+/// `Σ_{a∈N(v)} |N(a) ∩ N(v)| / 2`, an intersection computed with a bitset AND
+/// (`n ≤ 16 384`) or a marks array. The result is identical to the pairwise count.
 pub fn clustering_coefficient(graph: &CodeGraph) -> HashMap<String, f64> {
+    let g = &graph.graph;
+    let n = g.node_count();
+    let mut result = HashMap::with_capacity(n);
+
+    // Undirected, deduplicated, self-loop-free neighbour lists (sorted by node index).
+    let adj: Vec<Vec<u32>> = g
+        .node_indices()
+        .map(|idx| {
+            let mut list: Vec<u32> = g
+                .neighbors_directed(idx, Direction::Outgoing)
+                .chain(g.neighbors_directed(idx, Direction::Incoming))
+                .filter(|&m| m != idx)
+                .map(|m| m.index() as u32)
+                .collect();
+            list.sort_unstable();
+            list.dedup();
+            list
+        })
+        .collect();
+
+    let triangles = if n <= CLUSTERING_BITSET_MAX_NODES {
+        triangles_by_bitset(&adj)
+    } else {
+        triangles_by_marks(&adj)
+    };
+
+    for idx in g.node_indices() {
+        let i = idx.index();
+        let k = adj[i].len();
+        let coeff = if k < 2 {
+            0.0
+        } else {
+            let possible = k * (k - 1) / 2;
+            triangles[i] as f64 / possible as f64
+        };
+        result.insert(g[idx].id.clone(), coeff);
+    }
+
+    result
+}
+
+/// Triangles through each node, intersecting neighbour sets as bitset rows.
+fn triangles_by_bitset(adj: &[Vec<u32>]) -> Vec<usize> {
+    let n = adj.len();
+    let words = n.div_ceil(64).max(1);
+    let mut rows = vec![0u64; n * words];
+    for (v, list) in adj.iter().enumerate() {
+        let row = &mut rows[v * words..(v + 1) * words];
+        for &m in list {
+            row[(m / 64) as usize] |= 1u64 << (m % 64);
+        }
+    }
+    adj.iter()
+        .enumerate()
+        .map(|(v, list)| {
+            let row_v = &rows[v * words..(v + 1) * words];
+            let twice: usize = list
+                .iter()
+                .map(|&a| {
+                    let row_a = &rows[a as usize * words..(a as usize + 1) * words];
+                    row_v
+                        .iter()
+                        .zip(row_a)
+                        .map(|(x, y)| (x & y).count_ones() as usize)
+                        .sum::<usize>()
+                })
+                .sum();
+            twice / 2
+        })
+        .collect()
+}
+
+/// Triangles through each node with a stamp array, for graphs too large for bitsets.
+fn triangles_by_marks(adj: &[Vec<u32>]) -> Vec<usize> {
+    let mut stamp = vec![u32::MAX; adj.len()];
+    adj.iter()
+        .enumerate()
+        .map(|(v, list)| {
+            if list.len() < 2 {
+                return 0;
+            }
+            for &m in list {
+                stamp[m as usize] = v as u32;
+            }
+            let twice: usize = list
+                .iter()
+                .map(|&a| {
+                    adj[a as usize]
+                        .iter()
+                        .filter(|&&b| stamp[b as usize] == v as u32)
+                        .count()
+                })
+                .sum();
+            twice / 2
+        })
+        .collect()
+}
+
+/// The pairwise definition, kept as the reference the fast version is checked against.
+#[cfg(test)]
+fn clustering_coefficient_reference(graph: &CodeGraph) -> HashMap<String, f64> {
     let g = &graph.graph;
     let mut result = HashMap::with_capacity(g.node_count());
 
@@ -4108,6 +4220,93 @@ mod tests {
             (cc["center"] - 0.0).abs() < f64::EPSILON,
             "Star center should have clustering coefficient 0.0, got {}",
             cc["center"]
+        );
+    }
+
+    /// A pseudo-random graph with self-loops, parallel edges and edges in both directions.
+    fn make_random_graph(nodes: usize, edges: usize, seed: u64) -> CodeGraph {
+        let mut g = CodeGraph::new();
+        for i in 0..nodes {
+            g.add_node(CodeNode {
+                id: format!("n{i}"),
+                node_type: CodeNodeType::File,
+                path: None,
+                name: format!("n{i}"),
+                project_id: None,
+            });
+        }
+        let mut state = seed;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        for _ in 0..edges {
+            let (a, b) = (next() % nodes, next() % nodes);
+            g.add_edge(
+                &format!("n{a}"),
+                &format!("n{b}"),
+                CodeEdge {
+                    edge_type: CodeEdgeType::Imports,
+                    weight: 1.0,
+                },
+            );
+        }
+        g
+    }
+
+    #[test]
+    fn the_fast_clustering_is_identical_to_the_pairwise_definition() {
+        for (nodes, edges, seed) in [(1, 0, 1), (7, 20, 2), (60, 400, 3), (200, 3000, 4)] {
+            let g = make_random_graph(nodes, edges, seed);
+            let fast = clustering_coefficient(&g);
+            let reference = clustering_coefficient_reference(&g);
+            assert_eq!(fast.len(), reference.len());
+            for (id, expected) in &reference {
+                assert_eq!(
+                    fast[id].to_bits(),
+                    expected.to_bits(),
+                    "{id} differs on ({nodes}, {edges}, {seed})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_marks_variant_agrees_with_the_bitset_variant() {
+        let g = make_random_graph(150, 1500, 9);
+        let adj: Vec<Vec<u32>> = g
+            .graph
+            .node_indices()
+            .map(|idx| {
+                let mut list: Vec<u32> = g
+                    .graph
+                    .neighbors_directed(idx, Direction::Outgoing)
+                    .chain(g.graph.neighbors_directed(idx, Direction::Incoming))
+                    .filter(|&m| m != idx)
+                    .map(|m| m.index() as u32)
+                    .collect();
+                list.sort_unstable();
+                list.dedup();
+                list
+            })
+            .collect();
+        assert_eq!(triangles_by_bitset(&adj), triangles_by_marks(&adj));
+    }
+
+    #[test]
+    fn clustering_a_dense_graph_of_a_thousand_nodes_is_fast() {
+        // The fabric graph of a large project: ~1 300 nodes, a million edges. The pairwise
+        // version needed minutes; the bound is loose (seconds) so it only guards the order.
+        let g = make_random_graph(1300, 600_000, 11);
+        let started = std::time::Instant::now();
+        let cc = clustering_coefficient(&g);
+        assert_eq!(cc.len(), 1300);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "took {:?}",
+            started.elapsed()
         );
     }
 

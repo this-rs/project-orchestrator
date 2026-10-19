@@ -31,6 +31,7 @@
 
 pub mod algorithms;
 pub mod confidence;
+pub mod cpu;
 pub mod debouncer;
 pub mod engine;
 pub mod enrichment;
