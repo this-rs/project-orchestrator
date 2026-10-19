@@ -8932,9 +8932,9 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-websocket"
-version = "2.4.3"
+version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ca243c7f0bf935cd81123e07f82188ccb919b19fbfc74518b947eedc4619bbb"
+checksum = "fe432106abc61677935462da4615f1c5c710747485e23d18ac8eb3631b3a0ddf"
 dependencies = [
  "futures-util",
  "http",
