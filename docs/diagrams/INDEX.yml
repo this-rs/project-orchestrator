@@ -53,6 +53,16 @@ diagrams:
     covers:
       - "backend:src/chat/{envelope,delegation_limits,subagents,mirror,session_pool,cancelled_parents}.rs"
       - "backend:src/auth/{agent_tokens,jwt,tool_profile}.rs"
+  - name: po-execution-place
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-execution-place.mmd
+    # T5 : « exécute dans X ». delegate_task (api/handlers.rs) reste a po-api, l'enveloppe a po-spawn-envelope.
+    covers:
+      - "backend:src/api/execution_place_handlers.rs"
+      - "backend:src/chat/place_confirmation.rs"
+      - "backend:src/runner/ephemeral_worktree.rs"
+      - "backend:src/neo4j/execution_place.rs"
   - name: po-chat-agent-runtime
     owner: theotime
     status: verified

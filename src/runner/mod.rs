@@ -20,6 +20,7 @@
 pub mod dispatch;
 pub mod eligibility;
 pub mod enricher;
+pub mod ephemeral_worktree;
 pub mod feedback;
 pub mod feedback_analyzer;
 pub mod git;

@@ -106,6 +106,8 @@ pub struct MockGraphStore {
     pub chat_sessions: RwLock<HashMap<Uuid, ChatSessionNode>>,
     /// Chat anchors and their journal (one lock: state and event change together).
     pub anchor_store: RwLock<MockAnchorStore>,
+    /// The execution-place audit (T5), append-only.
+    pub execution_place_events: RwLock<Vec<crate::neo4j::models::ExecutionPlaceEvent>>,
     /// Provider harness settings, by (scope, key).
     pub llm_settings: RwLock<HashMap<(String, String), String>>,
     /// Test switch: writes to the `journal` scope (the send journal) fail, to prove
@@ -378,6 +380,7 @@ impl MockGraphStore {
             document_links: RwLock::new(HashMap::new()),
             chat_sessions: RwLock::new(HashMap::new()),
             anchor_store: RwLock::new(MockAnchorStore::default()),
+            execution_place_events: RwLock::new(Vec::new()),
             llm_settings: RwLock::new(HashMap::new()),
             fail_journal_writes: std::sync::atomic::AtomicBool::new(false),
             session_link_rows: RwLock::new(Vec::new()),
@@ -8713,6 +8716,33 @@ impl GraphStore for MockGraphStore {
             .cloned()
             .collect();
         out.sort_by_key(|e| (e.seq, e.at, e.id));
+        Ok(out)
+    }
+
+    async fn create_execution_place_event(
+        &self,
+        event: &crate::neo4j::models::ExecutionPlaceEvent,
+    ) -> Result<()> {
+        self.execution_place_events
+            .write()
+            .await
+            .push(event.clone());
+        Ok(())
+    }
+
+    async fn list_execution_place_events(
+        &self,
+        task_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::models::ExecutionPlaceEvent>> {
+        let mut out: Vec<_> = self
+            .execution_place_events
+            .read()
+            .await
+            .iter()
+            .filter(|e| e.task_id == task_id)
+            .cloned()
+            .collect();
+        out.sort_by_key(|e| (e.at, e.id));
         Ok(out)
     }
 

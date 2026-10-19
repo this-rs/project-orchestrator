@@ -590,6 +590,8 @@ const CLOSED_ROUTE_PREFIXES: &[&str] = &[
     "/api/notes/consolidate-memory",
     "/api/notes/update-staleness",
     "/api/notes/update-energy",
+    // « exécute dans X » (T5): only a person answers; no tool confirms or rejects a place
+    "/api/execution-places",
     // no kept tool calls these
     "/api/agents",
     "/api/alerts",
@@ -1427,6 +1429,7 @@ mod tests {
             "/api/notes/consolidate-memory",
             "/api/notes/update-staleness",
             "/api/notes/update-energy",
+            "/api/execution-places/x/confirm",
             "/api/agents",
             "/api/alerts",
             "/api/attention",

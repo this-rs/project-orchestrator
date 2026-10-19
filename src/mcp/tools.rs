@@ -433,7 +433,8 @@ fn plan_tool() -> ToolDefinition {
                 "custom_sections": {"type": "array", "items": {"type": "string"}, "description": "Custom prompt sections to append (delegate_task)"},
                 "provider": {"type": "string", "description": "Provider instance id that should run the sub-agent (delegate_task). Optional: omit to let the server resolve it. The project's consent still applies."},
                 "model": {"type": "string", "description": "Model id or alias (fast, default, deep, utility) for the sub-agent (delegate_task). Optional: omit for the instance's default."},
-                "task_class": {"type": "string", "description": "Task class (simple, complex, creative...) recorded with the delegation and used by the model policy (delegate_task)"}
+                "task_class": {"type": "string", "description": "Task class (simple, complex, creative...) recorded with the delegation and used by the model policy (delegate_task)"},
+                "execution_place": {"type": "string", "enum": ["project", "ephemeral_worktree"], "description": "Where the delegated task writes (delegate_task). ephemeral_worktree: PO resolves a new git worktree X of the repository of cwd and waits for the PERSON in front of this conversation to confirm « exécute dans X »; nothing runs before. An agent cannot confirm. Refused when nobody is in front of the session."}
             })),
             required: Some(vec!["action".to_string()]),
         },

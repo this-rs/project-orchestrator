@@ -51,6 +51,8 @@ const EXPECTED_CONSTRAINTS: &[&str] = &[
     "anchor_id",
     "anchor_session_target",
     "anchor_event_id",
+    // Execution-place audit (T5)
+    "execution_place_event_id",
     // Synaptic layer in shadow mode (T8)
     "synapse_shadow_trace_id",
     // Skills, protocols, personas, alerts, routing
@@ -429,6 +431,8 @@ impl Neo4jClient {
             "CREATE CONSTRAINT anchor_id IF NOT EXISTS FOR (a:Anchor) REQUIRE a.id IS UNIQUE",
             "CREATE CONSTRAINT anchor_session_target IF NOT EXISTS FOR (a:Anchor) REQUIRE (a.session_id, a.target_type, a.target_id) IS UNIQUE",
             "CREATE CONSTRAINT anchor_event_id IF NOT EXISTS FOR (e:AnchorEvent) REQUIRE e.id IS UNIQUE",
+            // Execution-place audit (T5): append-only, one node per event.
+            "CREATE CONSTRAINT execution_place_event_id IF NOT EXISTS FOR (e:ExecutionPlaceEvent) REQUIRE e.id IS UNIQUE",
             "CREATE CONSTRAINT synapse_shadow_trace_id IF NOT EXISTS FOR (t:SynapseShadowTrace) REQUIRE t.id IS UNIQUE",
             // Milestone & Release constraints
             "CREATE CONSTRAINT milestone_id IF NOT EXISTS FOR (m:Milestone) REQUIRE m.id IS UNIQUE",
@@ -528,6 +532,7 @@ impl Neo4jClient {
             "CREATE INDEX anchor_session IF NOT EXISTS FOR (a:Anchor) ON (a.session_id)",
             "CREATE INDEX synapse_shadow_trace_session IF NOT EXISTS FOR (t:SynapseShadowTrace) ON (t.session_id)",
             "CREATE INDEX anchor_event_session IF NOT EXISTS FOR (e:AnchorEvent) ON (e.session_id)",
+            "CREATE INDEX execution_place_event_task IF NOT EXISTS FOR (e:ExecutionPlaceEvent) ON (e.task_id)",
             "CREATE INDEX anchor_event_anchor IF NOT EXISTS FOR (e:AnchorEvent) ON (e.anchor_id)",
             // Journal order: `seq` is the per-session sequence number (see apply_anchor_op)
             "CREATE INDEX anchor_event_session_seq IF NOT EXISTS FOR (e:AnchorEvent) ON (e.session_id, e.seq)",

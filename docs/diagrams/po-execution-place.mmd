@@ -1,0 +1,70 @@
+%% name: po-execution-place
+%% covers: backend:src/api/execution_place_handlers.rs backend:src/chat/place_confirmation.rs backend:src/runner/ephemeral_worktree.rs backend:src/neo4j/execution_place.rs
+%% verified: 53ec3118
+%% ---
+%% PROUVE : « exécute dans X » (plan 09c88ffe, tâche T5) — une tâche déléguée qui écrit dans un
+%%   worktree éphémère, tel que le code le fait sur la branche feat/t5-exec-place-confirm (base 53ec3118) :
+%%   X résolu par PO, confirmation par une PERSONNE seulement, journal append-only, nettoyage sans perte.
+%% ---
+%% SOURCES LUES :
+%%   src/api/handlers.rs                 — delegate_task (execution_place), PreparedDelegation, launch_delegation
+%%   src/api/execution_place_handlers.rs — request_placement, confirm_execution_place, reject_execution_place,
+%%                                         get_execution_place, list_execution_place_events, LaunchedPlace
+%%   src/chat/place_confirmation.rs      — person_in_front, PlacementBook (request, confirm, reject, discard)
+%%   src/runner/ephemeral_worktree.rs    — plan, create, EphemeralWorktree::release, KeepReason
+%%   src/neo4j/execution_place.rs        — create_execution_place_event, list_execution_place_events
+%%   src/auth/middleware.rs              — is_human_only_mutation (/api/execution-places)
+%%   src/auth/tool_profile.rs            — CLOSED_ROUTE_PREFIXES (/api/execution-places)
+%% ---
+%% NON ETABLI :
+%%   aucun test de bout en bout avec un vrai moteur : le chemin « tâche finie → session fermée →
+%%   worktree libéré » (LaunchedPlace::finish) n'est testé que par ses parties (release sur dépôt
+%%   temporaire) ; le chemin d'échec (launch_failed) est testé de bout en bout sur MockGraphStore ;
+%%   les placements en attente vivent en mémoire (perdus au redémarrage : il faut redemander) ;
+%%   un worktree laissé par un arrêt brutal du serveur n'est pas balayé au démarrage ;
+%%   aucune interface ne montre encore la question (événement CRUD execution_place_confirmation_required émis) ;
+%%   la Cypher n'a pas été exécutée contre un Neo4j réel.
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans test  ⚪ autre domaine
+
+flowchart TD
+    subgraph legend["Légende"]
+        direction LR
+        L1["✅ vérifié par test"]
+        L2["🟠 écrit, sans test"]
+        L3["⚪ autre domaine"]
+    end
+
+    REQ["⚪ POST /api/plans/{plan}/tasks/{task}/delegate<br/>execution_place: ephemeral_worktree<br/>(enveloppe A17 appliquée au cwd demandé : po-spawn-envelope)"]
+    WHO{"✅ person_in_front<br/>session qui demande : owner signé, pas de spawned_by<br/>appel direct : Claims::may_keep_lasting_approvals<br/>test : a_session_with_nobody_in_front_is_refused_without_a_question"}
+    NOP["✅ 403 execution_place_no_person<br/>aucune question gardée, aucun journal<br/>(délégué, sous-agent, runner, protocole, anonyme, jeton agent)"]
+    PLAN["✅ ephemeral_worktree::plan<br/>dépôt = worktree PRINCIPAL ; base = origin/HEAD sinon HEAD, SHA figé ;<br/>X sous &lt;app&gt;/task-worktrees, jamais dans un worktree ; rien n'est créé<br/>test : the_place_is_planned_from_the_main_worktree_at_a_frozen_sha_outside_any_worktree"]
+    BOOK["✅ PlacementBook::request<br/>idempotent (tâche, personne, dépôt) ; 4 par personne, 32 au total, 15 min<br/>journal : requested (sinon rien n'est gardé)<br/>test : requests_are_idempotent_and_bounded, the_place_waits_for_its_person_and_names_x_resolved_by_po"]
+    ASK["🟠 202 confirmation_required + événement execution_place_confirmation_required"]
+
+    CONF{"✅ POST /api/execution-places/{id}/confirm {path: X}<br/>middleware : mutation réservée à un humain ; handler : jeton agent refusé ;<br/>PlacementBook::confirm : une PERSONNE, le propriétaire, X exact<br/>test : an_agent_token_cannot_confirm_for_its_person, an_agent_token_never_confirms_even_for_its_own_person,<br/>the_confirmation_must_name_the_place_po_resolved, human_only_mutation_matches_whole_segments_only"}
+    REF["✅ 403 not_a_person / not_the_owner, 409 mismatch<br/>la question reste en attente"]
+    AUD["✅ journal : confirmed (qui, X, quand, tâche) AVANT toute création<br/>échec d'écriture → rien n'est créé"]
+    MAKE["✅ ephemeral_worktree::create<br/>git worktree add -b po/task-… X &lt;sha figé&gt;"]
+    LAUNCH["⚪ launch_delegation (cwd = X)<br/>journal : launched (session)"]
+    FAIL["✅ échec d'ouverture → launch_failed puis libération immédiate<br/>test : a_confirmed_place_is_audited_made_and_released_when_the_launch_fails"]
+    DONE["🟠 tâche finie (résultat, échec, filet 1 h) → close_session → LaunchedPlace::finish"]
+    REL{"✅ EphemeralWorktree::release<br/>modifs non commitées (non suivis compris) ? commits hors base et hors remotes (HEAD détaché compris) ? illisible ?"}
+    KEPT["✅ GARDÉ avec sa branche + raison ; journal kept<br/>test : a_worktree_with_unpushed_commits_is_kept_with_its_branch,<br/>a_worktree_with_uncommitted_or_untracked_files_is_kept, a_detached_commit_in_the_worktree_is_unpushed_work_too"]
+    GONE["✅ git worktree remove (sans --force) + branch -D ; journal removed<br/>test : a_clean_worktree_is_removed_with_its_branch, pushed_commits_do_not_keep_the_worktree"]
+    REJ["✅ POST …/reject → journal rejected<br/>test : the_person_may_say_no"]
+    READ["🟠 GET /api/tasks/{task}/execution-places — le journal, du plus ancien au plus récent"]
+
+    REQ --> WHO
+    WHO -- personne --> NOP
+    WHO -- une personne répond --> PLAN --> BOOK --> ASK
+    ASK --> CONF
+    ASK --> REJ
+    CONF -- refus --> REF
+    CONF -- accepté --> AUD --> MAKE --> LAUNCH
+    LAUNCH -- échec --> FAIL --> REL
+    LAUNCH -- ouverte --> DONE --> REL
+    REL -- travail en jeu --> KEPT
+    REL -- rien à perdre --> GONE
+    AUD -.-> READ
