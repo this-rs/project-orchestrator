@@ -86,6 +86,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
+      # rust-toolchain sets CARGO_INCREMENTAL=0. These binaries only serve API Tests (release.yml
+      # builds what ships): on the self-hosted runner, keep the crate's incremental state, which
+      # build.rs invalidates at every commit anyway (it embeds `git describe`).
+      - name: Incremental release build (self-hosted runner)
+        if: runner.environment == 'self-hosted'
+        run: echo "CARGO_INCREMENTAL=1" >> "$GITHUB_ENV"
+
       - name: Cache cargo registry
         if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
