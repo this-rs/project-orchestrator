@@ -1074,6 +1074,9 @@ pub struct ChatManager {
     /// envelope counts the live children and held until the sub-agent ends, so parallel `Agent`
     /// calls cannot all count the same children and pass the cap together.
     pub(crate) subagent_slots: std::sync::Mutex<HashMap<String, usize>>,
+    /// The openings of children in flight, per parent, from EVERY path (P18-suite, point 6):
+    /// counted by the envelope with the live children (`envelope::ChildOpenings`).
+    pub(crate) child_openings: super::envelope::ChildOpenings,
     /// The cap on a parent's live children in force now (PLAFOND-RT): read at every delegation,
     /// replaced at runtime by `set_max_live_children`, seeded from the stored setting at startup.
     pub(crate) live_children_cap: std::sync::atomic::AtomicUsize,
@@ -3630,6 +3633,7 @@ impl ChatManager {
             self_ref: Default::default(),
             agent_modes: Default::default(),
             subagent_slots: Default::default(),
+            child_openings: Default::default(),
             live_children_cap: std::sync::atomic::AtomicUsize::new(
                 super::envelope::MAX_LIVE_CHILDREN,
             ),
@@ -3738,6 +3742,7 @@ impl ChatManager {
             self_ref: Default::default(),
             agent_modes: Default::default(),
             subagent_slots: Default::default(),
+            child_openings: Default::default(),
             live_children_cap: std::sync::atomic::AtomicUsize::new(
                 super::envelope::MAX_LIVE_CHILDREN,
             ),
