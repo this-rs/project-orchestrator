@@ -281,6 +281,10 @@ const FUNCTIONS: &[(&str, &str)] = &[
         "session_limits",
         "sans réglage, aucune limite de durée par tour ni budget de session (ISO5) : le CLI ne reçoit pas --max-budget-usd, une session du moteur agent s'ouvre et reprend sans turn_timeout_ms ni max_tokens",
     ),
+    (
+        "anthropic_messages",
+        "une instance `anthropic` (clé au coffre) : le harnais natif parle lui-même l'API Messages, et la requête reçue par le modèle porte les trois points cache_control — dernier outil, système, dernier tour (CTX5)",
+    ),
 ];
 
 /// Every cell of the table that is not `ok`, declared. A gap measured and not
@@ -311,6 +315,20 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
             why: CLI_TOOL_SEARCH,
         },
     ),
+    (
+        Engine::ClaudeCode,
+        "anthropic_messages",
+        Expect::NotMeasured {
+            why: CLI_PROMPT_CACHE,
+        },
+    ),
+    (
+        Engine::ClaudeCodeAgent,
+        "anthropic_messages",
+        Expect::NotMeasured {
+            why: CLI_PROMPT_CACHE,
+        },
+    ),
 ];
 
 /// Why `nexus_tools` is not measured on Claude Code, whatever its engine.
@@ -321,6 +339,12 @@ const CLI_TOOLS: &str = "Read / Edit / Bash sont les outils internes du CLI Clau
 const CLI_TOOL_SEARCH: &str = "les outils différés et ToolSearch sont internes au CLI Claude : la \
                                liste d'outils qu'il envoie au modèle n'est pas visible du \
                                harnais, et fake_claude rejoue un transcript";
+
+/// Why `anthropic_messages` is not measured on Claude Code, whatever its engine.
+const CLI_PROMPT_CACHE: &str =
+    "le CLI Claude parle lui-même l'API Messages et pose ses propres points \
+                                de cache : fake_claude rejoue un transcript, la requête au modèle \
+                                n'est pas visible du harnais";
 
 /// Why every function is `not_measured` on Codex (YARDSTICK, task 87eb345e).
 const CODEX_NOT_MEASURED: &str =
@@ -801,6 +825,9 @@ struct Stage {
     dir: tempfile::TempDir,
     /// The data directory: the documents' blobs, and the native transcripts (P14).
     data: tempfile::TempDir,
+    /// The vault of every backend of the stage: the key of the `anthropic` instance
+    /// (CTX5), granted to that instance only.
+    vault: Arc<crate::vault::VaultService>,
 }
 
 impl Stage {
@@ -834,6 +861,7 @@ impl Stage {
         let other = NatsEmitter::new(broker.client().await, "events");
         let blobs = tempfile::tempdir().unwrap();
         let store = DocumentStore::new(blobs.path());
+        let vault = anthropic_vault().await;
         Self {
             graph,
             project,
@@ -843,6 +871,7 @@ impl Stage {
             store,
             dir,
             data: blobs,
+            vault,
         }
     }
 
@@ -918,6 +947,7 @@ impl Stage {
             .with_nats(owner)
             .with_refs_v1(true)
             .with_document_store(self.store.clone())
+            .with_vault(Arc::clone(&self.vault))
             .with_native_transcripts(self.data.path().join("native-transcripts"));
         manager.update_claude_cli_path(Some(cli.path())).await;
         // As the server does at startup (CTX2): the deferred tools come from the stored
@@ -2843,6 +2873,11 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         Verdict::NotMeasured,
         "outils différés internes au CLI, liste d'outils invisible du harnais",
     );
+    cc.set(
+        "anthropic_messages",
+        Verdict::NotMeasured,
+        "cache de prompt posé par le CLI, requête au modèle invisible du harnais",
+    );
     w.settle(0, &manager).await;
 
     // Message queue: TURN-THREE sent while TURN-TWO runs.
@@ -4292,6 +4327,12 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     wb.said(WAIT, "answered switch two").await;
     let _ = manager.close_session(&back.session_id).await;
 
+    // ===================================================================
+    // native over the Anthropic Messages API (CTX5): an `anthropic` instance
+    // ===================================================================
+    let (ok, seen) = anthropic_turn(&stage, &manager, &cwd).await;
+    na.check("anthropic_messages", ok, Cause::Harness, seen);
+
     // The hard rule: the native harness announces only limits of the MODEL.
     if let Some(unduly) = &unduly {
         assert!(
@@ -4301,6 +4342,172 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         );
     }
     (cc, na)
+}
+
+// ============================================================================
+// The native harness over the Anthropic Messages API (CTX5)
+// ============================================================================
+
+/// Id of the `anthropic` instance of the stage, and the vault entry of its key.
+const ANTHROPIC_ID: &str = "claude-api";
+const ANTHROPIC_VAULT_KEY: &str = "anthropic-key";
+/// A key-shaped value that must never be seen anywhere but in the request header.
+const ANTHROPIC_KEY: &str = "sk-ant-parity-0123456789abcdef";
+
+/// The vault of the stage: unlocked, the key of the `anthropic` instance granted to it.
+async fn anthropic_vault() -> Arc<crate::vault::VaultService> {
+    use crate::vault::grants::{GrantScope, SecretSelector};
+    let vault = crate::vault::VaultService::ephemeral();
+    vault
+        .init(
+            "correct horse battery staple".into(),
+            chrono::Duration::hours(1),
+        )
+        .await
+        .unwrap();
+    let now = Utc::now();
+    vault
+        .put(ANTHROPIC_VAULT_KEY, ANTHROPIC_KEY, None, now)
+        .unwrap();
+    vault
+        .grant(
+            SecretSelector::Names([ANTHROPIC_VAULT_KEY.to_string()].into()),
+            GrantScope::Provider(ANTHROPIC_ID.to_string()),
+            chrono::Duration::hours(1),
+            None,
+            now,
+        )
+        .unwrap();
+    vault
+}
+
+/// A fake Anthropic API: the catalogue, and a Messages answer framed as the real one.
+fn anthropic_routes() -> Value {
+    let events = vec![
+        json!({"type": "message_start", "message": {"id": "msg_p", "type": "message",
+            "role": "assistant", "content": [], "model": "m",
+            "usage": {"input_tokens": 20, "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0, "output_tokens": 1}}}),
+        json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""}}),
+        json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "answered anthropic"}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 3}}),
+        json!({"type": "message_stop"}),
+    ];
+    json!([
+        {"method": "GET", "path": "/v1/models", "status": 200,
+         "body": {"data": [{"id": "m", "max_input_tokens": 200000,
+            "capabilities": {"image_input": {"supported": true}}}], "has_more": false}},
+        {"method": "POST", "path": "/v1/messages", "status": 200,
+         "sse_event_names": true, "sse": events},
+    ])
+}
+
+/// Every JSON path of `body` that carries a `cache_control`.
+fn cache_points(body: &Value) -> Vec<String> {
+    fn walk(value: &Value, path: String, out: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, inner) in map {
+                    if key == "cache_control" {
+                        out.push(path.clone());
+                    } else {
+                        walk(inner, format!("{path}.{key}"), out);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for (index, inner) in items.iter().enumerate() {
+                    walk(inner, format!("{path}[{index}]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(body, String::new(), &mut out);
+    out
+}
+
+/// One turn on an `anthropic` instance, opened by the manager like any instance (stored
+/// record, consent, key in the vault): `ok` when the model received ONE request on
+/// `/v1/messages` whose `cache_control` points are exactly the last tool, the system
+/// block and the last block of the last message, and the answer came back.
+async fn anthropic_turn(stage: &Stage, manager: &Arc<ChatManager>, cwd: &str) -> (bool, String) {
+    use super::provider::settings::{InstanceRecord, KIND_ANTHROPIC};
+    let fake = FakeOpenAi::start(anthropic_routes());
+    let record = InstanceRecord {
+        id: ANTHROPIC_ID.into(),
+        kind: KIND_ANTHROPIC.into(),
+        label: "Claude API".into(),
+        base_url: fake.base_url(),
+        origin: fake.origin(),
+        default_model: Some("m".into()),
+        cost_source: "unknown".into(),
+        credential_ref: format!("vault:{ANTHROPIC_VAULT_KEY}"),
+        ..Default::default()
+    };
+    store_instance(&stage.graph, &record).await;
+    consent(&stage.graph, "proj", ANTHROPIC_ID, &fake.origin()).await;
+    let mut req = request(Some(ANTHROPIC_ID), Some("proj"), "default");
+    req.cwd = cwd.to_string();
+    req.message = "ANTHROPIC-TURN: say hello".into();
+    req.user_claims = Some(parity_person());
+    let sid = match manager.create_session(&req).await {
+        Ok(created) => created.session_id,
+        Err(e) => return (false, format!("session anthropic refusée : {e:#}")),
+    };
+    let w = Watch::start(
+        stage.graph.clone(),
+        &sid,
+        manager.subscribe(&sid).await.unwrap(),
+    );
+    let answered = w.said(WAIT, "answered anthropic").await;
+    let posts: Vec<Value> = fake
+        .requests()
+        .into_iter()
+        .filter(|r| r["method"] == "POST" && r["path"] == "/v1/messages")
+        .collect();
+    w.settle(0, manager).await;
+    let _ = manager.close_session(&sid).await;
+    let Some(post) = posts.first() else {
+        return (false, "aucune requête POST /v1/messages".to_string());
+    };
+    let body = &post["body"];
+    let last = body["messages"]
+        .as_array()
+        .map_or(0, |m| m.len().saturating_sub(1));
+    let last_block = body["messages"][last]["content"]
+        .as_array()
+        .map_or(0, |c| c.len().saturating_sub(1));
+    let tools = body["tools"].as_array().map_or(0, Vec::len);
+    let expected = vec![
+        format!(".messages[{last}].content[{last_block}]"),
+        ".system[0]".to_string(),
+        format!(".tools[{}]", tools.saturating_sub(1)),
+    ];
+    let points = cache_points(body);
+    let version = post["header_values"]["anthropic-version"] == "2023-06-01";
+    let key_sent = post["authorization_present"] == true || post["x_api_key_present"] == true;
+    let leaked = post.to_string().contains(ANTHROPIC_KEY);
+    let ok = posts.len() == 1
+        && answered
+        && tools > 0
+        && points == expected
+        && version
+        && key_sent
+        && !leaked;
+    (
+        ok,
+        format!(
+            "requêtes /v1/messages={}, réponse={answered}, outils={tools}, points={points:?}, \
+             anthropic-version={version}, clé envoyée={key_sent}, clé journalisée={leaked}",
+            posts.len()
+        ),
+    )
 }
 
 // ============================================================================

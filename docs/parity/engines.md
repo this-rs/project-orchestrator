@@ -49,8 +49,9 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | `subagents` | un sous-agent (Agent / Task) travaille et sa réponse revient en résultat ; sur le natif, une session enfant qui ne peut pas re-déléguer | ok | ok | ok | not_measured | not_measured | not_measured |
 | `system_init.degraded` | system_init n'annonce comme manquant qu'une limite du modèle (liste fermée) | ok | ok | ok | not_measured | not_measured | not_measured |
 | `session_limits` | sans réglage, aucune limite de durée par tour ni budget de session (ISO5) : le CLI ne reçoit pas --max-budget-usd, une session du moteur agent s'ouvre et reprend sans turn_timeout_ms ni max_tokens | ok | ok | ok | not_measured | not_measured | not_measured |
+| `anthropic_messages` | une instance `anthropic` (clé au coffre) : le harnais natif parle lui-même l'API Messages, et la requête reçue par le modèle porte les trois points cache_control — dernier outil, système, dernier tour (CTX5) | not_measured | not_measured | ok | not_measured | not_measured | not_measured |
 
-`ok` : Claude Code 31/33, Claude Code (moteur agent) 31/33, natif 33/33, Codex 0/33, opencode 0/33, ACP 0/33.
+`ok` : Claude Code 31/34, Claude Code (moteur agent) 31/34, natif 34/34, Codex 0/34, opencode 0/34, ACP 0/34.
 
 ## Écarts déclarés
 
@@ -63,8 +64,10 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 |---|---|---|
 | Claude Code | `tool_search` | les outils différés et ToolSearch sont internes au CLI Claude : la liste d'outils qu'il envoie au modèle n'est pas visible du harnais, et fake_claude rejoue un transcript |
 | Claude Code | `nexus_tools` | Read / Edit / Bash sont les outils internes du CLI Claude : fake_claude rejoue un transcript et n'exécute aucun outil |
+| Claude Code | `anthropic_messages` | le CLI Claude parle lui-même l'API Messages et pose ses propres points de cache : fake_claude rejoue un transcript, la requête au modèle n'est pas visible du harnais |
 | Claude Code (moteur agent) | `tool_search` | les outils différés et ToolSearch sont internes au CLI Claude : la liste d'outils qu'il envoie au modèle n'est pas visible du harnais, et fake_claude rejoue un transcript |
 | Claude Code (moteur agent) | `nexus_tools` | Read / Edit / Bash sont les outils internes du CLI Claude : fake_claude rejoue un transcript et n'exécute aucun outil |
+| Claude Code (moteur agent) | `anthropic_messages` | le CLI Claude parle lui-même l'API Messages et pose ses propres points de cache : fake_claude rejoue un transcript, la requête au modèle n'est pas visible du harnais |
 | Codex | `hooks.before_tool` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | Codex | `hooks.after_tool` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | Codex | `hooks.before_compaction` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
@@ -98,6 +101,7 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | Codex | `subagents` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | Codex | `system_init.degraded` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | Codex | `session_limits` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
+| Codex | `anthropic_messages` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `hooks.before_tool` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `hooks.after_tool` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `hooks.before_compaction` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
@@ -131,6 +135,7 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | opencode | `subagents` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `system_init.degraded` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `session_limits` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
+| opencode | `anthropic_messages` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | ACP | `hooks.before_tool` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
 | ACP | `hooks.after_tool` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
 | ACP | `hooks.before_compaction` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
@@ -164,6 +169,7 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | ACP | `subagents` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
 | ACP | `system_init.degraded` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
 | ACP | `session_limits` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
+| ACP | `anthropic_messages` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
 
 ## À re-mesurer à chaque montée du CLI Claude Code
 

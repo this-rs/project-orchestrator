@@ -649,7 +649,7 @@ fn provider_tool() -> ToolDefinition {
                     "description": "Operation to perform"
                 },
                 "id": {"type": "string", "description": "Instance id (get/update/delete/status/models). `claude-code` is the built-in local instance and is never written"},
-                "kind": {"type": "string", "description": "Kind (create): openai_compatible (default), codex, acp, claude_code_remote"},
+                "kind": {"type": "string", "description": "Kind (create): openai_compatible (default), anthropic (native harness on the Anthropic Messages API; base_url optional, credential_ref must be vault:<name>), codex, acp, claude_code_remote"},
                 "preset": {"type": "string", "description": "Informational preset (create/update): deepseek, vllm, ollama, llama_server, nim. For acp, names the agent declared on the server"},
                 "label": {"type": "string", "description": "Display label (create/update). A claude_code_remote instance takes its id from it"},
                 "base_url": {"type": "string", "description": "Endpoint base URL (create/update), https outside loopback. Not used by codex, acp and claude_code_remote"},
