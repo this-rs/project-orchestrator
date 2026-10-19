@@ -12,11 +12,30 @@ description: >
 runs:
   using: composite
   steps:
-    - name: cargo install the fake servers
+    - name: Resolve the pinned nexus revision
+      id: rev
       shell: bash
       run: |
         REV=$(sed -n 's/^nexus-claude = .*rev = "\([0-9a-f]\{40\}\)".*/\1/p' Cargo.toml | head -n1)
         test -n "$REV"
+        echo "rev=$REV" >> "$GITHUB_OUTPUT"
+        echo "root=$RUNNER_TOOL_CACHE/nexus-fakes/$REV-tls-obscura-acp" >> "$GITHUB_OUTPUT"
+
+    # A hosted runner starts with an empty tool cache, so the installs below used to run in
+    # every job that needs the fakes: 3.5-4 min each in Unit Tests and Code Coverage (measured
+    # 19/10/2026). The binaries depend only on the pin and the runner image, so they are cached
+    # under that key. Like the cargo caches, only main writes it; PRs restore main's.
+    - name: Restore the fake servers of this pin
+      id: restore
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ steps.rev.outputs.root }}
+        key: nexus-fakes-${{ runner.os }}-${{ runner.arch }}-${{ steps.rev.outputs.rev }}-tls-obscura-acp-v1
+
+    - name: cargo install the fake servers
+      shell: bash
+      run: |
+        REV=${{ steps.rev.outputs.rev }}
         # One directory per pinned revision in the tool cache: a self-hosted runner keeps it and
         # skips the cargo installs until the pin moves (a new pin = a new directory, so the check
         # that the pin builds the shipped tools still runs once per pin); a hosted runner starts
@@ -33,3 +52,10 @@ runs:
           scripts/build-nexus-tools.sh "$ROOT"
         fi
         echo "NEXUS_FAKES_DIR=$ROOT/bin" >> "$GITHUB_ENV"
+
+    - name: Save the fake servers of this pin (main only)
+      if: steps.restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.event_name == 'push'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ steps.rev.outputs.root }}
+        key: ${{ steps.restore.outputs.cache-primary-key }}
