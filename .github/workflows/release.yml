@@ -919,14 +919,20 @@ jobs:
         if: matrix.legacy
         run: |
           echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
-          # Merged over tauri.conf.json by the Tauri CLI (arrays are replaced): the legacy app reads latest-legacy.json.
-          echo 'TAURI_CONFIG={"plugins":{"updater":{"endpoints":["https://github.com/this-rs/project-orchestrator/releases/latest/download/latest-legacy.json"]}}}' >> "$GITHUB_ENV"
+          # Merged over tauri.conf.json by `--config` in "Build Tauri bundle" (arrays are replaced):
+          # the legacy app reads latest-legacy.json.
+          # NOT through the TAURI_CONFIG env var: the CLI OVERWRITES it with its own --config
+          # (tauri.nexus-tools.json), so an override put there is silently dropped (run 39244961960).
+          echo '{"plugins":{"updater":{"endpoints":["https://github.com/this-rs/project-orchestrator/releases/latest/download/latest-legacy.json"]}}}' > "$RUNNER_TEMP/tauri-variant.json"
+          echo "TAURI_VARIANT_CONFIG=$RUNNER_TEMP/tauri-variant.json" >> "$GITHUB_ENV"
 
       # The standard Intel app links libonnxruntime (macOS 13.4+). Declare it, so an older Mac gets macOS's own
-      # "requires macOS 13.4" message instead of a crash at launch.
+      # "requires macOS 13.4" message instead of a crash at launch. Same file mechanism as above.
       - name: macOS Intel standard settings (declare the real minimum, 13.4)
         if: matrix.target == 'x86_64-apple-darwin' && !matrix.legacy
-        run: echo 'TAURI_CONFIG={"bundle":{"macOS":{"minimumSystemVersion":"13.4"}}}' >> "$GITHUB_ENV"
+        run: |
+          echo '{"bundle":{"macOS":{"minimumSystemVersion":"13.4"}}}' > "$RUNNER_TEMP/tauri-variant.json"
+          echo "TAURI_VARIANT_CONFIG=$RUNNER_TEMP/tauri-variant.json" >> "$GITHUB_ENV"
 
       # ONNX Runtime, from the SAME versioned channel as build-backend (scripts/prebuilt-lib.sh):
       # the download takes seconds, so this job no longer waits for an artifact another job uploaded.
@@ -1127,7 +1133,8 @@ jobs:
           TAURI_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           TAURI_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         # Legacy: arguments after `--` go to cargo. `custom-protocol` is what makes the app load its embedded frontend.
-        run: cargo tauri build --target ${{ matrix.tauri_target }} --config tauri.nexus-tools.json ${{ matrix.bundles && format('--bundles {0}', matrix.bundles) || '' }} ${{ matrix.legacy && '-- --no-default-features --features custom-protocol' || '' }}
+        # TAURI_VARIANT_CONFIG: the per-variant overlay file written by the macOS settings steps (absent elsewhere).
+        run: cargo tauri build --target ${{ matrix.tauri_target }} --config tauri.nexus-tools.json ${{ env.TAURI_VARIANT_CONFIG && format('--config {0}', env.TAURI_VARIANT_CONFIG) || '' }} ${{ matrix.bundles && format('--bundles {0}', matrix.bundles) || '' }} ${{ matrix.legacy && '-- --no-default-features --features custom-protocol' || '' }}
 
       # Free disk space after Tauri build completes.
       # The cargo build output (deps/, build/, .fingerprint/, incremental/) can
