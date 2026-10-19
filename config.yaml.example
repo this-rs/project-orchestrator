@@ -116,6 +116,7 @@ meilisearch:
 #   # ── Local provider settings (default, zero config) ────────────────
 #   # fastembed_model: "multilingual-e5-base"    # FASTEMBED_MODEL env override
 #   # fastembed_cache_dir: ".fastembed_cache"     # FASTEMBED_CACHE_DIR env override
+#   # batch_size: 8                               # EMBEDDING_BATCH_SIZE env override (texts per ONNX inference call; bounds peak memory)
 #   #
 #   # Supported local models (768d, compatible with Neo4j index):
 #   #   multilingual-e5-base (default, FR/EN/100+ languages)

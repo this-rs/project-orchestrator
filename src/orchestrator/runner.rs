@@ -231,11 +231,16 @@ fn init_local_embedding_provider(config: &crate::Config) -> Option<Arc<dyn Embed
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".fastembed_cache")));
 
-    match FastEmbedProvider::new(model_variant, cache_dir) {
+    let batch_size = config
+        .embedding_fastembed_batch_size
+        .unwrap_or(crate::embeddings::fastembed::DEFAULT_BATCH_SIZE);
+
+    match FastEmbedProvider::new(model_variant, cache_dir, batch_size) {
         Ok(provider) => {
             tracing::info!(
                 model = provider.model_name(),
                 dimensions = provider.dimensions(),
+                batch_size = provider.batch_size(),
                 provider = "local",
                 "Embedding provider initialized (local ONNX via fastembed)"
             );

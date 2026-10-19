@@ -405,3 +405,8 @@ systemd = "*"
 "libonnxruntime.so.1()(64bit)" = "*"
 "libonnxruntime.so.1(VERS_1.24.2)(64bit)" = "*"
 
+
+# MEM-1 : mesure de l'empreinte mémoire de l'embedder (examples/mem_embed.rs). Dépend de fastembed.
+[[example]]
+name = "mem_embed"
+required-features = ["local-embeddings"]
