@@ -316,7 +316,13 @@ jobs:
         # the clippy step.
         # nextest: one process per test (no shared globals between tests), all cores, and a
         # per-test timeout that NAMES a hung test instead of letting it hold the job.
-        run: cargo nextest run --profile ci --workspace --exclude project-orchestrator-desktop --lib
+        # parser_tests and the service-free integration targets (see below) are in the SAME
+        # invocation: as separate `cargo test --test ...` steps they compiled the non-test lib in a
+        # second, serial pass (2 min 50 s measured 19/10/2026); here cargo builds both in parallel.
+        run: >-
+          cargo nextest run --profile ci --workspace --exclude project-orchestrator-desktop
+          --lib --test parser_tests --test p2p_integration --test p2p_http_exchange
+          --test prompt_completeness --test routing_metamorphic
         env:
           # T9: the offline transverse evaluation (src/chat/eval_transverse.rs) runs in
           # this step and fails it on any leak; its report is kept below.
@@ -330,11 +336,8 @@ jobs:
           path: target/eval-transverse/report.json
           if-no-files-found: ignore
 
-      - name: Run parser tests
-        run: cargo test --test parser_tests
-
       # Integration targets that need no external service (in-process axum on
-      # random ports, pure logic). They were never run in CI before.
+      # random ports, pure logic), run by the nextest step above with the lib and parser_tests.
       #   p2p_integration, p2p_http_exchange: P2P pipeline + two local axum servers
       #   prompt_completeness: tool-reference/group coverage guard
       #   routing_metamorphic: RoutingProvider invariance harness
@@ -342,8 +345,6 @@ jobs:
       #   mcp_federation_integration: real remote MCP servers over the network
       # (cancel-tools / cancel-task end to end run in the lib step above: src/chat/cancel_e2e_tests.rs,
       # against fake_claude, on both engines; no CLI, no key.)
-      - name: Run service-free integration tests
-        run: cargo test --test p2p_integration --test p2p_http_exchange --test prompt_completeness --test routing_metamorphic
 
   # ==========================================================================
   # Integration Tests - Requires Neo4j and Meilisearch
