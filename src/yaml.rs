@@ -106,7 +106,7 @@ fn options() -> serde_saphyr::Options {
     // Never echo the input in an error: it may be a config file holding secrets.
     options.with_snippet = false;
     // As serde_yaml did: `.inf` and `.nan` are floats, also where no type is fixed.
-    options.reject_non_finite_typeless_float = false;
+    options.non_finite_float_policy = serde_saphyr::options::NonFiniteFloatPolicy::PassThrough;
     options
 }
 
