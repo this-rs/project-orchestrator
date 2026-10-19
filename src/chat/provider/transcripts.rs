@@ -48,9 +48,12 @@
 //! application directory, and a `git add -A` in `~` would then publish every conversation.
 //!
 //! On Windows the `0600`/`0700` modes do not exist: the protection is the ACL of
-//! the user profile (`%APPDATA%`, readable by that user, SYSTEM and the
-//! administrators by default). A profile whose ACLs were widened, or a roaming
-//! profile synced to a share, carries the transcripts with it.
+//! the user profile. The root is under `%LOCALAPPDATA%` (`data_local_dir`), which
+//! does not roam: the earlier `%APPDATA%` location roamed with the profile, and a
+//! roaming profile synced to a share carried the conversations with it.
+//! [`default_root`] moves the transcripts of that earlier location
+//! ([`migrate_legacy_root`]) on first use. A profile whose ACLs were widened still
+//! exposes the transcripts.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -63,6 +66,28 @@ const DIR_NAME: &str = "native-transcripts";
 /// The default root, under the application directory where the vault, the
 /// identity key and the neutral directories already live.
 pub fn default_root() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        // %LOCALAPPDATA%, not %APPDATA%: the latter roams with the profile and
+        // would carry the conversations to a synced share.
+        if let Some(local) = dirs::data_local_dir() {
+            let current = local.join("ProjectOrchestrator").join(DIR_NAME);
+            if let Some(roaming) = dirs::config_dir() {
+                let legacy = roaming.join("ProjectOrchestrator").join(DIR_NAME);
+                match migrate_legacy_root(&legacy, &current) {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::info!(moved = n, "native transcripts moved to the local profile")
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "native transcripts not migrated; they stay in the roaming profile"
+                    ),
+                }
+            }
+            return current;
+        }
+    }
     let app = match dirs::config_dir() {
         #[cfg(target_os = "windows")]
         Some(c) => c.join("ProjectOrchestrator"),
@@ -180,11 +205,117 @@ pub fn remove_for_token(root: &Path, instance_id: &str, wire: &str) -> std::io::
     }
 }
 
+/// Moves the transcripts of a previous root (`legacy`, on Windows the roaming
+/// `%APPDATA%` copy) into `current`, one instance directory at a time. An instance
+/// directory is renamed only when `current` has no directory of that name: an
+/// existing one is never overwritten, and its legacy copy stays where it is.
+/// Returns the number of instance directories moved. Idempotent: a second run moves
+/// nothing. The legacy root is removed once it is empty.
+pub fn migrate_legacy_root(legacy: &Path, current: &Path) -> std::io::Result<usize> {
+    let entries = match std::fs::read_dir(legacy) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    std::fs::create_dir_all(current)?;
+    let mut moved = 0;
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let target = current.join(entry.file_name());
+        // Never overwrite: an instance already present under `current` wins, and
+        // its legacy copy stays in place for a person to look at.
+        if std::fs::symlink_metadata(&target).is_ok() {
+            continue;
+        }
+        // One rename per instance directory: atomic on the same volume. Across
+        // volumes it fails and the error reaches the caller; nothing is half-moved.
+        std::fs::rename(entry.path(), &target)?;
+        moved += 1;
+    }
+    // Removes the legacy root only when every instance has left it.
+    let _ = std::fs::remove_dir(legacy);
+    Ok(moved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nexus_claude::model::ChatMessage;
     use nexus_claude::providers::native::TranscriptStore;
+
+    /// Writes `<root>/<instance>/<file>` with `body`, for the migration tests.
+    fn put(root: &Path, instance: &str, file: &str, body: &str) {
+        let dir = root.join(instance);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(file), body).unwrap();
+    }
+
+    #[test]
+    fn migration_moves_each_instance_directory_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp
+            .path()
+            .join("roaming/ProjectOrchestrator/native-transcripts");
+        let current = tmp
+            .path()
+            .join("local/ProjectOrchestrator/native-transcripts");
+        put(&legacy, "a", "t1.json", "one");
+        put(&legacy, "b", "t2.json", "two");
+
+        assert_eq!(migrate_legacy_root(&legacy, &current).unwrap(), 2);
+        assert_eq!(
+            std::fs::read_to_string(current.join("a/t1.json")).unwrap(),
+            "one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(current.join("b/t2.json")).unwrap(),
+            "two"
+        );
+        assert!(!legacy.join("a").exists(), "moved, not copied");
+        assert!(!legacy.exists(), "an emptied legacy root is removed");
+    }
+
+    #[test]
+    fn migration_never_overwrites_an_existing_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("roaming");
+        let current = tmp.path().join("local");
+        put(&legacy, "a", "t1.json", "old");
+        put(&current, "a", "t1.json", "new");
+
+        assert_eq!(migrate_legacy_root(&legacy, &current).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(current.join("a/t1.json")).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("a/t1.json")).unwrap(),
+            "old"
+        );
+    }
+
+    #[test]
+    fn migration_is_idempotent_and_a_missing_legacy_root_is_a_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("roaming");
+        let current = tmp.path().join("local");
+        assert_eq!(migrate_legacy_root(&legacy, &current).unwrap(), 0);
+        assert!(
+            !current.exists(),
+            "nothing created when there is nothing to move"
+        );
+
+        put(&legacy, "a", "t1.json", "one");
+        assert_eq!(migrate_legacy_root(&legacy, &current).unwrap(), 1);
+        assert_eq!(migrate_legacy_root(&legacy, &current).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(current.join("a/t1.json")).unwrap(),
+            "one"
+        );
+    }
 
     fn native_token(id: &str) -> String {
         ResumeToken::new(
@@ -242,7 +373,13 @@ mod tests {
     #[test]
     fn the_default_root_is_the_servers_application_directory() {
         let root = default_root();
-        if let Some(app) = dirs::config_dir() {
+        // Windows: the local profile (%LOCALAPPDATA%), never the roaming one.
+        let base = if cfg!(target_os = "windows") {
+            dirs::data_local_dir()
+        } else {
+            dirs::config_dir()
+        };
+        if let Some(app) = base {
             assert!(root.starts_with(&app), "{}", root.display());
             assert!(root.is_absolute());
         }
