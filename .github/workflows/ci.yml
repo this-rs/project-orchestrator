@@ -86,6 +86,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
+      - uses: ./.github/actions/pinned-toolchain-only
+
       # rust-toolchain sets CARGO_INCREMENTAL=0. These binaries only serve API Tests (release.yml
       # builds what ships): on the self-hosted runner, keep the crate's incremental state, which
       # build.rs invalidates at every commit anyway (it embeds `git describe`).
@@ -132,6 +134,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: ./.github/actions/pinned-toolchain-only
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
@@ -196,6 +200,8 @@ jobs:
         uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy, rustfmt
+
+      - uses: ./.github/actions/pinned-toolchain-only
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
@@ -279,6 +285,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
+      - uses: ./.github/actions/pinned-toolchain-only
+
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
@@ -334,6 +342,8 @@ jobs:
         uses: dtolnay/rust-toolchain@1.95.0
 
       - uses: ./.github/actions/test-profile
+
+      - uses: ./.github/actions/pinned-toolchain-only
 
       - name: Cache cargo registry
         if: runner.environment == 'github-hosted'
@@ -445,6 +455,8 @@ jobs:
 
       - uses: ./.github/actions/test-profile
 
+      - uses: ./.github/actions/pinned-toolchain-only
+
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
@@ -535,6 +547,8 @@ jobs:
         uses: dtolnay/rust-toolchain@1.95.0
 
       - uses: ./.github/actions/test-profile
+
+      - uses: ./.github/actions/pinned-toolchain-only
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
@@ -660,6 +674,8 @@ jobs:
           components: llvm-tools-preview
 
       - uses: ./.github/actions/test-profile
+
+      - uses: ./.github/actions/pinned-toolchain-only
 
       - name: Cache cargo registry
         if: runner.environment == 'github-hosted'
@@ -822,6 +838,8 @@ jobs:
         uses: dtolnay/rust-toolchain@1.95.0
 
       - uses: ./.github/actions/test-profile
+
+      - uses: ./.github/actions/pinned-toolchain-only
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
