@@ -161,7 +161,7 @@ jobs:
         include:
           # macOS Apple Silicon (native — ort-sys has prebuilt static ONNX Runtime)
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             os: macos
             arch: arm64
             use_cross: false
@@ -191,7 +191,7 @@ jobs:
           # `local-embeddings` feature: no ONNX Runtime at all, deployment target 10.15. Semantic search then needs an
           # HTTP embedding provider (Ollama, OpenAI...). Archive: orchestrator-<v>-macos-x86_64-legacy.tar.gz.
           - target: x86_64-apple-darwin
-            runner: macos-14
+            runner: macos-15-intel
             os: macos
             arch: x86_64-legacy
             use_cross: false
@@ -744,7 +744,7 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             tauri_target: aarch64-apple-darwin
             artifact_os: macos
             artifact_arch: arm64
@@ -761,7 +761,7 @@ jobs:
           # macOS Intel "legacy" (10.15 to 13.3): see build-backend. Own updater feed (latest-legacy.json) so a Catalina
           # install is never offered the standard build; its .dmg and .app.tar.gz carry a "-legacy" suffix.
           - target: x86_64-apple-darwin
-            runner: macos-14
+            runner: macos-15-intel
             tauri_target: x86_64-apple-darwin
             artifact_os: macos
             artifact_arch: x86_64-legacy
@@ -1185,11 +1185,23 @@ jobs:
             fi
           done
 
-          # Add rpath to bundled mcp_server (resource binary, also dynamically linked)
+          # Bundled mcp_server (resource binary, also dynamically linked). It already carries
+          # `@executable_path` from the archive step (Package light/full, l.373): that rpath is
+          # Contents/Resources itself, so the dylib goes next to it and no load command is added.
+          # Adding one here fails on Intel ("larger updated load commands do not fit", run 39137156378).
           MCP_SERVER="$APP_PATH/Contents/Resources/mcp_server"
           if [ -f "$MCP_SERVER" ]; then
-            echo "  rpath → mcp_server (resource)"
-            install_name_tool -add_rpath @executable_path/../Frameworks "$MCP_SERVER"
+            if otool -l "$MCP_SERVER" | grep -q 'path @executable_path (offset'; then
+              echo "  mcp_server: symlinks to the signed dylib in Frameworks (rpath @executable_path)"
+              # A symlink, not a copy: the Frameworks copy is the one codesign signs; a second
+              # unsigned Mach-O in Resources would break signing and notarization.
+              for dylib in "$FRAMEWORKS_DIR"/libonnxruntime*; do
+                ln -sfn "../Frameworks/$(basename "$dylib")" "$APP_PATH/Contents/Resources/$(basename "$dylib")"
+              done
+            else
+              echo "  rpath → mcp_server (resource)"
+              install_name_tool -add_rpath @executable_path/../Frameworks "$MCP_SERVER"
+            fi
           fi
 
           echo "✅ ONNX Runtime dylib bundled in Frameworks/"
