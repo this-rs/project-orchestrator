@@ -831,11 +831,27 @@ async fn a_native_compaction_in_stage_shadow_records_its_decision_and_runs_on_th
 
 /// N-C1 (nexus contract v8): `full` + `auto` on a native session, whose harness can write
 /// the summary with another of its provider's models (`compaction_model`): the decision is
-/// taken among the PRIMARY's models (`pm` failed the class sixty times, `ps` is untried),
-/// applied, and the summary is written by `primary/ps`; the conversation stays on `pm`.
+/// taken among the PRIMARY's models (`pm` failed the class sixty times, `ps` succeeded it
+/// sixty times), applied, and the summary is written by `primary/ps`; the conversation stays
+/// on `pm`.
 #[tokio::test]
 async fn a_native_compaction_in_full_auto_summarises_with_the_model_of_the_decision() {
     let w = world_with("full", "auto", &["pm", "ps"]).await;
+    // `ps` is TAUGHT, not untried: the decider draws each arm from its Beta posterior, seeded
+    // by the decision's id (a fresh UUID). An untried `ps` draws from the prior and, a few
+    // times in a hundred, not far enough above `pm` to pass the hysteresis margin: the
+    // decision then keeps `pm` ("kept because no challenger is clearly better") and the
+    // summary is written by the session's model (FLAKY-NC1, 19/10/2026: 6 failures in 60
+    // runs untried, 0 in 60 taught; the failing runs sent the fake the same requests, only
+    // the draw differed).
+    teach_counts(
+        &Neo4jRoutingStore::new(w.graph.clone()),
+        &TaskSignature::utility(TaskClass::UtilityCompaction, 0, None).arm_key(),
+        ("primary", "ps"),
+        60,
+        0,
+    )
+    .await;
     let mut named = pilot();
     named.provider = Some("primary".into());
     named.model = Some("pm".into());
