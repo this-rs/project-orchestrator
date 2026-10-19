@@ -1582,11 +1582,7 @@ fn transcript_main(k: Keys, cwd: &str, path: ProviderPath) -> Vec<Value> {
         hook(
             "UserPromptSubmit",
             "hook-prompt",
-            hook_input(
-                "UserPromptSubmit",
-                cwd,
-                json!({"prompt": k.k("TURN-ONE")}),
-            ),
+            hook_input("UserPromptSubmit", cwd, json!({"prompt": k.k("TURN-ONE")})),
             None,
         ),
         sleep_ms(200),
@@ -1998,7 +1994,11 @@ impl SessionHooks for Recording {
         } else {
             self.inner.before_stop(info).await
         };
-        self.answers.stop_replies.lock().unwrap().push(reply.clone());
+        self.answers
+            .stop_replies
+            .lock()
+            .unwrap()
+            .push(reply.clone());
         reply
     }
     async fn before_subagent_stop(&self, info: &SubagentStopInfo) -> HookReply {
