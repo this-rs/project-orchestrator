@@ -1,4 +1,4 @@
-# Classifier Bench — scoring the six backend classifiers
+# Classifier Bench — scoring the seven backend classifiers
 
 The backend decides things from text and from events: which **tool groups** a
 message needs, the **intent** of a message, the **class** of a chat turn, which
@@ -7,7 +7,7 @@ message needs, the **intent** of a message, the **class** of a chat turn, which
 of them had an accuracy number — only the tool-group router had a metamorphic
 invariance suite.
 
-The bench scores all six **offline**, on hand-labelled fixtures, and compares
+The bench scores all seven **offline**, on hand-labelled fixtures, and compares
 each one with the **majority-class baseline**: the accuracy a classifier that
 ignores its input completely would get. A classifier that cannot beat that
 baseline is not doing any work, and the bench fails.
@@ -73,6 +73,29 @@ code, and its job is to make the rule impossible to change by accident.
 The fixture is language-neutral by construction (a graph is not French or
 English), so it declares no `pair` ids and `FR<->EN` reads `n/a`. The `lang`
 field only satisfies the bench shape.
+
+## The ranking fixture
+
+`recall_selection` scores the *selection* that follows propagation: given the
+candidates and a slot count, which nodes survive the truncation, and in which
+order. The adapter runs the production `select_top`
+(`src/neurons/activation.rs`), the same function `activate_with_profile` calls
+in Phase 3.
+
+The fixture pins the outcomes that can silently drift:
+
+- **order and truncation** — score descending, then node id ascending; more
+  slots than candidates returns them all; zero slots returns `none`;
+- **ties** — the tie cases list their candidates in non-ascending name order, so
+  a score-only sort would answer differently.
+
+The fixture pins those *outcomes*; the tie-break *determinism* is pinned by
+`truncation_does_not_depend_on_the_input_order` in `activation.rs`, which fails
+if the node-id tie-break is removed. The bench alone could not: its only
+pass criterion is "better than the majority baseline", and a fixture whose tie
+cases are a minority still clears that bar with the tie-break gone.
+
+Like `recall_ranking` it is language-neutral and declares no `pair` ids.
 
 ## Where the figures are published
 

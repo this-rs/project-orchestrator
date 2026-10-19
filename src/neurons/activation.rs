@@ -373,6 +373,87 @@ pub fn spread_and_rank(
     out
 }
 
+// ============================================================================
+// Pure ranking rule (no I/O)
+// ============================================================================
+
+/// One candidate of the final ranking.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RankedCandidate {
+    /// Node identifier.
+    pub id: Uuid,
+    /// Activation score it reached.
+    pub score: f64,
+}
+
+/// The ranking order: score descending, then node id ascending.
+///
+/// Pure. The id tie-break is load-bearing: bounded sums make ties at the 1.0
+/// ceiling reachable, and the candidates come out of a `HashMap`, so without it
+/// the truncation to `max_results` would depend on iteration order.
+pub fn rank_cmp(a: &RankedCandidate, b: &RankedCandidate) -> std::cmp::Ordering {
+    b.score
+        .partial_cmp(&a.score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| a.id.cmp(&b.id))
+}
+
+/// Select the top `max_results` candidates by [`rank_cmp`].
+pub fn select_top(
+    mut candidates: Vec<RankedCandidate>,
+    max_results: usize,
+) -> Vec<RankedCandidate> {
+    candidates.sort_by(rank_cmp);
+    candidates.truncate(max_results);
+    candidates
+}
+
+#[cfg(test)]
+mod pure_ranking_tests {
+    use super::*;
+
+    fn candidate(id: u128, score: f64) -> RankedCandidate {
+        RankedCandidate {
+            id: Uuid::from_u128(id),
+            score,
+        }
+    }
+
+    #[test]
+    fn the_top_is_selected_by_score_then_id() {
+        let candidates = vec![candidate(3, 0.5), candidate(1, 0.9), candidate(2, 0.9)];
+        assert_eq!(
+            select_top(candidates, 2),
+            vec![candidate(1, 0.9), candidate(2, 0.9)]
+        );
+    }
+
+    #[test]
+    fn truncation_does_not_depend_on_the_input_order() {
+        let ascending = vec![
+            candidate(1, 0.5),
+            candidate(2, 0.5),
+            candidate(3, 0.5),
+            candidate(4, 0.5),
+        ];
+        let shuffled = vec![
+            candidate(4, 0.5),
+            candidate(3, 0.5),
+            candidate(2, 0.5),
+            candidate(1, 0.5),
+        ];
+        let from_ascending = select_top(ascending, 2);
+        let from_shuffled = select_top(shuffled, 2);
+        assert_eq!(from_ascending, from_shuffled);
+        assert_eq!(from_shuffled, vec![candidate(1, 0.5), candidate(2, 0.5)]);
+    }
+
+    #[test]
+    fn more_slots_than_candidates_returns_them_all() {
+        assert_eq!(select_top(vec![candidate(1, 0.1)], 5).len(), 1);
+    }
+}
+
 #[cfg(test)]
 mod pure_rule_tests {
     use super::*;
@@ -818,39 +899,33 @@ impl SpreadingActivationEngine {
             frontier = next_frontier;
         }
 
-        // Phase 3: Ranking.
+        // Phase 3: Ranking. The order and the truncation live in `select_top`
+        // (pure, synchronous) so the classifier bench can exercise them
+        // without a graph store — the same seam `apply_hop` gives the rule.
         //
-        // Every activated entity is ranked by score, and equal scores are
-        // ordered by note id: the activations come out of a `HashMap`, so
-        // without a tie-break the truncation to `max_results` would depend on
-        // iteration order. Bounded sums make ties at the 1.0 ceiling
-        // reachable, so this is not theoretical.
-        //
-        // There is no slot reservation and no hub bonus. Both existed because
-        // `max` kept every propagated score below every direct match: the
-        // quota forced a few propagated notes into the top-N, and the bonus
-        // made well-connected direct matches stand out. With the rule
-        // accumulating convergent evidence, a propagated note wins on merit
-        // and a hub is rewarded by its contributing paths — a degree bonus on
-        // top of that counts the same signal twice, and could push a direct
-        // score above 1.0.
-        let mut results: Vec<ActivatedNote> = activations
-            .into_values()
-            .map(|(score, source, note, entity_type)| ActivatedNote {
-                note,
-                activation_score: score,
-                source,
-                entity_type,
+        // There is no slot reservation and no hub bonus: both existed because
+        // `max` kept every propagated score below every direct match.
+        let candidates: Vec<RankedCandidate> = activations
+            .values()
+            .map(|(score, _, note, _)| RankedCandidate {
+                id: note.id,
+                score: *score,
             })
             .collect();
 
-        results.sort_by(|a, b| {
-            b.activation_score
-                .partial_cmp(&a.activation_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.note.id.cmp(&b.note.id))
-        });
-        results.truncate(config.max_results);
+        let results: Vec<ActivatedNote> = select_top(candidates, config.max_results)
+            .into_iter()
+            .filter_map(|candidate| {
+                activations
+                    .remove(&candidate.id)
+                    .map(|(_, source, note, entity_type)| ActivatedNote {
+                        note,
+                        activation_score: candidate.score,
+                        source,
+                        entity_type,
+                    })
+            })
+            .collect();
 
         let direct_count = results
             .iter()

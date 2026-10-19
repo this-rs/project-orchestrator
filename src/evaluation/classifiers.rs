@@ -17,7 +17,7 @@ use crate::chat::provider::cognitive::signature::{ContextHints, TaskSignature};
 use crate::chat::routing::{HeuristicRouter, RoutingContext, RoutingProvider};
 use crate::events::{CrudAction, CrudEvent, EntityType, EventTrigger, TriggerRouter};
 use crate::neurons::activation::{
-    spread_and_rank, Neighbourhood, SpreadEdge, SpreadNode, SpreadRule,
+    select_top, spread_and_rank, Neighbourhood, RankedCandidate, SpreadEdge, SpreadNode, SpreadRule,
 };
 use crate::neurons::intent::{IntentDetector, QueryIntentMode};
 use crate::skills::activation::evaluate_skill_match;
@@ -40,6 +40,7 @@ pub fn all() -> Vec<Box<dyn Classifier>> {
         Box::new(Skills),
         Box::new(Triggers),
         Box::new(RecallRanking),
+        Box::new(RecallSelection),
     ]
 }
 
@@ -412,5 +413,75 @@ impl Classifier for RecallRanking {
         }
 
         Ok(best.map_or_else(|| "none".to_string(), |(_, name)| name.to_string()))
+    }
+}
+
+#[derive(Deserialize)]
+struct SelectionCandidate {
+    id: String,
+    score: f64,
+}
+
+#[derive(Deserialize)]
+struct SelectionSpec {
+    max_results: usize,
+    candidates: Vec<SelectionCandidate>,
+}
+
+/// Which nodes the ranking rule keeps: the top `max_results` by score, ties
+/// broken by node id.
+///
+/// `recall_ranking` scores the *rule* (what propagation surfaces); this one
+/// scores the *selection* (what survives the truncation, and in which order).
+/// The case declares the candidates and the slot count; the adapter runs the
+/// production `select_top`, the same function `activate_with_profile` calls.
+pub struct RecallSelection;
+
+impl Classifier for RecallSelection {
+    fn name(&self) -> &'static str {
+        "recall_selection"
+    }
+
+    fn predict(&self, _fixture: &Fixture, case: &Case) -> Result<String> {
+        let spec: SelectionSpec = serde_json::from_value(case.input.clone())?;
+
+        // Deterministic ids: sorted names, so a tie is broken by the fixture's
+        // own ordering and never by the JSON key order.
+        let mut names: BTreeSet<&str> = BTreeSet::new();
+        for candidate in &spec.candidates {
+            names.insert(candidate.id.as_str());
+        }
+        let ids: BTreeMap<&str, Uuid> = names
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| (name, Uuid::from_u128(index as u128 + 1)))
+            .collect();
+        let reverse: BTreeMap<Uuid, &str> = ids.iter().map(|(name, id)| (*id, *name)).collect();
+
+        let candidates: Vec<RankedCandidate> = spec
+            .candidates
+            .iter()
+            .map(|candidate| {
+                let id = ids
+                    .get(candidate.id.as_str())
+                    .copied()
+                    .ok_or_else(|| anyhow!("unknown node `{}`", candidate.id))?;
+                Ok(RankedCandidate {
+                    id,
+                    score: candidate.score,
+                })
+            })
+            .collect::<Result<_>>()?;
+
+        let selected = select_top(candidates, spec.max_results);
+        let names: Vec<&str> = selected
+            .iter()
+            .map(|candidate| reverse.get(&candidate.id).copied().unwrap_or("none"))
+            .collect();
+        Ok(if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join("+")
+        })
     }
 }
