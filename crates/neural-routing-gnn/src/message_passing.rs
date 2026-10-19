@@ -5,7 +5,7 @@
 
 #[cfg(test)]
 use candle_core::Device;
-use candle_core::{Result, Tensor};
+use candle_core::{DType, Result, Tensor};
 
 /// Trait for message passing layers in graph neural networks.
 ///
@@ -33,15 +33,33 @@ pub trait MessagePassing {
     /// Update node representations with aggregated messages.
     fn update(&self, x: &Tensor, aggregated: &Tensor) -> Result<Tensor>;
 
-    /// Full forward pass: message -> aggregate -> update.
+    /// Full forward pass: message -> (optional edge-weight scaling) -> aggregate -> update.
+    ///
+    /// * `edge_weight` — optional `[num_edges]` per-edge weights. When `Some`, every
+    ///   message row is multiplied by its edge weight *before* aggregation, so an edge
+    ///   of weight `0.0` contributes nothing (its message becomes the zero vector).
+    ///   When `None`, no scaling happens at all and every edge weighs `1.0` — this is
+    ///   the historical behaviour, kept bit-for-bit identical.
+    ///
+    /// Caveat on the denominator: `scatter_add` (R-GCN) simply drops a zero-weight
+    /// message, but `scatter_mean` (GraphSAGE) still counts the edge in its divisor,
+    /// so a `0.0` weight attenuates an edge there instead of removing it.
     fn forward(
         &self,
         x: &Tensor,
         edge_index: &Tensor,
         edge_type: Option<&Tensor>,
+        edge_weight: Option<&Tensor>,
         num_nodes: usize,
     ) -> Result<Tensor> {
         let messages = self.message(x, edge_index, edge_type)?;
+        let messages = match edge_weight {
+            Some(w) => {
+                let weights = extract_edge_weights(w)?;
+                scale_messages_by_weight(&messages, &weights)?
+            }
+            None => messages,
+        };
         let aggregated = self.aggregate(&messages, edge_index, num_nodes)?;
         self.update(x, &aggregated)
     }
@@ -134,6 +152,55 @@ pub fn gather_rows(x: &Tensor, indices: &[u32]) -> Result<Tensor> {
         x.device(),
     )?;
     x.index_select(&index_tensor, 0)
+}
+
+/// Extract per-edge weights from a tensor.
+///
+/// * `edge_weight` — `[num_edges]` weights (any float dtype; cast to f32)
+///
+/// Returns one weight per edge, in edge order. A 2-D `[num_edges, 1]` tensor is also
+/// accepted (it is flattened first), so callers do not have to reshape.
+pub fn extract_edge_weights(edge_weight: &Tensor) -> Result<Vec<f32>> {
+    let flattened = edge_weight.to_dtype(DType::F32)?.flatten_all()?;
+    if flattened.rank() != 1 {
+        return Err(candle_core::Error::Msg(format!(
+            "extract_edge_weights expects a 1-D tensor, got shape {:?}",
+            edge_weight.dims()
+        )));
+    }
+    flattened.to_vec1::<f32>()
+}
+
+/// Scale each row of a message matrix by its per-edge weight.
+///
+/// * `messages` — `[num_edges, feature_dim]` messages (e.g. the output of `gather_rows`)
+/// * `weights` — one weight per edge; `weights.len()` must equal `messages.dim(0)`
+///
+/// Returns a tensor of the same shape where row `e` is `messages[e] * weights[e]`.
+/// A weight of `0.0` therefore yields an all-zero message row (the edge contributes
+/// nothing to a `scatter_add` aggregation).
+pub fn scale_messages_by_weight(messages: &Tensor, weights: &[f32]) -> Result<Tensor> {
+    if messages.rank() != 2 {
+        return Err(candle_core::Error::Msg(format!(
+            "scale_messages_by_weight expects [num_edges, feature_dim] messages, got shape {:?}",
+            messages.dims()
+        )));
+    }
+
+    let num_edges = messages.dim(0)?;
+    if weights.len() != num_edges {
+        return Err(candle_core::Error::Msg(format!(
+            "edge weight count ({}) does not match message count ({} edges)",
+            weights.len(),
+            num_edges
+        )));
+    }
+
+    // [num_edges, 1] so the weight applies to the whole feature row (broadcast_mul).
+    let weight_tensor = Tensor::from_vec(weights.to_vec(), (num_edges, 1), messages.device())?
+        .to_dtype(messages.dtype())?;
+
+    messages.broadcast_mul(&weight_tensor)
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +299,72 @@ mod tests {
         let (src, tgt) = extract_edge_indices(&edge_index)?;
         assert_eq!(src, vec![0, 1, 2]);
         assert_eq!(tgt, vec![1, 2, 0]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_edge_weights() -> Result<()> {
+        let device = Device::Cpu;
+
+        let w = Tensor::new(&[1.0f32, 0.75, 0.5], &device)?;
+        assert_eq!(extract_edge_weights(&w)?, vec![1.0, 0.75, 0.5]);
+
+        // f64 weights are accepted (cast to f32) — the sampler stores f64.
+        let w64 = Tensor::new(&[1.0f64, 0.25], &device)?;
+        assert_eq!(extract_edge_weights(&w64)?, vec![1.0, 0.25]);
+
+        // [num_edges, 1] is flattened.
+        let w2d = Tensor::new(&[[1.0f32], [0.0]], &device)?;
+        assert_eq!(extract_edge_weights(&w2d)?, vec![1.0, 0.0]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scale_messages_by_weight_basic() -> Result<()> {
+        let device = Device::Cpu;
+        let messages = Tensor::new(&[[1.0f32, 2.0], [4.0, 6.0], [0.5, 0.5]], &device)?;
+
+        let scaled = scale_messages_by_weight(&messages, &[1.0, 0.5, 0.0])?;
+        let r = scaled.to_vec2::<f32>()?;
+
+        assert_eq!(r[0], vec![1.0, 2.0]);
+        assert_eq!(r[1], vec![2.0, 3.0]);
+        // A zero weight produces a zero message row.
+        assert_eq!(r[2], vec![0.0, 0.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scale_messages_by_weight_unit_is_identity() -> Result<()> {
+        let device = Device::Cpu;
+        let messages = Tensor::new(&[[1.5f32, -2.0], [4.0, 6.0]], &device)?;
+
+        let scaled = scale_messages_by_weight(&messages, &[1.0, 1.0])?;
+        let diff = (scaled - &messages)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-6, "unit weights should be the identity: {}", diff);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scale_messages_by_weight_length_mismatch() -> Result<()> {
+        let device = Device::Cpu;
+        let messages = Tensor::new(&[[1.0f32, 2.0], [4.0, 6.0]], &device)?;
+
+        // 3 weights for 2 edges → explicit error, never silent truncation.
+        assert!(scale_messages_by_weight(&messages, &[1.0, 1.0, 1.0]).is_err());
+        assert!(scale_messages_by_weight(&messages, &[1.0]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_scale_messages_by_weight_preserves_shape() -> Result<()> {
+        let device = Device::Cpu;
+        let messages = Tensor::randn(0.0f32, 1.0, (7, 4), &device)?;
+        let weights = vec![0.1f32; 7];
+
+        let scaled = scale_messages_by_weight(&messages, &weights)?;
+        assert_eq!(scaled.dims(), &[7, 4]);
         Ok(())
     }
 

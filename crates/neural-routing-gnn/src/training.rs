@@ -81,6 +81,9 @@ pub struct DataSplit {
     pub edge_index: Tensor,
     /// Edge types for message-passing edges [num_msg_edges].
     pub edge_type: Tensor,
+    /// Edge weights for message-passing edges [num_msg_edges], when the source graph
+    /// carried one weight per edge. `None` means "leave the GNN at unit weights".
+    pub edge_weight: Option<Tensor>,
     /// Number of nodes.
     pub num_nodes: usize,
     /// Positive supervision edges [num_pos, 2] — edges to predict.
@@ -147,6 +150,7 @@ impl DataLoader {
 
         // Build message-passing edges (train only — no data leakage)
         let (train_edge_index, train_edge_type) = build_edge_tensors(&pyg, train_indices, &device)?;
+        let train_edge_weight = build_edge_weights(&pyg, train_indices, &device)?;
 
         // Build supervision edges for each split
         let train_pos = build_pos_edges(&pyg, train_indices, &device)?;
@@ -163,6 +167,7 @@ impl DataLoader {
                 x: x.clone(),
                 edge_index: train_edge_index.clone(),
                 edge_type: train_edge_type.clone(),
+                edge_weight: train_edge_weight.clone(),
                 num_nodes,
                 pos_edges: train_pos,
                 neg_edges: train_neg,
@@ -172,6 +177,7 @@ impl DataLoader {
                 x: x.clone(),
                 edge_index: train_edge_index.clone(),
                 edge_type: train_edge_type.clone(),
+                edge_weight: train_edge_weight.clone(),
                 num_nodes,
                 pos_edges: val_pos,
                 neg_edges: val_neg,
@@ -181,6 +187,7 @@ impl DataLoader {
                 x,
                 edge_index: train_edge_index,
                 edge_type: train_edge_type,
+                edge_weight: train_edge_weight,
                 num_nodes,
                 pos_edges: test_pos,
                 neg_edges: test_neg,
@@ -448,6 +455,7 @@ pub fn train(
             &train_split.x,
             &train_split.edge_index,
             Some(&train_split.edge_type),
+            train_split.edge_weight.as_ref(),
             train_split.num_nodes,
         )?;
 
@@ -476,6 +484,7 @@ pub fn train(
             &val_split.x,
             &val_split.edge_index,
             Some(&val_split.edge_type),
+            val_split.edge_weight.as_ref(),
             val_split.num_nodes,
         )?;
 
@@ -561,6 +570,7 @@ pub fn train(
         &test_split.x,
         &test_split.edge_index,
         Some(&test_split.edge_type),
+        test_split.edge_weight.as_ref(),
         test_split.num_nodes,
     )?;
 
@@ -1031,6 +1041,26 @@ fn build_edge_tensors(
     let edge_type = Tensor::from_vec(types, n, device)?;
 
     Ok((edge_index, edge_type))
+}
+
+/// Build the per-edge weight tensor for the selected edges, if the export has them.
+///
+/// Returns `None` whenever the source `PyGData` does not carry exactly one weight per
+/// edge, so training keeps working (at unit weights) on graphs exported without them.
+fn build_edge_weights(
+    pyg: &PyGData,
+    indices: &[usize],
+    device: &Device,
+) -> CandleResult<Option<Tensor>> {
+    if pyg.edge_weight.len() != pyg.num_edges {
+        return Ok(None);
+    }
+
+    let weights: Vec<f32> = indices.iter().map(|&i| pyg.edge_weight[i] as f32).collect();
+    if weights.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Tensor::from_vec(weights, indices.len(), device)?))
 }
 
 /// Build positive edge tensor [2, num_edges] from selected indices.
