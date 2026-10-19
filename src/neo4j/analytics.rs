@@ -1432,36 +1432,70 @@ impl Neo4jClient {
     /// Bridges the neural SYNAPSE connections between Notes to the Files they are
     /// linked to, producing (source_file_path, target_file_path, avg_weight) tuples.
     /// Only includes synapses with weight >= 0.3 (filters weak connections).
+    ///
+    /// Two linear queries (the project's strong synapses, then the file links of the notes
+    /// they touch) and the Note→File bridging in Rust. The single Cypher path
+    /// `File<-Note-[SYNAPSE]->Note->File` made Neo4j enumerate every combination of
+    /// anchored files per synapse (80 s on a project of 1 300 files); the result is the
+    /// same, see [`bridge_synapses`].
     pub async fn get_project_synapse_edges(
         &self,
         project_id: Uuid,
     ) -> Result<Vec<(String, String, f64)>> {
-        let q = query(
+        let synapses_q = query(
             r#"
-            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f1:File)
-            MATCH (n1:Note)-[:LINKED_TO]->(f1)
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(:File)<-[:LINKED_TO]-(n1:Note)
             MATCH (n1)-[s:SYNAPSE]->(n2:Note)
-            MATCH (n2)-[:LINKED_TO]->(f2:File)
-            WHERE f1 <> f2 AND s.weight >= 0.3
-            RETURN DISTINCT f1.path AS source, f2.path AS target, avg(s.weight) AS weight
+            WHERE s.weight >= 0.3
+            RETURN DISTINCT n1.id AS source, n2.id AS target, s.weight AS weight
             "#,
         )
         .param("project_id", project_id.to_string());
 
-        let mut result = self.graph.execute(q).await?;
-        let mut edges = Vec::new();
-
+        let mut result = self.graph.execute(synapses_q).await?;
+        let mut synapses: Vec<(String, String, f64)> = Vec::new();
+        let mut note_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(row) = result.next().await? {
             if let (Ok(source), Ok(target), Ok(weight)) = (
                 row.get::<String>("source"),
                 row.get::<String>("target"),
                 row.get::<f64>("weight"),
             ) {
-                edges.push((source, target, weight));
+                note_ids.insert(source.clone());
+                note_ids.insert(target.clone());
+                synapses.push((source, target, weight));
+            }
+        }
+        if synapses.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let links_q = query(
+            r#"
+            MATCH (n:Note)-[:LINKED_TO]->(f:File)
+            WHERE n.id IN $ids
+            RETURN n.id AS note, f.path AS path,
+                   EXISTS { MATCH (:Project {id: $project_id})-[:CONTAINS]->(f) } AS in_project
+            "#,
+        )
+        .param("ids", note_ids.into_iter().collect::<Vec<_>>())
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(links_q).await?;
+        let mut links: std::collections::HashMap<String, Vec<(String, bool)>> =
+            std::collections::HashMap::new();
+        while let Some(row) = result.next().await? {
+            if let (Ok(note), Ok(path), Ok(in_project)) = (
+                row.get::<String>("note"),
+                row.get::<String>("path"),
+                row.get::<bool>("in_project"),
+            ) {
+                links.entry(note).or_default().push((path, in_project));
             }
         }
 
-        Ok(edges)
+        let top_k = crate::graph::extraction::synapse_top_k_from_env();
+        crate::graph::cpu::run_cpu(move || bridge_synapses(&synapses, &links, top_k)).await
     }
 
     /// Get neural network metrics for a project's SYNAPSE layer.
@@ -3172,4 +3206,137 @@ fn euclidean_distance(a: &[f64], b: &[f64]) -> f64 {
         .map(|(x, y)| (x - y) * (x - y))
         .sum::<f64>()
         .sqrt()
+}
+
+/// Bridges note-level synapses to file-level edges.
+///
+/// For every synapse `a → b` of weight `w`, every file `f1` linked to `a` that belongs to
+/// the project and every file `f2` linked to `b` (any project) with `f1 != f2` gets an edge
+/// `f1 → f2`; the weight of an edge is the average of the synapses that produced it.
+/// `top_k > 0` keeps only the `k` heaviest edges leaving each file (0: all of them).
+pub(crate) fn bridge_synapses(
+    synapses: &[(String, String, f64)],
+    links: &std::collections::HashMap<String, Vec<(String, bool)>>,
+    top_k: usize,
+) -> Vec<(String, String, f64)> {
+    let mut acc: std::collections::HashMap<(&str, &str), (f64, u32)> =
+        std::collections::HashMap::new();
+    for (a, b, w) in synapses {
+        let (Some(from), Some(to)) = (links.get(a), links.get(b)) else {
+            continue;
+        };
+        for (f1, in_project) in from {
+            if !*in_project {
+                continue;
+            }
+            for (f2, _) in to {
+                if f1 != f2 {
+                    let entry = acc.entry((f1.as_str(), f2.as_str())).or_insert((0.0, 0));
+                    entry.0 += *w;
+                    entry.1 += 1;
+                }
+            }
+        }
+    }
+    let mut edges: Vec<(String, String, f64)> = acc
+        .into_iter()
+        .map(|((f1, f2), (sum, n))| (f1.to_string(), f2.to_string(), sum / f64::from(n)))
+        .collect();
+    if top_k > 0 {
+        edges.sort_by(|x, y| {
+            x.0.cmp(&y.0)
+                .then(y.2.total_cmp(&x.2))
+                .then_with(|| x.1.cmp(&y.1))
+        });
+        let mut kept_for: Option<(String, usize)> = None;
+        edges.retain(|(from, _, _)| match &mut kept_for {
+            Some((current, n)) if current == from => {
+                *n += 1;
+                *n <= top_k
+            }
+            _ => {
+                kept_for = Some((from.clone(), 1));
+                true
+            }
+        });
+    }
+    edges
+}
+
+#[cfg(test)]
+mod synapse_bridge_tests {
+    use super::bridge_synapses;
+    use std::collections::HashMap;
+
+    fn links(entries: &[(&str, &[(&str, bool)])]) -> HashMap<String, Vec<(String, bool)>> {
+        entries
+            .iter()
+            .map(|(n, fs)| {
+                (
+                    n.to_string(),
+                    fs.iter().map(|(f, p)| (f.to_string(), *p)).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn syn(a: &str, b: &str, w: f64) -> (String, String, f64) {
+        (a.into(), b.into(), w)
+    }
+
+    fn sorted(mut v: Vec<(String, String, f64)>) -> Vec<(String, String, f64)> {
+        v.sort_by(|x, y| (&x.0, &x.1).cmp(&(&y.0, &y.1)));
+        v
+    }
+
+    #[test]
+    fn every_pair_of_anchored_files_gets_an_edge_without_self_loops() {
+        let l = links(&[
+            ("a", &[("f1", true), ("f2", true)]),
+            ("b", &[("f2", true), ("f3", false)]),
+        ]);
+        let edges = sorted(bridge_synapses(&[syn("a", "b", 0.6)], &l, 0));
+        let pairs: Vec<_> = edges.iter().map(|e| (e.0.as_str(), e.1.as_str())).collect();
+        assert_eq!(pairs, vec![("f1", "f2"), ("f1", "f3"), ("f2", "f3")]);
+    }
+
+    #[test]
+    fn the_weight_is_the_average_of_the_synapses_that_produced_the_edge() {
+        let l = links(&[
+            ("a", &[("f1", true)]),
+            ("b", &[("f2", true)]),
+            ("c", &[("f2", true)]),
+        ]);
+        let edges = bridge_synapses(&[syn("a", "b", 0.4), syn("a", "c", 0.8)], &l, 0);
+        assert_eq!(edges.len(), 1);
+        assert!((edges[0].2 - 0.6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_source_file_must_belong_to_the_project_the_target_need_not() {
+        let l = links(&[("a", &[("other/x", false)]), ("b", &[("f2", true)])]);
+        assert!(bridge_synapses(&[syn("a", "b", 0.9)], &l, 0).is_empty());
+    }
+
+    #[test]
+    fn a_note_without_links_produces_nothing() {
+        let l = links(&[("a", &[("f1", true)])]);
+        assert!(bridge_synapses(&[syn("a", "ghost", 0.9)], &l, 0).is_empty());
+    }
+
+    #[test]
+    fn top_k_keeps_the_heaviest_edges_of_each_source_file() {
+        let l = links(&[
+            ("a", &[("f1", true)]),
+            ("b", &[("g1", true)]),
+            ("c", &[("g2", true)]),
+            ("d", &[("g3", true)]),
+        ]);
+        let s = [syn("a", "b", 0.5), syn("a", "c", 0.9), syn("a", "d", 0.7)];
+        let all = bridge_synapses(&s, &l, 0);
+        assert_eq!(all.len(), 3);
+        let top = sorted(bridge_synapses(&s, &l, 2));
+        let targets: Vec<_> = top.iter().map(|e| e.1.as_str()).collect();
+        assert_eq!(targets, vec!["g2", "g3"], "0.9 and 0.7 survive, 0.5 goes");
+    }
 }

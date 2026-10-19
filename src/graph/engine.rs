@@ -314,11 +314,16 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
     }
 
     async fn analyze_project(&self, project_id: Uuid) -> Result<ProjectAnalytics> {
+        let t = std::time::Instant::now();
         let file_analytics = self.analyze_file_graph(project_id).await?;
+        let file_ms = t.elapsed().as_millis() as u64;
+        let t = std::time::Instant::now();
         let function_analytics = self.analyze_function_graph(project_id).await?;
+        let function_ms = t.elapsed().as_millis() as u64;
 
         // Keep the fabric_* scores in step with the code-only ones. A failure
         // here must not discard the file/function results already persisted.
+        let t = std::time::Instant::now();
         if let Err(e) = self
             .analyze_fabric_graph(project_id, &FabricWeights::default())
             .await
@@ -329,6 +334,13 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
                 "analyze_project: fabric analytics refresh failed"
             );
         }
+        tracing::info!(
+            project_id = %project_id,
+            file_ms,
+            function_ms,
+            fabric_ms = t.elapsed().as_millis() as u64,
+            "analytics phase timings"
+        );
 
         Ok(ProjectAnalytics {
             file_analytics,
@@ -343,10 +355,18 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
         weights: &FabricWeights,
     ) -> Result<GraphAnalytics> {
         // 1. Extract multi-layer graph
+        let extract_started = std::time::Instant::now();
         let graph = self
             .extractor
             .extract_fabric_graph(project_id, weights)
             .await?;
+        tracing::info!(
+            project_id = %project_id,
+            nodes = graph.graph.node_count(),
+            edges = graph.graph.edge_count(),
+            extract_ms = extract_started.elapsed().as_millis() as u64,
+            "fabric graph extracted"
+        );
         let graph = Arc::new(graph);
 
         // 2. Compute analytics (PageRank, Louvain, Betweenness all use edge weights), off the

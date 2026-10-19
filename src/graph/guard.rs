@@ -151,6 +151,36 @@ impl AnalyticsEngine for GuardedAnalyticsEngine {
     }
 }
 
+/// A per-key "not again before" clock: [`Cooldown::try_start`] is true at most once per
+/// `period` for a key. Used for work that every commit used to repeat unconditionally
+/// (rebuilding the knowledge links of a project: ~1 800 Neo4j round trips, 57 s).
+pub struct Cooldown {
+    period: Duration,
+    last: Mutex<HashMap<Uuid, Instant>>,
+}
+
+impl Cooldown {
+    pub fn new(period: Duration) -> Self {
+        Self {
+            period,
+            last: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Whether `key` may run now; when true, the clock restarts.
+    pub fn try_start(&self, key: Uuid) -> bool {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        match last.get(&key) {
+            Some(at) if now.duration_since(*at) < self.period => false,
+            _ => {
+                last.insert(key, now);
+                true
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +241,17 @@ mod tests {
         async fn detect_processes(&self, _: Uuid) -> Result<Vec<crate::graph::process::Process>> {
             unimplemented!()
         }
+    }
+
+    #[test]
+    fn a_cooldown_lets_a_key_start_once_per_period() {
+        let c = Cooldown::new(Duration::from_millis(80));
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert!(c.try_start(a));
+        assert!(!c.try_start(a), "inside the period");
+        assert!(c.try_start(b), "another key has its own clock");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(c.try_start(a), "the period is over");
     }
 
     #[tokio::test]

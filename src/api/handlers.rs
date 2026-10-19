@@ -3564,7 +3564,17 @@ pub async fn create_commit(
             orch2.analytics_debouncer().trigger(pid);
             orch2.co_change_debouncer().trigger(pid);
 
-            // Reconstruct knowledge links for newly synced files
+            // Reconstruct knowledge links for newly synced files, at most once per project
+            // every 10 minutes: it is a full-project pass and a commit burst used to repeat it.
+            static RECONSTRUCT_COOLDOWN: std::sync::OnceLock<crate::graph::guard::Cooldown> =
+                std::sync::OnceLock::new();
+            let cooldown = RECONSTRUCT_COOLDOWN.get_or_init(|| {
+                crate::graph::guard::Cooldown::new(std::time::Duration::from_secs(600))
+            });
+            if !cooldown.try_start(pid) {
+                tracing::debug!(%pid, "Post-commit knowledge reconstruction skipped (cooldown)");
+                return;
+            }
             match crate::skills::activation::reconstruct_knowledge_links(orch2.neo4j(), pid).await {
                 Ok(r) if r.notes_linked > 0 || r.affects_created > 0 => {
                     tracing::info!(
