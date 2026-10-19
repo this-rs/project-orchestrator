@@ -811,14 +811,17 @@ jobs:
         run: |
           gh cache list --repo "$REPO" --ref refs/heads/main --limit 100 \
               --sort created_at --order desc --json id,key,createdAt,sizeInBytes > caches.json
-          # Newest first: the first entry of each profile (v0-rust-ci-<profile>-...) is kept.
-          jq -r '[.[] | select(.key | test("^v0-rust-ci-[a-z]+-"))]
-                 | group_by(.key | capture("^v0-rust-(?<p>ci-[a-z]+)-").p)
-                 | map(sort_by(.createdAt) | reverse | .[1:][]) | .[]
+          # The family of an entry: the cargo profile (v0-rust-ci-<profile>-...) or the nexus fake
+          # servers (nexus-fakes-..., one entry per pinned nexus revision, see
+          # .github/actions/nexus-fakes). The newest entry of each family is kept.
+          FAMILY='def family: if test("^v0-rust-ci-[a-z]+-") then capture("^v0-rust-(?<p>ci-[a-z]+)-").p
+                               elif test("^nexus-fakes-") then "nexus-fakes" else empty end;
+                  [.[] | select(.key | family) ] | group_by(.key | family)'
+          jq -r "$FAMILY"' | map(max_by(.createdAt)) | .[] | "  \(.key) \(.sizeInBytes)"' caches.json \
+            | sed '1i\
+          Keeping:' || true
+          jq -r "$FAMILY"' | map(sort_by(.createdAt) | reverse | .[1:][]) | .[]
                  | "\(.id) \(.key) \(.sizeInBytes)"' caches.json > stale.txt
-          echo "Keeping:"; jq -r '[.[] | select(.key | test("^v0-rust-ci-[a-z]+-"))]
-                 | group_by(.key | capture("^v0-rust-(?<p>ci-[a-z]+)-").p)
-                 | map(max_by(.createdAt)) | .[] | "  \(.key) \(.sizeInBytes)"' caches.json
           echo "Deleting:"; cat stale.txt
           while read -r id key size; do
             gh cache delete "$id" --repo "$REPO" || echo "::warning::could not delete $key"
