@@ -818,59 +818,23 @@ impl SpreadingActivationEngine {
             frontier = next_frontier;
         }
 
-        // Phase 2.5: Connectivity re-ranking — boost direct matches that are
-        // connected to other activated entities via synapses ("hub bonus").
-        // This makes well-connected notes rank higher than isolated ones,
-        // differentiating search_neurons from plain vector search.
-        if config.connectivity_boost > 0.0 {
-            let activated_ids: HashSet<Uuid> = activations.keys().copied().collect();
-            let mut boost_map: HashMap<Uuid, f64> = HashMap::new();
-
-            for (node_id, (_, source, _, _)) in &activations {
-                if !matches!(source, ActivationSource::Direct) {
-                    continue;
-                }
-                // Count how many other activated entities this direct match
-                // is connected to via synapses
-                if let Ok(synapses) = self.graph_store.get_synapses(*node_id).await {
-                    let connected_activated = synapses
-                        .iter()
-                        .filter(|(neighbor_id, _)| {
-                            *neighbor_id != *node_id && activated_ids.contains(neighbor_id)
-                        })
-                        .count();
-                    if connected_activated > 0 {
-                        let bonus = config.connectivity_boost * connected_activated as f64;
-                        boost_map.insert(*node_id, bonus);
-                    }
-                }
-            }
-
-            // Apply boosts
-            for (node_id, bonus) in &boost_map {
-                if let Some(entry) = activations.get_mut(node_id) {
-                    entry.0 += bonus;
-                }
-            }
-
-            if !boost_map.is_empty() {
-                debug!(
-                    "Phase 2.5: connectivity boost applied to {} direct matches",
-                    boost_map.len()
-                );
-            }
-        }
-
-        // Phase 3: Ranking with slot reservation
+        // Phase 3: Ranking.
         //
-        // Problem: direct matches score ~0.91 while propagated notes score
-        // ~0.39 (after hop decay). Pure score ranking means propagated notes
-        // NEVER appear in top-N results — making spreading useless.
+        // Every activated entity is ranked by score, and equal scores are
+        // ordered by note id: the activations come out of a `HashMap`, so
+        // without a tie-break the truncation to `max_results` would depend on
+        // iteration order. Bounded sums make ties at the 1.0 ceiling
+        // reachable, so this is not theoretical.
         //
-        // Solution: reserve a fraction of slots for propagated results.
-        // With propagated_ratio=0.4 and max_results=10: 4 slots for
-        // propagated, 6 for direct. Unused slots overflow to the other pool.
-        let (mut direct, mut propagated): (Vec<ActivatedNote>, Vec<ActivatedNote>) = activations
+        // There is no slot reservation and no hub bonus. Both existed because
+        // `max` kept every propagated score below every direct match: the
+        // quota forced a few propagated notes into the top-N, and the bonus
+        // made well-connected direct matches stand out. With the rule
+        // accumulating convergent evidence, a propagated note wins on merit
+        // and a hub is rewarded by its contributing paths — a degree bonus on
+        // top of that counts the same signal twice, and could push a direct
+        // score above 1.0.
+        let mut results: Vec<ActivatedNote> = activations
             .into_values()
             .map(|(score, source, note, entity_type)| ActivatedNote {
                 note,
@@ -878,41 +842,15 @@ impl SpreadingActivationEngine {
                 source,
                 entity_type,
             })
-            .partition(|r| matches!(r.source, ActivationSource::Direct));
+            .collect();
 
-        // Sort each pool by score descending
-        let score_cmp = |a: &ActivatedNote, b: &ActivatedNote| {
+        results.sort_by(|a, b| {
             b.activation_score
                 .partial_cmp(&a.activation_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-        };
-        direct.sort_by(score_cmp);
-        propagated.sort_by(score_cmp);
-
-        let results = if config.propagated_ratio > 0.0 && !propagated.is_empty() {
-            let propagated_slots =
-                (config.max_results as f64 * config.propagated_ratio).ceil() as usize;
-            let direct_slots = config.max_results.saturating_sub(propagated_slots);
-
-            // Take from each pool up to their slot allocation
-            let taken_direct: Vec<ActivatedNote> = direct.into_iter().take(direct_slots).collect();
-            let taken_propagated: Vec<ActivatedNote> =
-                propagated.into_iter().take(propagated_slots).collect();
-
-            // Merge and re-sort by score
-            let mut merged = taken_direct;
-            merged.extend(taken_propagated);
-            merged.sort_by(score_cmp);
-            merged.truncate(config.max_results);
-            merged
-        } else {
-            // No reservation: pure score ranking (original behavior)
-            let mut all = direct;
-            all.extend(propagated);
-            all.sort_by(score_cmp);
-            all.truncate(config.max_results);
-            all
-        };
+                .then_with(|| a.note.id.cmp(&b.note.id))
+        });
+        results.truncate(config.max_results);
 
         let direct_count = results
             .iter()
@@ -1339,6 +1277,147 @@ mod tests {
             match r.source {
                 ActivationSource::Propagated { via, .. } => assert_eq!(via, b.id),
                 _ => panic!("target should be propagated"),
+            }
+        }
+    }
+
+    /// With the rule accumulating evidence, a propagated note competes on
+    /// merit. The removed Phase 3 reserved 40 % of the slots for propagated
+    /// results, so at most 4 of them could ever be returned.
+    #[tokio::test]
+    async fn every_propagated_note_that_earns_its_score_is_returned() {
+        let mock = Arc::new(MockGraphStore::new());
+        let store = gs(&mock);
+        let project_id = Uuid::new_v4();
+        let emb = mock_embedding_provider().embed_text("query").await.unwrap();
+
+        let seed = note_with_energy(Uuid::new_v4(), Some(project_id), "query", 1.0);
+        store.create_note(&seed).await.unwrap();
+        store
+            .set_note_embedding(seed.id, &emb, "mock")
+            .await
+            .unwrap();
+
+        let mut targets = Vec::new();
+        for _ in 0..6 {
+            let target = note_with_energy(Uuid::new_v4(), Some(project_id), "target", 1.0);
+            store.create_note(&target).await.unwrap();
+            store
+                .create_synapses(seed.id, &[(target.id, 0.9)])
+                .await
+                .unwrap();
+            targets.push(target);
+        }
+
+        let config = SpreadingActivationConfig {
+            max_hops: 1,
+            min_activation: 0.01,
+            max_results: 10,
+            ..Default::default()
+        };
+        let engine = SpreadingActivationEngine::new(store, mock_embedding_provider());
+        let results = engine
+            .activate("query", Some(project_id), &config)
+            .await
+            .unwrap();
+
+        let propagated = results
+            .iter()
+            .filter(|r| matches!(r.source, ActivationSource::Propagated { .. }))
+            .count();
+        assert_eq!(
+            propagated,
+            targets.len(),
+            "all six propagated notes must be returned; a 40 % quota capped them at 4"
+        );
+    }
+
+    /// The removed hub bonus added `0.02 × activated neighbours` to every
+    /// direct match, which could push a seeded score above 1.0 — the ceiling
+    /// the published score and the UI assume.
+    #[tokio::test]
+    async fn no_activation_score_exceeds_one() {
+        let mock = Arc::new(MockGraphStore::new());
+        let store = gs(&mock);
+        let project_id = Uuid::new_v4();
+        let emb = mock_embedding_provider().embed_text("query").await.unwrap();
+
+        let seed = note_with_energy(Uuid::new_v4(), Some(project_id), "query", 1.0);
+        store.create_note(&seed).await.unwrap();
+        store
+            .set_note_embedding(seed.id, &emb, "mock")
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            let neighbour = note_with_energy(Uuid::new_v4(), Some(project_id), "n", 1.0);
+            store.create_note(&neighbour).await.unwrap();
+            store
+                .create_synapses(seed.id, &[(neighbour.id, 0.9)])
+                .await
+                .unwrap();
+        }
+
+        let config = SpreadingActivationConfig {
+            max_hops: 1,
+            min_activation: 0.01,
+            ..Default::default()
+        };
+        let engine = SpreadingActivationEngine::new(store, mock_embedding_provider());
+        let results = engine
+            .activate("query", Some(project_id), &config)
+            .await
+            .unwrap();
+
+        for r in &results {
+            assert!(
+                r.activation_score <= 1.0 + 1e-9,
+                "{} scored {} > 1.0",
+                r.note.id,
+                r.activation_score
+            );
+        }
+    }
+
+    /// Equal scores are ordered by note id, not by the `HashMap` the
+    /// activations come out of: without the tie-break, which notes survive
+    /// `truncate` would change from run to run.
+    #[tokio::test]
+    async fn equal_scores_are_truncated_deterministically() {
+        let mock = Arc::new(MockGraphStore::new());
+        let store = gs(&mock);
+        let project_id = Uuid::new_v4();
+        let emb = mock_embedding_provider().embed_text("query").await.unwrap();
+        for _ in 0..8 {
+            let note = note_with_energy(Uuid::new_v4(), Some(project_id), "query", 1.0);
+            store.create_note(&note).await.unwrap();
+            store
+                .set_note_embedding(note.id, &emb, "mock")
+                .await
+                .unwrap();
+        }
+
+        let config = SpreadingActivationConfig {
+            max_hops: 1,
+            min_activation: 0.01,
+            max_results: 5,
+            ..Default::default()
+        };
+        let engine = SpreadingActivationEngine::new(store, mock_embedding_provider());
+
+        let mut expected: Option<Vec<Uuid>> = None;
+        for _ in 0..20 {
+            let results = engine
+                .activate("query", Some(project_id), &config)
+                .await
+                .unwrap();
+            let got: Vec<Uuid> = results.iter().map(|r| r.note.id).collect();
+
+            match &expected {
+                None => expected = Some(got),
+                Some(first) => assert_eq!(
+                    &got, first,
+                    "equal scores must truncate to the same notes, in the same order"
+                ),
             }
         }
     }
