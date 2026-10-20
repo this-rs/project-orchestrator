@@ -500,27 +500,67 @@ pub struct ChatYamlConfig {
     /// (`CHAT_NATIVE_SESSION_MAX_TOKENS` wins). Unset by default: no budget, as in Claude Code.
     pub native_session_max_tokens: Option<u64>,
     /// Obscura's executable (`dsh-obscura-nav`), for the keyless `obscura` search engine of
-    /// native sessions. Default: `OBSCURA_BIN`, else found on the `PATH`.
+    /// native sessions, absolute (a relative path is ignored with a warning). `OBSCURA_BIN` wins.
+    /// Default: the engine embedded in nexus-tools, else `dsh-obscura-nav` found on the `PATH`.
     pub obscura_path: Option<String>,
     /// Also attach that executable as the native sessions' browser (`<path> mcp`, the
     /// `browser_*` tools), still only for a project that authorised the browser. Default false.
     pub obscura_browser: Option<bool>,
 }
 
+/// A boolean flag of the environment, read case-insensitively and trimmed: `true`/`1`/`yes`/`on`
+/// or `false`/`0`/`no`/`off`. Anything else is `None`, so it never overrides the YAML: a `TRUE`
+/// or a typo used to read as `false` and silently replace a `true` from config.yaml.
+pub(crate) fn parse_env_flag(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// A flag whose environment variable wins over the YAML only when it parses
+/// ([`parse_env_flag`]): an unknown value falls back to the YAML.
+pub(crate) fn env_flag_over(env: Option<&str>, yaml: Option<bool>) -> Option<bool> {
+    env.and_then(parse_env_flag).or(yaml)
+}
+
+/// The startup warning for a configured Obscura executable (`OBSCURA_BIN` / `chat.obscura_path`)
+/// that is not absolute: such a path is ignored (the server runs executables by absolute path
+/// only, a relative one would name a file of a session's project), and without this trace the
+/// only symptom was a `tool_engine_not_installed` at the first search.
+pub(crate) fn relative_obscura_path_warning(path: &str) -> Option<String> {
+    let path = path.trim();
+    (!path.is_empty() && !std::path::Path::new(path).is_absolute()).then(|| {
+        format!(
+            "OBSCURA_BIN / chat.obscura_path is relative ({path}) and is ignored: give an \
+             absolute path (the Obscura engine embedded in nexus-tools, else dsh-obscura-nav on \
+             the PATH, is used instead)"
+        )
+    })
+}
+
 /// Obscura's place in the chat configuration: `path` (from `OBSCURA_BIN` or
-/// `chat.obscura_path`) replaces what `ChatConfig::from_env` found on the `PATH`; with
-/// `browser` true it is also the browser (`<path> mcp`) when no `obscura` was found. The browser
-/// is still attached only to a project that authorised it (`PUT .../network-tools/browser`).
+/// `chat.obscura_path`, absolute only — a relative one is ignored with a warning) is the
+/// executable of the `obscura` search engine. Without it, the engine embedded in nexus-tools
+/// is the default and `dsh-obscura-nav` on the `PATH` the fallback, resolved at each session
+/// opening. With `browser` true the configured executable — else `on_path`, the `PATH`
+/// lookup — is also the browser (`<path> mcp`) when no `obscura` was found. The browser is
+/// still attached only to a project that authorised it (`PUT .../network-tools/browser`).
 pub(crate) fn apply_obscura(
     chat_config: &mut chat::ChatConfig,
     path: Option<&str>,
     browser: Option<bool>,
+    on_path: impl FnOnce() -> Option<std::path::PathBuf>,
 ) {
     if let Some(path) = path.filter(|p| !p.trim().is_empty()) {
-        chat_config.obscura_path = Some(std::path::PathBuf::from(path.trim()));
+        match relative_obscura_path_warning(path) {
+            Some(warning) => tracing::warn!("{warning}"),
+            None => chat_config.obscura_path = Some(std::path::PathBuf::from(path.trim())),
+        }
     }
     if browser == Some(true) && chat_config.nexus_browser_path.is_none() {
-        chat_config.nexus_browser_path = chat_config.obscura_path.clone();
+        chat_config.nexus_browser_path = chat_config.obscura_path.clone().or_else(on_path);
     }
 }
 
@@ -856,10 +896,11 @@ pub struct Config {
     /// Token budget of a native session (cache reads not counted).
     /// Priority: env var (CHAT_NATIVE_SESSION_MAX_TOKENS) > YAML (chat.native_session_max_tokens) > None (no budget).
     pub chat_native_session_max_tokens: Option<u64>,
-    /// Obscura's executable. Priority: env var (OBSCURA_BIN) > YAML (chat.obscura_path) > PATH.
+    /// Obscura's executable. Priority: env var (OBSCURA_BIN) > YAML (chat.obscura_path), absolute
+    /// only; unset, the engine embedded in nexus-tools, else `dsh-obscura-nav` on the PATH.
     pub chat_obscura_path: Option<String>,
-    /// Obscura as the browser (N23). Priority: env var (OBSCURA_BROWSER) > YAML
-    /// (chat.obscura_browser) > false.
+    /// Obscura as the browser (N23). Priority: env var (OBSCURA_BROWSER, case-insensitive
+    /// true/1/yes/on or false/0/no/off; any other value is ignored) > YAML (chat.obscura_browser) > false.
     pub chat_obscura_browser: Option<bool>,
 
     // ── Embedding provider config ────────────────────────────────────────
@@ -997,10 +1038,10 @@ impl Config {
                 .ok()
                 .filter(|v| !v.is_empty())
                 .or(yaml.chat.obscura_path),
-            chat_obscura_browser: std::env::var("OBSCURA_BROWSER")
-                .ok()
-                .map(|v| v == "true" || v == "1")
-                .or(yaml.chat.obscura_browser),
+            chat_obscura_browser: env_flag_over(
+                std::env::var("OBSCURA_BROWSER").ok().as_deref(),
+                yaml.chat.obscura_browser,
+            ),
             // Embedding provider config (env var > YAML > None)
             embedding_provider: std::env::var("EMBEDDING_PROVIDER")
                 .ok()
@@ -1768,6 +1809,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             &mut chat_config,
             config.chat_obscura_path.as_deref(),
             config.chat_obscura_browser,
+            chat::config::ChatConfig::obscura_on_path,
         );
         // Inject auth context for MCP session token generation.
         // When auth is enabled, build_options() will generate a JWT session token
@@ -3522,23 +3564,84 @@ chat:
         let mut chat = crate::chat::ChatConfig::from_env();
         chat.obscura_path = None;
         chat.nexus_browser_path = None;
-        apply_obscura(&mut chat, None, Some(true));
+        apply_obscura(&mut chat, None, Some(true), || None);
         assert_eq!(chat.obscura_path, None);
         assert_eq!(chat.nexus_browser_path, None, "nothing to attach");
-        apply_obscura(&mut chat, Some(" /opt/obscura/dsh-obscura-nav "), None);
+        apply_obscura(
+            &mut chat,
+            Some(" /opt/obscura/dsh-obscura-nav "),
+            None,
+            || None,
+        );
         assert_eq!(
             chat.obscura_path.as_deref(),
             Some(std::path::Path::new("/opt/obscura/dsh-obscura-nav"))
         );
         assert_eq!(chat.nexus_browser_path, None, "the browser is opt-in");
-        apply_obscura(&mut chat, None, Some(true));
+        apply_obscura(&mut chat, None, Some(true), || None);
         assert_eq!(chat.nexus_browser_path, chat.obscura_path);
         // A browser found as `obscura` is kept.
         chat.nexus_browser_path = Some("/usr/bin/obscura".into());
-        apply_obscura(&mut chat, Some("/x/dsh-obscura-nav"), Some(true));
+        apply_obscura(&mut chat, Some("/x/dsh-obscura-nav"), Some(true), || None);
         assert_eq!(
             chat.nexus_browser_path.as_deref(),
             Some(std::path::Path::new("/usr/bin/obscura"))
         );
+        // Nothing configured: the browser asked for is the `dsh-obscura-nav` of the PATH.
+        chat.obscura_path = None;
+        chat.nexus_browser_path = None;
+        apply_obscura(&mut chat, None, Some(true), || {
+            Some("/usr/local/bin/dsh-obscura-nav".into())
+        });
+        assert_eq!(
+            chat.obscura_path, None,
+            "the PATH is not the search engine's default"
+        );
+        assert_eq!(
+            chat.nexus_browser_path.as_deref(),
+            Some(std::path::Path::new("/usr/local/bin/dsh-obscura-nav"))
+        );
+    }
+
+    /// Review of #751: `OBSCURA_BROWSER=TRUE` or `yes` used to read as `false`, which then
+    /// overrode a `true` from config.yaml. The value is case-insensitive, and an unknown one is
+    /// no value at all.
+    #[test]
+    fn obscura_browser_from_the_environment_is_case_insensitive_and_an_unknown_value_keeps_the_yaml(
+    ) {
+        for yes in ["true", "TRUE", "True", "1", "yes", "YES", " on "] {
+            assert_eq!(parse_env_flag(yes), Some(true), "{yes:?}");
+            assert_eq!(env_flag_over(Some(yes), Some(false)), Some(true), "{yes:?}");
+        }
+        for no in ["false", "FALSE", "0", "no", "Off"] {
+            assert_eq!(parse_env_flag(no), Some(false), "{no:?}");
+            assert_eq!(env_flag_over(Some(no), Some(true)), Some(false), "{no:?}");
+        }
+        for unknown in ["", "maybe", "ture", "2"] {
+            assert_eq!(parse_env_flag(unknown), None, "{unknown:?}");
+            assert_eq!(
+                env_flag_over(Some(unknown), Some(true)),
+                Some(true),
+                "{unknown:?}"
+            );
+            assert_eq!(env_flag_over(Some(unknown), None), None, "{unknown:?}");
+        }
+        assert_eq!(env_flag_over(None, Some(true)), Some(true));
+    }
+
+    /// Review of #751: a relative `OBSCURA_BIN` was kept without a trace, then refused at every
+    /// opening (`tool_engine_not_installed`). It is now ignored at startup, with a warning.
+    #[test]
+    fn a_relative_obscura_path_is_ignored_at_startup_with_a_warning() {
+        let warning = relative_obscura_path_warning("bin/dsh-obscura-nav").expect("warned");
+        assert!(warning.contains("OBSCURA_BIN"), "{warning}");
+        assert!(warning.contains("bin/dsh-obscura-nav"), "{warning}");
+        assert_eq!(relative_obscura_path_warning("/opt/dsh-obscura-nav"), None);
+        assert_eq!(relative_obscura_path_warning("  "), None);
+
+        let mut chat = crate::chat::ChatConfig::from_env();
+        chat.obscura_path = None;
+        apply_obscura(&mut chat, Some("./dsh-obscura-nav"), None, || None);
+        assert_eq!(chat.obscura_path, None, "a relative path is not configured");
     }
 }

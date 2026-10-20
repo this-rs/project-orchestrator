@@ -2577,11 +2577,17 @@ async fn cc_scoped_twice(
             .await;
     }
     let line = cli.wait_line(0, req, WAIT).await.unwrap_or_default();
-    if cli
-        .wait_line(0, again, Duration::from_secs(3))
-        .await
-        .is_none()
-    {
+    // Waited on as such, never for a fixed time: the backend's own decision about `again`
+    // (it answers it, or the request waits for the user and nothing comes before WAIT).
+    // The fixed 3 s it replaces was not the cause of FLAKY-PARITE-ALWAYS (the backend's
+    // answer lands before `req`'s routing even returns) but still a bet on timing.
+    let by_backend = w
+        .wait(
+            WAIT,
+            |e| matches!(e, ChatEvent::PermissionDecision { id, .. } if id == again),
+        )
+        .await;
+    if !by_backend {
         // Not answered by the backend: the user unblocks it.
         let _ = manager
             .route_permission_response(&w.sid, again, true, once, false)

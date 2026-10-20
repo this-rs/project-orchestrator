@@ -47,6 +47,10 @@ Thank you for your interest in contributing to Project Orchestrator! This docume
 - Ensure all tests pass before submitting a PR: `cargo test`
 - **Unit tests** use mock backends (`MockGraphStore`, `MockSearchStore`) — no external services needed
 - **Integration tests** require Neo4j and Meilisearch running
+- **Store conformance** (`tests/store_conformance.rs`): one set of `GraphStore` checks run
+  against every backend (`mock::*` and `neo4j::*`). A new backend adds a `StoreFactory` and one
+  macro call; a mock/Neo4j divergence goes in `EXPECTED_DIVERGENCES` (Neo4j is the reference)
+  until the mock is fixed. Point `NEO4J_URI` at a disposable instance, never a development one.
 - Current test count: **1992 tests** (unit + integration)
 
 ### Commit Messages

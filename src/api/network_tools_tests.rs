@@ -697,16 +697,29 @@ async fn an_obscura_engine_is_declared_keyless_and_gives_websearch_once_duckduck
         "{after:?}"
     );
 
-    // Consented but no executable on this server: the engine is skipped, WebSearch goes with it.
+    // Consented, nothing configured, a nexus-tools without Obscura: the fallback is
+    // `dsh-obscura-nav` on the server's PATH (OBS-R). Without one there, the engine is skipped
+    // and WebSearch goes with it.
     let missing = native_session_args(graph, "obs-missing", None).await;
-    assert!(
-        !missing.iter().any(|a| a.starts_with("obscura:")),
-        "{missing:?}"
-    );
-    assert!(
-        !tools_of(&missing).iter().any(|t| t == "WebSearch"),
-        "{missing:?}"
-    );
+    match crate::chat::config::ChatConfig::obscura_on_path()
+        .as_deref()
+        .and_then(crate::chat::provider::native_factory::runnable_nexus_tools)
+    {
+        Some(on_path) => assert!(
+            missing.contains(&format!("obscura:{}", on_path.display())),
+            "{missing:?}"
+        ),
+        None => {
+            assert!(
+                !missing.iter().any(|a| a.starts_with("obscura:")),
+                "{missing:?}"
+            );
+            assert!(
+                !tools_of(&missing).iter().any(|t| t == "WebSearch"),
+                "{missing:?}"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]

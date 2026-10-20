@@ -11186,7 +11186,9 @@ impl ChatManager {
     /// backend answers the later requests it covers. `always` (P11b): a plain allow too, none
     /// of the CLI's `permission_suggestions` applied; the lasting grant
     /// (`session_grants::lasting_grant_for`) is written for the session's person and project
-    /// once the CLI has the answer. An `always` or a `session` the call cannot be granted for
+    /// once the CLI has the answer. Either grant covers the identical call from BEFORE the
+    /// CLI can read the answer (the CLI asks it again at once). An `always` or a `session`
+    /// the call cannot be granted for
     /// (or a session that keeps no lasting rule): refused
     /// ([`PermissionDeliveryError::ScopeUnsupported`]), the request stays waiting.
     async fn deliver_permission_answer(
@@ -11344,25 +11346,50 @@ impl ChatManager {
             "Sending permission control response to CLI (via stdin_tx, lock-free)"
         );
 
+        // The grant covers, from now on, the requests that arrive while the CLI takes the
+        // answer and the rule is written: the CLI asks the identical call again as soon as
+        // it has the answer (about 1 ms after the write, measured on the parity scenario,
+        // while the next statements here ran 50 µs after it; a thread preempted in between
+        // left the second call to the user — FLAKY-PARITE-ALWAYS). Begun BEFORE the write,
+        // as on the agent engine (`agent_runtime::PendingGrant`); taken back if it fails.
+        let lasting =
+            for_good && claimed.is_some() && scope == super::types::PermissionAnswerScope::Always;
+        if let Some(grant) = &grant {
+            let mut grants = session_grants.lock().unwrap_or_else(|p| p.into_inner());
+            if lasting {
+                grants.begin_lasting(grant.clone());
+            } else {
+                grants.begin_pending(grant.clone());
+            }
+        }
         // On the tool clock BEFORE the CLI has it: a fast tool's result cannot overtake it.
         let mark = tool_clock.decided(request_id, allow, chrono::Utc::now());
         if let Err(e) = stdin_tx.send(json).await {
             tool_clock.undecided(request_id, mark);
+            if let Some(grant) = &grant {
+                let mut grants = session_grants.lock().unwrap_or_else(|p| p.into_inner());
+                if lasting {
+                    grants.abort_lasting(grant);
+                } else {
+                    grants.end_pending(grant, false);
+                }
+            }
             restore_claim(claimed).await;
             return Err(PermissionDeliveryError::Failed(anyhow!(
                 "Failed to send permission control response: {}",
                 e
             )));
         }
+        #[cfg(test)]
+        answer_probe::cli_has_answer(session_id).await;
         drop(answering);
-        // Kept only now that the CLI has the answer. A lasting rule that cannot be written
-        // leaves the call granted for this session, and the decision says `session`.
+        // Kept for good only now that the CLI has the answer. A lasting rule that cannot be
+        // written leaves the call granted for this session, and the decision says `session`.
         let mut kept = scope;
         match (&grant, &claimed, scope) {
-            (Some(grant), Some(c), super::types::PermissionAnswerScope::Always) if for_good => {
+            (Some(grant), Some(c), super::types::PermissionAnswerScope::Always) if lasting => {
                 let place = {
-                    let mut grants = session_grants.lock().unwrap_or_else(|p| p.into_inner());
-                    grants.begin_lasting(grant.clone());
+                    let grants = session_grants.lock().unwrap_or_else(|p| p.into_inner());
                     // The shell may have moved since: then nothing is written.
                     (!grants.cwd_bound(&legacy_asked_call(c)))
                         .then(|| grants.lasting_scope())
@@ -11383,10 +11410,11 @@ impl ChatManager {
                 if scope == super::types::PermissionAnswerScope::Always {
                     kept = super::types::PermissionAnswerScope::Session;
                 }
+                // Pending since before the write: kept for the rest of the session.
                 session_grants
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .add(grant.clone())
+                    .end_pending(grant, true)
             }
             (None, _, _) => {}
         }
@@ -16690,11 +16718,14 @@ impl ChatManager {
                             program,
                             browser,
                             // The same rule as the others: an absolute, executable path.
-                            obscura: self
-                                .config
-                                .obscura_path
-                                .as_deref()
-                                .and_then(runnable_nexus_tools),
+                            // Unconfigured, the engine embedded in nexus-tools is the default
+                            // and `dsh-obscura-nav` on the PATH only the fallback (OBS-R).
+                            obscura: super::config::obscura_engine_program(
+                                self.config.obscura_path.as_deref(),
+                                embedded_obscura,
+                                super::config::ChatConfig::obscura_on_path,
+                                runnable_nexus_tools,
+                            ),
                             embedded_obscura,
                             deny_paths: nt::host_deny_paths(self.config_yaml_path.as_deref()),
                         },
@@ -21479,6 +21510,121 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    /// OBS-R: the executable of a declared `obscura` engine at a session opening.
+    #[tokio::test]
+    async fn a_declared_obscura_engine_runs_the_configured_executable_else_the_embedded_one() {
+        use nexus_claude::agent::{McpServerSpec, ProviderKind};
+        use std::os::unix::fs::PermissionsExt;
+        const EMBEDS: &str = "#!/bin/sh\n[ \"$1\" = --capabilities ] && echo '{\"version\":\"0.5.1\",\"tls\":true,\"obscura\":true}'\n";
+        const PLAIN: &str = "#!/bin/sh\n";
+
+        let engine_args = |nexus_tools: &'static str,
+                           configured: Option<PathBuf>,
+                           sid: &'static str| async move {
+            let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+            let record = crate::chat::provider::nexus_tools::SearchProviderRecord {
+                id: "obs".into(),
+                engine: "obscura".into(),
+                base_url: None,
+                credential_ref: "none".into(),
+            };
+            graph
+                .put_llm_setting(
+                    crate::chat::provider::settings::GLOBAL,
+                    &format!(
+                        "{}obs",
+                        crate::chat::provider::nexus_tools::SEARCH_PROVIDER_PREFIX
+                    ),
+                    &serde_json::to_string(&record).unwrap(),
+                )
+                .await
+                .unwrap();
+            crate::chat::provider::nexus_tools::record_origin_consent(
+                &*graph,
+                "proj",
+                crate::chat::provider::nexus_tools::OBSCURA_SEARCH_ORIGIN,
+                "tester",
+            )
+            .await
+            .unwrap();
+            let state = mock_app_state_with_graph(graph);
+            let bin = tempfile::TempDir::new().unwrap();
+            let program = bin.path().join("nexus-tools");
+            std::fs::write(&program, nexus_tools).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut config = test_config();
+            config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
+            config.nexus_tools_path = Some(program);
+            config.obscura_path = configured;
+            let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+            let claims = crate::auth::jwt::Claims::service_account("obs-r");
+            let spec = manager
+                .build_agent_spec(AgentSpecInput {
+                    file_scope_lifted: false,
+                    cwd: "/work/app",
+                    model: "m",
+                    system_prompt: "p",
+                    permission_mode: None,
+                    add_dirs: &[],
+                    user_claims: Some(&claims),
+                    session_id: sid,
+                    third_party: true,
+                    max_tokens: None,
+                    kind: ProviderKind::Native,
+                    remote_cwd: None,
+                    per_session_mcp: true,
+                    hooks: Some(AgentHookScope {
+                        project_slug: Some("proj".into()),
+                        task_id: None,
+                        runner: false,
+                    }),
+                })
+                .await
+                .unwrap();
+            crate::auth::agent_tokens::revoke_session(sid);
+            let Some(McpServerSpec::Stdio { args, .. }) = spec.mcp_servers.get("nexus") else {
+                panic!("a stdio `nexus` server expected");
+            };
+            let engine: Vec<String> = args
+                .windows(2)
+                .filter(|w| w[0] == "--search-engine")
+                .map(|w| w[1].clone())
+                .collect();
+            engine
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let obscura = dir.path().join("dsh-obscura-nav");
+        std::fs::write(&obscura, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&obscura, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let configured = vec![format!(
+            "obscura:{}",
+            std::fs::canonicalize(&obscura).unwrap().display()
+        )];
+        let embedded = vec!["obscura".to_string()];
+        let relative = Some(PathBuf::from("bin/dsh-obscura-nav"));
+        let missing = Some(dir.path().join("absent"));
+        for (n, (tools, path, want)) in [
+            (EMBEDS, Some(obscura.clone()), &configured),
+            (PLAIN, Some(obscura.clone()), &configured),
+            (EMBEDS, None, &embedded),
+            (EMBEDS, relative.clone(), &embedded),
+            (EMBEDS, missing.clone(), &embedded),
+            (PLAIN, relative, &Vec::new()),
+            (PLAIN, missing, &Vec::new()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sid = Box::leak(format!("obsr-{n}").into_boxed_str());
+            assert_eq!(
+                &engine_args(tools, path.clone(), sid).await,
+                want,
+                "case {n}: {path:?}"
+            );
+        }
     }
 
     /// P18: a native session a person opened runs sub-agents (the harness then offers
@@ -36366,6 +36512,253 @@ mod image_turn_services_tests {
                 .ends_with("; not_changed: set_model_failed"),
             "{}",
             stored[0].reason
+        );
+    }
+}
+
+/// What a test runs the moment the Claude Code CLI can read a permission answer of the
+/// user ([`ChatManager::deliver_permission_answer`]), before the function goes on: the
+/// CLI's next request lands there in the worst case (FLAKY-PARITE-ALWAYS).
+#[cfg(test)]
+pub(crate) mod answer_probe {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    type Probe =
+        Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
+    /// One probe per session (a session id is never shared between tests).
+    static PROBES: LazyLock<Mutex<HashMap<String, Probe>>> = LazyLock::new(Default::default);
+
+    /// Runs `probe` once, when the CLI of `session_id` has the next answer.
+    pub(crate) fn on_cli_has_answer(session_id: &str, probe: Probe) {
+        PROBES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(session_id.to_string(), probe);
+    }
+
+    /// Drops the probe of `session_id` if it never ran (the CLI never had an answer).
+    pub(crate) fn forget(session_id: &str) {
+        PROBES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(session_id);
+    }
+
+    pub(super) async fn cli_has_answer(session_id: &str) {
+        let probe = PROBES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(session_id);
+        if let Some(probe) = probe {
+            probe().await;
+        }
+    }
+}
+
+/// The CLI asks the identical call again as soon as it reads the answer of the first one:
+/// a grant the user gave (`session`, `always`) covers it from that moment, not only once
+/// the rest of the answer (the lasting rule's write) is done (FLAKY-PARITE-ALWAYS).
+#[cfg(test)]
+mod grant_before_the_cli_tests {
+    use super::super::lasting_rules::{LastingRuleStore, LastingScope};
+    use super::super::session_grants::{cover, AskedCall, Asker, Cover, SessionGrants};
+    use super::super::types::PermissionAnswerScope;
+    use super::*;
+
+    /// The call the session's pending `req-1` asks (`test_support`).
+    fn ls() -> AskedCall {
+        AskedCall {
+            asker: Asker::ClaudeCode,
+            tool: "Bash".into(),
+            canonical: None,
+            input: serde_json::json!({ "command": "ls" }),
+        }
+    }
+
+    struct Answered {
+        /// What covered the identical call the moment the CLI could read the answer.
+        at_the_cli: Option<Cover>,
+        /// What covers it once the answer is done.
+        after: Option<Cover>,
+        /// What covered ANOTHER call (`pwd`, never approved) at the same moment.
+        other_at_the_cli: Option<Cover>,
+        result: std::result::Result<(), PermissionDeliveryError>,
+        _dir: tempfile::TempDir,
+    }
+
+    /// A Claude Code session keeping lasting rules (in the project's root) whose `req-1`
+    /// is answered with `scope`; `cli_gone` drops the CLI's stdin first.
+    async fn answered(scope: PermissionAnswerScope, cli_gone: bool) -> Answered {
+        answered_in(scope, cli_gone, false).await
+    }
+
+    /// `broken_store`: the lasting rules' directory cannot be written (a file stands there).
+    async fn answered_in(
+        scope: PermissionAnswerScope,
+        cli_gone: bool,
+        broken_store: bool,
+    ) -> Answered {
+        let state = crate::test_helpers::mock_app_state();
+        let manager =
+            ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config());
+        let sid = uuid::Uuid::new_v4().to_string();
+        let client = nexus_claude::InteractiveClient::new(nexus_claude::ClaudeCodeOptions {
+            model: Some("test".into()),
+            cli_path: Some("/nonexistent/claude".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let (stdin_rx, _queue) =
+            test_support::insert_session_with_client(&manager, &sid, client, false, &["req-1"])
+                .await
+                .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        if broken_store {
+            std::fs::write(dir.path().join("rules"), b"not a directory").unwrap();
+        }
+        let place = LastingScope::of_session(
+            Some(&LastingRuleStore::new(dir.path().join("rules"))),
+            Some("person"),
+            Some("proj"),
+            Some(&root),
+            &root,
+        )
+        .expect("a session in the project's root keeps lasting rules");
+        let grants = manager.active_sessions.read().await[&sid]
+            .session_grants
+            .clone();
+        *grants.lock().unwrap() = SessionGrants::declaring(Vec::new()).with_lasting(Some(place));
+        assert!(
+            grants
+                .lock()
+                .unwrap()
+                .always_grant(&ls())
+                .is_some_and(|(_, lasting)| lasting),
+            "`ls` can be approved for good here"
+        );
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let (other_tx, other_rx) = tokio::sync::oneshot::channel();
+        let probed = Arc::clone(&grants);
+        answer_probe::on_cli_has_answer(
+            &sid,
+            Box::new(move || {
+                Box::pin(async move {
+                    let _ = seen_tx.send(cover(&probed, &ls()).await);
+                    let pwd = AskedCall {
+                        input: serde_json::json!({ "command": "pwd" }),
+                        ..ls()
+                    };
+                    let _ = other_tx.send(cover(&probed, &pwd).await);
+                })
+            }),
+        );
+        let stdin_rx = if cli_gone {
+            drop(stdin_rx);
+            None
+        } else {
+            Some(stdin_rx)
+        };
+        let result = manager
+            .send_permission_response_inner(&sid, "req-1", true, scope, true)
+            .await;
+        answer_probe::forget(&sid);
+        if let Some(mut rx) = stdin_rx {
+            assert!(rx.try_recv().unwrap().contains("req-1"), "the CLI has it");
+        }
+        Answered {
+            at_the_cli: seen_rx.await.ok().flatten(),
+            other_at_the_cli: other_rx.await.ok().flatten(),
+            after: cover(&grants, &ls()).await,
+            result,
+            _dir: dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_always_covers_the_identical_call_as_soon_as_the_cli_has_the_answer() {
+        let a = answered(PermissionAnswerScope::Always, false).await;
+        assert!(a.result.is_ok(), "{:?}", a.result);
+        assert!(
+            a.at_the_cli.as_ref().is_some_and(|c| c.lasting),
+            "the CLI's next identical call would be left to the user: {:?}",
+            a.at_the_cli
+        );
+        assert!(
+            a.after.as_ref().is_some_and(|c| c.lasting),
+            "the rule is kept: {:?}",
+            a.after
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_grant_covers_the_identical_call_as_soon_as_the_cli_has_the_answer() {
+        let a = answered(PermissionAnswerScope::Session, false).await;
+        assert!(a.result.is_ok(), "{:?}", a.result);
+        assert!(
+            a.at_the_cli.as_ref().is_some_and(|c| !c.lasting),
+            "the CLI's next identical call would be left to the user: {:?}",
+            a.at_the_cli
+        );
+        assert!(
+            a.after.as_ref().is_some_and(|c| !c.lasting),
+            "{:?}",
+            a.after
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_the_cli_never_got_covers_nothing() {
+        for scope in [
+            PermissionAnswerScope::Always,
+            PermissionAnswerScope::Session,
+        ] {
+            let a = answered(scope, true).await;
+            assert!(
+                matches!(a.result, Err(PermissionDeliveryError::Failed(_))),
+                "{scope:?}: {:?}",
+                a.result
+            );
+            assert!(a.after.is_none(), "{scope:?} still covers: {:?}", a.after);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_grant_leaves_another_call_to_the_user_even_before_the_cli_reads_it() {
+        for scope in [
+            PermissionAnswerScope::Always,
+            PermissionAnswerScope::Session,
+        ] {
+            let a = answered(scope, false).await;
+            assert!(a.result.is_ok(), "{scope:?}: {:?}", a.result);
+            assert!(
+                a.at_the_cli.is_some(),
+                "{scope:?}: the call itself is covered"
+            );
+            assert!(
+                a.other_at_the_cli.is_none(),
+                "{scope:?} covers another call: {:?}",
+                a.other_at_the_cli
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_always_whose_rule_cannot_be_written_stays_a_session_grant() {
+        let a = answered_in(PermissionAnswerScope::Always, false, true).await;
+        assert!(a.result.is_ok(), "{:?}", a.result);
+        assert!(
+            a.at_the_cli.as_ref().is_some_and(|c| c.lasting),
+            "pending for good until the write is known: {:?}",
+            a.at_the_cli
+        );
+        assert!(
+            a.after.as_ref().is_some_and(|c| !c.lasting),
+            "no rule on disk: granted for the session only: {:?}",
+            a.after
         );
     }
 }

@@ -213,11 +213,13 @@ policy. The network tools follow the project's consent, per **origin** (scheme, 
    **Keyless: Obscura.** `{"id": "obscura", "engine": "obscura", "credential_ref": "none"}` (no
    `base_url`, no key). Each query runs `<obscura> serp --max-results N -- <query>` (the
    `dsh-obscura-nav` build of the Obscura headless browser, an external executable,
-   never linked in). The server finds the executable in `chat.obscura_path` (config.yaml) or `OBSCURA_BIN`,
-   else on its `PATH` (`dsh-obscura-nav`, then `obscura`); a request never names it. The project consents
-   to `https://html.duckduckgo.com`, the page Obscura reads the results from. Without the executable the
-   engine runs in nexus-tools itself when that build embeds Obscura, else it is left out
-   (`tool_engine_not_installed`) and `WebSearch` with it.
+   never linked in). The server takes the executable from `chat.obscura_path` (config.yaml) or
+   `OBSCURA_BIN` (the variable wins), an absolute path only: a relative one is ignored, with a warning at
+   startup. Without one, the engine runs in nexus-tools itself when that build embeds Obscura (the
+   default of release builds); only a nexus-tools without it falls back to the server's `PATH`
+   (`dsh-obscura-nav`, then `obscura`). A request never names it. The project consents
+   to `https://html.duckduckgo.com`, the page Obscura reads the results from. With none of these the
+   engine is left out (`tool_engine_not_installed`) and `WebSearch` with it.
 
    **Built in (release builds).** The nexus-tools shipped with every release embeds Obscura
    (`--features tls,obscura`, `nexus-tools --capabilities` says `"obscura": true`). Then an `obscura`
@@ -229,7 +231,9 @@ policy. The network tools follow the project's consent, per **origin** (scheme, 
    next to another engine (nexus-tools would fall back to an origin nobody chose).
 3. The browser: `PUT /api/projects/{slug}/network-tools/browser` with `{"allowed": true}`. It is attached
    only once its executable is also found: `obscura` on the server's `PATH`, the Obscura executable
-   above with `chat.obscura_browser: true` (or `OBSCURA_BROWSER=1`), started as `<path> mcp`, or else the
+   above (else `dsh-obscura-nav` on the `PATH`) with `chat.obscura_browser: true` (or `OBSCURA_BROWSER`:
+   `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off`, any case; another value is ignored and the YAML
+   applies), started as `<path> mcp`, or else the
    browser embedded in nexus-tools (`nexus-tools obscura mcp`, release builds). Its
    `browser_*` tools then go through the same permission gate as the other MCP tools; navigation needs the
    destination's origin to be consented too.

@@ -52,5 +52,9 @@ pub use models::*;
 pub use segment::Neo4jSegmentStore;
 pub use traits::GraphStore;
 
-#[cfg(test)]
-pub(crate) mod mock;
+// The in-memory store. Unit tests get it through `cfg(test)`; the integration
+// test targets (tests/store_conformance.rs runs the same checks against it and
+// against Neo4j) get it through the `mock-store` feature, which the dev-dependency
+// of the crate on itself enables for every test build and no binary.
+#[cfg(any(test, feature = "mock-store"))]
+pub mod mock;
