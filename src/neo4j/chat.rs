@@ -698,13 +698,18 @@ impl Neo4jClient {
     }
 
     /// Get child sessions spawned by a parent session (identified by the SPAWNED_BY edge, else by parent_id in the spawned_by JSON).
+    ///
+    /// A parent that no longer exists has no children (P18-suite, point 9): its DETACH DELETE
+    /// took the edges of its children with it, and the JSON fallback would otherwise hand
+    /// them back as the children of a deleted session.
     pub async fn get_session_children(&self, parent_id: Uuid) -> Result<Vec<ChatSessionNode>> {
         let q = query(
             r#"
             // The SPAWNED_BY edge is the lineage; the `spawned_by` JSON is only the
             // fallback for sessions that have no edge at all (written before it).
+            MATCH (p:ChatSession {id: $parent_id})
             MATCH (s:ChatSession)
-            WHERE EXISTS { (s)-[:SPAWNED_BY]->(:ChatSession {id: $parent_id}) }
+            WHERE EXISTS { (s)-[:SPAWNED_BY]->(p) }
                OR (NOT EXISTS { (s)-[:SPAWNED_BY]->(:ChatSession) }
                    AND s.spawned_by IS NOT NULL
                    AND s.spawned_by <> ''

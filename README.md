@@ -631,6 +631,7 @@ code(action: "get_node_importance", project_slug: "my-project",
 | [Chat & WebSocket](docs/guides/chat-websocket.md) | Real-time chat and events |
 | [Knowledge Notes](docs/guides/knowledge-notes.md) | Contextual knowledge capture |
 | [Classifier Bench](docs/guides/classifier-bench.md) | Offline bench of the five backend classifiers vs the majority baseline |
+| [Operations: after-merge checks](docs/guides/operations.md) | `cargo xtask in-service` (is what runs main?) and `cargo xtask pins` (did a nexus merge reach the pin?) |
 
 ---
 

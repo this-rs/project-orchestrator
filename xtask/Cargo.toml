@@ -1,0 +1,24 @@
+# Repository automation (`cargo xtask <subcommand>`): after-merge checks that
+# CONSTATE and never act (no restart, no deploy, no write to any repo).
+#
+# Deliberately outside the workspace (`[workspace] exclude` in the root
+# Cargo.toml): zero dependencies beyond std, its own tiny Cargo.lock, and the
+# Docker/release builds, which copy only Cargo.toml + crates/ + src/, never
+# need to know it exists. Run through the alias in .cargo/config.toml.
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "After-merge checks for the Project Orchestrator backend (in-service revision, git pins)"
+
+[dependencies]
+
+# Its own workspace root: never resolved as part of the backend workspace,
+# whatever directory cargo is invoked from.
+[workspace]
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"

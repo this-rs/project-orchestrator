@@ -20,6 +20,18 @@ pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// was unavailable, e.g. Docker builds without `.git`).
 pub const GIT_DESCRIBE: &str = env!("PO_GIT_DESCRIBE");
 
+/// `git rev-parse HEAD` at build time ("" when git was unavailable). The
+/// full sha of the commit that runs: what `GET /api/version` exposes as
+/// `build.git_sha`, and what `cargo xtask in-service` compares with main.
+pub const GIT_SHA: &str = env!("PO_GIT_SHA");
+
+/// The build's commit, `None` when the build had no git (so a consumer never
+/// mistakes "" for a revision).
+pub fn git_sha() -> Option<&'static str> {
+    let s = GIT_SHA.trim();
+    (!s.is_empty()).then_some(s)
+}
+
 /// Parse a release tag or version (`v0.0.15`, `0.0.15`, `v1.2.0-rc.1`).
 pub fn parse_version(raw: &str) -> Option<Version> {
     let trimmed = raw.trim();
@@ -113,6 +125,19 @@ mod tests {
 
     fn v(s: &str) -> Version {
         parse_version(s).unwrap()
+    }
+
+    #[test]
+    fn git_sha_is_a_full_commit_or_absent_never_an_empty_string() {
+        // Built from a checkout: build.rs captured `git rev-parse HEAD`.
+        // Built without git (Docker, tarball): the field is absent, not "".
+        match git_sha() {
+            Some(sha) => {
+                assert_eq!(sha.len(), 40, "{sha}");
+                assert!(sha.bytes().all(|b| b.is_ascii_hexdigit()), "{sha}");
+            }
+            None => assert!(GIT_SHA.trim().is_empty()),
+        }
     }
 
     #[test]
