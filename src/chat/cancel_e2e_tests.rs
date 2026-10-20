@@ -187,6 +187,18 @@ fn alive(pid: u32) -> bool {
     !stat.is_empty() && !stat.starts_with('Z')
 }
 
+/// Whether every `pids` is alive, polled until `within` elapses.
+async fn wait_alive(pids: &[u32], within: Duration) -> bool {
+    let t0 = Instant::now();
+    while t0.elapsed() < within {
+        if pids.iter().all(|p| alive(*p)) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    pids.iter().all(|p| alive(*p))
+}
+
 async fn dead_within(pids: &[u32], within: Duration) -> Option<Duration> {
     let t0 = Instant::now();
     while t0.elapsed() < within {
@@ -542,7 +554,15 @@ async fn cancel_task_stops_one_task_only_and_caps(path: ProviderPath) {
     let pid_a = start_background(&mut rig, "BG-A", "t-bg-a", &go_a, "A started").await;
     let pid_b = start_background(&mut rig, "BG-B", "t-bg-b", &go_b, "B started").await;
     assert_ne!(pid_a, pid_b);
-    assert!(alive(pid_a) && alive(pid_b));
+    // Both must still be running before the cancel. A single look races the runner's load:
+    // a background process may not have been scheduled yet when the backend reads its PID
+    // (a loaded runner failed here once, #913). Wait for both, bounded, then assert.
+    assert!(
+        wait_alive(&[pid_a, pid_b], WAIT).await,
+        "background tasks must be alive before the cancel: a={} b={}",
+        alive(pid_a),
+        alive(pid_b)
+    );
 
     rig.send("SYNC").await;
     rig.said("sync done").await;

@@ -5155,11 +5155,16 @@ async fn the_historical_loop_holds_a_turn_for_a_down_provider() {
         )),
         "a `down` notice names the instance, its failures and its masked cause: {notices:#?}"
     );
+    // The `up` notice follows the answer it announces: read right after the text it can still
+    // be in flight (a loaded runner failed here, #914). Wait for it, bounded.
     assert!(
-        notices.iter().any(
-            |e| matches!(e, ChatEvent::ProviderOutage { phase, .. } if phase.as_str() == "up")
-        ),
-        "the recovery is announced too: {notices:#?}"
+        w.wait(Duration::from_secs(10), |e| matches!(
+            e,
+            ChatEvent::ProviderOutage { phase, .. } if phase.as_str() == "up"
+        ))
+        .await,
+        "the recovery is announced too: {:#?}",
+        w.all().await
     );
 
     // 4. A held turn is not a failed one: the user never reads the refusal.
