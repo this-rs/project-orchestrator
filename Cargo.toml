@@ -1,5 +1,9 @@
 [workspace]
 members = [".", "crates/*", "desktop/src-tauri"]
+# xtask/ (`cargo xtask in-service|pins`, after-merge checks) is a standalone
+# std-only crate with its own Cargo.lock: not a member, so the Docker and
+# release builds, which copy Cargo.toml + crates/ + src/ only, never see it.
+exclude = ["xtask"]
 resolver = "2"
 
 # =============================================================================

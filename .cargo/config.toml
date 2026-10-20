@@ -1,1 +1,8 @@
 # No local patches — all dependencies resolved from git
+
+# `cargo xtask <subcommand>`: the after-merge checks of xtask/ (a standalone
+# std-only crate, excluded from the workspace). Run from the repo root.
+#   cargo xtask in-service   is the running backend the current main? (AM-1)
+#   cargo xtask pins         did main of each git-pinned repo reach Cargo.toml? (AM-2)
+[alias]
+xtask = "run --quiet --manifest-path xtask/Cargo.toml --"

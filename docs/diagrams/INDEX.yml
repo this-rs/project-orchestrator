@@ -137,8 +137,12 @@ diagrams:
   - name: po-crates-tests
     owner: theotime
     status: planned
+    # Arbitrage : xtask/ (cargo xtask in-service|pins, verifications d'apres-fusion) et son alias
+    # .cargo/config.toml sont de l'outillage du depot, au meme titre que scripts/test.sh.
     covers:
       - "backend:Cargo.toml"
+      - "backend:xtask/**"
+      - "backend:.cargo/config.toml"
       - "backend:crates/**"
       - "backend:tests/*.rs"
       - "backend:.github/workflows/{ci,security,release}.yml"
