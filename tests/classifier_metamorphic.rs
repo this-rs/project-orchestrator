@@ -26,7 +26,7 @@
 
 use chrono::{DateTime, Utc};
 use project_orchestrator::chat::provider::cognitive::signature::{
-    ContextHints, MAX_CONTEXT_TOKENS, MIN_CONTEXT_TOKENS, TaskSignature,
+    ContextHints, TaskSignature, MAX_CONTEXT_TOKENS, MIN_CONTEXT_TOKENS,
 };
 use project_orchestrator::evaluation::embedded_fixtures;
 use project_orchestrator::events::trigger::EventTrigger;
@@ -35,9 +35,9 @@ use project_orchestrator::neo4j::models::{TaskNode, TaskStatus};
 use project_orchestrator::neurons::intent::{IntentDetector, QueryIntentMode};
 use project_orchestrator::protocol::models::Protocol;
 use project_orchestrator::protocol::routing::{
-    ContextVector, DimensionWeights, RelevanceVector, rank_protocols,
+    rank_protocols, ContextVector, DimensionWeights, RelevanceVector,
 };
-use project_orchestrator::runner::persona::{Complexity, profile_task};
+use project_orchestrator::runner::persona::{profile_task, Complexity};
 use project_orchestrator::skills::activation::evaluate_skill_match;
 use project_orchestrator::skills::models::{SkillNode, SkillTrigger};
 use uuid::Uuid;
