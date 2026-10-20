@@ -350,6 +350,18 @@ impl LiveSessionSnapshot {
     }
 }
 
+/// CACHE-POOL: whether a newly-opened session should track the project's pending
+/// objectives for itself (`ActiveSession::objective_tracking`). An ordinary conversation
+/// does; a delegation's child — conversation sub-agent, MCP sub-agent, runner, gate,
+/// trigger, any session with a `spawned_by` — does not. The objectives belong to
+/// whoever opened it, not to it: measured 17/10/2026, a child that inherited the
+/// parent's reminder answered it with an extra, unrequested turn (~9.4k cache tokens).
+/// One function for both construction sites (fresh open and restart recovery) so the
+/// rule cannot drift between them.
+pub(crate) fn tracks_own_objectives(has_spawner: bool) -> bool {
+    !has_spawner
+}
+
 /// An active chat session with a live Claude CLI subprocess
 pub struct ActiveSession {
     /// The model's context window (tokens) the session was opened with, `None` when
@@ -7884,7 +7896,12 @@ impl ChatManager {
                     protocol_run_id: spawned_protocol_run_id,
                     protocol_state: spawned_protocol_state.clone(),
                     reasoning_path_tracker: super::feedback::ReasoningPathTracker::new(),
-                    objective_tracking: true,
+                    // CACHE-POOL: a delegation's child (conversation sub-agent, MCP sub-agent,
+                    // runner, gate, trigger — any spawned_by) is not the conversation the
+                    // project's pending tasks belong to. Reminding it of the PARENT's objectives
+                    // is noise it never asked for (measured 17/10/2026: an extra unrequested
+                    // turn, ~9.4k cache tokens, to answer a reminder meant for someone else).
+                    objective_tracking: tracks_own_objectives(request.spawned_by.is_some()),
                     objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
                     objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
                     work_log: work_log.clone(),
@@ -13000,7 +13017,10 @@ impl ChatManager {
                     protocol_run_id: None,
                     protocol_state: None,
                     reasoning_path_tracker: super::feedback::ReasoningPathTracker::new(),
-                    objective_tracking: true,
+                    // CACHE-POOL: a session reopened on restart that was itself a delegation's
+                    // child stays one — it must not start receiving the parent's objective
+                    // reminders just because it crossed a restart.
+                    objective_tracking: tracks_own_objectives(session_node.spawned_by.is_some()),
                     objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
                     objective_reminders_in_a_row: Arc::new(AtomicU32::new(0)),
                     work_log: work_log.clone(),
@@ -23841,6 +23861,37 @@ mod tests {
         // and the JSON mechanism is there too: both mechanisms on the session
         let a = crate::chat::attachment::attach(&sessions, &rows);
         assert_eq!(a.by_plan[&plan][0].links.len(), 2);
+    }
+
+    // CACHE-POOL criterion 2: a delegation's child (conversation sub-agent, MCP
+    // sub-agent, runner, gate, trigger — any session with a `spawned_by`) must not be
+    // enrolled in the PARENT conversation's objective tracking: reminding it of the
+    // project's pending tasks is noise nobody asked it to act on (measured 17/10/2026:
+    // an extra unrequested turn, ~9.4k cache tokens, answering a reminder meant for
+    // someone else). `tracks_own_objectives` is the single rule shared by both
+    // construction sites (fresh open and restart recovery). Red without the fix:
+    // `objective_tracking` was the literal `true`, unconditionally, at both sites.
+    //
+    // Exercising this end-to-end through `create_session` would need the `fake_claude`
+    // CLI harness (the legacy engine's `InteractiveClient` has no transport seam in
+    // tests, unlike the agent engine's `FakeProvider` — confirmed in isolation: an
+    // agent-engine session never enters `active_sessions` at all, see
+    // `an_agent_session_of_claude_code_resumes_on_the_agent_engine_after_a_rollback`
+    // above). Out of scope here: these test the rule directly, pure and deterministic.
+    #[test]
+    fn a_delegations_child_does_not_track_the_parents_objectives() {
+        assert!(
+            !tracks_own_objectives(true),
+            "a spawned session must not track objectives"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_sessions_objective_tracking_is_unaffected() {
+        assert!(
+            tracks_own_objectives(false),
+            "a session nobody spawned still tracks objectives"
+        );
     }
 
     #[tokio::test]
