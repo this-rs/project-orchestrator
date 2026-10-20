@@ -251,6 +251,30 @@ fn looks_like_a_secret(token: &str) -> bool {
     has_alpha && has_digit && token.len() >= 24
 }
 
+/// The message of a refused request. Nexus keeps the provider's 400 body in the
+/// detail (`HTTP 400: {body}`, redacted, truncated to 512 bytes); its
+/// `error.message` is the reason a user can act on, so it is shown when it
+/// passes `safe_cause`. A body that does not parse (truncated, or not JSON) or a
+/// message that fails the gate keeps the generic line.
+fn invalid_request_message(detail: &str) -> String {
+    const GENERIC: &str = "The provider refused the request as invalid.";
+    let Some(start) = detail.find('{') else {
+        return GENERIC.to_string();
+    };
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(&detail[start..]) else {
+        return GENERIC.to_string();
+    };
+    let provider_message = body
+        .get("error")
+        .and_then(|error| error.get("message").or(Some(error)))
+        .or_else(|| body.get("message"))
+        .and_then(serde_json::Value::as_str);
+    match provider_message.and_then(safe_cause) {
+        Some(cause) => format!("The provider refused the request as invalid: {cause}"),
+        None => GENERIC.to_string(),
+    }
+}
+
 /// The message of an unreachable endpoint: the generic line, the instance when
 /// one is known, and the masked cause when the detail survives `safe_cause`.
 /// Never the raw detail, never a URL or a credential.
@@ -376,11 +400,9 @@ pub fn open_failure(err: &ProviderError, provider_id: Option<&str>) -> OpenFailu
             err.kind(),
             "A turn is already in progress on this session.".to_string(),
         ),
-        ProviderError::InvalidRequest { .. } => (
-            400,
-            err.kind(),
-            "The provider refused the request as invalid.".to_string(),
-        ),
+        ProviderError::InvalidRequest { detail } => {
+            (400, err.kind(), invalid_request_message(detail))
+        }
         ProviderError::Closed => (410, err.kind(), "The session is closed.".to_string()),
         // `ProviderError` is non-exhaustive: a variant added by nexus maps here
         // until this table learns it.
@@ -950,6 +972,39 @@ mod tests {
             ProviderError::InvalidRequest { detail: leaky() },
             400,
             "invalid_request",
+        );
+    }
+
+    #[test]
+    fn an_invalid_request_shows_the_providers_own_message() {
+        // The 400 body nexus keeps in `detail` (`HTTP 400: {body}`, redacted).
+        let body = r#"{"error":{"type":"invalid_request_error","message":"Unsupported parameter: temperature is not supported with this model"}}"#;
+        let err = ProviderError::InvalidRequest {
+            detail: format!("HTTP 400: {body}"),
+        };
+        let failure = open_failure(&err, Some("gemini-prod"));
+        assert_eq!((failure.status, failure.code), (400, "invalid_request"));
+        assert!(
+            failure
+                .message
+                .contains("Unsupported parameter: temperature is not supported with this model"),
+            "the provider's message is missing: {}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn an_invalid_request_message_with_a_secret_or_a_url_stays_generic() {
+        let body = format!(
+            r#"{{"error":{{"message":"bad key {SECRET} at https://api.example.com/v1{PATH}"}}}}"#
+        );
+        let err = ProviderError::InvalidRequest {
+            detail: format!("HTTP 400: {body}"),
+        };
+        let failure = open_failure(&err, Some("gemini-prod"));
+        assert_eq!(
+            failure.message,
+            "The provider refused the request as invalid."
         );
     }
 
