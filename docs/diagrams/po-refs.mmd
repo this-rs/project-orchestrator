@@ -1,17 +1,21 @@
 %% name: po-refs
 %% covers: backend:src/refs/** backend:src/api/refs_handlers.rs
-%% verified: 8ed0e4f6
+%% verified: 90bbb323
 %% ---
 %% PROUVE : ce que le module src/refs/ fait aujourd'hui (plan « Chat : références #/@ », R2) :
 %%   valider une référence envoyée par un client (sigil # data / @ actor porté par le jeton), décider si
 %%   la session peut la lire, la replier dans le texte du message, la résoudre par genre sur le GraphStore,
 %%   la proposer via GET /api/refs/search classée par pertinence, et l'expanser dans le tour envoyé à
 %%   l'agent (chat/manager.rs et chat/agent_runtime.rs appellent turn::expand_user_turn_in ;
-%%   la trame refs_resolved est émise). Drapeau refs_v1 actif par défaut (flag.rs).
+%%   la trame refs_resolved est émise). Sens inverse (agent -> utilisateur, PR 5b) : le prompt système enseigne
+%%   la citation #kind:uuid, l'identifiant cité dans la réponse est relu par la même AccessPolicy et annoncé
+%%   par cites_resolved en fin de tour, et un #kind:uuid dans un résultat d'outil est rendu inerte.
+%%   Drapeau refs_v1 actif par défaut (flag.rs).
 %% ---
 %% SOURCES LUES :
 %%   src/refs/{mod,kinds,types,registry,validate,access,block,wire,label,link,rank,resolvers,
-%%             resolvers_ext,resolvers_ext_contract,search,search_contract,turn,flag}.rs
+%%             resolvers_ext,resolvers_ext_contract,search,search_contract,turn,flag,cite}.rs
+%%   src/chat/{composer,feedback,post_stream,manager}.rs, src/chat/provider/event_map.rs (câblage des citations)
 %%   src/api/refs_handlers.rs (routes dans api/routes.rs), src/chat/refs_wiring_tests.rs
 %%   tests/refs_contract.rs, tests/fixtures/refs/*.json
 %% ---
@@ -20,7 +24,10 @@
 %%   une tâche plus ancienne que les 300 plus récentes de sa portée n'est pas proposée par texte ;
 %%   la pertinence n'est prouvée que sur le mock : pas encore mesurée sur le serveur réel ;
 %%   le push-down du workspace au store n'est pas prouvé pour plans et tâches (le mock l'ignore) ;
-%%   un identifiant cité par l'agent dans sa réponse n'est pas vérifié côté serveur (R2-9).
+%%   l'agent peut ne pas suivre la syntaxe enseignée : seul le texte qui la respecte est lu (aucun test ne mesure un modèle réel) ;
+%%   le rendu en pastille cliquable est dans le dépôt frontend (⚪ ici), non relu par ce diagramme ;
+%%   la neutralisation d'un jeton couvre les résultats d'outil (manager.rs, event_map.rs) : une autre source de texte non fiable
+%%   qui ne passe pas par ces deux constructeurs n'est pas couverte.
 %% ---
 %% LEGENDE
 %%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans appelant  ⚪ autre domaine
@@ -52,6 +59,14 @@ flowchart TD
     SEARCH["✅ search::search_with + refs_handlers::search_refs<br/>GET /api/refs/search : portée, politique, un kind lent ou en panne est omis ;<br/>test: plan_and_rfc_items_are_the_fixture_items"]
     RANK["✅ rank::score puis tri avant coupe<br/>exact 100, préfixe 80, début de mot 60, sous-chaîne du titre 40, mots du titre 30, corps 20, mots dispersés 10 ; casse et accents repliés ; égalité = le plus récent ; sans texte = le plus récent ;<br/>test: the_tiers_are_ordered_exact_prefix_word_substring_body, fond_ranks_fondations_before_a_text_with_fond_in_the_middle, without_text_each_kind_is_listed_newest_first"]
     TURN["✅ turn::expand_user_turn_in<br/>appelé par chat/manager.rs et chat/agent_runtime.rs ; texte stocké propre, pointeur et non contenu, store lent borné, libellé du bloc jamais cru ;<br/>test: send_message_expands_the_references_for_the_cli_and_keeps_the_stored_text_clean, a_hung_store_ends_the_whole_turn_within_the_budget"]
+    PROMPT["✅ cite::prompt_section<br/>le prompt système enseigne #kind:uuid, tous les genres data, jamais un acteur, jamais d identifiant inventé ; ajouté par composer.rs quand ChatManager.refs_v1 est vrai, sinon le prompt est identique à l octet ;<br/>test: teaches_the_token_and_every_kind, forbids_inventing_an_id_and_says_where_ids_come_from, test_cite_refs_off_leaves_the_prompt_untouched_and_on_only_adds_the_section"]
+    AGENT["⚪ agent: texte de la réponse"]
+    SCAN["✅ cite::cited_refs<br/>lit les jetons de la réponse, hors code en ligne et blocs clôturés, plafonnés et dédoublonnés, même règle que le client ;<br/>test: the_code_rule_is_the_clients_rule, caps_the_tokens_of_one_message"]
+    GUARD["✅ cite::guard_cites<br/>chaque citation passe par AccessPolicy::resolve_checked ; id inexistant ou d un autre projet = not_found sans libellé ;<br/>test: the_citations_of_the_answer_are_validated_and_announced, a_citation_of_nothing_never_reaches_the_graph"]
+    CITES["✅ ChatEvent::CitesResolved (cites_resolved)<br/>émis en fin de tour par post_stream::announce_answer_cites si refs_v1, enregistré pour le rejeu ;<br/>test: the_citations_of_the_answer_are_validated_and_announced"]
+    FRONT["⚪ frontend: pastille cliquable seulement pour une citation annoncée ok"]
+    INERT["✅ cite::neutralize_value<br/>#kind:uuid dans un résultat d outil ou un document devient inerte (U+2060 avant le sigle, aucun caractère visible ne change) ; appelé par manager.rs et provider/event_map.rs ;<br/>test: neutralizing_leaves_no_token_to_read, neutralizing_keeps_every_visible_character"]
+    TOOLRES["⚪ résultat d outil / document: donnée non fiable"]
     GATE["✅ scripts/lcov_gate.rs<br/>énumère src/refs/ depuis le disque ;<br/>CI: étape Blocking coverage gate"]
 
     CLIENT --> VALIDATE
@@ -76,3 +91,10 @@ flowchart TD
     SEARCH -. filtré par .-> POLICY
     GATE -. mesure .-> VALIDATE
     GATE -. mesure .-> POLICY
+    PROMPT --> AGENT
+    AGENT --> SCAN
+    SCAN --> GUARD
+    GUARD --> POLICY
+    GUARD --> CITES
+    CITES --> FRONT
+    TOOLRES --> INERT
