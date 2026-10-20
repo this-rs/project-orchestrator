@@ -929,6 +929,25 @@ mod tests {
     }
 
     #[test]
+    fn a_cli_asks_before_tools_in_default_and_plan_only() {
+        for asks in ["default", "plan"] {
+            assert!(cli_asks_before_tools(asks), "{asks}");
+        }
+        for acts in ["acceptEdits", "bypassPermissions"] {
+            assert!(!cli_asks_before_tools(acts), "{acts}");
+        }
+    }
+
+    #[test]
+    fn every_resume_message_says_the_queued_messages_are_lost() {
+        for (tool, context) in [(None, ""), (Some("Bash"), "\nUser: go")] {
+            let message = resume_message(tool, context);
+            assert!(message.starts_with(RESUME_MARKER), "{message}");
+            assert!(message.contains(QUEUED_MESSAGES_LOST), "{message}");
+        }
+    }
+
+    #[test]
     fn an_empty_or_finished_tail_is_settled() {
         assert_eq!(judge(&[]), Verdict::Settled);
         let done = [ev(1, "user_message", "{}"), ev(2, "result", "{}")];

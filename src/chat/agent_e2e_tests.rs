@@ -16119,6 +16119,39 @@ mod claude_code_recovery_at_boot {
         assert_closed_by_recovery(&events(&graph, &sid).await);
     }
 
+    /// The CLI that accepts the handshake but dies before the grace of a resume is out (a
+    /// conversation it only finds missing afterwards) is the same refusal: the turn is closed,
+    /// no fresh CLI takes its place.
+    #[tokio::test]
+    async fn a_legacy_claude_code_turn_whose_cli_dies_after_its_handshake_is_closed_not_started_fresh(
+    ) {
+        let dies_late = [
+            json!({"op": "sleep", "ms": 400}),
+            json!({"op": "exit", "code": 1}),
+        ]
+        .iter()
+        .map(|l| format!("{l}\n"))
+        .collect::<String>();
+        let (dir, graph, sid) = legacy_session_cut(&dies_late).await;
+        let after = legacy_server(&graph, &dir.path().join("claude"));
+        let (pending, _) = after.scan_interrupted_turns().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let report = after
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(10))
+            .await;
+        assert_eq!((report.resumed, report.failed), (0, 1), "{report:?}");
+        assert!(
+            wait_for_file(&dir.path().join("args.1.json")).await,
+            "the resumed CLI was started"
+        );
+        assert!(
+            !dir.path().join("args.2.json").exists(),
+            "no fresh CLI after the refused --resume"
+        );
+        assert!(!after.is_session_active(&sid).await);
+        assert_closed_by_recovery(&events(&graph, &sid).await);
+    }
+
     // ── several instances ──────────────────────────────────────────────────────────────
 
     /// A session live on instance A whose thread looks cut (its turn is running there) is
