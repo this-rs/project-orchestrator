@@ -2689,4 +2689,138 @@ mod tests {
             Some("daily")
         );
     }
+
+    // ================================================================
+    // PYSR-4: RED TESTS — missing structural validation in compose_protocol
+    //
+    // These tests document CURRENT BROKEN BEHAVIOR: invalid protocols
+    // are accepted when they should be rejected. When validation is
+    // added (step 3), these tests WILL FAIL and need to change from
+    // assert_eq!(status, CREATED) to assert_eq!(status, BAD_REQUEST).
+    // ================================================================
+
+    /// RED TEST: A state unreachable from the initial state should be rejected.
+    /// Current behavior: accepted (no reachability check).
+    #[tokio::test]
+    async fn compose_protocol_accepts_unreachable_state_pysr4_red() {
+        let graph = std::sync::Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+        let mut project = test_project();
+        project.id = project_id;
+        graph.projects.write().await.insert(project_id, project);
+        let app = crate::api::list_routes_tests::router_over(graph.clone()).await;
+
+        // Protocol: start → done, but "orphan" has no incoming transition
+        // (unreachable from start)
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/protocols/compose",
+            serde_json::json!({
+                "project_id": project_id,
+                "name": "unreachable-state-proto",
+                "states": [
+                    {"name": "start", "state_type": "start"},
+                    {"name": "done", "state_type": "terminal"},
+                    {"name": "orphan", "state_type": "intermediate"}  // unreachable!
+                ],
+                "transitions": [
+                    {"from_state": "start", "to_state": "done", "trigger": "finish"}
+                ]
+            }),
+        )
+        .await;
+
+        // BUG: this SHOULD be BAD_REQUEST once PYSR-4 step 3 is done
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CREATED,
+            "PYSR-4 RED: unreachable state 'orphan' was accepted (should reject): {body}"
+        );
+    }
+
+    /// RED TEST: A protocol with no terminal state should be rejected.
+    /// Current behavior: accepted (no terminal-state check).
+    #[tokio::test]
+    async fn compose_protocol_accepts_no_terminal_state_pysr4_red() {
+        let graph = std::sync::Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+        let mut project = test_project();
+        project.id = project_id;
+        graph.projects.write().await.insert(project_id, project);
+        let app = crate::api::list_routes_tests::router_over(graph.clone()).await;
+
+        // Protocol: start → work1 → work2 (chain with no terminal state)
+        // All states are intermediate or start — no terminal to end the protocol.
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/protocols/compose",
+            serde_json::json!({
+                "project_id": project_id,
+                "name": "no-terminal-proto",
+                "states": [
+                    {"name": "start", "state_type": "start"},
+                    {"name": "work1", "state_type": "intermediate"},
+                    {"name": "work2", "state_type": "intermediate"}
+                ],
+                "transitions": [
+                    {"from_state": "start", "to_state": "work1", "trigger": "begin"},
+                    {"from_state": "work1", "to_state": "work2", "trigger": "proceed"}
+                ]
+            }),
+        )
+        .await;
+
+        // BUG: this SHOULD be BAD_REQUEST once PYSR-4 step 3 is done
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CREATED,
+            "PYSR-4 RED: protocol without terminal state was accepted (should reject): {body}"
+        );
+    }
+
+    /// RED TEST: Duplicate transitions (same from_state + trigger) should be rejected.
+    /// Current behavior: accepted (no duplicate-transition check).
+    #[tokio::test]
+    async fn compose_protocol_accepts_duplicate_transitions_pysr4_red() {
+        let graph = std::sync::Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+        let mut project = test_project();
+        project.id = project_id;
+        graph.projects.write().await.insert(project_id, project);
+        let app = crate::api::list_routes_tests::router_over(graph.clone()).await;
+
+        // Protocol: from "start" with trigger "go" → both "a" AND "b"
+        // This is non-deterministic: which state do we go to on "go"?
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/protocols/compose",
+            serde_json::json!({
+                "project_id": project_id,
+                "name": "duplicate-transitions-proto",
+                "states": [
+                    {"name": "start", "state_type": "start"},
+                    {"name": "a", "state_type": "intermediate"},
+                    {"name": "b", "state_type": "intermediate"},
+                    {"name": "done", "state_type": "terminal"}
+                ],
+                "transitions": [
+                    {"from_state": "start", "to_state": "a", "trigger": "go"},  // dup!
+                    {"from_state": "start", "to_state": "b", "trigger": "go"},  // dup!
+                    {"from_state": "a", "to_state": "done", "trigger": "finish"},
+                    {"from_state": "b", "to_state": "done", "trigger": "finish"}
+                ]
+            }),
+        )
+        .await;
+
+        // BUG: this SHOULD be BAD_REQUEST once PYSR-4 step 3 is done
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CREATED,
+            "PYSR-4 RED: duplicate transitions (start + 'go') accepted (should reject): {body}"
+        );
+    }
 }
