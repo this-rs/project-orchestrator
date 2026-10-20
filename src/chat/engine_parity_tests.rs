@@ -358,7 +358,7 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
         "hooks.session_start",
         Expect::Gap {
             cause: Cause::Harness,
-            task: "ISO1",
+            task: "PISO1",
             why: CC_LEGACY_NO_V7_HOOKS,
         },
     ),
@@ -367,7 +367,7 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
         "hooks.user_prompt_submit",
         Expect::Gap {
             cause: Cause::Harness,
-            task: "ISO1",
+            task: "PISO1",
             why: CC_LEGACY_NO_V7_HOOKS,
         },
     ),
@@ -376,7 +376,7 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
         "hooks.stop",
         Expect::Gap {
             cause: Cause::Harness,
-            task: "ISO1",
+            task: "PISO1",
             why: CC_LEGACY_NO_V7_HOOKS,
         },
     ),
@@ -385,7 +385,7 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
         "hooks.subagent_stop",
         Expect::Gap {
             cause: Cause::Harness,
-            task: "ISO1",
+            task: "PISO1",
             why: CC_LEGACY_NO_V7_HOOKS,
         },
     ),
@@ -394,8 +394,39 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
         "hooks.notification",
         Expect::Gap {
             cause: Cause::Harness,
-            task: "ISO1",
+            task: "PISO1",
             why: CC_LEGACY_NO_V7_HOOKS,
+        },
+    ),
+    // ISO1: 3 contract-v7 lifecycle hooks on CC Agent Engine. neutral_hooks() registers
+    // them in the CLI protocol, but the harness-side SessionHooks calls (before_stop,
+    // before_subagent_stop, notification) are only made by the native turn loop.
+    // session_start and user_prompt_submit work because the façade calls them directly.
+    (
+        Engine::ClaudeCodeAgent,
+        "hooks.stop",
+        Expect::Gap {
+            cause: Cause::Harness,
+            task: "PISO1",
+            why: CC_AGENT_NO_LIFECYCLE_HOOKS,
+        },
+    ),
+    (
+        Engine::ClaudeCodeAgent,
+        "hooks.subagent_stop",
+        Expect::Gap {
+            cause: Cause::Harness,
+            task: "PISO1",
+            why: CC_AGENT_NO_LIFECYCLE_HOOKS,
+        },
+    ),
+    (
+        Engine::ClaudeCodeAgent,
+        "hooks.notification",
+        Expect::Gap {
+            cause: Cause::Harness,
+            task: "PISO1",
+            why: CC_AGENT_NO_LIFECYCLE_HOOKS,
         },
     ),
 ];
@@ -425,6 +456,19 @@ const CC_LEGACY_NO_V7_HOOKS: &str =
      graph_hook_table() qui ne couvre que PreCompact / PreToolUse / PostToolUse ; \
      les 5 événements du contrat v7 ne sont pas envoyés au CLI — ils fonctionnent \
      sur le moteur agent (neutral_hooks) et sur le natif (appels SessionHooks directs)";
+
+/// Why `hooks.stop`, `hooks.subagent_stop` and `hooks.notification` are gaps on the
+/// CC Agent Engine. These lifecycle hooks (`before_stop`, `before_subagent_stop`,
+/// `notification`) are called directly by the native harness's turn loop; the Agent
+/// Engine (nexus `AgentSession`) doesn't call SessionHooks for them yet — the CLI
+/// protocol registers them via `neutral_hooks()` but the harness-side lifecycle calls
+/// are missing. `hooks.session_start` and `hooks.user_prompt_submit` work because
+/// the backend façade calls them directly (before the engine).
+const CC_AGENT_NO_LIFECYCLE_HOOKS: &str =
+    "le moteur agent (AgentSession) enregistre les hooks via neutral_hooks() mais \
+     les appels de cycle de vie (before_stop, before_subagent_stop, notification) \
+     ne sont faits que par la boucle du harnais natif ; la façade n'appelle pas \
+     encore SessionHooks pour ces événements sur le chemin CC Agent Engine";
 
 /// Why every function is `not_measured` on Codex (YARDSTICK, task 87eb345e).
 const CODEX_NOT_MEASURED: &str =
@@ -3049,50 +3093,52 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         Cause::Harness,
         format!("session_start appelé {} fois, sources={ss:?}", ss.len()),
     );
-    // ISO1: UserPromptSubmit — the hook fires before each turn (contract v7).
-    let prompt_hook = cli.wait_line(0, "hook-prompt", WAIT).await;
+    // ISO1: UserPromptSubmit — checked via the Recording struct, not via CLI output.
+    // On CC Legacy the hook is never dispatched (graph_hook_table doesn't register it),
+    // so the answers field stays empty → Gap(Harness). Using cli.wait_line() here would
+    // block for WAIT (20 s) on CC Legacy and desynchronise the rest of the scenario.
+    let prompts = answers.user_prompt_submit_prompts.lock().unwrap().clone();
     cc.check(
         "hooks.user_prompt_submit",
-        prompt_hook.is_some(),
+        !prompts.is_empty(),
         Cause::Harness,
         format!(
-            "réponse au hook UserPromptSubmit : {:?}",
-            prompt_hook.as_deref().map(excerpt)
+            "user_prompt_submit appelé {} fois, prompts={:?}",
+            prompts.len(),
+            prompts.iter().map(|p| excerpt(p)).collect::<Vec<_>>()
         ),
     );
-    // ISO1: Stop — the hook fires before the turn ends (contract v7). On the fake the
-    // response is not acted on: the blocking path is tested on agent engine and native.
-    let stop_hook = cli.wait_line(0, "hook-stop", WAIT).await;
+    // ISO1: Stop — checked via the Recording struct only. On CC Legacy the hook is
+    // never dispatched (graph_hook_table doesn't register it). On CC Agent Engine the
+    // CLI protocol registers it via neutral_hooks(), but the lifecycle hook
+    // (before_stop) is only called by the native harness's turn loop — the Agent
+    // Engine doesn't call SessionHooks::before_stop() yet. Using cli.wait_line()
+    // here would block for WAIT (20 s) on both CC paths and kill the session.
+    let stop_replies = answers.stop_replies.lock().unwrap().clone();
     cc.check(
         "hooks.stop",
-        stop_hook.is_some(),
+        !stop_replies.is_empty(),
         Cause::Harness,
         format!(
-            "réponse au hook Stop : {:?}",
-            stop_hook.as_deref().map(excerpt)
+            "stop appelé {} fois, stop_replies={stop_replies:?}",
+            stop_replies.len()
         ),
     );
-    // ISO1: SubagentStop — the hook fires when a sub-agent finishes (contract v7).
-    let subagent_stop = cli.wait_line(0, "hook-subagent-stop", WAIT).await;
+    // ISO1: SubagentStop — same reasoning: the lifecycle call is native-only.
+    let sub_called = *answers.subagent_stop_called.lock().unwrap();
     cc.check(
         "hooks.subagent_stop",
-        subagent_stop.is_some(),
+        sub_called,
         Cause::Harness,
-        format!(
-            "réponse au hook SubagentStop : {:?}",
-            subagent_stop.as_deref().map(excerpt)
-        ),
+        format!("before_subagent_stop appelé={sub_called}"),
     );
-    // ISO1: Notification — the hook fires when a permission is pending (contract v7).
-    let notify = cli.wait_line(0, "hook-notify", WAIT).await;
+    // ISO1: Notification — same reasoning: the lifecycle call is native-only.
+    let notif = answers.notification_types.lock().unwrap().clone();
     cc.check(
         "hooks.notification",
-        notify.is_some(),
+        notif.iter().any(|t| t == "permission_prompt"),
         Cause::Harness,
-        format!(
-            "réponse au hook Notification : {:?}",
-            notify.as_deref().map(excerpt)
-        ),
+        format!("notification appelé {} fois, types={notif:?}", notif.len()),
     );
     assert!(
         w.said(WAIT, "answered one").await,
