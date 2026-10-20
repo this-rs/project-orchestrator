@@ -21449,6 +21449,121 @@ mod tests {
             .unwrap()
     }
 
+    /// OBS-R: the executable of a declared `obscura` engine at a session opening.
+    #[tokio::test]
+    async fn a_declared_obscura_engine_runs_the_configured_executable_else_the_embedded_one() {
+        use nexus_claude::agent::{McpServerSpec, ProviderKind};
+        use std::os::unix::fs::PermissionsExt;
+        const EMBEDS: &str = "#!/bin/sh\n[ \"$1\" = --capabilities ] && echo '{\"version\":\"0.5.1\",\"tls\":true,\"obscura\":true}'\n";
+        const PLAIN: &str = "#!/bin/sh\n";
+
+        let engine_args = |nexus_tools: &'static str,
+                           configured: Option<PathBuf>,
+                           sid: &'static str| async move {
+            let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+            let record = crate::chat::provider::nexus_tools::SearchProviderRecord {
+                id: "obs".into(),
+                engine: "obscura".into(),
+                base_url: None,
+                credential_ref: "none".into(),
+            };
+            graph
+                .put_llm_setting(
+                    crate::chat::provider::settings::GLOBAL,
+                    &format!(
+                        "{}obs",
+                        crate::chat::provider::nexus_tools::SEARCH_PROVIDER_PREFIX
+                    ),
+                    &serde_json::to_string(&record).unwrap(),
+                )
+                .await
+                .unwrap();
+            crate::chat::provider::nexus_tools::record_origin_consent(
+                &*graph,
+                "proj",
+                crate::chat::provider::nexus_tools::OBSCURA_SEARCH_ORIGIN,
+                "tester",
+            )
+            .await
+            .unwrap();
+            let state = mock_app_state_with_graph(graph);
+            let bin = tempfile::TempDir::new().unwrap();
+            let program = bin.path().join("nexus-tools");
+            std::fs::write(&program, nexus_tools).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut config = test_config();
+            config.jwt_secret = Some("test-secret-key-minimum-32-chars!!".into());
+            config.nexus_tools_path = Some(program);
+            config.obscura_path = configured;
+            let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+            let claims = crate::auth::jwt::Claims::service_account("obs-r");
+            let spec = manager
+                .build_agent_spec(AgentSpecInput {
+                    file_scope_lifted: false,
+                    cwd: "/work/app",
+                    model: "m",
+                    system_prompt: "p",
+                    permission_mode: None,
+                    add_dirs: &[],
+                    user_claims: Some(&claims),
+                    session_id: sid,
+                    third_party: true,
+                    max_tokens: None,
+                    kind: ProviderKind::Native,
+                    remote_cwd: None,
+                    per_session_mcp: true,
+                    hooks: Some(AgentHookScope {
+                        project_slug: Some("proj".into()),
+                        task_id: None,
+                        runner: false,
+                    }),
+                })
+                .await
+                .unwrap();
+            crate::auth::agent_tokens::revoke_session(sid);
+            let Some(McpServerSpec::Stdio { args, .. }) = spec.mcp_servers.get("nexus") else {
+                panic!("a stdio `nexus` server expected");
+            };
+            let engine: Vec<String> = args
+                .windows(2)
+                .filter(|w| w[0] == "--search-engine")
+                .map(|w| w[1].clone())
+                .collect();
+            engine
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let obscura = dir.path().join("dsh-obscura-nav");
+        std::fs::write(&obscura, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&obscura, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let configured = vec![format!(
+            "obscura:{}",
+            std::fs::canonicalize(&obscura).unwrap().display()
+        )];
+        let embedded = vec!["obscura".to_string()];
+        let relative = Some(PathBuf::from("bin/dsh-obscura-nav"));
+        let missing = Some(dir.path().join("absent"));
+        for (n, (tools, path, want)) in [
+            (EMBEDS, Some(obscura.clone()), &configured),
+            (PLAIN, Some(obscura.clone()), &configured),
+            (EMBEDS, None, &embedded),
+            (EMBEDS, relative.clone(), &embedded),
+            (EMBEDS, missing.clone(), &embedded),
+            (PLAIN, relative, &Vec::new()),
+            (PLAIN, missing, &Vec::new()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sid = Box::leak(format!("obsr-{n}").into_boxed_str());
+            assert_eq!(
+                &engine_args(tools, path.clone(), sid).await,
+                want,
+                "case {n}: {path:?}"
+            );
+        }
+    }
+
     /// P18: a native session a person opened runs sub-agents (the harness then offers
     /// `Agent`); a session something spawned — the sub-agent's own child session included —
     /// never does (depth 1, A17); nor does a manager that cannot hand itself over.

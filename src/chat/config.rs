@@ -792,6 +792,31 @@ mod tests {
         assert!(config.max_sessions > 0);
         assert_eq!(config.permission.mode, "default");
 
+        // Phase 5: OBSCURA_BIN, read here where the environment is owned.
+        for (raw, want) in [
+            (
+                Some("/opt/obscura/dsh-obscura-nav"),
+                Some("/opt/obscura/dsh-obscura-nav"),
+            ),
+            (Some("bin/dsh-obscura-nav"), None),
+            (Some("./dsh-obscura-nav"), None),
+            (Some(""), None),
+            (None, None),
+        ] {
+            match raw {
+                Some(value) => std::env::set_var(OBSCURA_BIN_VAR, value),
+                None => std::env::remove_var(OBSCURA_BIN_VAR),
+            }
+            let want = want.map(PathBuf::from);
+            assert_eq!(ChatConfig::detect_obscura_path(), want, "{raw:?}");
+            assert_eq!(ChatConfig::from_env().obscura_path, want, "{raw:?}");
+        }
+        let located = nexus_tools::search::ObscuraBackend::locate();
+        assert_eq!(
+            ChatConfig::obscura_on_path(),
+            located.map(|o| o.program().to_path_buf())
+        );
+
         // Cleanup
         std::env::remove_var("CHAT_DEFAULT_MODEL");
         std::env::remove_var("CHAT_MAX_SESSIONS");
