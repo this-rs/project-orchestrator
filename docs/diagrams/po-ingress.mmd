@@ -1,0 +1,32 @@
+%% name: po-ingress
+%% covers: backend:src/ingress/**
+%% verified: 35f7682f
+%% ---
+%% PROUVE : ce que le module d'ingestion d'evenements externes EST, tel que le code de la
+%%   PR #897 le fait — le journal garde la decision (accepte / rejete) et une raison stable,
+%%   JAMAIS le corps de la requete ; l'identifiant de livraison permet de refuser un rejeu.
+%% ---
+%% SOURCES LUES :
+%%   src/ingress/mod.rs   — module et re-exports (ExternalEvent, IngressOutcome)
+%%   src/ingress/model.rs — IngressOutcome { Accepted, Rejected } ;
+%%                          ExternalEvent { id, trigger_id, source, outcome, reason,
+%%                            delivery_id, event_type, action, body_bytes, received_at } ;
+%%                          le corps n'est jamais conserve (seuls sa taille et les en-tetes
+%%                          d'identification le sont)
+%% ---
+%% NON ETABLI : la route publique POST /hooks/events/{source}/{trigger_id} et la verification
+%%   HMAC vivent dans la PR suivante (#898) ; les requetes Cypher ne sont prouvees que contre
+%%   MockGraphStore (pas de Neo4j local).
+%% ---
+flowchart TD
+  E["ExternalEvent<br/>trigger_id, source, delivery_id,<br/>event_type, action, body_bytes, received_at"]
+  O{"IngressOutcome"}
+  A["Accepted"]
+  R["Rejected<br/>+ reason stable<br/>(invalid_signature, replayed_delivery, ...)"]
+  J["Journal par declencheur<br/>(lecture du plus recent au plus ancien)"]
+  D["delivery_id<br/>reservation unique par declencheur"]
+  E --> O
+  O --> A
+  O --> R
+  E --> J
+  E --> D
