@@ -82,6 +82,14 @@ pub async fn create_session(
         .as_ref()
         .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
 
+    // The opening of an agent's child, held until `create_session` below has returned (the
+    // child is then live): the envelope counts it for the parent's next openings (P18-suite,
+    // point 6 — an `Agent` call of the same parent in flight could otherwise pass the cap).
+    let opening = request
+        .session_id
+        .is_none()
+        .then(|| caller.reserve_opening(&chat_manager.child_openings))
+        .flatten();
     if let envelope::SpawnCaller::Agent { session_id, .. } = &caller {
         let graph = state.orchestrator.neo4j_arc();
         match request.session_id.as_deref() {
@@ -95,6 +103,7 @@ pub async fn create_session(
                     chat_manager.as_ref(),
                     &caller,
                     chat_manager.max_live_children(),
+                    opening.as_ref(),
                 )
                 .await?
                 .expect("an agent caller always has an envelope");

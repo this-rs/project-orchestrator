@@ -59,7 +59,11 @@
 //! `close_session` ([`MAX_LIVE_CHILDREN`](super::envelope::MAX_LIVE_CHILDREN) slots per
 //! parent; P18b round 2, fix 2: a dropped `run_subagent` future used to free the slot as soon
 //! as it was dropped, which could be well before the task it spawned had even learned the
-//! child's id, let alone closed it). The ceiling is the parent's CURRENT mode: a native
+//! child's id, let alone closed it). The slot counts only `Agent` calls; the cap counts EVERY
+//! child of the parent: the slot also carries the opening's ticket (`envelope::ChildOpenings`,
+//! P18-suite point 6), which the envelope adds to the live children — the children that
+//! `chat(send_message)` and `plan(delegate_task)` open hold one too — until the child is live.
+//! The ceiling is the parent's CURRENT mode: a native
 //! session's mode changes are kept live and persisted (`set_session_permission_mode`).
 //!
 //! What a child may not do: ask the user (`AskUserQuestion` is denied to a spawned native
@@ -227,6 +231,9 @@ impl SessionHooks for SubagentHooks {
 pub(crate) struct SubagentSlot {
     manager: Weak<ChatManager>,
     parent: String,
+    /// The opening of the child in flight (`envelope::ChildOpenings`, P18-suite point 6):
+    /// counted by the envelope of the parent's other openings until the child is live.
+    opening: Option<super::envelope::OpeningTicket>,
 }
 
 impl SubagentSlot {
@@ -244,10 +251,23 @@ impl SubagentSlot {
             return None;
         }
         *taken += 1;
+        drop(slots);
         Some(Self {
             manager: Arc::downgrade(manager),
             parent: parent.to_string(),
+            opening: Some(manager.child_openings.reserve(parent)),
         })
+    }
+
+    /// The opening this slot's child holds, for the envelope's count.
+    pub(crate) fn opening(&self) -> Option<&super::envelope::OpeningTicket> {
+        self.opening.as_ref()
+    }
+
+    /// The child is live (or its opening failed): it no longer counts as an opening; the
+    /// slot itself stays taken until the sub-agent ends.
+    fn opened(&mut self) {
+        self.opening = None;
     }
 }
 
@@ -503,12 +523,13 @@ impl ChatManager {
                  raise it in Settings or with PUT /api/chat/delegation-limits)"
             ))
         })?;
-        let env = envelope::resolve_envelope(
+        let env = envelope::resolve_envelope_for_opening(
             self.graph.as_ref(),
             self.as_ref(),
             parent_session_id,
             None,
             max,
+            slot.opening(),
         )
         .await
         .map_err(|e| refused(e.code().to_owned()))?;
@@ -700,12 +721,15 @@ impl ChatManager {
         cancelled: tokio::sync::oneshot::Receiver<std::convert::Infallible>,
         parent_session_id: &str,
         tool_use_id: &str,
-        slot: SubagentSlot,
+        mut slot: SubagentSlot,
         reuse: Option<Reuse>,
     ) -> Result<String, String> {
-        let (child_id, resumed_from) = self
+        let opened = self
             .open_child(&child, reuse.as_ref(), parent_session_id, tool_use_id)
-            .await?;
+            .await;
+        // Live (or failed): the parent's other openings now count the child itself.
+        slot.opened();
+        let (child_id, resumed_from) = opened?;
         tracing::info!(parent = %parent_session_id, child = %child_id, tool_use_id = %tool_use_id, resumed = resumed_from.is_some(), "sub-agent started");
         // The child exists from here: whatever ends this task, it is closed first (it stays
         // resumable and visible). Nothing between here and the end of the explicit close

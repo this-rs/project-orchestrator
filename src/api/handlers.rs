@@ -1077,11 +1077,15 @@ pub async fn delegate_task(
         envelope::session_header(&headers),
         state.auth_config.is_some(),
     )?;
+    // Held until the delegation's session is open (`launch_delegation` below): the envelope
+    // counts it for the parent's next openings (P18-suite, point 6).
+    let opening = caller.reserve_opening(&chat_manager.child_openings);
     let parent_envelope = envelope::envelope_for_caller(
         graph.as_ref(),
         chat_manager.as_ref(),
         &caller,
         chat_manager.max_live_children(),
+        opening.as_ref(),
     )
     .await?;
     let default_mode = chat_manager.default_permission_mode().await;
@@ -1136,7 +1140,9 @@ pub async fn delegate_task(
             ));
         }
     }
-    let launched = launch_delegation(&state, chat_manager, prepared, None).await?;
+    let launched = launch_delegation(&state, chat_manager, prepared, None).await;
+    drop(opening);
+    let launched = launched?;
     Ok((
         StatusCode::ACCEPTED,
         Json(DelegateTaskOutcome::Launched(launched)),

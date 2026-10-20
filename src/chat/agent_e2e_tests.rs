@@ -13750,6 +13750,68 @@ mod native_subagents {
         }
     }
 
+    /// P18-suite, point 6: the cap counts EVERY child of the parent, whichever path opened it.
+    /// Three children opened the way `chat(send_message)` opens one (the REST/MCP path, no
+    /// `Agent` slot) are working; two `Agent` calls then race. Only one may open: the fourth
+    /// child fills the cap of four, the fifth is refused.
+    ///
+    /// Red before the fix: the `Agent` slots counted only `Agent` calls (2 of 4) and the
+    /// envelope counted only children already live (3 of 4, the two openings still in
+    /// flight), so both calls passed and the parent had five children alive.
+    #[tokio::test]
+    async fn mcp_children_and_parallel_agent_calls_share_one_live_children_cap() {
+        let r = Arc::new(rig_slow(vec![Step::AwaitInterrupt], "default", 300).await);
+        for _ in 0..3 {
+            r.open_send_message_child().await;
+        }
+        assert_eq!(r.children().await.len(), 3);
+        let calls: Vec<_> = (0..2)
+            .map(|i| {
+                let r = r.clone();
+                tokio::spawn(async move { r.run(&format!("race{i}")).await })
+            })
+            .collect();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let finished = calls.iter().filter(|h| h.is_finished()).count();
+            if r.children().await.len() >= 4 && finished >= 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "children={}, finished={finished}",
+                r.children().await.len()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Past the opening time of a child that would have slipped through.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            r.children().await.len(),
+            crate::chat::envelope::MAX_LIVE_CHILDREN,
+            "3 MCP children + 1 Agent child: the cap of four holds"
+        );
+        let mut refused = 0;
+        let mut running = Vec::new();
+        for handle in calls {
+            if handle.is_finished() {
+                let out = handle.await.unwrap();
+                assert!(
+                    out.as_ref()
+                        .is_err_and(|e| e.contains("envelope_too_many_children")),
+                    "{out:?}"
+                );
+                refused += 1;
+            } else {
+                running.push(handle);
+            }
+        }
+        assert_eq!(refused, 1, "the fifth child is refused");
+        for handle in running {
+            handle.abort();
+        }
+    }
+
     /// A child that fails: an error result for the parent, the child closed.
     #[tokio::test]
     async fn a_failed_child_is_an_error_and_is_closed() {
