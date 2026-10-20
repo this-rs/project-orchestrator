@@ -142,7 +142,7 @@ main() {
 
   if [ "$OS" = "macos" ] && [ "$ARCH" = "x86_64" ] && macos_older_than_13_4; then
     ARCH="x86_64-legacy"
-    info "macOS older than 13.4: using the legacy Intel build (no local embeddings; use an HTTP provider such as Ollama for semantic search)"
+    info "macOS older than 13.4: using the legacy Intel build (no local embeddings, no built-in browser; use an HTTP provider such as Ollama for semantic search)"
   fi
 
   info "Detected platform: ${OS}-${ARCH}"
