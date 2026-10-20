@@ -885,9 +885,17 @@ pub(crate) fn is_transient_neo4j_code(code: &str) -> bool {
 
 /// Whether `err` carries a neo4rs server error with a transient code.
 /// Client errors (bad query, auth, connection) return `false`.
+///
+/// A failure that arrives while the rows are being PULLed (a node deleted by an overlapping
+/// transaction after the query started) does not come back as `Error::Neo4j`: neo4rs reports
+/// it as `UnexpectedMessage("unexpected response for PULL: Ok(Failure(..))")`, with the server
+/// code only inside the text. It is the same transient error and is safe to replay.
 pub(crate) fn is_transient_neo4j_error(err: &anyhow::Error) -> bool {
     match err.downcast_ref::<neo4rs::Error>() {
         Some(neo4rs::Error::Neo4j(e)) => is_transient_neo4j_code(e.code()),
+        Some(neo4rs::Error::UnexpectedMessage(text)) => {
+            text.starts_with("unexpected response for PULL") && text.contains("Neo.TransientError.")
+        }
         _ => false,
     }
 }
@@ -1013,6 +1021,24 @@ mod read_retry_tests {
         assert!(!is_read_only_cypher("MERGE (x:Trigger {id: $id}) RETURN x"));
         assert!(!is_read_only_cypher("CREATE (t:Trigger) RETURN t"));
         assert!(!is_read_only_cypher("CALL db.clearQueryCaches()"));
+    }
+
+    #[test]
+    fn a_transient_failure_reported_while_pulling_rows_is_replayed() {
+        // Seen in CI (test_trigger_type_filter_is_bound_not_spliced): the code is inside the text.
+        let pull = anyhow::Error::from(neo4rs::Error::UnexpectedMessage(
+            "unexpected response for PULL: Ok(Failure(Failure { metadata: BoltMap { value: {BoltString { value: \"code\" }: String(BoltString { value: \"Neo.TransientError.Transaction.Outdated\" })} } }))".to_string(),
+        ));
+        assert!(is_transient_neo4j_error(&pull));
+        // Another PULL failure, a non-transient code, and another message are not replayed.
+        let client = anyhow::Error::from(neo4rs::Error::UnexpectedMessage(
+            "unexpected response for PULL: Ok(Failure(.. Neo.ClientError.Statement.SyntaxError ..))".to_string(),
+        ));
+        assert!(!is_transient_neo4j_error(&client));
+        let other = anyhow::Error::from(neo4rs::Error::UnexpectedMessage(
+            "unexpected response for RUN: Neo.TransientError.Transaction.Outdated".to_string(),
+        ));
+        assert!(!is_transient_neo4j_error(&other));
     }
 
     #[test]
