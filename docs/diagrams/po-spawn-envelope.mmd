@@ -1,6 +1,6 @@
 %% name: po-spawn-envelope
 %% covers: backend:src/chat/{envelope,delegation_limits,subagents,mirror,session_pool,cancelled_parents}.rs backend:src/auth/{agent_tokens,jwt,tool_profile}.rs
-%% verified: 8de079c6
+%% verified: 0ab7a21f
 %% ---
 %% PROUVE : ce qu'une session ouverte PAR UN AGENT a le droit d'être (décisions A17, A25, A34),
 %%   tel que le code le fait sur la branche integration/harness-multi-provider (base 84804df0,
@@ -21,7 +21,8 @@
 %%   src/chat/mirror.rs       — MirrorTap (spawn follows_out_of_turn, observe, turn_ended), MirrorRegistry (claim, bind, closed,
 %%                              forget_owner, deleted), MirrorReadOnly ; ChatManager::refuse_if_mirror, mirror_tap,
 %%                              agent_mirror_tap ; ManagerTurnServices::observe_out_of_turn (P18c, P18c-suite)
-%%   src/chat/envelope.rs     — identify_caller, resolve_envelope, ParentEnvelope::apply,
+%%   src/chat/envelope.rs     — identify_caller, resolve_envelope, resolve_envelope_for_opening,
+%%                              ChildOpenings / OpeningTicket / SpawnCaller::reserve_opening (P18-suite point 6), ParentEnvelope::apply,
 %%                              restrict_permission_mode, is_within, ensure_child_of
 %%   src/api/chat_handlers.rs — create_session ; src/api/handlers.rs — delegate_task,
 %%                              delegation_chat_request
@@ -112,7 +113,7 @@ flowchart TD
     subgraph env["Enveloppe — resolve_envelope puis ParentEnvelope::apply"]
         DEPTH{"✅ le parent a-t-il lui-même un parent ?<br/>(spawned_by.parent_session_id)"}
         E_DEPTH["✅ 403 envelope_depth_exceeded (profondeur 1)<br/>test : a_spawned_session_cannot_spawn"]
-        FAN{"✅ enfants VIVANTS du parent ≥ plafond COURANT (réglage runtime GET/PUT/DELETE /api/chat/delegation-limits, root seul, 1..=32, défaut 4, PLAFOND-RT ; plus de variable d environnement) ?<br/>(get_session_children × is_session_active) ;<br/>sous-agents (P18) : créneau SubagentSlot pris AVANT ce compte, tenu jusqu'à la fin<br/>test : parallel_calls_open_at_most_four_children_and_a_dropped_call_closes_its_child<br/>test : the_live_children_cap_is_configurable_and_names_the_env_var"}
+        FAN{"✅ enfants VIVANTS du parent ≥ plafond COURANT (réglage runtime GET/PUT/DELETE /api/chat/delegation-limits, root seul, 1..=32, défaut 4, PLAFOND-RT ; plus de variable d environnement) ?<br/>(get_session_children × is_session_active) ;<br/>sous-agents (P18) : créneau SubagentSlot pris AVANT ce compte, tenu jusqu'à la fin<br/>✅ P18-suite point 6 : + les OUVERTURES EN VOL du même parent prises AVANT celle-ci (ChildOpenings : un ticket par ouverture, TOUS chemins — outil Agent dans le créneau, create_session REST/MCP et delegate_task —, pris avant le compte, lu AVANT les enfants vivants, rendu dès que l'enfant est vivant ou que l'ouverture a échoué) ; compter seulement les tickets ANTÉRIEURS donne la place au premier (deux ouvertures ne se refusent pas mutuellement) ; un double compte ne dure que l'instant entre l'enfant vivant et le ticket rendu (refus en trop, jamais un enfant de trop)<br/>test : mcp_children_and_parallel_agent_calls_share_one_live_children_cap (3 enfants MCP + 2 appels Agent simultanés → le 5e refusé ; rouge sans le correctif : 5 enfants), openings_in_flight_count_toward_the_cap_in_the_order_they_were_taken, only_an_agent_caller_reserves_an_opening<br/>🟠 delegate_task en worktree éphémère (T5) : le ticket est rendu à la mise en attente ; l'ouverture confirmée plus tard ne recompte pas l'enveloppe<br/>test : parallel_calls_open_at_most_four_children_and_a_dropped_call_closes_its_child<br/>test : the_live_children_cap_is_configurable_and_names_the_env_var"}
         E_FAN["✅ 403 envelope_too_many_children<br/>test : a_fifth_live_child_is_refused_…"]
         CEIL["✅ plafond = min(mode vivant | persisté | défaut global, plafond signé) ; mode vivant d'une session native (moteur agent) : agent_modes, gardé et persisté par set_session_permission_mode (P18)<br/>test : a_child_is_capped_at_the_parents_current_mode<br/>test : the_live_mode_and_the_signed_ceiling_both_clamp"]
         DIRS{"✅ cwd et add_dirs sous cwd/add_dirs du parent ?<br/>(is_within : composants entiers, .. replié, liens résolus) ;<br/>seule exception : parent en trust (rang 4 : trust OU bypassPermissions, jamais le littéral) → cwd permis dans un WORKTREE git d'un dépôt sous les racines du parent (fichier .git → worktrees/&lt;nom&gt;, lien retour gitdir vérifié, commondir sous une racine ; aucune commande git) dont la racine n'est ni /, ni le home ou un de ses ancêtres, ni un ancêtre d'un chemin refusé (too_broad_for_a_worktree ; test : a_worktree_faked_at_the_home_is_refused) ; add_dirs hors racines TOUJOURS refusés<br/>test : a_parent_in_trust_may_open_its_child_in_a_worktree_of_its_repository_whatever_the_spelling, a_parent_in_trust_cannot_open_its_child_anywhere_else, extra_directories_never_leave_the_parents_even_in_trust, a_planted_git_file_does_not_borrow_the_parents_repository"}
