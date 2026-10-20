@@ -70,7 +70,7 @@ Download the desktop app for your platform. Every link below goes through [proje
 |----------|----------|------|
 | **macOS** (Apple Silicon) | [Download .dmg](https://project-orchestrator.fr/install/?target=macos-arm64) | M1/M2/M3/M4 — macOS 11 or later |
 | **macOS** (Intel) | [Download .dmg](https://project-orchestrator.fr/install/?target=macos-x64) | Intel Mac — macOS **13.4 or later** |
-| **macOS** (Intel, older) | [Download .dmg](https://project-orchestrator.fr/install/?target=macos-x64-legacy) | Intel Mac on macOS **10.15 to 13.3** — no local embeddings (see below) |
+| **macOS** (Intel, older) | [Download .dmg](https://project-orchestrator.fr/install/?target=macos-x64-legacy) | Intel Mac on macOS **10.15 to 13.3** — no local embeddings, no built-in browser (see below) |
 | **Windows** (64-bit) | [Download .exe](https://project-orchestrator.fr/install/?target=windows-exe) | Installer |
 | **Windows** (64-bit MSI) | [Download .msi](https://project-orchestrator.fr/install/?target=windows-msi) | MSI |
 | **Linux** (x86_64 AppImage) | [Download .AppImage](https://project-orchestrator.fr/install/?target=linux-appimage) | Intel/AMD |
@@ -85,7 +85,7 @@ Download the desktop app for your platform. Every link below goes through [proje
 
 **Which Mac do I have?** Apple menu → *About This Mac*: a chip named *Apple M1…* is Apple Silicon, a *processor* named Intel is Intel. The same window gives your macOS version.
 
-**Intel Mac on macOS 10.15 to 13.3 (older Intel build).** The standard Intel build bundles ONNX Runtime, which needs macOS 13.4; on an older macOS it stops at launch with `Symbol not found … basic_stringbuf`. The older-Intel build is compiled without it, so it runs from macOS 10.15, but it has **no local embeddings**: semantic search needs an HTTP embedding provider such as Ollama (`embeddings.provider: http`). It updates from its own feed, so it is never offered the standard build. The install script (`install.sh`) and `/install/` pick between the two from your macOS version.
+**Intel Mac on macOS 10.15 to 13.3 (older Intel build).** The standard Intel build bundles ONNX Runtime, which needs macOS 13.4; on an older macOS it stops at launch with `Symbol not found … basic_stringbuf`. The older-Intel build is compiled without it, so it runs from macOS 10.15, but it has **no local embeddings** and **no built-in browser** (its V8 library does not run that far back): semantic search needs an HTTP embedding provider such as Ollama (`embeddings.provider: http`), and the agents' `browser_*` tools are not available. The standard Intel build, from macOS 13.4, has both. It updates from its own feed, so it is never offered the standard build. The install script (`install.sh`) and `/install/` pick between the two from your macOS version.
 
 ---
 
