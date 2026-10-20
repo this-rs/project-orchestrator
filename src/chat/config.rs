@@ -168,9 +168,11 @@ pub struct ChatConfig {
     pub nexus_browser_path: Option<PathBuf>,
     /// Obscura (`dsh-obscura-nav`): the executable of the keyless `obscura` search engine
     /// (`--search-engine obscura:<path>`). Server configuration only, never a request's:
-    /// `OBSCURA_BIN`, else `chat.obscura_path` in config.yaml (the variable wins), else the `PATH`
-    /// (`dsh-obscura-nav`, then `obscura`). With `chat.obscura_browser: true` it is also the
-    /// browser (N23) when none named `obscura` was found.
+    /// `OBSCURA_BIN`, else `chat.obscura_path` in config.yaml (the variable wins), absolute only.
+    /// `None` is the default: the engine embedded in nexus-tools, else the `PATH`
+    /// (`dsh-obscura-nav`, then `obscura`) looked up at each opening ([`obscura_engine_program`]).
+    /// With `chat.obscura_browser: true` it is also the browser (N23) when none named `obscura`
+    /// was found.
     pub obscura_path: Option<PathBuf>,
     /// Default model to use when not specified in request
     pub default_model: String,
@@ -255,6 +257,24 @@ pub const PROVIDER_PATH_VAR: &str = "CHAT_PROVIDER_PATH";
 
 /// Variable naming the `nexus-tools` executable of the native sessions (B40).
 pub const NEXUS_TOOLS_PATH_VAR: &str = "NEXUS_TOOLS_PATH";
+
+/// The executable of the `obscura` search engine of a session: the configured one
+/// (`configured`, [`ChatConfig::obscura_path`]) when runnable (`runnable`: absolute, executable);
+/// else none when nexus-tools embeds Obscura (`embedded`: the engine runs in that process,
+/// `--search-engine obscura`); else `dsh-obscura-nav` on the `PATH` (`on_path`, held to the
+/// same `runnable` rule). The embedded engine is the default, the `PATH` only a fallback (OBS-R).
+pub fn obscura_engine_program(
+    configured: Option<&std::path::Path>,
+    embedded: bool,
+    on_path: impl FnOnce() -> Option<PathBuf>,
+    runnable: impl Fn(&std::path::Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    match configured {
+        Some(path) => runnable(path),
+        None if embedded => None,
+        None => on_path().as_deref().and_then(runnable),
+    }
+}
 
 /// Variable naming the Obscura executable (`dsh-obscura-nav`) of the `obscura` search engine.
 pub const OBSCURA_BIN_VAR: &str = "OBSCURA_BIN";
@@ -494,11 +514,20 @@ impl ChatConfig {
         nexus_claude::providers::native::DefaultTools::locate().map(|tools| tools.program)
     }
 
-    /// [`Self::obscura_path`] from the environment: `OBSCURA_BIN`, else the `PATH`.
+    /// [`Self::obscura_path`] from the environment: `OBSCURA_BIN` when absolute (a relative one
+    /// is ignored, with a warning at startup: `apply_obscura`). Never the `PATH`: without a
+    /// configured executable the engine embedded in nexus-tools is the default, and
+    /// [`Self::obscura_on_path`] only the fallback ([`obscura_engine_program`]).
     pub fn detect_obscura_path() -> Option<PathBuf> {
-        if let Some(path) = std::env::var_os(OBSCURA_BIN_VAR).filter(|p| !p.is_empty()) {
-            return Some(PathBuf::from(path));
-        }
+        std::env::var_os(OBSCURA_BIN_VAR)
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    }
+
+    /// Obscura found on the `PATH` (`dsh-obscura-nav`, then `obscura`): the fallback of the
+    /// `obscura` search engine when nothing is configured and nexus-tools does not embed it.
+    pub fn obscura_on_path() -> Option<PathBuf> {
         nexus_tools::search::ObscuraBackend::locate().map(|o| o.program().to_path_buf())
     }
 
@@ -540,6 +569,38 @@ pub(crate) fn auto_continue_from_env(value: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OBS-R (review of #751): Obscura ships inside nexus-tools, so the engine embedded there is
+    /// the default; `dsh-obscura-nav` on the PATH is only the fallback of a nexus-tools without
+    /// it, and an executable the operator configured still wins.
+    #[test]
+    fn the_embedded_obscura_is_the_default_and_the_path_only_a_fallback() {
+        use std::path::Path;
+        let on_path = || Some(PathBuf::from("/usr/local/bin/dsh-obscura-nav"));
+        let runnable = |p: &Path| p.is_absolute().then(|| p.to_path_buf());
+        let never = || -> Option<PathBuf> { panic!("the PATH is not looked up") };
+        // Embedded, nothing configured: no external executable, even with one on the PATH.
+        assert_eq!(obscura_engine_program(None, true, on_path, runnable), None);
+        assert_eq!(obscura_engine_program(None, true, never, runnable), None);
+        // Not embedded: the PATH is the fallback.
+        assert_eq!(
+            obscura_engine_program(None, false, on_path, runnable),
+            Some(PathBuf::from("/usr/local/bin/dsh-obscura-nav"))
+        );
+        assert_eq!(obscura_engine_program(None, false, || None, runnable), None);
+        // Configured: it wins over both, and is never replaced by the PATH.
+        let configured = Path::new("/opt/obscura/dsh-obscura-nav");
+        for embedded in [true, false] {
+            assert_eq!(
+                obscura_engine_program(Some(configured), embedded, never, runnable),
+                Some(configured.to_path_buf())
+            );
+        }
+        assert_eq!(
+            obscura_engine_program(Some(Path::new("rel/obscura")), false, never, runnable),
+            None
+        );
+    }
 
     /// Auto-continue is on by default; `CHAT_AUTO_CONTINUE=false|0` is the kill switch.
     #[test]
@@ -730,6 +791,31 @@ mod tests {
         assert!(!config.default_model.is_empty());
         assert!(config.max_sessions > 0);
         assert_eq!(config.permission.mode, "default");
+
+        // Phase 5: OBSCURA_BIN, read here where the environment is owned.
+        for (raw, want) in [
+            (
+                Some("/opt/obscura/dsh-obscura-nav"),
+                Some("/opt/obscura/dsh-obscura-nav"),
+            ),
+            (Some("bin/dsh-obscura-nav"), None),
+            (Some("./dsh-obscura-nav"), None),
+            (Some(""), None),
+            (None, None),
+        ] {
+            match raw {
+                Some(value) => std::env::set_var(OBSCURA_BIN_VAR, value),
+                None => std::env::remove_var(OBSCURA_BIN_VAR),
+            }
+            let want = want.map(PathBuf::from);
+            assert_eq!(ChatConfig::detect_obscura_path(), want, "{raw:?}");
+            assert_eq!(ChatConfig::from_env().obscura_path, want, "{raw:?}");
+        }
+        let located = nexus_tools::search::ObscuraBackend::locate();
+        assert_eq!(
+            ChatConfig::obscura_on_path(),
+            located.map(|o| o.program().to_path_buf())
+        );
 
         // Cleanup
         std::env::remove_var("CHAT_DEFAULT_MODEL");

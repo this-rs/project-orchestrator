@@ -1123,8 +1123,10 @@ pub struct NexusToolsConfig {
     /// The browser, when its executable was found. Present does not mean authorised.
     pub browser: Option<BrowserTools>,
     /// Obscura (`dsh-obscura-nav`), for the keyless `obscura` search engine: the server's
-    /// configuration (`chat.obscura_path` / `OBSCURA_BIN`, else found on the `PATH`), never a
-    /// request's. `None`: a declared `obscura` engine is skipped (`tool_engine_not_installed`).
+    /// configuration (`chat.obscura_path` / `OBSCURA_BIN`; else, only when `program` does not
+    /// embed Obscura, found on the `PATH`: `crate::chat::config::obscura_engine_program`), never a
+    /// request's. `None`: the embedded engine when `embedded_obscura`, else a declared `obscura`
+    /// engine is skipped (`tool_engine_not_installed`).
     pub obscura: Option<PathBuf>,
     /// `program` embeds Obscura (nexus-tools built with its `obscura` feature, what
     /// [`embeds_obscura`] reads from `--capabilities`): a declared `obscura` engine runs in that

@@ -529,7 +529,8 @@ later, comes after the named ones. 200 with the engines in their new order. Code
 `{"id": "brave", "engine": "brave", "credential_ref": "vault:brave"}` or
 `{"id": "home", "engine": "searxng", "base_url": "http://localhost:8888"}` or
 `{"id": "obscura", "engine": "obscura", "credential_ref": "none"}` (keyless, no `base_url`: the executable is
-the server's `chat.obscura_path` / `OBSCURA_BIN` / `PATH`; origin `https://html.duckduckgo.com`). 201 with the engine.
+the server's `chat.obscura_path` / `OBSCURA_BIN` (absolute), else the engine embedded in nexus-tools, else
+`dsh-obscura-nav` on the `PATH`; origin `https://html.duckduckgo.com`). 201 with the engine.
 Codes: `secret_value_refused` (a `key`, `api_key`, `token`... field), `invalid_search_engine`,
 `invalid_search_engine_id`, `unknown_search_engine`, `invalid_search_engine_url`, `invalid_credential_ref`,
 `credential_ref_required`; 409 `search_engine_exists`. The key is then granted with `POST /api/vault/grants`,

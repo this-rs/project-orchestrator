@@ -166,8 +166,9 @@ chat:
   prompt_builder_model: "claude-opus-4-7"  # PROMPT_BUILDER_MODEL env override
   # Obscura (dsh-obscura-nav), the keyless search engine "obscura" of native sessions
   # (POST /api/chat/search-engines {"id":"obscura","engine":"obscura","credential_ref":"none"}).
-  # obscura_path: "/usr/local/bin/dsh-obscura-nav"   # OBSCURA_BIN env override; default: PATH lookup
-  # obscura_browser: false                            # OBSCURA_BROWSER env override; true = also the browser (browser_* tools)
+  # obscura_path: "/usr/local/bin/dsh-obscura-nav"   # OBSCURA_BIN env override; absolute only (a relative path is ignored with a warning)
+  #                                                   # default: the engine embedded in nexus-tools, else dsh-obscura-nav on the PATH
+  # obscura_browser: false                            # OBSCURA_BROWSER env override (true/1/yes/on, false/0/no/off, any case; other values ignored); true = also the browser (browser_* tools)
 
 # -----------------------------------------------------------------------------
 # Neural Routing — Trajectory-based route learning (optional)
