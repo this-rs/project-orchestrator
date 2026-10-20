@@ -68,7 +68,7 @@ pub enum SpawnedBy {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_session_id: Option<Uuid>,
     },
-    /// Spawned by the pipeline orchestrator (WaveExecutor / PipelineEngine).
+    /// Spawned by the pipeline orchestrator.
     Pipeline {
         run_id: Uuid,
         task_id: Uuid,

@@ -77,7 +77,7 @@ collision entre les deux index est une erreur, pas un arrangement.
 - `src/orchestrator/` (6) : `context.rs`, `mod.rs`, `planner.rs`, `runner.rs`, `topology_hook.rs`, `watcher.rs`
 - `src/parser/` (4) : `ast_cache.rs`, `helpers.rs`, `mod.rs`, `noise_filter.rs`
 - `src/parser/languages/` (18) : `bash.rs`, `c.rs`, `cpp.rs`, `csharp.rs`, `dart.rs`, `go.rs`, `hcl.rs`, `java.rs`, `kotlin.rs`, `mod.rs`, `php.rs`, `python.rs`, `ruby.rs`, `rust.rs`, `scala.rs`, `swift.rs`, `typescript.rs`, `zig.rs`
-- `src/pipeline/` (14) : `composer.rs`, `critic.rs`, `episode_adapter.rs`, `evolve.rs`, `feedback.rs`, `gates.rs`, `materialize.rs`, `metrics.rs`, `mod.rs`, `progress.rs`, `regression.rs`, `runner.rs`, `skill_injector.rs`, `wave_executor.rs`
+- `src/pipeline/` (13) : `composer.rs`, `critic.rs`, `episode_adapter.rs`, `evolve.rs`, `feedback.rs`, `gates.rs`, `materialize.rs`, `metrics.rs`, `mod.rs`, `progress.rs`, `regression.rs`, `runner.rs`, `skill_injector.rs`
 - `src/plan/` (3) : `manager.rs`, `mod.rs`, `models.rs`
 - `src/profile/` (5) : `aggregator.rs`, `collector.rs`, `mod.rs`, `signals.rs`, `wiring.rs`
 - `src/protocol/` (9) : `engine.rs`, `generator.rs`, `hooks.rs`, `mod.rs`, `models.rs`, `routing.rs`, `runner.rs`, `seed.rs`, `seed_runner.rs`
