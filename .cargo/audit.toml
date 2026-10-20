@@ -25,6 +25,13 @@ ignore = [
     # We will revisit when RustCrypto/RSA ships a constant-time release.
     "RUSTSEC-2023-0071",
 
+    # RUSTSEC-2026-0381 — webpki-roots bundles distrusted emSign intermediates.
+    # Patched only in webpki-roots >= 1.0.10 (bumped in Cargo.lock). The 0.26.11
+    # copy is pinned by neo4rs 0.8.0 (bolt over rustls); no 0.26 patch exists.
+    # Justification: that copy only validates the Neo4j server certificate of an
+    # operator-configured endpoint. Revisit when neo4rs moves to webpki-roots 1.x.
+    "RUSTSEC-2026-0381",
+
     # ---------------------------------------------------------------------
     # Unmaintained transitive dependencies (informational, not vulnerabilities).
     # Mirrored from deny.toml — see that file for per-advisory justifications.
