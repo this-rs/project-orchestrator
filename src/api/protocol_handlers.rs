@@ -1697,6 +1697,92 @@ pub async fn compose_protocol(
         }
     }
 
+    // ── PYSR-4: Structural validation ───────────────────────────────────
+
+    // 1. Check for duplicate transitions (same from_state + trigger = non-deterministic)
+    {
+        let mut seen: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
+        for t in &body.transitions {
+            let key = (t.from_state.as_str(), t.trigger.as_str());
+            if !seen.insert(key) {
+                return Err(AppError::BadRequest(format!(
+                    "duplicate transition: from '{}' with trigger '{}' appears multiple times (non-deterministic)",
+                    t.from_state, t.trigger
+                )));
+            }
+        }
+    }
+
+    // 2. Parse state types to check for terminal and start states
+    let parsed_types: Vec<(&str, crate::protocol::StateType)> = body
+        .states
+        .iter()
+        .map(|s| {
+            let st = s
+                .state_type
+                .as_ref()
+                .and_then(|t| t.parse().ok())
+                .unwrap_or_default();
+            (s.name.as_str(), st)
+        })
+        .collect();
+
+    // 3. Check that at least one terminal state exists
+    let has_terminal = parsed_types
+        .iter()
+        .any(|(_, st)| *st == crate::protocol::StateType::Terminal);
+    if !has_terminal {
+        return Err(AppError::BadRequest(
+            "protocol must have at least one terminal state".to_string(),
+        ));
+    }
+
+    // 4. Check that all states are reachable from start
+    {
+        let start_name = parsed_types
+            .iter()
+            .find(|(_, st)| *st == crate::protocol::StateType::Start)
+            .map(|(name, _)| *name)
+            .or_else(|| body.states.first().map(|s| s.name.as_str()));
+
+        if let Some(start) = start_name {
+            // Build adjacency: from_state -> [to_states]
+            let mut adj: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new();
+            for t in &body.transitions {
+                adj.entry(t.from_state.as_str())
+                    .or_default()
+                    .push(t.to_state.as_str());
+            }
+
+            // BFS from start
+            let mut reachable: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut queue = std::collections::VecDeque::new();
+            queue.push_back(start);
+            reachable.insert(start);
+
+            while let Some(current) = queue.pop_front() {
+                if let Some(neighbors) = adj.get(current) {
+                    for &next in neighbors {
+                        if reachable.insert(next) {
+                            queue.push_back(next);
+                        }
+                    }
+                }
+            }
+
+            // Check all states are reachable
+            for name in &state_names {
+                if !reachable.contains(*name) {
+                    return Err(AppError::BadRequest(format!(
+                        "state '{}' is unreachable from the start state",
+                        name
+                    )));
+                }
+            }
+        }
+    }
+
     let category = match &body.category {
         Some(s) => s
             .parse::<ProtocolCategory>()
@@ -2702,7 +2788,7 @@ mod tests {
     /// RED TEST: A state unreachable from the initial state should be rejected.
     /// Current behavior: accepted (no reachability check).
     #[tokio::test]
-    async fn compose_protocol_accepts_unreachable_state_pysr4_red() {
+    async fn compose_protocol_rejects_unreachable_state() {
         let graph = std::sync::Arc::new(MockGraphStore::new());
         let project_id = Uuid::new_v4();
         let mut project = test_project();
@@ -2731,18 +2817,22 @@ mod tests {
         )
         .await;
 
-        // BUG: this SHOULD be BAD_REQUEST once PYSR-4 step 3 is done
+        // PYSR-4 step 3: validation now rejects unreachable states
         assert_eq!(
             status,
-            axum::http::StatusCode::CREATED,
-            "PYSR-4 RED: unreachable state 'orphan' was accepted (should reject): {body}"
+            axum::http::StatusCode::BAD_REQUEST,
+            "unreachable state 'orphan' should be rejected: {body}"
+        );
+        assert!(
+            body.to_string().contains("unreachable"),
+            "error should mention 'unreachable': {body}"
         );
     }
 
-    /// RED TEST: A protocol with no terminal state should be rejected.
-    /// Current behavior: accepted (no terminal-state check).
+    /// Protocol with no terminal state is rejected.
+    /// PYSR-4: terminal state validation added.
     #[tokio::test]
-    async fn compose_protocol_accepts_no_terminal_state_pysr4_red() {
+    async fn compose_protocol_rejects_no_terminal_state() {
         let graph = std::sync::Arc::new(MockGraphStore::new());
         let project_id = Uuid::new_v4();
         let mut project = test_project();
@@ -2772,18 +2862,22 @@ mod tests {
         )
         .await;
 
-        // BUG: this SHOULD be BAD_REQUEST once PYSR-4 step 3 is done
+        // PYSR-4 step 3: validation now requires at least one terminal state
         assert_eq!(
             status,
-            axum::http::StatusCode::CREATED,
-            "PYSR-4 RED: protocol without terminal state was accepted (should reject): {body}"
+            axum::http::StatusCode::BAD_REQUEST,
+            "protocol without terminal state should be rejected: {body}"
+        );
+        assert!(
+            body.to_string().contains("terminal"),
+            "error should mention 'terminal': {body}"
         );
     }
 
-    /// RED TEST: Duplicate transitions (same from_state + trigger) should be rejected.
-    /// Current behavior: accepted (no duplicate-transition check).
+    /// Duplicate transitions (same from_state + trigger) are rejected.
+    /// PYSR-4: duplicate transition validation added.
     #[tokio::test]
-    async fn compose_protocol_accepts_duplicate_transitions_pysr4_red() {
+    async fn compose_protocol_rejects_duplicate_transitions() {
         let graph = std::sync::Arc::new(MockGraphStore::new());
         let project_id = Uuid::new_v4();
         let mut project = test_project();
@@ -2816,11 +2910,15 @@ mod tests {
         )
         .await;
 
-        // BUG: this SHOULD be BAD_REQUEST once PYSR-4 step 3 is done
+        // PYSR-4 step 3: validation now rejects duplicate transitions
         assert_eq!(
             status,
-            axum::http::StatusCode::CREATED,
-            "PYSR-4 RED: duplicate transitions (start + 'go') accepted (should reject): {body}"
+            axum::http::StatusCode::BAD_REQUEST,
+            "duplicate transitions should be rejected: {body}"
+        );
+        assert!(
+            body.to_string().contains("duplicate"),
+            "error should mention 'duplicate': {body}"
         );
     }
 }
