@@ -15701,3 +15701,514 @@ mod claude_code_mirror {
         manager.close_session(&sid).await.unwrap();
     }
 }
+
+/// P20-suite-2: a Claude Code turn cut by a restart is resumed ONCE at boot through the
+/// CLI's own `--resume`, on either engine, when its CLI asks before each tool; past the cap,
+/// or when the CLI is gone or refuses the conversation, it is closed with an `error` event.
+/// The CLI is nexus' `fake_claude`; the restart is a second manager over the same graph.
+mod claude_code_recovery_at_boot {
+    use super::claude_code_resume_token::FakeCli;
+    use super::*;
+    use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
+
+    const CLI_SESSION: &str = "cli-session-recovered";
+    /// `recovery::RESUME_MARKER` (the module is private to the manager).
+    const MARKER: &str = "[PO restart recovery]";
+
+    /// One turn as the CLI plays it, every spawn: reads the user's message, names its
+    /// session, answers, ends with a `result`, stays up until stdin closes.
+    fn cli_turn() -> String {
+        let lines = [
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 15000}),
+            json!({"op": "emit_json", "json": {
+                "type": "system", "subtype": "init", "session_id": CLI_SESSION,
+                "model": "fake-claude", "cwd": ".", "tools": ["Read"],
+                "permissionMode": "default", "apiKeySource": "none"}}),
+            json!({"op": "emit_json", "json": {
+                "type": "assistant", "message": {"id": "msg_fake", "type": "message",
+                "role": "assistant", "model": "fake-claude",
+                "content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn"}}}),
+            json!({"op": "emit_json", "json": {
+                "type": "result", "subtype": "success", "duration_ms": 12,
+                "duration_api_ms": 7, "is_error": false, "num_turns": 1,
+                "session_id": CLI_SESSION, "total_cost_usd": 0.0001,
+                "usage": {"input_tokens": 3, "output_tokens": 5}, "result": "done"}}),
+            json!({"op": "wait_eof", "timeout_ms": 15000, "optional": true}),
+        ];
+        lines.iter().map(|l| format!("{l}\n")).collect()
+    }
+
+    fn argv_of(path: &std::path::Path) -> Vec<String> {
+        let recorded: Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("argv recorded")).unwrap();
+        recorded["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.as_str().map(str::to_string))
+            .collect()
+    }
+
+    async fn wait_for_file(path: &std::path::Path) -> bool {
+        for _ in 0..400 {
+            if path.exists() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    async fn events(
+        graph: &MockGraphStore,
+        sid: &str,
+    ) -> Vec<crate::neo4j::models::ChatEventRecord> {
+        graph
+            .get_chat_events(Uuid::parse_str(sid).unwrap(), 0, 500)
+            .await
+            .unwrap()
+    }
+
+    async fn results(graph: &MockGraphStore, sid: &str, at_least: usize) -> usize {
+        let mut n = 0;
+        for _ in 0..400 {
+            n = events(graph, sid)
+                .await
+                .iter()
+                .filter(|e| e.event_type == "result")
+                .count();
+            if n >= at_least {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        n
+    }
+
+    /// Appends `tail` (type, data) after the last stored event: the turn the restart cut.
+    async fn cut_turn(graph: &MockGraphStore, sid: &str, tail: &[(&str, String)]) {
+        let uuid = Uuid::parse_str(sid).unwrap();
+        let last = graph.get_latest_chat_event_seq(uuid).await.unwrap();
+        for (i, (event_type, data)) in tail.iter().enumerate() {
+            graph
+                .store_chat_events(
+                    uuid,
+                    vec![crate::neo4j::models::ChatEventRecord {
+                        id: Uuid::new_v4(),
+                        session_id: uuid,
+                        seq: last + 1 + i as i64,
+                        event_type: event_type.to_string(),
+                        data: data.clone(),
+                        created_at: Utc::now(),
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    fn user(content: &str) -> (&'static str, String) {
+        (
+            "user_message",
+            json!({"type": "user_message", "content": content}).to_string(),
+        )
+    }
+
+    fn text(content: &str) -> (&'static str, String) {
+        (
+            "assistant_text",
+            json!({"type": "assistant_text", "content": content}).to_string(),
+        )
+    }
+
+    fn assert_closed_by_recovery(events: &[crate::neo4j::models::ChatEventRecord]) {
+        let last = events.last().expect("events");
+        assert_eq!(last.event_type, "error", "{events:?}");
+        assert!(last.data.contains("restart_interrupted"), "{}", last.data);
+    }
+
+    // ── the agent engine ───────────────────────────────────────────────────────────────
+
+    struct Agent {
+        dir: tempfile::TempDir,
+        graph: Arc<MockGraphStore>,
+        sid: String,
+    }
+
+    impl Agent {
+        fn argv_out(&self) -> PathBuf {
+            self.dir.path().join("argv.json")
+        }
+
+        /// The Claude Code provider of nexus on `cli`, recording its argv.
+        fn provider(&self, cli: PathBuf) -> FakeCli {
+            let mut config = ClaudeCodeConfig::default();
+            config.cli_path = Some(cli);
+            FakeCli {
+                inner: Arc::new(ClaudeCodeProvider::new(config)),
+                env: vec![
+                    (
+                        "FAKE_CLAUDE_TRANSCRIPT".into(),
+                        self.dir
+                            .path()
+                            .join("transcript.jsonl")
+                            .display()
+                            .to_string(),
+                    ),
+                    (
+                        "FAKE_CLAUDE_ARGS_OUT".into(),
+                        self.argv_out().display().to_string(),
+                    ),
+                ],
+            }
+        }
+
+        /// A server over the graph, its Claude Code CLI `cli`: the one after the restart
+        /// is a production one (no `resuming_claude_code_at_boot`).
+        fn server(&self, cli: PathBuf) -> ChatManager {
+            let dyn_graph: Arc<dyn GraphStore> = self.graph.clone();
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Agent,
+                mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+                max_sessions: 10,
+                ..Default::default()
+            };
+            ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+                .with_provider_source(Arc::new(self.provider(cli)))
+        }
+    }
+
+    /// A Claude Code session of the agent engine in `mode` whose first turn ended (the CLI
+    /// named its conversation), then a turn the restart cut after `tail`.
+    async fn agent_session_cut(mode: &str, tail: &[(&str, String)]) -> Agent {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("transcript.jsonl"), cli_turn()).unwrap();
+        let agent = Agent {
+            dir,
+            graph: Arc::new(MockGraphStore::new()),
+            sid: String::new(),
+        };
+        let before = agent.server(fake_bin("fake_claude"));
+        let mut req = request(None, None, mode);
+        req.message = "first".into();
+        req.cwd = agent.dir.path().display().to_string();
+        let sid = before.create_session(&req).await.unwrap().session_id;
+        assert!(before.agent_runtime.owns(&sid).await, "the agent engine");
+        assert_eq!(results(&agent.graph, &sid, 1).await, 1, "the first turn");
+        for _ in 0..200 {
+            let node = agent
+                .graph
+                .get_chat_session(Uuid::parse_str(&sid).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            if node.resume_token.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+        cut_turn(&agent.graph, &sid, tail).await;
+        std::fs::remove_file(agent.argv_out()).unwrap();
+        Agent { sid, ..agent }
+    }
+
+    #[tokio::test]
+    async fn a_claude_code_turn_cut_by_a_restart_is_resumed_once_with_the_cli_resume() {
+        let agent = agent_session_cut("default", &[user("go on"), text("working on it")]).await;
+        let after = agent.server(fake_bin("fake_claude"));
+        let (pending, scan) = after.scan_interrupted_turns().await.unwrap();
+        assert_eq!((pending.len(), scan.closed), (1, 0), "{scan:?}");
+        let report = after
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(5))
+            .await;
+        assert_eq!((report.resumed, report.failed), (1, 0), "{report:?}");
+        assert!(wait_for_file(&agent.argv_out()).await, "the CLI respawned");
+        let argv = argv_of(&agent.argv_out());
+        let at = argv
+            .iter()
+            .position(|a| a == "--resume")
+            .unwrap_or_else(|| panic!("the CLI resumes its conversation: {argv:?}"));
+        assert_eq!(argv.get(at + 1).map(String::as_str), Some(CLI_SESSION));
+        assert_eq!(
+            results(&agent.graph, &agent.sid, 2).await,
+            2,
+            "the resumed turn"
+        );
+        let stored = events(&agent.graph, &agent.sid).await;
+        let resume = stored
+            .iter()
+            .find(|e| e.event_type == "user_message" && e.data.contains(MARKER))
+            .expect("the resume message is on the thread");
+        assert!(resume.data.contains("User: go on"), "{}", resume.data);
+        assert!(
+            resume.data.contains("queued") && resume.data.contains("lost"),
+            "the queued messages are said lost: {}",
+            resume.data
+        );
+        after.close_session(&agent.sid).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_claude_code_turn_cut_again_past_the_cap_is_closed() {
+        let marker = format!("{MARKER} The server restarted while you were working.");
+        let agent = agent_session_cut(
+            "default",
+            &[
+                user("go on"),
+                user(&marker),
+                text("again"),
+                user(&marker),
+                text("and again"),
+            ],
+        )
+        .await;
+        let after = agent.server(fake_bin("fake_claude"));
+        let (pending, scan) = after.scan_interrupted_turns().await.unwrap();
+        assert_eq!((pending.len(), scan.closed), (0, 1), "{scan:?}");
+        assert_closed_by_recovery(&events(&agent.graph, &agent.sid).await);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!agent.argv_out().exists(), "no CLI was started");
+    }
+
+    #[tokio::test]
+    async fn a_claude_code_turn_whose_cli_is_gone_is_closed_with_an_error() {
+        let agent = agent_session_cut("default", &[user("go on"), text("working")]).await;
+        let after = agent.server(PathBuf::from("/nonexistent/claude"));
+        let (pending, _) = after.scan_interrupted_turns().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let report = after
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(5))
+            .await;
+        assert_eq!((report.resumed, report.failed), (0, 1), "{report:?}");
+        assert!(!after.is_session_active(&agent.sid).await);
+        assert_closed_by_recovery(&events(&agent.graph, &agent.sid).await);
+    }
+
+    /// The rule of the review of #726 (point 3) still holds: a CLI that runs tools without
+    /// asking is not resumed with nobody there.
+    #[tokio::test]
+    async fn a_claude_code_turn_that_runs_tools_without_asking_is_still_closed() {
+        let agent = agent_session_cut("bypassPermissions", &[user("go on"), text("working")]).await;
+        let after = agent.server(fake_bin("fake_claude"));
+        let (pending, scan) = after.scan_interrupted_turns().await.unwrap();
+        assert_eq!((pending.len(), scan.closed), (0, 1), "{scan:?}");
+        let stored = events(&agent.graph, &agent.sid).await;
+        assert_closed_by_recovery(&stored);
+        assert!(
+            stored.last().unwrap().data.contains("without asking"),
+            "{}",
+            stored.last().unwrap().data
+        );
+    }
+
+    // ── the historical engine ──────────────────────────────────────────────────────────
+
+    /// `fake_claude` behind a wrapper: `--version` probes pass through; spawn `n` plays
+    /// `transcript.<n>.jsonl` and records its argv in `args.<n>.json`.
+    fn legacy_wrapper(dir: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = fake_bin("fake_claude");
+        let path = dir.join("claude");
+        let script = format!(
+            "#!/bin/sh\n\
+             for a in \"$@\"; do if [ \"$a\" = \"--version\" ]; then exec \"{fake}\" \"$@\"; fi; done\n\
+             n=$(cat \"{dir}/count\" 2>/dev/null || echo 0)\n\
+             echo $((n+1)) > \"{dir}/count\"\n\
+             FAKE_CLAUDE_TRANSCRIPT=\"{dir}/transcript.$n.jsonl\" \
+             FAKE_CLAUDE_ARGS_OUT=\"{dir}/args.$n.json\" \
+             FAKE_CLAUDE_MAX_RUNTIME_MS=60000 \
+             exec \"{fake}\" \"$@\"\n",
+            fake = fake.display(),
+            dir = dir.display()
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn legacy_server(graph: &Arc<MockGraphStore>, cli: &std::path::Path) -> ChatManager {
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Legacy,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            claude_cli_path: Some(cli.display().to_string()),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+    }
+
+    /// A session of the historical engine whose first turn ended, then a cut turn; the
+    /// second spawn of the CLI plays `second`.
+    async fn legacy_session_cut(second: &str) -> (tempfile::TempDir, Arc<MockGraphStore>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("transcript.0.jsonl"), cli_turn()).unwrap();
+        std::fs::write(dir.path().join("transcript.1.jsonl"), second).unwrap();
+        std::fs::write(dir.path().join("transcript.2.jsonl"), cli_turn()).unwrap();
+        let cli = legacy_wrapper(dir.path());
+        let graph = Arc::new(MockGraphStore::new());
+        let before = legacy_server(&graph, &cli);
+        let mut req = request(None, None, "default");
+        req.message = "first".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = before.create_session(&req).await.unwrap().session_id;
+        assert!(
+            !before.agent_runtime.owns(&sid).await,
+            "the historical engine"
+        );
+        assert_eq!(results(&graph, &sid, 1).await, 1, "the first turn");
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.cli_session_id.as_deref(), Some(CLI_SESSION));
+        cut_turn(&graph, &sid, &[user("go on"), text("working")]).await;
+        (dir, graph, sid)
+    }
+
+    #[tokio::test]
+    async fn a_legacy_claude_code_turn_cut_by_a_restart_is_resumed_with_the_cli_resume() {
+        let (dir, graph, sid) = legacy_session_cut(&cli_turn()).await;
+        let after = legacy_server(&graph, &dir.path().join("claude"));
+        let (pending, scan) = after.scan_interrupted_turns().await.unwrap();
+        assert_eq!((pending.len(), scan.closed), (1, 0), "{scan:?}");
+        let report = after
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(5))
+            .await;
+        assert_eq!((report.resumed, report.failed), (1, 0), "{report:?}");
+        let args = dir.path().join("args.1.json");
+        assert!(wait_for_file(&args).await, "the CLI respawned");
+        let argv = argv_of(&args);
+        let at = argv
+            .iter()
+            .position(|a| a == "--resume")
+            .unwrap_or_else(|| panic!("the CLI resumes its conversation: {argv:?}"));
+        assert_eq!(argv.get(at + 1).map(String::as_str), Some(CLI_SESSION));
+        assert_eq!(results(&graph, &sid, 2).await, 2, "the resumed turn");
+        assert!(events(&graph, &sid)
+            .await
+            .iter()
+            .any(|e| e.event_type == "user_message" && e.data.contains(MARKER)));
+        after.close_session(&sid).await.unwrap();
+    }
+
+    /// A `--resume` the CLI refuses (here: it exits at once) closes the turn; the recovery
+    /// never falls back to a fresh CLI that would continue blind.
+    #[tokio::test]
+    async fn a_legacy_claude_code_turn_whose_resume_is_refused_is_closed_not_started_fresh() {
+        // The CLI given `--resume` exits at once, as one whose conversation expired.
+        let refuse = format!("{}\n", json!({"op": "exit", "code": 1}));
+        let (dir, graph, sid) = legacy_session_cut(&refuse).await;
+        let after = legacy_server(&graph, &dir.path().join("claude"));
+        let (pending, _) = after.scan_interrupted_turns().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let report = after
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(10))
+            .await;
+        assert_eq!((report.resumed, report.failed), (0, 1), "{report:?}");
+        assert!(
+            !dir.path().join("args.2.json").exists(),
+            "no fresh CLI after the refused --resume"
+        );
+        assert!(!after.is_session_active(&sid).await);
+        assert_closed_by_recovery(&events(&graph, &sid).await);
+    }
+
+    /// The CLI that accepts the handshake but dies before the grace of a resume is out (a
+    /// conversation it only finds missing afterwards) is the same refusal: the turn is closed,
+    /// no fresh CLI takes its place.
+    #[tokio::test]
+    async fn a_legacy_claude_code_turn_whose_cli_dies_after_its_handshake_is_closed_not_started_fresh(
+    ) {
+        let dies_late = [
+            json!({"op": "sleep", "ms": 400}),
+            json!({"op": "exit", "code": 1}),
+        ]
+        .iter()
+        .map(|l| format!("{l}\n"))
+        .collect::<String>();
+        let (dir, graph, sid) = legacy_session_cut(&dies_late).await;
+        let after = legacy_server(&graph, &dir.path().join("claude"));
+        let (pending, _) = after.scan_interrupted_turns().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let report = after
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(10))
+            .await;
+        assert_eq!((report.resumed, report.failed), (0, 1), "{report:?}");
+        assert!(
+            wait_for_file(&dir.path().join("args.1.json")).await,
+            "the resumed CLI was started"
+        );
+        assert!(
+            !dir.path().join("args.2.json").exists(),
+            "no fresh CLI after the refused --resume"
+        );
+        assert!(!after.is_session_active(&sid).await);
+        assert_closed_by_recovery(&events(&graph, &sid).await);
+    }
+
+    // ── several instances ──────────────────────────────────────────────────────────────
+
+    /// A session live on instance A whose thread looks cut (its turn is running there) is
+    /// neither resumed nor closed by instance B's boot scan: B asks on NATS first.
+    #[tokio::test]
+    async fn a_session_live_on_another_instance_is_left_alone_by_the_scan() {
+        use crate::events::nats_broker_test::TestBroker;
+        use crate::events::NatsEmitter;
+        let broker = TestBroker::start().await;
+        let graph = Arc::new(MockGraphStore::new());
+        let fake = super::super::agent_runtime::fake::FakeProvider::new();
+        let instance = |nats: Arc<NatsEmitter>| {
+            let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+            let config = super::super::config::ChatConfig {
+                provider_path: ProviderPath::Agent,
+                mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+                max_sessions: 10,
+                ..Default::default()
+            };
+            ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config)
+                .with_provider_source(Arc::new(fake.clone()))
+                .with_nats(nats)
+                // The fake answers as `claude-code` but is no CLI.
+                .resuming_claude_code_at_boot()
+        };
+        let a_nats = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let a = instance(a_nats.clone());
+        let sid = a
+            .create_session(&request(None, None, "default"))
+            .await
+            .unwrap()
+            .session_id;
+        assert!(a.agent_runtime.owns(&sid).await);
+        // A's turn is running: its thread ends mid-turn.
+        cut_turn(&graph, &sid, &[user("go on"), text("working")]).await;
+        // A answers for its session on the bus (its listener subscribes in the background).
+        let mut answered = false;
+        for _ in 0..100 {
+            if a_nats.request_streaming_snapshot(&sid).await.is_some() {
+                answered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(answered, "instance A answers for its live session");
+
+        let b = instance(Arc::new(NatsEmitter::new(broker.client().await, "events")));
+        let (pending, scan) = b.scan_interrupted_turns().await.unwrap();
+        assert_eq!(
+            (pending.len(), scan.closed, scan.live_elsewhere),
+            (0, 0, 1),
+            "{scan:?}"
+        );
+        assert!(!events(&graph, &sid)
+            .await
+            .iter()
+            .any(|e| e.event_type == "error"));
+        a.close_session(&sid).await.unwrap();
+    }
+}

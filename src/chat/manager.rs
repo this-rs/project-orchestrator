@@ -972,10 +972,11 @@ pub struct ChatManager {
     /// The CLI path the built-in Claude Code of the agent engine opens with: the one
     /// `update_claude_cli_path` sets, as the historical engine reads it (M2).
     builtin_cli_path: super::agent_runtime::ClaudeCliPath,
-    /// Whether the restart recovery resumes a cut Claude Code turn of the agent engine.
-    /// `false` on every server (M2, review of #726): unattended, the CLI could run tools
-    /// in `acceptEdits` or `bypassPermissions`, so the turn is closed, as the historical
-    /// engine's always were. Only the recovery tests set it, their fake being `claude-code`.
+    /// Whether the restart recovery resumes a cut Claude Code turn of the agent engine
+    /// whatever its permission mode and stored conversation. `false` on every server: there a turn is resumed
+    /// through `--resume` only when its CLI asks before each tool and named its
+    /// conversation (`recovery::claude_code_left_alone`; review of #726, point 3). Only the
+    /// recovery tests set it, their fake being `claude-code` but no CLI.
     recovery_resumes_claude_code: bool,
     /// The cognitive router (R2), when wired. `None` keeps the declarative
     /// resolution exactly as it was.
@@ -4615,8 +4616,9 @@ impl ChatManager {
         self
     }
 
-    /// The recovery resumes cut Claude Code turns too: for the recovery tests, whose fake
-    /// provider answers as `claude-code` (the field `recovery_resumes_claude_code`).
+    /// The recovery resumes cut Claude Code turns of the agent engine like any other,
+    /// whatever their permission mode and stored conversation: for the recovery tests, whose fake provider answers as
+    /// `claude-code` but is no CLI (the field `recovery_resumes_claude_code`).
     #[cfg(test)]
     pub(crate) fn resuming_claude_code_at_boot(mut self) -> Self {
         self.recovery_resumes_claude_code = true;
@@ -12630,6 +12632,21 @@ impl ChatManager {
         user_claims: Option<&crate::auth::jwt::Claims>,
         relay: Option<&super::relay::RelayedFrom>,
     ) -> Result<()> {
+        self.reopen_legacy_session_with(node, message, user_claims, relay, true)
+            .await
+    }
+
+    /// [`Self::reopen_legacy_session`]; `fresh_if_refused == false` (the restart recovery)
+    /// refuses to fall back to a fresh CLI when `--resume` is refused: a cut turn handed to
+    /// a CLI that lost the conversation would continue blind, so the caller closes it.
+    pub(super) async fn reopen_legacy_session_with(
+        &self,
+        node: &ChatSessionNode,
+        message: &str,
+        user_claims: Option<&crate::auth::jwt::Claims>,
+        relay: Option<&super::relay::RelayedFrom>,
+        fresh_if_refused: bool,
+    ) -> Result<()> {
         let sid = node.id.to_string();
         let session_id: &str = sid.as_str();
         let uuid = node.id;
@@ -12779,7 +12796,7 @@ impl ChatManager {
 
             let connected = candidate.connect().await;
             if let Err(e) = connected {
-                if resume_with.is_some() {
+                if resume_with.is_some() && fresh_if_refused {
                     warn!(
                         session_id = %session_id,
                         error = %e,
@@ -12806,6 +12823,12 @@ impl ChatManager {
             }
 
             if resume_with.is_some() && !Self::stays_alive(&candidate, RESUME_GRACE).await {
+                if !fresh_if_refused {
+                    let _ = candidate.disconnect().await;
+                    return Err(anyhow!(
+                        "the Claude CLI refused to resume its conversation (--resume)"
+                    ));
+                }
                 warn!(
                     session_id = %session_id,
                     "Resumed CLI exited right after its handshake, falling back to a fresh CLI \
@@ -24757,9 +24780,10 @@ mod tests {
         assert!(fake.state.turns_started.lock().unwrap().is_empty());
     }
 
-    /// Review of #726, point 3: a cut turn of a Claude Code session of the agent engine is
-    /// CLOSED at boot, as the historical engine's always were — not resumed with nobody
-    /// there (its CLI could run tools in `acceptEdits` or `bypassPermissions`).
+    /// Review of #726, point 3 (still the rule since P20-suite-2): a cut turn of a Claude
+    /// Code session whose CLI runs tools without asking (here `acceptEdits`) is CLOSED at
+    /// boot — not resumed with nobody there. In `default` it is resumed through `--resume`
+    /// (`claude_code_recovery_at_boot` in `agent_e2e_tests`).
     #[tokio::test]
     async fn a_cut_claude_code_turn_of_the_agent_engine_is_closed_at_boot_not_resumed() {
         let (resuming, graph, _fake, sid) =
@@ -24785,6 +24809,201 @@ mod tests {
                 .any(|e| e.data.contains("not resumed without you")),
             "the reason says why"
         );
+    }
+
+    // ── P20-suite-2: which cut Claude Code turns the boot recovery resumes ──────────────
+
+    /// A server as production builds it (it does not resume Claude Code by itself, so the
+    /// verdict is the one of `claude_code_left_alone`), over a graph holding one session
+    /// `node` whose events end mid-turn.
+    async fn production_server_with_cut(
+        node: ChatSessionNode,
+    ) -> (ChatManager, Arc<crate::neo4j::mock::MockGraphStore>, Uuid) {
+        production_server_with_cut_on(node, test_config()).await
+    }
+
+    async fn production_server_with_cut_on(
+        node: ChatSessionNode,
+        config: ChatConfig,
+    ) -> (ChatManager, Arc<crate::neo4j::mock::MockGraphStore>, Uuid) {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let manager = ChatManager::new_without_memory(dyn_graph, mock_app_state().meili, config);
+        let sid = node.id;
+        graph.create_chat_session(&node).await.unwrap();
+        for (i, (event_type, data)) in [("user_message", "{}"), ("assistant_text", "{}")]
+            .iter()
+            .enumerate()
+        {
+            graph
+                .store_chat_events(
+                    sid,
+                    vec![ChatEventRecord {
+                        id: Uuid::new_v4(),
+                        session_id: sid,
+                        seq: i as i64 + 1,
+                        event_type: event_type.to_string(),
+                        data: data.to_string(),
+                        created_at: chrono::Utc::now(),
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+        (manager, graph, sid)
+    }
+
+    /// A Claude Code session cut mid-turn: `engine` ("agent" or "legacy"), the permission
+    /// `mode` it was opened with, and the conversation its CLI named (`resume_token` on the
+    /// agent engine, `cli_session_id` on the historical one).
+    fn cut_claude_code_node(
+        engine: &str,
+        mode: Option<&str>,
+        conversation: Option<&str>,
+    ) -> ChatSessionNode {
+        let mut node = crate::test_helpers::test_chat_session(None);
+        node.provider_id = Some("claude-code".into());
+        node.engine = Some(engine.into());
+        node.permission_mode = mode.map(str::to_string);
+        if engine == ChatSessionNode::ENGINE_AGENT {
+            node.resume_token = conversation.map(str::to_string);
+        } else {
+            node.cli_session_id = conversation.map(str::to_string);
+        }
+        node
+    }
+
+    #[tokio::test]
+    async fn a_cut_claude_code_turn_whose_cli_runs_tools_without_asking_is_closed_on_both_engines()
+    {
+        for engine in [ChatSessionNode::ENGINE_AGENT, "legacy"] {
+            for mode in ["acceptEdits", "bypassPermissions"] {
+                let node = cut_claude_code_node(engine, Some(mode), Some("conversation-1"));
+                let (manager, graph, sid) = production_server_with_cut(node).await;
+                let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+                assert_eq!((pending.len(), scan.closed), (0, 1), "{engine} {mode}");
+                let events = events_of(&graph, sid).await;
+                assert_closed_by_recovery(&events);
+                assert!(
+                    events.last().unwrap().data.contains("without asking"),
+                    "{engine} {mode}: {}",
+                    events.last().unwrap().data
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cut_claude_code_turn_with_no_stored_conversation_is_closed_not_started_blind() {
+        for engine in [ChatSessionNode::ENGINE_AGENT, "legacy"] {
+            // No id at all, and an empty one (a CLI that named nothing).
+            for conversation in [None, Some("")] {
+                let node = cut_claude_code_node(engine, Some("default"), conversation);
+                let (manager, graph, sid) = production_server_with_cut(node).await;
+                let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+                assert_eq!(
+                    (pending.len(), scan.closed),
+                    (0, 1),
+                    "{engine} {conversation:?}"
+                );
+                let events = events_of(&graph, sid).await;
+                assert_closed_by_recovery(&events);
+                assert!(
+                    events
+                        .last()
+                        .unwrap()
+                        .data
+                        .contains("nothing to resume it from"),
+                    "{engine} {conversation:?}: {}",
+                    events.last().unwrap().data
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cut_claude_code_turn_whose_cli_asks_and_named_its_conversation_is_queued() {
+        for engine in [ChatSessionNode::ENGINE_AGENT, "legacy"] {
+            for mode in ["default", "plan"] {
+                let node = cut_claude_code_node(engine, Some(mode), Some("conversation-1"));
+                let (manager, graph, sid) = production_server_with_cut(node).await;
+                let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+                assert_eq!((pending.len(), scan.closed), (1, 0), "{engine} {mode}");
+                assert_eq!(pending[0].node.id, sid);
+                assert!(
+                    !events_of(&graph, sid)
+                        .await
+                        .iter()
+                        .any(|e| e.event_type == "error"),
+                    "{engine} {mode}: nothing is written before the resume"
+                );
+            }
+        }
+    }
+
+    /// A session that names no permission mode runs in the server's: resumed when that one
+    /// asks, closed when it does not.
+    #[tokio::test]
+    async fn a_cut_claude_code_turn_with_no_permission_mode_follows_the_servers() {
+        for (server_mode, queued) in [("default", 1), ("bypassPermissions", 0)] {
+            let node = cut_claude_code_node(ChatSessionNode::ENGINE_AGENT, None, Some("c-1"));
+            let (manager, graph, sid) = production_server_with_cut(node).await;
+            manager.permission_config.write().await.mode = server_mode.into();
+            let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+            assert_eq!(
+                (pending.len(), scan.closed),
+                (queued, 1 - queued),
+                "{server_mode}"
+            );
+            if queued == 0 {
+                assert_closed_by_recovery(&events_of(&graph, sid).await);
+            }
+        }
+        // An EMPTY mode is no mode either.
+        let node = cut_claude_code_node(ChatSessionNode::ENGINE_AGENT, Some(""), Some("c-1"));
+        let (manager, _graph, _sid) = production_server_with_cut(node).await;
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!(pending.len(), 1);
+    }
+
+    /// A session of the historical engine can only be a Claude Code one: a node that says
+    /// otherwise (another provider on the legacy engine) cannot be resumed there.
+    #[tokio::test]
+    async fn a_cut_turn_of_another_provider_on_the_historical_engine_is_closed() {
+        let mut node = cut_claude_code_node("legacy", Some("default"), Some("c-1"));
+        node.provider_id = Some("some-other-provider".into());
+        let (manager, graph, sid) = production_server_with_cut(node).await;
+        let (pending, scan) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!((pending.len(), scan.closed), (0, 1));
+        let events = events_of(&graph, sid).await;
+        assert_closed_by_recovery(&events);
+        assert!(
+            events
+                .last()
+                .unwrap()
+                .data
+                .contains("not resumed automatically"),
+            "{}",
+            events.last().unwrap().data
+        );
+    }
+
+    /// A cut turn of the historical engine whose CLI cannot be started at all ends in an
+    /// `error` event: the recovery does not fall back to a fresh CLI, and leaves nothing live.
+    #[tokio::test]
+    async fn a_historical_turn_whose_cli_cannot_start_is_closed_not_left_streaming() {
+        let node = cut_claude_code_node("legacy", Some("default"), Some("conversation-1"));
+        let mut config = test_config();
+        config.claude_cli_path = Some("/nonexistent/claude".into());
+        let (manager, graph, sid) = production_server_with_cut_on(node, config).await;
+        let (pending, _) = manager.scan_interrupted_turns().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let report = manager
+            .drive_recovery(pending, Duration::from_millis(10), Duration::from_secs(5))
+            .await;
+        assert_eq!((report.resumed, report.failed), (0, 1), "{report:?}");
+        assert!(!manager.is_session_active(&sid.to_string()).await);
+        assert_closed_by_recovery(&events_of(&graph, sid).await);
     }
 
     /// Review of #726, point 2: the engine is written on the node BEFORE the open. A
