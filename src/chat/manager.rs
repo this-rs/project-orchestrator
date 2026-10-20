@@ -18207,10 +18207,45 @@ impl ChatManager {
     /// deletion removes it, and before the node, which is what names it. A transcript
     /// that cannot be removed fails the deletion (the conversation would stay on disk
     /// with nothing left to find it); a retry removes both.
+    ///
+    /// A parent takes its descendants with it (P18-suite, point 9): they are closed first by
+    /// the cascade (B36: top-down, a delegation in flight refused at its activation), then
+    /// DELETED, deepest first, the parent last. Deleted rather than re-parented: a spawned
+    /// session is listed only under its parent (the session lists hide every session that
+    /// has a `spawned_by`), so a child that outlived its parent would be reachable from
+    /// nowhere while its `spawned_by` still named a parent that no longer exists — and a
+    /// child is a part of its parent's conversation (its delegated work), which the person
+    /// asked to delete. A descendant that cannot be deleted fails the deletion BEFORE the
+    /// parent goes, so a retry still finds the tree and finishes it.
     pub async fn delete_session(&self, session_id: Uuid) -> Result<bool> {
+        // Before the close, as before: an open mirror's tap must not write it again.
+        self.mirrors.deleted(session_id);
+        let root = session_id.to_string();
+        let _ = self.close_session_with_cascade(&root, true).await;
+        // The descendants, read once the whole tree is closed; parents before children.
+        let mut tree = Vec::new();
+        let mut seen = std::collections::HashSet::from([root.clone()]);
+        let mut frontier = vec![root];
+        while let Some(parent) = frontier.pop() {
+            for child in self.session_children(&parent).await {
+                if seen.insert(child.clone()) {
+                    tree.push(child.clone());
+                    frontier.push(child);
+                }
+            }
+        }
+        for child in tree.iter().rev() {
+            if let Ok(child) = Uuid::parse_str(child) {
+                self.delete_one_session(child).await?;
+            }
+        }
+        self.delete_one_session(session_id).await
+    }
+
+    /// [`Self::delete_session`] of ONE session, already closed: its transcript, then its node.
+    async fn delete_one_session(&self, session_id: Uuid) -> Result<bool> {
         // An open mirror of a Claude Code sub-agent: its tap drops it and never writes it again.
         self.mirrors.deleted(session_id);
-        let _ = self.close_session(&session_id.to_string()).await;
         if let Some(node) = self.graph.get_chat_session(session_id).await? {
             if let (Some(root), Some(provider), Some(token)) = (
                 self.native_transcripts.as_deref(),
@@ -23153,6 +23188,275 @@ mod tests {
         let left = child_dir.exists();
         let _ = std::fs::remove_dir_all(&child_dir);
         assert!(!left, "the child's neutral directory goes with it");
+    }
+
+    /// P18-suite, point 9: deleting a parent closes its two live children (and the child of
+    /// one of them), then deletes them all — none is left alive, none is left listed as the
+    /// child of a session that no longer exists. Red before: `delete_session` closed the
+    /// parent alone (no cascade) and deleted its node alone; the children ran on and the
+    /// `spawned_by` fallback still listed them under the deleted parent.
+    #[tokio::test]
+    async fn deleting_a_parent_closes_and_deletes_its_descendants() {
+        let mock = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: std::sync::Arc<dyn crate::neo4j::GraphStore> = mock.clone();
+        let manager = ChatManager::new_without_memory(graph, mock_app_state().meili, test_config());
+
+        let parent = crate::test_helpers::test_chat_session(None);
+        let first = delegated_child_of(&parent);
+        let second = delegated_child_of(&parent);
+        let grandchild = delegated_child_of(&first);
+        let tree = [&parent, &first, &second, &grandchild];
+        for node in tree {
+            manager.graph.create_chat_session(node).await.unwrap();
+            test_support::insert_live_session_without_cli(&manager, &node.id.to_string()).await;
+        }
+        assert_eq!(
+            manager
+                .graph
+                .get_session_children(parent.id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        assert!(manager.delete_session(parent.id).await.unwrap());
+
+        for (node, what) in [
+            (&parent, "parent"),
+            (&first, "first child"),
+            (&second, "second child"),
+            (&grandchild, "grandchild"),
+        ] {
+            assert!(
+                !manager.is_session_active(&node.id.to_string()).await,
+                "the {what} is closed"
+            );
+            assert!(
+                manager
+                    .graph
+                    .get_chat_session(node.id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the {what} is deleted"
+            );
+        }
+        assert!(manager
+            .graph
+            .get_session_children(parent.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// P18-suite, point 9: a parent deleted from the graph alone (no chat manager: its
+    /// children stay) lists no children — the `spawned_by` fallback does not hand them back
+    /// as the children of a session that no longer exists.
+    #[tokio::test]
+    async fn a_deleted_parent_has_no_children_left_by_the_spawned_by_fallback() {
+        let graph = crate::neo4j::mock::MockGraphStore::new();
+        let parent = crate::test_helpers::test_chat_session(None);
+        let child = delegated_child_of(&parent);
+        for node in [&parent, &child] {
+            graph.create_chat_session(node).await.unwrap();
+        }
+        assert_eq!(
+            graph.get_session_children(parent.id).await.unwrap().len(),
+            1
+        );
+        assert!(graph.delete_chat_session(parent.id).await.unwrap());
+        assert!(graph
+            .get_session_children(parent.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A manager over a fresh mock graph, with the whole tree stored and live.
+    async fn manager_with_live_tree(
+        nodes: &[&crate::neo4j::models::ChatSessionNode],
+    ) -> (
+        ChatManager,
+        std::sync::Arc<crate::neo4j::mock::MockGraphStore>,
+    ) {
+        let mock = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: std::sync::Arc<dyn crate::neo4j::GraphStore> = mock.clone();
+        let manager = ChatManager::new_without_memory(graph, mock_app_state().meili, test_config());
+        for node in nodes {
+            manager.graph.create_chat_session(node).await.unwrap();
+            test_support::insert_live_session_without_cli(&manager, &node.id.to_string()).await;
+        }
+        (manager, mock)
+    }
+
+    /// P18-suite, point 9: a session that does not exist deletes to `false` and takes no
+    /// other session with it.
+    #[tokio::test]
+    async fn deleting_an_unknown_session_answers_false_and_leaves_the_others() {
+        let bystander = crate::test_helpers::test_chat_session(None);
+        let (manager, _mock) = manager_with_live_tree(&[&bystander]).await;
+
+        assert!(!manager.delete_session(Uuid::new_v4()).await.unwrap());
+
+        assert!(manager
+            .graph
+            .get_chat_session(bystander.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(manager.is_session_active(&bystander.id.to_string()).await);
+    }
+
+    /// P18-suite, point 9: the cascade goes deeper than one level (a chain of four) and
+    /// stops at the tree: a sibling subtree and an unrelated session are left alone.
+    #[tokio::test]
+    async fn deleting_a_chain_takes_every_level_and_spares_the_sibling_subtree() {
+        let root = crate::test_helpers::test_chat_session(None);
+        let child = delegated_child_of(&root);
+        let grandchild = delegated_child_of(&child);
+        let great_grandchild = delegated_child_of(&grandchild);
+        let other_root = crate::test_helpers::test_chat_session(None);
+        let other_child = delegated_child_of(&other_root);
+        let all = [
+            &root,
+            &child,
+            &grandchild,
+            &great_grandchild,
+            &other_root,
+            &other_child,
+        ];
+        let (manager, _mock) = manager_with_live_tree(&all).await;
+
+        assert!(manager.delete_session(root.id).await.unwrap());
+
+        for gone in [&root, &child, &grandchild, &great_grandchild] {
+            assert!(manager
+                .graph
+                .get_chat_session(gone.id)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(!manager.is_session_active(&gone.id.to_string()).await);
+        }
+        for kept in [&other_root, &other_child] {
+            assert!(manager
+                .graph
+                .get_chat_session(kept.id)
+                .await
+                .unwrap()
+                .is_some());
+            assert!(manager.is_session_active(&kept.id.to_string()).await);
+        }
+    }
+
+    /// P18-suite, point 9: a child already closed (not live) is deleted all the same, and
+    /// a lineage that loops back on itself ends instead of walking forever.
+    #[tokio::test]
+    async fn deleting_a_parent_deletes_a_closed_child_and_survives_a_lineage_loop() {
+        let mut parent = crate::test_helpers::test_chat_session(None);
+        let child = delegated_child_of(&parent);
+        // The parent also names its own child as ITS parent: a loop in the lineage.
+        parent.spawned_by = Some(
+            serde_json::json!({"type": "delegation", "parent_session_id": child.id.to_string()})
+                .to_string(),
+        );
+        let (manager, _mock) = manager_with_live_tree(&[&parent]).await;
+        // The child is stored but was never live (already closed).
+        manager.graph.create_chat_session(&child).await.unwrap();
+
+        assert!(manager.delete_session(parent.id).await.unwrap());
+
+        for gone in [&parent, &child] {
+            assert!(manager
+                .graph
+                .get_chat_session(gone.id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    /// P18-suite, point 9: a descendant that cannot be deleted fails the deletion BEFORE
+    /// the parent goes; once the graph answers again, a retry finds the tree and finishes it.
+    #[tokio::test]
+    async fn a_graph_error_during_the_cascade_keeps_the_parent_and_a_retry_finishes() {
+        let parent = crate::test_helpers::test_chat_session(None);
+        let child = delegated_child_of(&parent);
+        let (manager, mock) = manager_with_live_tree(&[&parent, &child]).await;
+
+        mock.fail_reads.lock().unwrap().insert("get_chat_session");
+        let failed = manager.delete_session(parent.id).await;
+        mock.fail_reads.lock().unwrap().clear();
+
+        assert!(failed.is_err(), "the deletion reports the failure");
+        for kept in [&parent, &child] {
+            assert!(
+                manager
+                    .graph
+                    .get_chat_session(kept.id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "nothing was deleted before the failure"
+            );
+        }
+
+        assert!(manager.delete_session(parent.id).await.unwrap());
+        for gone in [&parent, &child] {
+            assert!(manager
+                .graph
+                .get_chat_session(gone.id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    /// P18-suite, point 9: the transcript of a native child goes with its parent's deletion,
+    /// and a transcript that cannot be removed fails the deletion with the parent kept.
+    #[tokio::test]
+    async fn deleting_a_parent_removes_a_native_childs_transcript() {
+        use nexus_claude::agent::{ProviderKind, ResumeToken};
+        let root = tempfile::tempdir().unwrap();
+        let instance_dir = root.path().join("local-1");
+        std::fs::create_dir_all(&instance_dir).unwrap();
+        let wire = |id: &str| {
+            ResumeToken::new(
+                ProviderKind::Native,
+                1,
+                serde_json::json!({ "transcript_id": id }),
+            )
+            .to_wire()
+        };
+
+        let parent = crate::test_helpers::test_chat_session(None);
+        let mut child = delegated_child_of(&parent);
+        child.provider_id = Some("local-1".to_string());
+        child.resume_token = Some(wire("t1"));
+        let (manager, _mock) = manager_with_live_tree(&[&parent, &child]).await;
+        let manager = manager.with_native_transcripts(root.path());
+
+        // A transcript that cannot be removed (a directory where the file should be).
+        std::fs::create_dir_all(instance_dir.join("t1.json")).unwrap();
+        assert!(manager.delete_session(parent.id).await.is_err());
+        assert!(manager
+            .graph
+            .get_chat_session(parent.id)
+            .await
+            .unwrap()
+            .is_some());
+
+        std::fs::remove_dir(instance_dir.join("t1.json")).unwrap();
+        std::fs::write(instance_dir.join("t1.json"), "{}").unwrap();
+        assert!(manager.delete_session(parent.id).await.unwrap());
+        assert!(!instance_dir.join("t1.json").exists());
+        assert!(manager
+            .graph
+            .get_chat_session(child.id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // ---- B36-RACE: a delegation in flight when its parent is cancelled ----

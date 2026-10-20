@@ -8108,8 +8108,11 @@ impl GraphStore for MockGraphStore {
     async fn get_session_children(&self, parent_id: Uuid) -> Result<Vec<ChatSessionNode>> {
         let sessions = self.chat_sessions.read().await;
         let parent_str = parent_id.to_string();
+        // A parent that no longer exists has no children (same as the Neo4j store).
+        let parent_exists = sessions.contains_key(&parent_id);
         let mut children: Vec<_> = sessions
             .values()
+            .filter(|_| parent_exists)
             .filter(|s| {
                 s.spawned_by
                     .as_ref()

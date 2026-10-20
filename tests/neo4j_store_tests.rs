@@ -1838,3 +1838,42 @@ async fn test_chat_discussed_entities_and_graph_data() {
         .await
         .unwrap();
 }
+
+/// P18-suite, point 9: the DETACH DELETE of a parent takes the SPAWNED_BY edges of its
+/// children with it; the `spawned_by` JSON fallback must not then hand the children back as
+/// the children of a session that no longer exists.
+#[tokio::test]
+async fn test_a_deleted_parent_has_no_children_left_by_the_spawned_by_fallback() {
+    let client = store_or_skip!();
+    let store: &dyn GraphStore = &client;
+
+    let parent = a_chat_session(None);
+    let mut child = a_chat_session(None);
+    child.spawned_by = Some(
+        serde_json::json!({"type": "conversation", "parent_session_id": parent.id.to_string()})
+            .to_string(),
+    );
+    for s in [&parent, &child] {
+        store.create_chat_session(s).await.unwrap();
+    }
+    let listed: Vec<Uuid> = store
+        .get_session_children(parent.id)
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(listed, vec![child.id]);
+
+    assert!(store.delete_chat_session(parent.id).await.unwrap());
+    assert!(
+        store
+            .get_session_children(parent.id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a deleted parent has no children"
+    );
+
+    store.delete_chat_session(child.id).await.unwrap();
+}
