@@ -675,6 +675,12 @@ jobs:
 
       - uses: ./.github/actions/test-profile
 
+      # Instrumented builds are never incremental: test-profile turns incremental on for the
+      # self-hosted runner, and an incremental build under coverage keeps the mapping of
+      # superseded copies of each function, which count as missed lines (see the reset step).
+      - name: No incremental compilation under coverage
+        run: echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+
       - uses: ./.github/actions/pinned-toolchain-only
 
       - name: Cache cargo registry
@@ -702,16 +708,15 @@ jobs:
       #
       # `clean --workspace` first, so stale profraw from the cargo cache cannot
       # inflate the numbers.
-      # A hosted runner starts empty: `--workspace` is the documented reset. The self-hosted
-      # runner keeps its instrumented build between runs; removing the profiles only keeps the
-      # crate's incremental state (`--workspace` would recompile it from scratch every time).
+      # `--workspace` on EVERY runner. The self-hosted runner used to remove only the profiles and
+      # keep the instrumented build for the incremental state (#893): since then main's report
+      # counts the same hits over many more lines (src/chat/manager.rs 23 840 -> 32 711 coverable
+      # lines, 92 % -> 63 %), and every patch touching that file reads as uncovered. An
+      # incremental build under instrumentation keeps the coverage mapping of superseded copies
+      # of the functions; they are never executed, so they count as missed lines. `--workspace`
+      # removes the workspace crates' artifacts (the dependencies stay warm).
       - name: Reset coverage profile data
-        run: |
-          if [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
-            cargo llvm-cov clean --profraw-only
-          else
-            cargo llvm-cov clean --workspace
-          fi
+        run: cargo llvm-cov clean --workspace
 
       # (1) Unit tests, whole workspace (member crates carry their own suites).
       # `test_large_index_performance` is a wall-clock assertion that does not
