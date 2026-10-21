@@ -1,35 +1,71 @@
 %% name: po-ingress
-%% covers: backend:src/ingress/** backend:src/neo4j/ingress.rs
-%% verified: 35f7682f
+%% covers: backend:src/api/ingress_handlers.rs backend:src/ingress/** backend:src/neo4j/ingress.rs
+%% verified: 3908c380
 %% ---
-%% PROUVE : ce que le module d'ingestion d'evenements externes EST, tel que le code de la
-%%   PR #897 le fait — le journal garde la decision (accepte / rejete) et une raison stable,
-%%   JAMAIS le corps de la requete ; l'identifiant de livraison permet de refuser un rejeu.
+%% PROUVE : ce que l'ingestion d'evenements externes EST, tel que le code le fait (PR #897 pour
+%%   le modele et le journal, PR durcie pour la route). La route POST /hooks/events/{source}/{trigger_id}
+%%   est PUBLIQUE (hors require_auth) et ETEINTE par defaut (ingress.enabled=false : non montee,
+%%   404 comme une route inconnue). Le secret HMAC n'est JAMAIS dans le declencheur : la regle porte
+%%   secret_ref = "vault:<nom>", resolu a chaque requete par VaultCredentialResolver::read_vault sous
+%%   le grant Provider("trigger:<id>") ; coffre verrouille, grant absent ou secret < 16 octets :
+%%   refus neutre (403), aucun repli. Les refus AVANT la signature n'ecrivent RIEN en base : compteur
+%%   en memoire borne (IngressRuntime::refused) + tracing debug. Apres la signature : desactive (403),
+%%   rejeu (409) et accepte (202) sont journalises. Le condensat du corps signe est TOUJOURS reserve
+%%   (body:<sha256>), l'identifiant d'en-tete EN PLUS (delivery:<id>). Si le journal echoue apres la
+%%   reservation, les reservations sont liberees (500) : la relivraison est acceptee, pas 409.
+%%   Retention : purge des ExternalEvent de plus de 30 jours a chaque tour du planificateur horaire.
 %% ---
 %% SOURCES LUES :
-%%   src/ingress/mod.rs   — module et re-exports (ExternalEvent, IngressOutcome)
-%%   src/ingress/model.rs — IngressOutcome { Accepted, Rejected } ;
-%%                          ExternalEvent { id, trigger_id, source, outcome, reason,
-%%                            delivery_id, event_type, action, body_bytes, received_at } ;
-%%                          le corps n'est jamais conserve (seuls sa taille et les en-tetes
-%%                          d'identification le sont)
-%%   src/neo4j/ingress.rs, src/neo4j/client.rs (contrainte external_delivery_key),
-%%   tests/store_conformance.rs (check_external_*)
+%%   src/api/ingress_handlers.rs — receive_external_event (permis de concurrence, delai global),
+%%                          handle (ordre des refus), read_body (flux, plafond, delai), Delivery
+%%   src/ingress/guard.rs  — IngressConfig (enabled=false, 1 MiB, 10 s, 32, 60/min) ; IngressRuntime
+%%                          (semaphore, seau a jetons par declencheur, compteur de refus par fenetre)
+%%   src/ingress/rule.rs   — Rule::of (source, secret_name, en-tetes ; `secret` en clair ignore),
+%%                          validate_trigger_config (creation), redact_config, sanitize_delivery_id
+%%   src/ingress/mod.rs    — purge_expired (30 jours) ; src/ingress/model.rs — ExternalEvent
+%%   src/neo4j/ingress.rs  — record / list / claim / release_external_delivery / purge_external_events_before
+%%   src/api/routes.rs (montage conditionnel), src/api/vault_handlers.rs (grant trigger:<id>),
+%%   src/api/handlers.rs (create_trigger valide, reponses masquees), src/protocol/hooks.rs (purge horaire)
 %% ---
-%% NON ETABLI : la route publique POST /hooks/events/{source}/{trigger_id} et la verification
-%%   HMAC vivent dans la PR suivante (#898) ; aucune de ces operations n'a d'appelant de production ici ;
-%%   le journal n'a ni purge ni suppression (pas de delete dans le trait) ; les checks de conformite
-%%   laissent derriere eux leurs evenements et reservations (identifiants frais).
+%% NON ETABLI : aucun horodatage signe (GitHub n'en signe pas) : un corps capture reste rejouable
+%%   s'il n'a JAMAIS ete livre ; les reservations ExternalDelivery ne sont pas purgees (sinon un corps
+%%   deja livre redeviendrait rejouable) ; la limite de debit precede la signature, donc un tiers qui
+%%   connait l'UUID peut epuiser le seau d'un declencheur ; aucun appelant ne lance encore de plan.
 %% ---
 flowchart TD
-  E["ExternalEvent<br/>trigger_id, source, delivery_id,<br/>event_type, action, body_bytes, received_at"]
-  O{"IngressOutcome"}
-  A["Accepted"]
-  R["Rejected<br/>+ reason stable<br/>(invalid_signature, replayed_delivery, ...)"]
-  J["Journal par declencheur<br/>(lecture du plus recent au plus ancien, limite)<br/>test: check_external_event_journal (mock ET Neo4j)"]
-  D["delivery_id<br/>reservation unique par declencheur<br/>atomique sous concurrence: contrainte external_delivery_key<br/>test: check_concurrent_external_delivery_claim (mock ET Neo4j)"]
-  E --> O
-  O --> A
-  O --> R
-  E --> J
-  E --> D
+  F{"ingress.enabled ?"}
+  N404["404 (route non montee)"]
+  P["POST /hooks/events/{source}/{trigger_id}<br/>(PUBLIQUE, hors require_auth)"]
+  C["place dans la limite de concurrence (32)"]
+  T["declencheur connu, webhook, bonne source"]
+  L["seau a jetons du declencheur (60/min)"]
+  H["en-tete sha256= + 64 hex<br/>(sinon le corps n'est pas lu)"]
+  CL["Content-Length <= 1 MiB"]
+  S["secret_ref resolu dans le coffre<br/>grant Provider(trigger:id), >= 16 octets"]
+  B["corps lu en flux : <= 1 MiB, <= 10 s"]
+  M["HMAC-SHA256 a temps constant"]
+  MEM["refus AVANT authentification<br/>compteur en memoire + tracing debug<br/>AUCUNE ecriture en base<br/>test: a_thousand_invalid_signatures_add_no_node"]
+  E["declencheur actif ?"]
+  K["reserve body:sha256 PUIS delivery:id<br/>contrainte external_delivery_key"]
+  J["journal Accepted (202)"]
+  REL["echec du journal : reservations liberees (500)<br/>test: a_failed_journal_does_not_turn_the_redelivery_into_a_replay"]
+  R["journal Rejected<br/>trigger_disabled (403), replayed_delivery (409)"]
+  PG["purge horaire > 30 jours<br/>test: check_external_event_purge (mock ET Neo4j)"]
+  F -->|non| N404
+  F -->|oui| P --> C --> T --> L --> H --> CL --> S --> B --> M
+  C -.->|503| MEM
+  T -.->|404| MEM
+  L -.->|429| MEM
+  H -.->|401| MEM
+  CL -.->|413| MEM
+  S -.->|403| MEM
+  B -.->|408 / 413| MEM
+  M -.->|401| MEM
+  M -->|authentifiee| E
+  E -->|non| R
+  E -->|oui| K
+  K -->|deja reserve| R
+  K -->|nouveau| J
+  J -.-> REL
+  J --> PG
+  R --> PG
