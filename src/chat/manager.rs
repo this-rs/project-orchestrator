@@ -16678,25 +16678,24 @@ impl ChatManager {
         });
         spec.model = Some(model.to_string());
         // What a provider kind refuses, it is not given (a refusal here would be a
-        // typed `unsupported` at open): ACP has no system prompt and no extra
-        // dirs; Codex and ACP have no turn limits.
+        // typed `unsupported` at open): ACP has no extra dirs; Codex and ACP have no turn
+        // limits. The system prompt IS given to ACP (ISO4): it has no system role, and nexus
+        // delivers it as the leading text block of the first `session/prompt`.
         let is_acp = kind == nexus_claude::agent::ProviderKind::Acp;
         let has_turn_limits = matches!(
             kind,
             nexus_claude::agent::ProviderKind::ClaudeCode
                 | nexus_claude::agent::ProviderKind::Native
         );
-        if !is_acp {
-            let text = if remote_cwd.is_some() {
-                format!("{system_prompt}\n\n{REMOTE_SESSION_NOTICE}")
-            } else {
-                system_prompt.to_string()
-            };
-            spec.system_prompt = Some(SystemPromptSpec {
-                text,
-                mode: SystemPromptMode::Replace,
-            });
-        }
+        let text = if remote_cwd.is_some() {
+            format!("{system_prompt}\n\n{REMOTE_SESSION_NOTICE}")
+        } else {
+            system_prompt.to_string()
+        };
+        spec.system_prompt = Some(SystemPromptSpec {
+            text,
+            mode: SystemPromptMode::Replace,
+        });
         spec.policy = policy;
         // A remote Claude Code cannot carry an MCP server (its configuration holds
         // the session token, which must not reach another machine's command line),
