@@ -2569,6 +2569,18 @@ impl GraphStore for Neo4jClient {
         self.update_chat_session_model(id, model).await
     }
 
+    async fn set_chat_session_fingerprint(
+        &self,
+        id: Uuid,
+        fingerprint: &str,
+    ) -> anyhow::Result<()> {
+        self.set_chat_session_fingerprint(id, fingerprint).await
+    }
+
+    async fn get_chat_session_fingerprint(&self, id: Uuid) -> anyhow::Result<Option<String>> {
+        self.get_chat_session_fingerprint(id).await
+    }
+
     async fn update_chat_session_routing(
         &self,
         id: Uuid,

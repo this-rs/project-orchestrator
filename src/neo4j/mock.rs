@@ -105,6 +105,8 @@ pub struct MockGraphStore {
     /// undirected the way the Cypher reads them
     pub document_links: RwLock<HashMap<Uuid, Vec<(EntityType, String)>>>,
     pub chat_sessions: RwLock<HashMap<Uuid, ChatSessionNode>>,
+    /// Resume fingerprints by session (PYSR-2).
+    pub chat_fingerprints: RwLock<HashMap<Uuid, String>>,
     /// Chat anchors and their journal (one lock: state and event change together).
     pub anchor_store: RwLock<MockAnchorStore>,
     /// The execution-place audit (T5), append-only.
@@ -396,6 +398,7 @@ impl MockGraphStore {
             discussed_calls: RwLock::new(Vec::new()),
             document_links: RwLock::new(HashMap::new()),
             chat_sessions: RwLock::new(HashMap::new()),
+            chat_fingerprints: RwLock::new(HashMap::new()),
             anchor_store: RwLock::new(MockAnchorStore::default()),
             execution_place_events: RwLock::new(Vec::new()),
             llm_settings: RwLock::new(HashMap::new()),
@@ -8429,6 +8432,18 @@ impl GraphStore for MockGraphStore {
             session.updated_at = Utc::now();
         }
         Ok(())
+    }
+
+    async fn set_chat_session_fingerprint(&self, id: Uuid, fingerprint: &str) -> Result<()> {
+        self.chat_fingerprints
+            .write()
+            .await
+            .insert(id, fingerprint.to_string());
+        Ok(())
+    }
+
+    async fn get_chat_session_fingerprint(&self, id: Uuid) -> Result<Option<String>> {
+        Ok(self.chat_fingerprints.read().await.get(&id).cloned())
     }
 
     async fn update_chat_session_routing(

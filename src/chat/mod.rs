@@ -58,6 +58,7 @@ pub mod provider;
 #[cfg(test)]
 mod refs_wiring_tests;
 pub mod relay;
+pub(crate) mod resume_guard;
 pub mod routing;
 #[cfg(test)]
 mod routing_modes_e2e_tests;

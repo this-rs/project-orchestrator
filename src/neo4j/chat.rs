@@ -593,6 +593,29 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// See [`crate::neo4j::traits::GraphStore::set_chat_session_fingerprint`].
+    pub async fn set_chat_session_fingerprint(&self, id: Uuid, fingerprint: &str) -> Result<()> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $id}) SET s.resume_fingerprint = $fp, s.updated_at = datetime()",
+        )
+        .param("id", id.to_string())
+        .param("fp", fingerprint.to_string());
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// See [`crate::neo4j::traits::GraphStore::get_chat_session_fingerprint`].
+    pub async fn get_chat_session_fingerprint(&self, id: Uuid) -> Result<Option<String>> {
+        let q = query("MATCH (s:ChatSession {id: $id}) RETURN s.resume_fingerprint AS fp")
+            .param("id", id.to_string());
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let fp: Option<String> = row.get("fp").unwrap_or(None);
+            return Ok(fp.filter(|f| !f.is_empty()));
+        }
+        Ok(None)
+    }
+
     /// See [`crate::neo4j::traits::GraphStore::set_chat_session_shell_moved`].
     pub async fn set_chat_session_shell_moved(&self, id: Uuid) -> Result<()> {
         let q = query("MATCH (s:ChatSession {id: $id}) SET s.shell_moved = true")
