@@ -747,7 +747,10 @@ impl fmt::Display for TriggerType {
 }
 
 /// A trigger node persisted in Neo4j, linked to a Plan via (:Trigger)-[:TRIGGERS]->(:Plan).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is written by hand: it masks `config.secret` (a legacy `/api/webhooks`
+/// trigger may still hold one), so a `{:?}` never prints it.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Trigger {
     pub id: Uuid,
     pub plan_id: Uuid,
@@ -784,6 +787,35 @@ pub struct Trigger {
     /// at create and enable; any value passed in is ignored.
     #[serde(default)]
     pub approved_mark: Option<DateTime<Utc>>,
+}
+
+impl Trigger {
+    /// A copy whose `config.secret` is masked: what the API returns.
+    pub fn redacted(&self) -> Self {
+        Self {
+            config: crate::ingress::rule::redact_config(&self.config),
+            ..self.clone()
+        }
+    }
+}
+
+impl std::fmt::Debug for Trigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Trigger")
+            .field("id", &self.id)
+            .field("plan_id", &self.plan_id)
+            .field("trigger_type", &self.trigger_type)
+            .field("config", &crate::ingress::rule::redact_config(&self.config))
+            .field("enabled", &self.enabled)
+            .field("cooldown_secs", &self.cooldown_secs)
+            .field("last_fired", &self.last_fired)
+            .field("fire_count", &self.fire_count)
+            .field("created_at", &self.created_at)
+            .field("author", &self.author)
+            .field("disabled_reason", &self.disabled_reason)
+            .field("approved_mark", &self.approved_mark)
+            .finish()
+    }
 }
 
 /// The caller that created or enabled a [`Trigger`], recorded so a run the

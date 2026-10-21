@@ -16,6 +16,7 @@ pub mod graph_handlers;
 pub mod graph_types;
 pub mod handlers;
 pub mod hook_handlers;
+pub mod ingress_handlers;
 #[cfg(test)]
 pub(crate) mod list_routes_tests;
 pub mod mcp_federation_handlers;

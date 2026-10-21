@@ -73,6 +73,11 @@ pub fn create_router(state: OrchestratorState) -> Router {
     if remote_mcp_enabled {
         public = public.merge(remote_mcp_public_routes());
     }
+    // External events ingestion is opt-in too (`ingress.enabled`, off by default):
+    // when off, the route is not mounted and answers exactly like an unknown path.
+    if state.ingress.config.enabled {
+        public = public.merge(ingress_routes());
+    }
 
     // Request timeout on protected REST routes only. Hung requests (e.g. a
     // handler blocked waiting for a saturated Neo4j pool) return 408 instead of
@@ -302,6 +307,15 @@ fn remote_mcp_protected_routes() -> Router<OrchestratorState> {
         post(crate::mcp::http_transport::mcp_post)
             .get(crate::mcp::http_transport::mcp_get)
             .delete(crate::mcp::http_transport::mcp_delete),
+    )
+}
+
+/// The public ingress route: guarded by the trigger's HMAC secret, never behind
+/// `require_auth`, with its own limits (see `src/api/ingress_handlers.rs`).
+fn ingress_routes() -> Router<OrchestratorState> {
+    Router::new().route(
+        "/hooks/events/{source}/{trigger_id}",
+        post(crate::api::ingress_handlers::receive_external_event),
     )
 }
 
@@ -2363,6 +2377,7 @@ mod tests {
             server_port: 6600,
             public_url: None,
             remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -2408,6 +2423,7 @@ mod tests {
             server_port: 6600,
             public_url: None,
             remote_mcp,
+            ingress: Default::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -2820,6 +2836,7 @@ mod tests {
             server_port: 6600,
             public_url: None,
             remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,

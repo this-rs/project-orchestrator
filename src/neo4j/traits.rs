@@ -3945,6 +3945,19 @@ pub trait GraphStore: Send + Sync {
     /// Réserve la livraison `delivery_key` pour `trigger_id`: `true` au premier appel, `false` au rejeu.
     async fn claim_external_delivery(&self, trigger_id: Uuid, delivery_key: &str) -> Result<bool>;
 
+    /// Libère une réservation de livraison (la livraison n'a pas pu être journalisée) :
+    /// une relivraison sera de nouveau acceptée. `true` si une réservation existait.
+    async fn release_external_delivery(&self, trigger_id: Uuid, delivery_key: &str)
+        -> Result<bool>;
+
+    /// Purge les événements externes reçus avant `before` (rétention). Rend le nombre
+    /// d'événements supprimés. Les réservations de livraison sont conservées (sans
+    /// elles, un corps signé capturé redeviendrait rejouable).
+    async fn purge_external_events_before(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64>;
+
     // ── AgentExecution ──────────────────────────────────────────────────────
 
     /// Create an AgentExecution node linked to a PlanRun and Task.

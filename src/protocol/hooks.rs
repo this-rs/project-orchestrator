@@ -593,6 +593,13 @@ pub fn spawn_protocol_scheduler(
             if let Err(e) = run_scheduled_protocols(store.clone(), emitter.clone()).await {
                 tracing::warn!("Protocol scheduler: scheduled trigger failed: {}", e);
             }
+
+            // 4. Retention of the external events journal (ingress): 30 days.
+            match crate::ingress::purge_expired(&*store, chrono::Utc::now()).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(purged = n, "Ingress: expired external events purged"),
+                Err(e) => tracing::warn!("Ingress: external event purge failed: {}", e),
+            }
         }
     });
 }

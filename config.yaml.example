@@ -95,6 +95,34 @@ meilisearch:
 #     - "https://claude.com"
 
 # -----------------------------------------------------------------------------
+# Ingress — public reception of external events (webhooks)
+# -----------------------------------------------------------------------------
+# OPT-IN AND OFF BY DEFAULT. When absent (or enabled: false), the public route
+# POST /hooks/events/{source}/{trigger_id} is NOT mounted: it answers 404 like
+# any unknown path.
+#
+# Enable env override: INGRESS_ENABLED=true
+#
+# The route is PUBLIC (no JWT): a webhook trigger whose config declares a
+# `source` is reached by it, and its HMAC-SHA256 secret is the only lock. That
+# secret is NEVER written in the trigger: the trigger names it by reference,
+#   config: { source: "github", secret_ref: "vault:<name>" }
+# and the vault grant that lets the server read it has the provider scope
+# `trigger:<trigger id>`. A plain `secret` on such a trigger is refused at
+# creation. Locked vault or missing grant: every delivery is refused.
+#
+# Refusals before the signature is verified write nothing to the database
+# (counted in memory, traced at debug). Accepted, replayed and disabled-trigger
+# deliveries are journaled (ExternalEvent), kept 30 days.
+#
+# ingress:
+#   enabled: false                     # master switch (default: false)
+#   max_body_bytes: 1048576            # 1 MiB; a larger Content-Length is refused before reading
+#   body_read_timeout_secs: 10         # a body still incomplete after this is cut (408)
+#   max_concurrent: 32                 # requests handled at once; beyond: 503 + Retry-After
+#   rate_per_minute: 60                # per trigger (token bucket); beyond: 429
+
+# -----------------------------------------------------------------------------
 # Embeddings — Vector embedding provider for semantic search
 # -----------------------------------------------------------------------------
 # Two providers available:

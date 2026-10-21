@@ -178,6 +178,9 @@ pub struct MockGraphStore {
     pub external_events: RwLock<Vec<crate::ingress::ExternalEvent>>,
     /// Claimed deliveries `(trigger, delivery key)` (`claim_external_delivery`).
     pub external_deliveries: RwLock<std::collections::HashSet<(Uuid, String)>>,
+    /// When set, `record_external_event` fails (ingress: a journal that fails after
+    /// the delivery was claimed must release the claim).
+    pub fail_external_event_writes: std::sync::atomic::AtomicBool,
     /// Makes `plan_third_party_written_at` fail (a graph error).
     pub fail_mark_read: std::sync::atomic::AtomicBool,
     /// Makes `update_chat_session_harness` fail (the capability snapshot is not stored).
@@ -421,6 +424,7 @@ impl MockGraphStore {
             trigger_firings: RwLock::new(HashMap::new()),
             external_events: RwLock::new(Vec::new()),
             external_deliveries: RwLock::new(std::collections::HashSet::new()),
+            fail_external_event_writes: std::sync::atomic::AtomicBool::new(false),
             trigger_reservations: RwLock::new(HashMap::new()),
             plan_third_party_writes: RwLock::new(HashMap::new()),
             fail_mark_read: std::sync::atomic::AtomicBool::new(false),
@@ -12888,6 +12892,12 @@ impl GraphStore for MockGraphStore {
         &self,
         event: &crate::ingress::ExternalEvent,
     ) -> anyhow::Result<()> {
+        if self
+            .fail_external_event_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("mock: external event journal write failed");
+        }
         self.external_events.write().await.push(event.clone());
         Ok(())
     }
@@ -12918,6 +12928,28 @@ impl GraphStore for MockGraphStore {
             .write()
             .await
             .insert((trigger_id, delivery_key.to_string())))
+    }
+
+    async fn release_external_delivery(
+        &self,
+        trigger_id: Uuid,
+        delivery_key: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .external_deliveries
+            .write()
+            .await
+            .remove(&(trigger_id, delivery_key.to_string())))
+    }
+
+    async fn purge_external_events_before(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<u64> {
+        let mut events = self.external_events.write().await;
+        let len = events.len();
+        events.retain(|e| e.received_at >= before);
+        Ok((len - events.len()) as u64)
     }
 
     // ── Cognitive routing (in-memory mock) ──────────────────────────────────

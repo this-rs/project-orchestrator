@@ -646,6 +646,8 @@ impl Neo4jClient {
             // delivery all won: seen on the conformance suite). The journal is read by trigger.
             "CREATE CONSTRAINT external_delivery_key IF NOT EXISTS FOR (d:ExternalDelivery) REQUIRE (d.trigger_id, d.delivery_key) IS UNIQUE",
             "CREATE INDEX external_event_trigger IF NOT EXISTS FOR (e:ExternalEvent) ON (e.trigger_id)",
+            // The hourly retention purge selects by age.
+            "CREATE INDEX external_event_received_at IF NOT EXISTS FOR (e:ExternalEvent) ON (e.received_at)",
             // Conversation segments (episodic memory, S4): the store MERGEs on
             // (conversation, id) — never the id alone, since two conversations with the
             // same seed derive the same segment ids. The constraint is what makes that

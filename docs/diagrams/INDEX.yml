@@ -40,10 +40,11 @@ diagrams:
     owner: theotime
     status: verified
     file: docs/diagrams/po-ingress.mmd
-    # Arbitrage : le modele et le journal des evenements entrants appartiennent a l'ingestion,
-    # pas a po-autonomic (cycle automatique) ni a po-api (route). La route publique et la
-    # verification HMAC restent dans la PR suivante (#898).
+    # Arbitrage : le modele, le journal, les garde-fous et la route publique des evenements
+    # entrants appartiennent a l'ingestion, pas a po-autonomic (cycle automatique) ni a po-api
+    # (surface administrative ; po-api liste ses fichiers un par un, sans wildcard).
     covers:
+      - "backend:src/api/ingress_handlers.rs"
       - "backend:src/ingress/**"
       - "backend:src/neo4j/ingress.rs"
   - name: po-chat-manager

@@ -526,6 +526,75 @@ pub mod conformance {
             .unwrap());
     }
 
+    /// A released claim is free again (the ingress route releases its claims when
+    /// the journal write fails, so the sender's redelivery is not refused as a
+    /// replay); releasing an absent claim is `false` and harmless; a release never
+    /// touches another trigger's claim of the same key.
+    pub async fn check_external_delivery_release(store: &dyn GraphStore) {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert!(store.claim_external_delivery(a, "body:x").await.unwrap());
+        assert!(store.claim_external_delivery(b, "body:x").await.unwrap());
+        assert!(
+            store.release_external_delivery(a, "body:x").await.unwrap(),
+            "an existing claim is released"
+        );
+        assert!(
+            !store.release_external_delivery(a, "body:x").await.unwrap(),
+            "releasing twice finds nothing"
+        );
+        assert!(
+            store.claim_external_delivery(a, "body:x").await.unwrap(),
+            "a released delivery can be claimed again"
+        );
+        assert!(
+            !store.claim_external_delivery(b, "body:x").await.unwrap(),
+            "b's claim was not released by a's release"
+        );
+    }
+
+    /// Retention: the purge deletes the events received strictly before the cutoff,
+    /// of every trigger, and keeps the others. The timestamps (year 2000) sit far
+    /// below every other check's (`at()`, 2026), so a concurrent check never loses
+    /// its events to this purge.
+    pub async fn check_external_event_purge(store: &dyn GraphStore) {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let when = |y, m| Utc.with_ymd_and_hms(y, m, 1, 0, 0, 0).unwrap();
+        let mut old_a = an_external_event(a, IngressOutcome::Accepted, 0);
+        old_a.received_at = when(2000, 1);
+        let mut old_b = an_external_event(b, IngressOutcome::Rejected, 0);
+        old_b.received_at = when(2000, 6);
+        let mut kept = an_external_event(a, IngressOutcome::Accepted, 0);
+        kept.received_at = when(2001, 6);
+        let mut at_cutoff = an_external_event(b, IngressOutcome::Accepted, 0);
+        at_cutoff.received_at = when(2001, 1);
+        for e in [&old_a, &old_b, &kept, &at_cutoff] {
+            store.record_external_event(e).await.unwrap();
+        }
+        let purged = store
+            .purge_external_events_before(when(2001, 1))
+            .await
+            .unwrap();
+        assert!(purged >= 2, "both old events are counted: {purged}");
+        assert_eq!(
+            ids(&store.list_external_events(a, 10).await.unwrap(), |e| e.id),
+            vec![kept.id],
+            "a keeps only its recent event"
+        );
+        assert_eq!(
+            ids(&store.list_external_events(b, 10).await.unwrap(), |e| e.id),
+            vec![at_cutoff.id],
+            "an event received exactly at the cutoff is kept"
+        );
+        assert_eq!(
+            store
+                .purge_external_events_before(when(2001, 1))
+                .await
+                .unwrap(),
+            0,
+            "a second purge finds nothing"
+        );
+    }
+
     /// The claim under contention: of 8 concurrent claims of one delivery,
     /// exactly one wins.
     pub async fn check_concurrent_external_delivery_claim(store: &dyn GraphStore) {
@@ -1685,6 +1754,8 @@ macro_rules! all_checks {
                 check_external_event_journal,
                 check_external_delivery_claim,
                 check_concurrent_external_delivery_claim,
+                check_external_delivery_release,
+                check_external_event_purge,
                 check_atomic_increments,
                 check_absent_entity_matrix,
                 check_cascade_delete_project,
