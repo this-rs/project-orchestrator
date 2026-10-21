@@ -67,6 +67,8 @@ const EXPECTED_CONSTRAINTS: &[&str] = &[
     "routing_decision_id",
     // Plan triggers
     "trigger_signal_key",
+    // External event ingestion: one claimed delivery per (trigger, delivery key)
+    "external_delivery_key",
     // Conversation segments (episodic memory, S4)
     "conversation_segment_key",
     "conversation_boundary_key",
@@ -639,6 +641,11 @@ impl Neo4jClient {
             // Plan triggers: one reserved signal per (trigger, key), kept 24 h.
             "CREATE CONSTRAINT trigger_signal_key IF NOT EXISTS FOR (s:TriggerSignal) REQUIRE (s.trigger_id, s.key) IS UNIQUE",
             "CREATE INDEX trigger_signal_reserved_at IF NOT EXISTS FOR (s:TriggerSignal) ON (s.reserved_at)",
+            // External events (ingress): the constraint is what makes the MERGE of
+            // `claim_external_delivery` atomic (without it, 8 concurrent claims of one
+            // delivery all won: seen on the conformance suite). The journal is read by trigger.
+            "CREATE CONSTRAINT external_delivery_key IF NOT EXISTS FOR (d:ExternalDelivery) REQUIRE (d.trigger_id, d.delivery_key) IS UNIQUE",
+            "CREATE INDEX external_event_trigger IF NOT EXISTS FOR (e:ExternalEvent) ON (e.trigger_id)",
             // Conversation segments (episodic memory, S4): the store MERGEs on
             // (conversation, id) — never the id alone, since two conversations with the
             // same seed derive the same segment ids. The constraint is what makes that

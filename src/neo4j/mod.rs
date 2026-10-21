@@ -17,6 +17,7 @@ mod event_trigger;
 mod execution_place;
 mod feature_graph;
 mod impl_graph_store;
+mod ingress;
 mod lifecycle_hook;
 mod mcp_federation;
 mod milestone;

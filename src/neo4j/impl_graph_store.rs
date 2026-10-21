@@ -4291,6 +4291,30 @@ impl GraphStore for Neo4jClient {
         self.list_trigger_firings_impl(trigger_id, limit).await
     }
 
+    async fn record_external_event(
+        &self,
+        event: &crate::ingress::ExternalEvent,
+    ) -> anyhow::Result<()> {
+        self.record_external_event_impl(event).await
+    }
+
+    async fn list_external_events(
+        &self,
+        trigger_id: Uuid,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::ingress::ExternalEvent>> {
+        self.list_external_events_impl(trigger_id, limit).await
+    }
+
+    async fn claim_external_delivery(
+        &self,
+        trigger_id: Uuid,
+        delivery_key: &str,
+    ) -> anyhow::Result<bool> {
+        self.claim_external_delivery_impl(trigger_id, delivery_key)
+            .await
+    }
+
     // ── Cognitive routing ───────────────────────────────────────────────────
 
     async fn get_routing_arm(

@@ -36,6 +36,16 @@ diagrams:
       - "backend:src/homeostasis.rs"
       - "backend:src/reflex/**"
       - "backend:src/events/{mod,bus,hybrid,reactor,trigger,builtin_triggers,reactions}.rs"
+  - name: po-ingress
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-ingress.mmd
+    # Arbitrage : le modele et le journal des evenements entrants appartiennent a l'ingestion,
+    # pas a po-autonomic (cycle automatique) ni a po-api (route). La route publique et la
+    # verification HMAC restent dans la PR suivante (#898).
+    covers:
+      - "backend:src/ingress/**"
+      - "backend:src/neo4j/ingress.rs"
   - name: po-chat-manager
     owner: theotime
     status: verified
