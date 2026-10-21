@@ -111,6 +111,8 @@ flowchart TD
     subgraph pump["Pompe de contrôle — control_pump.rs"]
         direction TB
         PUMP["✅ ⚓ spawn : une tâche par session possède le récepteur de contrôle ;<br/>hook_callback → dispatch_hook_from_registry → build_hook_response_json → stdin,<br/>en parallèle sous sémaphore MAX_CONCURRENT_HOOKS ;<br/>tout le reste (can_use_tool, control_response) → canal lu par stream_response<br/><i>vérifié : hooks_are_answered_even_when_no_turn_reads_the_forward_channel,<br/>non_hook_messages_are_forwarded_untouched_and_hooks_are_not,<br/>an_unknown_callback_does_not_block_the_next_hook, the_pump_stops_when_the_transport_closes</i>"]
+        PUMPNOTIF["✅ ISO1 : un can_use_tool (hors AskUserQuestion) est aussi dit au hook Notification de la session (permission_prompt, notify_permission_prompt, sans l attendre) avant d être transmis ; create_session et resume_session passent les SessionHooks du pont (serve_lifecycle) à spawn et demandent SessionStart après initialize_hooks<br/><i>vérifié : matrice de parité hooks.notification, hooks.session_start</i>"]
+        PUMP --> PUMPNOTIF
     end
 
     WIRES --> PUMP
