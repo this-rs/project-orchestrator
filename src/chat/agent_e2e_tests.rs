@@ -2381,7 +2381,7 @@ mod cognitive_routing {
     }
 
     #[tokio::test]
-    async fn a_chat_decision_is_linked_to_its_session_and_a_plain_close_learns_nothing() {
+    async fn a_chat_decision_is_linked_to_its_session_and_the_completed_turn_teaches_the_arm() {
         let s = setup("full", "auto", true).await;
         let session_id = open_routed_session(&s).await;
         let all = decisions(&s).await;
@@ -2394,20 +2394,28 @@ mod cognitive_routing {
         );
         let arm = decision.arm().expect("the decision chose an arm");
 
+        // R0: the completed turn fed the arm — a plain `completed` is a success.
+        let store = Neo4jRoutingStore::new(s.graph.clone());
+        let taught = store
+            .arm(&arm)
+            .await
+            .unwrap()
+            .expect("the completed turn taught the arm");
+        assert!(
+            taught.mean() > 0.5,
+            "one success on a Beta(1,1) prior: {taught:?}"
+        );
+        assert_eq!(taught.n, 1, "one observation: {taught:?}");
+
         s.manager.close_session(&session_id).await.unwrap();
 
+        // The close itself cannot tell success: its recorded outcome has no reward.
         let closed = decisions(&s).await.remove(0);
         let outcome = closed.outcome.expect("the close recorded what it saw");
         assert!(outcome.duration_ms.is_some(), "{outcome:?}");
         assert_eq!(
             outcome.reward, None,
-            "a chat cannot tell success: no reward"
-        );
-        // Nothing was fed to the arm: an unknown outcome reads as a failure.
-        let store = Neo4jRoutingStore::new(s.graph.clone());
-        assert!(
-            store.arm(&arm).await.unwrap().is_none(),
-            "a plain close must not create or move the arm"
+            "a plain close cannot tell success: no reward"
         );
         assert!(s.manager.open_decisions.lock().unwrap().is_empty());
     }
@@ -2431,9 +2439,12 @@ mod cognitive_routing {
             .await
             .unwrap()
             .expect("the override taught the arm");
+        // R0: the completed turn taught a success before the override taught a
+        // failure — two observations land the Beta(1,1) mean exactly at 0.5.
+        assert_eq!(stats.n, 2, "one turn + one override: {stats:?}");
         assert!(
-            stats.mean() < 0.5,
-            "one failure on a Beta(1,1) prior: {stats:?}"
+            (stats.mean() - 0.5).abs() < 1e-9,
+            "success then failure: {stats:?}"
         );
     }
 

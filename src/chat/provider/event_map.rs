@@ -414,7 +414,7 @@ fn category_name(c: ToolCategory) -> String {
         .unwrap_or_else(|| "other".to_string())
 }
 
-fn stop_reason_name(s: StopReason) -> String {
+pub(crate) fn stop_reason_name(s: StopReason) -> String {
     serde_json::to_value(s)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
@@ -543,7 +543,7 @@ pub(crate) fn compaction_failed_message(data: &Value) -> String {
 }
 
 /// `subtype` of a `result` when the provider gave none.
-fn default_subtype(stop: StopReason, is_error: bool) -> &'static str {
+pub(crate) fn default_subtype(stop: StopReason, is_error: bool) -> &'static str {
     match stop {
         StopReason::Completed => "success",
         StopReason::MaxTurns => "error_max_turns",
