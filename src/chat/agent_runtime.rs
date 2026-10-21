@@ -33,7 +33,9 @@ use super::manager::{
     CANCEL_TOOLS_CAP, CANCEL_TOOLS_WINDOW_SECS,
 };
 use super::provider::circuit_breaker::Outcome;
-use super::provider::event_map::{out_of_band_to_chat_events, EventMapper};
+use super::provider::event_map::{
+    default_subtype, out_of_band_to_chat_events, stop_reason_name, EventMapper,
+};
 use super::provider::outage::{HoldPolicy, OutageNotice, OutagePolicy, TurnHold};
 use super::spill::SpillConfig;
 use super::types::{
@@ -1753,6 +1755,8 @@ impl AgentSessionHandle {
                     cost,
                     is_error,
                     stop_reason,
+                    subtype,
+                    error,
                     ..
                 } = &event
                 {
@@ -1767,6 +1771,19 @@ impl AgentSessionHandle {
                     outcome.answered = !is_error
                         && (*stop_reason != nexus_claude::agent::StopReason::Interrupted
                             || self.keeps_interrupted_turns);
+                    // R0: capture the terminal result so `after_turn` can feed the
+                    // routing bandit the turn's outcome (the same mapping
+                    // `EventMapper` applies when it emits `ChatEvent::Result`).
+                    outcome.stop_reason = Some(stop_reason_name(*stop_reason));
+                    outcome.subtype = subtype
+                        .clone()
+                        .unwrap_or_else(|| default_subtype(*stop_reason, *is_error).to_string());
+                    outcome.is_error = *is_error;
+                    outcome.error_code = error.as_ref().map(|e| {
+                        super::provider::errors::open_failure(e, None)
+                            .code
+                            .to_string()
+                    });
                 }
                 let event = mask_agent_event(event);
                 let chat_events = self.mapper.lock().await.map(&event);
@@ -5864,6 +5881,10 @@ mod answered_tests {
     #[derive(Default)]
     struct Host {
         answered: StdMutex<Vec<bool>>,
+        stop_reason: StdMutex<Vec<Option<String>>>,
+        subtype: StdMutex<Vec<String>>,
+        is_error: StdMutex<Vec<bool>>,
+        error_code: StdMutex<Vec<Option<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -5882,6 +5903,16 @@ mod answered_tests {
         }
         async fn after_turn(&self, _session_id: &str, outcome: &TurnOutcome) -> AfterTurn {
             self.answered.lock().unwrap().push(outcome.answered);
+            self.stop_reason
+                .lock()
+                .unwrap()
+                .push(outcome.stop_reason.clone());
+            self.subtype.lock().unwrap().push(outcome.subtype.clone());
+            self.is_error.lock().unwrap().push(outcome.is_error);
+            self.error_code
+                .lock()
+                .unwrap()
+                .push(outcome.error_code.clone());
             AfterTurn::default()
         }
     }
@@ -5889,6 +5920,22 @@ mod answered_tests {
     impl Host {
         fn seen(&self) -> Vec<bool> {
             self.answered.lock().unwrap().clone()
+        }
+
+        fn seen_outcome(
+            &self,
+        ) -> (
+            Vec<Option<String>>,
+            Vec<String>,
+            Vec<bool>,
+            Vec<Option<String>>,
+        ) {
+            (
+                self.stop_reason.lock().unwrap().clone(),
+                self.subtype.lock().unwrap().clone(),
+                self.is_error.lock().unwrap().clone(),
+                self.error_code.lock().unwrap().clone(),
+            )
         }
     }
 
@@ -6004,6 +6051,36 @@ mod answered_tests {
         let (provider, handle, host) = session(0).await;
         play(&provider, &handle, vec![interrupted_done()]).await;
         assert_eq!(host.seen(), [true]);
+    }
+
+    /// R0: the terminal result of a turn is captured from its `done`, so the
+    /// manager's `after_turn` can feed the routing bandit (stop_reason/subtype/
+    /// is_error/error_code) instead of reading them empty.
+    #[tokio::test]
+    async fn a_completed_turn_populates_its_terminal_result() {
+        let (provider, handle, host) = session(0).await;
+        play(&provider, &handle, vec![done(false, None)]).await;
+        let (stop_reason, subtype, is_error, error_code) = host.seen_outcome();
+        assert_eq!(stop_reason, vec![Some("completed".to_string())]);
+        assert_eq!(subtype, vec!["success".to_string()]);
+        assert_eq!(is_error, vec![false]);
+        assert_eq!(error_code, vec![None]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_carries_its_typed_error_code() {
+        let (provider, handle, host) = session(0).await;
+        play(
+            &provider,
+            &handle,
+            vec![done(true, Some(ProviderError::Unauthorized))],
+        )
+        .await;
+        let (stop_reason, subtype, is_error, error_code) = host.seen_outcome();
+        assert_eq!(stop_reason, vec![Some("error".to_string())]);
+        assert_eq!(subtype, vec!["error_during_execution".to_string()]);
+        assert_eq!(is_error, vec![true]);
+        assert_eq!(error_code, vec![Some("unauthorized".to_string())]);
     }
 
     /// A provider not known to keep an interrupted turn (`keeps_interrupted_turns`):
