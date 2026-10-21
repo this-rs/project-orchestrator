@@ -5877,14 +5877,20 @@ mod answered_tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
-    /// The `answered` of each turn the host saw end.
+    /// The terminal-result fields of one turn, captured for assertions.
+    #[derive(Clone)]
+    struct OutcomeFields {
+        stop_reason: Option<String>,
+        subtype: String,
+        is_error: bool,
+        error_code: Option<String>,
+    }
+
+    /// The `answered` of each turn the host saw end, plus its terminal result.
     #[derive(Default)]
     struct Host {
         answered: StdMutex<Vec<bool>>,
-        stop_reason: StdMutex<Vec<Option<String>>>,
-        subtype: StdMutex<Vec<String>>,
-        is_error: StdMutex<Vec<bool>>,
-        error_code: StdMutex<Vec<Option<String>>>,
+        outcomes: StdMutex<Vec<OutcomeFields>>,
     }
 
     #[async_trait::async_trait]
@@ -5903,16 +5909,12 @@ mod answered_tests {
         }
         async fn after_turn(&self, _session_id: &str, outcome: &TurnOutcome) -> AfterTurn {
             self.answered.lock().unwrap().push(outcome.answered);
-            self.stop_reason
-                .lock()
-                .unwrap()
-                .push(outcome.stop_reason.clone());
-            self.subtype.lock().unwrap().push(outcome.subtype.clone());
-            self.is_error.lock().unwrap().push(outcome.is_error);
-            self.error_code
-                .lock()
-                .unwrap()
-                .push(outcome.error_code.clone());
+            self.outcomes.lock().unwrap().push(OutcomeFields {
+                stop_reason: outcome.stop_reason.clone(),
+                subtype: outcome.subtype.clone(),
+                is_error: outcome.is_error,
+                error_code: outcome.error_code.clone(),
+            });
             AfterTurn::default()
         }
     }
@@ -5922,20 +5924,8 @@ mod answered_tests {
             self.answered.lock().unwrap().clone()
         }
 
-        fn seen_outcome(
-            &self,
-        ) -> (
-            Vec<Option<String>>,
-            Vec<String>,
-            Vec<bool>,
-            Vec<Option<String>>,
-        ) {
-            (
-                self.stop_reason.lock().unwrap().clone(),
-                self.subtype.lock().unwrap().clone(),
-                self.is_error.lock().unwrap().clone(),
-                self.error_code.lock().unwrap().clone(),
-            )
+        fn seen_outcome(&self) -> Vec<OutcomeFields> {
+            self.outcomes.lock().unwrap().clone()
         }
     }
 
@@ -6060,11 +6050,11 @@ mod answered_tests {
     async fn a_completed_turn_populates_its_terminal_result() {
         let (provider, handle, host) = session(0).await;
         play(&provider, &handle, vec![done(false, None)]).await;
-        let (stop_reason, subtype, is_error, error_code) = host.seen_outcome();
-        assert_eq!(stop_reason, vec![Some("completed".to_string())]);
-        assert_eq!(subtype, vec!["success".to_string()]);
-        assert_eq!(is_error, vec![false]);
-        assert_eq!(error_code, vec![None]);
+        let fields = &host.seen_outcome()[0];
+        assert_eq!(fields.stop_reason.as_deref(), Some("completed"));
+        assert_eq!(fields.subtype.as_str(), "success");
+        assert!(!fields.is_error);
+        assert!(fields.error_code.is_none());
     }
 
     #[tokio::test]
@@ -6076,11 +6066,11 @@ mod answered_tests {
             vec![done(true, Some(ProviderError::Unauthorized))],
         )
         .await;
-        let (stop_reason, subtype, is_error, error_code) = host.seen_outcome();
-        assert_eq!(stop_reason, vec![Some("error".to_string())]);
-        assert_eq!(subtype, vec!["error_during_execution".to_string()]);
-        assert_eq!(is_error, vec![true]);
-        assert_eq!(error_code, vec![Some("unauthorized".to_string())]);
+        let fields = &host.seen_outcome()[0];
+        assert_eq!(fields.stop_reason.as_deref(), Some("error"));
+        assert_eq!(fields.subtype.as_str(), "error_during_execution");
+        assert!(fields.is_error);
+        assert_eq!(fields.error_code.as_deref(), Some("unauthorized"));
     }
 
     /// A provider not known to keep an interrupted turn (`keeps_interrupted_turns`):
