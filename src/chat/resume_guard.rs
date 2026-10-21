@@ -12,9 +12,25 @@
 use nexus_claude::agent::{ResumeFingerprint, ResumeIncompatible};
 use tracing::warn;
 
+use super::manager::{PO_MCP_SERVER, RESERVED_NATIVE_SERVERS};
+
+/// The servers the PERSON attached. The backend's own (the PO server, `nexus`, `browser`)
+/// come and go with the context a resume runs in: no caller identity means no PO server
+/// (the restart recovery), no `nexus-tools` binary means no `nexus`. They are not a change
+/// the person made, so they are neither recorded nor compared.
+fn attached_by_person(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| {
+            name.as_str() != PO_MCP_SERVER && !RESERVED_NATIVE_SERVERS.contains(&name.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
 /// The fingerprint of a session opened with `mcp_servers`, as JSON.
 pub(crate) fn fingerprint_json(mcp_servers: &[String]) -> String {
-    let fingerprint = ResumeFingerprint::new(None, mcp_servers.iter().cloned(), None);
+    let fingerprint = ResumeFingerprint::new(None, attached_by_person(mcp_servers), None);
     serde_json::to_string(&fingerprint).unwrap_or_default()
 }
 
@@ -33,6 +49,7 @@ pub(crate) fn check_servers_kept(
         warn!("an unreadable resume fingerprint is ignored");
         return Ok(());
     };
+    let now = attached_by_person(now);
     if stored.mcp_servers.iter().all(|name| now.contains(name)) {
         Ok(())
     } else {
@@ -79,6 +96,21 @@ mod tests {
     #[test]
     fn an_unreadable_fingerprint_is_ignored() {
         assert!(check_servers_kept(Some("{not json"), &names(&[])).is_ok());
+    }
+
+    #[test]
+    fn the_backends_own_servers_are_neither_recorded_nor_compared() {
+        let stored = fingerprint_json(&names(&[
+            "project-orchestrator",
+            "nexus",
+            "browser",
+            "mine",
+        ]));
+        assert_eq!(stored, r#"{"mcp_servers":["mine"]}"#);
+        // A resume without caller identity has no PO server: not a change of the person's.
+        assert!(check_servers_kept(Some(&stored), &names(&["mine", "nexus"])).is_ok());
+        let with_po = fingerprint_json(&names(&["project-orchestrator"]));
+        assert!(check_servers_kept(Some(&with_po), &names(&[])).is_ok());
     }
 
     #[test]
