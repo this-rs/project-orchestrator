@@ -17183,6 +17183,7 @@ impl ChatManager {
         // The project's files are on this machine unless the instance is remote.
         let project_dir =
             (!super::provider::resolver::is_remote_instance(provider_id)).then(|| spec.cwd.clone());
+        let mcp_names: Vec<String> = spec.mcp_servers.keys().cloned().collect();
         // Bounded below the HTTP request timeout: a provider that does not open in
         // time is a typed `timeout` the person can read, not a bare 408.
         let (session, dropped) = match tokio::time::timeout(
@@ -17244,6 +17245,7 @@ impl ChatManager {
             project_dir,
             lasting,
             false,
+            mcp_names,
             super::cancelled_parents::parent_of(request.spawned_by.as_deref()),
         )
         .await?;
@@ -17484,6 +17486,7 @@ impl ChatManager {
         project_dir: Option<std::path::PathBuf>,
         lasting: Option<super::lasting_rules::LastingScope>,
         resumed: bool,
+        mcp_names: Vec<String>,
         parent: Option<String>,
     ) -> std::result::Result<(), super::cancelled_parents::ParentCancelled> {
         // What the provider's kind tells beyond its capabilities (an unknown window on
@@ -17523,6 +17526,18 @@ impl ChatManager {
                 .await
             {
                 warn!(session_id, error = %e, "Failed to persist the provider snapshot (non-fatal)");
+            }
+            // PYSR-2: what a later resume must not lose. Rewritten at every opening and
+            // every in-place switch, so it describes the servers the session LAST ran with.
+            if let Err(e) = self
+                .graph
+                .set_chat_session_fingerprint(
+                    uuid,
+                    &super::resume_guard::fingerprint_json(&mcp_names),
+                )
+                .await
+            {
+                warn!(session_id, error = %e, "Failed to persist the resume fingerprint (non-fatal)");
             }
         }
         let kind_name = provider_kind_name(&kind);
@@ -18055,6 +18070,20 @@ impl ChatManager {
                 session_id: &sid,
             })
             .await?;
+            // PYSR-2: a plain resume may not lose an MCP server the conversation was
+            // opened with. Nothing is written yet: the router and the token this reopen
+            // minted are undone by `cleanup` on the way out.
+            let now: Vec<String> = spec.mcp_servers.keys().cloned().collect();
+            let stored = self
+                .graph
+                .get_chat_session_fingerprint(node.id)
+                .await
+                .unwrap_or(None);
+            if let Err(incompatible) =
+                super::resume_guard::check_servers_kept(stored.as_deref(), &now)
+            {
+                return Err(anyhow::Error::new(incompatible));
+            }
         }
         // No resume token survives a move across provider families: a switch opens fresh.
         let token = if relay.is_some() {
@@ -18086,6 +18115,7 @@ impl ChatManager {
         {
             host_missing.push(super::agent_runtime::PO_TOOLS_FEATURE.to_string());
         }
+        let mcp_names: Vec<String> = spec.mcp_servers.keys().cloned().collect();
         let opened = open_dropping_refused_mcp(provider.kind(), spec, |spec| {
             let provider = Arc::clone(&provider);
             let token = token.clone();
@@ -18151,6 +18181,7 @@ impl ChatManager {
             // moved, which would make every `always` command be asked again). Only a plain
             // resume (no relay) may have moved.
             relay.is_none(),
+            mcp_names,
             // B36-RACE: a warm child the pool resumes for a delegation is refused like a fresh
             // one; a person resuming it passes (B36-RACE-RESUME).
             super::cancelled_parents::parent_checked_on_resume(node.spawned_by.as_deref()),

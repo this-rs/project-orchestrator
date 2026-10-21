@@ -2180,6 +2180,15 @@ pub trait GraphStore: Send + Sync {
     /// survives idle-cleanup and is honored on resume/respawn)
     async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()>;
 
+    /// Records the resume fingerprint of a session (JSON of `ResumeFingerprint`): the MCP
+    /// servers it was opened with (PYSR-2). Written at each opening and each in-place
+    /// provider switch, so it always describes the servers the session last ran with.
+    async fn set_chat_session_fingerprint(&self, id: Uuid, fingerprint: &str) -> Result<()>;
+
+    /// The resume fingerprint recorded for a session; `None` for a session opened before
+    /// PYSR-2 (never refused) or when nothing was recorded.
+    async fn get_chat_session_fingerprint(&self, id: Uuid) -> Result<Option<String>>;
+
     /// Replace the routing of ONE conversation (`PUT /api/chat/sessions/{id}/routing`):
     /// mode, pool (JSON) and `routed_by`, `None` = cleared. Additive properties, read
     /// with defaults. `false` when the session does not exist.
