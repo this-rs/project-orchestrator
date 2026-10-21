@@ -6281,6 +6281,156 @@ mod parity {
         assert_eq!(r.interrupts(), 1);
     }
 
+    /// The user's sequence on a held message (QSN): queued while the agent answers,
+    /// moved to the front ("next"), then "send now". Each queue operation answers
+    /// at once (the WS loop awaits it inline), the running turn is cut short, the
+    /// message is SHOWN (`user_message`) and sent as the next turn, and the queue is
+    /// left empty. Returns every event seen from the queue operations to the end of
+    /// the run.
+    async fn queue_prioritize_send_now(r: &mut Rig, text: &str) -> Vec<ChatEvent> {
+        use crate::chat::pending_queue::QueueOp;
+        assert!(r.manager.queue_user_message(&r.sid, text).await.unwrap());
+        let held = r.manager.pending_queue_snapshot(&r.sid).await.unwrap();
+        assert_eq!(held.len(), 1, "{held:?}");
+        let id = held[0].id;
+        for op in [QueueOp::Prioritize { id }, QueueOp::SendNow { id }] {
+            let reached = tokio::time::timeout(
+                Duration::from_secs(2),
+                r.manager.pending_queue_op(&r.sid, &op),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{op:?} blocks the WS loop"))
+            .unwrap();
+            assert!(reached, "{op:?}");
+        }
+        let mut seen = Vec::new();
+        loop {
+            let e = next_event(&mut r.rx, |_| true).await;
+            let end = matches!(
+                e,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            );
+            seen.push(e);
+            if end {
+                return seen;
+            }
+        }
+    }
+
+    fn assert_delivered(r: &Rig, seen: &[ChatEvent], text: &str) {
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, ChatEvent::UserMessage { content } if content == text)),
+            "the message sent now is shown: {seen:?}"
+        );
+        let sent = r.sent();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent[1].ends_with(text), "sent as the next turn: {sent:?}");
+        assert!(r.interrupts() >= 1, "the running turn is cut short");
+    }
+
+    /// QSN, mid-text: the agent is writing when the message is sent now.
+    #[tokio::test]
+    async fn queue_prioritize_send_now_mid_text_shows_and_sends_the_message() {
+        for kind in [ProviderKind::Native, ProviderKind::ClaudeCode] {
+            let mut r = rig(
+                kind,
+                vec![
+                    vec![steps::text("partial answer"), Step::AwaitInterrupt],
+                    vec![steps::text("read it"), steps::done(&caps())],
+                ],
+            )
+            .await;
+            r.manager.send_message(&r.sid, "first").await.unwrap();
+            next_event(&mut r.rx, |e| {
+                matches!(
+                    e,
+                    ChatEvent::StreamDelta { .. } | ChatEvent::AssistantText { .. }
+                )
+            })
+            .await;
+            let seen = queue_prioritize_send_now(&mut r, "now please").await;
+            assert_delivered(&r, &seen, "now please");
+            assert_eq!(
+                r.manager.pending_queue_snapshot(&r.sid).await,
+                Some(vec![]),
+                "{kind:?}"
+            );
+            assert!(!r.manager.is_session_streaming(&r.sid).await, "{kind:?}");
+        }
+    }
+
+    /// QSN, mid tool call: the agent waits on a long tool when the message is sent
+    /// now — the tool is cut with the turn.
+    #[tokio::test]
+    async fn queue_prioritize_send_now_during_a_long_tool_shows_and_sends_the_message() {
+        for kind in [ProviderKind::Native, ProviderKind::ClaudeCode] {
+            let mut r = rig(
+                kind,
+                vec![
+                    vec![
+                        steps::tool_call("long1", "slow", json!({})),
+                        Step::Sleep { ms: 60_000 },
+                        steps::text("never"),
+                        steps::done(&caps()),
+                    ],
+                    vec![steps::text("read it"), steps::done(&caps())],
+                ],
+            )
+            .await;
+            r.manager.send_message(&r.sid, "first").await.unwrap();
+            next_event(
+                &mut r.rx,
+                |e| matches!(e, ChatEvent::ToolUse { id, .. } if id == "long1"),
+            )
+            .await;
+            let seen = queue_prioritize_send_now(&mut r, "stop the tool").await;
+            assert_delivered(&r, &seen, "stop the tool");
+            assert!(
+                !seen.iter().any(
+                    |e| matches!(e, ChatEvent::AssistantText { content, .. } if content == "never")
+                ),
+                "{kind:?}: the tool's turn did not go on: {seen:?}"
+            );
+            assert!(!r.manager.is_session_streaming(&r.sid).await, "{kind:?}");
+        }
+    }
+
+    /// QSN, the turn is ending: the provider's turn is over (its interrupt finds
+    /// no turn and does nothing) while the session still streams — here, the
+    /// pause before an auto-continue. The message must still be shown and sent
+    /// next, promptly, instead of the "continue" hint; not stranded in the queue.
+    #[tokio::test]
+    async fn queue_prioritize_send_now_after_the_provider_turn_ended_still_delivers() {
+        for kind in [ProviderKind::Native, ProviderKind::ClaudeCode] {
+            let mut r = rig(
+                kind,
+                vec![
+                    stopped_on_its_turn_limit(),
+                    vec![steps::text("read it"), steps::done(&caps())],
+                ],
+            )
+            .await;
+            r.manager.send_message(&r.sid, "go").await.unwrap();
+            next_event(&mut r.rx, |e| matches!(e, ChatEvent::AutoContinue { .. })).await;
+            let started = tokio::time::Instant::now();
+            let seen = queue_prioritize_send_now(&mut r, "late send now").await;
+            assert_delivered(&r, &seen, "late send now");
+            assert!(
+                !seen.iter().any(|e| matches!(e, ChatEvent::SystemHint { content } if content.starts_with("Continue where you left off"))),
+                "{kind:?}: the auto-continue gave way to the message: {seen:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{kind:?}: delivered promptly ({:?})",
+                started.elapsed()
+            );
+            assert!(!r.manager.is_session_streaming(&r.sid).await, "{kind:?}");
+        }
+    }
+
     fn stopped_on_its_turn_limit() -> Vec<Step> {
         vec![
             steps::text("partial"),
