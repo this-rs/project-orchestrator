@@ -13328,6 +13328,72 @@ mod openclaw_delegation {
             .count();
         assert_eq!(notices, 1, "the refusal is told once, at the first opening");
     }
+
+    /// PYSR-2: a session opened with a server the person attached (`docs`) and resumed
+    /// without it is refused, naming `mcp_servers`, BEFORE the provider is asked to load
+    /// the conversation, and nothing is written: no event, no process left behind.
+    #[tokio::test]
+    async fn a_resume_that_loses_a_server_the_person_attached_is_refused_and_writes_nothing() {
+        let bridge = Agent::new("bridge", "acp-bridge", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let first = bridge.manager(&graph, "pysr2-lost").await;
+        let sid = open(&first, "pysr2-lost").await;
+        first.close_session(&sid).await.unwrap();
+        drop(first);
+        let uuid = Uuid::parse_str(&sid).unwrap();
+        // What the opening would have recorded had the person attached a `docs` server.
+        graph
+            .set_chat_session_fingerprint(
+                uuid,
+                &super::super::resume_guard::fingerprint_json(&["docs".to_string()]),
+            )
+            .await
+            .unwrap();
+        let events_before = graph.get_chat_events(uuid, 0, 500).await.unwrap().len();
+        bridge.mode("load");
+        let manager = bridge.manager(&graph, "pysr2-lost").await;
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        let error = manager
+            .resume_session(&sid, "again", Some(&claims))
+            .await
+            .expect_err("a resume that loses `docs` must be refused");
+        assert!(
+            format!("{error:#}").contains("mcp_servers"),
+            "the refusal names the field: {error:#}"
+        );
+        assert!(
+            bridge.servers_sent("session/load").is_empty(),
+            "the provider was never asked to load the conversation"
+        );
+        assert_eq!(
+            graph.get_chat_events(uuid, 0, 500).await.unwrap().len(),
+            events_before,
+            "a refused resume writes no event"
+        );
+    }
+
+    /// The same session with the fingerprint it was opened with resumes: the guard refuses
+    /// a LOSS, not a resume.
+    #[tokio::test]
+    async fn a_resume_that_keeps_its_servers_is_not_refused() {
+        let bridge = Agent::new("bridge", "acp-bridge", None);
+        let graph = Arc::new(MockGraphStore::new());
+        let first = bridge.manager(&graph, "pysr2-kept").await;
+        let sid = open(&first, "pysr2-kept").await;
+        first.close_session(&sid).await.unwrap();
+        drop(first);
+        graph
+            .set_chat_session_fingerprint(
+                Uuid::parse_str(&sid).unwrap(),
+                &super::super::resume_guard::fingerprint_json(&[]),
+            )
+            .await
+            .unwrap();
+        bridge.mode("load");
+        let manager = bridge.manager(&graph, "pysr2-kept").await;
+        resume(&manager, &sid).await;
+        manager.close_session(&sid).await.unwrap();
+    }
 }
 
 // ============================================================================
