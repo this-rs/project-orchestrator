@@ -46,6 +46,7 @@ use std::sync::Arc;
 pub mod conformance {
     use chrono::{DateTime, Duration, TimeZone, Utc};
     use futures::future::join_all;
+    use project_orchestrator::ingress::{ExternalEvent, IngressOutcome};
     use project_orchestrator::neo4j::models::{
         AlertNode, AlertSeverity, FileNode, PlanNode, PlanStatus, ProjectNode, TaskNode, TaskStatus,
     };
@@ -408,6 +409,138 @@ pub mod conformance {
             "exactly one of 8 concurrent root creations wins: {outcomes:?}"
         );
         assert_eq!(running, 1, "and the store holds exactly one running run");
+    }
+
+    // ------------------------------------------------------------------
+    // 3b. External events: journal and delivery claim (ingress, PR 1/5).
+    // ------------------------------------------------------------------
+
+    fn an_external_event(trigger_id: Uuid, outcome: IngressOutcome, seconds: i64) -> ExternalEvent {
+        ExternalEvent {
+            id: Uuid::new_v4(),
+            trigger_id,
+            source: "github".to_string(),
+            outcome,
+            reason: None,
+            delivery_id: Some(format!("delivery-{seconds}")),
+            event_type: Some("push".to_string()),
+            action: None,
+            body_bytes: 42,
+            received_at: at(seconds),
+        }
+    }
+
+    /// The journal of one trigger lists newest first by `received_at` (not by
+    /// insertion order: the events are written 2, 3, 1), honours the limit, never
+    /// shows another trigger's events, and reads back every field it was given,
+    /// the absent optional ones as `None` (never `Some("")`). There is no delete
+    /// in the trait: the events are scoped to fresh trigger ids and left behind.
+    pub async fn check_external_event_journal(store: &dyn GraphStore) {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut rejected = an_external_event(a, IngressOutcome::Rejected, 2);
+        rejected.reason = Some("invalid_signature".to_string());
+        rejected.delivery_id = None;
+        rejected.event_type = None;
+        rejected.body_bytes = 0;
+        let mut accepted = an_external_event(a, IngressOutcome::Accepted, 3);
+        accepted.action = Some("opened".to_string());
+        accepted.body_bytes = 1_048_576;
+        let oldest = an_external_event(a, IngressOutcome::Accepted, 1);
+        let foreign = an_external_event(b, IngressOutcome::Accepted, 4);
+        for e in [&rejected, &accepted, &oldest, &foreign] {
+            store.record_external_event(e).await.unwrap();
+        }
+
+        let listed = store.list_external_events(a, 10).await.unwrap();
+        assert_eq!(
+            ids(&listed, |e| e.id),
+            vec![accepted.id, rejected.id, oldest.id],
+            "newest received_at first, and b's event does not leak into a's journal"
+        );
+        assert_eq!(listed[0], accepted, "every field reads back");
+        assert_eq!(
+            listed[1], rejected,
+            "absent optional fields read back as None"
+        );
+        assert_eq!(listed[2], oldest);
+
+        let limited = store.list_external_events(a, 2).await.unwrap();
+        assert_eq!(
+            ids(&limited, |e| e.id),
+            vec![accepted.id, rejected.id],
+            "the limit keeps the newest"
+        );
+        let only_b = store.list_external_events(b, 10).await.unwrap();
+        assert_eq!(ids(&only_b, |e| e.id), vec![foreign.id]);
+        assert!(
+            store
+                .list_external_events(Uuid::new_v4(), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a trigger with no event has an empty journal"
+        );
+    }
+
+    /// A delivery is claimed once per trigger: the first claim wins, a replay of
+    /// the same key on the same trigger is refused (however often), while the same
+    /// key on another trigger and another key on the same trigger are both free.
+    /// The claims have no delete in the trait and are left behind (fresh ids).
+    pub async fn check_external_delivery_claim(store: &dyn GraphStore) {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert!(store
+            .claim_external_delivery(a, "github:d-1")
+            .await
+            .unwrap());
+        assert!(
+            !store
+                .claim_external_delivery(a, "github:d-1")
+                .await
+                .unwrap(),
+            "a replay on the same trigger is refused"
+        );
+        assert!(
+            !store
+                .claim_external_delivery(a, "github:d-1")
+                .await
+                .unwrap(),
+            "and stays refused"
+        );
+        assert!(
+            store
+                .claim_external_delivery(b, "github:d-1")
+                .await
+                .unwrap(),
+            "the same key on another trigger is a different delivery"
+        );
+        assert!(
+            store
+                .claim_external_delivery(a, "github:d-2")
+                .await
+                .unwrap(),
+            "another key on the same trigger is a different delivery"
+        );
+        assert!(!store
+            .claim_external_delivery(b, "github:d-1")
+            .await
+            .unwrap());
+    }
+
+    /// The claim under contention: of 8 concurrent claims of one delivery,
+    /// exactly one wins.
+    pub async fn check_concurrent_external_delivery_claim(store: &dyn GraphStore) {
+        let trigger = Uuid::new_v4();
+        let outcomes =
+            join_all((0..8).map(|_| store.claim_external_delivery(trigger, "github:race"))).await;
+        let won = outcomes.iter().filter(|o| matches!(o, Ok(true))).count();
+        assert_eq!(
+            won, 1,
+            "exactly one of 8 concurrent claims wins: {outcomes:?}"
+        );
+        assert!(
+            outcomes.iter().all(|o| o.is_ok()),
+            "no claim errors: {outcomes:?}"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1549,6 +1682,9 @@ macro_rules! all_checks {
                 check_merge_idempotence,
                 check_cas_protocol_run,
                 check_concurrent_create_protocol_run,
+                check_external_event_journal,
+                check_external_delivery_claim,
+                check_concurrent_external_delivery_claim,
                 check_atomic_increments,
                 check_absent_entity_matrix,
                 check_cascade_delete_project,

@@ -45,6 +45,7 @@ diagrams:
     # verification HMAC restent dans la PR suivante (#898).
     covers:
       - "backend:src/ingress/**"
+      - "backend:src/neo4j/ingress.rs"
   - name: po-chat-manager
     owner: theotime
     status: verified
