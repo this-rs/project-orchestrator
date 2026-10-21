@@ -41,6 +41,7 @@ flowchart TD
     NOP["✅ 403 execution_place_no_person<br/>aucune question gardée, aucun journal<br/>(délégué, sous-agent, runner, protocole, anonyme, jeton agent)"]
     PLAN["✅ ephemeral_worktree::plan<br/>dépôt = worktree PRINCIPAL ; base = origin/HEAD sinon HEAD, SHA figé ;<br/>X sous &lt;app&gt;/task-worktrees, jamais dans un worktree ; rien n'est créé<br/>test : the_place_is_planned_from_the_main_worktree_at_a_frozen_sha_outside_any_worktree"]
     BOOK["✅ PlacementBook::request<br/>idempotent (tâche, personne, dépôt) ; 4 par personne, 32 au total, 15 min<br/>journal : requested (sinon rien n'est gardé)<br/>test : requests_are_idempotent_and_bounded, the_place_waits_for_its_person_and_names_x_resolved_by_po"]
+    AUTO{"✅ Rock'n roll : l'enveloppe lit le mode du parent (ceiling >= bypassPermissions/trust), demandeur = SESSION avec une personne devant<br/>le HARNAIS confirme pour le propriétaire : PlacementBook::confirm_for_owner (propriétaire, X exact relu du carnet)<br/>journal : confirmed, acteur = propriétaire, détail auto:bypassPermissions ; pas de carte, pas de POST<br/>test : in_bypass_the_harness_confirms_for_the_owner_and_the_audit_says_so, bypass_does_not_open_a_session_nobody_is_in_front_of,<br/>outside_bypass_the_delegation_still_waits_for_a_human_click, the_harness_confirms_only_for_the_session_owner_and_the_exact_path"}
     ASK["🟠 202 confirmation_required + événement execution_place_confirmation_required"]
 
     CONF{"✅ POST /api/execution-places/{id}/confirm {path: X}<br/>middleware : mutation réservée à un humain ; handler : jeton agent refusé ;<br/>PlacementBook::confirm : une PERSONNE, le propriétaire, X exact<br/>test : an_agent_token_cannot_confirm_for_its_person, an_agent_token_never_confirms_even_for_its_own_person,<br/>the_confirmation_must_name_the_place_po_resolved, human_only_mutation_matches_whole_segments_only"}
@@ -58,7 +59,9 @@ flowchart TD
 
     REQ --> WHO
     WHO -- personne --> NOP
-    WHO -- une personne répond --> PLAN --> BOOK --> ASK
+    WHO -- une personne répond --> PLAN --> BOOK --> AUTO
+    AUTO -- hors bypass --> ASK
+    AUTO -- bypass --> AUD
     ASK --> CONF
     ASK --> REJ
     CONF -- refus --> REF
