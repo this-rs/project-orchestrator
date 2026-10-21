@@ -17529,11 +17529,15 @@ impl ChatManager {
             }
             // PYSR-2: what a later resume must not lose. Rewritten at every opening and
             // every in-place switch, so it describes the servers the session LAST ran with.
+            // A session opened WITHOUT its servers (the provider takes none or refused
+            // them: `without_mcp`) ran with none, and its resume rebuilds the spec without
+            // them: recording the ones asked for would refuse every one of its resumes.
+            let attached: &[String] = if without_mcp { &[] } else { &mcp_names };
             if let Err(e) = self
                 .graph
                 .set_chat_session_fingerprint(
                     uuid,
-                    &super::resume_guard::fingerprint_json(&mcp_names),
+                    &super::resume_guard::fingerprint_json(attached),
                 )
                 .await
             {
