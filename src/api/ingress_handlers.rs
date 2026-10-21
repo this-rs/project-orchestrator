@@ -9,9 +9,8 @@
 //!
 //! Ordre des vérifications, chacune refusée avant la suivante :
 //! 1. place dans la limite de concurrence (503 immédiat sinon) ;
-//! 1b. seau GLOBAL de la route (429), avant toute lecture du graphe ;
-//! 2. déclencheur connu, `webhook`, de la bonne source (404) ;
-//! 3. (le seau à jetons du déclencheur n'est débité qu'APRÈS le HMAC valide, voir 9) ;
+//! 2. seau GLOBAL de la route (429), avant toute lecture du graphe ;
+//! 3. déclencheur connu, `webhook`, de la bonne source (404) ;
 //! 4. en-tête de signature présent et bien formé, `sha256=` + 64 hex (401) ;
 //! 5. Content-Length au plus `max_body_bytes` (413), AVANT toute lecture ;
 //! 6. secret résolu dans le coffre (403 neutre) ;
@@ -19,6 +18,7 @@
 //! 8. HMAC-SHA256 à temps constant (401) ;
 //! 9. seau à jetons du déclencheur (429), débité seulement par un appelant
 //!    authentifié : qui ne connaît pas le secret ne peut pas épuiser le quota
+//!    d'une livraison légitime.
 //!    d'une livraison légitime.
 //!
 //! Ces refus PRÉCÈDENT l'authentification : ils n'écrivent RIEN en base, ils sont
@@ -164,7 +164,10 @@ pub async fn receive_external_event(
     // Seau global, AVANT toute lecture du graphe : un flot d'identifiants (connus ou
     // non) ne charge ni Neo4j ni le coffre au-delà de ce débit.
     if !runtime.allow_global() {
-        runtime.refused(crate::ingress::guard::UNKNOWN_TRIGGER, "global_rate_limited");
+        runtime.refused(
+            crate::ingress::guard::UNKNOWN_TRIGGER,
+            "global_rate_limited",
+        );
         let after = (60 / u64::from(runtime.config.global_rate_per_minute.max(1))).max(1);
         return rejected_retry(StatusCode::TOO_MANY_REQUESTS, after);
     }
@@ -1006,7 +1009,11 @@ mod tests {
                 Body::from(&b"{}"[..]),
             )
             .await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "never 429 before the HMAC");
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "never 429 before the HMAC"
+            );
         }
         assert_eq!(
             signed(&r, b"{\"n\":1}", "d-1").await,
@@ -1048,7 +1055,11 @@ mod tests {
             assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
             assert!(response.headers().contains_key(header::RETRY_AFTER));
         }
-        assert_eq!(reads(), before, "the graph was not read past the global limit");
+        assert_eq!(
+            reads(),
+            before,
+            "the graph was not read past the global limit"
+        );
         assert_eq!(journal(&r).await.len(), 2, "nothing more was written");
     }
 

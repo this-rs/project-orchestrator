@@ -151,8 +151,8 @@ impl IngressRuntime {
         let capacity = f64::from(self.config.global_rate_per_minute.max(1));
         let now = Instant::now();
         let mut b = self.global.lock().unwrap_or_else(|p| p.into_inner());
-        b.tokens = (b.tokens + now.duration_since(b.at).as_secs_f64() * capacity / 60.0)
-            .min(capacity);
+        b.tokens =
+            (b.tokens + now.duration_since(b.at).as_secs_f64() * capacity / 60.0).min(capacity);
         b.at = now;
         if b.tokens >= 1.0 {
             b.tokens -= 1.0;
