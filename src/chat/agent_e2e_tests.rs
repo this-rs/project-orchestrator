@@ -13098,6 +13098,140 @@ mod openclaw_delegation {
         agent.assert_home_here("p19-bridge");
     }
 
+    /// ISO4: ACP has no system role, but the PO system prompt is not lost: the backend gives
+    /// it to the session (`SessionSpec::system_prompt`) and nexus delivers it as the leading
+    /// text block of the FIRST `session/prompt`, in front of the turn's own text (which is
+    /// the enriched message, `TurnServices::prepare`, the same for every engine).
+    #[tokio::test]
+    async fn an_acp_session_receives_the_po_system_prompt_as_the_leading_block_of_its_first_prompt()
+    {
+        let agent = Agent::new("bridge", "acp-bridge", Some(false));
+        agent.mode("ignoring");
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = agent.manager(&graph, "iso4-acp").await;
+        open(&manager, "iso4-acp").await;
+        let prompts: Vec<Value> = agent
+            .recorded()
+            .into_iter()
+            .filter(|e| e["kind"] == "in" && e["method"] == "session/prompt")
+            .collect();
+        assert_eq!(prompts.len(), 1, "one prompt: {prompts:?}");
+        let blocks = prompts[0]["params"]["prompt"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a prompt array: {:?}", prompts[0]));
+        let texts: Vec<&str> = blocks.iter().filter_map(|b| b["text"].as_str()).collect();
+        let at = texts
+            .iter()
+            .position(|t| t.contains("hi there"))
+            .unwrap_or_else(|| panic!("the turn text is in the prompt: {texts:?}"));
+        assert!(
+            at >= 1,
+            "the system prompt leads the first prompt, the turn follows: {texts:?}"
+        );
+        assert!(
+            texts[0].len() > 200 && !texts[0].contains("hi there"),
+            "the leading block is the PO system prompt, not the turn: {:?}",
+            texts[0]
+        );
+    }
+
+    /// A native instance (`local`, `fake_openai`) and an ACP agent (`fake_acp`) on one manager.
+    async fn native_and_acp(agent: &Agent) -> (ChatManager, Arc<MockGraphStore>, FakeOpenAi) {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = agent.manager(&graph, "iso4-acp").await;
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        (manager, graph, fake)
+    }
+
+    /// ISO4, switch in both directions on the fake binaries (native -> ACP here, ACP -> native
+    /// below): the thread keeps its id, the target gets the relay, and an ACP target gets the
+    /// PO system prompt in front of it like any other session.
+    #[tokio::test]
+    async fn a_conversation_moves_from_the_native_harness_to_acp_with_the_system_prompt() {
+        let agent = Agent::new("bridge", "acp-bridge", Some(false));
+        agent.mode("ignoring");
+        let (manager, graph, _fake) = native_and_acp(&agent).await;
+        let created = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("the native session must open: {e:#}"));
+        let sid = created.session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+
+        let moved = manager
+            .switch_session_provider(&sid, "iso4-acp", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("the switch to ACP failed: {e:#}"));
+        assert_eq!(moved.session_id, sid, "the SAME thread continues");
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.provider_id.as_deref(), Some("iso4-acp"));
+        let said = persisted(&graph, &sid, |e| match e {
+            ChatEvent::AssistantText { content, .. } if content.contains("hello from openclaw") => {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+        assert!(said.is_some(), "the ACP agent answered after the switch");
+        let prompts: Vec<Value> = agent
+            .recorded()
+            .into_iter()
+            .filter(|e| e["kind"] == "in" && e["method"] == "session/prompt")
+            .collect();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        let texts: Vec<&str> = prompts[0]["params"]["prompt"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect();
+        assert!(texts.len() >= 2, "system prompt then the turn: {texts:?}");
+        assert!(texts[0].len() > 200, "the system prompt leads: {texts:?}");
+        assert!(
+            texts.iter().any(|t| t.contains("<conversation_relay")),
+            "the history is relayed: {texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conversation_moves_from_acp_to_the_native_harness() {
+        let agent = Agent::new("bridge", "acp-bridge", Some(false));
+        agent.mode("ignoring");
+        let (manager, graph, fake) = native_and_acp(&agent).await;
+        let sid = open(&manager, "iso4-acp").await;
+
+        let moved = manager
+            .switch_session_provider(&sid, "local", None, "hi there again", None)
+            .await
+            .unwrap_or_else(|e| panic!("the switch to the native harness failed: {e:#}"));
+        assert_eq!(moved.session_id, sid, "the SAME thread continues");
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.provider_id.as_deref(), Some("local"));
+        let said = persisted(&graph, &sid, |e| match e {
+            ChatEvent::AssistantText { content, .. } if content.contains("fake model") => Some(()),
+            _ => None,
+        })
+        .await;
+        assert!(said.is_some(), "the native model answered after the switch");
+        assert!(
+            fake.chat_requests()
+                .iter()
+                .any(|r| r.to_string().contains("<conversation_relay")),
+            "the native model received the relayed ACP history"
+        );
+    }
+
     /// Two FIRST sessions opened at once on a refusing agent: whichever learns the
     /// refusal first, the other one (built while the provider still said yes) is
     /// opened too — by nexus' retry, or by the backend's when nexus answers
