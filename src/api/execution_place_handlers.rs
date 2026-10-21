@@ -298,7 +298,7 @@ pub(crate) async fn request_placement(
     claims: Option<&Claims>,
     parent: Option<&ParentEnvelope>,
     prepared: PreparedDelegation,
-) -> Result<ConfirmationRequired, AppError> {
+) -> Result<DelegateTaskOutcome, AppError> {
     let graph = state.orchestrator.neo4j_arc();
     // Nobody in front: refused now, no question kept, nothing planned.
     let session = asking_session(graph.as_ref(), parent).await?;
@@ -330,6 +330,17 @@ pub(crate) async fn request_placement(
         .get(requested.id(), Utc::now())
         .ok_or_else(|| PlacementError::NotFound(requested.id()).into_app_error())?;
     let meta = PlacementMeta::of_pending(&pending);
+    // Rock'n roll: the person in front of the session gave their consent in advance (the session
+    // is in bypassPermissions, a mode only a person sets, over the WebSocket, as the session's
+    // owner). The HARNESS answers for them. Read from the envelope (the parent's mode as the
+    // server knows it, clamped by its token), never from the model's text. A caller that is not
+    // a session a person is in front of never gets here (`person_in_front` refused it above).
+    let consent_in_advance = parent
+        .is_some_and(|env| envelope::mode_rank(&env.ceiling) >= envelope::TRUST_RANK)
+        && matches!(
+            pending.requester,
+            crate::chat::place_confirmation::Requester::Session { .. }
+        );
     if let Requested::New(id) = requested {
         // No audit, no question: a placement nobody can trace is not kept.
         if let Err(e) = meta
@@ -345,10 +356,31 @@ pub(crate) async fn request_placement(
             PLACEMENTS.discard(id);
             return Err(AppError::Internal(e.context("execution-place audit")));
         }
-        emit_question(state, &meta);
+        if !consent_in_advance {
+            emit_question(state, &meta);
+        }
+    }
+    if consent_in_advance {
+        let chat_manager = state
+            .chat_manager
+            .clone()
+            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
+        // The path is the one PO resolved and kept, read back from the book.
+        let path = meta.place.path.to_string_lossy().to_string();
+        let confirmed = PLACEMENTS
+            .confirm_for_owner(meta.placement_id, &meta.owner, &path, Utc::now())
+            .map_err(PlacementError::into_app_error)?;
+        return confirm_and_launch(
+            state,
+            &chat_manager,
+            confirmed,
+            &meta.owner,
+            Some(AUTO_CONFIRM_BYPASS),
+        )
+        .await;
     }
     let view = ExecutionPlaceView::of(&meta, Some(pending.expires_at));
-    Ok(ConfirmationRequired {
+    Ok(DelegateTaskOutcome::ConfirmationRequired(ConfirmationRequired {
         status: "confirmation_required",
         task_id,
         plan_id,
@@ -358,7 +390,7 @@ pub(crate) async fn request_placement(
             view.path, view.placement_id, view.path
         ),
         execution_place: view,
-    })
+    }))
 }
 
 /// Tell the clients a person has a question waiting (a UI shows « exécute dans X »).
@@ -423,15 +455,31 @@ pub async fn confirm_execution_place(
         .confirm(placement_id, person, body.path.trim(), Utc::now())
         .map_err(PlacementError::into_app_error)?;
     let actor = person.map(|c| c.sub.clone()).unwrap_or_default();
+    let launched = confirm_and_launch(&state, &chat_manager, pending, &actor, None).await?;
+    Ok((StatusCode::ACCEPTED, Json(launched)))
+}
+
+/// The cause the audit writes when the harness confirmed for a session in bypassPermissions.
+pub const AUTO_CONFIRM_BYPASS: &str = "auto:bypassPermissions";
+
+/// A placement that was confirmed (by a click, or in advance): audit first, then make X and open
+/// the session in it. `cause`: `None` for a person's answer, [`AUTO_CONFIRM_BYPASS`] for the harness.
+async fn confirm_and_launch(
+    state: &OrchestratorState,
+    chat_manager: &std::sync::Arc<crate::chat::manager::ChatManager>,
+    pending: Pending<PreparedDelegation>,
+    actor: &str,
+    cause: Option<&str>,
+) -> Result<DelegateTaskOutcome, AppError> {
     let meta = PlacementMeta::of_pending(&pending);
     let graph = state.orchestrator.neo4j_arc();
     // The audit comes first: no trace of who confirmed what, no worktree.
     meta.record(
         graph.as_ref(),
         ExecutionPlaceEventKind::Confirmed,
-        Some(&actor),
+        Some(actor),
         None,
-        None,
+        cause.map(str::to_string),
     )
     .await
     .map_err(|e| AppError::Internal(e.context("execution-place audit")))?;
@@ -451,11 +499,8 @@ pub async fn confirm_execution_place(
     let mut prepared = pending.launch;
     prepared.chat_request.cwd = worktree.cwd();
     let place = LaunchedPlace { worktree, meta };
-    let launched = launch_delegation(&state, &chat_manager, prepared, Some(place)).await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(DelegateTaskOutcome::Launched(launched)),
-    ))
+    let launched = launch_delegation(state, chat_manager, prepared, Some(place)).await?;
+    Ok(DelegateTaskOutcome::Launched(launched))
 }
 
 /// POST /api/execution-places/{id}/reject — the person says no.
@@ -776,6 +821,84 @@ mod tests {
             confirm(&f, Claims::person(OWNER, "p@example.org", "P"), id, &x).await,
             Err(AppError::NotFound(_))
         ));
+    }
+
+    async fn in_bypass(f: &Fixture) {
+        f.mock
+            .update_chat_session_permission_mode(f.parent.id, "bypassPermissions")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn outside_bypass_the_delegation_still_waits_for_a_human_click() {
+        let f = fixture(Some(OWNER), None).await;
+        f.mock
+            .update_chat_session_permission_mode(f.parent.id, "acceptEdits")
+            .await
+            .unwrap();
+        let pending = ask(&f).await.unwrap();
+        assert_eq!(pending.status, "confirmation_required");
+        assert_eq!(kinds(&f).await, vec![ExecutionPlaceEventKind::Requested]);
+        PLACEMENTS.discard(pending.execution_place.placement_id);
+    }
+
+    /// Bypass: no click. The harness confirms as the owner, audited with the cause. (No engine is
+    /// registered in a test, so the launch then fails and X is released.)
+    #[tokio::test]
+    async fn in_bypass_the_harness_confirms_for_the_owner_and_the_audit_says_so() {
+        let f = fixture(Some(OWNER), None).await;
+        in_bypass(&f).await;
+        let result = delegate_task(
+            State(f.state.clone()),
+            None,
+            as_session(f.parent.id),
+            Path((f.plan_id, f.task_id)),
+            Json(request(&f.parent.cwd)),
+        )
+        .await;
+        assert!(
+            !matches!(
+                result,
+                Ok((_, Json(DelegateTaskOutcome::ConfirmationRequired(_))))
+            ),
+            "no click may be asked in bypass"
+        );
+        let events = f.mock.list_execution_place_events(f.task_id).await.unwrap();
+        let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ExecutionPlaceEventKind::Requested,
+                ExecutionPlaceEventKind::Confirmed,
+                ExecutionPlaceEventKind::LaunchFailed,
+                ExecutionPlaceEventKind::Removed,
+            ]
+        );
+        let confirmed = &events[1];
+        assert_eq!(confirmed.actor.as_deref(), Some(OWNER));
+        assert_eq!(confirmed.detail.as_deref(), Some("auto:bypassPermissions"));
+        assert_eq!(confirmed.requested_by, format!("session:{}", f.parent.id));
+        assert!(PLACEMENTS.get(confirmed.placement_id, Utc::now()).is_none());
+        assert!(!std::path::Path::new(&confirmed.path).exists());
+    }
+
+    #[tokio::test]
+    async fn bypass_does_not_open_a_session_nobody_is_in_front_of() {
+        let f = fixture(Some(OWNER), Some(r#"{"type":"delegation"}"#)).await;
+        in_bypass(&f).await;
+        match ask(&f).await {
+            Err(AppError::Forbidden(m)) => {
+                assert!(m.starts_with("execution_place_no_person"), "{m}")
+            }
+            other => panic!("expected a refusal even in bypass, got {other:?}"),
+        }
+        assert!(kinds(&f).await.is_empty());
+        // An ownerless session either.
+        let g = fixture(None, None).await;
+        in_bypass(&g).await;
+        assert!(matches!(ask(&g).await, Err(AppError::Forbidden(_))));
+        assert!(kinds(&g).await.is_empty());
     }
 
     #[tokio::test]

@@ -15,7 +15,10 @@
 //! - **Who may confirm.** A person signed in with their own token
 //!   (`Claims::may_keep_lasting_approvals`), and the OWNER of the placement: the person in front
 //!   of the session that asked (its `owner`), or the person who asked directly. An agent token
-//!   never confirms, whoever it acts for.
+//!   never confirms, whoever it acts for. Consent given in advance (EXEC-CONFIRM): when the
+//!   asking SESSION runs in bypassPermissions — a mode only its person sets — the HARNESS answers
+//!   for that owner ([`PlacementBook::confirm_for_owner`]), with the path it reads from the book;
+//!   the audit writes the cause `auto:bypassPermissions`.
 //! - **What is confirmed.** The confirmation must name X exactly as PO resolved it: a
 //!   confirmation of another path is refused (`execution_place_mismatch`) and the placement stays
 //!   pending.
@@ -303,6 +306,42 @@ impl<T: Clone> PlacementBook<T> {
         Ok(pending.remove(&id).expect("checked live"))
     }
 
+    /// The HARNESS answers for the person who stands in front of the session that asked, because
+    /// that person gave their consent in advance (the session runs in bypassPermissions). It is
+    /// never reachable from a request: the caller is server code that read the mode itself.
+    ///
+    /// Same checks as [`Self::confirm`], minus the token: the placement must have been asked by a
+    /// SESSION (a person in front of it, see [`person_in_front`]), `owner` must be its owner, and
+    /// `seen` is the path the HARNESS read from the placement, so the object of the question is
+    /// never the model's. Returns the owner as the actor.
+    pub fn confirm_for_owner(
+        &self,
+        id: Uuid,
+        owner: &str,
+        seen: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Pending<T>, PlacementError> {
+        let mut pending = self.lock();
+        Self::live(&mut pending, id, now)?;
+        let p = pending.get(&id).expect("checked live");
+        if !matches!(p.requester, Requester::Session { .. }) {
+            return Err(PlacementError::NoPersonInFront(
+                "only a session a person is in front of can have its consent given in advance",
+            ));
+        }
+        if p.owner != owner {
+            return Err(PlacementError::NotTheOwner);
+        }
+        let resolved = p.place.path.to_string_lossy().to_string();
+        if seen != resolved {
+            return Err(PlacementError::PlaceMismatch {
+                seen: seen.to_string(),
+                resolved,
+            });
+        }
+        Ok(pending.remove(&id).expect("checked live"))
+    }
+
     /// The person says no: the placement is dropped.
     pub fn reject(
         &self,
@@ -520,6 +559,48 @@ mod tests {
         assert!(matches!(
             ask(Uuid::new_v4(), "/d"),
             Err(PlacementError::TooMany(_))
+        ));
+    }
+
+    #[test]
+    fn the_harness_confirms_only_for_the_session_owner_and_the_exact_path() {
+        let book: PlacementBook<()> = PlacementBook::new();
+        let ask = |requester: Requester| {
+            book.request(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SUB.into(),
+                requester,
+                place("/work/x"),
+                (),
+                Utc::now(),
+            )
+            .unwrap()
+            .id()
+        };
+        let id = ask(Requester::Session {
+            session_id: Uuid::new_v4(),
+        });
+        assert!(matches!(
+            book.confirm_for_owner(id, "mallory", "/work/x", Utc::now()),
+            Err(PlacementError::NotTheOwner)
+        ));
+        assert!(matches!(
+            book.confirm_for_owner(id, SUB, "/work/other", Utc::now()),
+            Err(PlacementError::PlaceMismatch { .. })
+        ));
+        assert!(book
+            .confirm_for_owner(id, SUB, "/work/x", Utc::now())
+            .is_ok());
+        assert!(matches!(
+            book.confirm_for_owner(id, SUB, "/work/x", Utc::now()),
+            Err(PlacementError::NotFound(_))
+        ));
+        // Asked directly by a person: nobody sits in front of a session, no advance consent.
+        let id = ask(Requester::Person { sub: SUB.into() });
+        assert!(matches!(
+            book.confirm_for_owner(id, SUB, "/work/x", Utc::now()),
+            Err(PlacementError::NoPersonInFront(_))
         ));
     }
 }

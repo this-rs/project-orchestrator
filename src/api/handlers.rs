@@ -1130,17 +1130,14 @@ pub async fn delegate_task(
     match super::execution_place_handlers::DelegationPlace::parse(req.execution_place.as_deref())? {
         super::execution_place_handlers::DelegationPlace::AsGiven => {}
         super::execution_place_handlers::DelegationPlace::EphemeralWorktree => {
-            let pending = super::execution_place_handlers::request_placement(
+            let outcome = super::execution_place_handlers::request_placement(
                 &state,
                 claims.as_ref().map(|c| &c.0),
                 parent_envelope.as_ref(),
                 prepared,
             )
             .await?;
-            return Ok((
-                StatusCode::ACCEPTED,
-                Json(DelegateTaskOutcome::ConfirmationRequired(pending)),
-            ));
+            return Ok((StatusCode::ACCEPTED, Json(outcome)));
         }
     }
     let launched = launch_delegation(&state, chat_manager, prepared, None).await;
