@@ -1507,6 +1507,36 @@ pub fn child_section(frame: &ChildFrame) -> String {
 }
 
 // ============================================================================
+// 3D scenes — the ```iso-scene block the chat interface draws
+// ============================================================================
+
+/// What the agent of a conversation a person reads in the PO interface is told about
+/// the ```iso-scene block (frontend `src/components/chat/viz/iso/`, PR #400): the
+/// interface draws it as an animated 3D scene, any other reader sees its JSON. Added by
+/// the composer only when [`super::composer::PromptAudience::displays_scenes`] says so.
+/// Its vocabulary and example are checked against the frontend's contract by
+/// `tests::the_iso_scene_section_matches_the_frontend_contract`.
+pub const SECTION_ISO_SCENE: &str = r#"## 3D scenes
+
+The interface draws a fenced `iso-scene` block as an animated 3D scene. Use one (at most one per answer) when a picture explains better than prose: a mechanism, an architecture, a progression, interacting parts; never for plain text or code, and still say it in words.
+
+The body is JSON data only; an unknown field refuses the scene:
+
+```iso-scene
+{"title":"Release","stations":[
+ {"mech":"dependency-graph","tone":"violet","label":"Plan"},
+ {"mech":"parallel-lanes","tone":"sky","label":"Build","after":[0]},
+ {"ast":{"kind":"use","ref":"flag"},"tone":"green","label":"Ship","after":[1]}],
+"build":{"mode":"sequential"}}
+```
+
+- Scene fields: title, caption, layout, stations, build. Station fields: one of mech or ast, tone, label (≤ 60 chars), after (indices, no cycle).
+- Keep 2 to 5 stations (more rarely fit). Normally omit layout; name one only when its shape means something: arch (a progression), ring (a whole and its parts), wings (two sides).
+- mech: drawers, dependency-graph, parallel-lanes, knowledge-graph, local-vault, skill-cartridge, stair-procedure, consent-gate, model-selector, reach-devices.
+- tone: green, indigo, amber, red, violet, sky. build.mode: parallel, sequential, waves.
+- One object: {"title":"...","ast":NODE}. NODE kinds: use (ref: agent, screen, chip, flag, arrow, server, document, node, step), group (children), slab (size), sphere or ring (r), puck or cone (r, h), tube (to, r); optional at, tone. Vectors [x,y,z]; sizes 0.01-6; at most 8 levels, 160 shapes. Prefer a mech."#;
+
+// ============================================================================
 // Tool Reference Groups — selective rendering of TOOL_REFERENCE
 // ============================================================================
 
@@ -2135,6 +2165,246 @@ mod tests {
             !ids.contains(&PromptSectionId::PlanExecutionAutomation),
             "PlanExec excluded without plan"
         );
+    }
+
+    /// The contract of the frontend's ```iso-scene block, copied from
+    /// this-rs/project-orchestrator-frontend@fdde6f41545e43f5d71f6e07ac5ab41abfb06dcd
+    /// (`src/components/chat/viz/iso/compile.ts`: SCENE_KEYS, STATION_KEYS; engine copy
+    /// `src/vendor/three-iso/` from website@8ff26ee: `mechanisms.ts` MECHANISMS,
+    /// `iso.ts` LAMP, `layouts.ts` LAYOUTS, `scene.ts` STATION_RANGE, `ast.ts` KINDS and
+    /// AST_LIMITS, `catalog.ts` OBJECTS, `choreography.ts` BuildMode). Re-copy it when
+    /// the frontend's contract moves. The example was also run through the frontend's
+    /// own `compileIsoScene` (main fdde6f4 and PR #401 a2b3bae), which accepted it.
+    mod iso_contract {
+        pub const SCENE_KEYS: &[&str] = &[
+            "title",
+            "caption",
+            "layout",
+            "stations",
+            "angles",
+            "home",
+            "stepSeconds",
+            "build",
+            "ast",
+            "tone",
+            "label",
+        ];
+        pub const STATION_KEYS: &[&str] = &["mech", "ast", "tone", "label", "after"];
+        pub const MECHANISMS: &[&str] = &[
+            "drawers",
+            "dependency-graph",
+            "parallel-lanes",
+            "knowledge-graph",
+            "local-vault",
+            "skill-cartridge",
+            "stair-procedure",
+            "consent-gate",
+            "model-selector",
+            "reach-devices",
+        ];
+        pub const TONES: &[&str] = &["green", "indigo", "amber", "red", "violet", "sky"];
+        /// Layouts and their station range (`STATION_RANGE`).
+        pub const LAYOUTS: &[(&str, usize, usize)] = &[
+            ("ring", 3, 12),
+            ("stadium", 4, 12),
+            ("arch", 3, 9),
+            ("wings", 2, 10),
+            ("corners", 4, 12),
+            ("solo", 1, 1),
+        ];
+        pub const KINDS: &[&str] = &[
+            "slab", "puck", "sphere", "tube", "ring", "cone", "group", "use",
+        ];
+        pub const OBJECTS: &[&str] = &[
+            "agent", "screen", "chip", "flag", "arrow", "server", "document", "node", "step",
+        ];
+        pub const BUILD_MODES: &[&str] = &["parallel", "sequential", "waves"];
+        pub const MAX_LABEL: usize = 60;
+        pub const MAX_DEPTH: usize = 8;
+        pub const MAX_SHAPES: usize = 160;
+    }
+
+    /// The checks of `compile.ts` / `defineScene` / `checkAst` a model's scene meets
+    /// first: known fields and names, one of `mech`/`ast`, station count, `after`, AST
+    /// depth and shapes. Returns the problems (empty = accepted).
+    fn iso_scene_problems(scene: &serde_json::Value) -> Vec<String> {
+        use iso_contract::*;
+        use serde_json::Value;
+        let mut out = Vec::new();
+        let Some(obj) = scene.as_object() else {
+            return vec!["not an object".into()];
+        };
+        for k in obj.keys() {
+            if !SCENE_KEYS.contains(&k.as_str()) {
+                out.push(format!("unknown scene field {k}"));
+            }
+        }
+        fn walk(n: &Value, depth: usize, shapes: &mut usize, out: &mut Vec<String>) {
+            let kind = n.get("kind").and_then(Value::as_str).unwrap_or("");
+            if !KINDS.contains(&kind) {
+                out.push(format!("unknown kind {kind}"));
+                return;
+            }
+            if depth > MAX_DEPTH {
+                out.push("tree too deep".into());
+            }
+            if let Some(t) = n.get("tone").and_then(Value::as_str) {
+                if t != "accent" && !TONES.contains(&t) {
+                    out.push(format!("unknown node tone {t}"));
+                }
+            }
+            match kind {
+                "group" => match n.get("children").and_then(Value::as_array) {
+                    Some(c) if !c.is_empty() => {
+                        c.iter().for_each(|c| walk(c, depth + 1, shapes, out))
+                    }
+                    _ => out.push("a group needs children".into()),
+                },
+                "use" => {
+                    let r = n.get("ref").and_then(Value::as_str).unwrap_or("");
+                    if !OBJECTS.contains(&r) {
+                        out.push(format!("unknown object {r}"));
+                    }
+                }
+                _ => *shapes += 1,
+            }
+        }
+        let trees: Vec<&Value> = match obj.get("stations").and_then(Value::as_array) {
+            Some(stations) => {
+                if obj.contains_key("ast") {
+                    out.push("stations and ast".into());
+                }
+                let n = stations.len();
+                if let Some(l) = obj.get("layout").and_then(Value::as_str) {
+                    match LAYOUTS.iter().find(|(k, ..)| *k == l) {
+                        Some((_, lo, hi)) if (*lo..=*hi).contains(&n) => {}
+                        Some(_) => out.push(format!("{n} stations on {l}")),
+                        None => out.push(format!("unknown layout {l}")),
+                    }
+                }
+                if let Some(mode) = scene.pointer("/build/mode").and_then(Value::as_str) {
+                    if !BUILD_MODES.contains(&mode) {
+                        out.push(format!("unknown build mode {mode}"));
+                    }
+                }
+                let mut trees = Vec::new();
+                for (i, st) in stations.iter().enumerate() {
+                    let Some(st) = st.as_object() else {
+                        out.push(format!("station {i} not an object"));
+                        continue;
+                    };
+                    for k in st.keys() {
+                        if !STATION_KEYS.contains(&k.as_str()) {
+                            out.push(format!("station {i}: unknown field {k}"));
+                        }
+                    }
+                    match (st.get("mech"), st.get("ast")) {
+                        (Some(m), None) => {
+                            if !m.as_str().is_some_and(|m| MECHANISMS.contains(&m)) {
+                                out.push(format!("station {i}: unknown mech {m}"));
+                            }
+                        }
+                        (None, Some(a)) => trees.push(a),
+                        _ => out.push(format!("station {i}: one of mech or ast")),
+                    }
+                    if let Some(t) = st.get("tone") {
+                        if !t.as_str().is_some_and(|t| TONES.contains(&t)) {
+                            out.push(format!("station {i}: unknown tone {t}"));
+                        }
+                    }
+                    if let Some(l) = st.get("label") {
+                        if l.as_str().is_none_or(|l| l.chars().count() > MAX_LABEL) {
+                            out.push(format!("station {i}: bad label"));
+                        }
+                    }
+                    for d in st
+                        .get("after")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        if !d
+                            .as_u64()
+                            .is_some_and(|d| (d as usize) < n && d as usize != i)
+                        {
+                            out.push(format!("station {i}: bad after {d}"));
+                        }
+                    }
+                }
+                trees
+            }
+            None => obj.get("ast").into_iter().collect(),
+        };
+        for t in trees {
+            let mut shapes = 0;
+            walk(t, 0, &mut shapes, &mut out);
+            if shapes > MAX_SHAPES {
+                out.push(format!("{shapes} shapes"));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_iso_scene_section_matches_the_frontend_contract() {
+        use iso_contract::*;
+        let section = SECTION_ISO_SCENE;
+        // The example: the one ```iso-scene block of the section, accepted.
+        let body = section
+            .split_once("```iso-scene\n")
+            .and_then(|(_, rest)| rest.split_once("\n```"))
+            .map(|(json, _)| json)
+            .expect("the section holds an ```iso-scene example");
+        let example: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+        assert_eq!(iso_scene_problems(&example), Vec::<String>::new());
+        // The checker is not a rubber stamp: what the frontend refuses, it refuses.
+        for bad in [
+            r#"{"stations":[{"mech":"teleporter"},{"mech":"drawers"}]}"#,
+            r#"{"stations":[{"mech":"drawers","script":"alert(1)"}]}"#,
+            r#"{"code":"x","stations":[]}"#,
+            r#"{"layout":"spiral","stations":[{"mech":"drawers"}]}"#,
+            r#"{"layout":"solo","stations":[{"mech":"drawers"},{"mech":"drawers"}]}"#,
+            r##"{"stations":[{"mech":"drawers","tone":"#ff00ff"}]}"##,
+            r#"{"ast":{"kind":"use","ref":"spaceship"}}"#,
+            r#"{"stations":[{"mech":"drawers","ast":{"kind":"use","ref":"flag"}}]}"#,
+        ] {
+            let v: serde_json::Value = serde_json::from_str(bad).unwrap();
+            assert!(
+                !iso_scene_problems(&v).is_empty(),
+                "{bad} should be refused"
+            );
+        }
+        // Every name the frontend accepts and the section teaches is spelled as the
+        // frontend spells it.
+        for name in MECHANISMS
+            .iter()
+            .chain(TONES)
+            .chain(KINDS)
+            .chain(OBJECTS)
+            .chain(BUILD_MODES)
+        {
+            assert!(section.contains(name), "the section names {name}");
+        }
+        for (layout, ..) in LAYOUTS
+            .iter()
+            .filter(|(l, ..)| ["arch", "ring", "wings"].contains(l))
+        {
+            assert!(section.contains(layout), "the section names {layout}");
+        }
+        for key in ["title", "caption", "layout", "stations", "build"] {
+            assert!(SCENE_KEYS.contains(&key) && section.contains(key), "{key}");
+        }
+        for key in STATION_KEYS {
+            assert!(
+                section.contains(key),
+                "the section names the station field {key}"
+            );
+        }
+        assert!(section.contains(&format!("{MAX_LABEL} chars")));
+        assert!(section.contains(&format!("{MAX_DEPTH} levels")));
+        assert!(section.contains(&format!("{MAX_SHAPES} shapes")));
+        // Concise: about 410 tokens (cl100k), well under 2 000 characters.
+        assert!(section.len() < 1_700, "{} chars", section.len());
     }
 
     #[test]
