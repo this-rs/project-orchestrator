@@ -431,6 +431,167 @@ impl GraphSessionHooks {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The other door: Claude Code's own events on the historical engine (ISO1)
+// ---------------------------------------------------------------------------
+
+/// The events the CLI sends to SDK callbacks that [`serve_lifecycle`] answers. `SessionStart`
+/// is not one of them: the CLI sends it to command hooks only (measured on 2.1.296), the host
+/// asks [`GraphSessionHooks::session_start`] itself, at the session's opening.
+const SERVED_EVENTS: [&str; 4] = [USER_PROMPT_SUBMIT, STOP, SUBAGENT_STOP, NOTIFICATION];
+
+/// Answers the CLI's `UserPromptSubmit`, `Stop`, `SubagentStop` and `Notification` callbacks
+/// from the session's [`SessionHooks`]: the very hooks the agent engine and the native harness
+/// call, so the three engines consult the graph the same way.
+struct LifecycleBridge {
+    hooks: Arc<dyn SessionHooks>,
+}
+
+/// A neutral [`HookReply`] as the CLI reads it (`decision: "block"` + `reason`, `systemMessage`,
+/// the event's own output), as nexus's agent engine writes it.
+fn reply_output(
+    reply: &HookReply,
+    specific: Option<nexus_claude::HookSpecificOutput>,
+) -> HookJSONOutput {
+    let reason = reply.block_reason();
+    HookJSONOutput::Sync(nexus_claude::SyncHookJSONOutput {
+        decision: reason.map(|_| "block".to_owned()),
+        reason: reason.map(str::to_owned),
+        system_message: reply.system_text().map(str::to_owned),
+        hook_specific_output: specific,
+        ..Default::default()
+    })
+}
+
+#[async_trait]
+impl nexus_claude::HookCallback for LifecycleBridge {
+    async fn execute(
+        &self,
+        input: &HookInput,
+        _tool_use_id: Option<&str>,
+        _context: &HookContext,
+    ) -> Result<HookJSONOutput, nexus_claude::SdkError> {
+        Ok(match input {
+            HookInput::UserPromptSubmit(submit) => {
+                let reply = self
+                    .hooks
+                    .user_prompt_submit(&PromptInfo::new(submit.prompt.clone()))
+                    .await;
+                let context = reply.context_text().map(|context| {
+                    nexus_claude::HookSpecificOutput::UserPromptSubmit(
+                        nexus_claude::UserPromptSubmitHookSpecificOutput {
+                            additional_context: Some(context.to_owned()),
+                        },
+                    )
+                });
+                reply_output(&reply, context)
+            }
+            HookInput::Stop(stop) => {
+                let info =
+                    StopInfo::new(stop.stop_hook_active, stop.last_assistant_message.clone());
+                reply_output(&self.hooks.before_stop(&info).await, None)
+            }
+            HookInput::SubagentStop(stop) => {
+                let mut info = SubagentStopInfo::new(
+                    stop.stop_hook_active,
+                    stop.last_assistant_message.clone(),
+                );
+                info.agent_id = stop.agent_id.clone();
+                info.agent_type = stop.agent_type.clone();
+                reply_output(&self.hooks.before_subagent_stop(&info).await, None)
+            }
+            HookInput::Notification(notification) => {
+                // A permission prompt is told by the control pump, which sees the `can_use_tool`
+                // request: the CLI sends none to SDK callbacks (measured), and if a later CLI
+                // does, it is not told twice.
+                if notification.notification_type != PERMISSION_PROMPT {
+                    let mut info = NotificationInfo::new(
+                        notification.notification_type.clone(),
+                        notification.message.clone(),
+                    );
+                    info.title = notification.title.clone();
+                    self.hooks.notification(&info).await;
+                }
+                HookJSONOutput::Sync(Default::default())
+            }
+            _ => HookJSONOutput::Sync(Default::default()),
+        })
+    }
+}
+
+/// The `Notification` type of a tool call that waits for the user's permission.
+const PERMISSION_PROMPT: &str = "permission_prompt";
+
+/// Registers, in the table of a HISTORICAL-engine session, the callbacks that serve Claude
+/// Code's own events (ISO1), and returns the session's [`SessionHooks`] for them. Called with
+/// the table `ChatManager::graph_hook_table` built, before it
+/// goes to the CLI: the hooks it returns read that table as it was BEFORE the bridge entered it
+/// (an event the table already served keeps its callbacks, consulted through them), and `wrap`
+/// is the seam of a test (`ProviderSource::wrap_lifecycle`).
+pub(crate) fn serve_lifecycle(
+    table: &mut HookTable,
+    session_id: &str,
+    cwd: &str,
+    permission_mode: Option<String>,
+    wrap: impl FnOnce(Arc<dyn SessionHooks>) -> Arc<dyn SessionHooks>,
+) -> Arc<dyn SessionHooks> {
+    let hooks = wrap(Arc::new(GraphSessionHooks::new(
+        table.clone(),
+        session_id,
+        cwd,
+        permission_mode,
+    )));
+    let bridge: Arc<dyn nexus_claude::HookCallback> = Arc::new(LifecycleBridge {
+        hooks: Arc::clone(&hooks),
+    });
+    for event in SERVED_EVENTS {
+        table.insert(
+            event.to_owned(),
+            vec![HookMatcher {
+                matcher: None,
+                hooks: vec![Arc::clone(&bridge)],
+            }],
+        );
+    }
+    hooks
+}
+
+/// Tells the session's `Notification` hook that a tool call waits for the user's permission,
+/// without waiting for the hook (it observes, it never holds a turn back). `AskUserQuestion`
+/// is a question, not a permission.
+pub(crate) fn notify_permission_prompt(hooks: &Arc<dyn SessionHooks>, tool: &str) {
+    if tool == "AskUserQuestion" {
+        return;
+    }
+    let hooks = Arc::clone(hooks);
+    let info = NotificationInfo::permission_prompt(tool);
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(5), hooks.notification(&info)).await;
+    });
+}
+
+/// Asks the session's `SessionStart` hook, at the opening of a historical-engine session
+/// (`source`: `startup` or `resume`). Its `systemMessage` is logged; a context it adds is not
+/// carried to the CLI on this engine (see the matrix row's note).
+pub(crate) async fn ask_session_start(
+    hooks: &Arc<dyn SessionHooks>,
+    source: &str,
+    session_id: &str,
+) {
+    let info = SessionStartInfo::new(source);
+    match tokio::time::timeout(Duration::from_secs(5), hooks.session_start(&info)).await {
+        Ok(reply) => {
+            if reply.context_text().is_some() {
+                warn!(
+                    session_id,
+                    "SessionStart hook context not delivered on the historical Claude Code engine"
+                );
+            }
+        }
+        Err(_) => warn!(session_id, "SessionStart hook timed out"),
+    }
+}
+
 /// How long the decider may take before the turn goes on without it.
 pub(crate) const DECIDE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -2137,6 +2298,87 @@ mod tests {
         assert_eq!(
             hooks_.before_stop(&StopInfo::new(false, None)).await.block,
             None
+        );
+    }
+
+    /// What the CLI is answered for `input` by the callback `serve_lifecycle` put under `event`.
+    async fn cli_answer(table: &HookTable, event: &str, input: HookInput) -> HookJSONOutput {
+        table[event][0].hooks[0]
+            .execute(&input, None, &HookContext { signal: None })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn serve_lifecycle_answers_the_cli_events_from_the_session_hooks() {
+        let stop = Scripted::answering(blocking("write the tests first"));
+        let mut table_ = table(STOP, None, vec![stop.clone()]);
+        let _hooks = serve_lifecycle(&mut table_, "s1", "/work/app", None, |h| h);
+        for event in SERVED_EVENTS {
+            assert_eq!(table_[event].len(), 1, "{event} has the bridge, alone");
+        }
+        // The CLI's Stop is answered with the block of the callback the table already served.
+        let out = cli_answer(
+            &table_,
+            STOP,
+            HookInput::Stop(StopHookInput {
+                session_id: "s1".into(),
+                transcript_path: String::new(),
+                cwd: "/work/app".into(),
+                permission_mode: None,
+                stop_hook_active: false,
+                last_assistant_message: Some("done".into()),
+            }),
+        )
+        .await;
+        let HookJSONOutput::Sync(sync) = out else {
+            panic!("a sync output is expected");
+        };
+        assert_eq!(sync.decision.as_deref(), Some("block"));
+        assert_eq!(sync.reason.as_deref(), Some("write the tests first"));
+        assert_eq!(stop.seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_bridge_leaves_the_permission_prompt_to_the_control_pump() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counting(AtomicUsize);
+        #[async_trait]
+        impl SessionHooks for Counting {
+            async fn notification(&self, _info: &NotificationInfo) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let counting = Arc::new(Counting(AtomicUsize::new(0)));
+        let mut table_ = HookTable::new();
+        let seen = Arc::clone(&counting);
+        let _hooks = serve_lifecycle(&mut table_, "s1", "/work/app", None, move |_| seen);
+        let notification = |kind: &str| {
+            HookInput::Notification(NotificationHookInput {
+                session_id: "s1".into(),
+                transcript_path: String::new(),
+                cwd: "/work/app".into(),
+                permission_mode: None,
+                message: "m".into(),
+                title: None,
+                notification_type: kind.into(),
+            })
+        };
+        // A permission prompt is told by the control pump, once; any other kind comes here.
+        cli_answer(&table_, NOTIFICATION, notification(PERMISSION_PROMPT)).await;
+        assert_eq!(counting.0.load(Ordering::SeqCst), 0);
+        cli_answer(&table_, NOTIFICATION, notification("idle_prompt")).await;
+        assert_eq!(counting.0.load(Ordering::SeqCst), 1);
+        notify_permission_prompt(&(counting.clone() as Arc<dyn SessionHooks>), "Bash");
+        notify_permission_prompt(
+            &(counting.clone() as Arc<dyn SessionHooks>),
+            "AskUserQuestion",
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            counting.0.load(Ordering::SeqCst),
+            2,
+            "a question is no permission"
         );
     }
 

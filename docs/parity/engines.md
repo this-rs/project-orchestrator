@@ -19,11 +19,11 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | `hooks.before_tool` | le hook PreToolUse du graphe est consulté avant un outil | ok | ok | ok | not_measured | not_measured | not_measured |
 | `hooks.after_tool` | le hook PostToolUse du graphe répond après un Grep bruyant (find_references) | ok | ok | ok | not_measured | not_measured | not_measured |
 | `hooks.before_compaction` | le hook PreCompact du graphe nomme le projet dans les instructions du résumé (Claude Code : `systemMessage`, le champ que lit le CLI) | ok | ok | ok | not_measured | not_measured | not_measured |
-| `hooks.session_start` | le hook SessionStart du graphe est consulté à l'ouverture de la session (contract v7) | gap (harnais, PISO1) | ok | ok | not_measured | not_measured | not_measured |
-| `hooks.user_prompt_submit` | le hook UserPromptSubmit du graphe est consulté avant chaque tour (contract v7) | gap (harnais, PISO1) | ok | ok | not_measured | not_measured | not_measured |
-| `hooks.stop` | le hook Stop du graphe est consulté avant la fin du tour ; un block fait continuer le tour avec la raison (contract v7) | gap (harnais, PISO1) | gap (harnais, PISO1) | ok | not_measured | not_measured | not_measured |
-| `hooks.subagent_stop` | le hook SubagentStop du graphe est consulté quand un sous-agent s'arrête (contract v7) | gap (harnais, PISO1) | gap (harnais, PISO1) | ok | not_measured | not_measured | not_measured |
-| `hooks.notification` | le hook Notification du graphe est appelé quand une permission est attendue (contract v7) | gap (harnais, PISO1) | gap (harnais, PISO1) | ok | not_measured | not_measured | not_measured |
+| `hooks.session_start` | le hook SessionStart du graphe est consulté à l'ouverture de la session (contract v7) | ok | ok | ok | not_measured | not_measured | not_measured |
+| `hooks.user_prompt_submit` | le hook UserPromptSubmit du graphe est consulté avant chaque tour (contract v7) | ok | ok | ok | not_measured | not_measured | not_measured |
+| `hooks.stop` | le hook Stop du graphe est consulté avant la fin du tour ; un block fait continuer le tour avec la raison (contract v7) | ok | ok | ok | not_measured | not_measured | not_measured |
+| `hooks.subagent_stop` | le hook SubagentStop du graphe est consulté quand un sous-agent s'arrête (contract v7) | ok | ok | ok | not_measured | not_measured | not_measured |
+| `hooks.notification` | le hook Notification du graphe est appelé quand une permission est attendue (contract v7) | ok | ok | ok | not_measured | not_measured | not_measured |
 | `compaction` | compaction_started et compact_boundary sur le fil | ok | ok | ok | not_measured | not_measured | not_measured |
 | `compaction.manual` | `/compact <instructions>` envoyé depuis le chat : Claude Code reçoit la commande telle quelle (le CLI compacte, compact_boundary trigger manual) ; le natif compacte hors tour (AgentSession::compact), les instructions et le hook PreCompact dans la requête de résumé, aucun tour envoyé au modèle, compaction_started / compact_boundary trigger manual sur le fil (ISO3) | ok | ok | ok | not_measured | not_measured | not_measured |
 | `message_queue` | un message envoyé pendant un tour l'interrompt et passe ensuite | ok | ok | ok | not_measured | not_measured | not_measured |
@@ -56,20 +56,12 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | `session_limits` | sans réglage, aucune limite de durée par tour ni budget de session (ISO5) : le CLI ne reçoit pas --max-budget-usd, une session du moteur agent s'ouvre et reprend sans turn_timeout_ms ni max_tokens | ok | ok | ok | not_measured | not_measured | not_measured |
 | `anthropic_messages` | une instance `anthropic` (clé au coffre) : le harnais natif parle lui-même l'API Messages, et la requête reçue par le modèle porte les trois points cache_control — dernier outil, système, dernier tour (CTX5) | not_measured | not_measured | ok | not_measured | not_measured | not_measured |
 
-`ok` : Claude Code 31/39, Claude Code (moteur agent) 33/39, natif 39/39, Codex 0/39, opencode 0/39, ACP 0/39.
+`ok` : Claude Code 36/39, Claude Code (moteur agent) 36/39, natif 39/39, Codex 0/39, opencode 0/39, ACP 0/39.
 
 ## Écarts déclarés
 
 | Moteur | Fonction | Cause | Tâche | Ce qui manque |
 |---|---|---|---|---|
-| Claude Code | `hooks.session_start` | harnais | PISO1 | le chemin CC Legacy (InteractiveClient direct) enregistre les hooks via graph_hook_table() qui ne couvre que PreCompact / PreToolUse / PostToolUse ; les 5 événements du contrat v7 ne sont pas envoyés au CLI — ils fonctionnent sur le moteur agent (neutral_hooks) et sur le natif (appels SessionHooks directs) |
-| Claude Code | `hooks.user_prompt_submit` | harnais | PISO1 | le chemin CC Legacy (InteractiveClient direct) enregistre les hooks via graph_hook_table() qui ne couvre que PreCompact / PreToolUse / PostToolUse ; les 5 événements du contrat v7 ne sont pas envoyés au CLI — ils fonctionnent sur le moteur agent (neutral_hooks) et sur le natif (appels SessionHooks directs) |
-| Claude Code | `hooks.stop` | harnais | PISO1 | le chemin CC Legacy (InteractiveClient direct) enregistre les hooks via graph_hook_table() qui ne couvre que PreCompact / PreToolUse / PostToolUse ; les 5 événements du contrat v7 ne sont pas envoyés au CLI — ils fonctionnent sur le moteur agent (neutral_hooks) et sur le natif (appels SessionHooks directs) |
-| Claude Code | `hooks.subagent_stop` | harnais | PISO1 | le chemin CC Legacy (InteractiveClient direct) enregistre les hooks via graph_hook_table() qui ne couvre que PreCompact / PreToolUse / PostToolUse ; les 5 événements du contrat v7 ne sont pas envoyés au CLI — ils fonctionnent sur le moteur agent (neutral_hooks) et sur le natif (appels SessionHooks directs) |
-| Claude Code | `hooks.notification` | harnais | PISO1 | le chemin CC Legacy (InteractiveClient direct) enregistre les hooks via graph_hook_table() qui ne couvre que PreCompact / PreToolUse / PostToolUse ; les 5 événements du contrat v7 ne sont pas envoyés au CLI — ils fonctionnent sur le moteur agent (neutral_hooks) et sur le natif (appels SessionHooks directs) |
-| Claude Code (moteur agent) | `hooks.stop` | harnais | PISO1 | le moteur agent (AgentSession) enregistre les hooks via neutral_hooks() mais les appels de cycle de vie (before_stop, before_subagent_stop, notification) ne sont faits que par la boucle du harnais natif ; la façade n'appelle pas encore SessionHooks pour ces événements sur le chemin CC Agent Engine |
-| Claude Code (moteur agent) | `hooks.subagent_stop` | harnais | PISO1 | le moteur agent (AgentSession) enregistre les hooks via neutral_hooks() mais les appels de cycle de vie (before_stop, before_subagent_stop, notification) ne sont faits que par la boucle du harnais natif ; la façade n'appelle pas encore SessionHooks pour ces événements sur le chemin CC Agent Engine |
-| Claude Code (moteur agent) | `hooks.notification` | harnais | PISO1 | le moteur agent (AgentSession) enregistre les hooks via neutral_hooks() mais les appels de cycle de vie (before_stop, before_subagent_stop, notification) ne sont faits que par la boucle du harnais natif ; la façade n'appelle pas encore SessionHooks pour ces événements sur le chemin CC Agent Engine |
 
 ## Non mesuré
 

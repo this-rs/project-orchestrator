@@ -45,11 +45,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use nexus_claude::agent::SessionHooks;
 use nexus_claude::{
     build_hook_response_json, dispatch_hook_from_registry, is_hook_callback, HookCallback,
 };
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::{debug, info, warn};
+
+use super::agent_hooks::notify_permission_prompt;
 
 /// The registry `InteractiveClient::hook_callbacks()` hands out: callback id →
 /// callback. Shared with the client, which keeps registering into it.
@@ -82,6 +85,7 @@ pub fn spawn(
     mut raw_rx: mpsc::Receiver<serde_json::Value>,
     registry: HookRegistry,
     stdin_tx: Option<mpsc::Sender<String>>,
+    notifier: Option<Arc<dyn SessionHooks>>,
 ) -> mpsc::Receiver<serde_json::Value> {
     let (forward_tx, forward_rx) = mpsc::channel(FORWARD_CAPACITY);
 
@@ -97,6 +101,9 @@ pub fn spawn(
 
         while let Some(msg) = raw_rx.recv().await {
             if !is_hook_callback(&msg) {
+                if let (Some(hooks), Some(tool)) = (&notifier, permission_tool(&msg)) {
+                    notify_permission_prompt(hooks, &tool);
+                }
                 if forward_tx.send(msg).await.is_err() {
                     debug!(session_id = %session_id, "Control pump: forward receiver dropped, stopping");
                     break;
@@ -121,6 +128,18 @@ pub fn spawn(
     });
 
     forward_rx
+}
+
+/// The tool a `can_use_tool` control request asks permission for (`None` for any other message).
+fn permission_tool(msg: &serde_json::Value) -> Option<String> {
+    let request = msg.get("request").unwrap_or(msg);
+    (request.get("subtype").and_then(|s| s.as_str()) == Some("can_use_tool")).then(|| {
+        request
+            .get("tool_name")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    })
 }
 
 /// The CLI's request id lives either at the top level or under `request`,
@@ -234,7 +253,13 @@ mod tests {
         let (raw_tx, raw_rx) = mpsc::channel(16);
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(16);
         let calls = Arc::new(AtomicUsize::new(0));
-        let _forward_rx = spawn("sess".into(), raw_rx, registry_with(&calls), Some(stdin_tx));
+        let _forward_rx = spawn(
+            "sess".into(),
+            raw_rx,
+            registry_with(&calls),
+            Some(stdin_tx),
+            None,
+        );
 
         for i in 0..5 {
             raw_tx
@@ -265,7 +290,13 @@ mod tests {
         let (raw_tx, raw_rx) = mpsc::channel(16);
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(16);
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut forward_rx = spawn("sess".into(), raw_rx, registry_with(&calls), Some(stdin_tx));
+        let mut forward_rx = spawn(
+            "sess".into(),
+            raw_rx,
+            registry_with(&calls),
+            Some(stdin_tx),
+            None,
+        );
 
         let permission = serde_json::json!({
             "type": "control_request",
@@ -295,7 +326,13 @@ mod tests {
         let (raw_tx, raw_rx) = mpsc::channel(16);
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(16);
         let calls = Arc::new(AtomicUsize::new(0));
-        let _forward_rx = spawn("sess".into(), raw_rx, registry_with(&calls), Some(stdin_tx));
+        let _forward_rx = spawn(
+            "sess".into(),
+            raw_rx,
+            registry_with(&calls),
+            Some(stdin_tx),
+            None,
+        );
 
         raw_tx
             .send(hook_request("req-unknown", "cb-missing"))
@@ -324,7 +361,13 @@ mod tests {
         let (raw_tx, raw_rx) = mpsc::channel(16);
         let (stdin_tx, _stdin_rx) = mpsc::channel::<String>(16);
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut forward_rx = spawn("sess".into(), raw_rx, registry_with(&calls), Some(stdin_tx));
+        let mut forward_rx = spawn(
+            "sess".into(),
+            raw_rx,
+            registry_with(&calls),
+            Some(stdin_tx),
+            None,
+        );
         drop(raw_tx);
         assert!(timeout(Duration::from_secs(2), forward_rx.recv())
             .await

@@ -7678,7 +7678,7 @@ impl ChatManager {
         let work_log = Arc::new(Mutex::new(SessionWorkLog::default()));
 
         // Build session hooks: PreCompact (compaction notifier) + PreToolUse (skill activation)
-        let session_hooks = {
+        let (session_hooks, lifecycle_hooks) = {
             let context_source = match &spawned_ctx {
                 Some(ctx) if ctx.task_id.is_some() => {
                     CompactionContextSource::Task(ctx.task_id.unwrap())
@@ -7688,7 +7688,7 @@ impl ChatManager {
                     None => CompactionContextSource::None,
                 },
             };
-            self.graph_hook_table(GraphHookInput {
+            let mut table = self.graph_hook_table(GraphHookInput {
                 session_id: session_id.to_string(),
                 context_source,
                 work_log: work_log.clone(),
@@ -7698,7 +7698,16 @@ impl ChatManager {
                 // full task context via the prompt.
                 tool_knowledge: request.runner_context.is_none(),
                 announce: Some(events_tx.clone()),
-            })
+            });
+            // ISO1: Claude Code's own events (UserPromptSubmit, Stop, SubagentStop,
+            // Notification) consult the same hooks as on the agent engine and the native harness.
+            let lifecycle = self.serve_lifecycle_hooks(
+                &mut table,
+                &session_id.to_string(),
+                &request.cwd,
+                request.permission_mode.clone(),
+            );
+            (table, lifecycle)
         };
 
         // Build options and create InteractiveClient
@@ -7735,6 +7744,9 @@ impl ChatManager {
                 e
             );
         }
+        // ISO1: the CLI sends no SessionStart to SDK callbacks: the host asks it itself.
+        super::agent_hooks::ask_session_start(&lifecycle_hooks, "startup", &session_id.to_string())
+            .await;
 
         // Create ConversationMemoryManager for message recording
         // It records into the conversation named on the node at creation.
@@ -7770,6 +7782,7 @@ impl ChatManager {
                 raw_rx,
                 client.hook_callbacks(),
                 stdin_tx.clone(),
+                Some(Arc::clone(&lifecycle_hooks)),
             )
         });
         let sdk_control_rx = Arc::new(tokio::sync::Mutex::new(sdk_control_rx));
@@ -12474,6 +12487,20 @@ impl ChatManager {
             });
     }
 
+    /// ISO1: the hooks the HISTORICAL engine answers Claude Code's own events with. Registers
+    /// their callbacks in the session's table (`agent_hooks::serve_lifecycle`).
+    fn serve_lifecycle_hooks(
+        &self,
+        table: &mut super::agent_hooks::HookTable,
+        session_id: &str,
+        cwd: &str,
+        permission_mode: Option<String>,
+    ) -> Arc<dyn nexus_claude::agent::SessionHooks> {
+        super::agent_hooks::serve_lifecycle(table, session_id, cwd, permission_mode, |hooks| {
+            self.provider_source.wrap_lifecycle(hooks)
+        })
+    }
+
     /// The hooks a resumed Claude CLI session is given: the SAME as at its creation
     /// (`create_session` → [`Self::graph_hook_table`]), B14.
     fn resume_hook_table(
@@ -12726,7 +12753,14 @@ impl ChatManager {
         let work_log = Arc::new(Mutex::new(SessionWorkLog::default()));
 
         // Build session hooks: the same table as at creation (B14).
-        let session_hooks = self.resume_hook_table(session_node, &events_tx, &work_log);
+        let mut session_hooks = self.resume_hook_table(session_node, &events_tx, &work_log);
+        // ISO1: Claude Code's own events consult the session's hooks (see create_session).
+        let lifecycle_hooks = self.serve_lifecycle_hooks(
+            &mut session_hooks,
+            session_id,
+            &session_node.cwd,
+            session_node.permission_mode.clone(),
+        );
 
         // A resume keeps the access the session was opened with and can only narrow it.
         let access = super::provider::policy::SessionAccess::for_resume(session_node.access, None);
@@ -12857,6 +12891,13 @@ impl ChatManager {
             }
             break candidate;
         };
+        // ISO1: the CLI sends no SessionStart to SDK callbacks: the host asks it itself.
+        let source = if resume_with.is_some() {
+            "resume"
+        } else {
+            "startup"
+        };
+        super::agent_hooks::ask_session_start(&lifecycle_hooks, source, session_id).await;
 
         // Clone stdin sender for lock-free permission responses (see create_session).
         let stdin_tx = client.clone_stdin_sender().await;
@@ -12869,6 +12910,7 @@ impl ChatManager {
                 raw_rx,
                 client.hook_callbacks(),
                 stdin_tx.clone(),
+                Some(Arc::clone(&lifecycle_hooks)),
             )
         });
         let sdk_control_rx = Arc::new(tokio::sync::Mutex::new(sdk_control_rx));

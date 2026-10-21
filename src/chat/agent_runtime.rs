@@ -596,6 +596,18 @@ pub trait TurnServices: Send + Sync {
 pub trait ProviderSource: Send + Sync {
     /// The instance, when it exists.
     fn get(&self, provider_id: &str) -> Option<Arc<dyn AgentProvider>>;
+
+    /// The lifecycle hooks (`UserPromptSubmit`, `Stop`, `SubagentStop`, `Notification`,
+    /// `SessionStart`) the HISTORICAL Claude Code engine serves, as the engine hands them to
+    /// `agent_hooks::serve_lifecycle`. The agent engine gets its hooks through the provider's
+    /// `SessionSpec`, which a source can tap; the historical engine has no provider, so this is
+    /// its seam. The default returns them unchanged; a test overrides it to record the calls.
+    fn wrap_lifecycle(
+        &self,
+        hooks: Arc<dyn nexus_claude::agent::SessionHooks>,
+    ) -> Arc<dyn nexus_claude::agent::SessionHooks> {
+        hooks
+    }
 }
 
 /// How many answered request ids a session keeps ([`AgentSessionHandle::answers_itself`]).

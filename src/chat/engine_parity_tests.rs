@@ -350,85 +350,6 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
             why: CLI_PROMPT_CACHE,
         },
     ),
-    // ISO1: the 5 contract-v7 hooks on CC Legacy. graph_hook_table() only registers
-    // PreCompact / PreToolUse / PostToolUse; the new events go through neutral_hooks()
-    // on the Agent Engine path and through direct SessionHooks calls on Native.
-    (
-        Engine::ClaudeCode,
-        "hooks.session_start",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "PISO1",
-            why: CC_LEGACY_NO_V7_HOOKS,
-        },
-    ),
-    (
-        Engine::ClaudeCode,
-        "hooks.user_prompt_submit",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "PISO1",
-            why: CC_LEGACY_NO_V7_HOOKS,
-        },
-    ),
-    (
-        Engine::ClaudeCode,
-        "hooks.stop",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "PISO1",
-            why: CC_LEGACY_NO_V7_HOOKS,
-        },
-    ),
-    (
-        Engine::ClaudeCode,
-        "hooks.subagent_stop",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "PISO1",
-            why: CC_LEGACY_NO_V7_HOOKS,
-        },
-    ),
-    (
-        Engine::ClaudeCode,
-        "hooks.notification",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "PISO1",
-            why: CC_LEGACY_NO_V7_HOOKS,
-        },
-    ),
-    // ISO1: 3 contract-v7 lifecycle hooks on CC Agent Engine. neutral_hooks() registers
-    // them in the CLI protocol, but the harness-side SessionHooks calls (before_stop,
-    // before_subagent_stop, notification) are only made by the native turn loop.
-    // session_start and user_prompt_submit work because the façade calls them directly.
-    (
-        Engine::ClaudeCodeAgent,
-        "hooks.stop",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "PISO1",
-            why: CC_AGENT_NO_LIFECYCLE_HOOKS,
-        },
-    ),
-    (
-        Engine::ClaudeCodeAgent,
-        "hooks.subagent_stop",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "PISO1",
-            why: CC_AGENT_NO_LIFECYCLE_HOOKS,
-        },
-    ),
-    (
-        Engine::ClaudeCodeAgent,
-        "hooks.notification",
-        Expect::Gap {
-            cause: Cause::Harness,
-            task: "PISO1",
-            why: CC_AGENT_NO_LIFECYCLE_HOOKS,
-        },
-    ),
 ];
 
 /// Why `nexus_tools` is not measured on Claude Code, whatever its engine.
@@ -445,30 +366,6 @@ const CLI_PROMPT_CACHE: &str =
     "le CLI Claude parle lui-même l'API Messages et pose ses propres points \
                                 de cache : fake_claude rejoue un transcript, la requête au modèle \
                                 n'est pas visible du harnais";
-
-/// Why the 5 contract-v7 hooks are gaps on the CC Legacy engine. `graph_hook_table()`
-/// only registers PreCompact, PreToolUse and PostToolUse hook callbacks; the CLI never
-/// sends hook_callbacks for the new events (`UserPromptSubmit`, `Stop`, `SubagentStop`,
-/// `Notification`). The Agent Engine path uses `neutral_hooks()` which registers all 7,
-/// and the Native path calls `SessionHooks` directly.
-const CC_LEGACY_NO_V7_HOOKS: &str =
-    "le chemin CC Legacy (InteractiveClient direct) enregistre les hooks via \
-     graph_hook_table() qui ne couvre que PreCompact / PreToolUse / PostToolUse ; \
-     les 5 événements du contrat v7 ne sont pas envoyés au CLI — ils fonctionnent \
-     sur le moteur agent (neutral_hooks) et sur le natif (appels SessionHooks directs)";
-
-/// Why `hooks.stop`, `hooks.subagent_stop` and `hooks.notification` are gaps on the
-/// CC Agent Engine. These lifecycle hooks (`before_stop`, `before_subagent_stop`,
-/// `notification`) are called directly by the native harness's turn loop; the Agent
-/// Engine (nexus `AgentSession`) doesn't call SessionHooks for them yet — the CLI
-/// protocol registers them via `neutral_hooks()` but the harness-side lifecycle calls
-/// are missing. `hooks.session_start` and `hooks.user_prompt_submit` work because
-/// the backend façade calls them directly (before the engine).
-const CC_AGENT_NO_LIFECYCLE_HOOKS: &str =
-    "le moteur agent (AgentSession) enregistre les hooks via neutral_hooks() mais \
-     les appels de cycle de vie (before_stop, before_subagent_stop, notification) \
-     ne sont faits que par la boucle du harnais natif ; la façade n'appelle pas \
-     encore SessionHooks pour ces événements sur le chemin CC Agent Engine";
 
 /// Why every function is `not_measured` on Codex (YARDSTICK, task 87eb345e).
 const CODEX_NOT_MEASURED: &str =
@@ -1045,6 +942,19 @@ impl Stage {
         answers: &Arc<Answers>,
         path: ProviderPath,
     ) -> Arc<ChatManager> {
+        self.backend_with(cli, answers, answers, path).await
+    }
+
+    /// [`Self::backend`] with the hooks of the native instance recorded in `answers` and those
+    /// of Claude Code (either engine) in `claude_answers`: a column never reads the calls of
+    /// the other.
+    async fn backend_with(
+        &self,
+        cli: &FakeClaude,
+        answers: &Arc<Answers>,
+        claude_answers: &Arc<Answers>,
+        path: ProviderPath,
+    ) -> Arc<ChatManager> {
         let config = ChatConfig {
             provider_path: path,
             mcp_server_path: fake_bin("fake_mcp"),
@@ -1093,7 +1003,7 @@ impl Stage {
             },
             claude: Tap {
                 inner: claude,
-                answers: Arc::clone(answers),
+                answers: Arc::clone(claude_answers),
             },
         })));
         // The native sessions run their `Agent` calls as child sessions (P18).
@@ -2133,6 +2043,15 @@ impl ProviderSource for Taps {
             _ => None,
         }
     }
+
+    /// The historical engine has no provider to tap: the hooks it serves Claude Code's own
+    /// events with are recorded in the Claude Code column's answers.
+    fn wrap_lifecycle(&self, hooks: Arc<dyn SessionHooks>) -> Arc<dyn SessionHooks> {
+        Arc::new(Recording {
+            inner: hooks,
+            answers: Arc::clone(&self.claude.answers),
+        })
+    }
 }
 
 /// ISO5: whether every session of `kind` (one at least) was opened and resumed with neither a
@@ -3013,6 +2932,8 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     store_instance(&stage.graph, &instance(&fake, "none")).await;
     consent(&stage.graph, "proj", "local", &fake.origin()).await;
     let answers: Arc<Answers> = Arc::default();
+    // What the hooks of Claude Code (either engine) were asked, apart from the native harness's.
+    let cc_answers: Arc<Answers> = Arc::default();
 
     let mut cc = Measures::default();
     let mut na = Measures::default();
@@ -3027,7 +2948,7 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     // ===================================================================
     // Claude Code, historical engine (backend process #1)
     // ===================================================================
-    let manager = stage.backend(&cli, &answers, path).await;
+    let manager = stage.backend_with(&cli, &answers, &cc_answers, path).await;
     let mut req = request(None, Some("proj"), "default");
     req.cwd = cwd.clone();
     req.message = format!("{}: where is the spec built?", kc.k("TURN-ONE"));
@@ -3093,62 +3014,36 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
             compact.as_deref().map(excerpt)
         ),
     );
-    // ISO1: SessionStart — the façade calls hooks.session_start() directly (not through
-    // the CLI hook protocol). Verified through the Recording / answers struct.
-    let ss = answers.session_start_sources.lock().unwrap().clone();
+    // ISO1: SessionStart — the CLI sends none to SDK callbacks (measured), the host asks the
+    // session's hook itself at the opening, on both engines.
+    let ss = cc_answers.session_start_sources.lock().unwrap().clone();
     cc.check(
         "hooks.session_start",
         !ss.is_empty(),
         Cause::Harness,
         format!("session_start appelé {} fois, sources={ss:?}", ss.len()),
     );
-    // ISO1: UserPromptSubmit — checked via the Recording struct, not via CLI output.
-    // On CC Legacy the hook is never dispatched (graph_hook_table doesn't register it),
-    // so the answers field stays empty → Gap(Harness). Using cli.wait_line() here would
-    // block for WAIT (20 s) on CC Legacy and desynchronise the rest of the scenario.
-    let prompts = answers.user_prompt_submit_prompts.lock().unwrap().clone();
+    // ISO1: UserPromptSubmit — the CLI's callback reaches the session's hook, and the CLI is
+    // answered (the response line carries the callback's request id).
+    let prompt_answered = cli.wait_line(0, "hook-prompt", WAIT).await.is_some();
+    let prompts = cc_answers
+        .user_prompt_submit_prompts
+        .lock()
+        .unwrap()
+        .clone();
     cc.check(
         "hooks.user_prompt_submit",
-        !prompts.is_empty(),
+        prompt_answered && !prompts.is_empty(),
         Cause::Harness,
         format!(
-            "user_prompt_submit appelé {} fois, prompts={:?}",
+            "CLI répondu={prompt_answered}, user_prompt_submit appelé {} fois, prompts={:?}",
             prompts.len(),
             prompts.iter().map(|p| excerpt(p)).collect::<Vec<_>>()
         ),
     );
-    // ISO1: Stop — checked via the Recording struct only. On CC Legacy the hook is
-    // never dispatched (graph_hook_table doesn't register it). On CC Agent Engine the
-    // CLI protocol registers it via neutral_hooks(), but the lifecycle hook
-    // (before_stop) is only called by the native harness's turn loop — the Agent
-    // Engine doesn't call SessionHooks::before_stop() yet. Using cli.wait_line()
-    // here would block for WAIT (20 s) on both CC paths and kill the session.
-    let stop_replies = answers.stop_replies.lock().unwrap().clone();
-    cc.check(
-        "hooks.stop",
-        !stop_replies.is_empty(),
-        Cause::Harness,
-        format!(
-            "stop appelé {} fois, stop_replies={stop_replies:?}",
-            stop_replies.len()
-        ),
-    );
-    // ISO1: SubagentStop — same reasoning: the lifecycle call is native-only.
-    let sub_called = *answers.subagent_stop_called.lock().unwrap();
-    cc.check(
-        "hooks.subagent_stop",
-        sub_called,
-        Cause::Harness,
-        format!("before_subagent_stop appelé={sub_called}"),
-    );
-    // ISO1: Notification — same reasoning: the lifecycle call is native-only.
-    let notif = answers.notification_types.lock().unwrap().clone();
-    cc.check(
-        "hooks.notification",
-        notif.iter().any(|t| t == "permission_prompt"),
-        Cause::Harness,
-        format!("notification appelé {} fois, types={notif:?}", notif.len()),
-    );
+    // Stop, SubagentStop and Notification are measured further down, after the turns in
+    // which the fake CLI raises them (TURN-THREE, TURN-AGENT, TURN-FIVE): measured here they
+    // read as gaps only because their turn had not happened yet.
     assert!(
         w.said(WAIT, "answered one").await,
         "the first Claude Code turn never answered"
@@ -3203,6 +3098,8 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     cc_sent += 1;
     assert!(cli.wait_line(0, &kc.k("TURN-TWO"), WAIT).await.is_some());
     tokio::time::sleep(Duration::from_millis(300)).await;
+    // ISO1: the Stop hook of this turn blocks once (as the native TURN-STOP does).
+    *cc_answers.stop_block_once.lock().unwrap() = Some("keep going".to_string());
     manager
         .send_message(&sid, &kc.k("TURN-THREE"))
         .await
@@ -3220,6 +3117,27 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         ),
     );
     w.settle(ends, &manager).await;
+    // ISO1: Stop — the session's hook was consulted before the turn ended, and its block
+    // went to the CLI as `decision: block` + the reason: the answer the CLI reads to carry
+    // the turn on (fake_claude replays a transcript, so the relaunch itself is the CLI's).
+    let stop_line = cli
+        .wait_line(0, "hook-stop", WAIT)
+        .await
+        .unwrap_or_default();
+    let stop_replies = cc_answers.stop_replies.lock().unwrap().clone();
+    let blocked = stop_replies
+        .iter()
+        .any(|r| r.block_reason() == Some("keep going"));
+    cc.check(
+        "hooks.stop",
+        blocked && stop_line.contains("\"block\"") && stop_line.contains("keep going"),
+        Cause::Harness,
+        format!(
+            "stop appelé {} fois, hook a bloqué={blocked}, réponse au CLI : {}",
+            stop_replies.len(),
+            excerpt(&stop_line)
+        ),
+    );
 
     // Auto-continue: always on (decision 7b95342a), no toggle sent.
     let ends = w.turn_ends();
@@ -3296,6 +3214,16 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         allowed.contains("\"behavior\":\"allow\"") && w.said(WAIT, "answered five").await,
         Cause::Harness,
         format!("réponse écrite : {}", excerpt(&allowed)),
+    );
+    // ISO1: Notification — a tool call waited for the user's permission: the session's hook
+    // was told (the CLI sends no such notification to SDK callbacks, measured: the host tells
+    // it from the `can_use_tool` request, on both engines).
+    let notif = cc_answers.notification_types.lock().unwrap().clone();
+    cc.check(
+        "hooks.notification",
+        notif.iter().any(|t| t == "permission_prompt"),
+        Cause::Harness,
+        format!("notification appelé {} fois, types={notif:?}", notif.len()),
     );
     w.settle(ends, &manager).await;
     let (timed, seen) = timing_verdict(&w.persisted().await, "t5");
@@ -3663,6 +3591,16 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         Cause::Harness,
         format!("messages du sous-agent sous t-agent={nested}, réponse en résultat={returned}"),
     );
+    // ISO1: SubagentStop — the CLI's callback reached the session's hook, and the CLI was
+    // answered.
+    let sub_answered = cli.wait_line(0, "hook-subagent-stop", WAIT).await.is_some();
+    let sub_called = *cc_answers.subagent_stop_called.lock().unwrap();
+    cc.check(
+        "hooks.subagent_stop",
+        sub_answered && sub_called,
+        Cause::Harness,
+        format!("CLI répondu={sub_answered}, before_subagent_stop appelé={sub_called}"),
+    );
     w.settle(ends, &manager).await;
 
     // A tool result of about a megabyte: the turn closes, the next one starts.
@@ -3692,7 +3630,7 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     drop(w);
     drop(manager);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let manager = stage.backend(&cli, &answers, path).await;
+    let manager = stage.backend_with(&cli, &answers, &cc_answers, path).await;
     manager
         .resume_session(&sid, &format!("{}: go on", kc.k("RESUMED")), Some(&claims))
         .await
@@ -3723,7 +3661,7 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
         .count();
     let spawned = !cli.args(0).is_empty() && !cli.args(1).is_empty();
     let (specs_ok, specs_seen) = if matches!(path, ProviderPath::Agent) {
-        no_session_limits(&answers, ProviderKind::ClaudeCode)
+        no_session_limits(&cc_answers, ProviderKind::ClaudeCode)
     } else {
         (true, "moteur historique : aucune SessionSpec".to_string())
     };
