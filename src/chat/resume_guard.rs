@@ -69,8 +69,8 @@ mod tests {
 
     #[test]
     fn a_resume_that_loses_a_server_is_refused_and_names_the_field() {
-        let stored = fingerprint_json(&names(&["project-orchestrator", "nexus"]));
-        let error = check_servers_kept(Some(&stored), &names(&["nexus"])).unwrap_err();
+        let stored = fingerprint_json(&names(&["docs", "tickets"]));
+        let error = check_servers_kept(Some(&stored), &names(&["tickets"])).unwrap_err();
         assert_eq!(error.field, "mcp_servers");
         assert!(error.to_string().contains("mcp_servers"));
     }
@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn the_recorded_fingerprint_carries_names_only() {
-        let json = fingerprint_json(&names(&["nexus", "a"]));
-        assert_eq!(json, r#"{"mcp_servers":["a","nexus"]}"#);
+        let json = fingerprint_json(&names(&["tickets", "a"]));
+        assert_eq!(json, r#"{"mcp_servers":["a","tickets"]}"#);
     }
 }
