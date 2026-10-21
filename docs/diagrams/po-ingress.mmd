@@ -1,32 +1,47 @@
 %% name: po-ingress
-%% covers: backend:src/ingress/**
-%% verified: 35f7682f
+%% covers: backend:src/api/ingress_handlers.rs backend:src/ingress/**
+%% verified: a498f112
 %% ---
-%% PROUVE : ce que le module d'ingestion d'evenements externes EST, tel que le code de la
-%%   PR #897 le fait — le journal garde la decision (accepte / rejete) et une raison stable,
-%%   JAMAIS le corps de la requete ; l'identifiant de livraison permet de refuser un rejeu.
+%% PROUVE : ce que l'ingestion d'evenements externes EST, tel que le code des PR #897 et #898
+%%   le fait. La route est PUBLIQUE (hors require_auth) : c'est le secret du declencheur qui
+%%   garde l'acces. Les verifications s'enchainent, chacune refusee avant la suivante :
+%%   declencheur connu et de bonne source, declencheur actif, secret present, en-tete de
+%%   signature present (le corps n'est PAS lu s'il manque), taille <= 5 MiB, signature
+%%   HMAC-SHA256 valide, livraison non rejouee. Seule une livraison acceptee est journalisee
+%%   comme telle ; chaque refus est journalise avec son code de raison. Ni secret ni corps
+%%   ne sortent dans les reponses ou les journaux.
 %% ---
 %% SOURCES LUES :
+%%   src/api/ingress_handlers.rs — POST /hooks/events/{source}/{trigger_id}, MAX_BODY_BYTES
+%%                          (5 MiB), en-tete de signature par defaut x-hub-signature-256,
+%%                          Rule (source, secret, signature_header, delivery_header)
 %%   src/ingress/mod.rs   — module et re-exports (ExternalEvent, IngressOutcome)
 %%   src/ingress/model.rs — IngressOutcome { Accepted, Rejected } ;
 %%                          ExternalEvent { id, trigger_id, source, outcome, reason,
-%%                            delivery_id, event_type, action, body_bytes, received_at } ;
-%%                          le corps n'est jamais conserve (seuls sa taille et les en-tetes
-%%                          d'identification le sont)
+%%                            delivery_id, event_type, action, body_bytes, received_at }
 %% ---
-%% NON ETABLI : la route publique POST /hooks/events/{source}/{trigger_id} et la verification
-%%   HMAC vivent dans la PR suivante (#898) ; les requetes Cypher ne sont prouvees que contre
-%%   MockGraphStore (pas de Neo4j local).
+%% NON ETABLI : la signature est verifiee APRES la lecture du corps (un HMAC ne se verifie pas
+%%   sans lui) ; seul l'en-tete manquant court-circuite la lecture. Les requetes Cypher ne sont
+%%   prouvees que contre MockGraphStore (pas de Neo4j local).
 %% ---
 flowchart TD
-  E["ExternalEvent<br/>trigger_id, source, delivery_id,<br/>event_type, action, body_bytes, received_at"]
-  O{"IngressOutcome"}
+  P["POST /hooks/events/{source}/{trigger_id}<br/>(route PUBLIQUE, hors require_auth)"]
+  T["declencheur connu, de la bonne source, actif"]
+  S["secret present"]
+  H["en-tete de signature present<br/>(le corps n'est pas lu s'il manque)"]
+  B["taille <= 5 MiB"]
+  M["signature HMAC-SHA256 valide"]
+  D["livraison non rejouee<br/>(delivery_id reserve une fois)"]
   A["Accepted"]
-  R["Rejected<br/>+ reason stable<br/>(invalid_signature, replayed_delivery, ...)"]
-  J["Journal par declencheur<br/>(lecture du plus recent au plus ancien)"]
-  D["delivery_id<br/>reservation unique par declencheur"]
-  E --> O
-  O --> A
-  O --> R
-  E --> J
-  E --> D
+  R["Rejected + reason stable<br/>(source_inconnue, declencheur_inactif,<br/>invalid_signature, replayed_delivery, ...)"]
+  J["Journal ExternalEvent<br/>par declencheur, du plus recent au plus ancien"]
+  P --> T --> S --> H --> B --> M --> D
+  D -->|non rejouee| A
+  D -->|rejouee| R
+  T -.->|refus| R
+  S -.->|refus| R
+  H -.->|refus| R
+  B -.->|refus| R
+  M -.->|refus| R
+  A --> J
+  R --> J
