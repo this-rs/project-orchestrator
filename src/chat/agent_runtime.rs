@@ -3162,8 +3162,14 @@ pub(crate) mod fake {
             scope: InterruptScope,
         ) -> Result<InterruptOutcome, ProviderError> {
             self.state.interrupts.lock().unwrap().push(scope);
-            self.state.end_turn();
-            Ok(InterruptOutcome::default())
+            // Report whether a turn was actually running: the manager surfaces
+            // this as `InterruptOutcome.delivered` so an idle stop reads false.
+            let turn_interrupted = self.state.turn_tx.lock().unwrap().take().is_some();
+            Ok(InterruptOutcome {
+                turn_interrupted,
+                tools_cancelled: 0,
+                diagnostic: None,
+            })
         }
         async fn cancel_tools(&self, _scope: CancelScope) -> Result<CancelOutcome, ProviderError> {
             Ok(CancelOutcome::default())
