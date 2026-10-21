@@ -1527,6 +1527,7 @@ mod tests {
         for transient in [
             ProviderError::RateLimited {
                 retry_after_ms: None,
+                resets_at_ms: None,
             },
             ProviderError::Overloaded,
             ProviderError::Unauthorized,
@@ -1546,7 +1547,8 @@ mod tests {
         assert!(is_out_of_credit(&refused("HTTP 402: insufficient credits")));
         assert!(!is_out_of_credit(&refused("HTTP 400: not a chat model")));
         assert!(!is_out_of_credit(&ProviderError::RateLimited {
-            retry_after_ms: None
+            retry_after_ms: None,
+            resets_at_ms: None,
         }));
 
         let routing = CognitiveRouting::new(std::sync::Arc::new(InMemoryRoutingStore::new()));
