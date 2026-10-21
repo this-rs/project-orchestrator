@@ -129,4 +129,62 @@ impl Neo4jClient {
             .ok_or_else(|| anyhow::anyhow!("claim_external_delivery returned no row"))?;
         Ok(row.get::<bool>("created")?)
     }
+
+    /// Supprime la réservation `delivery_key` du déclencheur ; `true` si elle existait.
+    pub async fn release_external_delivery_impl(
+        &self,
+        trigger_id: Uuid,
+        delivery_key: &str,
+    ) -> Result<bool> {
+        let q = query(
+            r#"
+            OPTIONAL MATCH (d:ExternalDelivery {trigger_id: $trigger_id, delivery_key: $delivery_key})
+            WITH d, d IS NOT NULL AS existed
+            DETACH DELETE d
+            RETURN existed
+            "#,
+        )
+        .param("trigger_id", trigger_id.to_string())
+        .param("delivery_key", delivery_key.to_string());
+        let mut result = self.graph.execute(q).await?;
+        let row = result
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("release_external_delivery returned no row"))?;
+        Ok(row.get::<bool>("existed")?)
+    }
+
+    /// Supprime, par lots, les `ExternalEvent` reçus avant `before`. `received_at`
+    /// est écrit en RFC 3339 de largeur fixe (UTC, nanosecondes) : la comparaison
+    /// de chaînes est la comparaison chronologique.
+    pub async fn purge_external_events_before_impl(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64> {
+        const BATCH: i64 = 5_000;
+        let cutoff = before.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let mut total = 0u64;
+        loop {
+            let q = query(
+                r#"
+                MATCH (e:ExternalEvent)
+                WHERE e.received_at < $cutoff
+                WITH e LIMIT $batch
+                DETACH DELETE e
+                RETURN count(*) AS deleted
+                "#,
+            )
+            .param("cutoff", cutoff.clone())
+            .param("batch", BATCH);
+            let mut result = self.graph.execute(q).await?;
+            let deleted = match result.next().await? {
+                Some(row) => row.get::<i64>("deleted")?,
+                None => 0,
+            };
+            total += deleted.max(0) as u64;
+            if deleted < BATCH {
+                return Ok(total);
+            }
+        }
+    }
 }

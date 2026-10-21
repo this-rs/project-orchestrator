@@ -210,6 +210,10 @@ pub struct YamlConfig {
     /// + OAuth 2.1 AS). Disabled by default: absent section ⇒ remote MCP off.
     #[serde(default)]
     pub remote_mcp: RemoteMcpConfig,
+    /// External events ingestion section (optional — the public route
+    /// `POST /hooks/events/{source}/{trigger_id}`). Off by default.
+    #[serde(default)]
+    pub ingress: ingress::IngressConfig,
     /// Document storage section (optional — where uploaded blobs live)
     #[serde(default)]
     pub documents: DocumentsYamlConfig,
@@ -867,6 +871,9 @@ pub struct Config {
     /// Streamable HTTP + OAuth 2.1 AS routes and carries the exposure settings
     /// (bind, session TTL, rate limit, origin allowlist).
     pub remote_mcp: RemoteMcpConfig,
+    /// External events ingestion (off by default): gates the public route
+    /// `POST /hooks/events/{source}/{trigger_id}` and carries its limits.
+    pub ingress: ingress::IngressConfig,
     /// Chat permission config from YAML (if present).
     /// Priority: YAML > env vars > defaults.
     pub chat_permissions: Option<chat::config::PermissionConfig>,
@@ -1007,6 +1014,15 @@ impl Config {
                     rm.enabled = v == "true" || v == "1";
                 }
                 rm
+            },
+            // Ingress: YAML section, with one env override for the master switch
+            // (INGRESS_ENABLED=true|1), like remote MCP.
+            ingress: {
+                let mut ing = yaml.ingress;
+                if let Ok(v) = std::env::var("INGRESS_ENABLED") {
+                    ing.enabled = v == "true" || v == "1";
+                }
+                ing
             },
             chat_permissions: yaml.chat.permissions,
             chat_default_model: yaml.chat.default_model,
@@ -1406,6 +1422,18 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         .remote_mcp
         .validate()
         .map_err(|e| anyhow::anyhow!("Invalid remote_mcp config: {e}"))?;
+    config
+        .ingress
+        .validate()
+        .map_err(|e| anyhow::anyhow!("Invalid ingress config: {e}"))?;
+    if config.ingress.enabled {
+        tracing::info!(
+            max_body_bytes = config.ingress.max_body_bytes,
+            max_concurrent = config.ingress.max_concurrent,
+            rate_per_minute = config.ingress.rate_per_minute,
+            "Ingress ENABLED — POST /hooks/events/{{source}}/{{trigger_id}} is mounted (public, HMAC-guarded)"
+        );
+    }
     if config.remote_mcp.enabled {
         tracing::info!(
             bind_addr = %config.remote_mcp.bind_addr,
@@ -2269,6 +2297,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         server_port: config.server_port,
         public_url: config.public_url.clone(),
         remote_mcp: config.remote_mcp.clone(),
+        ingress: Arc::new(ingress::IngressRuntime::new(config.ingress.clone())),
         ws_ticket_store,
         registry_remote_url: config.registry_remote_url.clone(),
         neural_router: neural_router.clone(),

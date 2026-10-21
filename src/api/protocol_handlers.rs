@@ -2276,6 +2276,7 @@ mod tests {
             server_port: 0,
             public_url: None,
             remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             identity: None,

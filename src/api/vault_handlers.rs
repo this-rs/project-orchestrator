@@ -287,6 +287,21 @@ pub(crate) async fn validate_provider_grant(
             .ok_or_else(|| AppError::NotFound(format!("unknown search engine '{instance}'")))?;
         return names_only_the_reference(instance, &engine.credential_ref, secrets);
     }
+    // A webhook trigger with a source is granted under `trigger:<id>`: the server reads
+    // that secret to verify the HMAC of the public ingress route, and nothing else.
+    if let Some(id) = instance.strip_prefix(crate::ingress::rule::TRIGGER_GRANT_PREFIX) {
+        let unknown = || AppError::NotFound(format!("unknown ingress trigger '{instance}'"));
+        let id = id.parse::<uuid::Uuid>().map_err(|_| unknown())?;
+        let trigger = graph
+            .get_trigger(id)
+            .await
+            .map_err(AppError::Internal)?
+            .ok_or_else(unknown)?;
+        let name = crate::ingress::rule::Rule::of(&trigger)
+            .and_then(|rule| rule.secret_name)
+            .ok_or_else(unknown)?;
+        return names_only_the_reference(instance, &format!("vault:{name}"), secrets);
+    }
     let record = crate::chat::provider::store::instance(graph, instance)
         .await
         .map_err(AppError::Internal)?
@@ -645,6 +660,7 @@ mod tests {
             server_port: 6600,
             public_url: None,
             remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,

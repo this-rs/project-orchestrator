@@ -57,6 +57,9 @@ pub struct ServerState {
     /// gates the `/mcp` + OAuth AS routes; its `origin_allowlist` is union'd into
     /// `allowed_origins()` (e.g. the Claude connector origins).
     pub remote_mcp: crate::RemoteMcpConfig,
+    /// External events ingestion: its switch (off by default: the public route is
+    /// not mounted) and the in-memory guards of the route (concurrency, rate, refusals).
+    pub ingress: Arc<crate::ingress::IngressRuntime>,
     /// In-memory store for ephemeral WebSocket auth tickets.
     /// Used as a fallback when cookies are not sent on WS upgrades (WKWebView).
     pub ws_ticket_store: Arc<super::ws_auth::WsTicketStore>,
@@ -6724,6 +6727,10 @@ pub async fn create_trigger(
         })?;
         crate::runner::providers::schedule::validate_cron(cron).map_err(AppError::BadRequest)?;
     }
+    // A webhook trigger with a `source` is reached by the PUBLIC ingress route: its
+    // secret is a vault reference, never a value (and never `vault:...` used as a key).
+    crate::ingress::rule::validate_trigger_config(&trigger_type, &config)
+        .map_err(AppError::BadRequest)?;
     let cooldown_secs = body
         .get("cooldown_secs")
         .and_then(|v| v.as_u64())
@@ -6757,7 +6764,9 @@ pub async fn create_trigger(
         None,
     );
 
-    Ok(Json(serde_json::to_value(&created).unwrap_or_default()))
+    Ok(Json(
+        serde_json::to_value(created.redacted()).unwrap_or_default(),
+    ))
 }
 
 /// GET /api/plans/:id/triggers — List triggers for a plan.
@@ -6771,6 +6780,7 @@ pub async fn list_triggers(
         .await
         .map_err(AppError::Internal)?;
 
+    let triggers: Vec<_> = triggers.iter().map(|t| t.redacted()).collect();
     Ok(Json(serde_json::to_value(&triggers).unwrap_or_default()))
 }
 
@@ -6823,7 +6833,9 @@ pub async fn enable_trigger(
         None,
     );
 
-    Ok(Json(serde_json::to_value(&trigger).unwrap_or_default()))
+    Ok(Json(
+        serde_json::to_value(trigger.redacted()).unwrap_or_default(),
+    ))
 }
 
 /// PATCH /api/triggers/:id/disable — Disable a trigger.
@@ -6845,7 +6857,9 @@ pub async fn disable_trigger(
         None,
     );
 
-    Ok(Json(serde_json::to_value(&trigger).unwrap_or_default()))
+    Ok(Json(
+        serde_json::to_value(trigger.redacted()).unwrap_or_default(),
+    ))
 }
 
 /// GET /api/triggers/:id/firings — Get trigger firing history.
@@ -8436,6 +8450,7 @@ pub(crate) mod tests {
             server_port: 6600,
             public_url: None,
             remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -8691,6 +8706,7 @@ pub(crate) mod tests {
             server_port,
             public_url: public_url.map(|s| s.to_string()),
             remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -8865,6 +8881,7 @@ pub(crate) mod tests {
             server_port: 6600,
             public_url: None,
             remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -9816,6 +9833,7 @@ pub(crate) mod tests {
             server_port: 6600,
             public_url: None,
             remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -9928,6 +9946,7 @@ pub(crate) mod tests {
             server_port: 6600,
             public_url: None,
             remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -10107,6 +10126,7 @@ pub(crate) mod tests {
             server_port: 6600,
             public_url: None,
             remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -10160,6 +10180,7 @@ pub(crate) mod tests {
             server_port: 6600,
             public_url: None,
             remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -11259,6 +11280,7 @@ pub(crate) mod tests {
             server_port: 0,
             public_url: None,
             remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -11581,6 +11603,7 @@ pub(crate) mod tests {
             server_port: 0,
             public_url: None,
             remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
             ws_ticket_store: std::sync::Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -11970,6 +11993,7 @@ mod retry_plan_task_tests {
             server_port: 0,
             public_url: None,
             remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -12060,6 +12084,7 @@ mod retry_plan_task_tests {
             server_port: 0,
             public_url: None,
             remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,

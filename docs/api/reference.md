@@ -34,6 +34,7 @@ For detailed setup instructions (Google OAuth, JWT configuration, environment va
 | `/auth/me`, `/auth/refresh` | **Protected** | User info and token refresh |
 | `/ws/*` | Public | Auth via first WebSocket message |
 | `/hooks/wake` | **Protected** | Agent webhook (same handler as `/api/wake`) |
+| `POST /hooks/events/{source}/{trigger_id}` | Public (HMAC) | External event ingestion; mounted only when `ingress.enabled` (off by default) |
 | `/internal/events` | **Protected** | Internal event receiver (deprecated) |
 | `/api/*` | **Protected** | All API routes require JWT |
 
@@ -2449,6 +2450,40 @@ curl -X POST http://localhost:8080/hooks/wake \
     "files_modified": ["src/auth.rs"]
   }'
 ```
+
+### POST /hooks/events/{source}/{trigger_id} -- Public (HMAC-signed)
+
+Receives a delivery from an external sender (GitHub or a generic source) for a
+`webhook` trigger whose config declares that `source`. **Off by default**: the route
+is mounted only when `ingress.enabled: true` (or `INGRESS_ENABLED=true`); otherwise it
+answers 404 like any unknown path.
+
+No JWT: the lock is the HMAC-SHA256 of the raw body, `sha256=<64 hex>` in
+`X-Hub-Signature-256` (or the header named by `config.signature_header`), keyed with
+the secret the trigger names by reference (`config.secret_ref: "vault:<name>"`,
+granted to the provider scope `trigger:<trigger id>`). A trigger with a plain
+`config.secret` and a `source` is refused at creation.
+
+```bash
+curl -X POST http://localhost:8080/hooks/events/github/$TRIGGER_ID \
+  -H "X-Hub-Signature-256: sha256=$HMAC_HEX" \
+  -H "X-GitHub-Delivery: $DELIVERY_ID" \
+  --data-binary @payload.json
+```
+
+| Status | When |
+|--------|------|
+| 202 | Accepted and journaled (`{"status":"accepted","event_id":...}`) |
+| 404 | Unknown trigger, other source, or route off |
+| 429 / 503 | Rate per trigger, or route concurrency, exceeded (`Retry-After`) |
+| 401 | Signature header missing or malformed, or HMAC invalid |
+| 403 | No usable secret (no reference, vault locked, no grant) — or trigger disabled |
+| 408 / 413 | Body read timeout (10 s) / body over `max_body_bytes` (1 MiB) |
+| 409 | Replay: the same signed body (or the same delivery id) was already accepted |
+
+Every refusal has the same body, `{"status":"rejected"}`. Refusals before the HMAC is
+verified write nothing to the database; replays and disabled-trigger deliveries are
+journaled after it.
 
 ### POST /internal/events -- Protected
 

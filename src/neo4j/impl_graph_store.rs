@@ -4315,6 +4315,22 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
+    async fn release_external_delivery(
+        &self,
+        trigger_id: Uuid,
+        delivery_key: &str,
+    ) -> anyhow::Result<bool> {
+        self.release_external_delivery_impl(trigger_id, delivery_key)
+            .await
+    }
+
+    async fn purge_external_events_before(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<u64> {
+        self.purge_external_events_before_impl(before).await
+    }
+
     // ── Cognitive routing ───────────────────────────────────────────────────
 
     async fn get_routing_arm(
