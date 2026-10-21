@@ -115,12 +115,24 @@ meilisearch:
 # (counted in memory, traced at debug). Accepted, replayed and disabled-trigger
 # deliveries are journaled (ExternalEvent), kept 30 days.
 #
+# DEPLOYMENT CONDITION: enable this route ONLY behind a reverse proxy (nginx,
+# Caddy, a cloud load balancer...) that enforces a read timeout on request
+# HEADERS and on request BODIES (and, ideally, a per-IP rate limit and a
+# connection limit). The server itself sets no HTTP header-read timeout (this
+# holds for the whole server, not only this route): without that proxy, a
+# slow-header client (slowloris) can hold connections open indefinitely. The
+# route's own body timeout (body_read_timeout_secs) only starts once the
+# headers have been received.
+#
 # ingress:
 #   enabled: false                     # master switch (default: false)
 #   max_body_bytes: 1048576            # 1 MiB; a larger Content-Length is refused before reading
 #   body_read_timeout_secs: 10         # a body still incomplete after this is cut (408)
 #   max_concurrent: 32                 # requests handled at once; beyond: 503 + Retry-After
-#   rate_per_minute: 60                # per trigger (token bucket); beyond: 429
+#   rate_per_minute: 60                # per trigger (token bucket), spent only by an
+#                                      # authenticated (valid HMAC) delivery; beyond: 429
+#   global_rate_per_minute: 600        # whole route, spent BEFORE any graph read,
+#                                      # authenticated or not; beyond: 429
 
 # -----------------------------------------------------------------------------
 # Embeddings — Vector embedding provider for semantic search

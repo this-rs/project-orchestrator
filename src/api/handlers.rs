@@ -6917,6 +6917,17 @@ pub async fn receive_webhook(
         )));
     }
 
+    // A trigger with a `source` belongs to the public, signed route
+    // (`/hooks/events/{source}/{id}`): its secret lives in the vault
+    // (`secret_ref`), never in `config.secret`, so this route would accept it
+    // UNSIGNED from any bearer of a JWT. Refuse it here.
+    if trigger.config.get("source").is_some_and(|v| !v.is_null()) {
+        return Err(AppError::BadRequest(format!(
+            "Trigger {trigger_id} declares a `source`: it is received only by \
+             POST /hooks/events/{{source}}/{trigger_id} (signed), not by /api/webhooks"
+        )));
+    }
+
     // 2. Validate HMAC signature if secret is configured
     if let Some(secret) = trigger.config.get("secret").and_then(|v| v.as_str()) {
         let signature = headers
@@ -11248,6 +11259,65 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(resp["status"], "duplicate", "{resp}");
 
+        reset_runner_globals().await;
+    }
+
+    /// M3: `/api/webhooks/{id}` refuses a trigger that has a `source` (it would
+    /// run unsigned for any JWT holder), and leaves the triggers without one as
+    /// they were: unsigned when they have no secret, checked when they have one.
+    #[tokio::test]
+    async fn test_receive_webhook_refuses_a_trigger_with_a_source() {
+        let _guard = crate::runner::runner::RUNNER_GLOBALS_TEST_LOCK.lock().await;
+        reset_runner_globals().await;
+        let state = mock_server_state().await;
+        let graph = state.orchestrator.neo4j_arc();
+        let dir = tempfile::tempdir().unwrap();
+        let (_, plan_id) =
+            crate::runner::dispatch::tests::completed_plan_in_git_repo(graph.as_ref(), dir.path())
+                .await;
+        let make = |config: serde_json::Value| {
+            let mut t = crate::runner::dispatch::tests::trigger_of(
+                plan_id,
+                crate::runner::TriggerType::Webhook,
+            );
+            t.config = config;
+            t
+        };
+        let sourced = make(serde_json::json!({"source": "github", "secret_ref": "vault:k"}));
+        let plain = make(serde_json::json!({}));
+        let signed = make(serde_json::json!({"secret": "a-long-enough-secret-0123"}));
+        for t in [&sourced, &plain, &signed] {
+            graph.create_trigger(t).await.unwrap();
+        }
+        let call = |id: Uuid| {
+            receive_webhook(
+                State(state.clone()),
+                Path(id),
+                axum::Extension(crate::auth::jwt::Claims::service_account("jwt-holder")),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::from_static(br#"{"ref":"refs/heads/main"}"#),
+            )
+        };
+
+        match call(sourced.id).await {
+            Err(AppError::BadRequest(msg)) => assert!(msg.contains("/hooks/events"), "{msg}"),
+            other => panic!("a sourced trigger must be refused, ok={}", other.is_ok()),
+        }
+        assert!(
+            graph
+                .list_trigger_firings(sourced.id, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing fired"
+        );
+        // Unchanged: no source, no secret -> still dispatched; with a secret -> still checked.
+        let Json(resp) = call(plain.id).await.unwrap();
+        assert_eq!(resp["status"], "start_failed", "{resp}");
+        assert!(matches!(
+            call(signed.id).await,
+            Err(AppError::Unauthorized(_))
+        ));
         reset_runner_globals().await;
     }
 

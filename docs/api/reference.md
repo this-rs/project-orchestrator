@@ -2464,6 +2464,17 @@ the secret the trigger names by reference (`config.secret_ref: "vault:<name>"`,
 granted to the provider scope `trigger:<trigger id>`). A trigger with a plain
 `config.secret` and a `source` is refused at creation.
 
+**Deployment condition.** Enable this route only behind a reverse proxy that enforces
+a read timeout on request **headers** and **bodies** (plus, ideally, a per-IP rate
+limit and a connection limit). The server sets no HTTP header-read timeout (true of
+the whole server, not only this route), so without that proxy a slow-header client
+(slowloris) can hold connections open; the route's own body timeout starts only after
+the headers are received.
+
+A trigger that declares a `source` is received **only** by this route:
+`POST /api/webhooks/{id}` refuses it with 400 (it would otherwise run unsigned for any
+JWT holder).
+
 ```bash
 curl -X POST http://localhost:8080/hooks/events/github/$TRIGGER_ID \
   -H "X-Hub-Signature-256: sha256=$HMAC_HEX" \
@@ -2475,7 +2486,7 @@ curl -X POST http://localhost:8080/hooks/events/github/$TRIGGER_ID \
 |--------|------|
 | 202 | Accepted and journaled (`{"status":"accepted","event_id":...}`) |
 | 404 | Unknown trigger, other source, or route off |
-| 429 / 503 | Rate per trigger, or route concurrency, exceeded (`Retry-After`) |
+| 429 / 503 | Global route rate (`ingress.global_rate_per_minute`, 600, checked before any graph read), per-trigger rate (60/min, spent only after a valid HMAC), or route concurrency, exceeded (`Retry-After`) |
 | 401 | Signature header missing or malformed, or HMAC invalid |
 | 403 | No usable secret (no reference, vault locked, no grant) — or trigger disabled |
 | 408 / 413 | Body read timeout (10 s) / body over `max_body_bytes` (1 MiB) |
