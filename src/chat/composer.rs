@@ -41,7 +41,7 @@
 use super::prompt::TOOL_REFERENCE;
 use super::prompt_sections::{
     adapt_subagent_vocabulary, assemble_sections, assemble_sections_weighted, child_section,
-    extract_tool_reference,
+    extract_tool_reference, SECTION_ISO_SCENE,
 };
 use super::routing::{HeuristicRouter, RoutingContext, RoutingDecisionRecord, RoutingProvider};
 use super::stages::status_injection::ProtocolRunStatus;
@@ -59,6 +59,9 @@ pub struct PromptAudience {
     pub vocabulary: SubagentVocabulary,
     /// `Some` for the child of a conversation: it gets the child section.
     pub child: Option<ChildFrame>,
+    /// The session has a `spawned_by` (a child, a delegation, a run...): something
+    /// other than a person opened it. `false` for a root conversation.
+    pub spawned: bool,
 }
 
 impl PromptAudience {
@@ -87,7 +90,18 @@ impl PromptAudience {
         Self {
             vocabulary: SubagentVocabulary::of_provider(provider_id),
             child,
+            spawned: spawned_by.is_some_and(|s| !s.trim().is_empty()),
         }
+    }
+
+    /// Whether a person reads this conversation's answers in the PO interface, which
+    /// draws an ```iso-scene block as a 3D scene: a root conversation only. The child
+    /// of a conversation (an `Agent` call, a sub-conversation an agent opened) answers a
+    /// model, which would only get the JSON; a runner, pipeline, gate, trigger or
+    /// delegation session has no display either (and normally gets `runner::prompt`,
+    /// not this one).
+    pub fn displays_scenes(&self) -> bool {
+        !self.spawned && self.child.is_none()
     }
 }
 
@@ -137,6 +151,10 @@ pub struct ComposerInput<'a> {
     /// `refs_v1` is on: teach the agent to cite entities as `#kind:uuid`.
     /// Off (the default) the prompt is unchanged byte for byte.
     pub cite_refs: bool,
+    /// The interface draws ```iso-scene blocks for this conversation
+    /// ([`PromptAudience::displays_scenes`]): teach the agent to write one
+    /// ([`SECTION_ISO_SCENE`]). Off (the default) the prompt is unchanged byte for byte.
+    pub iso_scene: bool,
     /// Who the prompt is for: the engine's sub-agent words, the frame of a child of a
     /// conversation. The default (root session, Claude Code) changes nothing.
     pub audience: PromptAudience,
@@ -364,6 +382,10 @@ impl FsmPromptComposer {
         if input.cite_refs {
             cite_owned = crate::refs::cite::prompt_section();
             parts.push(&cite_owned);
+        }
+
+        if input.iso_scene {
+            parts.push(SECTION_ISO_SCENE);
         }
 
         let fsm_owned;
@@ -1028,6 +1050,52 @@ mod tests {
         assert!(
             !prompt.contains("Active Protocol Context"),
             "No FSM section"
+        );
+    }
+
+    #[test]
+    fn only_a_root_conversation_is_taught_the_iso_scene_block() {
+        // A person reads a root conversation in the PO interface, which draws the block.
+        assert!(PromptAudience::of(None, "").displays_scenes());
+        assert!(PromptAudience::of(Some(""), "deepseek").displays_scenes());
+        assert!(PromptAudience::default().displays_scenes());
+        // A child answers a model; a delegation, a run, a trigger has no display.
+        assert!(!audience_of_child("claude-code", Some("toolu_1")).displays_scenes());
+        assert!(!audience_of_child("deepseek", None).displays_scenes());
+        for spawned in [
+            r#"{"type":"delegation","plan_id":"x","task_id":"y"}"#,
+            r#"{"type":"runner","run_id":"a","task_id":"b"}"#,
+            r#"{"type":"pipeline","run_id":"a","task_id":"b","wave":1}"#,
+            r#"{"type":"gate","run_id":"a","task_id":"b","gate_name":"g","attempt":1}"#,
+            r#"{"type":"trigger","trigger_id":"t"}"#,
+            r#"{"type":"conversation"}"#,
+            "not json",
+        ] {
+            assert!(
+                !PromptAudience::of(Some(spawned), "").displays_scenes(),
+                "{spawned}"
+            );
+        }
+
+        // Off (the default): the prompt is unchanged; on: the section and nothing else.
+        let off = ComposerInput {
+            user_message: "explique l'architecture",
+            ..Default::default()
+        };
+        let on = ComposerInput {
+            iso_scene: true,
+            ..off.clone()
+        };
+        let (before, after) = (
+            FsmPromptComposer::compose(&off),
+            FsmPromptComposer::compose(&on),
+        );
+        assert!(!before.contains("```iso-scene"), "off: no scene section");
+        assert!(after.contains(SECTION_ISO_SCENE), "on: the section is in");
+        assert_eq!(
+            after.replacen(&format!("\n\n---\n\n{SECTION_ISO_SCENE}"), "", 1),
+            before,
+            "on = off + the section, nothing else moved"
         );
     }
 

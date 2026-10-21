@@ -5624,6 +5624,7 @@ impl ChatManager {
         let Some(slug) = project_slug else {
             let input = ComposerInput {
                 cite_refs: self.refs_v1,
+                iso_scene: audience.displays_scenes(),
                 context_window,
                 audience: audience.clone(),
                 ..Default::default()
@@ -5641,6 +5642,7 @@ impl ChatManager {
                 );
                 let input = ComposerInput {
                     cite_refs: self.refs_v1,
+                    iso_scene: audience.displays_scenes(),
                     context_window,
                     audience: audience.clone(),
                     ..Default::default()
@@ -5823,6 +5825,7 @@ impl ChatManager {
             message_embedding: message_embedding.as_ref(),
             external_tools_available,
             cite_refs: self.refs_v1,
+            iso_scene: audience.displays_scenes(),
             audience: audience.clone(),
         };
 
