@@ -22,8 +22,15 @@ pub struct IngressConfig {
     pub body_read_timeout_secs: u64,
     /// Requêtes traitées en même temps sur la route. Défaut : 32.
     pub max_concurrent: usize,
-    /// Requêtes acceptées par minute et par déclencheur (seau à jetons). Défaut : 60.
+    /// Requêtes AUTHENTIFIÉES par minute et par déclencheur (seau à jetons, débité
+    /// seulement après un HMAC valide). Défaut : 60.
     pub rate_per_minute: u32,
+    /// Requêtes par minute pour TOUTE la route, authentifiées ou non, débitées avant
+    /// la moindre lecture du graphe (seau global en mémoire). Défaut : 600, soit
+    /// 10 par seconde : très au-dessus d'une instance qui reçoit des webhooks de
+    /// dépôts (quelques livraisons par minute), et assez bas pour que le flot d'un
+    /// inconnu ne charge ni le pool Neo4j ni le coffre.
+    pub global_rate_per_minute: u32,
 }
 
 /// Plafond dur de `max_body_bytes` (GitHub plafonne lui-même à 25 MB).
@@ -37,6 +44,7 @@ impl Default for IngressConfig {
             body_read_timeout_secs: 10,
             max_concurrent: 32,
             rate_per_minute: 60,
+            global_rate_per_minute: 600,
         }
     }
 }
@@ -52,10 +60,13 @@ impl IngressConfig {
                 "ingress.max_body_bytes must be in 1..={MAX_BODY_CEILING}"
             ));
         }
-        if self.body_read_timeout_secs == 0 || self.max_concurrent == 0 || self.rate_per_minute == 0
+        if self.body_read_timeout_secs == 0
+            || self.max_concurrent == 0
+            || self.rate_per_minute == 0
+            || self.global_rate_per_minute == 0
         {
             return Err(
-                "ingress.body_read_timeout_secs, max_concurrent and rate_per_minute must be > 0"
+                "ingress.body_read_timeout_secs, max_concurrent, rate_per_minute and global_rate_per_minute must be > 0"
                     .into(),
             );
         }
@@ -90,6 +101,7 @@ pub struct IngressRuntime {
     pub config: IngressConfig,
     permits: Arc<Semaphore>,
     buckets: std::sync::Mutex<HashMap<Uuid, Bucket>>,
+    global: std::sync::Mutex<Bucket>,
     refusals: std::sync::Mutex<HashMap<Uuid, Window>>,
 }
 
@@ -113,10 +125,15 @@ pub const UNKNOWN_TRIGGER: Uuid = Uuid::nil();
 
 impl IngressRuntime {
     pub fn new(config: IngressConfig) -> Self {
+        let global = Bucket {
+            tokens: f64::from(config.global_rate_per_minute.max(1)),
+            at: Instant::now(),
+        };
         Self {
             permits: Arc::new(Semaphore::new(config.max_concurrent.max(1))),
             config,
             buckets: std::sync::Mutex::new(HashMap::new()),
+            global: std::sync::Mutex::new(global),
             refusals: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -125,6 +142,24 @@ impl IngressRuntime {
     /// (pas d'attente : la réponse est immédiate).
     pub fn try_enter(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
         self.permits.clone().try_acquire_owned().ok()
+    }
+
+    /// Le seau GLOBAL de la route accorde-t-il une requête de plus ? À appeler
+    /// avant toute lecture du graphe : il borne le travail qu'un inconnu peut
+    /// provoquer, qu'il connaisse un identifiant ou non.
+    pub fn allow_global(&self) -> bool {
+        let capacity = f64::from(self.config.global_rate_per_minute.max(1));
+        let now = Instant::now();
+        let mut b = self.global.lock().unwrap_or_else(|p| p.into_inner());
+        b.tokens =
+            (b.tokens + now.duration_since(b.at).as_secs_f64() * capacity / 60.0).min(capacity);
+        b.at = now;
+        if b.tokens >= 1.0 {
+            b.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
     }
 
     /// Le seau à jetons du déclencheur accorde-t-il une requête de plus ?
@@ -222,6 +257,7 @@ mod tests {
         assert_eq!(c.body_read_timeout_secs, 10);
         assert_eq!(c.max_concurrent, 32);
         assert_eq!(c.rate_per_minute, 60);
+        assert_eq!(c.global_rate_per_minute, 600);
         assert!(c.validate().is_ok());
         let bad = IngressConfig {
             enabled: true,
@@ -241,6 +277,16 @@ mod tests {
         assert!(rt.allow(a) && rt.allow(a) && rt.allow(a));
         assert!(!rt.allow(a), "the fourth in the minute is refused");
         assert!(rt.allow(b), "another trigger has its own bucket");
+    }
+
+    #[test]
+    fn the_global_bucket_refuses_past_its_rate() {
+        let rt = IngressRuntime::new(IngressConfig {
+            global_rate_per_minute: 3,
+            ..IngressConfig::default()
+        });
+        assert!(rt.allow_global() && rt.allow_global() && rt.allow_global());
+        assert!(!rt.allow_global());
     }
 
     #[test]

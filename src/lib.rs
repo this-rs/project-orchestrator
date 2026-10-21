@@ -1431,6 +1431,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             max_body_bytes = config.ingress.max_body_bytes,
             max_concurrent = config.ingress.max_concurrent,
             rate_per_minute = config.ingress.rate_per_minute,
+            global_rate_per_minute = config.ingress.global_rate_per_minute,
             "Ingress ENABLED — POST /hooks/events/{{source}}/{{trigger_id}} is mounted (public, HMAC-guarded)"
         );
     }

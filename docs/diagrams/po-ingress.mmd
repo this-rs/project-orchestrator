@@ -1,6 +1,6 @@
 %% name: po-ingress
 %% covers: backend:src/api/ingress_handlers.rs backend:src/ingress/** backend:src/neo4j/ingress.rs
-%% verified: 3908c380
+%% verified: ff7d0a84
 %% ---
 %% PROUVE : ce que l'ingestion d'evenements externes EST, tel que le code le fait (PR #897 pour
 %%   le modele et le journal, PR durcie pour la route). La route POST /hooks/events/{source}/{trigger_id}
@@ -13,6 +13,7 @@
 %%   rejeu (409) et accepte (202) sont journalises. Le condensat du corps signe est TOUJOURS reserve
 %%   (body:<sha256>), l'identifiant d'en-tete EN PLUS (delivery:<id>). Si le journal echoue apres la
 %%   reservation, les reservations sont liberees (500) : la relivraison est acceptee, pas 409.
+%%   Debit : seau global (600/min, avant le graphe) puis, apres le HMAC seulement, seau par declencheur.
 %%   Retention : purge des ExternalEvent de plus de 30 jours a chaque tour du planificateur horaire.
 %% ---
 %% SOURCES LUES :
@@ -29,8 +30,8 @@
 %% ---
 %% NON ETABLI : aucun horodatage signe (GitHub n'en signe pas) : un corps capture reste rejouable
 %%   s'il n'a JAMAIS ete livre ; les reservations ExternalDelivery ne sont pas purgees (sinon un corps
-%%   deja livre redeviendrait rejouable) ; la limite de debit precede la signature, donc un tiers qui
-%%   connait l'UUID peut epuiser le seau d'un declencheur ; aucun appelant ne lance encore de plan.
+%%   deja livre redeviendrait rejouable) ; aucun delai de lecture des en-tetes HTTP (hyper/axum non configures : condition de
+%%   deploiement documentee, proxy inverse) ; aucun appelant ne lance encore de plan.
 %% ---
 flowchart TD
   F{"ingress.enabled ?"}
@@ -38,7 +39,8 @@ flowchart TD
   P["POST /hooks/events/{source}/{trigger_id}<br/>(PUBLIQUE, hors require_auth)"]
   C["place dans la limite de concurrence (32)"]
   T["declencheur connu, webhook, bonne source"]
-  L["seau a jetons du declencheur (60/min)"]
+  G["seau GLOBAL de la route (600/min)<br/>AVANT toute lecture du graphe<br/>test: the_global_limit_refuses_without_reading_the_graph"]
+  L["seau a jetons du declencheur (60/min)<br/>debite APRES un HMAC valide<br/>test: invalid_signatures_do_not_spend_the_trigger_quota"]
   H["en-tete sha256= + 64 hex<br/>(sinon le corps n'est pas lu)"]
   CL["Content-Length <= 1 MiB"]
   S["secret_ref resolu dans le coffre<br/>grant Provider(trigger:id), >= 16 octets"]
@@ -52,16 +54,17 @@ flowchart TD
   R["journal Rejected<br/>trigger_disabled (403), replayed_delivery (409)"]
   PG["purge horaire > 30 jours<br/>test: check_external_event_purge (mock ET Neo4j)"]
   F -->|non| N404
-  F -->|oui| P --> C --> T --> L --> H --> CL --> S --> B --> M
+  F -->|oui| P --> C --> G --> T --> H --> CL --> S --> B --> M --> L
   C -.->|503| MEM
   T -.->|404| MEM
+  G -.->|429| MEM
   L -.->|429| MEM
   H -.->|401| MEM
   CL -.->|413| MEM
   S -.->|403| MEM
   B -.->|408 / 413| MEM
   M -.->|401| MEM
-  M -->|authentifiee| E
+  L -->|authentifiee| E
   E -->|non| R
   E -->|oui| K
   K -->|deja reserve| R

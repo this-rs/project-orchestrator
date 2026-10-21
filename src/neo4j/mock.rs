@@ -125,6 +125,9 @@ pub struct MockGraphStore {
     /// projects, workspaces, sharing policies, scoped neighborhoods): the measure
     /// of the cost of a turn in anchor mode.
     pub store_reads: std::sync::atomic::AtomicUsize,
+    /// Number of `get_trigger` calls (the public ingestion route must not read the
+    /// graph for a request its global rate limit refuses).
+    pub trigger_reads: std::sync::atomic::AtomicUsize,
     /// Log of the grouped reads the cockpit aggregator performs, in order
     /// (query-count assertions: one entry per store call).
     pub read_log: std::sync::Mutex<Vec<&'static str>>,
@@ -401,6 +404,7 @@ impl MockGraphStore {
             task_sessions: RwLock::new(HashMap::new()),
             session_link_reads: std::sync::atomic::AtomicUsize::new(0),
             store_reads: std::sync::atomic::AtomicUsize::new(0),
+            trigger_reads: std::sync::atomic::AtomicUsize::new(0),
             read_log: std::sync::Mutex::new(Vec::new()),
             fail_reads: std::sync::Mutex::new(std::collections::HashSet::new()),
             chat_events: RwLock::new(HashMap::new()),
@@ -12697,6 +12701,8 @@ impl GraphStore for MockGraphStore {
         &self,
         trigger_id: Uuid,
     ) -> anyhow::Result<Option<crate::runner::Trigger>> {
+        self.trigger_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let triggers = self.triggers.read().await;
         Ok(triggers.get(&trigger_id).cloned())
     }
