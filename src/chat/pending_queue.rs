@@ -51,6 +51,30 @@ pub enum QueueOp {
     Snapshot,
 }
 
+impl QueueOp {
+    /// The operation's wire name, for logs (never the text of an edit).
+    pub fn name(&self) -> &'static str {
+        match self {
+            QueueOp::Edit { .. } => "edit",
+            QueueOp::Remove { .. } => "remove",
+            QueueOp::Prioritize { .. } => "prioritize",
+            QueueOp::SendNow { .. } => "send_now",
+            QueueOp::Snapshot => "snapshot",
+        }
+    }
+
+    /// The held message it names (`None` for `Snapshot`).
+    pub fn id(&self) -> Option<Uuid> {
+        match self {
+            QueueOp::Edit { id, .. }
+            | QueueOp::Remove { id }
+            | QueueOp::Prioritize { id }
+            | QueueOp::SendNow { id } => Some(*id),
+            QueueOp::Snapshot => None,
+        }
+    }
+}
+
 /// What an operation did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct OpOutcome {
@@ -178,6 +202,25 @@ mod tests {
 
     fn texts(queue: &VecDeque<PendingMessage>) -> Vec<String> {
         snapshot(queue).into_iter().map(|e| e.content).collect()
+    }
+
+    #[test]
+    fn an_op_is_logged_by_its_wire_name_and_id() {
+        let id = Uuid::new_v4();
+        for op in [
+            QueueOp::Edit {
+                id,
+                content: "secret".into(),
+            },
+            QueueOp::Remove { id },
+            QueueOp::Prioritize { id },
+            QueueOp::SendNow { id },
+            QueueOp::Snapshot,
+        ] {
+            let wire = serde_json::to_value(&op).unwrap();
+            assert_eq!(wire["op"], op.name(), "{wire}");
+            assert_eq!(op.id(), (op != QueueOp::Snapshot).then_some(id));
+        }
     }
 
     #[test]

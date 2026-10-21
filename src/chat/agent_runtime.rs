@@ -1340,17 +1340,53 @@ impl AgentSessionHandle {
             let outcome = super::pending_queue::apply(&mut queue, op);
             (outcome, super::pending_queue::snapshot(&queue))
         };
+        let streaming = self.is_streaming.load(Ordering::SeqCst);
+        tracing::info!(
+            session_id = %self.session_id,
+            // The kind and the id only: an edit carries the user's text.
+            op = op.name(),
+            id = ?op.id(),
+            found = outcome.found,
+            interrupt = outcome.interrupt,
+            streaming,
+            held_left = messages.len(),
+            "queue op applied"
+        );
         self.emit(ChatEvent::PendingQueue { messages }).await;
-        if outcome.interrupt && self.is_streaming.load(Ordering::SeqCst) {
+        if outcome.interrupt && streaming {
             self.interrupt_for_the_queue().await;
         }
     }
 
     /// Cuts the running turn short so the message queued in front is read now.
+    ///
+    /// The message itself is delivered by the run's own loop (`drive` →
+    /// `next_queued`) once the turn ends: an interrupt the provider could not apply
+    /// (no turn of its own running — the run is between two turns, or in its
+    /// end-of-turn steps) only means it waits for those steps, never that it is lost.
     async fn interrupt_for_the_queue(&self) {
         self.interrupted.store(true, Ordering::SeqCst);
-        if let Err(e) = self.session.interrupt(InterruptScope::TurnAndTools).await {
-            tracing::warn!(session_id = %self.session_id, error = %e, "interrupting the turn for a queued message failed");
+        match self.session.interrupt(InterruptScope::TurnAndTools).await {
+            Ok(outcome) if outcome.turn_interrupted => {
+                tracing::info!(
+                    session_id = %self.session_id,
+                    turn_interrupted = true,
+                    tools_cancelled = outcome.tools_cancelled,
+                    "turn interrupted for a queued message"
+                );
+            }
+            Ok(outcome) => {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    turn_interrupted = false,
+                    tools_cancelled = outcome.tools_cancelled,
+                    streaming = self.is_streaming.load(Ordering::SeqCst),
+                    "the provider had no turn to interrupt for a queued message: it is sent when the run's current step ends"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(session_id = %self.session_id, error = %e, "interrupting the turn for a queued message failed");
+            }
         }
     }
 
@@ -1561,6 +1597,16 @@ impl AgentSessionHandle {
             let (next, dropped) = super::drain::pop_next_after_turn(&mut queue, interrupted);
             if dropped > 0 {
                 tracing::info!(session_id = %self.session_id, dropped, "Stop requested: dropped automated queued messages");
+            }
+            if let Some(next) = next.as_ref() {
+                tracing::info!(
+                    session_id = %self.session_id,
+                    kind = ?next.kind,
+                    held = next.held,
+                    interrupted,
+                    left = queue.len(),
+                    "next queued message taken for a new turn"
+                );
             }
             if next.is_none() {
                 self.is_streaming.store(false, Ordering::SeqCst);

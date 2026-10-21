@@ -11046,8 +11046,19 @@ impl ChatManager {
                     let outcome = super::pending_queue::apply(&mut queue, op);
                     (outcome, super::pending_queue::snapshot(&queue))
                 };
+                let streaming = session.is_streaming.load(Ordering::SeqCst);
+                info!(
+                    session_id = %session_id,
+                    op = op.name(),
+                    id = ?op.id(),
+                    found = outcome.found,
+                    interrupt = outcome.interrupt,
+                    streaming,
+                    held_left = messages.len(),
+                    "queue op applied (legacy engine)"
+                );
                 self.publish_pending_queue(session_id, &session.events_tx, messages);
-                if outcome.interrupt && session.is_streaming.load(Ordering::SeqCst) {
+                if outcome.interrupt && streaming {
                     // Same three steps as a message sent mid-stream.
                     session.interrupt_flag.store(true, Ordering::SeqCst);
                     session.interrupt_token.cancel();
