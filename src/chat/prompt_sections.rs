@@ -1530,11 +1530,11 @@ The body is JSON data only; an unknown field refuses the scene:
 "build":{"mode":"sequential"}}
 ```
 
-- Scene fields: title, caption, layout, stations, build. Station fields: one of mech or ast, tone, label (≤ 60 chars), after (indices, no cycle).
+- Scene fields: title, caption, layout, stations, build, focal (perspective, 0 = isometric). Station fields: one of mech or ast, tone, label (≤ 60 chars), after (indices, no cycle).
 - Keep 2 to 5 stations (more rarely fit). Normally omit layout; name one only when its shape means something: arch (a progression), ring (a whole and its parts), wings (two sides).
 - mech: drawers, dependency-graph, parallel-lanes, knowledge-graph, local-vault, skill-cartridge, stair-procedure, consent-gate, model-selector, reach-devices.
 - tone: green, indigo, amber, red, violet, sky. build.mode: parallel, sequential, waves.
-- One object: {"title":"...","ast":NODE}. NODE kinds: use (ref: agent, screen, chip, flag, arrow, server, document, node, step), group (children), slab (size), sphere or ring (r), puck or cone (r, h), tube (to, r); optional at, tone. Vectors [x,y,z]; sizes 0.01-6; at most 8 levels, 160 shapes. Prefer a mech."#;
+- One object: {"title":"...","ast":NODE}. NODE kinds: use (ref: agent, screen, chip, flag, arrow, server, document, node, step), group (children), slab (size), sphere or ring (r), puck or cone (r, h), tube (to, r), lathe (profile, seg), capsule (r, h), torus (r, t), repeat (shape, positions 1-128 — the shape counts once); optional at, rot, tone, mat, motion. Vectors [x,y,z]; sizes 0.01-6; at most 8 levels, 160 shapes. Prefer a mech."#;
 
 // ============================================================================
 // Tool Reference Groups — selective rendering of TOOL_REFERENCE
@@ -2167,14 +2167,11 @@ mod tests {
         );
     }
 
-    /// The contract of the frontend's ```iso-scene block, copied from
-    /// this-rs/project-orchestrator-frontend@fdde6f41545e43f5d71f6e07ac5ab41abfb06dcd
-    /// (`src/components/chat/viz/iso/compile.ts`: SCENE_KEYS, STATION_KEYS; engine copy
-    /// `src/vendor/three-iso/` from website@8ff26ee: `mechanisms.ts` MECHANISMS,
-    /// `iso.ts` LAMP, `layouts.ts` LAYOUTS, `scene.ts` STATION_RANGE, `ast.ts` KINDS and
-    /// AST_LIMITS, `catalog.ts` OBJECTS, `choreography.ts` BuildMode). Re-copy it when
-    /// the frontend's contract moves. The example was also run through the frontend's
-    /// own `compileIsoScene` (main fdde6f4 and PR #401 a2b3bae), which accepted it.
+    /// The contract of the frontend's ```iso-scene block: SCENE_KEYS, STATION_KEYS,
+    /// MECHANISMS, TONES, LAYOUTS, OBJECTS, BUILD_MODES and limits are the engine's
+    /// contract (`src/vendor/three-iso/`). SCENE_KEYS and KINDS were extended with
+    /// `focal`, `lathe`, `capsule`, `repeat`, `torus` (frontend PRs #407/#408/#409).
+    /// Re-copy it when the frontend's contract moves.
     mod iso_contract {
         pub const SCENE_KEYS: &[&str] = &[
             "title",
@@ -2188,6 +2185,7 @@ mod tests {
             "ast",
             "tone",
             "label",
+            "focal",
         ];
         pub const STATION_KEYS: &[&str] = &["mech", "ast", "tone", "label", "after"];
         pub const MECHANISMS: &[&str] = &[
@@ -2213,7 +2211,8 @@ mod tests {
             ("solo", 1, 1),
         ];
         pub const KINDS: &[&str] = &[
-            "slab", "puck", "sphere", "tube", "ring", "cone", "group", "use",
+            "slab", "puck", "sphere", "tube", "ring", "cone", "lathe", "capsule", "repeat",
+            "torus", "group", "use",
         ];
         pub const OBJECTS: &[&str] = &[
             "agent", "screen", "chip", "flag", "arrow", "server", "document", "node", "step",
@@ -2266,6 +2265,13 @@ mod tests {
                         out.push(format!("unknown object {r}"));
                     }
                 }
+                "repeat" => match n.get("shape") {
+                    Some(shape) => {
+                        walk(shape, depth + 1, shapes, out);
+                        *shapes += 1;
+                    }
+                    None => out.push("repeat needs a shape".into()),
+                },
                 _ => *shapes += 1,
             }
         }
@@ -2405,6 +2411,20 @@ mod tests {
         assert!(section.contains(&format!("{MAX_SHAPES} shapes")));
         // Concise: about 410 tokens (cl100k), well under 2 000 characters.
         assert!(section.len() < 1_700, "{} chars", section.len());
+    }
+
+    #[test]
+    fn repeat_is_accepted_and_counts_its_shape_once() {
+        // repeat + a 2-leaf shape = accepted; the shape is validated once, not per position.
+        let scene: serde_json::Value = serde_json::from_str(
+            r#"{"ast":{"kind":"group","children":[{"kind":"repeat","shape":{"kind":"group","children":[{"kind":"slab","size":[1,1,1]},{"kind":"puck","r":0.5,"h":1}]},"positions":[[0,0,0],[1,0,0]]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(iso_scene_problems(&scene), Vec::<String>::new());
+        // repeat without a shape is refused.
+        let bad: serde_json::Value =
+            serde_json::from_str(r#"{"ast":{"kind":"repeat","positions":[[0,0,0]]}}"#).unwrap();
+        assert!(!iso_scene_problems(&bad).is_empty(), "repeat needs a shape");
     }
 
     #[test]
