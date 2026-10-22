@@ -785,10 +785,12 @@ const _: () = assert!(
 /// it just span on "Stopping…" forever.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InterruptOutcome {
-    /// `true` when the session was found in `active_sessions` and the
-    /// interrupt was actually applied (flag + token + control_request).
-    /// `false` means nothing local was stopped — the session may live on
-    /// another instance (see `routed`), or not be running at all.
+    /// `true` when a live turn was actually interrupted locally. On the agent
+    /// engine this is the provider's own `turn_interrupted` verdict; on the
+    /// legacy engine it means the session was in `active_sessions` and the
+    /// flag + token + control_request were applied. `false` means nothing
+    /// local was stopped — the session may live on another instance (see
+    /// `routed`), or not be running at all.
     pub delivered: bool,
     /// Where the interrupt went: `"local"`, `"nats"` (not local, published
     /// for whichever instance owns the session) or `"none"` (nowhere).
@@ -14062,7 +14064,7 @@ impl ChatManager {
             let outcome = handle.interrupt_scoped(scope).await?;
             let diagnostic = outcome.diagnostic;
             return Ok(InterruptOutcome {
-                delivered: true,
+                delivered: outcome.turn_interrupted,
                 routed: "local".to_string(),
                 cli_pid: diagnostic.as_ref().and_then(|d| d.pid),
                 killed_pids: diagnostic.map(|d| d.killed_pids).unwrap_or_default(),
@@ -27016,6 +27018,30 @@ mod tests {
         );
         manager.close_session(&sid).await.unwrap();
         crate::auth::agent_tokens::revoke_session(&sid);
+    }
+
+    #[tokio::test]
+    async fn agent_interrupt_scoped_reports_whether_a_turn_was_running() {
+        let (manager, _graph, _fake) = agent_manager();
+
+        // An idle session has no turn: the Stop is delivered nowhere.
+        let idle = manager
+            .create_session(&agent_request(""))
+            .await
+            .unwrap()
+            .session_id;
+        let outcome = manager.interrupt_scoped(&idle, true).await.unwrap();
+        assert!(!outcome.delivered, "no turn running → delivered false");
+        assert_eq!(outcome.routed, "local");
+
+        // A session whose turn is running has something to interrupt.
+        let running = manager
+            .create_session(&agent_request("go"))
+            .await
+            .unwrap()
+            .session_id;
+        let outcome = manager.interrupt_scoped(&running, true).await.unwrap();
+        assert!(outcome.delivered, "a turn was running → delivered true");
     }
 
     #[tokio::test]
