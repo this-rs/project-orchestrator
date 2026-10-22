@@ -67,11 +67,14 @@ pub fn create_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Handle tray menu item clicks.
 ///
-/// The "settings" handler opens the desktop Settings page (`/settings`) by
-/// navigating INSIDE the single-page app (`pushState` + `popstate`), never with
+/// The "settings" handler opens the desktop Settings — the setup wizard in
+/// reconfigure mode (`/setup?from=tray`: servers, auth, models) — by navigating
+/// INSIDE the single-page app (`pushState` + `popstate`), never with
 /// `window.location.href`: a full reload drops the in-memory access token and the
-/// user lands back on the login page instead of the settings. The page the user
-/// was on is stored in `sessionStorage['settings_return_url']` for the back button.
+/// user lands back on the login page instead of the settings. The `?from=tray`
+/// param is read reactively by the frontend (`useTrayNavigation`), which sets
+/// `trayNavigationAtom` so the wizard skips the first-run status check and
+/// pre-fills from the existing config.yaml.
 fn handle_menu_event(app: &AppHandle, item_id: &str) {
     match item_id {
         "open" => {
@@ -83,9 +86,9 @@ fn handle_menu_event(app: &AppHandle, item_id: &str) {
                 window.set_focus().ok();
                 let _ = window.eval(
                     "(function(){var p=location.pathname;\
-                     if(p!=='/settings'){\
+                     if(p!=='/setup'){\
                      sessionStorage.setItem('settings_return_url',p+location.search);\
-                     history.pushState({},'','/settings');\
+                     history.pushState({},'','/setup?from=tray');\
                      window.dispatchEvent(new PopStateEvent('popstate'));}})()",
                 );
             }
