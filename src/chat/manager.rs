@@ -27933,6 +27933,7 @@ mod tests {
             true,
             Some(ProviderError::RateLimited {
                 retry_after_ms: Some(10),
+                resets_at_ms: None,
             }),
         ));
         let retrying = next_matching(&mut rx, |e| matches!(e, ChatEvent::Retrying { .. })).await;

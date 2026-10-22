@@ -359,6 +359,7 @@ pub fn open_failure(err: &ProviderError, provider_id: Option<&str>) -> OpenFailu
         }
         ProviderError::RateLimited {
             retry_after_ms: delay,
+            ..
         } => {
             retry_after_ms = *delay;
             (
@@ -888,6 +889,7 @@ mod tests {
         let failure = assert_mapped(
             ProviderError::RateLimited {
                 retry_after_ms: Some(1500),
+                resets_at_ms: None,
             },
             429,
             "rate_limited",
@@ -901,6 +903,7 @@ mod tests {
         let bare = assert_mapped(
             ProviderError::RateLimited {
                 retry_after_ms: None,
+                resets_at_ms: None,
             },
             429,
             "rate_limited",
@@ -1227,6 +1230,7 @@ mod tests {
             },
             E::RateLimited {
                 retry_after_ms: None,
+                resets_at_ms: None,
             },
             E::Overloaded,
             E::Timeout { after_ms: 1 },

@@ -12708,6 +12708,7 @@ mod post_turn {
             structured_output: None,
             error: Some(nexus_claude::agent::ProviderError::RateLimited {
                 retry_after_ms: Some(5),
+                resets_at_ms: None,
             }),
         };
         let r = rig(

@@ -250,6 +250,7 @@ fn shows_content(event: &AgentEvent) -> bool {
 fn retry_delay_ms(error: &ProviderError, attempt: u32, retry: &RetryConfig) -> u64 {
     if let ProviderError::RateLimited {
         retry_after_ms: Some(ms),
+        ..
     } = error
     {
         return (*ms).min(MAX_RETRY_DELAY_MS);
@@ -3377,6 +3378,7 @@ mod mask_tests {
         let config = RetryConfig::default();
         let limited = |ms| ProviderError::RateLimited {
             retry_after_ms: Some(ms),
+            resets_at_ms: None,
         };
         assert_eq!(retry_delay_ms(&limited(40), 1, &config), 40);
         assert_eq!(retry_delay_ms(&limited(900_000), 1, &config), 30_000);
@@ -3564,6 +3566,7 @@ mod mask_tests {
         };
         let limited = ProviderError::RateLimited {
             retry_after_ms: Some(5),
+            resets_at_ms: None,
         };
         let timeout = ProviderError::Timeout { after_ms: 60_000 };
         assert!(mid_generation_retryable(&done(true, Some(limited))).is_some());
@@ -5956,6 +5959,7 @@ mod answered_tests {
             true,
             Some(ProviderError::RateLimited {
                 retry_after_ms: Some(5),
+                resets_at_ms: None,
             }),
         )
     }
@@ -6202,6 +6206,7 @@ mod answered_tests {
                         true,
                         Some(ProviderError::RateLimited {
                             retry_after_ms: Some(5),
+                            resets_at_ms: None,
                         }),
                     ),
                 ],
@@ -6292,6 +6297,7 @@ mod answered_tests {
                     true,
                     Some(ProviderError::RateLimited {
                         retry_after_ms: Some(5),
+                        resets_at_ms: None,
                     }),
                 ),
             ]],
