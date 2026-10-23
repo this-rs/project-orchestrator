@@ -196,7 +196,12 @@ const TOP1_MC_SAMPLES: usize = 512;
 /// one sample from this distribution; `p_top1` is what an off-policy estimator
 /// (IPS/SNIPS) needs as the propensity of the pure-Thompson policy. Estimated
 /// deterministically: a fixed seed stream, independent of the decision seed.
-fn top1_probabilities(alphas: &[f64], betas: &[f64], arm_seeds: &[u64], samples: usize) -> Vec<f64> {
+fn top1_probabilities(
+    alphas: &[f64],
+    betas: &[f64],
+    arm_seeds: &[u64],
+    samples: usize,
+) -> Vec<f64> {
     let k = alphas.len();
     if k == 0 {
         return Vec::new();
