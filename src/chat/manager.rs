@@ -35983,6 +35983,7 @@ mod auto_open_bounds_tests {
             chosen: chosen.map(|(p, m)| Pick::new(p, m)),
             score: None,
             explored: false,
+            exploration_epsilon: 0.0,
             reason: "test".into(),
             alternatives: alternatives
                 .iter()
@@ -35990,6 +35991,8 @@ mod auto_open_bounds_tests {
                     pick: Pick::new(*p, *m),
                     score: *score,
                     rejected: rejected.then_some(RejectReason::Unhealthy),
+                    p_top1: None,
+                    propensity: None,
                 })
                 .collect(),
             applied: true,

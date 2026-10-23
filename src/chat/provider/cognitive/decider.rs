@@ -16,7 +16,7 @@ use super::candidates::{self, ModelFacts, Slot};
 use super::decision::{
     turn_reward, CognitiveDecision, DecideRequest, Decider, DecisionAlternative, Pick,
 };
-use super::mode::{LearningStage, ProviderRoutingMode, RoutingSettings};
+use super::mode::{LearningStage, ProviderRoutingMode, RoutingSettings, MAX_EXPLORATION_EPSILON};
 use super::scorer::{self, PriorHints, Scored};
 use super::segment_store::SegmentStore;
 use super::signature::TaskSignature;
@@ -176,6 +176,7 @@ fn decide_free(
         chosen: None,
         score: None,
         explored: false,
+        exploration_epsilon: 0.0,
         reason: String::new(),
         alternatives: Vec::new(),
         applied: false,
@@ -213,6 +214,8 @@ fn decide_free(
                 pick: pick_of(&r.candidate),
                 score: None,
                 rejected: Some(r.reason.clone()),
+                p_top1: None,
+                propensity: None,
             }));
     };
     if filtered.eligible.is_empty() {
@@ -270,12 +273,22 @@ fn decide_free(
     decision.explored = best.explored;
     decision.reason = reason_of(signature, best, best.explored, kept);
     decision.applied = is_applied(settings.mode, settings.stage, signature.role);
+    // Log the off-policy propensities: the exploration rate in force, the
+    // number of scored arms, and per arm both the pure-Thompson top-1
+    // probability and the ε-greedy propensity (before the hysteresis).
+    let epsilon = score_settings
+        .exploration_epsilon
+        .clamp(0.0, MAX_EXPLORATION_EPSILON);
+    let k = scored.len();
+    decision.exploration_epsilon = epsilon;
     decision.alternatives = scored
         .iter()
         .map(|s| DecisionAlternative {
             pick: pick_of(&s.candidate),
             score: Some(s.utility),
             rejected: None,
+            p_top1: Some(s.p_top1),
+            propensity: Some((1.0 - epsilon) * s.p_top1 + epsilon / k as f64),
         })
         .collect();
     rejected(&mut decision);

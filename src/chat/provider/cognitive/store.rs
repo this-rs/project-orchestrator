@@ -268,6 +268,7 @@ mod tests {
             chosen: Some(Pick::new("deepseek", "v4")),
             score: Some(0.7),
             explored: false,
+            exploration_epsilon: 0.0,
             reason: "test".into(),
             alternatives: vec![],
             applied: false,

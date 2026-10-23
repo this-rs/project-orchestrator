@@ -336,6 +336,7 @@ pub(crate) mod test_support {
                 chosen: (!explicit).then(|| self.pick.clone()),
                 score: None,
                 explored: false,
+                exploration_epsilon: 0.0,
                 reason: "fake".into(),
                 alternatives: Vec::new(),
                 applied: self.applied && !explicit,

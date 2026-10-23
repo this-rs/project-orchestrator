@@ -317,6 +317,7 @@ mod tests {
             chosen: Some(Pick::new("glm", "big")),
             score: Some(0.5),
             explored: false,
+            exploration_epsilon: 0.0,
             reason: "test".into(),
             alternatives: vec![],
             applied: false,

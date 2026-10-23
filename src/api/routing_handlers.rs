@@ -973,6 +973,7 @@ mod tests {
                 chosen: Some(Pick::new("prov", "model")),
                 score: Some(0.5),
                 explored: false,
+                exploration_epsilon: 0.0,
                 reason: format!("d{i}"),
                 alternatives: vec![],
                 applied: false,
@@ -1027,6 +1028,8 @@ mod tests {
             pick: Pick::new("claude-code", model),
             score,
             rejected,
+            p_top1: None,
+            propensity: None,
         };
         let store = InMemoryRoutingStore::new();
         store
@@ -1037,6 +1040,7 @@ mod tests {
                 chosen: None,
                 score: None,
                 explored: false,
+                exploration_epsilon: 0.0,
                 reason: "no_candidate".into(),
                 alternatives: vec![
                     alternative("claude-opus-5-5", Some(0.4), None),
@@ -1125,6 +1129,7 @@ mod tests {
                 chosen: Some(Pick::new("prov", "model")),
                 score: Some(0.5),
                 explored: false,
+                exploration_epsilon: 0.0,
                 reason: "r".into(),
                 alternatives: vec![],
                 applied: false,

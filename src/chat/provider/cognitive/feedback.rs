@@ -350,6 +350,7 @@ mod tests {
             chosen,
             score: None,
             explored: false,
+            exploration_epsilon: 0.0,
             reason: "test".into(),
             alternatives: vec![],
             applied: true,
@@ -705,6 +706,8 @@ mod tests {
             pick: Pick::new("p", model),
             score,
             rejected: None,
+            p_top1: None,
+            propensity: None,
         }
     }
 

@@ -1963,6 +1963,7 @@ mod cognitive_routing {
                 chosen: Some(Pick::new("other", "o1")),
                 score: Some(0.9),
                 explored: false,
+                exploration_epsilon: 0.0,
                 reason: "other/o1: fake".into(),
                 alternatives: Vec::new(),
                 applied: true,
@@ -2045,6 +2046,7 @@ mod cognitive_routing {
                 chosen: None,
                 score: None,
                 explored: false,
+                exploration_epsilon: 0.0,
                 reason: "declines: fake".into(),
                 alternatives: Vec::new(),
                 applied: false,
@@ -3131,6 +3133,7 @@ mod turn_routing {
                 )),
                 score: Some(0.9),
                 explored: false,
+                exploration_epsilon: 0.0,
                 reason: format!("fake: {model}"),
                 alternatives: Vec::new(),
                 applied,
@@ -4806,12 +4809,16 @@ mod provider_switch {
                     pick: chosen.clone(),
                     score: Some(0.9),
                     rejected: None,
+                    p_top1: None,
+                    propensity: None,
                 }];
                 if chosen != current {
                     alternatives.push(DecisionAlternative {
                         pick: current,
                         score: Some(0.3),
                         rejected: None,
+                        p_top1: None,
+                        propensity: None,
                     });
                 }
                 Ok(CognitiveDecision {
@@ -4821,6 +4828,7 @@ mod provider_switch {
                     chosen: Some(chosen.clone()),
                     score: Some(0.9),
                     explored: false,
+                    exploration_epsilon: 0.0,
                     reason: format!("fake: {}/{}", chosen.provider_id, chosen.model),
                     alternatives,
                     applied: request.settings.mode == ProviderRoutingMode::Full
@@ -14780,6 +14788,7 @@ mod native_subagents {
                     chosen: Some(pick),
                     score: Some(0.9),
                     explored: false,
+                    exploration_epsilon: 0.0,
                     reason: "role-aware: fake".into(),
                     alternatives: Vec::new(),
                     applied: true,
@@ -14941,6 +14950,7 @@ mod native_subagents {
                     chosen: Some(pick),
                     score: Some(0.9),
                     explored: false,
+                    exploration_epsilon: 0.0,
                     reason: "routes children: fake".into(),
                     alternatives: Vec::new(),
                     applied: true,
