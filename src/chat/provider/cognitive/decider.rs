@@ -859,6 +859,68 @@ mod tests {
         )
     }
 
+    #[test]
+    fn a_decision_logs_p_top1_and_propensity_for_every_scored_arm() {
+        let req = request(pilot(), ProviderRoutingMode::Full, LearningStage::Auto);
+        let decision = decide_with(
+            Uuid::from_u128(42),
+            Utc::now(),
+            &req,
+            &[],
+            &PriorHints::new(),
+        );
+        assert_eq!(decision.exploration_epsilon, 0.0);
+        let scored: Vec<_> = decision
+            .alternatives
+            .iter()
+            .filter(|a| a.score.is_some())
+            .collect();
+        assert_eq!(scored.len(), 2);
+        for a in &scored {
+            let p = a.p_top1.unwrap();
+            assert!((0.0..=1.0).contains(&p));
+            // ε = 0 → the propensity is exactly the top-1 probability.
+            assert!((a.propensity.unwrap() - p).abs() < 1e-12);
+        }
+        let sum: f64 = scored.iter().map(|a| a.p_top1.unwrap()).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-9,
+            "top-1 probabilities sum to 1, got {sum}"
+        );
+    }
+
+    #[test]
+    fn the_logged_propensity_follows_the_epsilon_greedy_formula() {
+        let mut req = request(pilot(), ProviderRoutingMode::Full, LearningStage::Auto);
+        req.settings.exploration_epsilon = 0.2;
+        let decision = decide_with(
+            Uuid::from_u128(42),
+            Utc::now(),
+            &req,
+            &[],
+            &PriorHints::new(),
+        );
+        assert_eq!(decision.exploration_epsilon, 0.2);
+        let scored: Vec<_> = decision
+            .alternatives
+            .iter()
+            .filter(|a| a.score.is_some())
+            .collect();
+        let k = scored.len();
+        assert_eq!(k, 2);
+        let mut sum = 0.0;
+        for a in &scored {
+            let p = a.p_top1.unwrap();
+            let expected = (1.0 - 0.2) * p + 0.2 / k as f64;
+            assert!(
+                (a.propensity.unwrap() - expected).abs() < 1e-12,
+                "π = (1−ε)·p_top1 + ε/k"
+            );
+            sum += a.propensity.unwrap();
+        }
+        assert!((sum - 1.0).abs() < 1e-9, "propensities sum to 1, got {sum}");
+    }
+
     #[tokio::test]
     async fn a_successful_turn_raises_the_served_arms_mean() {
         let store = Arc::new(InMemoryRoutingStore::new());
