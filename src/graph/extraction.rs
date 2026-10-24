@@ -392,7 +392,6 @@ mod tests {
         );
         assert_eq!(synapse_top_k_from_env(), DEFAULT_SYNAPSE_TOP_K);
     }
-    }
 
     /// Seed a project with files and import relationships into the mock store.
     async fn seed_files_and_imports(
