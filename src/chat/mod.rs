@@ -10,6 +10,7 @@ pub mod cli_version;
 pub mod compaction_context;
 pub mod composer;
 pub mod config;
+pub mod content_policy;
 pub mod continuity;
 pub mod control_pump;
 pub(crate) mod drain;

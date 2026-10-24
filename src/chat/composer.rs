@@ -62,6 +62,11 @@ pub struct PromptAudience {
     /// The session has a `spawned_by` (a child, a delegation, a run...): something
     /// other than a person opened it. `false` for a root conversation.
     pub spawned: bool,
+    /// The content posture of the engine the prompt is for ([`super::content_policy`]):
+    /// a `Restricted` provider (Claude Code) does not get the project's provider-sensitive
+    /// notes in its prompt, so a safety classifier does not refuse the turn for context it
+    /// never needed. The default is `Restricted` (a root session on Claude Code).
+    pub content_policy: super::content_policy::ContentPolicy,
 }
 
 impl PromptAudience {
@@ -91,6 +96,7 @@ impl PromptAudience {
             vocabulary: SubagentVocabulary::of_provider(provider_id),
             child,
             spawned: spawned_by.is_some_and(|s| !s.trim().is_empty()),
+            content_policy: super::content_policy::provider_content_policy(provider_id),
         }
     }
 
@@ -962,6 +968,25 @@ mod tests {
                 "{spawned:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_audience_carries_the_provider_content_policy() {
+        use super::super::content_policy::ContentPolicy;
+        // Claude Code (and the empty default) is restricted: Anthropic's safeguards.
+        assert_eq!(
+            PromptAudience::of(None, "claude-code").content_policy,
+            ContentPolicy::Restricted
+        );
+        assert_eq!(
+            PromptAudience::default().content_policy,
+            ContentPolicy::Restricted
+        );
+        // Another provider is permissive.
+        assert_eq!(
+            PromptAudience::of(None, "deepseek").content_policy,
+            ContentPolicy::Permissive
+        );
     }
 
     #[test]

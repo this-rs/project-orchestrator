@@ -5640,7 +5640,7 @@ impl ChatManager {
         };
 
         // Fetch raw context from Neo4j
-        let ctx = match fetch_project_context(&self.graph, slug).await {
+        let mut ctx = match fetch_project_context(&self.graph, slug).await {
             Ok(ctx) => ctx,
             Err(e) => {
                 warn!(
@@ -5657,6 +5657,39 @@ impl ChatManager {
                 return (FsmPromptComposer::compose(&input), empty_ids);
             }
         };
+
+        // A restricted provider (Claude Code: Anthropic's safeguards) does not get the
+        // project's provider-sensitive notes in its prompt. Injected, they make the
+        // endpoint's safety classifier refuse EVERY turn of the session — even a bare
+        // "salut" — because it reads the system prompt. The content is legitimate; it is
+        // kept for a permissive provider, and left out here so a normal conversation is not
+        // refused for context it never needed (decision 3fccf7c5; the auto-route of a
+        // conversation that does need it is the planned follow-up).
+        if audience.content_policy.is_restricted() {
+            use super::content_policy::tags_are_sensitive;
+            let before = ctx.guidelines.len()
+                + ctx.gotchas.len()
+                + ctx.global_guidelines.len()
+                + ctx.global_gotchas.len();
+            ctx.guidelines.retain(|n| !tags_are_sensitive(&n.tags));
+            ctx.gotchas.retain(|n| !tags_are_sensitive(&n.tags));
+            ctx.global_guidelines
+                .retain(|n| !tags_are_sensitive(&n.tags));
+            ctx.global_gotchas.retain(|n| !tags_are_sensitive(&n.tags));
+            let omitted = before
+                - (ctx.guidelines.len()
+                    + ctx.gotchas.len()
+                    + ctx.global_guidelines.len()
+                    + ctx.global_gotchas.len());
+            if omitted > 0 {
+                info!(
+                    session_id = session_id.unwrap_or(""),
+                    slug,
+                    omitted,
+                    "left provider-sensitive notes out of a restricted provider's prompt"
+                );
+            }
+        }
 
         // Collect note IDs from guidelines/gotchas for deduplication with enrichment
         let included_note_ids: std::collections::HashSet<String> = ctx
