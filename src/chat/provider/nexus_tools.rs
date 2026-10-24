@@ -1136,6 +1136,11 @@ pub struct NexusToolsConfig {
     /// Places no file tool of the session may reach, scoped or not (`--deny-path`, nexus #93):
     /// [`host_deny_paths`] in production.
     pub deny_paths: Vec<PathBuf>,
+    /// The user's home, when the server knows it ([`HostPlaces::home`]): the native shell's
+    /// `git`/`gh` then mirror the host's credentials (decision 2238b1e4) — `GIT_CONFIG_GLOBAL`
+    /// for the commit identity and the `gh auth git-credential` helper, `GH_TOKEN` for the
+    /// token — while the shell keeps its own HOME. `None`: no mirroring (tests, unknown home).
+    pub host_home: Option<PathBuf>,
 }
 
 /// The `nexus-tools` tools a session's policy gives it (the profile signed into its token).
@@ -1256,6 +1261,38 @@ pub fn session_temp_dir(session_id: &str) -> Option<PathBuf> {
         }
     }
     std::fs::canonicalize(dir).ok()
+}
+
+/// The token of the host's `gh` login, read once per attach so a native session's `git`/`gh`
+/// authenticate exactly like the host does (decision 2238b1e4). `HOME=<home> gh auth token` is the
+/// only pointer that works on macOS: the token lives in the Keychain, resolved through the real
+/// home, so `GH_CONFIG_DIR` alone answers 401. The child gets a clean environment (a stray
+/// `GH_TOKEN`/`GH_CONFIG_DIR` of the server must not decide how the host's login is read).
+///
+/// Best-effort: no `gh` on the PATH, not logged in, a timeout of 5 s, or an empty answer → `None`,
+/// and the session simply has no `GH_TOKEN`. The value is never logged.
+async fn host_gh_token(home: &Path) -> Option<String> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut command = tokio::process::Command::new("gh");
+    command
+        .args(["auth", "token"])
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", home)
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let token = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (!token.is_empty()).then_some(token)
 }
 
 /// Whether a session's file scope is lifted (`nexus-tools --unscoped`): its policy is in trust
@@ -1561,6 +1598,24 @@ pub async fn attach(
         attachment.temp_dir = Some(tmp);
     }
     env.extend(secrets);
+    // The host's git/gh credential context (decision 2238b1e4): the sandboxed `git`/`gh` of a
+    // native session then authenticate exactly like the host does, while the shell keeps its own
+    // HOME. `GIT_CONFIG_GLOBAL` gives the commit identity and the `gh auth git-credential` helper;
+    // `GH_TOKEN` is the host's `gh` login, asked once here (best-effort). Without `gh`, without a
+    // login, or on a timeout, the session simply has no GH_TOKEN and push fails as before —
+    // `git`/`gh` stay working for everything that needs no credential.
+    if let Some(home) = &config.host_home {
+        let gitconfig = home.join(".gitconfig");
+        if gitconfig.is_file() {
+            env.insert(
+                "NEXUS_TOOLS_GIT_CONFIG_GLOBAL".to_owned(),
+                gitconfig.display().to_string(),
+            );
+        }
+        if let Some(token) = host_gh_token(home).await {
+            env.insert("NEXUS_TOOLS_GH_TOKEN".to_owned(), token);
+        }
+    }
     attachment.servers.insert(
         NEXUS_TOOLS_SERVER.to_owned(),
         McpServerSpec::Stdio {
@@ -1688,6 +1743,7 @@ mod tests {
             obscura: None,
             embedded_obscura: false,
             deny_paths: vec![PathBuf::from("/home/me/.ssh")],
+            host_home: None,
         }
     }
 
@@ -1724,6 +1780,30 @@ mod tests {
             }
             other => panic!("expected a stdio server `{name}`, got {other:?}"),
         }
+    }
+
+    /// A known host home makes the session's `git` read the host's config (decision 2238b1e4):
+    /// identity and the `gh auth git-credential` helper, without moving the shell into the home.
+    #[tokio::test]
+    async fn a_known_host_home_points_the_session_git_at_the_host_config() {
+        let home = tempfile::tempdir().unwrap();
+        let gitconfig = home.path().join(".gitconfig");
+        std::fs::write(&gitconfig, "[user]\n\tname = H\n").unwrap();
+        let graph = Arc::new(MockGraphStore::new());
+        let consents = GraphConsents(graph.clone());
+        let policy = ask();
+        let cfg = NexusToolsConfig {
+            host_home: Some(home.path().to_path_buf()),
+            ..config()
+        };
+        let a = attach(&cfg, &consents, None, input("git-home", &policy, None)).await;
+        let env = stdio(&a, NEXUS_TOOLS_SERVER).2;
+        assert_eq!(
+            env.get("NEXUS_TOOLS_GIT_CONFIG_GLOBAL").map(String::as_str),
+            Some(gitconfig.to_str().unwrap())
+        );
+        // No `gh` login under this home, so no token — and never an empty variable.
+        assert!(!env.contains_key("NEXUS_TOOLS_GH_TOKEN"));
     }
 
     // ---- (3) the consent of the project, by origin -------------------------------------
@@ -3494,6 +3574,7 @@ mod tests {
             obscura: None,
             embedded_obscura: false,
             deny_paths: Vec::new(),
+            host_home: None,
         };
         // Detected, not authorised.
         let a = attach(
