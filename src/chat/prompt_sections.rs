@@ -2351,6 +2351,1165 @@ mod tests {
         out
     }
 
+    /// The v2 contract of the ```scene3d block (`frontend/docs/architecture/3d-general/01-scene-contract.md`):
+    /// a free-camera scene graph with inline `mesh` geometry, PBR `material`s, `texture`s, `lights` and
+    /// `assets`. A `scene3d` block may still carry a v1 payload (`version: "1"` — migration tier 2), which
+    /// delegates to [`iso_scene_problems`]. The exact bounds are `scene3d_contract` (spec §3).
+    mod scene3d_contract {
+        pub const V1_KEYS: &[&str] = &[
+            "layout",
+            "stations",
+            "angles",
+            "home",
+            "stepSeconds",
+            "focal",
+            "build",
+            "ast",
+            "tone",
+            "label",
+        ];
+        pub const V2_KEYS: &[&str] = &[
+            "camera",
+            "lights",
+            "textures",
+            "materials",
+            "assets",
+            "nodes",
+        ];
+        pub const META_KEYS: &[&str] = &["version", "title", "caption"];
+        pub const VERSIONS: &[&str] = &["1", "2"];
+
+        pub const MAX_TITLE: usize = 120;
+        pub const MAX_CAPTION: usize = 300;
+        pub const MAX_NODES: usize = 512;
+        pub const MAX_DEPTH: usize = 32;
+        pub const MAX_ASSETS: usize = 256;
+        pub const MAX_MATERIALS: usize = 64;
+        pub const MAX_TEXTURES: usize = 32;
+        pub const MAX_LIGHTS: usize = 16;
+        pub const MAX_MESHES: usize = 256;
+
+        pub const MAX_VERTICES: usize = 65_536;
+        pub const MAX_TRIANGLES: usize = 131_072;
+        pub const MAX_VERTICES_TOTAL: usize = 1_048_576;
+        pub const MAX_TRIANGLES_TOTAL: usize = 2_097_152;
+
+        pub const POS_LO: f64 = -1000.0;
+        pub const POS_HI: f64 = 1000.0;
+        pub const ROT_LO: f64 = -360.0;
+        pub const ROT_HI: f64 = 360.0;
+        pub const UV_LO: f64 = -64.0;
+        pub const UV_HI: f64 = 64.0;
+        pub const SCALE_LO: f64 = 1e-4;
+        pub const SCALE_HI: f64 = 1000.0;
+
+        pub const MAX_URL: usize = 2048;
+        pub const MAX_DATA_BYTES: usize = 512 * 1024;
+
+        pub const FOV_LO: f64 = 1.0;
+        pub const FOV_HI: f64 = 120.0;
+        pub const NEAR_HI: f64 = 10_000.0;
+        pub const FAR_HI: f64 = 100_000.0;
+        pub const INTENSITY_HI: f64 = 100.0;
+        pub const DISTANCE_HI: f64 = 10_000.0;
+        pub const DECAY_HI: f64 = 4.0;
+        pub const EMISSIVE_HI: f64 = 64.0;
+        pub const IOR_LO: f64 = 1.0;
+        pub const IOR_HI: f64 = 3.0;
+
+        pub const MAX_ID: usize = 64;
+        pub const CAMERA_KINDS: &[&str] = &["perspective", "orthographic"];
+        pub const TEXTURE_KINDS: &[&str] = &["image", "procedural"];
+        pub const PROCEDURAL_TYPES: &[&str] = &["checker", "solid", "gradient"];
+        pub const WRAPS: &[&str] = &["repeat", "clamp", "mirror"];
+        pub const FILTERS: &[&str] = &["nearest", "linear"];
+        pub const LIGHT_KINDS: &[&str] = &["ambient", "directional", "point"];
+        pub const WINDINGS: &[&str] = &["ccw", "cw"];
+    }
+
+    /// The v2 checks of the ```scene3d block: a free-camera scene graph (`nodes`) with inline `mesh`
+    /// geometry, PBR `material`s, `texture`s, `lights` and `assets`, and the exact bounds of the spec §3.
+    /// A v1 payload (`version: "1"`, or v1 fields without v2 fields) delegates to [`iso_scene_problems`].
+    fn scene3d_problems(scene: &serde_json::Value) -> Vec<String> {
+        use scene3d_contract::*;
+        use serde_json::Value;
+        use std::collections::{HashMap, HashSet};
+
+        fn is_id(s: &str) -> bool {
+            !s.is_empty()
+                && s.chars().count() <= MAX_ID
+                && s.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+                && s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+                && s.chars().last().is_some_and(|c| c.is_ascii_alphanumeric())
+        }
+        fn num_in(v: &Value, lo: f64, hi: f64) -> bool {
+            v.as_f64()
+                .is_some_and(|x| x.is_finite() && x >= lo && x <= hi)
+        }
+        fn int_in(v: &Value, lo: i64, hi: i64) -> bool {
+            v.as_i64().is_some_and(|x| x >= lo && x <= hi)
+        }
+        fn vec3(v: &Value, lo: f64, hi: f64) -> bool {
+            v.as_array()
+                .is_some_and(|a| a.len() == 3 && a.iter().all(|x| num_in(x, lo, hi)))
+        }
+        fn is_hex_color(s: &str) -> bool {
+            let hex = s.strip_prefix('#').unwrap_or(s);
+            matches!(hex.len(), 3 | 4 | 6 | 8) && hex.chars().all(|c| c.is_ascii_hexdigit())
+        }
+        fn is_color(v: &Value) -> bool {
+            match v {
+                Value::String(s) => is_hex_color(s),
+                Value::Array(a) => {
+                    (a.len() == 3 || a.len() == 4) && a.iter().all(|x| num_in(x, 0.0, 1.0))
+                }
+                _ => false,
+            }
+        }
+
+        let mut out = Vec::new();
+        let Some(obj) = scene.as_object() else {
+            return vec!["not an object".into()];
+        };
+
+        let version = obj.get("version").and_then(Value::as_str);
+        if let Some(v) = version {
+            if !VERSIONS.contains(&v) {
+                out.push(format!("unknown version {v}"));
+                return out;
+            }
+        }
+        let has = |keys: &[&str]| keys.iter().any(|k| obj.contains_key(*k));
+        let has_v1 = has(V1_KEYS);
+        let has_v2 = has(V2_KEYS);
+        if has_v1 && has_v2 {
+            out.push("mixed v1 and v2 fields".into());
+            return out;
+        }
+        let is_v1 = match version {
+            Some("1") => true,
+            Some("2") => false,
+            _ if has_v1 => true,
+            _ if has_v2 => false,
+            _ => return vec!["a scene needs stations/ast or nodes".into()],
+        };
+        if is_v1 {
+            if has_v2 {
+                out.push("version 1 with v2 fields".into());
+                return out;
+            }
+            let mut v1 = obj.clone();
+            v1.remove("version");
+            return iso_scene_problems(&Value::Object(v1));
+        }
+        if has_v1 {
+            out.push("version 2 with v1 fields".into());
+            return out;
+        }
+
+        // v2 root fields.
+        if let Some(t) = obj.get("title") {
+            if t.as_str().is_none_or(|s| s.chars().count() > MAX_TITLE) {
+                out.push("bad title".into());
+            }
+        }
+        if let Some(c) = obj.get("caption") {
+            if c.as_str().is_none_or(|s| s.chars().count() > MAX_CAPTION) {
+                out.push("bad caption".into());
+            }
+        }
+        for k in obj.keys() {
+            if !V2_KEYS.contains(&k.as_str()) && !META_KEYS.contains(&k.as_str()) {
+                out.push(format!("unknown scene field {k}"));
+            }
+        }
+
+        // textures
+        let mut texture_ids: HashSet<String> = HashSet::new();
+        if let Some(list) = obj.get("textures").and_then(Value::as_array) {
+            if list.len() > MAX_TEXTURES {
+                out.push(format!("{} textures (at most {MAX_TEXTURES})", list.len()));
+            }
+            for (i, t) in list.iter().enumerate() {
+                let Some(t) = t.as_object() else {
+                    out.push(format!("texture {i} not an object"));
+                    continue;
+                };
+                let Some(id) = t.get("id").and_then(Value::as_str) else {
+                    out.push(format!("texture {i} needs an id"));
+                    continue;
+                };
+                if !is_id(id) {
+                    out.push(format!("texture {i}: bad id {id}"));
+                }
+                if !texture_ids.insert(id.to_string()) {
+                    out.push(format!("duplicate texture id {id}"));
+                }
+                let kind = t.get("kind").and_then(Value::as_str).unwrap_or("");
+                if !TEXTURE_KINDS.contains(&kind) {
+                    out.push(format!("texture {id}: unknown kind {kind}"));
+                    continue;
+                }
+                match kind {
+                    "image" => {
+                        match t.get("image") {
+                            Some(Value::Object(img)) => {
+                                if let Some(u) = img.get("url").and_then(Value::as_str) {
+                                    if u.len() > MAX_URL {
+                                        out.push(format!("texture {id}: url too long"));
+                                    }
+                                    if !(u.starts_with("https:") || u.starts_with("data:image/")) {
+                                        out.push(format!("texture {id}: url scheme must be https: or data:image/"));
+                                    }
+                                    if u.starts_with("data:")
+                                        && u.len().saturating_mul(3) / 4 > MAX_DATA_BYTES
+                                    {
+                                        out.push(format!("texture {id}: data URI too large"));
+                                    }
+                                }
+                                for (key, allowed) in [
+                                    ("wrapS", WRAPS),
+                                    ("wrapT", WRAPS),
+                                    ("minFilter", FILTERS),
+                                    ("magFilter", FILTERS),
+                                ] {
+                                    if let Some(v) = img.get(key).and_then(Value::as_str) {
+                                        if !allowed.contains(&v) {
+                                            out.push(format!(
+                                                "texture {id}: {key} {v} not in {}",
+                                                allowed.join(",")
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            _ => out.push(format!("texture {id}: image must be an object")),
+                        }
+                    }
+                    "procedural" => match t.get("procedural").and_then(Value::as_object) {
+                        Some(p) => {
+                            let ty = p.get("type").and_then(Value::as_str).unwrap_or("");
+                            if !PROCEDURAL_TYPES.contains(&ty) {
+                                out.push(format!("texture {id}: unknown procedural type {ty}"));
+                            }
+                            for key in ["colorA", "colorB"] {
+                                if let Some(v) = p.get(key) {
+                                    if !v.as_str().is_some_and(is_hex_color) {
+                                        out.push(format!(
+                                            "texture {id}: {key} must be a hex color"
+                                        ));
+                                    }
+                                }
+                            }
+                            if let Some(s) = p.get("scale") {
+                                if !int_in(s, 1, 64) {
+                                    out.push(format!(
+                                        "texture {id}: scale must be an integer 1..64"
+                                    ));
+                                }
+                            }
+                        }
+                        None => out.push(format!("texture {id}: procedural must be an object")),
+                    },
+                    _ => {}
+                }
+            }
+        }
+
+        // materials
+        let mut material_ids: HashSet<String> = HashSet::new();
+        if let Some(list) = obj.get("materials").and_then(Value::as_array) {
+            if list.len() > MAX_MATERIALS {
+                out.push(format!(
+                    "{} materials (at most {MAX_MATERIALS})",
+                    list.len()
+                ));
+            }
+            for (i, m) in list.iter().enumerate() {
+                let Some(m) = m.as_object() else {
+                    out.push(format!("material {i} not an object"));
+                    continue;
+                };
+                let Some(id) = m.get("id").and_then(Value::as_str) else {
+                    out.push(format!("material {i} needs an id"));
+                    continue;
+                };
+                if !is_id(id) {
+                    out.push(format!("material {i}: bad id {id}"));
+                }
+                if !material_ids.insert(id.to_string()) {
+                    out.push(format!("duplicate material id {id}"));
+                }
+                for key in ["baseColor", "emissive"] {
+                    if let Some(v) = m.get(key) {
+                        if !is_color(v) {
+                            out.push(format!("material {id}: bad {key}"));
+                        }
+                    }
+                }
+                for (key, lo, hi) in [
+                    ("metallic", 0.0, 1.0),
+                    ("roughness", 0.0, 1.0),
+                    ("opacity", 0.0, 1.0),
+                    ("alphaCutoff", 0.0, 1.0),
+                ] {
+                    if let Some(v) = m.get(key) {
+                        if !num_in(v, lo, hi) {
+                            out.push(format!("material {id}: {key} must be {lo}..{hi}"));
+                        }
+                    }
+                }
+                if let Some(v) = m.get("emissiveIntensity") {
+                    if !num_in(v, 0.0, EMISSIVE_HI) {
+                        out.push(format!("material {id}: emissiveIntensity out of range"));
+                    }
+                }
+                if let Some(v) = m.get("ior") {
+                    if !num_in(v, IOR_LO, IOR_HI) {
+                        out.push(format!("material {id}: ior must be {IOR_LO}..{IOR_HI}"));
+                    }
+                }
+                for key in [
+                    "baseColorTexture",
+                    "normalMap",
+                    "metallicRoughnessTexture",
+                    "occlusionTexture",
+                ] {
+                    if let Some(v) = m.get(key) {
+                        if !v.is_null() && !v.as_str().is_some_and(|s| texture_ids.contains(s)) {
+                            out.push(format!("material {id}: {key} does not reference a texture"));
+                        }
+                    }
+                }
+                if let Some(v) = m.get("doubleSided") {
+                    if !v.is_boolean() {
+                        out.push(format!("material {id}: doubleSided must be a boolean"));
+                    }
+                }
+            }
+        }
+
+        // camera
+        if let Some(cam) = obj.get("camera").and_then(Value::as_object) {
+            let kind = cam
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("perspective");
+            if !CAMERA_KINDS.contains(&kind) {
+                out.push(format!("camera: unknown kind {kind}"));
+            }
+            for key in ["position", "target", "up"] {
+                if let Some(v) = cam.get(key) {
+                    if !vec3(v, POS_LO, POS_HI) {
+                        out.push(format!(
+                            "camera: {key} must be [x,y,z] in [{POS_LO},{POS_HI}]"
+                        ));
+                    }
+                }
+            }
+            if let Some(n) = cam.get("near") {
+                if !n.as_f64().is_some_and(|x| x > 0.0 && x <= NEAR_HI) {
+                    out.push(format!("camera: near must be in (0, {NEAR_HI}]"));
+                }
+            }
+            if let Some(f) = cam.get("far") {
+                if !f.as_f64().is_some_and(|x| x.is_finite() && x <= FAR_HI) {
+                    out.push(format!("camera: far must be <= {FAR_HI}"));
+                }
+            }
+            if let (Some(n), Some(f)) = (cam.get("near"), cam.get("far")) {
+                if let (Some(n), Some(f)) = (n.as_f64(), f.as_f64()) {
+                    if f <= n {
+                        out.push("camera: far must be > near".into());
+                    }
+                }
+            }
+            if kind == "perspective" {
+                if let Some(fov) = cam.get("fov") {
+                    if !num_in(fov, FOV_LO, FOV_HI) {
+                        out.push(format!("camera: fov must be {FOV_LO}..{FOV_HI}"));
+                    }
+                }
+            } else {
+                if let Some(z) = cam.get("zoom") {
+                    if !z.as_f64().is_some_and(|x| x > 0.0 && x <= 1000.0) {
+                        out.push("camera: zoom must be in (0, 1000]".into());
+                    }
+                }
+                if let (Some(l), Some(r)) = (
+                    cam.get("left").and_then(Value::as_f64),
+                    cam.get("right").and_then(Value::as_f64),
+                ) {
+                    if r <= l {
+                        out.push("camera: right must be > left".into());
+                    }
+                }
+                if let (Some(b), Some(t)) = (
+                    cam.get("bottom").and_then(Value::as_f64),
+                    cam.get("top").and_then(Value::as_f64),
+                ) {
+                    if t <= b {
+                        out.push("camera: top must be > bottom".into());
+                    }
+                }
+            }
+        } else if obj.contains_key("camera") {
+            out.push("camera must be an object".into());
+        }
+
+        // lights
+        if let Some(list) = obj.get("lights").and_then(Value::as_array) {
+            if list.len() > MAX_LIGHTS {
+                out.push(format!("{} lights (at most {MAX_LIGHTS})", list.len()));
+            }
+            for (i, l) in list.iter().enumerate() {
+                let Some(l) = l.as_object() else {
+                    out.push(format!("light {i} not an object"));
+                    continue;
+                };
+                let kind = l.get("kind").and_then(Value::as_str).unwrap_or("");
+                if !LIGHT_KINDS.contains(&kind) {
+                    out.push(format!("light {i}: unknown kind {kind}"));
+                    continue;
+                }
+                if let Some(c) = l.get("color") {
+                    if !is_color(c) {
+                        out.push(format!("light {i}: bad color"));
+                    }
+                }
+                if let Some(v) = l.get("intensity") {
+                    if !num_in(v, 0.0, INTENSITY_HI) {
+                        out.push(format!("light {i}: intensity out of range"));
+                    }
+                }
+                match kind {
+                    "directional" => {
+                        if let Some(d) = l.get("direction") {
+                            let nonzero = d.as_array().is_some_and(|a| {
+                                a.iter().any(|x| x.as_f64().is_some_and(|y| y != 0.0))
+                            });
+                            if !vec3(d, POS_LO, POS_HI) || !nonzero {
+                                out.push(format!(
+                                    "light {i}: direction must be a non-zero [x,y,z]"
+                                ));
+                            }
+                        }
+                    }
+                    "point" => {
+                        if let Some(p) = l.get("position") {
+                            if !vec3(p, POS_LO, POS_HI) {
+                                out.push(format!("light {i}: position out of range"));
+                            }
+                        }
+                        if let Some(d) = l.get("distance") {
+                            if !num_in(d, 0.0, DISTANCE_HI) {
+                                out.push(format!("light {i}: distance out of range"));
+                            }
+                        }
+                        if let Some(d) = l.get("decay") {
+                            if !num_in(d, 0.0, DECAY_HI) {
+                                out.push(format!("light {i}: decay out of range"));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // assets
+        let mut asset_ids: HashSet<String> = HashSet::new();
+        if let Some(list) = obj.get("assets").and_then(Value::as_array) {
+            if list.len() > MAX_ASSETS {
+                out.push(format!("{} assets (at most {MAX_ASSETS})", list.len()));
+            }
+            for (i, a) in list.iter().enumerate() {
+                let Some(a) = a.as_object() else {
+                    out.push(format!("asset {i} not an object"));
+                    continue;
+                };
+                let Some(id) = a.get("id").and_then(Value::as_str) else {
+                    out.push(format!("asset {i} needs an id"));
+                    continue;
+                };
+                if !is_id(id) {
+                    out.push(format!("asset {i}: bad id {id}"));
+                }
+                if !asset_ids.insert(id.to_string()) {
+                    out.push(format!("duplicate asset id {id}"));
+                }
+            }
+        }
+
+        // nodes
+        fn check_mesh(
+            mesh: &Value,
+            material_ids: &HashSet<String>,
+            where_: &str,
+            out: &mut Vec<String>,
+            verts: &mut usize,
+            tris: &mut usize,
+        ) {
+            let Some(m) = mesh.as_object() else {
+                out.push(format!("{where_}: mesh must be an object"));
+                return;
+            };
+            let Some(positions) = m.get("positions").and_then(Value::as_array) else {
+                out.push(format!("{where_}: mesh needs positions"));
+                return;
+            };
+            if positions.is_empty() || positions.len() % 3 != 0 {
+                out.push(format!(
+                    "{where_}: positions length must be a positive multiple of 3"
+                ));
+                return;
+            }
+            let vcount = positions.len() / 3;
+            if vcount > MAX_VERTICES {
+                out.push(format!(
+                    "{where_}: {vcount} vertices (at most {MAX_VERTICES})"
+                ));
+            }
+            if positions.iter().any(|x| !num_in(x, POS_LO, POS_HI)) {
+                out.push(format!(
+                    "{where_}: a position component is outside [{POS_LO},{POS_HI}]"
+                ));
+            }
+            if let Some(n) = m.get("normals").and_then(Value::as_array) {
+                if n.len() != positions.len() {
+                    out.push(format!(
+                        "{where_}: normals length must equal positions length"
+                    ));
+                } else if n.iter().any(|x| !num_in(x, -1.0, 1.0)) {
+                    out.push(format!("{where_}: a normal component is outside [-1,1]"));
+                }
+            }
+            if let Some(u) = m.get("uvs").and_then(Value::as_array) {
+                if u.len() != vcount * 2 {
+                    out.push(format!("{where_}: uvs length must be 2 × vertex count"));
+                } else if u.iter().any(|x| !num_in(x, UV_LO, UV_HI)) {
+                    out.push(format!(
+                        "{where_}: a uv component is outside [{UV_LO},{UV_HI}]"
+                    ));
+                }
+            }
+            let Some(indices) = m.get("indices").and_then(Value::as_array) else {
+                out.push(format!("{where_}: mesh needs indices"));
+                return;
+            };
+            if indices.is_empty() || indices.len() % 3 != 0 {
+                out.push(format!(
+                    "{where_}: indices length must be a positive multiple of 3"
+                ));
+                return;
+            }
+            if indices
+                .iter()
+                .any(|i| i.as_u64().is_none_or(|x| (x as usize) >= vcount))
+            {
+                out.push(format!("{where_}: an index is >= vertex count"));
+            }
+            let tcount = indices.len() / 3;
+            if tcount > MAX_TRIANGLES {
+                out.push(format!(
+                    "{where_}: {tcount} triangles (at most {MAX_TRIANGLES})"
+                ));
+            }
+            if let Some(w) = m.get("winding").and_then(Value::as_str) {
+                if !WINDINGS.contains(&w) {
+                    out.push(format!("{where_}: unknown winding {w}"));
+                }
+            }
+            if let Some(mat) = m.get("material").and_then(Value::as_str) {
+                if !material_ids.contains(mat) {
+                    out.push(format!("{where_}: material {mat} not declared"));
+                }
+            }
+            *verts += vcount;
+            *tris += tcount;
+        }
+
+        let mut node_ids: HashSet<String> = HashSet::new();
+        let mut parents: HashMap<String, Option<String>> = HashMap::new();
+        let mut mesh_count = 0usize;
+        let mut vertices_total = 0usize;
+        let mut triangles_total = 0usize;
+
+        if let Some(list) = obj.get("nodes").and_then(Value::as_array) {
+            if list.len() > MAX_NODES {
+                out.push(format!("{} nodes (at most {MAX_NODES})", list.len()));
+            }
+            for (i, n) in list.iter().enumerate() {
+                let where_ = format!("node {i}");
+                let Some(n) = n.as_object() else {
+                    out.push(format!("{where_} not an object"));
+                    continue;
+                };
+                let Some(id) = n.get("id").and_then(Value::as_str) else {
+                    out.push(format!("{where_} needs an id"));
+                    continue;
+                };
+                if !is_id(id) {
+                    out.push(format!("{where_}: bad id {id}"));
+                }
+                if !node_ids.insert(id.to_string()) {
+                    out.push(format!("{where_}: duplicate id {id}"));
+                }
+                parents.insert(
+                    id.to_string(),
+                    n.get("parent").and_then(Value::as_str).map(str::to_string),
+                );
+
+                if let Some(p) = n.get("position") {
+                    if !vec3(p, POS_LO, POS_HI) {
+                        out.push(format!(
+                            "{where_}: position must be [x,y,z] in [{POS_LO},{POS_HI}]"
+                        ));
+                    }
+                }
+                if let Some(r) = n.get("rotation") {
+                    if !vec3(r, ROT_LO, ROT_HI) {
+                        out.push(format!(
+                            "{where_}: rotation must be [x,y,z] in [{ROT_LO},{ROT_HI}]"
+                        ));
+                    }
+                }
+                if let Some(q) = n.get("quaternion") {
+                    let norm = q.as_array().and_then(|a| {
+                        if a.len() != 4 {
+                            return None;
+                        }
+                        Some(
+                            a.iter()
+                                .filter_map(Value::as_f64)
+                                .map(|x| x * x)
+                                .sum::<f64>(),
+                        )
+                    });
+                    match norm {
+                        Some(s) if (s - 1.0).abs() <= 1e-4 => {}
+                        _ => out.push(format!(
+                            "{where_}: quaternion must be a normalized [x,y,z,w]"
+                        )),
+                    }
+                }
+                if n.contains_key("rotation") && n.contains_key("quaternion") {
+                    out.push(format!("{where_}: rotation and quaternion are exclusive"));
+                }
+                if let Some(s) = n.get("scale") {
+                    let ok = match s {
+                        Value::Number(_) => num_in(s, SCALE_LO, SCALE_HI),
+                        Value::Array(a) => {
+                            a.len() == 3 && a.iter().all(|x| num_in(x, SCALE_LO, SCALE_HI))
+                        }
+                        _ => false,
+                    };
+                    if !ok {
+                        out.push(format!(
+                            "{where_}: scale must be a scalar or [x,y,z] in [{SCALE_LO},{SCALE_HI}]"
+                        ));
+                    }
+                }
+
+                let content = [
+                    n.contains_key("primitive"),
+                    n.contains_key("mesh"),
+                    n.contains_key("instance"),
+                ]
+                .iter()
+                .filter(|b| **b)
+                .count();
+                if content != 1 {
+                    out.push(format!(
+                        "{where_}: exactly one of primitive, mesh, instance"
+                    ));
+                }
+                if let Some(m) = n.get("mesh") {
+                    mesh_count += 1;
+                    check_mesh(
+                        m,
+                        &material_ids,
+                        &where_,
+                        &mut out,
+                        &mut vertices_total,
+                        &mut triangles_total,
+                    );
+                }
+                if let Some(inst) = n.get("instance").and_then(Value::as_object) {
+                    let asset = inst.get("asset").and_then(Value::as_str).unwrap_or("");
+                    let known = asset_ids.contains(asset)
+                        || iso_contract::OBJECTS.contains(&asset)
+                        || (asset.starts_with("mech:")
+                            && iso_contract::MECHANISMS.contains(&&asset["mech:".len()..]));
+                    if !known {
+                        out.push(format!("{where_}: unknown asset {asset}"));
+                    }
+                    if let Some(mat) = inst.get("material").and_then(Value::as_str) {
+                        if !material_ids.contains(mat) {
+                            out.push(format!("{where_}: material {mat} not declared"));
+                        }
+                    }
+                }
+                if let Some(p) = n.get("primitive") {
+                    if let Some(kind) = p.get("kind").and_then(Value::as_str) {
+                        if !iso_contract::KINDS.contains(&kind) {
+                            out.push(format!("{where_}: unknown primitive kind {kind}"));
+                        }
+                    } else {
+                        out.push(format!("{where_}: primitive needs a kind"));
+                    }
+                }
+                if let Some(mat) = n.get("material").and_then(Value::as_str) {
+                    if !material_ids.contains(mat) {
+                        out.push(format!("{where_}: material {mat} not declared"));
+                    }
+                }
+                for (key, ok) in [
+                    ("visible", n.get("visible").is_none_or(Value::is_boolean)),
+                    (
+                        "castsShadow",
+                        n.get("castsShadow").is_none_or(Value::is_boolean),
+                    ),
+                    (
+                        "receivesShadow",
+                        n.get("receivesShadow").is_none_or(Value::is_boolean),
+                    ),
+                ] {
+                    if !ok {
+                        out.push(format!("{where_}: {key} must be a boolean"));
+                    }
+                }
+            }
+        }
+
+        // resolve parents + acyclicity + depth
+        for id in node_ids.iter() {
+            let mut path: HashSet<&str> = HashSet::new();
+            let mut cur: &str = id.as_str();
+            let mut depth = 0usize;
+            loop {
+                if !path.insert(cur) {
+                    out.push(format!("node {id}: parent cycle"));
+                    break;
+                }
+                let Some(Some(p)) = parents.get(cur) else {
+                    break;
+                };
+                if !node_ids.contains(p) {
+                    out.push(format!("node {id}: parent {p} not declared"));
+                    break;
+                }
+                cur = p.as_str();
+                depth += 1;
+                if depth > MAX_DEPTH {
+                    out.push(format!("node {id}: graph too deep"));
+                    break;
+                }
+            }
+        }
+
+        if mesh_count > MAX_MESHES {
+            out.push(format!("{mesh_count} meshes (at most {MAX_MESHES})"));
+        }
+        if vertices_total > MAX_VERTICES_TOTAL {
+            out.push(format!(
+                "{vertices_total} vertices total (at most {MAX_VERTICES_TOTAL})"
+            ));
+        }
+        if triangles_total > MAX_TRIANGLES_TOTAL {
+            out.push(format!(
+                "{triangles_total} triangles total (at most {MAX_TRIANGLES_TOTAL})"
+            ));
+        }
+
+        out
+    }
+
+    #[test]
+    fn scene3d_accepts_the_v2_example_and_refuses_a_bad_mesh() {
+        // The §5 example of 01-scene-contract.md: free camera + inline meshes + PBR + texture.
+        let example: serde_json::Value = serde_json::from_str(
+            r##"{
+              "version": "2",
+              "title": "Plan métallique texturé",
+              "camera": { "kind": "perspective", "position": [3.2, -2.6, 2.4], "target": [0, 0, 0.4], "fov": 42, "near": 0.1, "far": 100 },
+              "lights": [
+                { "kind": "directional", "color": "#ffffff", "intensity": 3, "direction": [0.6, -1, 0.8] },
+                { "kind": "ambient", "color": "#3a4055", "intensity": 0.4 }
+              ],
+              "textures": [
+                { "id": "checker", "kind": "procedural", "procedural": { "type": "checker", "colorA": "#dfe3ee", "colorB": "#1b1e2b", "scale": 8 } }
+              ],
+              "materials": [
+                { "id": "metal", "baseColor": "#c89a4a", "metallic": 0.9, "roughness": 0.35 },
+                { "id": "sol", "baseColor": "#ffffff", "baseColorTexture": "checker", "metallic": 0, "roughness": 0.8 }
+              ],
+              "nodes": [
+                { "id": "dalle", "mesh": { "positions": [-2,0,-2, 2,0,-2, 2,0,2, -2,0,2], "uvs": [0,0, 1,0, 1,1, 0,1], "indices": [0,1,2, 0,2,3] }, "material": "sol" },
+                { "id": "cube", "position": [0,0,0.6], "mesh": { "positions": [-0.5,-0.5,-0.5, 0.5,-0.5,-0.5, 0.5,0.5,-0.5, -0.5,0.5,-0.5, -0.5,-0.5,0.5, 0.5,-0.5,0.5, 0.5,0.5,0.5, -0.5,0.5,0.5], "uvs": [0,0, 1,0, 1,1, 0,1, 0,0, 1,0, 1,1, 0,1], "indices": [4,5,6, 4,6,7, 1,0,3, 1,3,2, 5,1,2, 5,2,6, 0,4,7, 0,7,3, 7,6,2, 7,2,3, 0,1,5, 0,5,4] }, "material": "metal" }
+              ]
+            }"##,
+        )
+        .unwrap();
+        assert_eq!(scene3d_problems(&example), Vec::<String>::new());
+
+        // A malformed mesh is refused: positions length not a multiple of 3.
+        let bad: serde_json::Value = serde_json::from_str(
+            r#"{"version":"2","nodes":[{"id":"m","mesh":{"positions":[0,0,0,1,1],"indices":[0,1,2]}}]}"#,
+        )
+        .unwrap();
+        assert!(
+            !scene3d_problems(&bad).is_empty(),
+            "5 positions should be refused"
+        );
+
+        // An index beyond the vertex count is refused.
+        let bad_idx: serde_json::Value = serde_json::from_str(
+            r#"{"version":"2","nodes":[{"id":"m","mesh":{"positions":[0,0,0, 1,0,0, 0,1,0],"indices":[0,1,9]}}]}"#,
+        )
+        .unwrap();
+        assert!(
+            !scene3d_problems(&bad_idx).is_empty(),
+            "index >= vertex count should be refused"
+        );
+
+        // A v1 payload is still accepted through the same entry point (Tier 2 migration).
+        let v1: serde_json::Value = serde_json::from_str(
+            r#"{"version":"1","title":"Release","stations":[{"mech":"drawers","tone":"green","label":"Plan"}],"build":{"mode":"sequential"}}"#,
+        )
+        .unwrap();
+        assert_eq!(scene3d_problems(&v1), Vec::<String>::new());
+    }
+
+    // ── scene3d v2: every refusal branch of the checker ───────────────────
+    // One malformed scene per family, each breaking many rules at once; the
+    // assertions check that the branch emitted (substring), not its exact wording.
+
+    fn s3d(v: &serde_json::Value) -> Vec<String> {
+        scene3d_problems(v)
+    }
+    fn has(p: &[String], needle: &str) -> bool {
+        p.iter().any(|x| x.contains(needle))
+    }
+    fn s3d_str(json: &str) -> Vec<String> {
+        s3d(&serde_json::from_str(json).unwrap())
+    }
+
+    #[test]
+    fn scene3d_refuses_bad_roots_and_versions() {
+        assert!(has(&s3d(&serde_json::json!(42)), "not an object"));
+        assert!(has(&s3d_str(r#"{"version":"9"}"#), "unknown version 9"));
+        assert!(has(
+            &s3d_str(r#"{"stations":[],"nodes":[]}"#),
+            "mixed v1 and v2 fields"
+        ));
+        assert!(has(
+            &s3d_str(r#"{"title":"x"}"#),
+            "a scene needs stations/ast or nodes"
+        ));
+        assert!(has(
+            &s3d_str(r#"{"version":"1","nodes":[]}"#),
+            "version 1 with v2 fields"
+        ));
+        assert!(has(
+            &s3d_str(r#"{"version":"2","stations":[]}"#),
+            "version 2 with v1 fields"
+        ));
+        let long_caption = "c".repeat(301);
+        let p = s3d(&serde_json::json!({
+            "version": "2", "nodes": [], "title": 123, "caption": long_caption, "bogus": 1
+        }));
+        assert!(has(&p, "bad title"), "{p:?}");
+        assert!(has(&p, "bad caption"), "{p:?}");
+        assert!(has(&p, "unknown scene field bogus"), "{p:?}");
+    }
+
+    #[test]
+    fn scene3d_refuses_bad_textures() {
+        let long_url = format!("http://{}", "a".repeat(2100));
+        let big_data = format!("data:image/png;base64,{}", "A".repeat(700_000));
+        let p = s3d(&serde_json::json!({
+            "version": "2", "nodes": [],
+            "textures": [
+                1,
+                {"kind": "image"},
+                {"id": "Bad_ID", "kind": "image", "image": {}},
+                {"id": "dup", "kind": "procedural", "procedural": {"type": "solid"}},
+                {"id": "dup", "kind": "procedural", "procedural": {"type": "solid"}},
+                {"id": "k", "kind": "video"},
+                {"id": "i1", "kind": "image", "image": "x"},
+                {"id": "i2", "kind": "image", "image": {"url": long_url, "wrapS": "bogus", "minFilter": "cubic"}},
+                {"id": "i3", "kind": "image", "image": {"url": big_data}},
+                {"id": "p1", "kind": "procedural", "procedural": "x"},
+                {"id": "p2", "kind": "procedural", "procedural": {"type": "noise", "colorA": "red", "scale": 0}}
+            ]
+        }));
+        for needle in [
+            "texture 0 not an object",
+            "texture 1 needs an id",
+            "bad id Bad_ID",
+            "duplicate texture id dup",
+            "unknown kind video",
+            "image must be an object",
+            "url too long",
+            "url scheme must be https: or data:image/",
+            "wrapS bogus not in",
+            "minFilter cubic not in",
+            "data URI too large",
+            "procedural must be an object",
+            "unknown procedural type noise",
+            "colorA must be a hex color",
+            "scale must be an integer 1..64",
+        ] {
+            assert!(has(&p, needle), "missing {needle:?} in {p:?}");
+        }
+        let many: Vec<serde_json::Value> = (0..33)
+            .map(|i| serde_json::json!({"id": format!("t{i}"), "kind": "procedural", "procedural": {"type": "solid"}}))
+            .collect();
+        let p = s3d(&serde_json::json!({"version": "2", "nodes": [], "textures": many}));
+        assert!(has(&p, "33 textures (at most 32)"), "{p:?}");
+    }
+
+    #[test]
+    fn scene3d_refuses_bad_materials() {
+        let p = s3d(&serde_json::json!({
+            "version": "2", "nodes": [],
+            "materials": [
+                1,
+                {"metallic": 0.5},
+                {"id": "Bad_ID"},
+                {"id": "dup"}, {"id": "dup"},
+                {"id": "m", "baseColor": "purple", "emissive": [1, 1, 1, 1, 1],
+                 "metallic": 2, "roughness": -1, "opacity": 5, "alphaCutoff": 2,
+                 "emissiveIntensity": 100, "ior": 5, "baseColorTexture": "nope",
+                 "doubleSided": "yes"}
+            ]
+        }));
+        for needle in [
+            "material 0 not an object",
+            "material 1 needs an id",
+            "bad id Bad_ID",
+            "duplicate material id dup",
+            "bad baseColor",
+            "bad emissive",
+            "metallic must be 0..1",
+            "roughness must be 0..1",
+            "opacity must be 0..1",
+            "alphaCutoff must be 0..1",
+            "emissiveIntensity out of range",
+            "ior must be 1..3",
+            "baseColorTexture does not reference a texture",
+            "doubleSided must be a boolean",
+        ] {
+            assert!(has(&p, needle), "missing {needle:?} in {p:?}");
+        }
+        let many: Vec<serde_json::Value> = (0..65)
+            .map(|i| serde_json::json!({"id": format!("m{i}")}))
+            .collect();
+        let p = s3d(&serde_json::json!({"version": "2", "nodes": [], "materials": many}));
+        assert!(has(&p, "65 materials (at most 64)"), "{p:?}");
+    }
+
+    #[test]
+    fn scene3d_refuses_bad_cameras() {
+        assert!(has(
+            &s3d_str(r#"{"version":"2","nodes":[],"camera":5}"#),
+            "camera must be an object"
+        ));
+        let p = s3d(&serde_json::json!({
+            "version": "2", "nodes": [],
+            "camera": {"kind": "fisheye", "position": [1, 2], "near": 0, "far": 1e9, "fov": 500}
+        }));
+        for needle in [
+            "camera: unknown kind fisheye",
+            "camera: position must be [x,y,z]",
+            "camera: near must be in (0,",
+            "camera: far must be <=",
+        ] {
+            assert!(has(&p, needle), "missing {needle:?} in {p:?}");
+        }
+        let p = s3d(&serde_json::json!({
+            "version": "2", "nodes": [],
+            "camera": {"kind": "perspective", "near": 10, "far": 5, "fov": 500}
+        }));
+        assert!(has(&p, "camera: far must be > near"), "{p:?}");
+        assert!(has(&p, "camera: fov must be"), "{p:?}");
+        let p = s3d(&serde_json::json!({
+            "version": "2", "nodes": [],
+            "camera": {"kind": "orthographic", "zoom": 0, "left": 5, "right": 1, "bottom": 5, "top": 1}
+        }));
+        for needle in [
+            "camera: zoom must be in (0, 1000]",
+            "camera: right must be > left",
+            "camera: top must be > bottom",
+        ] {
+            assert!(has(&p, needle), "missing {needle:?} in {p:?}");
+        }
+    }
+
+    #[test]
+    fn scene3d_refuses_bad_lights_and_assets() {
+        let p = s3d(&serde_json::json!({
+            "version": "2", "nodes": [],
+            "lights": [
+                1,
+                {"kind": "spot"},
+                {"kind": "ambient", "color": "nope", "intensity": 1000},
+                {"kind": "directional", "direction": [0, 0, 0]},
+                {"kind": "point", "position": [5000, 0, 0], "distance": 1e9, "decay": 10}
+            ],
+            "assets": [1, {"kind": "x"}, {"id": "Bad_ID"}, {"id": "dup"}, {"id": "dup"}]
+        }));
+        for needle in [
+            "light 0 not an object",
+            "light 1: unknown kind spot",
+            "light 2: bad color",
+            "light 2: intensity out of range",
+            "light 3: direction must be a non-zero [x,y,z]",
+            "light 4: position out of range",
+            "light 4: distance out of range",
+            "light 4: decay out of range",
+            "asset 0 not an object",
+            "asset 1 needs an id",
+            "asset 2: bad id Bad_ID",
+            "duplicate asset id dup",
+        ] {
+            assert!(has(&p, needle), "missing {needle:?} in {p:?}");
+        }
+        let lights: Vec<serde_json::Value> = (0..17)
+            .map(|_| serde_json::json!({"kind": "ambient"}))
+            .collect();
+        let assets: Vec<serde_json::Value> = (0..257)
+            .map(|i| serde_json::json!({"id": format!("a{i}")}))
+            .collect();
+        let p = s3d(
+            &serde_json::json!({"version": "2", "nodes": [], "lights": lights, "assets": assets}),
+        );
+        assert!(has(&p, "17 lights (at most 16)"), "{p:?}");
+        assert!(has(&p, "257 assets (at most 256)"), "{p:?}");
+    }
+
+    #[test]
+    fn scene3d_refuses_bad_meshes() {
+        let tri = |extra: serde_json::Value| {
+            let mut m = serde_json::json!({"positions": [0,0,0, 1,0,0, 0,1,0], "indices": [0,1,2]});
+            if let (Some(a), Some(b)) = (m.as_object_mut(), extra.as_object()) {
+                for (k, v) in b {
+                    a.insert(k.clone(), v.clone());
+                }
+            }
+            m
+        };
+        let p = s3d(&serde_json::json!({
+            "version": "2",
+            "nodes": [
+                {"id": "a", "mesh": "x"},
+                {"id": "b", "mesh": {}},
+                {"id": "c", "mesh": {"positions": []}},
+                {"id": "d", "mesh": {"positions": [5000,0,0, 1,0,0, 0,1,0], "indices": [0,1,2]}},
+                {"id": "e", "mesh": tri(serde_json::json!({"normals": [0, 0]}))},
+                {"id": "f", "mesh": tri(serde_json::json!({"normals": [2,0,0, 0,0,0, 0,0,0]}))},
+                {"id": "g", "mesh": tri(serde_json::json!({"uvs": [0, 0]}))},
+                {"id": "h", "mesh": tri(serde_json::json!({"uvs": [100,0, 0,0, 0,0]}))},
+                {"id": "i", "mesh": {"positions": [0,0,0, 1,0,0, 0,1,0]}},
+                {"id": "j", "mesh": {"positions": [0,0,0, 1,0,0, 0,1,0], "indices": [0, 1]}},
+                {"id": "k", "mesh": tri(serde_json::json!({"winding": "zigzag", "material": "ghost"}))}
+            ]
+        }));
+        for needle in [
+            "node 0: mesh must be an object",
+            "node 1: mesh needs positions",
+            "node 2: positions length must be a positive multiple of 3",
+            "node 3: a position component is outside",
+            "node 4: normals length must equal positions length",
+            "node 5: a normal component is outside [-1,1]",
+            "node 6: uvs length must be 2 × vertex count",
+            "node 7: a uv component is outside",
+            "node 8: mesh needs indices",
+            "node 9: indices length must be a positive multiple of 3",
+            "node 10: unknown winding zigzag",
+            "node 10: material ghost not declared",
+        ] {
+            assert!(has(&p, needle), "missing {needle:?} in {p:?}");
+        }
+        // Per-mesh vertex cap: 65 537 vertices.
+        let positions = vec![0.0f64; 65_537 * 3];
+        let p = s3d(&serde_json::json!({
+            "version": "2",
+            "nodes": [{"id": "big", "mesh": {"positions": positions, "indices": [0, 1, 2]}}]
+        }));
+        assert!(has(&p, "vertices (at most 65536)"), "{p:?}");
+    }
+
+    #[test]
+    fn scene3d_refuses_bad_nodes_and_parents() {
+        let p = s3d(&serde_json::json!({
+            "version": "2",
+            "nodes": [
+                1,
+                {"mesh": {}},
+                {"id": "Bad_ID", "primitive": {"kind": "group"}},
+                {"id": "dup", "primitive": {"kind": "group"}},
+                {"id": "dup", "primitive": {"kind": "group"}},
+                {"id": "t", "primitive": {"kind": "group"}, "position": [1], "rotation": [400, 0, 0],
+                 "quaternion": [1, 1, 1, 1], "scale": 0,
+                 "visible": "yes", "castsShadow": 1, "receivesShadow": "no", "material": "ghost"},
+                {"id": "none"},
+                {"id": "both", "mesh": {"positions": [0,0,0, 1,0,0, 0,1,0], "indices": [0,1,2]}, "primitive": {"kind": "group"}},
+                {"id": "inst", "instance": {"asset": "nope", "material": "ghost"}},
+                {"id": "prim1", "primitive": {}},
+                {"id": "prim2", "primitive": {"kind": "blob"}},
+                {"id": "orphan", "primitive": {"kind": "group"}, "parent": "nope"},
+                {"id": "x", "primitive": {"kind": "group"}, "parent": "y"},
+                {"id": "y", "primitive": {"kind": "group"}, "parent": "x"}
+            ]
+        }));
+        for needle in [
+            "node 0 not an object",
+            "node 1 needs an id",
+            "node 2: bad id Bad_ID",
+            "node 4: duplicate id dup",
+            "node 5: position must be [x,y,z]",
+            "node 5: rotation must be [x,y,z]",
+            "node 5: quaternion must be a normalized [x,y,z,w]",
+            "node 5: rotation and quaternion are exclusive",
+            "node 5: scale must be a scalar or [x,y,z]",
+            "node 5: visible must be a boolean",
+            "node 5: castsShadow must be a boolean",
+            "node 5: receivesShadow must be a boolean",
+            "node 5: material ghost not declared",
+            "node 6: exactly one of primitive, mesh, instance",
+            "node 7: exactly one of primitive, mesh, instance",
+            "node 8: unknown asset nope",
+            "node 8: material ghost not declared",
+            "node 9: primitive needs a kind",
+            "node 10: unknown primitive kind blob",
+            "node orphan: parent nope not declared",
+            "parent cycle",
+        ] {
+            assert!(has(&p, needle), "missing {needle:?} in {p:?}");
+        }
+        // Too many nodes, too many meshes, and a graph too deep.
+        let mut nodes: Vec<serde_json::Value> = (0..513)
+            .map(|i| {
+                serde_json::json!({"id": format!("n{i}"),
+                    "mesh": {"positions": [0,0,0, 1,0,0, 0,1,0], "indices": [0,1,2]}})
+            })
+            .collect();
+        for i in 1..35 {
+            nodes.push(
+                serde_json::json!({"id": format!("d{i}"), "primitive": {"kind": "group"},
+                "parent": format!("d{}", i - 1)}),
+            );
+        }
+        nodes.push(serde_json::json!({"id": "d0", "primitive": {"kind": "group"}}));
+        let p = s3d(&serde_json::json!({"version": "2", "nodes": nodes}));
+        assert!(has(&p, "nodes (at most 512)"), "{p:?}");
+        assert!(has(&p, "meshes (at most 256)"), "{p:?}");
+        assert!(has(&p, "graph too deep"), "{p:?}");
+    }
+
     #[test]
     fn the_iso_scene_section_matches_the_frontend_contract() {
         use iso_contract::*;
