@@ -15389,6 +15389,7 @@ mod file_scope_lift {
             obscura: None,
             embedded_obscura: false,
             deny_paths: vec![ssh.clone()],
+            host_home: None,
         };
         let consents = nt::GraphConsents(Arc::new(crate::neo4j::mock::MockGraphStore::new()));
         let policy =

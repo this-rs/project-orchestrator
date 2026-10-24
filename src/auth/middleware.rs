@@ -723,7 +723,7 @@ mod tests {
             scope: None,
             jti: None,
         };
-        let token = jsonwebtoken::encode(
+        let token = crate::auth::jwt_crypto::encode(
             &jsonwebtoken::Header::default(),
             &claims,
             &jsonwebtoken::EncodingKey::from_secret(TEST_SECRET.as_bytes()),
