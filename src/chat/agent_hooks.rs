@@ -2545,6 +2545,7 @@ mod provider_move_tests {
                 score: Some(self.score),
                 explored: self.explored,
                 exploration_epsilon: 0.0,
+                confidence: None,
                 reason: "fake".into(),
                 alternatives,
                 applied: crate::chat::provider::cognitive::decider::is_applied(
@@ -4327,6 +4328,7 @@ mod segment_tests {
                 score: Some(0.9),
                 explored: false,
                 exploration_epsilon: 0.0,
+                confidence: None,
                 reason: "recording".into(),
                 alternatives,
                 applied: request.settings.mode == ProviderRoutingMode::Full

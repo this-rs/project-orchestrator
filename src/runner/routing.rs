@@ -337,6 +337,7 @@ pub(crate) mod test_support {
                 score: None,
                 explored: false,
                 exploration_epsilon: 0.0,
+                confidence: None,
                 reason: "fake".into(),
                 alternatives: Vec::new(),
                 applied: self.applied && !explicit,

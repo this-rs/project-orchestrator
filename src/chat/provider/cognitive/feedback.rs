@@ -351,6 +351,7 @@ mod tests {
             score: None,
             explored: false,
             exploration_epsilon: 0.0,
+            confidence: None,
             reason: "test".into(),
             alternatives: vec![],
             applied: true,
@@ -388,7 +389,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(arm.n, 1, "the second close must not count twice");
-        assert_eq!(arm.alpha, 2.0);
+        // Fractional reward: a first-try success scores 0.7, so alpha = 1.7.
+        assert!((arm.alpha - 1.7).abs() < 1e-9);
         let stored = store.decision(d.id).await.unwrap().unwrap();
         assert_eq!(stored.outcome.unwrap().success, Some(true));
     }
@@ -666,13 +668,15 @@ mod tests {
         assert!(close(a, 0.7) && close(b, 0.4), "{a} vs {b}");
         // Too late once closed.
         assert!(!mark_override(&store, flagged.id).await.unwrap());
-        // The arm saw both: one success (0.7), one below the threshold (0.4).
+        // The arm saw both, fractionally: 0.7 and 0.4 → alpha 2.1, beta 1.9.
         let arm = store
             .arm(&ArmKey::new("utility.compaction", "deepseek", "v4"))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!((arm.n, arm.alpha, arm.beta), (2, 2.0, 2.0));
+        assert_eq!(arm.n, 2);
+        assert!((arm.alpha - 2.1).abs() < 1e-9);
+        assert!((arm.beta - 1.9).abs() < 1e-9);
     }
 
     #[derive(Default)]

@@ -35984,6 +35984,7 @@ mod auto_open_bounds_tests {
             score: None,
             explored: false,
             exploration_epsilon: 0.0,
+            confidence: None,
             reason: "test".into(),
             alternatives: alternatives
                 .iter()

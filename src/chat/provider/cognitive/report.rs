@@ -435,6 +435,7 @@ mod tests {
             score: Some(0.5),
             explored: false,
             exploration_epsilon: 0.0,
+            confidence: None,
             reason: "test".into(),
             alternatives: vec![],
             applied: false,

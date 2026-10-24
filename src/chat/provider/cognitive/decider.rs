@@ -16,6 +16,7 @@ use super::candidates::{self, ModelFacts, Slot};
 use super::decision::{
     turn_reward, CognitiveDecision, DecideRequest, Decider, DecisionAlternative, Pick,
 };
+use super::feedback::decision_confidence;
 use super::mode::{LearningStage, ProviderRoutingMode, RoutingSettings, MAX_EXPLORATION_EPSILON};
 use super::scorer::{self, PriorHints, Scored};
 use super::segment_store::SegmentStore;
@@ -177,6 +178,7 @@ fn decide_free(
         score: None,
         explored: false,
         exploration_epsilon: 0.0,
+        confidence: None,
         reason: String::new(),
         alternatives: Vec::new(),
         applied: false,
@@ -292,6 +294,7 @@ fn decide_free(
         })
         .collect();
     rejected(&mut decision);
+    decision.confidence = Some(decision_confidence(&decision));
     decision
 }
 

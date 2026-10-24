@@ -974,6 +974,7 @@ mod tests {
                 score: Some(0.5),
                 explored: false,
                 exploration_epsilon: 0.0,
+                confidence: None,
                 reason: format!("d{i}"),
                 alternatives: vec![],
                 applied: false,
@@ -1041,6 +1042,7 @@ mod tests {
                 score: None,
                 explored: false,
                 exploration_epsilon: 0.0,
+                confidence: None,
                 reason: "no_candidate".into(),
                 alternatives: vec![
                     alternative("claude-opus-5-5", Some(0.4), None),
@@ -1130,6 +1132,7 @@ mod tests {
                 score: Some(0.5),
                 explored: false,
                 exploration_epsilon: 0.0,
+                confidence: None,
                 reason: "r".into(),
                 alternatives: vec![],
                 applied: false,

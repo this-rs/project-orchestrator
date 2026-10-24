@@ -95,6 +95,11 @@ pub struct CognitiveDecision {
     /// ε-greedy propensity from the logged `p_top1` and `propensity`.
     #[serde(default)]
     pub exploration_epsilon: f64,
+    /// Confidence of the decision: `1 − H(p)/ln(k)` over the scored
+    /// alternatives' scores. `None` when it was not scored. Persisted so the
+    /// dashboard and the off-policy replay see the same number the scorer saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
     /// One readable sentence (no URL, no secret).
     pub reason: String,
     /// The options considered, best first, rejected ones included.
@@ -309,6 +314,7 @@ mod tests {
             score: None,
             explored: false,
             exploration_epsilon: 0.0,
+            confidence: None,
             reason: "test".into(),
             alternatives: vec![],
             applied: true,
