@@ -88,6 +88,9 @@ pub struct Scored {
     pub n: u64,
     /// The Thompson draw.
     pub draw: f64,
+    /// Marginal probability, over the seed distribution, that this arm's draw
+    /// is the maximum — the pure-Thompson propensity before exploration.
+    pub p_top1: f64,
     /// Cost penalty term, in `[0, 1]`.
     pub cost_norm: f64,
     /// Latency penalty term, in `[0, 1]`.
@@ -185,6 +188,42 @@ pub fn beta_draw(alpha: f64, beta: f64, seed: u64) -> f64 {
     }
 }
 
+/// Number of Monte-Carlo seeds for the top-1 marginal probabilities.
+const TOP1_MC_SAMPLES: usize = 512;
+
+/// The marginal probability, over the seed distribution, that each arm's
+/// Thompson draw is the maximum — `p_top1`. The realized draw of a decision is
+/// one sample from this distribution; `p_top1` is what an off-policy estimator
+/// (IPS/SNIPS) needs as the propensity of the pure-Thompson policy. Estimated
+/// deterministically: a fixed seed stream, independent of the decision seed.
+fn top1_probabilities(
+    alphas: &[f64],
+    betas: &[f64],
+    arm_seeds: &[u64],
+    samples: usize,
+) -> Vec<f64> {
+    let k = alphas.len();
+    if k == 0 {
+        return Vec::new();
+    }
+    let mut wins = vec![0u64; k];
+    for s in 0..samples {
+        let mut best = 0usize;
+        let mut best_draw = f64::NEG_INFINITY;
+        for i in 0..k {
+            // Seed by the arm's identity, not its position, so the estimate is
+            // order-independent (a reversed candidate list keeps each p_top1).
+            let draw = beta_draw(alphas[i], betas[i], arm_seeds[i].wrapping_add(s as u64));
+            if draw > best_draw {
+                best_draw = draw;
+                best = i;
+            }
+        }
+        wins[best] += 1;
+    }
+    wins.iter().map(|w| *w as f64 / samples as f64).collect()
+}
+
 fn median(mut values: Vec<f64>) -> Option<f64> {
     if values.is_empty() {
         return None;
@@ -254,21 +293,32 @@ pub fn score(
     let cost_norm = normalise(&costs);
     let latency_norm = normalise(&latencies);
 
+    let posteriors: Vec<(f64, f64, u64)> = candidates
+        .iter()
+        .map(|facts| match stored(facts) {
+            Some(arm) => (arm.alpha, arm.beta, arm.n),
+            None => {
+                let (a, b) = prior_for(
+                    signature.class,
+                    hints.alias_of(&facts.provider_id, &facts.model),
+                );
+                (a, b, 0)
+            }
+        })
+        .collect();
+    let alphas: Vec<f64> = posteriors.iter().map(|p| p.0).collect();
+    let betas: Vec<f64> = posteriors.iter().map(|p| p.1).collect();
+    let arm_seeds: Vec<u64> = candidates
+        .iter()
+        .map(|facts| stable_hash(&[&class, &facts.provider_id, &facts.model]))
+        .collect();
+    let top1 = top1_probabilities(&alphas, &betas, &arm_seeds, TOP1_MC_SAMPLES);
+
     let mut scored: Vec<Scored> = candidates
         .iter()
         .enumerate()
         .map(|(i, facts)| {
-            let arm = stored(facts);
-            let (alpha, beta, n) = match arm {
-                Some(arm) => (arm.alpha, arm.beta, arm.n),
-                None => {
-                    let (a, b) = prior_for(
-                        signature.class,
-                        hints.alias_of(&facts.provider_id, &facts.model),
-                    );
-                    (a, b, 0)
-                }
-            };
+            let (alpha, beta, n) = posteriors[i];
             let arm_seed = seed ^ stable_hash(&[&class, &facts.provider_id, &facts.model]);
             let draw = beta_draw(alpha, beta, arm_seed);
             let utility = draw
@@ -280,10 +330,11 @@ pub fn score(
                 beta,
                 n,
                 draw,
+                p_top1: top1[i],
                 cost_norm: cost_norm[i],
                 latency_norm: latency_norm[i],
                 utility,
-                arm_mean_cost_usd: arm.and_then(ArmStats::mean_cost_usd),
+                arm_mean_cost_usd: stored(facts).and_then(ArmStats::mean_cost_usd),
                 est_turn_cost_usd: facts.estimated_turn_cost_usd(signature),
                 explored: false,
             }
@@ -588,5 +639,37 @@ mod tests {
             assert!((mean - a / (a + b)).abs() < 0.03, "{a},{b}: {mean}");
         }
         assert_eq!(beta_draw(2.0, 3.0, 9), beta_draw(2.0, 3.0, 9));
+    }
+
+    #[test]
+    fn top1_probabilities_sum_to_one_are_deterministic_and_order_free() {
+        let sig = signature(TaskClass::Simple);
+        let pool = vec![
+            facts("a", "m", None),
+            facts("b", "m", None),
+            facts("c", "m", None),
+        ];
+        let out = score(&sig, &pool, &[], &PriorHints::new(), &settings(0.0), 1);
+        let sum: f64 = out.iter().map(|s| s.p_top1).sum();
+        assert!((sum - 1.0).abs() < 1e-9, "top1 probs sum to 1, got {sum}");
+        assert!(out.iter().all(|s| (0.0..=1.0).contains(&s.p_top1)));
+
+        // Deterministic: same inputs, same posteriors, same probs.
+        let again = score(&sig, &pool, &[], &PriorHints::new(), &settings(0.0), 1);
+        assert_eq!(out, again);
+
+        // Order-free: reversing the pool keeps each candidate's own p_top1.
+        let reversed: Vec<_> = pool.iter().rev().cloned().collect();
+        let rev = score(&sig, &reversed, &[], &PriorHints::new(), &settings(0.0), 1);
+        let top1_of = |p: &str, scored: &[Scored]| {
+            scored
+                .iter()
+                .find(|s| s.candidate.provider_id == p)
+                .unwrap()
+                .p_top1
+        };
+        for p in ["a", "b", "c"] {
+            assert_eq!(top1_of(p, &out), top1_of(p, &rev), "p_top1 of {p}");
+        }
     }
 }

@@ -2525,12 +2525,16 @@ mod provider_move_tests {
                 pick: self.pick.clone(),
                 score: Some(self.score),
                 rejected: None,
+                p_top1: None,
+                propensity: None,
             }];
             if let Some(current) = request.current.clone().filter(|c| *c != self.pick) {
                 alternatives.push(DecisionAlternative {
                     pick: current,
                     score: Some(self.current_score),
                     rejected: None,
+                    p_top1: None,
+                    propensity: None,
                 });
             }
             Ok(CognitiveDecision {
@@ -2540,6 +2544,8 @@ mod provider_move_tests {
                 chosen: Some(self.pick.clone()),
                 score: Some(self.score),
                 explored: self.explored,
+                exploration_epsilon: 0.0,
+                confidence: None,
                 reason: "fake".into(),
                 alternatives,
                 applied: crate::chat::provider::cognitive::decider::is_applied(
@@ -4302,12 +4308,16 @@ mod segment_tests {
                 pick: pick.clone(),
                 score: Some(0.9),
                 rejected: None,
+                p_top1: None,
+                propensity: None,
             }];
             if let Some(current) = request.current.clone().filter(|c| *c != pick) {
                 alternatives.push(DecisionAlternative {
                     pick: current,
                     score: Some(0.1),
                     rejected: None,
+                    p_top1: None,
+                    propensity: None,
                 });
             }
             Ok(CognitiveDecision {
@@ -4317,6 +4327,8 @@ mod segment_tests {
                 chosen: Some(pick),
                 score: Some(0.9),
                 explored: false,
+                exploration_epsilon: 0.0,
+                confidence: None,
                 reason: "recording".into(),
                 alternatives,
                 applied: request.settings.mode == ProviderRoutingMode::Full

@@ -143,14 +143,14 @@ pub trait TrajectorySink: Send + Sync {
     fn record(&self, decision: &CognitiveDecision, reward: f64);
 }
 
-/// Confidence of a decision: `1 - H(p) / ln(k)` over the normalised scores of
-/// its scored alternatives. 1 when one option dominates, 0 when they are
-/// indistinguishable, and 0 when fewer than two were scored.
-pub fn decision_confidence(decision: &CognitiveDecision) -> f64 {
-    let scores: Vec<f64> = decision
-        .alternatives
+/// Confidence over normalised scores: `1 - H(p) / ln(k)`. 1 when one option
+/// dominates, 0 when they are indistinguishable, and 0 when fewer than two were
+/// given. The single implementation shared by the decision confidence and the
+/// cognitive decider's hysteresis margin (L1): never recompute it locally.
+pub fn confidence_from_scores(scores: &[f64]) -> f64 {
+    let scores: Vec<f64> = scores
         .iter()
-        .filter_map(|a| a.score)
+        .copied()
         .filter(|s| s.is_finite())
         .map(|s| s.max(0.0))
         .collect();
@@ -169,6 +169,17 @@ pub fn decision_confidence(decision: &CognitiveDecision) -> f64 {
         .map(|p| -p * p.ln())
         .sum();
     (1.0 - entropy / (k as f64).ln()).clamp(0.0, 1.0)
+}
+
+/// Confidence of a decision: [`confidence_from_scores`] over the scores of its
+/// scored alternatives.
+pub fn decision_confidence(decision: &CognitiveDecision) -> f64 {
+    let scores: Vec<f64> = decision
+        .alternatives
+        .iter()
+        .filter_map(|a| a.score)
+        .collect();
+    confidence_from_scores(&scores)
 }
 
 /// Sends closed decisions to the neural-routing `TrajectoryCollector`.
@@ -350,6 +361,8 @@ mod tests {
             chosen,
             score: None,
             explored: false,
+            exploration_epsilon: 0.0,
+            confidence: None,
             reason: "test".into(),
             alternatives: vec![],
             applied: true,
@@ -387,7 +400,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(arm.n, 1, "the second close must not count twice");
-        assert_eq!(arm.alpha, 2.0);
+        // Fractional reward: a first-try success scores 0.7, so alpha = 1.7.
+        assert!((arm.alpha - 1.7).abs() < 1e-9);
         let stored = store.decision(d.id).await.unwrap().unwrap();
         assert_eq!(stored.outcome.unwrap().success, Some(true));
     }
@@ -665,13 +679,15 @@ mod tests {
         assert!(close(a, 0.7) && close(b, 0.4), "{a} vs {b}");
         // Too late once closed.
         assert!(!mark_override(&store, flagged.id).await.unwrap());
-        // The arm saw both: one success (0.7), one below the threshold (0.4).
+        // The arm saw both, fractionally: 0.7 and 0.4 → alpha 2.1, beta 1.9.
         let arm = store
             .arm(&ArmKey::new("utility.compaction", "deepseek", "v4"))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!((arm.n, arm.alpha, arm.beta), (2, 2.0, 2.0));
+        assert_eq!(arm.n, 2);
+        assert!((arm.alpha - 2.1).abs() < 1e-9);
+        assert!((arm.beta - 1.9).abs() < 1e-9);
     }
 
     #[derive(Default)]
@@ -705,6 +721,8 @@ mod tests {
             pick: Pick::new("p", model),
             score,
             rejected: None,
+            p_top1: None,
+            propensity: None,
         }
     }
 

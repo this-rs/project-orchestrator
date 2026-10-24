@@ -257,6 +257,8 @@ mod tests {
             chosen: Some(Pick::new("p", "m")),
             score: None,
             explored: false,
+            exploration_epsilon: 0.0,
+            confidence: None,
             reason: "t".into(),
             alternatives: vec![],
             applied,

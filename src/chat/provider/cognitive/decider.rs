@@ -16,7 +16,8 @@ use super::candidates::{self, ModelFacts, Slot};
 use super::decision::{
     turn_reward, CognitiveDecision, DecideRequest, Decider, DecisionAlternative, Pick,
 };
-use super::mode::{LearningStage, ProviderRoutingMode, RoutingSettings};
+use super::feedback::{confidence_from_scores, decision_confidence};
+use super::mode::{LearningStage, ProviderRoutingMode, RoutingSettings, MAX_EXPLORATION_EPSILON};
 use super::scorer::{self, PriorHints, Scored};
 use super::segment_store::SegmentStore;
 use super::signature::TaskSignature;
@@ -25,6 +26,13 @@ use crate::chat::provider::resolver::Role;
 
 /// A challenger must beat the pair in force by this much to replace it.
 pub const HYSTERESIS_MARGIN: f64 = 0.1;
+
+/// Minimum effective observations (`n_eff`, the observation count: each
+/// fractional reward adds exactly 1 to `alpha + beta`) before the
+/// confidence-derived hysteresis margin applies. Below it a barely-observed
+/// winner must not lock in on thin evidence — the base [`HYSTERESIS_MARGIN`]
+/// still decides. Calibrate against the replay journal (PYSR-1) before lowering.
+pub const HYSTERESIS_WARMUP: u64 = 10;
 
 /// Reason of a decision that found nothing eligible.
 pub const NO_CANDIDATE: &str = "no_candidate";
@@ -159,6 +167,43 @@ fn mean_utility(scored: &Scored, settings: &RoutingSettings) -> f64 {
         - settings.latency_weight * scored.latency_norm
 }
 
+/// The hysteresis margin: how much better than the pair in force a challenger
+/// must be to replace it. Confidence-derived once the arms in play are warm
+/// (L1): a tight field — low confidence, the challenger's advantage is likely
+/// noise — widens the margin, while a clear winner keeps the base
+/// [`HYSTERESIS_MARGIN`]. Below [`HYSTERESIS_WARMUP`] effective observations on
+/// either side the confidence is not trusted and the base margin decides, so a
+/// barely-observed arm never locks in on a lucky dominance.
+fn hysteresis_margin(
+    scored: &[Scored],
+    current_index: usize,
+    settings: &RoutingSettings,
+    steady: bool,
+) -> f64 {
+    let challenger = &scored[0];
+    let incumbent = &scored[current_index];
+    if challenger.n < HYSTERESIS_WARMUP || incumbent.n < HYSTERESIS_WARMUP {
+        return HYSTERESIS_MARGIN;
+    }
+    // Confidence over the SAME signal the switch is decided on: the posterior
+    // means on a steady turn, the Thompson draws otherwise. A single shared
+    // implementation (`confidence_from_scores`), never a local copy.
+    let utilities: Vec<f64> = scored
+        .iter()
+        .map(|s| {
+            if steady {
+                mean_utility(s, settings)
+            } else {
+                s.utility
+            }
+        })
+        .collect();
+    let confidence = confidence_from_scores(&utilities);
+    // Never narrower than the base margin; only wider when uncertain. Confidence
+    // 1 (clear winner) keeps the base, confidence 0 (indistinguishable) doubles it.
+    HYSTERESIS_MARGIN * (2.0 - confidence)
+}
+
 /// [`decide_with`] as if the chosen pair could always be used.
 fn decide_free(
     id: Uuid,
@@ -176,6 +221,8 @@ fn decide_free(
         chosen: None,
         score: None,
         explored: false,
+        exploration_epsilon: 0.0,
+        confidence: None,
         reason: String::new(),
         alternatives: Vec::new(),
         applied: false,
@@ -213,6 +260,8 @@ fn decide_free(
                 pick: pick_of(&r.candidate),
                 score: None,
                 rejected: Some(r.reason.clone()),
+                p_top1: None,
+                propensity: None,
             }));
     };
     if filtered.eligible.is_empty() {
@@ -256,10 +305,13 @@ fn decide_free(
                 .iter()
                 .position(|s| pick_of(&s.candidate) == *current);
             if let Some(index) = at_index {
-                if index > 0 && gap(&scored[0], &scored[index]) < HYSTERESIS_MARGIN {
-                    let stay = scored.remove(index);
-                    scored.insert(0, stay);
-                    kept = true;
+                if index > 0 {
+                    let margin = hysteresis_margin(&scored, index, settings, request.steady);
+                    if gap(&scored[0], &scored[index]) < margin {
+                        let stay = scored.remove(index);
+                        scored.insert(0, stay);
+                        kept = true;
+                    }
                 }
             }
         }
@@ -270,15 +322,26 @@ fn decide_free(
     decision.explored = best.explored;
     decision.reason = reason_of(signature, best, best.explored, kept);
     decision.applied = is_applied(settings.mode, settings.stage, signature.role);
+    // Log the off-policy propensities: the exploration rate in force, the
+    // number of scored arms, and per arm both the pure-Thompson top-1
+    // probability and the ε-greedy propensity (before the hysteresis).
+    let epsilon = score_settings
+        .exploration_epsilon
+        .clamp(0.0, MAX_EXPLORATION_EPSILON);
+    let k = scored.len();
+    decision.exploration_epsilon = epsilon;
     decision.alternatives = scored
         .iter()
         .map(|s| DecisionAlternative {
             pick: pick_of(&s.candidate),
             score: Some(s.utility),
             rejected: None,
+            p_top1: Some(s.p_top1),
+            propensity: Some((1.0 - epsilon) * s.p_top1 + epsilon / k as f64),
         })
         .collect();
     rejected(&mut decision);
+    decision.confidence = Some(decision_confidence(&decision));
     decision
 }
 
@@ -846,6 +909,68 @@ mod tests {
         )
     }
 
+    #[test]
+    fn a_decision_logs_p_top1_and_propensity_for_every_scored_arm() {
+        let req = request(pilot(), ProviderRoutingMode::Full, LearningStage::Auto);
+        let decision = decide_with(
+            Uuid::from_u128(42),
+            Utc::now(),
+            &req,
+            &[],
+            &PriorHints::new(),
+        );
+        assert_eq!(decision.exploration_epsilon, 0.0);
+        let scored: Vec<_> = decision
+            .alternatives
+            .iter()
+            .filter(|a| a.score.is_some())
+            .collect();
+        assert_eq!(scored.len(), 2);
+        for a in &scored {
+            let p = a.p_top1.unwrap();
+            assert!((0.0..=1.0).contains(&p));
+            // ε = 0 → the propensity is exactly the top-1 probability.
+            assert!((a.propensity.unwrap() - p).abs() < 1e-12);
+        }
+        let sum: f64 = scored.iter().map(|a| a.p_top1.unwrap()).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-9,
+            "top-1 probabilities sum to 1, got {sum}"
+        );
+    }
+
+    #[test]
+    fn the_logged_propensity_follows_the_epsilon_greedy_formula() {
+        let mut req = request(pilot(), ProviderRoutingMode::Full, LearningStage::Auto);
+        req.settings.exploration_epsilon = 0.2;
+        let decision = decide_with(
+            Uuid::from_u128(42),
+            Utc::now(),
+            &req,
+            &[],
+            &PriorHints::new(),
+        );
+        assert_eq!(decision.exploration_epsilon, 0.2);
+        let scored: Vec<_> = decision
+            .alternatives
+            .iter()
+            .filter(|a| a.score.is_some())
+            .collect();
+        let k = scored.len();
+        assert_eq!(k, 2);
+        let mut sum = 0.0;
+        for a in &scored {
+            let p = a.p_top1.unwrap();
+            let expected = (1.0 - 0.2) * p + 0.2 / k as f64;
+            assert!(
+                (a.propensity.unwrap() - expected).abs() < 1e-12,
+                "π = (1−ε)·p_top1 + ε/k"
+            );
+            sum += a.propensity.unwrap();
+        }
+        assert!((sum - 1.0).abs() < 1e-9, "propensities sum to 1, got {sum}");
+    }
+
     #[tokio::test]
     async fn a_successful_turn_raises_the_served_arms_mean() {
         let store = Arc::new(InMemoryRoutingStore::new());
@@ -1372,6 +1497,97 @@ mod tests {
             })
             .count();
         assert_eq!(changes, 0);
+    }
+
+    /// L1: the hysteresis margin is confidence-derived once warm. A WARM tight field —
+    /// two arms whose means are close, so the confidence is low — widens the margin
+    /// past the base 0.1: the pair in force stays against a challenger that is better
+    /// ON AVERAGE by ~0.15 (over the base margin, under the doubled one). Red with the
+    /// fixed margin: the gap exceeds 0.1 and the challenger takes over.
+    #[test]
+    fn a_warm_tight_field_widens_the_margin_and_keeps_the_pair_in_force() {
+        let sig = pilot();
+        let arms = vec![
+            // Challenger: mean 0.60.
+            ArmStats {
+                n: 20,
+                ..ArmStats::fresh(ArmKey::new(sig.arm_key(), "local", "a"), 12.0, 8.0)
+            },
+            // Pair in force: mean 0.45.
+            ArmStats {
+                n: 20,
+                ..ArmStats::fresh(ArmKey::new(sig.arm_key(), "local", "b"), 9.0, 11.0)
+            },
+        ];
+        let mean = |m: &str| {
+            arms.iter()
+                .find(|a| a.key.model == m)
+                .map(ArmStats::mean)
+                .unwrap()
+        };
+        let gap = mean("a") - mean("b");
+        assert!(
+            gap > HYSTERESIS_MARGIN && gap < 2.0 * HYSTERESIS_MARGIN,
+            "{gap}"
+        );
+        let mut req = request(sig, ProviderRoutingMode::Full, LearningStage::Auto);
+        req.pool = vec![facts("local", "a", 1.0), facts("local", "b", 1.0)];
+        req.settings.cost_weight = 0.0;
+        req.settings.latency_weight = 0.0;
+        req.steady = true;
+        req.current = Some(Pick::new("local", "b"));
+        // A seed where the challenger leads on its draw, so the hysteresis is what
+        // keeps the incumbent (not a draw ordering that already put it first).
+        let id = (0..2_000u128)
+            .map(Uuid::from_u128)
+            .find(|id| {
+                let mut no_current = req.clone();
+                no_current.current = None;
+                decide_with(*id, Utc::now(), &no_current, &arms, &PriorHints::new()).chosen
+                    == Some(Pick::new("local", "a"))
+            })
+            .expect("a seed where the challenger leads exists");
+        let d = decide_with(id, Utc::now(), &req, &arms, &PriorHints::new());
+        assert_eq!(d.chosen, Some(Pick::new("local", "b")), "{}", d.reason);
+        assert!(d.reason.contains("kept"), "{}", d.reason);
+    }
+
+    /// L1: below the warmup the confidence is never trusted — the base margin decides,
+    /// so a barely-observed challenger that beats the pair in force by MORE than the
+    /// base margin still takes over (a cold pair is never frozen by a widened margin).
+    #[test]
+    fn a_barely_observed_pair_stays_on_the_base_margin() {
+        let sig = pilot();
+        let arms = vec![
+            ArmStats {
+                n: 1,
+                ..ArmStats::fresh(ArmKey::new(sig.arm_key(), "local", "a"), 12.0, 8.0)
+            },
+            ArmStats {
+                n: 2,
+                ..ArmStats::fresh(ArmKey::new(sig.arm_key(), "local", "b"), 9.0, 11.0)
+            },
+        ];
+        let mut req = request(sig, ProviderRoutingMode::Full, LearningStage::Auto);
+        req.pool = vec![facts("local", "a", 1.0), facts("local", "b", 1.0)];
+        req.settings.cost_weight = 0.0;
+        req.settings.latency_weight = 0.0;
+        req.steady = true;
+        req.current = Some(Pick::new("local", "b"));
+        let switched = (0..500u128).any(|s| {
+            let d = decide_with(
+                Uuid::from_u128(s),
+                Utc::now(),
+                &req,
+                &arms,
+                &PriorHints::new(),
+            );
+            d.chosen == Some(Pick::new("local", "a"))
+        });
+        assert!(
+            switched,
+            "a cold pair must still switch past the base margin"
+        );
     }
 
     fn models(names: &[&str]) -> Vec<String> {

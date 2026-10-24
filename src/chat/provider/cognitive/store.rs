@@ -101,7 +101,8 @@ impl ArmStats {
 pub struct ArmObservation {
     /// Reward in `[0, 1]`.
     pub reward: f64,
-    /// Reward above which the observation counts as a success.
+    /// Legacy: the reward is now fractional (`alpha += reward`); this threshold
+    /// is no longer consulted and is kept only for call-site compatibility.
     pub success_threshold: f64,
     /// Marginal USD, `None` when unknown.
     pub cost_usd: Option<f64>,
@@ -186,11 +187,14 @@ impl RoutingArmStore for InMemoryRoutingStore {
         let arm = arms
             .entry(key.clone())
             .or_insert_with(|| ArmStats::fresh(key.clone(), 1.0, 1.0));
-        if observation.reward >= observation.success_threshold {
-            arm.alpha += 1.0;
-        } else {
-            arm.beta += 1.0;
-        }
+        // Fractional reward: the [0, 1] reward feeds the Beta directly (soft
+        // pseudo-counts) instead of being thresholded to a success/failure, so a
+        // reward of 0.9 carries more weight than 0.55. `n` still counts one
+        // observation. This is an approximation: the posterior variance is no
+        // longer calibrated like an integer count (see the n_eff caveat).
+        let reward = observation.reward.clamp(0.0, 1.0);
+        arm.alpha += reward;
+        arm.beta += 1.0 - reward;
         arm.n += 1;
         if let Some(cost) = observation.cost_usd {
             arm.cost_sum_usd += cost;
@@ -268,6 +272,8 @@ mod tests {
             chosen: Some(Pick::new("deepseek", "v4")),
             score: Some(0.7),
             explored: false,
+            exploration_epsilon: 0.0,
+            confidence: None,
             reason: "test".into(),
             alternatives: vec![],
             applied: false,
@@ -299,12 +305,16 @@ mod tests {
         store.observe(&key, &obs(0.9, Some(0.10))).await.unwrap();
         store.observe(&key, &obs(0.2, None)).await.unwrap();
         let arm = store.arm(&key).await.unwrap().unwrap();
-        assert_eq!((arm.alpha, arm.beta, arm.n), (2.0, 2.0, 2));
+        // Fractional pseudo-counts: 0.9 → +0.9/+0.1, 0.2 → +0.2/+0.8 over the
+        // Beta(1, 1) prior, so the mean is 2.1 / 4.0 = 0.525, not the binarised 0.5.
+        assert!((arm.alpha - 2.1).abs() < 1e-9);
+        assert!((arm.beta - 1.9).abs() < 1e-9);
+        assert_eq!(arm.n, 2);
         // The unknown cost did not count as zero.
         assert_eq!(arm.cost_n, 1);
         assert_eq!(arm.mean_cost_usd(), Some(0.10));
         assert_eq!(arm.mean_latency_ms(), Some(1_000.0));
-        assert!((arm.mean() - 0.5).abs() < 1e-9);
+        assert!((arm.mean() - 0.525).abs() < 1e-9);
         let other = ArmKey::new("complex", "deepseek", "v4");
         assert_eq!(store.arms_of_class("simple").await.unwrap().len(), 1);
         assert!(store.arms_of_class("complex").await.unwrap().is_empty());

@@ -11397,7 +11397,16 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         };
-        assert_eq!((arm.alpha, arm.beta, arm.n), (2.0, 1.0, 1));
+        // The reward is fractional (feedback.rs): a first-try success scores 0.7, so the arm
+        // gains 0.7 of alpha and 0.3 of beta, and exactly one observation.
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(
+            close(arm.alpha, 1.7) && close(arm.beta, 1.3) && arm.n == 1,
+            "alpha={} beta={} n={}",
+            arm.alpha,
+            arm.beta,
+            arm.n
+        );
         assert_eq!(
             arm.cost_n, 0,
             "an unknown or non-marginal cost stays unknown"

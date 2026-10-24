@@ -100,7 +100,8 @@ impl Neo4jClient {
         key: &ArmKey,
         observation: &ArmObservation,
     ) -> Result<ArmStats> {
-        let success = observation.reward >= observation.success_threshold;
+        // Fractional reward: same soft pseudo-counts as the in-memory store.
+        let reward = observation.reward.clamp(0.0, 1.0);
         let q = query(&format!(
             "MERGE (a:RoutingArm {{class: $class, provider_id: $provider_id, model: $model}}) \
              ON CREATE SET a.alpha = 1.0, a.beta = 1.0, a.n = 0, a.cost_sum_usd = 0.0, \
@@ -114,8 +115,8 @@ impl Neo4jClient {
         .param("class", key.class.clone())
         .param("provider_id", key.provider_id.clone())
         .param("model", key.model.clone())
-        .param("d_alpha", if success { 1.0_f64 } else { 0.0 })
-        .param("d_beta", if success { 0.0_f64 } else { 1.0 })
+        .param("d_alpha", reward)
+        .param("d_beta", 1.0 - reward)
         .param("cost", observation.cost_usd.unwrap_or(0.0))
         .param("cost_n", i64::from(observation.cost_usd.is_some()))
         .param(
@@ -317,6 +318,8 @@ mod tests {
             chosen: Some(Pick::new("glm", "big")),
             score: Some(0.5),
             explored: false,
+            exploration_epsilon: 0.0,
+            confidence: None,
             reason: "test".into(),
             alternatives: vec![],
             applied: false,

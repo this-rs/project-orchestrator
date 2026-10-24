@@ -42,6 +42,15 @@ pub struct DecisionAlternative {
     pub score: Option<f64>,
     /// Why it was not eligible, when it was not.
     pub rejected: Option<RejectReason>,
+    /// Marginal probability this arm's Thompson draw is the max (`p_top1`),
+    /// `None` when it was not scored. What an off-policy estimator needs to
+    /// replay the pure-Thompson policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p_top1: Option<f64>,
+    /// Logged selection propensity under the ε-greedy Thompson policy:
+    /// `(1−ε)·p_top1 + ε/k`, before the hysteresis. `None` when not scored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub propensity: Option<f64>,
 }
 
 /// What happened afterwards, filled when the work closes.
@@ -82,6 +91,15 @@ pub struct CognitiveDecision {
     pub score: Option<f64>,
     /// Whether the draw was an exploration.
     pub explored: bool,
+    /// The exploration rate in force (clamped), so a replay reconstructs the
+    /// ε-greedy propensity from the logged `p_top1` and `propensity`.
+    #[serde(default)]
+    pub exploration_epsilon: f64,
+    /// Confidence of the decision: `1 − H(p)/ln(k)` over the scored
+    /// alternatives' scores. `None` when it was not scored. Persisted so the
+    /// dashboard and the off-policy replay see the same number the scorer saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
     /// One readable sentence (no URL, no secret).
     pub reason: String,
     /// The options considered, best first, rejected ones included.
@@ -295,6 +313,8 @@ mod tests {
             chosen: Some(Pick::new("deepseek", "v4")),
             score: None,
             explored: false,
+            exploration_epsilon: 0.0,
+            confidence: None,
             reason: "test".into(),
             alternatives: vec![],
             applied: true,
