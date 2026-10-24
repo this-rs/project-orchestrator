@@ -11,6 +11,7 @@ pub mod agent_tokens;
 pub mod extractor;
 pub mod google;
 pub mod jwt;
+pub mod jwt_crypto;
 pub mod middleware;
 pub mod oauth_server;
 pub mod oidc;
