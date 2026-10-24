@@ -143,14 +143,14 @@ pub trait TrajectorySink: Send + Sync {
     fn record(&self, decision: &CognitiveDecision, reward: f64);
 }
 
-/// Confidence of a decision: `1 - H(p) / ln(k)` over the normalised scores of
-/// its scored alternatives. 1 when one option dominates, 0 when they are
-/// indistinguishable, and 0 when fewer than two were scored.
-pub fn decision_confidence(decision: &CognitiveDecision) -> f64 {
-    let scores: Vec<f64> = decision
-        .alternatives
+/// Confidence over normalised scores: `1 - H(p) / ln(k)`. 1 when one option
+/// dominates, 0 when they are indistinguishable, and 0 when fewer than two were
+/// given. The single implementation shared by the decision confidence and the
+/// cognitive decider's hysteresis margin (L1): never recompute it locally.
+pub fn confidence_from_scores(scores: &[f64]) -> f64 {
+    let scores: Vec<f64> = scores
         .iter()
-        .filter_map(|a| a.score)
+        .copied()
         .filter(|s| s.is_finite())
         .map(|s| s.max(0.0))
         .collect();
@@ -169,6 +169,17 @@ pub fn decision_confidence(decision: &CognitiveDecision) -> f64 {
         .map(|p| -p * p.ln())
         .sum();
     (1.0 - entropy / (k as f64).ln()).clamp(0.0, 1.0)
+}
+
+/// Confidence of a decision: [`confidence_from_scores`] over the scores of its
+/// scored alternatives.
+pub fn decision_confidence(decision: &CognitiveDecision) -> f64 {
+    let scores: Vec<f64> = decision
+        .alternatives
+        .iter()
+        .filter_map(|a| a.score)
+        .collect();
+    confidence_from_scores(&scores)
 }
 
 /// Sends closed decisions to the neural-routing `TrajectoryCollector`.
