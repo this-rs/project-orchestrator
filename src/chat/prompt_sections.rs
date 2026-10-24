@@ -2906,7 +2906,7 @@ mod tests {
             }
             if indices
                 .iter()
-                .any(|i| !i.as_u64().is_some_and(|x| (x as usize) < vcount))
+                .any(|i| i.as_u64().is_none_or(|x| (x as usize) >= vcount))
             {
                 out.push(format!("{where_}: an index is >= vertex count"));
             }
