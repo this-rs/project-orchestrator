@@ -3,6 +3,7 @@
 //! Supports multiple programming languages with full AST extraction.
 
 pub mod ast_cache;
+pub mod code_ir;
 pub mod helpers;
 pub mod languages;
 pub mod noise_filter;
@@ -156,6 +157,28 @@ impl CodeParser {
 
     /// Parse a file and extract code structure
     pub fn parse_file(&mut self, path: &Path, content: &str) -> Result<ParsedFile> {
+        self.parse_file_with_tree(path, content)
+            .map(|(parsed, _tree)| parsed)
+    }
+
+    /// Parse a file and additionally build the canonical [`code_ir::CodeIr`]
+    /// (AST → scene projection, stage 2 of the pipeline).
+    pub fn parse_file_with_ir(
+        &mut self,
+        path: &Path,
+        content: &str,
+    ) -> Result<(ParsedFile, code_ir::CodeIr)> {
+        let (parsed, tree) = self.parse_file_with_tree(path, content)?;
+        let ir = code_ir::build_code_ir(&tree.root_node(), content, &parsed);
+        Ok((parsed, ir))
+    }
+
+    /// Parse a file, keep the tree alive for downstream passes (CodeIR build).
+    fn parse_file_with_tree(
+        &mut self,
+        path: &Path,
+        content: &str,
+    ) -> Result<(ParsedFile, tree_sitter::Tree)> {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -250,7 +273,7 @@ impl CodeParser {
             }
         }
 
-        Ok(parsed)
+        Ok((parsed, tree))
     }
 
     /// Convert parsed file to a code document for Meilisearch
