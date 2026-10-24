@@ -3219,7 +3219,12 @@ pub(crate) fn bridge_synapses(
     links: &std::collections::HashMap<String, Vec<(String, bool)>>,
     top_k: usize,
 ) -> Vec<(String, String, f64)> {
-    let mut acc: std::collections::HashMap<(&str, &str), (f64, u32)> =
+    // Bounded accumulation keyed by source file. When `top_k > 0`, each source's target
+    // set is pruned to `top_k` DURING the loop, so memory stays O(#source_files × top_k)
+    // instead of the full cartesian product. The previous version accumulated every pair
+    // into one unbounded HashMap and applied `top_k` only afterwards, which OOM'd the
+    // backend (hundreds of millions of entries, a bucket array of 24.5 GiB and growing).
+    let mut acc: std::collections::HashMap<&str, std::collections::HashMap<&str, (f64, u32)>> =
         std::collections::HashMap::new();
     for (a, b, w) in synapses {
         let (Some(from), Some(to)) = (links.get(a), links.get(b)) else {
@@ -3229,18 +3234,26 @@ pub(crate) fn bridge_synapses(
             if !*in_project {
                 continue;
             }
+            let by_target = acc.entry(f1.as_str()).or_default();
             for (f2, _) in to {
                 if f1 != f2 {
-                    let entry = acc.entry((f1.as_str(), f2.as_str())).or_insert((0.0, 0));
+                    let entry = by_target.entry(f2.as_str()).or_insert((0.0, 0));
                     entry.0 += *w;
                     entry.1 += 1;
                 }
+            }
+            if top_k > 0 && by_target.len() > top_k.saturating_mul(2) {
+                prune_targets(by_target, top_k);
             }
         }
     }
     let mut edges: Vec<(String, String, f64)> = acc
         .into_iter()
-        .map(|((f1, f2), (sum, n))| (f1.to_string(), f2.to_string(), sum / f64::from(n)))
+        .flat_map(|(f1, targets)| {
+            targets
+                .into_iter()
+                .map(move |(f2, (sum, n))| (f1.to_string(), f2.to_string(), sum / f64::from(n)))
+        })
         .collect();
     if top_k > 0 {
         edges.sort_by(|x, y| {
@@ -3261,6 +3274,24 @@ pub(crate) fn bridge_synapses(
         });
     }
     edges
+}
+
+/// Keep only the `top_k` heaviest targets (by average weight, then name) of one source file.
+fn prune_targets(targets: &mut std::collections::HashMap<&str, (f64, u32)>, top_k: usize) {
+    let mut ranked: Vec<(&str, (f64, u32))> = targets.iter().map(|(k, v)| (*k, *v)).collect();
+    ranked.sort_by(|a, b| {
+        let (ka, (sa, na)) = *a;
+        let (kb, (sb, nb)) = *b;
+        let avg_a = sa / f64::from(na);
+        let avg_b = sb / f64::from(nb);
+        // Descending average weight, then ascending target name.
+        avg_b.total_cmp(&avg_a).then_with(|| ka.cmp(kb))
+    });
+    *targets = ranked
+        .into_iter()
+        .take(top_k)
+        .map(|(k, v)| (k, v))
+        .collect();
 }
 
 #[cfg(test)]
@@ -3338,5 +3369,27 @@ mod synapse_bridge_tests {
         let top = sorted(bridge_synapses(&s, &l, 2));
         let targets: Vec<_> = top.iter().map(|e| e.1.as_str()).collect();
         assert_eq!(targets, vec!["g2", "g3"], "0.9 and 0.7 survive, 0.5 goes");
+    }
+
+    #[test]
+    fn a_source_anchored_on_many_files_is_pruned_to_top_k() {
+        // Note "a" is anchored on one project file "f1"; it has 10 synapses to notes
+        // b0..b9, each anchored on its own file g0..g9 (weights 0.3..1.2). With top_k=2,
+        // "f1" must keep only its two heaviest targets g9 (1.2) and g8 (1.1) — the
+        // pruning path runs because the cross-product (10) exceeds 2×top_k.
+        let mut links: HashMap<String, Vec<(String, bool)>> = HashMap::new();
+        links.insert("a".to_string(), vec![("f1".to_string(), true)]);
+        let mut synapses: Vec<(String, String, f64)> = Vec::new();
+        for i in 0..10 {
+            let b = format!("b{i}");
+            let g = format!("g{i}");
+            links.insert(b.clone(), vec![(g.clone(), true)]);
+            synapses.push(("a".to_string(), b, 0.3 + i as f64 * 0.1));
+        }
+        let edges = bridge_synapses(&synapses, &links, 2);
+        assert_eq!(edges.len(), 2);
+        let mut targets: Vec<&str> = edges.iter().map(|(_, t, _)| t.as_str()).collect();
+        targets.sort();
+        assert_eq!(targets, vec!["g8", "g9"]);
     }
 }

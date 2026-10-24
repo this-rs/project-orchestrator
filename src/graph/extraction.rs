@@ -357,14 +357,18 @@ impl GraphExtractor {
 /// Environment variable capping the SYNAPSE edges kept per file in the fabric graph.
 pub const SYNAPSE_TOP_K_ENV: &str = "PO_FABRIC_SYNAPSE_TOP_K";
 
-/// Cap on SYNAPSE edges leaving one file (0 = no cap, the default: the metrics keep their
-/// values). On a project whose notes are anchored on hundreds of files the layer is nearly
-/// complete (a million edges); a cap trades exactness of the fabric metrics for size.
+/// Bounded default for the per-file SYNAPSE cap. `0` = unbounded (opt-in, dangerous:
+/// see `bridge_synapses` — the full cartesian product OOM'd the backend at ~24.5 GiB).
+pub const DEFAULT_SYNAPSE_TOP_K: usize = 32;
+
+/// Cap on SYNAPSE edges leaving one file. A bounded default prevents the cartesian
+/// product from exploding memory; set `PO_FABRIC_SYNAPSE_TOP_K=0` to restore the
+/// unbounded (full-fidelity) layer explicitly.
 pub fn synapse_top_k_from_env() -> usize {
     std::env::var(SYNAPSE_TOP_K_ENV)
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0)
+        .unwrap_or(DEFAULT_SYNAPSE_TOP_K)
 }
 
 #[cfg(test)]
