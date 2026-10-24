@@ -378,6 +378,24 @@ mod tests {
     use crate::neo4j::models::{FunctionNode, Visibility};
     use crate::test_helpers::test_project;
 
+    /// The per-file SYNAPSE cap defaults to a BOUNDED value: `0` (unbounded) was the
+    /// default that let `bridge_synapses` materialise the full note->file cartesian
+    /// product and OOM the backend. Covered without touching the process environment
+    /// (a `set_var` here could race the fabric tests that read the same variable): when
+    /// the variable is absent the default must come back; when a CI sets it, it must
+    /// parse.
+    #[test]
+    fn synapse_top_k_defaults_to_a_bounded_value() {
+        assert_eq!(DEFAULT_SYNAPSE_TOP_K, 32);
+        match std::env::var(SYNAPSE_TOP_K_ENV) {
+            Err(_) => assert_eq!(synapse_top_k_from_env(), DEFAULT_SYNAPSE_TOP_K),
+            Ok(raw) => assert_eq!(
+                synapse_top_k_from_env(),
+                raw.trim().parse::<usize>().unwrap_or(DEFAULT_SYNAPSE_TOP_K)
+            ),
+        }
+    }
+
     /// Seed a project with files and import relationships into the mock store.
     async fn seed_files_and_imports(
         store: &MockGraphStore,
