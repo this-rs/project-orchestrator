@@ -1734,6 +1734,12 @@ pub(crate) async fn enrichment_for_turn(
     if let Some(pid) = project_id {
         crate::neurons::synaptic_shadow::spawn_turn(graph.clone(), uuid, pid, node.created_at);
     }
+    // A restricted provider (Claude Code) is not sent the project's provider-sensitive
+    // notes by the per-turn injection either: kept out of the system prompt alone, they
+    // would come back in the message of the next turn.
+    let restricted_content =
+        super::content_policy::provider_content_policy(node.provider_id.as_deref().unwrap_or(""))
+            .is_restricted();
     let input = super::enrichment::EnrichmentInput {
         message: message.to_string(),
         session_id: uuid,
@@ -1743,6 +1749,7 @@ pub(crate) async fn enrichment_for_turn(
         protocol_run_id: protocol.run_id,
         protocol_state: protocol.state,
         excluded_note_ids,
+        restricted_content,
         reasoning_path_tracker: protocol.reasoning_path_tracker,
     };
     let ctx = pipeline.execute(&input).await;
