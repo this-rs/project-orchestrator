@@ -16828,6 +16828,8 @@ impl ChatManager {
                             ),
                             embedded_obscura,
                             deny_paths: nt::host_deny_paths(self.config_yaml_path.as_deref()),
+                            // The native shell's git/gh mirror the host's credentials (decision 2238b1e4).
+                            host_home: dirs::home_dir(),
                         },
                         &nt::GraphConsents(self.graph.clone()),
                         self.vault.as_deref(),
