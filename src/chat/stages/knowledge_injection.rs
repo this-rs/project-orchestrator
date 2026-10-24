@@ -401,6 +401,7 @@ impl KnowledgeInjectionStage {
     ///
     /// Returns deduplicated notes and decisions, sorted by relevance.
     /// Accepts an explicit config to support scaffolding-adjusted parameters.
+    #[allow(clippy::too_many_arguments)]
     async fn query_knowledge_with_config(
         &self,
         message: &str,
