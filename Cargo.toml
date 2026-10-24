@@ -93,7 +93,7 @@ toml = { workspace = true }
 neo4rs = { workspace = true }
 
 # Meilisearch
-meilisearch-sdk = { version = "0.33", default-features = false, features = ["reqwest", "tls", "jwt_rust_crypto"] }
+meilisearch-sdk = { version = "0.33", default-features = false, features = ["reqwest", "tls"] }
 
 # Tree-sitter
 tree-sitter = "0.26"
@@ -161,15 +161,15 @@ async-trait = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Chat / Claude Code SDK
-nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "d958a39ce122fdbe25153fd9225dc4f370c15f3e", features = ["memory", "auto-download", "provider-native", "provider-codex", "provider-acp"] }
+nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "0587011ae4e914b2a0c52d12b5225a65382ea988", features = ["memory", "auto-download", "provider-native", "provider-codex", "provider-acp"] }
 # The path resolver of nexus-tools (`files::Scope`), so that the backend confines a session that
 # left trust exactly as the server would (decision fce98b8a; the same resolver, not a second one
 # that could drift: P11b point 8). Same pin as nexus-claude.
-nexus-tools = { git = "https://github.com/this-rs/nexus.git", rev = "d958a39ce122fdbe25153fd9225dc4f370c15f3e" }
+nexus-tools = { git = "https://github.com/this-rs/nexus.git", rev = "0587011ae4e914b2a0c52d12b5225a65382ea988" }
 tokio-stream = { workspace = true }
 
 # Auth
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11" }
 bcrypt = "0.19"
 
 # P2P Identity (M4)
@@ -296,11 +296,11 @@ wiremock = "0.6.5"
 proptest = "1"
 # The scripted provider of nexus (a harness that calls the session hooks), for the tests of
 # per-turn model routing. Same pin as the dependency above.
-nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "d958a39ce122fdbe25153fd9225dc4f370c15f3e", features = ["testkit"] }
+nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "0587011ae4e914b2a0c52d12b5225a65382ea988", features = ["testkit"] }
 # The REAL verifier of the signed profile token of nexus-tools (B40): the tests check that the
 # token the backend signs is the one the server accepts, and that a tool outside it never runs.
 # Same pin as above (which contains nexus-tools, #68); adds the test tools.
-nexus-tools = { git = "https://github.com/this-rs/nexus.git", rev = "d958a39ce122fdbe25153fd9225dc4f370c15f3e", features = ["test-tools"] }
+nexus-tools = { git = "https://github.com/this-rs/nexus.git", rev = "0587011ae4e914b2a0c52d12b5225a65382ea988", features = ["test-tools"] }
 # A real WebSocket client, to test the chat handler end to end (already in the lock
 # tree through axum).
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }

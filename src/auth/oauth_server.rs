@@ -35,6 +35,7 @@
 //! `POST /auth/mcp-tokens` (label `OAuth: {client_name}`) — inventory and
 //! revocation work identically for OAuth-issued and manually-issued tokens.
 
+use super::jwt_crypto::{decode, encode};
 use crate::api::handlers::{AppError, OrchestratorState};
 use crate::auth::jwt::encode_mcp_token;
 use crate::auth::refresh;
@@ -44,7 +45,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     Form, Json,
 };
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};

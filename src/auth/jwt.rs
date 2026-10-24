@@ -4,8 +4,9 @@
 //! HTTP API authentication (Bearer header) and WebSocket auth
 //! (first message after connection).
 
+use super::jwt_crypto::{decode, encode};
 use anyhow::{Context, Result};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, TokenData, Validation};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, TokenData, Validation};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -452,7 +453,7 @@ mod tests {
             jti: None,
         };
 
-        let token = jsonwebtoken::encode(
+        let token = crate::auth::jwt_crypto::encode(
             &jsonwebtoken::Header::default(),
             &claims,
             &jsonwebtoken::EncodingKey::from_secret(TEST_SECRET.as_bytes()),
