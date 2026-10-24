@@ -3287,11 +3287,7 @@ fn prune_targets(targets: &mut std::collections::HashMap<&str, (f64, u32)>, top_
         // Descending average weight, then ascending target name.
         avg_b.total_cmp(&avg_a).then_with(|| ka.cmp(kb))
     });
-    *targets = ranked
-        .into_iter()
-        .take(top_k)
-        .map(|(k, v)| (k, v))
-        .collect();
+    *targets = ranked.into_iter().take(top_k).collect();
 }
 
 #[cfg(test)]
