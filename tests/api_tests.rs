@@ -28,7 +28,7 @@ fn auth_client() -> Client {
         "iat": now,
         "exp": now + 3600,
     });
-    let token = jsonwebtoken::encode(
+    let token = project_orchestrator::auth::jwt_crypto::encode(
         &jsonwebtoken::Header::default(),
         &claims,
         &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),

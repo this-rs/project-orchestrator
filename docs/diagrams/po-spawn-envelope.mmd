@@ -1,5 +1,5 @@
 %% name: po-spawn-envelope
-%% covers: backend:src/chat/{envelope,delegation_limits,subagents,mirror,session_pool,cancelled_parents}.rs backend:src/auth/{agent_tokens,jwt,tool_profile}.rs
+%% covers: backend:src/chat/{envelope,delegation_limits,subagents,mirror,session_pool,cancelled_parents}.rs backend:src/auth/{agent_tokens,jwt,jwt_crypto,tool_profile}.rs
 %% verified: 0ab7a21f
 %% ---
 %% PROUVE : ce qu'une session ouverte PAR UN AGENT a le droit d'être (décisions A17, A25, A34),
@@ -10,6 +10,8 @@
 %% SOURCES LUES :
 %%   src/auth/jwt.rs          — generate_session_token, agent_session_binding, AgentSessionBinding,
 %%                              Claims::is_agent_session, Claims::is_human
+%%   src/auth/jwt_crypto.rs   — HmacOnly (signer_factory, verifier_factory), install, encode, decode :
+%%                              le seul fournisseur JWT du binaire, HS256/384/512 ; RS/ES/EdDSA refusés
 %%   src/auth/agent_tokens.rs — register, is_live, revoke_session, register_tools, tools_live (jeton de profil nexus-tools, B40 : révoqué avec la session)
 %%   src/auth/tool_profile.rs — ToolProfile (from_name, from_unverified_token, filter_tools,
 %%                              allows_action, route_forbidden) ; src/mcp/server.rs — profile_refusal
