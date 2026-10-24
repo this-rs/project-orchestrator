@@ -3214,6 +3214,17 @@ pub(crate) fn stored_interrupted_result(event: &ChatEvent) -> Option<ChatEvent> 
     }
 }
 
+/// The sentinel a config/default uses to mean "let the harness choose the model", NOT a
+/// model name. `chat.default_model: auto` reaches a session as the model string `"auto"`;
+/// passed verbatim it becomes `--model auto`, which the Claude Code CLI rejects
+/// (`[claude-code:unrecognized_model]`) — every turn then fails with "There's an issue with
+/// the selected model (auto)". Treated as the sentinel, the model is left unset: the CLI
+/// (and nexus) use the account's own default, and PO's cognitive router still overrides it
+/// when a pool/mode is configured. Case-insensitive, trimmed.
+pub(crate) fn is_auto_model(model: &str) -> bool {
+    model.trim().eq_ignore_ascii_case("auto")
+}
+
 /// Opens (or resumes) a session with `spec` through `open`. A provider that learned,
 /// between the reading of its capabilities and this opening, that it takes no MCP
 /// server per session (two first sessions opened at once on an ACP agent that refuses
@@ -6732,7 +6743,6 @@ impl ChatManager {
         };
 
         let mut builder = ClaudeCodeOptions::builder()
-            .model(model)
             .cwd(cwd)
             .system_prompt(system_prompt)
             .permission_mode(effective_permission)
@@ -6748,6 +6758,13 @@ impl ChatManager {
             // (where `ps` shows it to any process of the same user).
             .mcp_config_via_file(true)
             .add_mcp_server("project-orchestrator", mcp_config);
+
+        // `auto` is a sentinel, not a model name (see [`is_auto_model`]): left unset the CLI
+        // uses the account's default instead of a `--model auto` it would reject. A named
+        // model is passed through.
+        if !is_auto_model(model) {
+            builder = builder.model(model);
+        }
 
         // Wire allowed/disallowed tool patterns from config
         if !perm_config.allowed_tools.is_empty() {
@@ -16739,7 +16756,13 @@ impl ChatManager {
             Some(remote) => remote.to_string(),
             None => expand_tilde(cwd),
         });
-        spec.model = Some(model.to_string());
+        // `auto` is a sentinel, not a model name: left unset, Claude Code uses the account's
+        // own default instead of being handed `--model auto` (which it rejects). Only Claude
+        // Code sees this sentinel — a native/ACP instance resolves its own default model, never
+        // `auto` — so the special case is scoped to that kind.
+        spec.model = (!(kind == nexus_claude::agent::ProviderKind::ClaudeCode
+            && is_auto_model(model)))
+        .then(|| model.to_string());
         // What a provider kind refuses, it is not given (a refusal here would be a
         // typed `unsupported` at open): ACP has no extra dirs; Codex and ACP have no turn
         // limits. The system prompt IS given to ACP (ISO4): it has no system role, and nexus
@@ -20527,6 +20550,55 @@ mod tests {
         assert_eq!(options.cwd, Some(PathBuf::from("/tmp/project")));
         assert!(options.resume.is_none());
         assert!(options.mcp_servers.contains_key("project-orchestrator"));
+    }
+
+    #[test]
+    fn auto_model_is_the_choose_for_me_sentinel_not_a_name() {
+        assert!(is_auto_model("auto"));
+        assert!(is_auto_model("AUTO"));
+        assert!(is_auto_model("  Auto  "));
+        assert!(!is_auto_model("claude-opus-4-8"));
+        assert!(!is_auto_model("automatic"));
+        assert!(!is_auto_model(""));
+    }
+
+    #[tokio::test]
+    async fn test_build_options_omits_model_flag_for_auto_sentinel() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // `auto` must NOT reach the CLI as `--model auto` (it rejects it): the flag is omitted
+        // so the account's own default is used.
+        let options = manager
+            .build_options(
+                "/tmp/project",
+                "auto",
+                "System prompt here",
+                None,
+                None,
+                None,
+                &[],
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(options.model, None, "auto must not be sent as --model");
+
+        // A named model is still passed through.
+        let named = manager
+            .build_options(
+                "/tmp/project",
+                "claude-opus-4-8",
+                "System prompt here",
+                None,
+                None,
+                None,
+                &[],
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(named.model, Some("claude-opus-4-8".into()));
     }
 
     #[tokio::test]
