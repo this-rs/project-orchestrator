@@ -616,4 +616,142 @@ mod tests {
             branches.iter().map(|b| &b.label).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn primitive_kind_names_and_function_ids_are_stable() {
+        assert_eq!(PrimitiveKind::Assembly.as_str(), "assembly");
+        assert_eq!(PrimitiveKind::Mechanism.as_str(), "mechanism");
+        assert_eq!(PrimitiveKind::Loop.as_str(), "loop");
+        assert_eq!(PrimitiveKind::Branch.as_str(), "branch");
+        assert_eq!(PrimitiveKind::Call.as_str(), "call");
+        assert_eq!(PrimitiveKind::Assign.as_str(), "assign");
+        assert_eq!(PrimitiveKind::Data.as_str(), "data");
+        assert_eq!(function_id("a/b.rs", "f", 7), "a/b.rs:f:7");
+        assert_eq!(bounded_size(0.0), 1.0, "sizes are floored at 1");
+        assert_eq!(bounded_size(1e9), SIZE_MAX, "sizes are capped at SIZE_MAX");
+        assert_eq!(file_label("src/a/b.rs"), "b.rs");
+    }
+
+    #[test]
+    fn code_ir_folds_types_calls_imports_and_every_flow_kind() {
+        // A struct, a trait and an enum (nested assemblies), a `for`, a `loop` and a
+        // `match` (the other loop/branch kinds), a local and an external call, an import,
+        // and an `if` whose condition is longer than 40 characters (truncated label).
+        let src = "use std::collections::HashMap;\n\
+                   struct Point { x: i32 }\n\
+                   trait Shape { fn area(&self) -> i32; }\n\
+                   enum Color { Red, Blue }\n\
+                   fn helper(v: i32) -> i32 { v + 1 }\n\
+                   fn main_flow(n: i32) -> i32 {\n\
+                   \x20 let mut total = 0;\n\
+                   \x20 for i in 0..n { total += helper(i); }\n\
+                   \x20 loop { break; }\n\
+                   \x20 match n { 0 => total = 1, _ => total = 2 }\n\
+                   \x20 if total_is_very_large_and_this_condition_is_long(total) && n > 0 { total = 3; }\n\
+                   \x20 external_function(total);\n\
+                   \x20 total\n\
+                   }\n";
+        let mut parser = CodeParser::new().unwrap();
+        let (parsed, ir) = parser
+            .parse_file_with_ir(std::path::Path::new("sample.rs"), src)
+            .unwrap();
+        assert!(parsed.functions.len() >= 2, "{:?}", parsed.functions.len());
+
+        // Nested assemblies for the struct, trait and enum, each a Member of the file.
+        let file_id = file_assembly_id("sample.rs");
+        for (detail, name) in [("struct", "Point"), ("trait", "Shape"), ("enum", "Color")] {
+            let node = ir
+                .primitives_of(PrimitiveKind::Assembly)
+                .find(|a| a.detail.as_deref() == Some(detail) && a.label == name)
+                .unwrap_or_else(|| panic!("missing {detail} assembly {name}"));
+            assert!(
+                ir.links
+                    .iter()
+                    .any(|l| l.kind == LinkKind::Member && l.from == file_id && l.to == node.id),
+                "{name} must be a Member of the file"
+            );
+            assert_eq!(
+                node.id,
+                type_assembly_id("sample.rs", detail, name, node.line_start)
+            );
+        }
+        // The file assembly itself, labelled by file name.
+        assert!(ir
+            .primitives_of(PrimitiveKind::Assembly)
+            .any(|a| a.id == file_id && a.label == "b.rs".replace("b.rs", "sample.rs")));
+
+        // Every loop and branch kind of the snippet.
+        let details = |k: PrimitiveKind| -> Vec<String> {
+            ir.primitives_of(k)
+                .filter_map(|n| n.detail.clone())
+                .collect()
+        };
+        let loops = details(PrimitiveKind::Loop);
+        assert!(loops.iter().any(|d| d == "for"), "{loops:?}");
+        assert!(loops.iter().any(|d| d == "loop"), "{loops:?}");
+        let branches = details(PrimitiveKind::Branch);
+        assert!(branches.iter().any(|d| d == "match"), "{branches:?}");
+        assert!(branches.iter().any(|d| d == "if"), "{branches:?}");
+
+        // The long `if` condition is truncated to 40 characters plus an ellipsis.
+        let truncated = ir
+            .primitives_of(PrimitiveKind::Branch)
+            .find(|b| b.label.ends_with('…'))
+            .expect("a truncated branch label");
+        assert_eq!(truncated.label.chars().count(), 41, "{}", truncated.label);
+
+        // Calls: a `call` node per call site, linked Call-wise; an unknown callee is external.
+        let calls: Vec<&CodeIrNode> = ir.primitives_of(PrimitiveKind::Call).collect();
+        assert!(
+            !calls.is_empty(),
+            "the snippet calls helper() and external_function()"
+        );
+        assert!(calls.iter().all(|c| (0.0..=1.0).contains(&c.size)));
+        assert!(ir.links.iter().any(|l| l.kind == LinkKind::Call));
+        if calls.iter().any(|c| c.label == "external_function") {
+            assert!(ir
+                .links
+                .iter()
+                .any(|l| l.kind == LinkKind::Call && l.to == "external:external_function"));
+        }
+
+        // The import becomes an Import link from the file to an external id.
+        assert!(ir.links.iter().any(|l| l.kind == LinkKind::Import
+            && l.from == file_id
+            && l.to.starts_with("external:")));
+
+        // Flow nodes hang off the innermost function (Control links), never the file.
+        let main_id = parsed
+            .functions
+            .iter()
+            .find(|f| f.name == "main_flow")
+            .map(|f| function_id(&f.file_path, &f.name, f.line_start))
+            .expect("main_flow parsed");
+        assert!(ir
+            .links
+            .iter()
+            .any(|l| l.kind == LinkKind::Control && l.from == main_id));
+        for n in ir.nodes.iter() {
+            assert!(n.size >= 1.0 || n.kind == PrimitiveKind::Call, "{:?}", n);
+        }
+    }
+
+    #[test]
+    fn a_very_complex_function_is_capped_at_size_max() {
+        let mut body = String::from("fn busy(a: i32) -> i32 {\n  let mut x = a;\n");
+        for i in 0..12 {
+            body.push_str(&format!("  if x > {i} {{ x += 1; }}\n"));
+        }
+        body.push_str("  x\n}\n");
+        let mut parser = CodeParser::new().unwrap();
+        let (_, ir) = parser
+            .parse_file_with_ir(std::path::Path::new("sample.rs"), &body)
+            .unwrap();
+        let busy = ir
+            .primitives_of(PrimitiveKind::Mechanism)
+            .find(|m| m.label == "busy")
+            .expect("busy mechanism");
+        assert_eq!(busy.size, SIZE_MAX, "complexity beyond SIZE_MAX is clamped");
+        assert_eq!(ir.primitives_of(PrimitiveKind::Branch).count(), 12);
+    }
 }
