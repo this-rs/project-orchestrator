@@ -3182,6 +3182,334 @@ mod tests {
         assert_eq!(scene3d_problems(&v1), Vec::<String>::new());
     }
 
+    // ── scene3d v2: every refusal branch of the checker ───────────────────
+    // One malformed scene per family, each breaking many rules at once; the
+    // assertions check that the branch emitted (substring), not its exact wording.
+
+    fn s3d(v: &serde_json::Value) -> Vec<String> {
+        scene3d_problems(v)
+    }
+    fn has(p: &[String], needle: &str) -> bool {
+        p.iter().any(|x| x.contains(needle))
+    }
+    fn s3d_str(json: &str) -> Vec<String> {
+        s3d(&serde_json::from_str(json).unwrap())
+    }
+
+    #[test]
+    fn scene3d_refuses_bad_roots_and_versions() {
+        assert!(has(&s3d(&serde_json::json!(42)), "not an object"));
+        assert!(has(&s3d_str(r#"{"version":"9"}"#), "unknown version 9"));
+        assert!(has(
+            &s3d_str(r#"{"stations":[],"nodes":[]}"#),
+            "mixed v1 and v2 fields"
+        ));
+        assert!(has(
+            &s3d_str(r#"{"title":"x"}"#),
+            "a scene needs stations/ast or nodes"
+        ));
+        assert!(has(
+            &s3d_str(r#"{"version":"1","nodes":[]}"#),
+            "version 1 with v2 fields"
+        ));
+        assert!(has(
+            &s3d_str(r#"{"version":"2","stations":[]}"#),
+            "version 2 with v1 fields"
+        ));
+        let long_caption = "c".repeat(301);
+        let p = s3d(&serde_json::json!({
+            "version": "2", "nodes": [], "title": 123, "caption": long_caption, "bogus": 1
+        }));
+        assert!(has(&p, "bad title"), "{p:?}");
+        assert!(has(&p, "bad caption"), "{p:?}");
+        assert!(has(&p, "unknown scene field bogus"), "{p:?}");
+    }
+
+    #[test]
+    fn scene3d_refuses_bad_textures() {
+        let long_url = format!("http://{}", "a".repeat(2100));
+        let big_data = format!("data:image/png;base64,{}", "A".repeat(700_000));
+        let p = s3d(&serde_json::json!({
+            "version": "2", "nodes": [],
+            "textures": [
+                1,
+                {"kind": "image"},
+                {"id": "Bad_ID", "kind": "image", "image": {}},
+                {"id": "dup", "kind": "procedural", "procedural": {"type": "solid"}},
+                {"id": "dup", "kind": "procedural", "procedural": {"type": "solid"}},
+                {"id": "k", "kind": "video"},
+                {"id": "i1", "kind": "image", "image": "x"},
+                {"id": "i2", "kind": "image", "image": {"url": long_url, "wrapS": "bogus", "minFilter": "cubic"}},
+                {"id": "i3", "kind": "image", "image": {"url": big_data}},
+                {"id": "p1", "kind": "procedural", "procedural": "x"},
+                {"id": "p2", "kind": "procedural", "procedural": {"type": "noise", "colorA": "red", "scale": 0}}
+            ]
+        }));
+        for needle in [
+            "texture 0 not an object",
+            "texture 1 needs an id",
+            "bad id Bad_ID",
+            "duplicate texture id dup",
+            "unknown kind video",
+            "image must be an object",
+            "url too long",
+            "url scheme must be https: or data:image/",
+            "wrapS bogus not in",
+            "minFilter cubic not in",
+            "data URI too large",
+            "procedural must be an object",
+            "unknown procedural type noise",
+            "colorA must be a hex color",
+            "scale must be an integer 1..64",
+        ] {
+            assert!(has(&p, needle), "missing {needle:?} in {p:?}");
+        }
+        let many: Vec<serde_json::Value> = (0..33)
+            .map(|i| serde_json::json!({"id": format!("t{i}"), "kind": "procedural", "procedural": {"type": "solid"}}))
+            .collect();
+        let p = s3d(&serde_json::json!({"version": "2", "nodes": [], "textures": many}));
+        assert!(has(&p, "33 textures (at most 32)"), "{p:?}");
+    }
+
+    #[test]
+    fn scene3d_refuses_bad_materials() {
+        let p = s3d(&serde_json::json!({
+            "version": "2", "nodes": [],
+            "materials": [
+                1,
+                {"metallic": 0.5},
+                {"id": "Bad_ID"},
+                {"id": "dup"}, {"id": "dup"},
+                {"id": "m", "baseColor": "purple", "emissive": [1, 1, 1, 1, 1],
+                 "metallic": 2, "roughness": -1, "opacity": 5, "alphaCutoff": 2,
+                 "emissiveIntensity": 100, "ior": 5, "baseColorTexture": "nope",
+                 "doubleSided": "yes"}
+            ]
+        }));
+        for needle in [
+            "material 0 not an object",
+            "material 1 needs an id",
+            "bad id Bad_ID",
+            "duplicate material id dup",
+            "bad baseColor",
+            "bad emissive",
+            "metallic must be 0..1",
+            "roughness must be 0..1",
+            "opacity must be 0..1",
+            "alphaCutoff must be 0..1",
+            "emissiveIntensity out of range",
+            "ior must be 1..3",
+            "baseColorTexture does not reference a texture",
+            "doubleSided must be a boolean",
+        ] {
+            assert!(has(&p, needle), "missing {needle:?} in {p:?}");
+        }
+        let many: Vec<serde_json::Value> = (0..65)
+            .map(|i| serde_json::json!({"id": format!("m{i}")}))
+            .collect();
+        let p = s3d(&serde_json::json!({"version": "2", "nodes": [], "materials": many}));
+        assert!(has(&p, "65 materials (at most 64)"), "{p:?}");
+    }
+
+    #[test]
+    fn scene3d_refuses_bad_cameras() {
+        assert!(has(
+            &s3d_str(r#"{"version":"2","nodes":[],"camera":5}"#),
+            "camera must be an object"
+        ));
+        let p = s3d(&serde_json::json!({
+            "version": "2", "nodes": [],
+            "camera": {"kind": "fisheye", "position": [1, 2], "near": 0, "far": 1e9, "fov": 500}
+        }));
+        for needle in [
+            "camera: unknown kind fisheye",
+            "camera: position must be [x,y,z]",
+            "camera: near must be in (0,",
+            "camera: far must be <=",
+        ] {
+            assert!(has(&p, needle), "missing {needle:?} in {p:?}");
+        }
+        let p = s3d(&serde_json::json!({
+            "version": "2", "nodes": [],
+            "camera": {"kind": "perspective", "near": 10, "far": 5, "fov": 500}
+        }));
+        assert!(has(&p, "camera: far must be > near"), "{p:?}");
+        assert!(has(&p, "camera: fov must be"), "{p:?}");
+        let p = s3d(&serde_json::json!({
+            "version": "2", "nodes": [],
+            "camera": {"kind": "orthographic", "zoom": 0, "left": 5, "right": 1, "bottom": 5, "top": 1}
+        }));
+        for needle in [
+            "camera: zoom must be in (0, 1000]",
+            "camera: right must be > left",
+            "camera: top must be > bottom",
+        ] {
+            assert!(has(&p, needle), "missing {needle:?} in {p:?}");
+        }
+    }
+
+    #[test]
+    fn scene3d_refuses_bad_lights_and_assets() {
+        let p = s3d(&serde_json::json!({
+            "version": "2", "nodes": [],
+            "lights": [
+                1,
+                {"kind": "spot"},
+                {"kind": "ambient", "color": "nope", "intensity": 1000},
+                {"kind": "directional", "direction": [0, 0, 0]},
+                {"kind": "point", "position": [5000, 0, 0], "distance": 1e9, "decay": 10}
+            ],
+            "assets": [1, {"kind": "x"}, {"id": "Bad_ID"}, {"id": "dup"}, {"id": "dup"}]
+        }));
+        for needle in [
+            "light 0 not an object",
+            "light 1: unknown kind spot",
+            "light 2: bad color",
+            "light 2: intensity out of range",
+            "light 3: direction must be a non-zero [x,y,z]",
+            "light 4: position out of range",
+            "light 4: distance out of range",
+            "light 4: decay out of range",
+            "asset 0 not an object",
+            "asset 1 needs an id",
+            "asset 2: bad id Bad_ID",
+            "duplicate asset id dup",
+        ] {
+            assert!(has(&p, needle), "missing {needle:?} in {p:?}");
+        }
+        let lights: Vec<serde_json::Value> = (0..17)
+            .map(|_| serde_json::json!({"kind": "ambient"}))
+            .collect();
+        let assets: Vec<serde_json::Value> = (0..257)
+            .map(|i| serde_json::json!({"id": format!("a{i}")}))
+            .collect();
+        let p = s3d(
+            &serde_json::json!({"version": "2", "nodes": [], "lights": lights, "assets": assets}),
+        );
+        assert!(has(&p, "17 lights (at most 16)"), "{p:?}");
+        assert!(has(&p, "257 assets (at most 256)"), "{p:?}");
+    }
+
+    #[test]
+    fn scene3d_refuses_bad_meshes() {
+        let tri = |extra: serde_json::Value| {
+            let mut m = serde_json::json!({"positions": [0,0,0, 1,0,0, 0,1,0], "indices": [0,1,2]});
+            if let (Some(a), Some(b)) = (m.as_object_mut(), extra.as_object()) {
+                for (k, v) in b {
+                    a.insert(k.clone(), v.clone());
+                }
+            }
+            m
+        };
+        let p = s3d(&serde_json::json!({
+            "version": "2",
+            "nodes": [
+                {"id": "a", "mesh": "x"},
+                {"id": "b", "mesh": {}},
+                {"id": "c", "mesh": {"positions": []}},
+                {"id": "d", "mesh": {"positions": [5000,0,0, 1,0,0, 0,1,0], "indices": [0,1,2]}},
+                {"id": "e", "mesh": tri(serde_json::json!({"normals": [0, 0]}))},
+                {"id": "f", "mesh": tri(serde_json::json!({"normals": [2,0,0, 0,0,0, 0,0,0]}))},
+                {"id": "g", "mesh": tri(serde_json::json!({"uvs": [0, 0]}))},
+                {"id": "h", "mesh": tri(serde_json::json!({"uvs": [100,0, 0,0, 0,0]}))},
+                {"id": "i", "mesh": {"positions": [0,0,0, 1,0,0, 0,1,0]}},
+                {"id": "j", "mesh": {"positions": [0,0,0, 1,0,0, 0,1,0], "indices": [0, 1]}},
+                {"id": "k", "mesh": tri(serde_json::json!({"winding": "zigzag", "material": "ghost"}))}
+            ]
+        }));
+        for needle in [
+            "node 0: mesh must be an object",
+            "node 1: mesh needs positions",
+            "node 2: positions length must be a positive multiple of 3",
+            "node 3: a position component is outside",
+            "node 4: normals length must equal positions length",
+            "node 5: a normal component is outside [-1,1]",
+            "node 6: uvs length must be 2 × vertex count",
+            "node 7: a uv component is outside",
+            "node 8: mesh needs indices",
+            "node 9: indices length must be a positive multiple of 3",
+            "node 10: unknown winding zigzag",
+            "node 10: material ghost not declared",
+        ] {
+            assert!(has(&p, needle), "missing {needle:?} in {p:?}");
+        }
+        // Per-mesh vertex cap: 65 537 vertices.
+        let positions = vec![0.0f64; 65_537 * 3];
+        let p = s3d(&serde_json::json!({
+            "version": "2",
+            "nodes": [{"id": "big", "mesh": {"positions": positions, "indices": [0, 1, 2]}}]
+        }));
+        assert!(has(&p, "vertices (at most 65536)"), "{p:?}");
+    }
+
+    #[test]
+    fn scene3d_refuses_bad_nodes_and_parents() {
+        let p = s3d(&serde_json::json!({
+            "version": "2",
+            "nodes": [
+                1,
+                {"mesh": {}},
+                {"id": "Bad_ID", "primitive": {"kind": "group"}},
+                {"id": "dup", "primitive": {"kind": "group"}},
+                {"id": "dup", "primitive": {"kind": "group"}},
+                {"id": "t", "primitive": {"kind": "group"}, "position": [1], "rotation": [400, 0, 0],
+                 "quaternion": [1, 1, 1, 1], "scale": 0,
+                 "visible": "yes", "castsShadow": 1, "receivesShadow": "no", "material": "ghost"},
+                {"id": "none"},
+                {"id": "both", "mesh": {"positions": [0,0,0, 1,0,0, 0,1,0], "indices": [0,1,2]}, "primitive": {"kind": "group"}},
+                {"id": "inst", "instance": {"asset": "nope", "material": "ghost"}},
+                {"id": "prim1", "primitive": {}},
+                {"id": "prim2", "primitive": {"kind": "blob"}},
+                {"id": "orphan", "primitive": {"kind": "group"}, "parent": "nope"},
+                {"id": "x", "primitive": {"kind": "group"}, "parent": "y"},
+                {"id": "y", "primitive": {"kind": "group"}, "parent": "x"}
+            ]
+        }));
+        for needle in [
+            "node 0 not an object",
+            "node 1 needs an id",
+            "node 2: bad id Bad_ID",
+            "node 4: duplicate id dup",
+            "node 5: position must be [x,y,z]",
+            "node 5: rotation must be [x,y,z]",
+            "node 5: quaternion must be a normalized [x,y,z,w]",
+            "node 5: rotation and quaternion are exclusive",
+            "node 5: scale must be a scalar or [x,y,z]",
+            "node 5: visible must be a boolean",
+            "node 5: castsShadow must be a boolean",
+            "node 5: receivesShadow must be a boolean",
+            "node 5: material ghost not declared",
+            "node 6: exactly one of primitive, mesh, instance",
+            "node 7: exactly one of primitive, mesh, instance",
+            "node 8: unknown asset nope",
+            "node 8: material ghost not declared",
+            "node 9: primitive needs a kind",
+            "node 10: unknown primitive kind blob",
+            "node orphan: parent nope not declared",
+            "parent cycle",
+        ] {
+            assert!(has(&p, needle), "missing {needle:?} in {p:?}");
+        }
+        // Too many nodes, too many meshes, and a graph too deep.
+        let mut nodes: Vec<serde_json::Value> = (0..513)
+            .map(|i| {
+                serde_json::json!({"id": format!("n{i}"),
+                    "mesh": {"positions": [0,0,0, 1,0,0, 0,1,0], "indices": [0,1,2]}})
+            })
+            .collect();
+        for i in 1..35 {
+            nodes.push(
+                serde_json::json!({"id": format!("d{i}"), "primitive": {"kind": "group"},
+                "parent": format!("d{}", i - 1)}),
+            );
+        }
+        nodes.push(serde_json::json!({"id": "d0", "primitive": {"kind": "group"}}));
+        let p = s3d(&serde_json::json!({"version": "2", "nodes": nodes}));
+        assert!(has(&p, "nodes (at most 512)"), "{p:?}");
+        assert!(has(&p, "meshes (at most 256)"), "{p:?}");
+        assert!(has(&p, "graph too deep"), "{p:?}");
+    }
+
     #[test]
     fn the_iso_scene_section_matches_the_frontend_contract() {
         use iso_contract::*;
