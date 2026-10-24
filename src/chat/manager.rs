@@ -1019,6 +1019,9 @@ pub struct ChatManager {
     pub(crate) permission_config: Arc<RwLock<super::config::PermissionConfig>>,
     /// Path to config.yaml for persisting permission changes (None = no persistence)
     pub(crate) config_yaml_path: Option<std::path::PathBuf>,
+    /// The host's home, whose git/gh credentials the native shell mirrors (decision 2238b1e4).
+    /// `None` in tests that must not depend on the machine's own files.
+    pub(crate) host_home: Option<std::path::PathBuf>,
     /// Runtime-mutable environment config (PATH, CLI path, auto-update).
     /// Updated via REST API and persisted to config.yaml.
     pub(crate) env_config: Arc<RwLock<RuntimeEnvConfig>>,
@@ -3626,6 +3629,7 @@ impl ChatManager {
             nats: None,
             permission_config,
             config_yaml_path: None,
+            host_home: dirs::home_dir(),
             env_config,
             enrichment_pipeline,
             trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
@@ -3735,6 +3739,7 @@ impl ChatManager {
             nats: None,
             permission_config,
             config_yaml_path: None,
+            host_home: dirs::home_dir(),
             env_config,
             enrichment_pipeline,
             trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
@@ -16829,7 +16834,7 @@ impl ChatManager {
                             embedded_obscura,
                             deny_paths: nt::host_deny_paths(self.config_yaml_path.as_deref()),
                             // The native shell's git/gh mirror the host's credentials (decision 2238b1e4).
-                            host_home: dirs::home_dir(),
+                            host_home: self.host_home.clone(),
                         },
                         &nt::GraphConsents(self.graph.clone()),
                         self.vault.as_deref(),
@@ -21061,7 +21066,9 @@ mod tests {
         let (_bin, program) = fake_nexus_tools();
         config.nexus_tools_path = Some(program.clone());
         config.permission.disallowed_tools = vec!["Monitor".into()];
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let mut manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        // Hermetic: the host's own credentials (mirrored when present) are not this test's subject.
+        manager.host_home = None;
         let claims = crate::auth::jwt::Claims::service_account("nexus");
         let add_dirs = vec!["/tmp/extra".to_string()];
         let spec_for = |kind: ProviderKind| {
