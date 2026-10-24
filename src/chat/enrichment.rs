@@ -151,6 +151,10 @@ pub struct EnrichmentInput {
     /// Note IDs already included in the system prompt (from ProjectContext guidelines/gotchas).
     /// Used by KnowledgeInjectionStage to avoid duplicating notes that are already present.
     pub excluded_note_ids: HashSet<String>,
+    /// The session's provider is content-restricted (`chat::content_policy`): a note tagged
+    /// `provider-sensitive` must not be injected into the turn, as it is not in the system
+    /// prompt. `false` everywhere a session's provider is not known (reflex, orchestrator).
+    pub restricted_content: bool,
     /// Optional reasoning path tracker for Hebbian reinforcement.
     /// When Some, StatusInjectionStage records traversed reasoning tree paths
     /// so they can be reinforced on session close.
@@ -758,6 +762,7 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
             excluded_note_ids: Default::default(),
+            restricted_content: false,
             reasoning_path_tracker: None,
         }
     }

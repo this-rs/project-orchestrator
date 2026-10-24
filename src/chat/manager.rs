@@ -1734,6 +1734,12 @@ pub(crate) async fn enrichment_for_turn(
     if let Some(pid) = project_id {
         crate::neurons::synaptic_shadow::spawn_turn(graph.clone(), uuid, pid, node.created_at);
     }
+    // A restricted provider (Claude Code) is not sent the project's provider-sensitive
+    // notes by the per-turn injection either: kept out of the system prompt alone, they
+    // would come back in the message of the next turn.
+    let restricted_content =
+        super::content_policy::provider_content_policy(node.provider_id.as_deref().unwrap_or(""))
+            .is_restricted();
     let input = super::enrichment::EnrichmentInput {
         message: message.to_string(),
         session_id: uuid,
@@ -1743,6 +1749,7 @@ pub(crate) async fn enrichment_for_turn(
         protocol_run_id: protocol.run_id,
         protocol_state: protocol.state,
         excluded_note_ids,
+        restricted_content,
         reasoning_path_tracker: protocol.reasoning_path_tracker,
     };
     let ctx = pipeline.execute(&input).await;
@@ -5651,7 +5658,7 @@ impl ChatManager {
         };
 
         // Fetch raw context from Neo4j
-        let ctx = match fetch_project_context(&self.graph, slug).await {
+        let mut ctx = match fetch_project_context(&self.graph, slug).await {
             Ok(ctx) => ctx,
             Err(e) => {
                 warn!(
@@ -5668,6 +5675,39 @@ impl ChatManager {
                 return (FsmPromptComposer::compose(&input), empty_ids);
             }
         };
+
+        // A restricted provider (Claude Code: Anthropic's safeguards) does not get the
+        // project's provider-sensitive notes in its prompt. Injected, they make the
+        // endpoint's safety classifier refuse EVERY turn of the session — even a bare
+        // "salut" — because it reads the system prompt. The content is legitimate; it is
+        // kept for a permissive provider, and left out here so a normal conversation is not
+        // refused for context it never needed (decision 3fccf7c5; the auto-route of a
+        // conversation that does need it is the planned follow-up).
+        if audience.content_policy.is_restricted() {
+            use super::content_policy::tags_are_sensitive;
+            let before = ctx.guidelines.len()
+                + ctx.gotchas.len()
+                + ctx.global_guidelines.len()
+                + ctx.global_gotchas.len();
+            ctx.guidelines.retain(|n| !tags_are_sensitive(&n.tags));
+            ctx.gotchas.retain(|n| !tags_are_sensitive(&n.tags));
+            ctx.global_guidelines
+                .retain(|n| !tags_are_sensitive(&n.tags));
+            ctx.global_gotchas.retain(|n| !tags_are_sensitive(&n.tags));
+            let omitted = before
+                - (ctx.guidelines.len()
+                    + ctx.gotchas.len()
+                    + ctx.global_guidelines.len()
+                    + ctx.global_gotchas.len());
+            if omitted > 0 {
+                info!(
+                    session_id = session_id.unwrap_or(""),
+                    slug,
+                    omitted,
+                    "left provider-sensitive notes out of a restricted provider's prompt"
+                );
+            }
+        }
 
         // Collect note IDs from guidelines/gotchas for deduplication with enrichment
         let included_note_ids: std::collections::HashSet<String> = ctx

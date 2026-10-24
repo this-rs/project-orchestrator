@@ -364,6 +364,7 @@ impl ContextBuilder {
                 protocol_run_id: None,
                 protocol_state: None,
                 excluded_note_ids: Default::default(),
+                restricted_content: false,
                 reasoning_path_tracker: None,
             };
 

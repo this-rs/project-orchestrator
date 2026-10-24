@@ -207,10 +207,14 @@ fn recency_factor(freshest: chrono::DateTime<chrono::Utc>) -> f64 {
 ///   only if `may_read` allows it for `reader` (the conversation's project).
 ///   Entity lookups by file path or symbol name and UUID references are not
 ///   scoped by project, so this is the one place every source goes through.
+/// - with `restricted` (the session's provider refuses sensitive material,
+///   `chat::content_policy`), a note tagged `provider-sensitive` is dropped. The
+///   whole note is loaded here for the consent check, so this costs no query.
 async fn keep_current_notes(
     graph: &dyn crate::neo4j::traits::GraphStore,
     reader: Option<Uuid>,
     notes: Vec<ScoredNote>,
+    restricted: bool,
 ) -> Vec<ScoredNote> {
     let lookups = notes.iter().map(|n| async move {
         match Uuid::parse_str(&n.id) {
@@ -223,6 +227,10 @@ async fn keep_current_notes(
     let mut readable = Vec::with_capacity(current.len());
     for (scored, note) in notes.into_iter().zip(current) {
         let Some(note) = note else { continue };
+        if restricted && crate::chat::content_policy::tags_are_sensitive(&note.tags) {
+            debug!(note_id = %note.id, source = scored.source, "Note withheld from a restricted provider");
+            continue;
+        }
         let verdict = consent.note(&note).await;
         if verdict.is_allow() {
             readable.push((scored, note));
@@ -393,6 +401,7 @@ impl KnowledgeInjectionStage {
     ///
     /// Returns deduplicated notes and decisions, sorted by relevance.
     /// Accepts an explicit config to support scaffolding-adjusted parameters.
+    #[allow(clippy::too_many_arguments)]
     async fn query_knowledge_with_config(
         &self,
         message: &str,
@@ -401,6 +410,7 @@ impl KnowledgeInjectionStage {
         entities: &[ExtractedEntity],
         referenced_uuids: &[Uuid],
         config: &KnowledgeInjectionConfig,
+        restricted: bool,
     ) -> (
         Vec<ScoredNote>,
         Vec<ScoredDecision>,
@@ -695,7 +705,18 @@ impl KnowledgeInjectionStage {
                     .await
                 {
                     Ok(propagated) => {
-                        for pn in propagated.into_iter().take(3) {
+                        // These do not go through `keep_current_notes`: a provider-sensitive
+                        // one is left out here for a restricted provider.
+                        for pn in propagated
+                            .into_iter()
+                            .filter(|pn| {
+                                !(restricted
+                                    && crate::chat::content_policy::tags_are_sensitive(
+                                        &pn.note.tags,
+                                    ))
+                            })
+                            .take(3)
+                        {
                             ws_notes.push(ScoredNote {
                                 id: pn.note.id.to_string(),
                                 note_type: format!("{:?}", pn.note.note_type),
@@ -847,7 +868,8 @@ impl KnowledgeInjectionStage {
         // Collect and sort notes by score descending — after the currency
         // check against Neo4j (see keep_current_notes).
         let notes: Vec<ScoredNote> = note_map.into_values().collect();
-        let mut notes = keep_current_notes(self.graph.as_ref(), _project_id, notes).await;
+        let mut notes =
+            keep_current_notes(self.graph.as_ref(), _project_id, notes, restricted).await;
         notes.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -1173,6 +1195,7 @@ impl ParallelEnrichmentStage for KnowledgeInjectionStage {
                 &entities,
                 &referenced_uuids,
                 &effective_config,
+                input.restricted_content,
             )
             .await;
 
@@ -1348,6 +1371,7 @@ mod tests {
                 scored(fresh.id, "bm25_search"),
                 scored(replaced.id, "uuid_reference"),
             ],
+            false,
         )
         .await;
         let ids: Vec<&str> = kept.iter().map(|n| n.id.as_str()).collect();
@@ -1365,6 +1389,42 @@ mod tests {
         // Equal relevance: the fresher instruction ranks above the old one.
         let score = |id: Uuid| kept.iter().find(|n| n.id == id.to_string()).unwrap().score;
         assert!(score(fresh.id) > score(old.id));
+    }
+
+    #[tokio::test]
+    async fn a_provider_sensitive_note_is_withheld_from_a_restricted_provider_only() {
+        use crate::notes::{Note, NoteType};
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let project = Some(Uuid::new_v4());
+        let plain = Note::new(project, NoteType::Gotcha, "plain".into(), "t".into());
+        let mut sensitive = Note::new(project, NoteType::Gotcha, "tagged".into(), "t".into());
+        sensitive.tags = vec!["provider-sensitive".to_string()];
+        for n in [&plain, &sensitive] {
+            store.create_note(n).await.unwrap();
+        }
+        let candidates = || {
+            vec![
+                scored(plain.id, "bm25_search"),
+                scored(sensitive.id, "bm25_search"),
+            ]
+        };
+
+        // A restricted provider (Claude Code): only the untagged note goes through.
+        let restricted = keep_current_notes(&store, project, candidates(), true).await;
+        let ids: Vec<&str> = restricted.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&plain.id.to_string().as_str()));
+        assert!(
+            !ids.contains(&sensitive.id.to_string().as_str()),
+            "a provider-sensitive note must not reach a restricted provider: {ids:?}"
+        );
+
+        // A permissive provider keeps both: the material is legitimate, only the endpoint refuses it.
+        let permissive = keep_current_notes(&store, project, candidates(), false).await;
+        assert_eq!(
+            permissive.len(),
+            2,
+            "nothing is withheld from a permissive provider"
+        );
     }
 
     #[tokio::test]
@@ -1453,7 +1513,15 @@ mod tests {
         let entities = entity_extractor::extract_entities(&message);
         let uuids = KnowledgeInjectionStage::extract_uuids(&message);
         let (notes, ..) = stage
-            .query_knowledge_with_config(&message, Some("me"), Some(me), &entities, &uuids, &config)
+            .query_knowledge_with_config(
+                &message,
+                Some("me"),
+                Some(me),
+                &entities,
+                &uuids,
+                &config,
+                false,
+            )
             .await;
         let text: Vec<&str> = notes.iter().map(|n| n.content.as_str()).collect();
         for kept in ["LOCAL_DENY", "GLOBAL_NOTSET", "FOREIGN_ALLOW"] {
@@ -1731,6 +1799,7 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
             excluded_note_ids: Default::default(),
+            restricted_content: false,
             reasoning_path_tracker: None,
         };
         let output = stage.execute(&input).await.unwrap();
@@ -1780,6 +1849,7 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
             excluded_note_ids: Default::default(),
+            restricted_content: false,
             reasoning_path_tracker: None,
         };
 
@@ -1805,6 +1875,7 @@ mod tests {
             protocol_run_id: Some(proto_run_id),
             protocol_state: Some("implement".to_string()),
             excluded_note_ids: Default::default(),
+            restricted_content: false,
             reasoning_path_tracker: None,
         };
 
