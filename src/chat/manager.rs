@@ -21181,8 +21181,14 @@ mod tests {
         // Nothing from the host's environment: only the session's own key and the profile
         // it signs (#596), never on argv, and its own private temporary directory (decision
         // fce98b8a: its command outputs live there, one of its directories).
+        // The two host git/gh credential variables (decision 2238b1e4) are the deliberate
+        // exception, and `GH_TOKEN` only exists where the host has a `gh` login: they are
+        // left out of the comparison so it does not depend on the machine.
         assert_eq!(
-            env.keys().map(String::as_str).collect::<Vec<_>>(),
+            env.keys()
+                .map(String::as_str)
+                .filter(|k| !matches!(*k, "NEXUS_TOOLS_GIT_CONFIG_GLOBAL" | "NEXUS_TOOLS_GH_TOKEN"))
+                .collect::<Vec<_>>(),
             [
                 "NEXUS_TOOLS_KEY",
                 "NEXUS_TOOLS_PROFILE",
