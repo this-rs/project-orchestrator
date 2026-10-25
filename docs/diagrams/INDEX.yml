@@ -276,7 +276,7 @@ diagrams:
     covers:
       - "backend:src/plan/**"
       - "backend:src/lifecycle/**"
-      - "backend:src/neo4j/{lifecycle_hook,step,task,plan}.rs"
+      - "backend:src/neo4j/{lifecycle_hook,step,task,plan,day_plan}.rs"
       - "backend:src/events/types.rs"
   - name: po-protocols
     owner: theotime

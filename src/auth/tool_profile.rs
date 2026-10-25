@@ -527,6 +527,7 @@ const ALLOWED_ROUTE_PREFIXES: &[&str] = &[
     "/api/commits",
     "/api/components",
     "/api/constraints",
+    "/api/day-plan",
     "/api/decisions",
     "/api/entities",
     "/api/episodes",

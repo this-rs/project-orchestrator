@@ -25,6 +25,7 @@ const EXPECTED_CONSTRAINTS: &[&str] = &[
     "step_id",
     "decision_id",
     "constraint_id",
+    "day_plan_key",
     "agent_id",
     "note_id",
     "document_id",
