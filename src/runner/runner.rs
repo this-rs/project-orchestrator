@@ -3795,6 +3795,7 @@ impl PlanRunner {
             scaffolding_override: None,
             runner_context: Some(runner_context),
             routing_decision_id,
+            denied_tools: vec![],
         };
         // What the runner asks for (None = provider default). When it named no
         // model, the one the resolver picked (alias, policy, auto) is read back
@@ -10919,6 +10920,7 @@ mod tests {
             scaffolding_override: None,
             runner_context: None,
             routing_decision_id: None,
+            denied_tools: vec![],
         };
         assert_eq!(run_level_provider(&request), Some("deepseek"));
         request.task_alias = Some("fast".into());

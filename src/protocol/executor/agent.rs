@@ -348,6 +348,7 @@ fn agent_session_request(
         scaffolding_override: None,
         runner_context: None,
         routing_decision_id: None,
+        denied_tools: vec![],
     }
 }
 

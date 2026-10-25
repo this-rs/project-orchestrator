@@ -304,6 +304,14 @@ const FUNCTIONS: &[(&str, &str)] = &[
         "un sous-agent (Agent / Task) travaille et sa réponse revient en résultat ; sur le natif, une session enfant qui ne peut pas re-déléguer",
     ),
     (
+        "subagents.background",
+        "un sous-agent lancé en arrière-plan (run_in_background: true) rend la main au parent immédiatement ; sa fin est injectée comme task_notification au tour suivant",
+    ),
+    (
+        "subagents.types",
+        "subagent_type valide parmi les types déclarés ; un type inconnu est refusé avec la liste des types connus",
+    ),
+    (
         "system_init.degraded",
         "system_init n'annonce comme manquant qu'une limite du modèle (liste fermée)",
     ),
@@ -331,6 +339,15 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
     // Native/anthropic_messages: ok with correct fakes (header_values["anthropic-version"] is
     // captured by fake_openai ≥ pin 0587011). Old fakes (08/10) silently dropped that header,
     // causing a false gap; no EXPECTED entry is needed here.
+    // ISO2: subagents.background — the parity scenario is turn-based (fake_openai), so a
+    // background sub-agent whose inject_hint triggers a new turn would need a matching
+    // script entry; tested by dedicated unit tests (unknown_subagent_type_is_refused,
+    // denied_tools_populate_chat_request) and the background path in run_subagent.
+    (Engine::Native, "subagents.background", Expect::NotMeasured { why: "le scénario turn-based ne peut pas exercer inject_hint sans entrée script ; chemin testé par les tests unitaires ISO2" }),
+    (Engine::ClaudeCode, "subagents.background", Expect::NotMeasured { why: "fake_claude rejoue un transcript sans Agent(run_in_background) ; le miroir P18c le mesure séparément" }),
+    (Engine::ClaudeCodeAgent, "subagents.background", Expect::NotMeasured { why: "fake_claude rejoue un transcript sans Agent(run_in_background) ; le miroir P18c le mesure séparément" }),
+    (Engine::ClaudeCode, "subagents.types", Expect::NotMeasured { why: "la validation des types est propre au natif (ISO2) ; sur Claude Code le CLI gère ses propres types d'agents" }),
+    (Engine::ClaudeCodeAgent, "subagents.types", Expect::NotMeasured { why: "la validation des types est propre au natif (ISO2) ; sur Claude Code le CLI gère ses propres types d'agents" }),
     // ── Codex — known harness gaps (A40 hooks, A12 images, no bg-tasks) ──
     (Engine::Codex, "hooks.before_tool", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_HOOKS }),
     (Engine::Codex, "hooks.after_tool", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_HOOKS }),
@@ -370,6 +387,8 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
     (Engine::Codex, "session_record", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
     (Engine::Codex, "session_limits", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
     (Engine::Codex, "subagents", Expect::NotMeasured { why: "collabToolCall (sous-agents Codex) NOT VERIFIED dans la suite nexus ; transcript nécessaire" }),
+    (Engine::Codex, "subagents.background", Expect::NotMeasured { why: "collabToolCall (sous-agents Codex) NOT VERIFIED dans la suite nexus ; transcript nécessaire" }),
+    (Engine::Codex, "subagents.types", Expect::NotMeasured { why: "collabToolCall (sous-agents Codex) NOT VERIFIED dans la suite nexus ; transcript nécessaire" }),
     (Engine::Codex, "system_init.degraded", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
     // ── ACP — known harness gaps ─────────────────────────────────────────
     (Engine::Acp, "hooks.before_tool", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
@@ -413,6 +432,8 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
     (Engine::Acp, "cancel_task", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
     (Engine::Acp, "images", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
     (Engine::Acp, "subagents", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "subagents.background", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "subagents.types", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
     (Engine::Acp, "system_init.degraded", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
     (Engine::Acp, "session_limits", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
     // ── opencode — all not_measured (no fake_opencode) ───────────────────
@@ -2391,7 +2412,7 @@ fn native_script(k: Keys, cwd: &str) -> Value {
             &k.k("TURN-AGENT"),
             "ca1",
             "Agent",
-            json!({"description": "find the spec", "prompt": k.k("SUB-PROMPT")}),
+            json!({"description": "find the spec", "prompt": k.k("SUB-PROMPT"), "subagent_type": "explore"}),
         ),
         says(&k.k("SUB-PROMPT"), &k.k("SUB-ANSWER")),
         says(&k.k("TURN-AGENT"), "answered agent"),
@@ -4546,6 +4567,18 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
              session enfant dans l'arbre={in_tree}, outils de l'enfant sans Agent={child_cannot_delegate} \
              ({} outils)",
             child_tools.len()
+        ),
+    );
+    // ISO2: subagents.types — the Agent(subagent_type: "explore") call above succeeded:
+    // the type was resolved by resolve_subagent_type, the child session was created and
+    // returned a result. If the type were unknown, run_subagent would have returned an
+    // error containing "unknown subagent_type" and `returned` would be false.
+    na.check(
+        "subagents.types",
+        returned && in_tree,
+        Cause::Harness,
+        format!(
+            "Agent(subagent_type: explore) accepté : enfant créé={in_tree}, résultat reçu={returned}"
         ),
     );
     wn.settle(ends, &manager).await;

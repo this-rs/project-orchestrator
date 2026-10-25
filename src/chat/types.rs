@@ -516,6 +516,12 @@ pub struct ChatRequest {
     /// applied. Absent for a request nobody routed. Additive.
     #[serde(default)]
     pub routing_decision_id: Option<uuid::Uuid>,
+    /// Tool names the child is denied (ISO2: sub-agent type restrictions).
+    /// Applied as `spec.policy.deny` entries by `create_session_resolved`.
+    /// Set by `run_subagent` from the agent type registry; empty = no extra
+    /// restriction. Internal only.
+    #[serde(skip)]
+    pub denied_tools: Vec<String>,
 }
 
 /// Kind of background subprocess being tracked.
