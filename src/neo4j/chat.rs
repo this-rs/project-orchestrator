@@ -396,6 +396,40 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Adds `delta_usd` to the children spend of a session (PYSR-3); returns the new total.
+    /// Atomic in the database (one `SET x = coalesce(x, 0) + $delta`).
+    pub async fn add_chat_session_children_cost(&self, id: Uuid, delta_usd: f64) -> Result<f64> {
+        let delta = if delta_usd.is_finite() && delta_usd > 0.0 {
+            delta_usd
+        } else {
+            0.0
+        };
+        let cypher = "MATCH (s:ChatSession {id: $id}) \
+             SET s.children_cost_usd = coalesce(s.children_cost_usd, 0.0) + $delta \
+             RETURN s.children_cost_usd AS total";
+        let q = query(cypher)
+            .param("id", id.to_string())
+            .param("delta", delta);
+        let mut rows = self.graph.execute(q).await?;
+        Ok(match rows.next().await? {
+            Some(row) => row.get::<f64>("total").unwrap_or(0.0),
+            None => 0.0,
+        })
+    }
+
+    /// The children spend of a session (`0.0` when none).
+    pub async fn get_chat_session_children_cost(&self, id: Uuid) -> Result<f64> {
+        let q = query(
+            "MATCH (s:ChatSession {id: $id}) RETURN coalesce(s.children_cost_usd, 0.0) AS total",
+        )
+        .param("id", id.to_string());
+        let mut rows = self.graph.execute(q).await?;
+        Ok(match rows.next().await? {
+            Some(row) => row.get::<f64>("total").unwrap_or(0.0),
+            None => 0.0,
+        })
+    }
+
     /// Records whether a person lifted the file scope of a chat session (decision fce98b8a).
     pub async fn update_chat_session_file_scope_lifted(
         &self,

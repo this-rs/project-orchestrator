@@ -108,6 +108,8 @@ pub struct MockGraphStore {
     /// undirected the way the Cypher reads them
     pub document_links: RwLock<HashMap<Uuid, Vec<(EntityType, String)>>>,
     pub chat_sessions: RwLock<HashMap<Uuid, ChatSessionNode>>,
+    /// Spend of the children of a session (PYSR-3), apart from its own cost.
+    pub chat_children_costs: RwLock<HashMap<Uuid, f64>>,
     /// Resume fingerprints by session (PYSR-2).
     pub chat_fingerprints: RwLock<HashMap<Uuid, String>>,
     /// Chat anchors and their journal (one lock: state and event change together).
@@ -402,6 +404,7 @@ impl MockGraphStore {
             discussed_calls: RwLock::new(Vec::new()),
             document_links: RwLock::new(HashMap::new()),
             chat_sessions: RwLock::new(HashMap::new()),
+            chat_children_costs: RwLock::new(HashMap::new()),
             chat_fingerprints: RwLock::new(HashMap::new()),
             anchor_store: RwLock::new(MockAnchorStore::default()),
             execution_place_events: RwLock::new(Vec::new()),
@@ -8461,6 +8464,28 @@ impl GraphStore for MockGraphStore {
         } else {
             Ok(None)
         }
+    }
+
+    async fn add_chat_session_children_cost(&self, id: Uuid, delta_usd: f64) -> Result<f64> {
+        let delta = if delta_usd.is_finite() && delta_usd > 0.0 {
+            delta_usd
+        } else {
+            0.0
+        };
+        let mut costs = self.chat_children_costs.write().await;
+        let total = costs.entry(id).or_insert(0.0);
+        *total += delta;
+        Ok(*total)
+    }
+
+    async fn get_chat_session_children_cost(&self, id: Uuid) -> Result<f64> {
+        Ok(self
+            .chat_children_costs
+            .read()
+            .await
+            .get(&id)
+            .copied()
+            .unwrap_or(0.0))
     }
 
     async fn update_chat_session_permission_mode(&self, id: Uuid, mode: &str) -> Result<()> {

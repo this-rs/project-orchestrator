@@ -82,7 +82,9 @@
 //! parent's model reads why and does the step itself. A covered request never fails the
 //! call, however long its automatic answer takes (unless that answer fails).
 //! The call otherwise waits as long as the child works, bounded by the parent's turn
-//! timeout. Budget and cost of the children are not counted in the parent's (task B36).
+//! timeout. What a child spent is added to its parent's CHILDREN spend when the call ends
+//! ([`ChatManager::aggregated_cost_usd`] = own + children); the parent's own
+//! `total_cost_usd` is untouched, so its routing decision is not charged twice (PYSR-3).
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -724,6 +726,12 @@ impl ChatManager {
         mut slot: SubagentSlot,
         reuse: Option<Reuse>,
     ) -> Result<String, String> {
+        // A resumed warm session already carries the cost of its earlier turns: only what it
+        // spends from here on is this call's (PYSR-3).
+        let baseline = match reuse.as_ref().and_then(|reuse| reuse.warm.as_ref()) {
+            Some(warm) => self.own_cost_usd(&warm.session_id).await,
+            None => 0.0,
+        };
         let opened = self
             .open_child(&child, reuse.as_ref(), parent_session_id, tool_use_id)
             .await;
@@ -761,6 +769,9 @@ impl ChatManager {
         if let Err(e) = self.close_session(&child_id).await {
             tracing::debug!(child = %child_id, error = %e, "sub-agent close");
         }
+        // What the child spent is the parent's too, however the call ended (PYSR-3).
+        self.charge_children_cost(parent_session_id, &child_id, baseline)
+            .await;
         // Closed: the backstop is not needed any more, and the session becomes the
         // conversation's warm prefix for its next delegation of the same engine and model.
         if let Some(reuse) = reuse {
@@ -836,6 +847,60 @@ impl ChatManager {
             .await
             .map_err(|e| format!("the sub-agent could not start: {e:#}"))?;
         Ok((opened.session_id, None))
+    }
+
+    /// The OWN cost of a session (`0.0` when unknown).
+    async fn own_cost_usd(&self, sid: &str) -> f64 {
+        let Ok(id) = Uuid::parse_str(sid) else {
+            return 0.0;
+        };
+        match self.graph.get_chat_session(id).await {
+            Ok(Some(session)) => session
+                .total_cost_usd
+                .filter(|c| c.is_finite())
+                .unwrap_or(0.0),
+            _ => 0.0,
+        }
+    }
+
+    /// Adds what the child spent since `baseline` to the CHILDREN spend of its parent. The
+    /// parent's own `total_cost_usd` is left alone: the routing decision of the parent is closed
+    /// on its own cost, the child's being carried by the child's own decision (AUTO-SUB) —
+    /// otherwise the two arms would both be charged.
+    async fn charge_children_cost(&self, parent_session_id: &str, child_id: &str, baseline: f64) {
+        let spent = (self.own_cost_usd(child_id).await - baseline).max(0.0);
+        if spent <= 0.0 {
+            return;
+        }
+        let Ok(parent) = Uuid::parse_str(parent_session_id) else {
+            return;
+        };
+        if let Err(e) = self
+            .graph
+            .add_chat_session_children_cost(parent, spent)
+            .await
+        {
+            tracing::warn!(parent = %parent_session_id, child = %child_id, error = %e, "the sub-agent's cost could not be added to its parent");
+        }
+    }
+
+    /// The cost of a session WITH its sub-agents: its own plus what its children spent
+    /// (PYSR-3). `total_cost_usd` stays the own cost.
+    pub async fn aggregated_cost_usd(&self, session_id: &str) -> Option<f64> {
+        let id = Uuid::parse_str(session_id).ok()?;
+        let own = self
+            .graph
+            .get_chat_session(id)
+            .await
+            .ok()??
+            .total_cost_usd
+            .unwrap_or(0.0);
+        let children = self
+            .graph
+            .get_chat_session_children_cost(id)
+            .await
+            .unwrap_or(0.0);
+        Some(own + children)
     }
 
     /// The last event sequence the thread of `sid` holds (0 when it has none): the floor a
@@ -1297,6 +1362,57 @@ mod tests {
             Default::default(),
         ));
         (graph, manager)
+    }
+
+    /// PYSR-3 — what a sub-agent spent shows in its parent's AGGREGATE (own + children), and
+    /// the parent's OWN cost is left alone: its routing decision is closed on the own cost, the
+    /// child's being carried by the child's own decision (AUTO-SUB), so no arm is charged twice.
+    /// Red before the fix: the child's cost was nowhere on the parent.
+    #[tokio::test]
+    async fn a_sub_agents_cost_is_in_the_parents_aggregate_not_in_its_own_cost() {
+        let (graph, manager) = bare_manager();
+        let mut parent = crate::test_helpers::test_chat_session(None);
+        parent.total_cost_usd = Some(1.0);
+        let mut child = crate::test_helpers::test_chat_session(None);
+        child.total_cost_usd = Some(2.0);
+        graph.create_chat_session(&parent).await.unwrap();
+        graph.create_chat_session(&child).await.unwrap();
+        let (parent_id, child_id) = (parent.id.to_string(), child.id.to_string());
+
+        manager
+            .charge_children_cost(&parent_id, &child_id, 0.0)
+            .await;
+
+        assert_eq!(manager.aggregated_cost_usd(&parent_id).await, Some(3.0));
+        let own = graph.get_chat_session(parent.id).await.unwrap().unwrap();
+        assert_eq!(
+            own.total_cost_usd,
+            Some(1.0),
+            "the own cost is what the routing decision is closed on"
+        );
+    }
+
+    /// PYSR-3 — a resumed warm child carries the cost of its earlier turns: only what it spent
+    /// since the baseline is this call's; two calls add up.
+    #[tokio::test]
+    async fn a_resumed_children_earlier_turns_are_not_charged_again() {
+        let (graph, manager) = bare_manager();
+        let parent = crate::test_helpers::test_chat_session(None);
+        let mut child = crate::test_helpers::test_chat_session(None);
+        child.total_cost_usd = Some(5.0);
+        graph.create_chat_session(&parent).await.unwrap();
+        graph.create_chat_session(&child).await.unwrap();
+        let (parent_id, child_id) = (parent.id.to_string(), child.id.to_string());
+        // The warm child had spent 4.0 before this call; it is at 5.0 after it.
+        manager
+            .charge_children_cost(&parent_id, &child_id, 4.0)
+            .await;
+        assert_eq!(manager.aggregated_cost_usd(&parent_id).await, Some(1.0));
+        // A free call adds nothing.
+        manager
+            .charge_children_cost(&parent_id, &child_id, 5.0)
+            .await;
+        assert_eq!(manager.aggregated_cost_usd(&parent_id).await, Some(1.0));
     }
 
     fn said(t: &str) -> ChatEvent {

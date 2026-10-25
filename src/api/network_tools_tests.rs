@@ -605,6 +605,7 @@ async fn native_session_args_with(
             session_id: sid,
             third_party: true,
             max_tokens: None,
+            max_cost_usd: None,
             kind: nexus_claude::agent::ProviderKind::Native,
             remote_cwd: None,
             per_session_mcp: true,

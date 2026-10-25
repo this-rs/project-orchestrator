@@ -92,16 +92,54 @@ pub enum CwdValidation {
     Strict,
 }
 
+/// Wall-clock cap of one task, in seconds (3 h). The ONE source of this default: the
+/// PlanRunner reads it through [`RunnerConfig::default`], and `plan(delegate_task)` through
+/// [`DelegationLimits::default`] (PYSR-3) — never a second constant.
+pub const DEFAULT_TASK_TIMEOUT_SECS: u64 = 10800;
+
+/// Spend cap in USD (marginal cost) — the ONE source, as [`DEFAULT_TASK_TIMEOUT_SECS`].
+pub const DEFAULT_MAX_COST_USD: f64 = 50.0;
+
+/// The delay and the budget of ONE delegation (`plan(delegate_task)`) or sub-agent: its own,
+/// not its parent's turn. Defaults are the PlanRunner's (same constants); `max_tokens` is
+/// `None` like the runner's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DelegationLimits {
+    /// Wall-clock cap, seconds. `0` = unlimited.
+    pub timeout_secs: u64,
+    /// Marginal spend cap, USD. `0` or negative = unlimited.
+    pub max_cost_usd: f64,
+    /// Token cap. `None` = unlimited.
+    pub max_tokens: Option<u64>,
+}
+
+impl DelegationLimits {
+    /// The limits a runner configuration gives one of its tasks.
+    pub fn of_runner(config: &RunnerConfig) -> Self {
+        Self {
+            timeout_secs: config.task_timeout_secs,
+            max_cost_usd: config.max_cost_usd,
+            max_tokens: config.max_tokens,
+        }
+    }
+}
+
+impl Default for DelegationLimits {
+    fn default() -> Self {
+        Self::of_runner(&RunnerConfig::default())
+    }
+}
+
 impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
-            task_timeout_secs: 10800,
+            task_timeout_secs: DEFAULT_TASK_TIMEOUT_SECS,
             idle_timeout_secs: 180,
             max_retries: 1,
             auto_pr: false,
             build_check: true,
             test_runner: false,
-            max_cost_usd: 50.0,
+            max_cost_usd: DEFAULT_MAX_COST_USD,
             max_tokens: None,
             per_task_cap: PerTaskCap::default(),
             spawning_timeout_secs: 480,

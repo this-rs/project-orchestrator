@@ -1336,6 +1336,11 @@ pub(crate) async fn launch_delegation(
         parent_session_id,
         custom_sections,
     } = prepared;
+    // The delegation's OWN delay and budget (PYSR-3), from the PlanRunner's constants: the engine
+    // enforces the spend and token caps (`BudgetExceeded`), the listener the delay (`Interrupted`).
+    let limits = crate::runner::DelegationLimits::default();
+    chat_request.max_cost_usd = (limits.max_cost_usd > 0.0).then_some(limits.max_cost_usd);
+    chat_request.max_tokens = chat_request.max_tokens.or(limits.max_tokens);
     let graph = state.orchestrator.neo4j_arc();
     // The model alias set on THIS task (A16 level "task"): a delegation used to
     // leave it out, so the alias never applied to a delegated task.
@@ -1562,6 +1567,11 @@ pub(crate) async fn launch_delegation(
                 close,
                 execution,
                 owner,
+                limits,
+                Some(Arc::new(HaltSession {
+                    manager: cm.clone(),
+                    session_id: sid.clone(),
+                })),
             )
             .await;
         };
@@ -1751,6 +1761,7 @@ fn delegation_chat_request(
         run_provider: None,
         run_model: None,
         max_tokens: None,
+        max_cost_usd: None,
         task_class: None,
         permission_mode: Some("bypassPermissions".to_string()),
         add_dirs: None,
@@ -1786,32 +1797,65 @@ async fn listen_delegation_result(
     close: Option<DelegationClose>,
     execution: DelegationExecution,
     owner: DelegationOwner,
-) {
+    limits: crate::runner::DelegationLimits,
+    halt: Option<Arc<dyn DelegationHalt>>,
+) -> Option<nexus_claude::agent::StopReason> {
     use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
+    use nexus_claude::agent::StopReason;
 
-    // Tokio's clock, so a paused test clock reaches the 1h safety net.
+    // Tokio's clock, so a paused test clock reaches the delay. The delay is the delegation's
+    // OWN (PYSR-3: it used to be a hidden 1h constant that only stopped LISTENING — the child
+    // went on running, unbounded); `0` = unlimited.
     let start = tokio::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(3600); // 1h safety net
+    let timeout = if limits.timeout_secs == 0 {
+        std::time::Duration::from_secs(u64::MAX / 4)
+    } else {
+        std::time::Duration::from_secs(limits.timeout_secs)
+    };
 
     // Every `break` but the `Result` one leaves `execution` to drop: closed
-    // `failed` (timeout, channel closed without a result).
+    // `failed` (channel closed without a result).
     loop {
         let remaining = timeout.saturating_sub(start.elapsed());
         if remaining.is_zero() {
-            tracing::warn!(task_id = %task_id, "Delegation listener timed out after 1h");
-            break;
+            tracing::warn!(task_id = %task_id, timeout_secs = limits.timeout_secs, "Delegation past its delay: the child is stopped");
+            // Stop the CHILD, not only the listening: an interrupted turn, then a closed session.
+            if let Some(halt) = &halt {
+                halt.halt().await;
+            }
+            let mut end = DelegationEnd::failed();
+            end.duration_secs = Some(start.elapsed().as_secs_f64());
+            end.stop = Some(StopReason::Interrupted);
+            execution.close(&end).await;
+            return Some(StopReason::Interrupted);
         }
 
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await {
             Ok(Ok(crate::chat::types::ChatEvent::Result {
                 cost_usd,
-                is_error,
+                mut is_error,
                 cost: cost_detail,
                 usage,
                 model,
                 num_turns,
+                subtype,
+                stop_reason,
                 ..
             })) => {
+                // The engine enforces the limits we gave it (`ChatRequest::max_cost_usd` /
+                // `max_tokens`) and says so; a cost over the cap with no such word is a
+                // budget stop all the same (an engine that cannot enforce live).
+                let tokens = usage.as_ref().map(|u| {
+                    ["input_tokens", "output_tokens"]
+                        .iter()
+                        .map(|k| u.get(*k).and_then(|v| v.as_u64()).unwrap_or(0))
+                        .sum::<u64>()
+                });
+                let stop =
+                    budget_stop_of(&limits, stop_reason.as_deref(), &subtype, cost_usd, tokens);
+                if stop.is_some() {
+                    is_error = true;
+                }
                 let duration_secs = start.elapsed().as_secs_f64();
                 // Close the loop: the arm that was chosen learns how it went.
                 if let Some(close) = &close {
@@ -1835,6 +1879,7 @@ async fn listen_delegation_result(
                     num_turns,
                     duration_secs,
                 );
+                let end = DelegationEnd { stop, ..end };
 
                 // The delegation's spend is its run's spend (B36), and only
                 // when an executor of that run delegated: only a real spend
@@ -1861,6 +1906,7 @@ async fn listen_delegation_result(
                     "cost_usd": cost,
                     "duration_secs": duration_secs,
                     "is_error": is_error,
+                    "stop_reason": stop,
                 });
 
                 event_bus.emit(CrudEvent {
@@ -1908,7 +1954,7 @@ async fn listen_delegation_result(
                     }
                 }
 
-                break;
+                return stop;
             }
             Ok(Ok(_)) => {
                 // Other event types — keep listening
@@ -1925,6 +1971,53 @@ async fn listen_delegation_result(
             }
         }
     }
+    None
+}
+
+/// Stops the child of a delegation that went past its own limits: the running turn is
+/// interrupted and the session closed. A seam, so the listener is driven without a manager.
+#[async_trait::async_trait]
+pub(crate) trait DelegationHalt: Send + Sync {
+    async fn halt(&self);
+}
+
+/// [`DelegationHalt`] on a chat session.
+struct HaltSession {
+    manager: Arc<ChatManager>,
+    session_id: String,
+}
+
+#[async_trait::async_trait]
+impl DelegationHalt for HaltSession {
+    async fn halt(&self) {
+        if let Err(e) = self.manager.interrupt(&self.session_id).await {
+            tracing::debug!(session_id = %self.session_id, "interrupting the delegation past its limit: {e}");
+        }
+        if let Err(e) = self.manager.close_session(&self.session_id).await {
+            tracing::debug!(session_id = %self.session_id, "closing the delegation past its limit: {e}");
+        }
+    }
+}
+
+/// `BudgetExceeded` when a delegation's `Result` shows its OWN budget was spent: the engine said
+/// so (`stop_reason` / an `error_max_budget*` subtype / `max_tokens`), or the reported spend /
+/// tokens are past the cap (an engine that cannot enforce a limit live). `None` otherwise.
+fn budget_stop_of(
+    limits: &crate::runner::DelegationLimits,
+    stop_reason: Option<&str>,
+    subtype: &str,
+    cost_usd: Option<f64>,
+    tokens: Option<u64>,
+) -> Option<nexus_claude::agent::StopReason> {
+    let said = stop_reason == Some("budget_exceeded")
+        || subtype.starts_with("error_max_budget")
+        || (limits.max_tokens.is_some() && stop_reason == Some("max_tokens"));
+    let over_cost = limits.max_cost_usd > 0.0 && cost_usd.is_some_and(|c| c > limits.max_cost_usd);
+    let over_tokens = limits
+        .max_tokens
+        .zip(tokens)
+        .is_some_and(|(cap, used)| used > cap);
+    (said || over_cost || over_tokens).then_some(nexus_claude::agent::StopReason::BudgetExceeded)
 }
 
 /// The run a delegation is spent on: the run whose executor runs
@@ -1965,6 +2058,9 @@ struct DelegationEnd {
     num_turns: Option<u32>,
     /// `None`: measured from the execution's start when it is closed.
     duration_secs: Option<f64>,
+    /// Why a delegation was STOPPED by its own limits (PYSR-3), explicit: `BudgetExceeded`
+    /// (the spend cap or the token cap) or `Interrupted` (the delay). `None`: it ended on its own.
+    stop: Option<nexus_claude::agent::StopReason>,
 }
 
 impl DelegationEnd {
@@ -2003,6 +2099,7 @@ impl DelegationEnd {
             model,
             num_turns: num_turns.and_then(|n| u32::try_from(n).ok()),
             duration_secs: Some(duration_secs),
+            stop: None,
         }
     }
 
@@ -2041,7 +2138,9 @@ impl DelegationEnd {
         use crate::neo4j::agent_execution::AgentExecutionStatus;
         let now = chrono::Utc::now();
         let mut closed = open.clone();
-        closed.status = if self.is_error {
+        closed.status = if self.stop == Some(nexus_claude::agent::StopReason::Interrupted) {
+            AgentExecutionStatus::Timeout
+        } else if self.is_error {
             AgentExecutionStatus::Failed
         } else {
             AgentExecutionStatus::Completed
@@ -6319,8 +6418,9 @@ pub struct RunPlanRequest {
     /// Defaults to "manual" if not specified.
     #[serde(default)]
     pub triggered_by: Option<String>,
-    /// Optional budget limit in USD. Overrides the default ($10).
-    /// When omitted, falls back to RunnerConfig::default().max_cost_usd.
+    /// Optional budget limit in USD. When omitted, falls back to
+    /// `RunnerConfig::default().max_cost_usd` (`DEFAULT_MAX_COST_USD` = $50) — the ONE
+    /// source of this default, shared with a delegation's `DelegationLimits` (PYSR-3).
     pub max_cost_usd: Option<f64>,
     /// Provider instance of every session of the run (A16 level "run"). Absent:
     /// the rules decide.
@@ -8060,6 +8160,8 @@ pub(crate) mod tests {
             None,
             execution,
             owner,
+            crate::runner::DelegationLimits::default(),
+            None,
         )
         .await;
     }
@@ -8224,10 +8326,11 @@ pub(crate) mod tests {
         assert!(stored.completed_at.is_some());
     }
 
-    /// B36 (review 4) — the 1h safety net expires: the execution is closed
-    /// `failed`.
+    /// B36 (review 4) — the delegation's delay (the runner's default, PYSR-3) expires
+    /// with no halt wired: the execution is closed `timeout` (it was `failed` under the old
+    /// hidden 1 h net).
     #[tokio::test(start_paused = true)]
-    async fn a_delegation_past_the_safety_net_is_closed_failed() {
+    async fn a_delegation_past_its_default_delay_is_closed_timeout() {
         use crate::neo4j::agent_execution::AgentExecutionStatus;
         let (mock, id, execution) = delegation_execution().await;
         let (tx, rx) = tokio::sync::broadcast::channel(16);
@@ -8244,12 +8347,155 @@ pub(crate) mod tests {
             None,
             execution,
             super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            None,
         )
         .await;
         drop(tx);
 
         let stored = closed_execution(&mock, id).await;
+        assert_eq!(stored.status, AgentExecutionStatus::Timeout);
+    }
+
+    /// A `DelegationHalt` that only records it was asked to stop the child.
+    struct HaltRecorder(Arc<std::sync::atomic::AtomicBool>);
+
+    #[async_trait::async_trait]
+    impl super::DelegationHalt for HaltRecorder {
+        async fn halt(&self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// PYSR-3 — a delegation past ITS OWN delay is stopped: the child is halted (not only
+    /// listened to no more), the stop is `Interrupted` and the execution is closed `timeout`.
+    /// Red before the fix: the listener had a hidden 1 h constant that only stopped LISTENING;
+    /// the child went on running and nothing named why.
+    #[tokio::test(start_paused = true)]
+    async fn a_delegation_past_its_own_delay_is_halted_and_interrupted() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        let (mock, id, execution) = delegation_execution().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let event_bus = Arc::new(crate::events::HybridEmitter::new(Arc::new(
+            crate::events::EventBus::default(),
+        )));
+        let limits = crate::runner::DelegationLimits {
+            timeout_secs: 90,
+            ..Default::default()
+        };
+
+        let stop = super::listen_delegation_result(
+            rx,
+            Uuid::new_v4(),
+            "delegated",
+            event_bus,
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            limits,
+            Some(Arc::new(HaltRecorder(halted.clone()))),
+        )
+        .await;
+        drop(tx);
+
+        assert_eq!(stop, Some(nexus_claude::agent::StopReason::Interrupted));
+        assert!(
+            halted.load(std::sync::atomic::Ordering::SeqCst),
+            "the child must be stopped"
+        );
+        let stored = closed_execution(&mock, id).await;
+        assert_eq!(stored.status, AgentExecutionStatus::Timeout);
+    }
+
+    /// PYSR-3 — a delegation whose result is over its own spend cap ends `BudgetExceeded`,
+    /// closed `failed`, even when the engine did not flag it (`is_error: false`).
+    #[tokio::test]
+    async fn a_delegation_over_its_own_budget_ends_budget_exceeded() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        let (mock, id, execution) = delegation_execution().await;
+        let over = crate::runner::DelegationLimits::default().max_cost_usd + 1.0;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        tx.send(reported(over)).unwrap();
+        let event_bus = Arc::new(crate::events::HybridEmitter::new(Arc::new(
+            crate::events::EventBus::default(),
+        )));
+
+        let stop = super::listen_delegation_result(
+            rx,
+            Uuid::new_v4(),
+            "delegated",
+            event_bus,
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            None,
+        )
+        .await;
+
+        assert_eq!(stop, Some(nexus_claude::agent::StopReason::BudgetExceeded));
+        let stored = closed_execution(&mock, id).await;
         assert_eq!(stored.status, AgentExecutionStatus::Failed);
+    }
+
+    /// PYSR-3 — the engine's own word counts: a `Result` the engine stopped on its budget
+    /// (`error_max_budget*`, `stop_reason: budget_exceeded`) is a budget stop although it is
+    /// under the cap by the reported spend.
+    #[test]
+    fn the_engines_budget_stop_is_a_budget_stop() {
+        use nexus_claude::agent::StopReason::BudgetExceeded;
+        let limits = crate::runner::DelegationLimits::default();
+        assert_eq!(
+            super::budget_stop_of(&limits, Some("budget_exceeded"), "success", Some(0.1), None),
+            Some(BudgetExceeded)
+        );
+        assert_eq!(
+            super::budget_stop_of(&limits, None, "error_max_budget_usd", None, None),
+            Some(BudgetExceeded)
+        );
+        assert_eq!(
+            super::budget_stop_of(&limits, Some("completed"), "success", Some(0.1), Some(10)),
+            None,
+            "a delegation inside its limits is left alone"
+        );
+        let tokens = crate::runner::DelegationLimits {
+            max_tokens: Some(100),
+            ..limits
+        };
+        assert_eq!(
+            super::budget_stop_of(&tokens, None, "success", None, Some(101)),
+            Some(BudgetExceeded)
+        );
+        let unlimited = crate::runner::DelegationLimits {
+            max_cost_usd: 0.0,
+            ..limits
+        };
+        assert_eq!(
+            super::budget_stop_of(&unlimited, None, "success", Some(1e9), None),
+            None,
+            "0 = unlimited"
+        );
+    }
+
+    /// PYSR-3 — ONE source of defaults: a delegation gets the PlanRunner's delay and budget.
+    #[test]
+    fn a_delegations_defaults_are_the_plan_runners() {
+        let runner = crate::runner::RunnerConfig::default();
+        let limits = crate::runner::DelegationLimits::default();
+        assert_eq!(limits.timeout_secs, runner.task_timeout_secs);
+        assert_eq!(limits.max_cost_usd, runner.max_cost_usd);
+        assert_eq!(limits.max_tokens, runner.max_tokens);
+        assert_eq!(
+            limits.timeout_secs,
+            crate::runner::models::DEFAULT_TASK_TIMEOUT_SECS
+        );
+        assert_eq!(
+            limits.max_cost_usd,
+            crate::runner::models::DEFAULT_MAX_COST_USD
+        );
     }
 
     /// B36 (review 4) — a delegation that never gets to listen (its prompt

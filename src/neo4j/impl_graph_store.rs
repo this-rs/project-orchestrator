@@ -2582,6 +2582,18 @@ impl GraphStore for Neo4jClient {
         self.update_chat_session_permission_mode(id, mode).await
     }
 
+    async fn add_chat_session_children_cost(
+        &self,
+        id: Uuid,
+        delta_usd: f64,
+    ) -> anyhow::Result<f64> {
+        Neo4jClient::add_chat_session_children_cost(self, id, delta_usd).await
+    }
+
+    async fn get_chat_session_children_cost(&self, id: Uuid) -> anyhow::Result<f64> {
+        Neo4jClient::get_chat_session_children_cost(self, id).await
+    }
+
     async fn update_chat_session_file_scope_lifted(
         &self,
         id: Uuid,
