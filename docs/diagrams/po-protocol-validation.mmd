@@ -1,0 +1,51 @@
+%% name: po-protocol-validation
+%% covers: backend:src/protocol/validate.rs
+%% verified: 2f2176e6
+%% ---
+%% PROUVE : validation structurelle des protocoles FSM — fonctions pures utilisées
+%%   par compose_protocol (création) et validate_all_protocols (vérification a posteriori).
+%% ---
+%% SOURCES LUES (backend@2f2176e6) :
+%%   src/protocol/validate.rs   — ProtocolViolation, ValidatableState, ValidatableTransition,
+%%                                validate_protocol_structure (BFS reachability, duplicate
+%%                                transitions, terminal state check)
+%% ---
+%% TESTS VÉRIFIÉS :
+%%   8 unitaires (tests mod) : valid_linear_protocol, valid_protocol_with_cycle,
+%%     duplicate_transition_detected, no_terminal_state_detected, unreachable_state_detected,
+%%     multiple_violations_detected, empty_protocol_no_violations, single_terminal_state_valid
+%%   2 intégration (protocol_handlers_tests) : compose_rejects_duplicate_transitions,
+%%     compose_rejects_no_terminal_state
+%%   1 #[ignore] réel (real_graph mod) : all_stored_protocols_pass — 60/60 protocoles valides
+%% ---
+
+flowchart TB
+    subgraph Validation["validate_protocol_structure()"]
+        direction TB
+        VS["Pure function<br/>(states, transitions) → Vec&lt;Violation&gt;"]
+
+        subgraph Rules["3 Structural Rules"]
+            DT["DuplicateTransition<br/>same (from, trigger) = non-deterministic"]
+            TS["NoTerminalState<br/>at least one terminal required"]
+            UR["UnreachableState<br/>BFS from start, handles cycles"]
+        end
+
+        VS --> DT
+        VS --> TS
+        VS --> UR
+    end
+
+    subgraph Callers["Callers"]
+        CP["compose_protocol<br/>POST /api/protocols/compose<br/>MCP protocol(compose)"]
+        VA["validate_all_protocols<br/>GET /api/protocols/validate<br/>MCP protocol(validate_all)"]
+    end
+
+    subgraph Tests["✅ Verified"]
+        T1["8 unit tests"]
+        T2["2 integration tests"]
+        T3["#[ignore] real_graph<br/>60/60 protocols valid"]
+    end
+
+    CP --> VS
+    VA --> VS
+    VS -.-> Tests
