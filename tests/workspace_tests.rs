@@ -828,6 +828,8 @@ async fn test_workspace_milestone_task_association() {
         interrupted_reason: None,
         tags: vec![],
         estimated_complexity: None,
+        due_date: None,
+        estimated_minutes: None,
         actual_complexity: None,
         acceptance_criteria: vec![],
         affected_files: vec![],

@@ -256,6 +256,8 @@ fn task(tags: &[&str], files: usize) -> TaskNode {
         acceptance_criteria: vec![],
         affected_files: (0..files).map(|i| format!("src/f{i}.rs")).collect(),
         estimated_complexity: None,
+        due_date: None,
+        estimated_minutes: None,
         actual_complexity: None,
         created_at: DateTime::<Utc>::UNIX_EPOCH,
         updated_at: None,

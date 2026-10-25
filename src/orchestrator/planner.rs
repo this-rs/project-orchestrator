@@ -1563,6 +1563,8 @@ impl ImplementationPlanner {
                 depends_on: prev_task_id.map(|id| vec![id]),
                 steps: None,
                 estimated_complexity: None,
+                due_date: None,
+                estimated_minutes: None,
             };
 
             let task_node = self.plan_manager.add_task(plan_id, task_req).await?;

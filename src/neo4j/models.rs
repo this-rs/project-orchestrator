@@ -1,7 +1,7 @@
 //! Neo4j graph models representing code structure and plans
 
 use crate::chat::provider::policy::SessionAccess;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
@@ -860,6 +860,11 @@ pub struct TaskNode {
     pub affected_files: Vec<String>,
     pub estimated_complexity: Option<u32>,
     pub actual_complexity: Option<u32>,
+    /// Due date (a YYYY-MM-DD calendar day), stored as a plain string in Neo4j.
+    /// Drives the /today "at risk" (overdue) view and the future agenda.
+    pub due_date: Option<NaiveDate>,
+    /// Estimated duration in minutes.
+    pub estimated_minutes: Option<u32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
