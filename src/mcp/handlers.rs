@@ -13051,31 +13051,27 @@ mod schema_drift_tests {
         assert!(errors.is_empty(), "action drift:\n{}", errors.join("\n"));
     }
 
-    /// (c) The "Actions: a, b, c" list in each tool description matches its enum.
+    /// (c) The `action` enum is the ONLY copy of the action list in a tool definition.
+    ///
+    /// Every description used to re-list its own actions (`Manage plans. Actions: list,
+    /// create, …`), a second copy of the `enum` three lines below — 5 874 characters
+    /// (≈1 470 tokens) re-sent to the model at every turn, and the copy that goes stale
+    /// when an action is added. This test is what keeps it gone: a drift between the
+    /// description and the enum is impossible once the description no longer lists them.
     #[test]
-    fn test_description_action_lists_match_enums() {
-        let mut errors = Vec::new();
+    fn test_description_does_not_re_list_the_action_enum() {
+        let mut offenders = Vec::new();
         for (tool, (enum_actions, _, description)) in published_tools() {
-            let Some(list) = description.split("Actions: ").nth(1) else {
-                continue;
-            };
-            let list = list.split(". ").next().unwrap_or(list);
-            let described: BTreeSet<String> = list
-                .split(',')
-                .map(|s| s.trim().trim_end_matches('.').to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            for a in described.difference(&enum_actions) {
-                errors.push(format!("{tool}.{a}: in description but not in enum"));
-            }
-            for a in enum_actions.difference(&described) {
-                errors.push(format!("{tool}.{a}: in enum but not in description"));
+            let listed: Vec<&str> = enum_actions.iter().map(String::as_str).collect();
+            if listed.len() >= 2 && description.contains(&listed.join(", ")) {
+                offenders.push(tool);
             }
         }
         assert!(
-            errors.is_empty(),
-            "description drift:\n{}",
-            errors.join("\n")
+            offenders.is_empty(),
+            "these tool descriptions re-list their own `action` enum: {offenders:?}. The enum \
+             is the single source of the action list, and `TOOL_REFERENCE` documents each \
+             action with its parameters; delete the echo instead of keeping a copy that drifts."
         );
     }
 

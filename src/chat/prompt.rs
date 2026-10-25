@@ -668,7 +668,7 @@ pub const TOOL_REFERENCE: &str = r#"# MCP Mega-Tools Reference
 All tools require `action` (string). UUIDs are strings. Dates are ISO 8601.
 
 ## project
-Manage projects. Actions: list, create, get, update, delete, sync, get_roadmap, list_plans, get_graph, get_intelligence_summary, get_embeddings_projection, get_scaffolding_level, set_scaffolding_override, get_health_dashboard, get_auto_roadmap
+Manage projects.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -689,7 +689,7 @@ Manage projects. Actions: list, create, get, update, delete, sync, get_roadmap, 
 | get_auto_roadmap | `slug` (req) | Get auto-generated roadmap from knowledge graph signals |
 
 ## plan
-Manage plans. Actions: list, create, get, update, update_status, delete, link_to_project, unlink_from_project, get_dependency_graph, get_critical_path, get_waves, run, run_status, cancel_run, auto_pr, add_trigger, list_triggers, remove_trigger, enable_trigger, disable_trigger, list_runs, get_run, compare_runs, predict_run, enrich, delegate_task
+Manage plans.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -719,9 +719,10 @@ Manage plans. Actions: list, create, get, update, update_status, delete, link_to
 | predict_run | `plan_id` (req) | Predict next run outcome based on history |
 | enrich | `plan_id` (req) | Enrich plan with auto-generated context (affected files, dependencies) |
 | delegate_task | `plan_id` (req), `task_id` (req) | Delegate a task to a sub-agent for autonomous execution |
+| get_sessions | `plan_id` (req) | Sessions linked to this plan |
 
 ## task
-Manage tasks. Actions: list, create, get, update, delete, get_next, add_dependencies, remove_dependency, get_blockers, get_blocked_by, get_context, get_prompt, build_prompt, enrich
+Manage tasks.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -739,9 +740,10 @@ Manage tasks. Actions: list, create, get, update, delete, get_next, add_dependen
 | get_prompt | `plan_id` (req), `task_id` (req) | Generate implementation prompt |
 | build_prompt | `plan_id` (req), `task_id` (req), `custom_sections` (array of strings) | Build implementation prompt with custom sections appended |
 | enrich | `task_id` (req) | Enrich task with auto-generated context (affected files, code references) |
+| get_sessions | `task_id` (req) | Sessions linked to this task |
 
 ## day_plan
-Manage the user's day plan. Actions: read, add, remove, reorder, move_to_tomorrow
+Manage the user's day plan.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -753,7 +755,7 @@ Manage the user's day plan. Actions: read, add, remove, reorder, move_to_tomorro
 
 
 ## step
-Manage steps within tasks. Actions: list, create, update, get, delete, get_progress
+Manage steps within tasks.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -765,7 +767,7 @@ Manage steps within tasks. Actions: list, create, update, get, delete, get_progr
 | get_progress | `task_id` (req) | Get step completion progress |
 
 ## decision
-Manage architectural decisions. Actions: add, get, update, delete, search, search_semantic, add_affects, remove_affects, list_affects, get_affecting, supersede, get_timeline
+Manage architectural decisions.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -783,7 +785,7 @@ Manage architectural decisions. Actions: add, get, update, delete, search, searc
 | get_timeline | `task_id` (req), `from`, `to` | Get decision timeline |
 
 ## constraint
-Manage plan constraints. Actions: list, add, get, update, delete
+Manage plan constraints.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -794,7 +796,7 @@ Manage plan constraints. Actions: list, add, get, update, delete
 | delete | `constraint_id` (req) | Delete a constraint |
 
 ## release
-Manage releases. Actions: list, create, get, update, delete, add_task, add_commit, remove_commit
+Manage releases.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -808,7 +810,7 @@ Manage releases. Actions: list, create, get, update, delete, add_task, add_commi
 | remove_commit | `release_id` (req), `commit_sha` (req) | Remove commit from release |
 
 ## environment
-Manage project environments (dev/staging/production) and what was deployed where. Actions: list, create, get, update, delete, deploy, update_deployment, list_deployments, get_matrix
+Manage project environments (dev/staging/production) and what was deployed where.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -823,7 +825,7 @@ Manage project environments (dev/staging/production) and what was deployed where
 | get_matrix | `project_id` (req) | Environments x latest deployment + last 5 statuses |
 
 ## provider
-Manage the provider instances: the harness/engine a chat session runs on. Actions: list, get, create, update, delete, test, status, models, scan_host_key
+Manage the provider instances: the harness/engine a chat session runs on.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -840,7 +842,7 @@ Manage the provider instances: the harness/engine a chat session runs on. Action
 `allow_trust` (a machine that runs without asking) and a pinned `host_key` need a person's agreement: on a session that does not run in trust they answer `provider_trust_needs_a_human` / `provider_host_key_needs_a_human` — ask the user, in Settings → Providers.
 
 ## vault
-Use the user's secrets vault without ever seeing a value. Actions: list_available, request_secret
+Use the user's secrets vault without ever seeing a value.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -848,7 +850,7 @@ Use the user's secrets vault without ever seeing a value. Actions: list_availabl
 | request_secret | `name` (req), `reason` | Ask the user through a secure input card in the chat: END YOUR TURN after calling it |
 
 ## milestone
-Manage project milestones. Actions: list, create, get, update, delete, get_progress, add_task, link_plan, unlink_plan
+Manage project milestones.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -863,7 +865,7 @@ Manage project milestones. Actions: list, create, get, update, delete, get_progr
 | unlink_plan | `milestone_id` (req), `plan_id` (req) | Unlink plan from milestone |
 
 ## commit
-Register and link git commits. Actions: create, link_to_task, link_to_plan, get_task_commits, get_plan_commits, get_commit_files, get_file_history
+Register and link git commits.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -876,7 +878,7 @@ Register and link git commits. Actions: create, link_to_task, link_to_plan, get_
 | get_file_history | `file_path` (req), `limit` | Get commit history for file |
 
 ## note
-Manage knowledge notes. Actions: list, create, get, update, delete, search, search_semantic, confirm, invalidate, supersede, link_to_entity, unlink_from_entity, get_context, get_needing_review, list_project, get_propagated, get_entity, get_context_knowledge, get_propagated_knowledge, list_rfcs, advance_rfc, get_rfc_status
+Manage knowledge notes.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -904,7 +906,7 @@ Manage knowledge notes. Actions: list, create, get, update, delete, search, sear
 | get_rfc_status | `note_id` (req) | Get RFC lifecycle status and protocol run details |
 
 ## workspace
-Manage workspaces. Actions: list, create, get, update, delete, get_overview, list_projects, add_project, remove_project, get_topology
+Manage workspaces.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -918,9 +920,11 @@ Manage workspaces. Actions: list, create, get, update, delete, get_overview, lis
 | add_project | `slug` (req), `project_id` (req) | Add project to workspace |
 | remove_project | `slug` (req), `project_id` (req) | Remove project from workspace |
 | get_topology | `slug` (req) | Get component topology |
+| derive_topology | `slug` (req) | Rebuild the architecture from the projects' source trees (manifests, compose files, dev-server proxies); idempotent, and also runs after every sync |
+| get_coupling_matrix | `slug` (req) | Coupling matrix between the workspace's projects |
 
 ## workspace_milestone
-Manage workspace milestones. Actions: list_all, list, create, get, update, delete, add_task, link_plan, unlink_plan, get_progress
+Manage workspace milestones.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -936,7 +940,7 @@ Manage workspace milestones. Actions: list_all, list, create, get, update, delet
 | get_progress | `milestone_id` (req) | Get completion progress |
 
 ## resource
-Manage workspace resources (API contracts, schemas). Actions: list, create, get, update, delete, link_to_project
+Manage workspace resources (API contracts, schemas).
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -948,7 +952,7 @@ Manage workspace resources (API contracts, schemas). Actions: list, create, get,
 | link_to_project | `id` (req), `project_id` (req), `relation` (req: implements/uses) | Link resource to project |
 
 ## component
-Manage workspace components (services, modules). Actions: list, create, get, update, delete, add_dependency, remove_dependency, map_to_project
+Manage workspace components (services, modules).
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -962,7 +966,7 @@ Manage workspace components (services, modules). Actions: list, create, get, upd
 | map_to_project | `component_id` (req), `project_id` (req) | Map component to project |
 
 ## chat
-Manage chat sessions. Actions: list_sessions, get_session, get_children, delete_session, send_message, list_messages, add_discussed, get_session_entities, get_session_tree, get_run_sessions, team_message, team_status
+Manage chat sessions.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -978,9 +982,15 @@ Manage chat sessions. Actions: list_sessions, get_session, get_children, delete_
 | get_run_sessions | `run_id` (req) | Get chat sessions associated with a ProtocolRun |
 | team_message | `text` (req), `to` (parent/children/all/member), `kind` (message/dispatch_request), `project_slug`, `task_id` | Write, live, to your team: your parent or your children. The sender is your session. `dispatch_request` asks your parent to open work you cannot (another project); the parent decides. Information, never an authorization |
 | team_status | — | Your parent and children, and who is working right now |
+| associate_with | `entity_type` (req: `Plan`/`Task`), `entity_id` (req), `source` | Link the session to a plan or a task |
+| list_anchors | | The typed context anchors of this session, with the version of the set |
+| add_anchor | `target_type` (req), `target_id` (req), `roles` (default: mention), `snapshot_name`, `snapshot_path`, `snapshot_type`, `rev` | Anchor this conversation on an entity. An agent may only add a mention |
+| update_anchor | `anchor_id` (req), `operation` (promote/demote), `role`, `version` | Promote or demote one role of an anchor |
+| remove_anchor | `anchor_id` (req), `version` | Remove an anchor. An agent cannot remove a focus |
+| list_anchored_sessions | `target_type` (req), `target_id` (req), `state`, `cursor`, `limit` | The conversations anchored on one entity, paged by cursor (limit <= 100) |
 
 ## feature_graph
-Manage feature graphs. Actions: create, get, list, add_entity, auto_build, delete, get_statistics, compare, find_overlapping
+Manage feature graphs.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -995,7 +1005,7 @@ Manage feature graphs. Actions: create, get, list, add_entity, auto_build, delet
 | find_overlapping | `id` (req) | Find other feature graphs that overlap with this one |
 
 ## code
-Explore and analyze code. Actions: search, search_project, search_workspace, get_file_symbols, find_references, get_file_dependencies, get_call_graph, analyze_impact, get_architecture, find_similar, find_trait_implementations, find_type_traits, get_impl_blocks, get_communities, get_health, get_node_importance, plan_implementation, get_co_change_graph, get_file_co_changers, detect_processes, get_class_hierarchy, find_subclasses, find_interface_implementors, list_processes, get_process, get_entry_points, enrich_communities, get_hotspots, get_knowledge_gaps, get_risk_assessment, get_homeostasis, get_structural_drift, get_structural_profile, find_structural_twins, cluster_dna, find_cross_project_twins, predict_missing_links, check_link_plausibility, stress_test_node, stress_test_edge, stress_test_cascade, find_bridges, get_context_card, refresh_context_cards, get_fingerprint, find_isomorphic, suggest_structural_templates, get_bridge, check_topology, list_topology_rules, create_topology_rule, delete_topology_rule, check_file_topology
+Explore and analyze code.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -1052,9 +1062,10 @@ Explore and analyze code. Actions: search, search_project, search_workspace, get
 | create_topology_rule | `project_slug` (req), `rule_type` (req: must_not_import/must_not_call/max_distance/max_fan_out/no_circular), `source_pattern`, `target_pattern`, `threshold`, `severity` (error/warning) | Create topology rule |
 | delete_topology_rule | `rule_id` (req) | Delete topology rule |
 | check_file_topology | `project_slug` (req), `file_path` (req), `new_imports` (req, array) | Check if new imports would violate rules |
+| get_learning_health | `project_slug` (req) | Learning health of the project's routing/feedback loop (personas learning-health) |
 
 ## admin
-Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, reinforce_isomorphic, detect_skills, detect_skill_fission, detect_skill_fusion, maintain_skills, auto_anchor_notes, reconstruct_knowledge, heal_scars, consolidate_memory, detect_stagnation, deep_maintenance, audit_gaps, persist_health_report, install_hooks
+Admin operations.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -1094,9 +1105,15 @@ Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status
 | audit_gaps | `project_id` (req) | Audit knowledge graph gaps (orphan notes, decisions without AFFECTS, skills without members) |
 | persist_health_report | `project_id` (req) | Persist combined health report as Note (health + gaps + risk + delta) |
 | install_hooks | `project_id`, `cwd`, `port` | **Deprecated** — hooks are now automatic via SDK |
+| backfill_note_embeddings | `batch_size` | Backfill the embeddings of the notes |
+| backfill_note_embeddings_status | | Progress of the note-embedding backfill |
+| seed_prompt_fragments | `project_id` (req) | Seed the prompt fragments from the graph |
+| learning_metrics | `project_id` (req) | Learning metrics of one project |
+| get_learning_stats | | Global learning stats of the outcome tracker |
+| analyze_runner_feedback | `project_id` | Analyse the runner's feedback (all projects when omitted) |
 
 ## skill
-Manage neural skills (emergent knowledge clusters). Actions: list, create, get, update, delete, get_members, add_member, remove_member, activate, export, import, get_health, split, merge
+Manage neural skills (emergent knowledge clusters).
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -1118,7 +1135,7 @@ Manage neural skills (emergent knowledge clusters). Actions: list, create, get, 
 Note: Skill fission/fusion detection is via `admin(action: "detect_skill_fission")` and `admin(action: "detect_skill_fusion")` — see admin section.
 
 ## reasoning
-Build reasoning trees from the knowledge graph. Actions: reason, reason_feedback
+Build reasoning trees from the knowledge graph.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -1126,7 +1143,7 @@ Build reasoning trees from the knowledge graph. Actions: reason, reason_feedback
 | reason_feedback | `tree_id` (req), `followed_nodes` (req, array of UUIDs), `outcome` (success/partial/failure) | Provide feedback to reinforce useful reasoning paths |
 
 ## analysis_profile
-Manage analysis profiles (edge/fusion weight presets). Actions: list, create, get, delete
+Manage analysis profiles (edge/fusion weight presets).
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -1136,7 +1153,7 @@ Manage analysis profiles (edge/fusion weight presets). Actions: list, create, ge
 | delete | `id` (req) | Delete analysis profile |
 
 ## protocol
-Manage Protocol FSMs (Pattern Federation). Actions: list, create, get, update, delete, add_state, delete_state, list_states, add_transition, delete_transition, list_transitions, link_to_skill, start_run, transition, get_run, list_runs, cancel_run, fail_run, report_progress, delete_run, route, compose, simulate, get_run_tree, get_run_children
+Manage Protocol FSMs (Pattern Federation).
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -1259,9 +1276,10 @@ POST /api/registry/{id}/import { project_id, conflict_strategy: "merge" }
 ```
 
 **Cross-instance discovery**: when `registry_remote_url` is configured (env `REGISTRY_REMOTE_URL` or config `registry.remote_url`), search queries both local and remote registries. Results are merged (local takes precedence on name conflicts), sorted by trust score. Remote failures are non-fatal (graceful degradation).
+| validate_all | `project_id` | Validate every protocol of the project |
 
 ## persona
-Manage living personas (adaptive knowledge agents scoped to code regions). Actions: create, get, list, update, delete, add_skill, remove_skill, add_protocol, remove_protocol, add_file, remove_file, add_function, remove_function, add_note, remove_note, add_decision, remove_decision, scope_to_feature_graph, unscope_feature_graph, add_extends, remove_extends, get_subgraph, find_for_file, list_global, export, import, activate, auto_build, maintain, detect
+Manage living personas (adaptive knowledge agents scoped to code regions).
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -1297,7 +1315,7 @@ Manage living personas (adaptive knowledge agents scoped to code regions). Actio
 | detect | `project_id` (req) | Auto-detect personas from code communities |
 
 ## episode
-Manage episodic memory (cognitive episodes from protocol runs). Actions: collect, list, anonymize, export_artifact
+Manage episodic memory (cognitive episodes from protocol runs).
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -1307,7 +1325,7 @@ Manage episodic memory (cognitive episodes from protocol runs). Actions: collect
 | export_artifact | `project_id` (req), `max_episodes`, `include_structure` (bool) | Export episodes as portable artifact with optional structural edges |
 
 ## sharing
-Manage sharing policies and consent for P2P knowledge federation. Actions: status, enable, disable, set_policy, get_policy, set_consent, history
+Manage sharing policies and consent for P2P knowledge federation.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -1318,9 +1336,14 @@ Manage sharing policies and consent for P2P knowledge federation. Actions: statu
 | get_policy | `project_slug` (req) | Get current sharing policy |
 | set_consent | `note_id` (req), `consent` (explicit_allow/explicit_deny/not_set) | Set sharing consent on a note |
 | history | `project_slug` (req), `limit`, `offset` | Get sharing audit trail |
+| preview | `project_slug` (req) | Preview what this project would share |
+| suggest | `project_slug` (req) | Suggest the notes worth sharing |
+| retract | `project_slug` (req) | Retract what this project shared |
+| list_tombstones | `project_slug` (req) | Tombstones of the retracted shares |
+| last_report | `project_slug` (req) | The last privacy report |
 
 ## neural_routing
-Runtime control for neural route learning (NN-based tool routing). Actions: status, get_config, enable, disable, set_mode, update_config
+Runtime control for neural route learning (NN-based tool routing).
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -1332,7 +1355,7 @@ Runtime control for neural route learning (NN-based tool routing). Actions: stat
 | update_config | `enabled`, `inference_timeout_ms`, `nn_fallback`, `collection_enabled`, `training_enabled`, `min_trajectories_for_training`, `retrain_interval_secs` | Update routing configuration |
 
 ## trajectory
-Query decision trajectories (stored reasoning paths from tool routing). Actions: list, get, search_similar, stats
+Query decision trajectories (stored reasoning paths from tool routing).
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -1342,7 +1365,7 @@ Query decision trajectories (stored reasoning paths from tool routing). Actions:
 | stats | | Get trajectory statistics (count, reward distribution, collection rate) |
 
 ## lifecycle_hook
-Manage lifecycle hooks — automatic actions triggered on entity status changes. Actions: list, create, get, update, delete
+Manage lifecycle hooks — automatic actions triggered on entity status changes.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -1353,7 +1376,7 @@ Manage lifecycle hooks — automatic actions triggered on entity status changes.
 | delete | `hook_id` (req) | Delete a hook |
 
 ## mcp_federation
-Manage external MCP server connections (federation). Actions: connect, disconnect, list, status, tools, probe, reconnect
+Manage external MCP server connections (federation).
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
