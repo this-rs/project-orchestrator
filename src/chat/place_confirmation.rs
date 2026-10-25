@@ -646,9 +646,7 @@ mod tests {
             Uuid::new_v4(),
             Uuid::new_v4(),
             other.into(),
-            Requester::Person {
-                sub: other.into(),
-            },
+            Requester::Person { sub: other.into() },
             place("/c"),
             (),
             now,

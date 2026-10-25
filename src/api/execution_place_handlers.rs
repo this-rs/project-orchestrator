@@ -1003,9 +1003,13 @@ mod tests {
         let id = pending.execution_place.placement_id;
 
         // The owner sees their own placement.
-        let views = list_for(&f, Claims::person(OWNER, "p@example.org", "P"), query_pending())
-            .await
-            .unwrap();
+        let views = list_for(
+            &f,
+            Claims::person(OWNER, "p@example.org", "P"),
+            query_pending(),
+        )
+        .await
+        .unwrap();
         assert_eq!(views.0.len(), 1);
         assert_eq!(views.0[0].placement_id, id);
         assert_eq!(views.0[0].owner, OWNER);
@@ -1019,7 +1023,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(views.0.is_empty(), "another person must not see the owner's placements");
+        assert!(
+            views.0.is_empty(),
+            "another person must not see the owner's placements"
+        );
 
         PLACEMENTS.discard(id);
     }
