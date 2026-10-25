@@ -352,7 +352,7 @@ impl TaskSignature {
             .and_then(Self::subagent_class)
             .or_else(|| subagent_type.and_then(TaskClass::parse))
             .unwrap_or(TaskClass::Simple);
-        let needs_tools = subagent_type.map_or(true, Self::subagent_needs_tools);
+        let needs_tools = subagent_type.is_none_or(Self::subagent_needs_tools);
         let length_bonus = (prompt.chars().count() / 800).min(2) as u8;
         let message_tokens = prompt.chars().count() as u64 / CHARS_PER_TOKEN;
         Self {
