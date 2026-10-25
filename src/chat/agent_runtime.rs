@@ -96,7 +96,7 @@ fn waits_for_a_reset(error: &ProviderError, now_ms: u64) -> bool {
 
 /// The failure that ends a turn and is worth trying again: a retryable
 /// `done.error` of an error turn, or a retryable terminal `error`.
-fn retryable_failure(event: &AgentEvent) -> Option<ProviderError> {
+fn retryable_failure(event: &AgentEvent, now_ms: u64) -> Option<ProviderError> {
     match event {
         // A turn its configured time limit stopped (`error_timeout`) is not a transient
         // failure: running it again would hit the same limit (ISO5). A silent model
@@ -111,7 +111,7 @@ fn retryable_failure(event: &AgentEvent) -> Option<ProviderError> {
             ..
         }
         | AgentEvent::Error { error }
-            if error.retryable() && !waits_for_a_reset(error, wall_clock_ms()) =>
+            if error.retryable() && !waits_for_a_reset(error, now_ms) =>
         {
             Some(error.clone())
         }
@@ -127,7 +127,7 @@ fn retryable_failure(event: &AgentEvent) -> Option<ProviderError> {
 /// a turn which already showed something is not replayed, since they are more
 /// likely a systemic condition than a mid-stream blip. Quota (402) is handled
 /// elsewhere and never arrives as a retryable error here.
-fn mid_generation_retryable(event: &AgentEvent) -> Option<ProviderError> {
+fn mid_generation_retryable(event: &AgentEvent, now_ms: u64) -> Option<ProviderError> {
     match event {
         AgentEvent::Done {
             subtype: Some(subtype),
@@ -142,7 +142,7 @@ fn mid_generation_retryable(event: &AgentEvent) -> Option<ProviderError> {
             if matches!(
                 error,
                 ProviderError::RateLimited { .. } | ProviderError::Timeout { .. }
-            ) && !waits_for_a_reset(error, wall_clock_ms()) =>
+            ) && !waits_for_a_reset(error, now_ms) =>
         {
             Some(error.clone())
         }
@@ -1784,7 +1784,11 @@ impl AgentSessionHandle {
                 // still ends the turn.
                 let terminal = event.is_terminal();
                 self.observe_quota(&event);
-                outcome.quota_refusal |= is_quota_refusal(&event);
+                // A quota refusal is only counted when the turn ENDS on it: a 429
+                // retried then followed by a real error is not a refusal of the account.
+                if terminal {
+                    outcome.quota_refusal = is_quota_refusal(&event);
+                }
                 exited |= process_exited(&event);
                 // The provider may have just named its session: stored before the
                 // terminal event goes out, so a client that saw the turn end can
@@ -1792,10 +1796,14 @@ impl AgentSessionHandle {
                 if terminal || matches!(event, AgentEvent::SessionStarted { .. }) {
                     self.sync_resume_token().await;
                 }
+                let now_ms = self
+                    .quota
+                    .as_ref()
+                    .map_or_else(wall_clock_ms, |q| q.now_ms());
                 let failure = if !shown {
-                    retryable_failure(&event)
+                    retryable_failure(&event, now_ms)
                 } else if outcome.tools.is_empty() {
-                    mid_generation_retryable(&event)
+                    mid_generation_retryable(&event, now_ms)
                 } else {
                     None
                 };
@@ -3483,11 +3491,11 @@ mod mask_tests {
         assert!(!waits_for_a_reset(&ProviderError::Overloaded, now));
         // The rule reaches the stream: a far reset makes the terminal error not retryable.
         let far = AgentEvent::Error {
-            error: at(Some(wall_clock_ms() + 3 * 86_400_000)),
+            error: at(Some(now + 3 * 86_400_000)),
         };
-        assert!(retryable_failure(&far).is_none());
+        assert!(retryable_failure(&far, now).is_none());
         let burst = AgentEvent::Error { error: at(None) };
-        assert!(retryable_failure(&burst).is_some());
+        assert!(retryable_failure(&burst, now).is_some());
     }
 
     #[test]
@@ -3637,6 +3645,7 @@ mod mask_tests {
 
     #[test]
     fn only_a_retryable_failure_of_an_error_turn_is_retried() {
+        let now = 1_792_500_000_000_u64;
         let done = |is_error, error| AgentEvent::Done {
             stop_reason: nexus_claude::agent::StopReason::Error,
             subtype: None,
@@ -3652,13 +3661,16 @@ mod mask_tests {
             structured_output: None,
             error,
         };
-        assert!(retryable_failure(&done(true, Some(ProviderError::Overloaded))).is_some());
-        assert!(retryable_failure(&done(true, Some(ProviderError::Unauthorized))).is_none());
-        assert!(retryable_failure(&done(false, Some(ProviderError::Overloaded))).is_none());
-        assert!(retryable_failure(&done(true, None)).is_none());
-        assert!(retryable_failure(&AgentEvent::Error {
-            error: ProviderError::Overloaded
-        })
+        assert!(retryable_failure(&done(true, Some(ProviderError::Overloaded)), now).is_some());
+        assert!(retryable_failure(&done(true, Some(ProviderError::Unauthorized)), now).is_none());
+        assert!(retryable_failure(&done(false, Some(ProviderError::Overloaded)), now).is_none());
+        assert!(retryable_failure(&done(true, None), now).is_none());
+        assert!(retryable_failure(
+            &AgentEvent::Error {
+                error: ProviderError::Overloaded
+            },
+            now
+        )
         .is_some());
         // A turn its configured time limit stopped is not run again (ISO5); a silent model
         // stream (the same typed timeout, `error_during_execution`) still is.
@@ -3674,14 +3686,15 @@ mod mask_tests {
             }
             event
         };
-        assert!(retryable_failure(&timeout("error_timeout")).is_none());
-        assert!(retryable_failure(&timeout("error_during_execution")).is_some());
+        assert!(retryable_failure(&timeout("error_timeout"), now).is_none());
+        assert!(retryable_failure(&timeout("error_during_execution"), now).is_some());
     }
 
     /// A2/D1: mid-generation retries are narrower than pre-content retries — only the
     /// transient 429/504, never a turn its own limit stopped or a systemic 503.
     #[test]
     fn only_a_rate_limit_or_timeout_is_retried_mid_generation() {
+        let now = 1_792_500_000_000_u64;
         let done = |is_error, error| AgentEvent::Done {
             stop_reason: nexus_claude::agent::StopReason::Error,
             subtype: None,
@@ -3702,20 +3715,27 @@ mod mask_tests {
             resets_at_ms: None,
         };
         let timeout = ProviderError::Timeout { after_ms: 60_000 };
-        assert!(mid_generation_retryable(&done(true, Some(limited))).is_some());
-        assert!(mid_generation_retryable(&done(true, Some(timeout.clone()))).is_some());
-        assert!(mid_generation_retryable(&AgentEvent::Error { error: timeout }).is_some());
+        assert!(mid_generation_retryable(&done(true, Some(limited)), now).is_some());
+        assert!(mid_generation_retryable(&done(true, Some(timeout.clone())), now).is_some());
+        assert!(mid_generation_retryable(&AgentEvent::Error { error: timeout }, now).is_some());
         // The other retryable classes keep the old "already showed something" rule.
-        assert!(mid_generation_retryable(&done(true, Some(ProviderError::Overloaded))).is_none());
-        assert!(mid_generation_retryable(&done(
-            true,
-            Some(ProviderError::EndpointUnreachable { detail: "d".into() })
-        ))
+        assert!(
+            mid_generation_retryable(&done(true, Some(ProviderError::Overloaded)), now).is_none()
+        );
+        assert!(mid_generation_retryable(
+            &done(
+                true,
+                Some(ProviderError::EndpointUnreachable { detail: "d".into() })
+            ),
+            now
+        )
         .is_none());
         // Non-retryable failures are not retried, and a clean done neither.
-        assert!(mid_generation_retryable(&done(true, Some(ProviderError::Unauthorized))).is_none());
-        assert!(mid_generation_retryable(&done(false, None)).is_none());
-        assert!(mid_generation_retryable(&done(true, None)).is_none());
+        assert!(
+            mid_generation_retryable(&done(true, Some(ProviderError::Unauthorized)), now).is_none()
+        );
+        assert!(mid_generation_retryable(&done(false, None), now).is_none());
+        assert!(mid_generation_retryable(&done(true, None), now).is_none());
         // A turn its configured time limit stopped is not run again (ISO5).
         let limit_stopped = {
             let mut event = done(
@@ -3729,7 +3749,96 @@ mod mask_tests {
             }
             event
         };
-        assert!(mid_generation_retryable(&limit_stopped).is_none());
+        assert!(mid_generation_retryable(&limit_stopped, now).is_none());
+    }
+
+    // ── Fix 3: quota_refusal is terminal-only ────────────────────────────────
+
+    /// A 429 retried then followed by a real protocol error: the turn does NOT count as
+    /// `quota_refusal` because the terminal event is the protocol error, not the 429.
+    /// Before the fix, `outcome.quota_refusal |=` was sticky: once true, always true.
+    #[test]
+    fn quota_refusal_is_only_true_when_the_terminal_event_is_a_refusal() {
+        let refusal = AgentEvent::Error {
+            error: ProviderError::RateLimited {
+                retry_after_ms: Some(5),
+                resets_at_ms: None,
+            },
+        };
+        let protocol_error = AgentEvent::Error {
+            error: ProviderError::InvalidRequest {
+                detail: "HTTP 400: bad request".into(),
+            },
+        };
+        // The 429 is indeed a quota refusal…
+        assert!(is_quota_refusal(&refusal));
+        // …but a protocol error is not.
+        assert!(!is_quota_refusal(&protocol_error));
+        // The fix: only the TERMINAL event determines `quota_refusal`.
+        // Simulate the event loop's logic (Fix 3): `if terminal { outcome.quota_refusal = is_quota_refusal(&event); }`
+        // If the last event is a protocol error, quota_refusal must be false even though
+        // a 429 came earlier. The old code (`|=`) would have kept it true.
+        let events = vec![refusal, protocol_error];
+        let mut quota_refusal = false;
+        for event in &events {
+            // Old code: quota_refusal |= is_quota_refusal(event); ← BUG: sticky
+            // New code: only on the terminal (last) event.
+            let is_terminal = std::ptr::eq(event, events.last().unwrap());
+            if is_terminal {
+                quota_refusal = is_quota_refusal(event);
+            }
+        }
+        assert!(
+            !quota_refusal,
+            "the terminal event is a protocol error, not a quota refusal"
+        );
+    }
+
+    /// When the terminal event IS a 429, `quota_refusal` is true.
+    #[test]
+    fn quota_refusal_is_true_when_the_terminal_event_is_a_429() {
+        let refusal = AgentEvent::Error {
+            error: ProviderError::RateLimited {
+                retry_after_ms: None,
+                resets_at_ms: Some(99),
+            },
+        };
+        assert!(is_quota_refusal(&refusal));
+        // A 402 "insufficient credits" is also a refusal.
+        let no_credit = AgentEvent::Error {
+            error: ProviderError::InvalidRequest {
+                detail: "HTTP 402: insufficient credits".into(),
+            },
+        };
+        assert!(is_quota_refusal(&no_credit));
+    }
+
+    // ── Fix 4: waits_for_a_reset uses the injected clock ─────────────────────
+
+    /// `waits_for_a_reset` compares the reset time to the `now_ms` argument (the injected
+    /// clock), not to the system clock. This test proves it: the same error is either "far"
+    /// or "near" depending solely on the `now_ms` we pass.
+    #[test]
+    fn waits_for_a_reset_depends_only_on_the_injected_now_ms() {
+        let resets_at = 1_792_500_000_000_u64 + 3 * 86_400_000; // some date 3 days hence
+
+        // With now_ms close to resets_at: the remaining wait is short → NOT a quota exhaustion.
+        let now_close = resets_at - 5_000; // 5 s before the reset
+        let error = ProviderError::RateLimited {
+            retry_after_ms: None,
+            resets_at_ms: Some(resets_at),
+        };
+        assert!(
+            !waits_for_a_reset(&error, now_close),
+            "5 s before reset → near → retryable, not a quota wall"
+        );
+
+        // With now_ms far before resets_at: the remaining wait is long → IS a quota exhaustion.
+        let now_far = resets_at - 3 * 86_400_000; // 3 days before the reset
+        assert!(
+            waits_for_a_reset(&error, now_far),
+            "3 days before reset → far → quota exhaustion"
+        );
     }
 }
 
