@@ -109,6 +109,16 @@ impl ManualClock {
         let mut at = self.at.lock().unwrap_or_else(|e| e.into_inner());
         *at += chrono::Duration::from_std(by).unwrap_or_default();
     }
+
+    /// Resets the clock to an arbitrary instant. Use in tests that need to simulate out-of-order
+    /// events (a late message whose wall clock was earlier than the current entry).
+    #[cfg(test)]
+    pub fn set(&self, instant: &str) {
+        let new_at = DateTime::parse_from_rfc3339(instant)
+            .expect("an RFC 3339 instant")
+            .with_timezone(&Utc);
+        *self.at.lock().unwrap_or_else(|e| e.into_inner()) = new_at;
+    }
 }
 
 impl Clock for ManualClock {

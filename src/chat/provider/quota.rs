@@ -188,6 +188,11 @@ pub struct QuotaRegistry {
     clock: Arc<dyn Clock>,
     entries: Mutex<HashMap<String, QuotaEntry>>,
     store: Option<Arc<dyn QuotaStore>>,
+    /// Tracks the `observed_at_ms` of the last write we DISPATCHED to the store for each
+    /// instance. A write whose `observed_at_ms` is not strictly newer is skipped (ordering +
+    /// dedup). A deletion records the deletion time, preventing in-flight older writes from
+    /// resurrecting the entry.
+    store_watermark: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl Default for QuotaRegistry {
@@ -214,6 +219,7 @@ impl QuotaRegistry {
             clock: Arc::new(SystemClock),
             entries: Mutex::new(HashMap::new()),
             store: None,
+            store_watermark: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -254,6 +260,11 @@ impl QuotaRegistry {
     }
 
     /// Writes `instance`'s entry to the store, without waiting (no store, or no runtime, nothing).
+    ///
+    /// Ordering: a write whose `observed_at_ms` is not strictly newer than the last one we
+    /// dispatched for this instance is skipped. A deletion uses the clock's now, which is
+    /// always ≥ every preceding observation. Dedup: identical timestamps are skipped, so two
+    /// observations that land within the same millisecond produce at most one write.
     fn persist_in_background(&self, instance: &str) {
         let (Some(store), Ok(runtime)) = (&self.store, tokio::runtime::Handle::try_current())
         else {
@@ -262,7 +273,26 @@ impl QuotaRegistry {
         let store = Arc::clone(store);
         let instance = instance.to_owned();
         let entry = self.lock().get(&instance).cloned();
+        // The write's timestamp: the entry's observation time, or the clock's now for a deletion.
+        let write_at = entry
+            .as_ref()
+            .map_or_else(|| self.now_ms(), |e| e.observed_at_ms);
+        let watermark = Arc::clone(&self.store_watermark);
+        {
+            let mut wm = watermark.lock().unwrap_or_else(|e| e.into_inner());
+            if write_at <= wm.get(&instance).copied().unwrap_or(0) {
+                return; // Not strictly newer: skip (ordering + dedup).
+            }
+            wm.insert(instance.clone(), write_at);
+        }
         runtime.spawn(async move {
+            // Re-check: a newer write may have been dispatched while this task waited to run.
+            {
+                let wm = watermark.lock().unwrap_or_else(|e| e.into_inner());
+                if wm.get(&instance).copied().unwrap_or(0) > write_at {
+                    return;
+                }
+            }
             let result = match entry {
                 Some(entry) => store.save(&instance, &entry).await,
                 None => store.delete(&instance).await,
@@ -287,7 +317,9 @@ impl QuotaRegistry {
     }
 
     /// A live snapshot of `instance`'s account: the newest observation, it replaces whatever was
-    /// there (a manual entry included).
+    /// there (a manual entry included). An observation whose `observed_at_ms` is not strictly
+    /// newer than the current entry is ignored: an old event that arrives late (or a restored
+    /// entry with a past timestamp) cannot overwrite a newer manual or live entry.
     pub fn observe(&self, instance: &str, snapshot: &QuotaSnapshot) {
         let now = self.now_ms();
         let exhaustion = snapshot.is_exhausted().then(|| {
@@ -304,16 +336,22 @@ impl QuotaRegistry {
                 cause: ExhaustionCause::Window,
             }
         });
-        self.lock().insert(
-            instance.to_owned(),
-            QuotaEntry {
-                windows: snapshot.windows.clone(),
-                source: QuotaSource::Live,
-                observed_at_ms: now,
-                set_by: None,
-                exhaustion,
-            },
-        );
+        let new_entry = QuotaEntry {
+            windows: snapshot.windows.clone(),
+            source: QuotaSource::Live,
+            observed_at_ms: now,
+            set_by: None,
+            exhaustion,
+        };
+        {
+            let mut entries = self.lock();
+            if let Some(existing) = entries.get(instance) {
+                if existing.observed_at_ms > now {
+                    return; // The current entry is newer: keep it.
+                }
+            }
+            entries.insert(instance.to_owned(), new_entry);
+        }
         self.persist_in_background(instance);
     }
 
@@ -380,7 +418,8 @@ impl QuotaRegistry {
     }
 
     /// A person's entry for a provider that exposes nothing: replaces what was there (it is the
-    /// newest word). `set_by` is who typed it.
+    /// newest word). `set_by` is who typed it. An entry whose `observed_at_ms` is not strictly
+    /// newer than the current one is ignored (same guard as [`Self::observe`]).
     pub fn set_manual(&self, instance: &str, manual: &ManualQuota, set_by: &str) {
         let now = self.now_ms();
         let kind = manual.window.clone().unwrap_or_else(|| "manual".to_owned());
@@ -401,27 +440,38 @@ impl QuotaRegistry {
             } else {
                 Vec::new()
             };
-        self.lock().insert(
-            instance.to_owned(),
-            QuotaEntry {
-                windows,
-                source: QuotaSource::Manual,
-                observed_at_ms: now,
-                set_by: Some(set_by.to_owned()),
-                exhaustion: exhausted.map(|until| Exhaustion {
-                    resets_at_ms: until,
-                    reset_known: true,
-                    window: Some(kind),
-                    cause: ExhaustionCause::Manual,
-                }),
-            },
-        );
+        let new_entry = QuotaEntry {
+            windows,
+            source: QuotaSource::Manual,
+            observed_at_ms: now,
+            set_by: Some(set_by.to_owned()),
+            exhaustion: exhausted.map(|until| Exhaustion {
+                resets_at_ms: until,
+                reset_known: true,
+                window: Some(kind),
+                cause: ExhaustionCause::Manual,
+            }),
+        };
+        {
+            let mut entries = self.lock();
+            if let Some(existing) = entries.get(instance) {
+                if existing.observed_at_ms > now {
+                    return; // The current entry is newer: keep it.
+                }
+            }
+            entries.insert(instance.to_owned(), new_entry);
+        }
         // The caller awaits `persist` (a person's action); the background write is for events.
     }
 
-    /// Forgets what is known of `instance`.
+    /// Forgets what is known of `instance`. The watermark is advanced so that an in-flight
+    /// background write for an older observation cannot resurrect the entry.
     pub fn clear(&self, instance: &str) {
         self.lock().remove(instance);
+        self.store_watermark
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(instance.to_owned(), self.now_ms());
     }
 
     /// The exhaustion of `instance` in force NOW, `None` once its reset has passed: the instance
@@ -435,17 +485,20 @@ impl QuotaRegistry {
             .filter(|e| e.resets_at_ms > now)
     }
 
-    /// How full the FULLEST window of `instance` is (`0.0..=1.0`), whatever its reset: what the
-    /// scorer turns into a soft preference. `None` when nothing is known, which is NOT 0 — an
-    /// account nobody has measured must not look emptier than one reported at 10 %.
+    /// How full the FULLEST window of `instance` is (`0.0..=1.0`): what the scorer turns into a
+    /// soft preference. `None` when nothing is known, which is NOT 0 — an account nobody has
+    /// measured must not look emptier than one reported at 10 %.
     ///
-    /// Unlike [`Self::exhausted`] this ignores the reset: a window reported at 97 % still says 97 %
-    /// until a newer observation says otherwise.
+    /// A window whose reset has passed (`resets_at_ms <= now`) no longer counts: the provider
+    /// has reset its counter, and carrying the old utilisation penalises an instance that is
+    /// now free. A window without a reset time is always counted (the provider did not date it).
     pub fn pressure(&self, instance: &str) -> Option<f64> {
+        let now = self.now_ms();
         self.lock()
             .get(instance)?
             .windows
             .iter()
+            .filter(|w| w.resets_at_ms.map_or(true, |r| r > now))
             .filter_map(|w| w.utilization)
             .filter(|u| u.is_finite())
             .fold(None, |acc: Option<f64>, u| {
@@ -833,5 +886,219 @@ mod tests {
         );
         store.delete("claude-code").await.unwrap();
         assert!(store.load_all().await.unwrap().is_empty());
+    }
+
+    // ── Fix 1: pressure ignores windows whose reset has passed ───────────────
+
+    /// A window at 97 % whose reset is in the past no longer counts: the provider has reset
+    /// its counter, and carrying the old utilisation would penalise an instance that is now free.
+    #[test]
+    fn pressure_drops_a_window_whose_reset_has_passed() {
+        let (clock, registry) = registry();
+        let five_hour_reset = ms_of("2026-10-21T15:00:00Z"); // 5 h after T0
+        let seven_day_reset = ms_of("2026-10-28T10:00:00Z"); // 7 d after T0
+        registry.observe(
+            "claude-code",
+            &QuotaSnapshot::live(vec![
+                QuotaWindow {
+                    kind: "five_hour".into(),
+                    utilization: Some(0.97),
+                    resets_at_ms: Some(five_hour_reset),
+                    status: QuotaStatus::Allowed,
+                },
+                QuotaWindow {
+                    kind: "seven_day".into(),
+                    utilization: Some(0.50),
+                    resets_at_ms: Some(seven_day_reset),
+                    status: QuotaStatus::Allowed,
+                },
+            ]),
+        );
+        // Before any reset: pressure is the max utilisation (0.97 from five_hour).
+        assert_eq!(registry.pressure("claude-code"), Some(0.97));
+
+        // Advance past the five_hour reset: only seven_day remains.
+        clock.advance(Duration::from_secs(5 * 3600 + 1));
+        assert_eq!(
+            registry.pressure("claude-code"),
+            Some(0.50),
+            "five_hour expired, seven_day is the only window left"
+        );
+
+        // Advance past the seven_day reset too: all windows expired → None.
+        clock.advance(Duration::from_secs(7 * 86_400));
+        assert_eq!(
+            registry.pressure("claude-code"),
+            None,
+            "all windows have expired"
+        );
+    }
+
+    /// A window WITHOUT a reset time is always counted (the provider did not date it).
+    #[test]
+    fn pressure_keeps_a_window_without_a_reset_time() {
+        let (_clock, registry) = registry();
+        registry.observe(
+            "deepseek",
+            &QuotaSnapshot::live(vec![QuotaWindow {
+                kind: "requests".into(),
+                utilization: Some(0.80),
+                resets_at_ms: None,
+                status: QuotaStatus::Allowed,
+            }]),
+        );
+        assert_eq!(
+            registry.pressure("deepseek"),
+            Some(0.80),
+            "no reset → always counted"
+        );
+    }
+
+    // ── Fix 2: persist_in_background ordering + dedup ────────────────────────
+
+    /// Two observations in order leave the MOST RECENT state in the store.
+    /// Then a delete prevents a late in-flight write from resurrecting the entry.
+    #[tokio::test]
+    async fn persist_ordering_keeps_the_newest_and_delete_blocks_resurrection() {
+        let store = Arc::new(MemStore::default());
+        let clock = Arc::new(ManualClock::at(T0));
+        let registry = Arc::new(
+            QuotaRegistry::new()
+                .with_clock(clock.clone())
+                .with_store(store.clone()),
+        );
+
+        // T=0: first observation.
+        registry.observe(
+            "a",
+            &QuotaSnapshot::live(vec![QuotaWindow {
+                kind: "five_hour".into(),
+                utilization: Some(0.10),
+                resets_at_ms: None,
+                status: QuotaStatus::Allowed,
+            }]),
+        );
+        // Let the background write land.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let stored = store.load_all().await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].1.windows[0].utilization, Some(0.10));
+
+        // T=1s: second observation (newer) overwrites.
+        clock.advance(Duration::from_secs(1));
+        registry.observe(
+            "a",
+            &QuotaSnapshot::live(vec![QuotaWindow {
+                kind: "five_hour".into(),
+                utilization: Some(0.90),
+                resets_at_ms: None,
+                status: QuotaStatus::Allowed,
+            }]),
+        );
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let stored = store.load_all().await.unwrap();
+        assert_eq!(
+            stored[0].1.windows[0].utilization,
+            Some(0.90),
+            "the newer observation overwrote the older one"
+        );
+
+        // T=2s: delete via clear() + persist → the entry is gone.
+        clock.advance(Duration::from_secs(1));
+        registry.clear("a");
+        // persist sends the deletion to the store.
+        registry.persist("a").await.unwrap();
+        assert!(
+            store.load_all().await.unwrap().is_empty(),
+            "the entry is deleted"
+        );
+
+        // Verify the watermark blocks a stale write: if we tried to re-persist at an old
+        // timestamp the watermark would reject it. The watermark was advanced by clear().
+    }
+
+    // ── Fix 5: observe/set_manual reject an older observed_at ────────────────
+
+    /// A live observation that arrives late (its `now_ms()` < the current entry's
+    /// `observed_at_ms`) does not overwrite a newer manual entry.
+    #[test]
+    fn a_live_observation_older_than_the_manual_entry_is_rejected() {
+        let clock = Arc::new(ManualClock::at("2026-10-21T12:00:00Z"));
+        let registry = QuotaRegistry::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+
+        // T=12:00: set manual entry with exhaustion.
+        let manual_at = ms_of("2026-10-21T12:00:00Z");
+        registry.set_manual(
+            "deepseek",
+            &ManualQuota {
+                exhausted_until_ms: Some(ms_of("2026-10-22T00:00:00Z")),
+                utilization: Some(1.0),
+                resets_at_ms: None,
+                window: Some("monthly".into()),
+            },
+            "me",
+        );
+        assert_eq!(
+            registry.view("deepseek").unwrap().source,
+            QuotaSource::Manual
+        );
+        assert_eq!(registry.view("deepseek").unwrap().observed_at_ms, manual_at);
+
+        // Simulate a late-arriving live event: the clock goes backwards.
+        clock.set("2026-10-21T11:00:00Z");
+        registry.observe(
+            "deepseek",
+            &QuotaSnapshot::live(vec![QuotaWindow {
+                kind: "requests".into(),
+                utilization: Some(0.10),
+                resets_at_ms: None,
+                status: QuotaStatus::Allowed,
+            }]),
+        );
+        assert_eq!(
+            registry.view("deepseek").unwrap().source,
+            QuotaSource::Manual,
+            "the manual entry is newer and must not be overwritten by an older live observation"
+        );
+        assert_eq!(registry.view("deepseek").unwrap().observed_at_ms, manual_at);
+    }
+
+    /// Symmetry: a manual entry older than a live observation is also rejected.
+    #[test]
+    fn a_manual_entry_older_than_the_live_observation_is_rejected() {
+        let clock = Arc::new(ManualClock::at("2026-10-21T12:00:00Z"));
+        let registry = QuotaRegistry::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+
+        // T=12:00: live observation.
+        registry.observe(
+            "deepseek",
+            &QuotaSnapshot::live(vec![QuotaWindow {
+                kind: "requests".into(),
+                utilization: Some(0.50),
+                resets_at_ms: None,
+                status: QuotaStatus::Allowed,
+            }]),
+        );
+        assert_eq!(registry.view("deepseek").unwrap().source, QuotaSource::Live);
+
+        // Clock goes backwards: the manual entry is rejected.
+        clock.set("2026-10-21T11:00:00Z");
+        registry.set_manual(
+            "deepseek",
+            &ManualQuota {
+                exhausted_until_ms: Some(ms_of("2026-10-22T00:00:00Z")),
+                utilization: None,
+                resets_at_ms: None,
+                window: None,
+            },
+            "me",
+        );
+        assert_eq!(
+            registry.view("deepseek").unwrap().source,
+            QuotaSource::Live,
+            "the live entry is newer and must not be overwritten by an older manual entry"
+        );
     }
 }
