@@ -86,7 +86,7 @@ enum Engine {
     /// `not_measured` (YARDSTICK, task 87eb345e).
     OpenCode,
     /// ACP harness. `fake_acp` exists in the nexus repository. Per-function verdicts
-    /// are declared in [`EXPECTED`]; known harness gaps are `gap (harnais)` (ISO4).
+    /// are declared in [`EXPECTED`] as `declared(harnais)` (ISO4) or `not_measured`.
     Acp,
 }
 
@@ -385,9 +385,10 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
     (Engine::Acp, "ask_user_question", Expect::NotMeasured { why: "le backend synthétise la question via le harnais natif ; non exercé dans le scénario de parité (transcripts ACP non adaptés, ISO4)" }),
     (Engine::Acp, "enrichment", Expect::NotMeasured { why: "ACP injecte le contexte PO via le bloc system du premier session/prompt ; la vérification parity cherche PLAN_TITLE dans les requêtes OpenAI qui n'existent pas pour ACP ; non exercé dans ce scénario (ISO4)" }),
     (Engine::Acp, "compaction.manual", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: "/compact n'est pas transmis à un agent ACP : la compaction manuelle n'a pas de canal côté harnais" }),
-    // ── ACP — ok (verified by separate tests, #924) ──────────────────────
-    // `provider_switch.relay`: verified by `a_conversation_moves_from_*_to_acp_*` (#924).
-    // `enrichment`: verified by `an_acp_session_receives_the_po_system_prompt_as_the_leading_block` (#924).
+    // ── ACP — ok (measured in run_acp_column, relay confirmed via FAKE_ACP_RECORD) ──────────
+    // `provider_switch.relay`: verified by `run_acp_column` (this file) and by
+    // `a_conversation_moves_from_*_to_acp_*` in agent_e2e_tests.rs.
+    // `enrichment`: moved to not_measured — ACP uses its own system/prompt path (ISO4).
     // ── ACP — not_measured (fake_acp transcript-based, specific scenario not yet adapted) ──
     (Engine::Acp, "compaction", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
     (Engine::Acp, "message_queue", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
