@@ -332,19 +332,19 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
     // captured by fake_openai ≥ pin 0587011). Old fakes (08/10) silently dropped that header,
     // causing a false gap; no EXPECTED entry is needed here.
     // ── Codex — known harness gaps (A40 hooks, A12 images, no bg-tasks) ──
-    (Engine::Codex, "hooks.before_tool", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: CODEX_HOOKS }),
-    (Engine::Codex, "hooks.after_tool", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: CODEX_HOOKS }),
-    (Engine::Codex, "hooks.before_compaction", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: CODEX_HOOKS }),
-    (Engine::Codex, "hooks.session_start", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: CODEX_HOOKS }),
-    (Engine::Codex, "hooks.user_prompt_submit", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: CODEX_HOOKS }),
-    (Engine::Codex, "hooks.stop", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: CODEX_HOOKS }),
-    (Engine::Codex, "hooks.subagent_stop", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: CODEX_HOOKS }),
-    (Engine::Codex, "hooks.notification", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: CODEX_HOOKS }),
-    (Engine::Codex, "background_tasks", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: CODEX_NO_BG }),
-    (Engine::Codex, "cancel_task", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: CODEX_NO_BG }),
-    (Engine::Codex, "images", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: "Codex v1 n'accepte pas les blocs image (A12)" }),
+    (Engine::Codex, "hooks.before_tool", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_HOOKS }),
+    (Engine::Codex, "hooks.after_tool", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_HOOKS }),
+    (Engine::Codex, "hooks.before_compaction", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_HOOKS }),
+    (Engine::Codex, "hooks.session_start", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_HOOKS }),
+    (Engine::Codex, "hooks.user_prompt_submit", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_HOOKS }),
+    (Engine::Codex, "hooks.stop", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_HOOKS }),
+    (Engine::Codex, "hooks.subagent_stop", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_HOOKS }),
+    (Engine::Codex, "hooks.notification", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_HOOKS }),
+    (Engine::Codex, "background_tasks", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_NO_BG }),
+    (Engine::Codex, "cancel_task", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_NO_BG }),
+    (Engine::Codex, "images", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "Codex v1 n'accepte pas les blocs image (A12)" }),
     (Engine::Codex, "anthropic_messages", Expect::NotMeasured { why: "Codex utilise son propre moteur LLM (API Codex v1), pas l'API Anthropic Messages ; concept sans objet sur ce moteur" }),
-    (Engine::Codex, "ask_user_question", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: "requestUserInput est expérimental en v1 ; le backend le synthétise mais ne peut pas l'interroger via Codex" }),
+    (Engine::Codex, "ask_user_question", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "requestUserInput est expérimental en v1 ; le backend le synthétise mais ne peut pas l'interroger via Codex" }),
     // ── Codex — not_measured (transcript-based fake_codex needs per-function JSONL) ──
     (Engine::Codex, "compaction", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
     (Engine::Codex, "compaction.manual", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
@@ -372,19 +372,19 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
     (Engine::Codex, "subagents", Expect::NotMeasured { why: "collabToolCall (sous-agents Codex) NOT VERIFIED dans la suite nexus ; transcript nécessaire" }),
     (Engine::Codex, "system_init.degraded", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
     // ── ACP — known harness gaps ─────────────────────────────────────────
-    (Engine::Acp, "hooks.before_tool", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: ACP_HOOKS }),
-    (Engine::Acp, "hooks.after_tool", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: ACP_HOOKS }),
-    (Engine::Acp, "hooks.before_compaction", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: ACP_HOOKS }),
-    (Engine::Acp, "hooks.session_start", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: ACP_HOOKS }),
-    (Engine::Acp, "hooks.user_prompt_submit", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: ACP_HOOKS }),
-    (Engine::Acp, "hooks.stop", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: ACP_HOOKS }),
-    (Engine::Acp, "hooks.subagent_stop", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: ACP_HOOKS }),
-    (Engine::Acp, "hooks.notification", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: ACP_HOOKS }),
-    (Engine::Acp, "nexus_tools", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: "ACP utilise son propre environnement d'outils ; nexus-tools n'est pas joint à une session ACP" }),
+    (Engine::Acp, "hooks.before_tool", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
+    (Engine::Acp, "hooks.after_tool", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
+    (Engine::Acp, "hooks.before_compaction", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
+    (Engine::Acp, "hooks.session_start", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
+    (Engine::Acp, "hooks.user_prompt_submit", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
+    (Engine::Acp, "hooks.stop", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
+    (Engine::Acp, "hooks.subagent_stop", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
+    (Engine::Acp, "hooks.notification", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
+    (Engine::Acp, "nexus_tools", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "ACP utilise son propre environnement d'outils ; nexus-tools n'est pas joint à une session ACP" }),
     (Engine::Acp, "anthropic_messages", Expect::NotMeasured { why: "ACP utilise son propre moteur LLM (protocole ACP), pas l'API Anthropic Messages ; concept sans objet sur ce moteur" }),
     (Engine::Acp, "ask_user_question", Expect::NotMeasured { why: "le backend synthétise la question via le harnais natif ; non exercé dans le scénario de parité (transcripts ACP non adaptés, ISO4)" }),
     (Engine::Acp, "enrichment", Expect::NotMeasured { why: "ACP injecte le contexte PO via le bloc system du premier session/prompt ; la vérification parity cherche PLAN_TITLE dans les requêtes OpenAI qui n'existent pas pour ACP ; non exercé dans ce scénario (ISO4)" }),
-    (Engine::Acp, "compaction.manual", Expect::Gap { cause: Cause::Harness, task: "PISO4", why: "/compact n'est pas transmis à un agent ACP : la compaction manuelle n'a pas de canal côté harnais" }),
+    (Engine::Acp, "compaction.manual", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "/compact n'est pas transmis à un agent ACP : la compaction manuelle n'a pas de canal côté harnais" }),
     // ── ACP — ok (measured in run_acp_column, relay confirmed via FAKE_ACP_RECORD) ──────────
     // `provider_switch.relay`: verified by `run_acp_column` (this file) and by
     // `a_conversation_moves_from_*_to_acp_*` in agent_e2e_tests.rs.
@@ -5449,9 +5449,13 @@ fn every_declared_cell_names_a_function_of_the_matrix_once() {
             "{function} declared twice for {engine:?}"
         );
         if let Expect::Gap { task, .. } = x {
+            // P… = plan 5ad54c48 "Parité totale"
+            // M… = plan e87abcc2 "Claude Code devient optionnel"
+            // ISO… = ISO1…ISO5 harness-isomorphism tasks (e.g. ISO4, id 4e2becce): these
+            //        are cross-cutting harness gaps, not scoped to a single parity plan.
             assert!(
-                task.starts_with('P') || task.starts_with('M'),
-                "a PO task of plan 5ad54c48 (P…) or e87abcc2 (M…): {task}"
+                task.starts_with('P') || task.starts_with('M') || task.starts_with("ISO"),
+                "a PO task of plan 5ad54c48 (P…), e87abcc2 (M…) or an ISO harness task (ISO…): {task}"
             );
         }
     }
