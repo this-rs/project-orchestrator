@@ -235,6 +235,13 @@ pub(crate) const MEGA_TOOL_ACTIONS: &[(&str, &str, &str)] = &[
     ("task", "build_prompt", "build_task_prompt"),
     ("task", "enrich", "enrich_task"),
     ("task", "get_sessions", "get_task_sessions"),
+    // Day plan
+    ("day_plan", "read", "read_day_plan"),
+    ("day_plan", "add", "add_to_day_plan"),
+    ("day_plan", "remove", "remove_from_day_plan"),
+    ("day_plan", "reorder", "reorder_day_plan"),
+    ("day_plan", "move_to_tomorrow", "move_day_plan_to_tomorrow"),
+
 
     // Step
     ("step", "list", "list_steps"),
@@ -1750,6 +1757,76 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            "read_day_plan" => {
+                let date = args
+                    .get("date")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+                let result = http.get(&format!("/api/day-plan?date={}", date)).await?;
+                Ok(Some(result))
+            }
+
+            "reorder_day_plan" => {
+                let date = args
+                    .get("date")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+                let ids = args.get("ids").cloned().unwrap_or_else(|| json!([]));
+                let body = json!({ "date": date, "ids": ids });
+                let result = http.put("/api/day-plan", &body).await?;
+                Ok(Some(if result.is_null() {
+                    json!({"updated": true})
+                } else {
+                    result
+                }))
+            }
+
+            "add_to_day_plan" => {
+                let task_id = extract_id(args, "task_id")?;
+                let result = http
+                    .post(&format!("/api/day-plan/tasks/{}", task_id), &json!({}))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"added": true})
+                } else {
+                    result
+                }))
+            }
+
+            "remove_from_day_plan" => {
+                let task_id = extract_id(args, "task_id")?;
+                let result = http
+                    .delete(&format!("/api/day-plan/tasks/{}", task_id))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"removed": true})
+                } else {
+                    result
+                }))
+            }
+
+            "move_day_plan_to_tomorrow" => {
+                let task_id = extract_id(args, "task_id")?;
+                let tomorrow = (chrono::Utc::now() + chrono::Duration::days(1))
+                    .format("%Y-%m-%d")
+                    .to_string();
+                let _ = http
+                    .delete(&format!("/api/day-plan/tasks/{}", task_id))
+                    .await?;
+                let result = http
+                    .post(
+                        &format!("/api/day-plan/tasks/{}?date={}", task_id, tomorrow),
+                        &json!({}),
+                    )
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"moved": true})
+                } else {
+                    result
+                }))
+            }
             "enrich_task" => {
                 let plan_id = extract_id(args, "plan_id")?;
                 let task_id = extract_id(args, "task_id")?;
@@ -10341,6 +10418,40 @@ mod tests {
         assert_eq!(result["path"], "/api/skills/import");
     }
 
+    #[tokio::test]
+    async fn test_http_read_day_plan() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("read_day_plan", Some(json!({"date": "2026-10-25"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/day-plan?date=2026-10-25");
+    }
+
+    #[tokio::test]
+    async fn test_http_add_to_day_plan() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("add_to_day_plan", Some(json!({"task_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], format!("/api/day-plan/tasks/{}", UUID1));
+    }
+
+    #[tokio::test]
+    async fn test_http_move_day_plan_to_tomorrow() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("move_day_plan_to_tomorrow", Some(json!({"task_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        let path = result["path"].as_str().unwrap();
+        assert!(path.contains("/api/day-plan/tasks/"));
+        assert!(path.contains("?date="));
+    }
     #[tokio::test]
     async fn test_http_get_skill_health() {
         let (handler, _) = make_http_handler().await;

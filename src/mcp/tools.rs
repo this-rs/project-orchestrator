@@ -15,6 +15,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         project_tool(),
         plan_tool(),
         task_tool(),
+        day_plan_tool(),
         step_tool(),
         decision_tool(),
         constraint_tool(),
@@ -479,6 +480,27 @@ fn task_tool() -> ToolDefinition {
                 "offset": {"type": "integer", "description": "Skip items (list)"},
                 "custom_sections": {"type": "array", "items": {"type": "string"}, "description": "Custom prompt sections to append (build_prompt)"},
                 "session_id": {"type": "string", "description": "Chat session UUID (update) — auto-links session to task+plan when status changes to in_progress"}
+            })),
+            required: Some(vec!["action".to_string()]),
+        },
+    }
+}
+
+fn day_plan_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "day_plan".to_string(),
+        description: "Manage the user's day plan (the ordered list of tasks to do today). Actions: read, add, remove, reorder, move_to_tomorrow".to_string(),
+        input_schema: InputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "action": {
+                    "type": "string",
+                    "enum": ["read", "add", "remove", "reorder", "move_to_tomorrow"],
+                    "description": "Operation to perform"
+                },
+                "date": {"type": "string", "description": "YYYY-MM-DD day (read/reorder; default today)"},
+                "task_id": {"type": "string", "description": "Task UUID (add/remove/move_to_tomorrow)"},
+                "ids": {"type": "array", "items": {"type": "string"}, "description": "Ordered task ids (reorder)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
