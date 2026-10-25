@@ -318,9 +318,12 @@ impl QuotaRegistry {
     }
 
     /// The instance refused with a rate limit. `resets_at_ms` is the provider's date when it gave
-    /// one, else `retry_after_ms` from now. A 429 that names neither is a transient failure (a
-    /// burst), not an exhaustion: nothing is recorded (the turn is retried as before). A later date
-    /// already known for the instance is kept: a 429 never shortens what a window report said.
+    /// one, else `retry_after_ms` from now. A 429 that names NEITHER falls back to
+    /// [`FALLBACK_COOLDOWN`], exactly like a 402: the account did refuse, and a refusal we cannot
+    /// date is still a refusal — sending the next turn to the same place would meet it again.
+    /// `reset_known` stays `false`, so the interface says "about 5 minutes", never an hour it
+    /// invented. A later date already known for the instance is kept: a 429 never shortens what a
+    /// window report said.
     pub fn mark_rate_limited(
         &self,
         instance: &str,
@@ -328,10 +331,8 @@ impl QuotaRegistry {
         retry_after_ms: Option<u64>,
     ) {
         let now = self.now_ms();
-        let resets = resets_at_ms.or_else(|| retry_after_ms.map(|d| now + d));
-        if resets.is_some() {
-            self.mark(instance, resets, ExhaustionCause::RateLimited);
-        }
+        let resets = resets_at_ms.or_else(|| retry_after_ms.map(|d| now.saturating_add(d)));
+        self.mark(instance, resets, ExhaustionCause::RateLimited);
     }
 
     /// The account has no credit left. No date exists for a top-up: the fallback cooldown holds
@@ -344,7 +345,10 @@ impl QuotaRegistry {
         let now = self.now_ms();
         let (until, known) = match resets_at_ms {
             Some(at) => (at, true),
-            None => (now + FALLBACK_COOLDOWN.as_millis() as u64, false),
+            None => (
+                now.saturating_add(FALLBACK_COOLDOWN.as_millis() as u64),
+                false,
+            ),
         };
         {
             let mut entries = self.lock();
@@ -550,6 +554,26 @@ mod tests {
         assert_eq!(
             registry.exhausted("other").unwrap().resets_at_ms,
             clock.now().timestamp_millis() as u64 + 90_000
+        );
+
+        // A 429 that names NEITHER a date nor a delay: the account refused, so it is held out on
+        // the fallback cooldown like a 402 — and `reset_known` is false, so nothing invents an
+        // hour. This is what docs/guides/providers.md promises; the code used to record nothing.
+        let bare = clock.now().timestamp_millis() as u64;
+        registry.mark_rate_limited("bare", None, None);
+        let held = registry
+            .exhausted("bare")
+            .expect("a bare 429 still holds it out");
+        assert!(!held.reset_known, "no date was given, none is invented");
+        assert_eq!(held.cause, ExhaustionCause::RateLimited);
+        assert_eq!(
+            held.resets_at_ms,
+            bare + FALLBACK_COOLDOWN.as_millis() as u64
+        );
+        clock.advance(FALLBACK_COOLDOWN + Duration::from_secs(1));
+        assert!(
+            registry.exhausted("bare").is_none(),
+            "and it comes back by itself"
         );
     }
 

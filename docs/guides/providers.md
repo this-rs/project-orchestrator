@@ -295,8 +295,10 @@ replaces an older manual entry, and a manual entry made after the last report re
   Codex its own limit update. Nexus reads the wire and gives the backend windows in epoch
   milliseconds; the backend never parses the payload itself.
 - **a refusal** — `ProviderError::RateLimited { resets_at_ms }` marks the account exhausted until
-  that instant. A 402 (out of credit) or a 429 with no date falls back to a 300 s cooldown, and
-  **only** then: a mute refusal never shortens a reset already known.
+  that instant. A 402 (out of credit) or a 429 that names neither a date nor a delay falls back to
+  a 300 s cooldown, and **only** then: a mute refusal never shortens a reset already known. Such an
+  entry is flagged `reset_known: false`, so an interface says "about 5 minutes" rather than an hour
+  it invented.
 - **manual** — what a person types for a provider that exposes nothing.
 
 ### Routes

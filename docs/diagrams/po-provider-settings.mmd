@@ -1,12 +1,14 @@
 %% name: po-provider-settings
 %% covers: backend:src/api/provider_handlers.rs backend:src/api/network_tools_handlers.rs backend:src/api/quota_handlers.rs
-%% verified: 1845c812
+%% verified: 2f2176e6
 %% ---
 %% PROUVE : les routes de réglages des providers (A15, A19, A24, A25, A28, A32, A37) : instances, test de
 %%   connexion, consentement, rôles, alias, politique de modèle, journal d'envoi. La logique pure est dans
 %%   po-chat-provider (settings.rs) ; ici, les routes et leurs gardes.
 %% ---
 %% SOURCES LUES :
+%%   src/api/quota_handlers.rs — list_quotas, get_quota, put_quota, delete_quota, validate_manual (QUOTA) ;
+%%                                   le REGISTRE lui-meme (chat/provider/quota.rs) est dans po-chat-provider
 %%   src/api/provider_handlers.rs — create/update/delete/test_provider, provider_status, provider_models,
 %%                                   list/allow/revoke consent, roles, aliases, policy, send_journal, require_human (partagé)
 %%   src/api/routing_handlers.rs  — get/put_routing, get/put/delete_project_routing (fichier possédé par po-cognitive-routing ; ses routes sont montrées ici)
@@ -48,6 +50,16 @@ flowchart TD
         HOSTKEY["✅ POST /providers/ssh-host-key {host, ssh_port?} : ssh-keyscan (arguments explicites, `--` avant l'hôte, jamais un shell), hôte validé par la même charset que le transport, 10 s au total, sortie plafonnée à 64 Ko, kill_on_drop ; renvoie la première clé valide et son empreinte pour qu'une PERSONNE la confirme (TOFU rendu explicite, rien n'est stocké) ; humain seulement, porte A32<br/>test : the_host_key_route_refuses_hostile_hosts_before_any_process_starts, the_first_valid_key_line_is_parsed_and_noise_is_skipped, a_scan_that_hangs_is_cut_at_the_deadline, a_scan_that_never_stops_writing_is_capped"]
         STATUS["✅ GET /providers/{id}/status : santé mesurée<br/>test : a_saved_instances_status_is_its_real_health_not_unknown"]
         PATCH["✅ PUT|PATCH /providers/{id} : l'id ne change jamais ; changer l'origine OU la référence d'identifiant invalide les consentements (consents_invalidated)<br/>test : consent_is_bound_to_the_origin_and_stops_holding_when_it_changes"]
+    end
+
+    subgraph quotaroutes["Quota d'un compte (QUOTA) — quota_handlers.rs"]
+        QGET["✅ GET /api/chat/provider-quotas et GET /providers/{id}/quota : {now_ms, quota|quotas} — l'horloge du SERVEUR est rendue pour que l'interface montre le reset dans le fuseau du lecteur sans croire la sienne ; `quota: null` quand rien n'est connu ; instance inconnue = 404 ; LECTURE ouverte à toute personne connectée<br/>test : a_plausible_entry_is_accepted (validation), the_quota_route_is_a_human_only_mutation_but_its_read_is_open"]
+        QPUT["✅ PUT /providers/{id}/quota : saisie d'une PERSONNE pour un provider qui n'expose rien ({exhausted_until_ms} OU {utilization, resets_at_ms, window}) ; au-delà de 400 jours, hors 0..=1, ou un corps qui ne dit rien = refusé avec sa raison<br/>test : a_typo_is_refused_with_its_reason"]
+        QHUMAN["✅ MUTATIONS = personne seulement, DEUX fois : le middleware refuse un jeton d'agent sous /api/chat/providers, ET le handler revérifie require_human AVANT de lire le registre (une personne obtient 501 quand le routeur est arrêté, preuve qu'elle est passée). Un quota décide quel provider un routeur peut utiliser : un agent qui l'écrirait choisirait le moteur sur lequel il tourne.<br/>tests : an_agent_token_may_not_write_a_quota_while_a_person_may (routeur), the_handler_refuses_an_agent_by_itself_without_the_middleware (handler seul — la mutation de require_human SURVIVAIT au seul test de routeur)"]
+        QDEL["✅ DELETE /providers/{id}/quota : oublie ce qui est connu (personne seulement). Et DELETE /providers/{id} purge `quota:&lt;id&gt;` : un id peut être recréé, un quota qui survivrait à son instance tiendrait la NOUVELLE à l'écart jusqu'à un reset inexplicable<br/>test : deleting_an_instance_forgets_its_quota_so_a_new_one_starts_clean"]
+        QGET --> QPUT
+        QPUT --> QHUMAN
+        QGET --> QDEL
     end
 
     subgraph agentsurf["Surface agent — l'outil MCP `provider` (B-M1)"]
