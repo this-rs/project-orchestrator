@@ -1592,6 +1592,7 @@ impl ToolRefGroupId {
                 "provider",
                 "vault",
                 "milestone",
+                "day_plan",
             ],
             Self::Knowledge => &["note", "decision", "commit"],
             Self::CodeExploration => &["code", "analysis_profile"],
