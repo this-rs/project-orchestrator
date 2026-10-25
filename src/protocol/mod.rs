@@ -32,5 +32,9 @@ pub mod runner;
 mod runner_tests;
 pub mod seed;
 pub mod seed_runner;
+pub mod validate;
 
 pub use models::*;
+pub use validate::{
+    validate_protocol_structure, ProtocolViolation, ValidatableState, ValidatableTransition,
+};
