@@ -498,7 +498,7 @@ impl QuotaRegistry {
             .get(instance)?
             .windows
             .iter()
-            .filter(|w| w.resets_at_ms.map_or(true, |r| r > now))
+            .filter(|w| w.resets_at_ms.is_none_or(|r| r > now))
             .filter_map(|w| w.utilization)
             .filter(|u| u.is_finite())
             .fold(None, |acc: Option<f64>, u| {
