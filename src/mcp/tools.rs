@@ -1245,13 +1245,13 @@ fn skill_tool() -> ToolDefinition {
 fn protocol_tool() -> ToolDefinition {
     ToolDefinition {
         name: "protocol".to_string(),
-        description: "Manage protocols (Pattern Federation FSMs). Actions: list, create, get, update, delete, add_state, delete_state, list_states, add_transition, delete_transition, list_transitions, link_to_skill, start_run, get_run, list_runs, transition, cancel_run, fail_run, report_progress, delete_run, route, compose, simulate, get_run_tree, get_run_children".to_string(),
+        description: "Manage protocols (Pattern Federation FSMs). Actions: list, create, get, update, delete, add_state, delete_state, list_states, add_transition, delete_transition, list_transitions, link_to_skill, start_run, get_run, list_runs, transition, cancel_run, fail_run, report_progress, delete_run, route, compose, simulate, get_run_tree, get_run_children, validate_all".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update", "delete", "add_state", "delete_state", "list_states", "add_transition", "delete_transition", "list_transitions", "link_to_skill", "start_run", "get_run", "list_runs", "transition", "cancel_run", "fail_run", "report_progress", "delete_run", "route", "compose", "simulate", "get_run_tree", "get_run_children"],
+                    "enum": ["list", "create", "get", "update", "delete", "add_state", "delete_state", "list_states", "add_transition", "delete_transition", "list_transitions", "link_to_skill", "start_run", "get_run", "list_runs", "transition", "cancel_run", "fail_run", "report_progress", "delete_run", "route", "compose", "simulate", "get_run_tree", "get_run_children", "validate_all"],
                     "description": "Operation to perform"
                 },
                 "protocol_id": {"type": "string", "description": "Protocol UUID (get/update/delete/add_state/delete_state/list_states/add_transition/delete_transition/list_transitions/link_to_skill/start_run/list_runs)"},
