@@ -2188,6 +2188,15 @@ pub trait GraphStore: Send + Sync {
     /// Update the permission_mode field on a chat session node
     async fn update_chat_session_permission_mode(&self, id: Uuid, mode: &str) -> Result<()>;
 
+    /// Adds `delta_usd` to the spend of the CHILDREN of a session (sub-agents of the `Agent`
+    /// tool, PYSR-3) and returns the new children total. Kept APART from `total_cost_usd`, which
+    /// stays the session's OWN cost: the routing decision of the parent is closed on its own
+    /// cost only, the child's cost being carried by the child's own decision (AUTO-SUB).
+    async fn add_chat_session_children_cost(&self, id: Uuid, delta_usd: f64) -> Result<f64>;
+
+    /// The spend of the children of a session (`0.0` when none was recorded).
+    async fn get_chat_session_children_cost(&self, id: Uuid) -> Result<f64>;
+
     /// Record whether a PERSON lifted the session's file scope (decision fce98b8a):
     /// [`ChatSessionNode::file_scope_lifted`].
     async fn update_chat_session_file_scope_lifted(&self, id: Uuid, lifted: bool) -> Result<()>;
