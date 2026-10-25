@@ -128,6 +128,8 @@ mod tests {
             healthy: Some(healthy),
             allowed_for_project: allowed,
             sandboxed: false,
+            quota_exhausted: None,
+            quota_utilization: None,
         }
     }
 

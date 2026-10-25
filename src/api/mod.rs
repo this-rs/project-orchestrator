@@ -31,6 +31,7 @@ pub mod project_handlers;
 pub mod protocol_handlers;
 pub mod provider_handlers;
 pub mod query;
+pub mod quota_handlers;
 pub mod reason_handlers;
 pub mod refs_handlers;
 #[cfg(test)]

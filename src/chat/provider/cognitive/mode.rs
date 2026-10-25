@@ -25,6 +25,10 @@ pub const MAX_EXPLORATION_EPSILON: f64 = 0.25;
 pub const DEFAULT_COST_WEIGHT: f64 = 0.3;
 /// Default weight of the normalised latency in the utility.
 pub const DEFAULT_LATENCY_WEIGHT: f64 = 0.1;
+/// Default weight of the quota pressure in the utility: how strongly the router prefers an
+/// account that is NOT near its limit, once past [`QUOTA_NEAR_LIMIT`](crate::chat::provider::quota::QUOTA_NEAR_LIMIT).
+/// A soft preference, never an exclusion (that is `RejectReason::QuotaExhausted`); 0 disables it.
+pub const DEFAULT_QUOTA_WEIGHT: f64 = 0.2;
 /// Default window (decisions) after which a learnt arm that does worse than the
 /// declarative choice demotes the stage back to `shadow`.
 pub const DEFAULT_DEMOTE_AFTER: u32 = 20;
@@ -148,6 +152,9 @@ fn default_cost_weight() -> f64 {
 fn default_latency_weight() -> f64 {
     DEFAULT_LATENCY_WEIGHT
 }
+fn default_quota_weight() -> f64 {
+    DEFAULT_QUOTA_WEIGHT
+}
 fn default_demote_after() -> u32 {
     DEFAULT_DEMOTE_AFTER
 }
@@ -175,6 +182,10 @@ pub struct RoutingSettings {
     /// Weight of the normalised latency in the utility, `0.0..=1.0`.
     #[serde(default = "default_latency_weight")]
     pub latency_weight: f64,
+    /// Weight of the quota pressure in the utility, `0.0..=1.0`: how strongly an account near
+    /// its limit is avoided while it still serves. 0 disables the preference.
+    #[serde(default = "default_quota_weight")]
+    pub quota_weight: f64,
     /// Decisions after which a worse learnt arm demotes the stage, `>= 5`.
     #[serde(default = "default_demote_after")]
     pub demote_after: u32,
@@ -189,6 +200,7 @@ impl Default for RoutingSettings {
             exploration_epsilon: DEFAULT_EXPLORATION_EPSILON,
             cost_weight: DEFAULT_COST_WEIGHT,
             latency_weight: DEFAULT_LATENCY_WEIGHT,
+            quota_weight: DEFAULT_QUOTA_WEIGHT,
             demote_after: DEFAULT_DEMOTE_AFTER,
         }
     }
@@ -261,6 +273,7 @@ pub fn validate_routing_settings(settings: &RoutingSettings) -> Result<(), Routi
     )?;
     in_bounds("cost_weight", settings.cost_weight, 1.0)?;
     in_bounds("latency_weight", settings.latency_weight, 1.0)?;
+    in_bounds("quota_weight", settings.quota_weight, 1.0)?;
     if settings.demote_after < MIN_DEMOTE_AFTER {
         return Err(RoutingError::InvalidWeight(format!(
             "demote_after must be at least {MIN_DEMOTE_AFTER}"
@@ -583,6 +596,7 @@ mod tests {
             exploration_epsilon: 0.2,
             cost_weight: 1.0,
             latency_weight: 0.0,
+            quota_weight: 0.4,
             demote_after: 5,
         };
         let v = serde_json::to_value(&s).unwrap();

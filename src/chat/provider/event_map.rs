@@ -401,6 +401,9 @@ impl EventMapper {
             }
             // A notice is a diagnostic: nothing in a turn.
             AgentEvent::ProviderNotice { .. } => Vec::new(),
+            // The account's limits go to the quota registry (`AgentSessionHandle::observe_quota`),
+            // not to the thread: nothing to show in a turn.
+            AgentEvent::Quota { .. } => Vec::new(),
             // `AgentEvent` is non-exhaustive: an unknown event is ignored.
             _ => Vec::new(),
         }

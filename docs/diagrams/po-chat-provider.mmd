@@ -1,6 +1,6 @@
 %% name: po-chat-provider
-%% covers: backend:src/chat/provider/{catalog,circuit_breaker,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,nexus_tools,oneshot,outage,policy,resolver,settings,store}.rs backend:src/chat/provider/limits/** backend:src/chat/deferred_tools.rs
-%% verified: 459cab6f
+%% covers: backend:src/chat/provider/{catalog,circuit_breaker,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,nexus_tools,oneshot,outage,policy,quota,resolver,settings,store}.rs backend:src/chat/provider/limits/** backend:src/chat/deferred_tools.rs
+%% verified: 5573620a
 %% ---
 %% PROUVE : le RÉSOLVEUR backend de provider (décisions A1, A16, A18, A29, A43) : quel
 %%   provider/modèle pour une demande, comment une erreur d'ouverture devient un statut HTTP
@@ -22,6 +22,8 @@
 %%   src/chat/provider/credentials.rs — VaultCredentialResolver ; src/vault/service.rs — read_for_provider
 %%   src/chat/provider/nexus_tools.rs — attach, sign_profile, SessionToolsToken, check_call, ToolAccessHooks, ToolAccessError, resolve_search_key ;
 %%                                   ChatManager::build_agent_spec (point d attache) ; src/auth/agent_tokens.rs — register_tools, tools_live
+%%   src/chat/provider/quota.rs    — QuotaRegistry, QuotaEntry, Exhaustion, ExhaustionCause, ManualQuota, QuotaView,
+%%                                   QuotaStore/GraphQuotaStore, QUOTA_NEAR_LIMIT, FALLBACK_COOLDOWN ; src/api/quota_handlers.rs (routes : po-provider-settings)
 %%   src/chat/provider/policy.rs   — parse_mode, to_legacy, neutral_name, legacy_name,
 %%                                   tool_policy, wire_tool_policy
 %%   nexus_claude::agent           — ProviderError, PolicyMode, ToolPolicy (contrat nexus)
@@ -155,6 +157,26 @@ flowchart TD
         LIMTODO["🟠 NON BRANCHÉ : aucun appelant de production — le tour de chat ne réserve pas encore avant l'envoi ni ne règle après (RL5) ; couture prête : limits::report(record, Some(&ledger)) remplit used/remaining/resets_at/status de la route RL7 sans changer une clé, Ledger::standing alimente le classifieur ; CONTRAT NEXUS : ProviderError::Overloaded et RateLimited{retry_after_ms} existent DÉJÀ (agent/error.rs) — rien à ajouter côté nexus ; le repli from_provider_error lit un rate_limited sans quota comme une surcharge, jamais comme un épuisement"]
     end
     NEXUS -.-> LIMTODO
+    subgraph quota["quota.rs — QUOTA : jusqu'à QUAND un COMPTE refuse (état par instance, persisté)"]
+        QREG["✅ QuotaRegistry : un état par instance de provider, horloge INJECTÉE (Clock) ;<br/>persisté en LlmSetting (portée global, clé quota:&lt;instance&gt;) donc il survit au redémarrage<br/>tests : the_entries_survive_a_restart, the_graph_store_round_trips_through_llm_settings"]
+        QLIVE["✅ source LIVE — AgentEvent::Quota du provider (Claude Code rate_limit_event, Codex) → observe() :<br/>fenêtres {kind, utilization, resets_at, status} en epoch ms, c'est NEXUS qui lit le filaire<br/>test : the_recorded_rate_limit_event_of_the_cli_lands_in_the_registry_through_nexus (fixture RÉELLE du CLI 2.1.296)"]
+        QERR["✅ source REFUS — ProviderError::RateLimited{resets_at_ms} → épuisé jusqu'à CET instant ;<br/>402 / crédit épuisé ou 429 sans date → FALLBACK_COOLDOWN (300 s) SEULEMENT faute de reset connu ;<br/>un refus muet ne RACCOURCIT jamais un reset déjà connu<br/>tests : a_refusal_without_a_date_holds_the_fallback_cooldown_and_a_dated_one_holds_its_date, a_refusal_never_shortens_a_reset_already_known"]
+        QMAN["✅ source MANUELLE — saisie d'une PERSONNE pour un provider qui n'expose rien (source: manual) ;<br/>le mot le PLUS RÉCENT gagne, dans les deux sens : un live postérieur remplace un manuel, et l'inverse<br/>tests : the_newest_word_wins_between_a_person_and_the_provider, a_manual_date_in_the_past_exhausts_nothing"]
+        QEXH["✅ exhausted(instance) → None dès que resets_at est passé : l'instance revient SEULE,<br/>personne n'a rien à faire et aucune tâche de fond ne tourne (c'est l'horloge qui décide)<br/>test : an_exhausted_window_holds_the_instance_out_until_its_reset_then_lets_it_back"]
+        QPRESS["✅ pressure(instance) = la fenêtre la PLUS pleine ; None (non mesuré) n'est PAS 0 (vide) —<br/>ce que lit le scorer pour sa préférence douce au-delà de QUOTA_NEAR_LIMIT (0,9) : voir po-cognitive-routing<br/>test : the_pressure_is_the_fullest_window_and_an_unmeasured_account_stays_unknown"]
+        QREG --> QLIVE
+        QREG --> QERR
+        QREG --> QMAN
+        QREG --> QEXH
+        QREG --> QPRESS
+    end
+    QMSG["✅ errors.rs — un 429 qui connaît son reset NOMME l'heure (quota_exhausted_message) :<br/>en choix explicite on ne bascule JAMAIS en silence, le message dit quand le compte sert à nouveau<br/>test : a_rate_limit_with_a_reset_names_the_hour_and_never_offers_a_silent_switch"]
+    NEXUS -.-> QLIVE
+    OPEN -.-> QERR
+    QERR -.-> QMSG
+    QEXH -.-> CATALOG
+    NOTHEALTH["⚪ le quota n'est PAS la santé : un compte épuisé RÉPOND, et dit non.<br/>Il ne passe ni par `healthy` ni par le disjoncteur (qui peut LIRE ce registre, pas l'inverse)"]
+    QEXH -.-> NOTHEALTH
     TODO["🟠 non branché : create_session / resume_session / runner n'appellent pas encore resolve ;<br/>system_init ne porte pas tool_policy ; VaultCredentialResolver n'est passé à aucun registre"]
     BUILTIN -.-> TODO
     OPEN -.-> TODO

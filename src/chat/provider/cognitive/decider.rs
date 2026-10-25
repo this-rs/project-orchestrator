@@ -165,6 +165,7 @@ fn mean_utility(scored: &Scored, settings: &RoutingSettings) -> f64 {
     scored.alpha / (scored.alpha + scored.beta)
         - settings.cost_weight * scored.cost_norm
         - settings.latency_weight * scored.latency_norm
+        - settings.quota_weight * scored.quota_norm
 }
 
 /// The hysteresis margin: how much better than the pair in force a challenger
@@ -502,10 +503,6 @@ pub fn is_out_of_credit(error: &nexus_claude::agent::ProviderError) -> bool {
     )
 }
 
-/// How long an out-of-credit instance stays out of the routing pool before it is
-/// re-checked (the next pool build re-probes it; if credit returned it resumes).
-pub const OUT_OF_CREDIT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(300);
-
 /// Capability probes of the routing: (instance, model) to what is known.
 pub type ProbeLog = std::collections::HashMap<(String, String), ProbeMark>;
 
@@ -739,10 +736,10 @@ pub struct CognitiveRouting {
     /// What is known of each native model's capability probe: a probe is sent once
     /// per model (a failure is retried later, a conclusion never), never twice at once.
     pub probed: Arc<std::sync::Mutex<ProbeLog>>,
-    /// Per-instance "out of credit" cooldown: when a 402 is observed, the instance is
-    /// excluded from the routing pool until this instant. It re-checks (and resumes)
-    /// once the cooldown has elapsed and the next probe/send sees credit again.
-    pub credit_until: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
+    /// Quota of every instance (QUOTA): until when an account refuses (its own report, a dated
+    /// refusal, a person's entry), and the fixed cooldown of a refusal that names no date. One
+    /// registry for the pool filter, the fallback after a failure and the send path.
+    pub quota: Arc<super::super::quota::QuotaRegistry>,
     /// The bounds of those probes.
     pub probe_policy: ProbePolicy,
     /// Where decisions and arms live, when the standard wiring built this; it is
@@ -770,7 +767,7 @@ impl CognitiveRouting {
             hints,
             health: Arc::new(candidates::HealthCache::standard()),
             probed: Default::default(),
-            credit_until: Default::default(),
+            quota: Default::default(),
             probe_policy: ProbePolicy::standard(),
             store: Some(store),
             segment_store: None,
@@ -785,7 +782,7 @@ impl CognitiveRouting {
             hints: Arc::new(RwLock::new(PriorHints::new())),
             health: Arc::new(candidates::HealthCache::standard()),
             probed: Default::default(),
-            credit_until: Default::default(),
+            quota: Default::default(),
             probe_policy: ProbePolicy::standard(),
             store: None,
             segment_store: None,
@@ -802,6 +799,13 @@ impl CognitiveRouting {
         self
     }
 
+    /// This router reading its quota from `registry` (the standard wiring shares one with the
+    /// chat runtime and the API; the default is private and in memory).
+    pub fn with_quota(mut self, registry: Arc<super::super::quota::QuotaRegistry>) -> Self {
+        self.quota = registry;
+        self
+    }
+
     /// Attaches a graph-backed segment store, so a conversation's segments and
     /// boundaries outlive the process. Without it the default is in-memory only.
     pub fn with_segment_store(mut self, store: Arc<dyn SegmentStore>) -> Self {
@@ -809,22 +813,16 @@ impl CognitiveRouting {
         self
     }
 
-    /// Marks `instance` out of credit for [`OUT_OF_CREDIT_COOLDOWN`].
-    pub fn mark_out_of_credit(&self, instance: &str, now: std::time::Instant) {
-        self.credit_until
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(instance.to_owned(), now + OUT_OF_CREDIT_COOLDOWN);
+    /// Marks `instance` out of credit: held out for [`super::super::quota::FALLBACK_COOLDOWN`]
+    /// (no date exists for a top-up), unless a reset is already known.
+    pub fn mark_out_of_credit(&self, instance: &str) {
+        self.quota.mark_out_of_credit(instance);
     }
 
     /// Whether `instance` is currently out of credit and must be excluded from
     /// the routing pool.
-    pub fn out_of_credit(&self, instance: &str, now: std::time::Instant) -> bool {
-        self.credit_until
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(instance)
-            .is_some_and(|until| now < *until)
+    pub fn out_of_credit(&self, instance: &str) -> bool {
+        self.quota.exhausted(instance).is_some()
     }
 
     /// Replaces the alias hints.
@@ -860,6 +858,8 @@ mod tests {
             healthy: Some(true),
             allowed_for_project: true,
             sandboxed: false,
+            quota_exhausted: None,
+            quota_utilization: None,
         }
     }
 
@@ -894,6 +894,106 @@ mod tests {
         let store = Arc::new(InMemoryRoutingStore::new());
         let decider = CognitiveDecider::new(store.clone());
         (decider.decide(request).await.unwrap(), store)
+    }
+
+    /// QUOTA — the test that fails without the change: a pool {A, B} where A has a quota used up
+    /// until T. Auto never picks A, and the alternative A says `quota_exhausted` with T (before the
+    /// change it said `unhealthy`, or A stayed a candidate when only the 429 text was known). At
+    /// T + 1 s, on the same registry and the same clock, A is eligible again: nobody did anything.
+    #[tokio::test]
+    async fn a_provider_whose_quota_is_used_up_is_excluded_until_its_reset_then_back() {
+        use crate::chat::provider::limits::ManualClock;
+        use crate::chat::provider::quota::QuotaRegistry;
+        use nexus_claude::agent::{QuotaSnapshot, QuotaStatus, QuotaWindow};
+
+        let clock = Arc::new(ManualClock::at("2026-10-21T10:00:00Z"));
+        let quota = QuotaRegistry::new().with_clock(clock.clone());
+        let reset_ms = 1_792_836_000_000_u64; // 2026-10-24T10:00:00Z
+        quota.observe(
+            "deepseek",
+            &QuotaSnapshot::live(vec![QuotaWindow {
+                kind: "seven_day".into(),
+                utilization: Some(1.0),
+                resets_at_ms: Some(reset_ms),
+                status: QuotaStatus::Exhausted,
+            }]),
+        );
+        let pool_at = || {
+            let mut pool = vec![facts("deepseek", "v4", 1.0), facts("glm", "big", 2.0)];
+            candidates::apply_quota(&mut pool, &quota);
+            pool
+        };
+        let mut req = request(pilot(), ProviderRoutingMode::Full, LearningStage::Auto);
+        req.pool = pool_at();
+        let (decision, _) = decide(&req).await;
+        assert_eq!(
+            decision.chosen.as_ref().map(|p| p.provider_id.as_str()),
+            Some("glm")
+        );
+        let rejected = decision
+            .alternatives
+            .iter()
+            .find(|a| a.pick.provider_id == "deepseek")
+            .and_then(|a| a.rejected.clone())
+            .expect("the exhausted provider is listed as rejected");
+        assert_eq!(rejected.code(), "quota_exhausted");
+        assert_eq!(
+            rejected,
+            RejectReason::QuotaExhausted {
+                resets_at_ms: reset_ms,
+                window: Some("seven_day".into())
+            }
+        );
+
+        // A second before the reset it is still out; one second after, it is back.
+        clock.advance(std::time::Duration::from_secs(3 * 86_400 - 1));
+        req.pool = pool_at();
+        assert!(req.pool[0].quota_exhausted.is_some());
+        clock.advance(std::time::Duration::from_secs(2));
+        req.pool = pool_at();
+        assert!(req.pool[0].quota_exhausted.is_none());
+        let (decision, _) = decide(&req).await;
+        let deepseek = decision
+            .alternatives
+            .iter()
+            .find(|a| a.pick.provider_id == "deepseek")
+            .expect("listed");
+        assert_eq!(deepseek.rejected, None, "eligible again at the reset");
+    }
+
+    /// An account that is out is not an unhealthy one: `healthy` is not what says it, and the
+    /// quota reason is tested before health (the reason must carry the instant it is back). When
+    /// every candidate is out the decision picks nobody (the caller keeps the session's engine)
+    /// instead of failing.
+    #[test]
+    fn the_quota_reason_comes_before_health_and_all_exhausted_picks_nobody() {
+        let mut a = facts("deepseek", "v4", 1.0);
+        a.healthy = Some(false);
+        a.quota_exhausted = Some(candidates::QuotaExhaustion {
+            resets_at_ms: 42,
+            window: None,
+        });
+        let mut b = facts("glm", "big", 2.0);
+        b.quota_exhausted = Some(candidates::QuotaExhaustion {
+            resets_at_ms: 43,
+            window: None,
+        });
+        let mut req = request(pilot(), ProviderRoutingMode::Full, LearningStage::Auto);
+        req.pool = vec![a, b];
+        let decision = decide_with(
+            Uuid::from_u128(1),
+            Utc::now(),
+            &req,
+            &[],
+            &PriorHints::new(),
+        );
+        assert_eq!(decision.chosen, None);
+        let codes: Vec<_> = decision
+            .alternatives
+            .iter()
+            .filter_map(|a| a.rejected.as_ref().map(RejectReason::code))
+            .collect();
+        assert_eq!(codes, ["quota_exhausted", "quota_exhausted"]);
     }
 
     /// A decision with a known chosen pair, made from an empty store: its arm is
@@ -1767,21 +1867,26 @@ mod tests {
             resets_at_ms: None,
         }));
 
-        let routing = CognitiveRouting::new(std::sync::Arc::new(InMemoryRoutingStore::new()));
-        let t0 = std::time::Instant::now();
-        assert!(!routing.out_of_credit("deepseek", t0));
-        routing.mark_out_of_credit("deepseek", t0);
-        assert!(routing.out_of_credit("deepseek", t0));
-        assert!(routing.out_of_credit(
-            "deepseek",
-            t0 + OUT_OF_CREDIT_COOLDOWN - std::time::Duration::from_secs(1)
+        let clock = std::sync::Arc::new(crate::chat::provider::limits::ManualClock::at(
+            "2026-10-21T10:00:00Z",
         ));
-        assert!(!routing.out_of_credit(
-            "deepseek",
-            t0 + OUT_OF_CREDIT_COOLDOWN + std::time::Duration::from_secs(1)
-        ));
+        let routing = CognitiveRouting::new(std::sync::Arc::new(InMemoryRoutingStore::new()))
+            .with_quota(std::sync::Arc::new(
+                crate::chat::provider::quota::QuotaRegistry::new().with_clock(clock.clone()),
+            ));
+        let cooldown = crate::chat::provider::quota::FALLBACK_COOLDOWN;
+        assert!(!routing.out_of_credit("deepseek"));
+        routing.mark_out_of_credit("deepseek");
+        assert!(routing.out_of_credit("deepseek"));
+        clock.advance(cooldown - std::time::Duration::from_secs(1));
+        assert!(routing.out_of_credit("deepseek"));
+        clock.advance(std::time::Duration::from_secs(2));
+        assert!(
+            !routing.out_of_credit("deepseek"),
+            "back after the cooldown"
+        );
         // Another instance is unaffected.
-        assert!(!routing.out_of_credit("claude-code", t0));
+        assert!(!routing.out_of_credit("claude-code"));
     }
 
     /// Review of #709 (N2): a model the catalogue lists without tools is never reserved,

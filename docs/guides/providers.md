@@ -281,6 +281,91 @@ The figures are read from the `result` events stored with the turns, for every p
 
 An OpenAI-compatible endpoint (DeepSeek, vLLM…) never reports a cache write, so `cache_creation_tokens` stays absent rather than zero. The native harness also writes one INFO line per model request (`native model request`, target `nexus_claude::native::request`): `host_session_id` is the conversation id, followed by `prompt_tokens`, `cached_tokens`, `latency_ms` and the prefix fingerprint.
 
+## Quotas (how much is left, and until when)
+
+A quota is not health: an exhausted account **answers, and says no**. It is held per provider
+instance, with the instant it serves again, and it survives a restart (`LlmSetting`, scope `global`,
+key `quota:<instance>`).
+
+Three things can say so, and **the most recent word wins, whoever said it** — a live report
+replaces an older manual entry, and a manual entry made after the last report replaces that:
+
+- **live** — the provider's own report (`AgentEvent::Quota`): Claude Code emits `rate_limit_event`
+  at every turn (`five_hour` and `seven_day` windows, each with its utilisation and `resetsAt`),
+  Codex its own limit update. Nexus reads the wire and gives the backend windows in epoch
+  milliseconds; the backend never parses the payload itself.
+- **a refusal** — `ProviderError::RateLimited { resets_at_ms }` marks the account exhausted until
+  that instant. A 402 (out of credit) or a 429 with no date falls back to a 300 s cooldown, and
+  **only** then: a mute refusal never shortens a reset already known.
+- **manual** — what a person types for a provider that exposes nothing.
+
+### Routes
+
+| Route | Who |
+|---|---|
+| `GET /api/chat/provider-quotas` | anyone signed in — `{ now_ms, quotas: [...] }` |
+| `GET /api/chat/providers/{id}/quota` | anyone signed in — `{ now_ms, quota }`, `quota: null` when nothing is known |
+| `PUT /api/chat/providers/{id}/quota` | **a person only** (an agent token gets 403) |
+| `DELETE /api/chat/providers/{id}/quota` | **a person only** — forgets what is known |
+
+A quota decides which provider a router may use, so an agent must not write one: it would choose the
+engine it runs on. Mutations under `/api/chat/providers` are reserved to a human session by the auth
+middleware, and the handler checks again. Reads stay open.
+
+One entry of `quotas` (and the `quota` of the single-instance route):
+
+```json
+{
+  "provider_id": "claude-code",
+  "windows": [
+    { "kind": "seven_day", "utilization": 0.97, "resets_at_ms": 1792828800000, "status": "allowed_warning" }
+  ],
+  "source": "live",
+  "observed_at_ms": 1792500000000,
+  "exhausted": { "resets_at_ms": 1792828800000, "reset_known": true, "window": "seven_day", "cause": "window" }
+}
+```
+
+`exhausted` is absent when the account serves (and disappears on its own once the reset has passed —
+nothing runs in the background; the registry simply compares against its clock). `cause` is one of
+`window`, `rate_limited`, `out_of_credit`, `manual`. `now_ms` is the server's clock, so an interface
+shows the reset in the viewer's time zone without trusting its own.
+
+The body of a `PUT` says either until when the account refuses, or where a window stands:
+
+```json
+{ "exhausted_until_ms": 1792600000000 }
+{ "utilization": 0.8, "resets_at_ms": 1792828800000, "window": "seven_day" }
+```
+
+A date further than 400 days away, a utilisation outside `0..=1`, or a body that says nothing at all
+is refused with its reason.
+
+### What Auto does with it
+
+- **Exhausted is a hard exclusion**, until the reset: the candidate is rejected with
+  `quota_exhausted` carrying `resets_at_ms` and the window, and the routing reason says it in
+  words. The exclusion is tested **before** health, because "unhealthy" could not say until when.
+  The instance becomes eligible again at its reset with nobody doing anything.
+- **Near the limit is a soft preference**, not an exclusion: past `QUOTA_NEAR_LIMIT` (0.9 of a
+  window) the utility drops by `quota_weight` × how far past it is (full window = the whole
+  weight). `quota_weight` lives in the routing settings beside `cost_weight` and `latency_weight`
+  (default `0.2`, `0` disables it) — the same single source of configuration, no scattered
+  constants. An account nobody has measured pays nothing: unknown is not empty.
+- **An explicit choice is never swapped in silence.** When the provider a person pinned is
+  exhausted, the turn fails with a message naming the hour it serves again, and the options
+  (wait, switch by hand, or let it resume at the reset) — it does not quietly move the
+  conversation elsewhere.
+- A refusal by the account is **not the model failing**: a 429 or an out-of-credit turn feeds no
+  failure to the learnt arm, so a provider is not demoted for being full.
+
+### Not verified here
+
+The windows and resets were exercised against a **recorded** `rate_limit_event` of the Claude Code
+CLI 2.1.296 and against fake providers, with a simulated clock — never against a real account that
+had actually run out. The Codex and HTTP-header mappings are nexus's and are covered there, not by
+the backend suite.
+
 ## Server settings
 
 | Variable | Default | Meaning |

@@ -18,6 +18,7 @@ use super::candidates::ModelFacts;
 use super::mode::{RoutingSettings, MAX_EXPLORATION_EPSILON};
 use super::signature::{ChatIntent, TaskClass, TaskSignature};
 use super::store::{ArmKey, ArmStats};
+use crate::chat::provider::quota::QUOTA_NEAR_LIMIT;
 use crate::chat::provider::settings::ModelAlias;
 
 /// Alias that marks a model as the strong, slow one.
@@ -95,7 +96,10 @@ pub struct Scored {
     pub cost_norm: f64,
     /// Latency penalty term, in `[0, 1]`.
     pub latency_norm: f64,
-    /// `draw - cost_weight * cost_norm - latency_weight * latency_norm`.
+    /// Quota pressure penalty term, in `[0, 1]`: 0 below [`QUOTA_NEAR_LIMIT`], rising to 1 at a
+    /// full window. 0 as well when nothing is known about the account.
+    pub quota_norm: f64,
+    /// `draw - cost_weight * cost_norm - latency_weight * latency_norm - quota_weight * quota_norm`.
     pub utility: f64,
     /// Mean known cost of the arm, when it has one.
     pub arm_mean_cost_usd: Option<f64>,
@@ -103,6 +107,23 @@ pub struct Scored {
     pub est_turn_cost_usd: Option<f64>,
     /// This pair was picked by the exploration draw, not by its utility.
     pub explored: bool,
+}
+
+/// The soft penalty of an account's quota pressure: 0 while the fullest window is at or below
+/// [`QUOTA_NEAR_LIMIT`], then rising linearly to 1 when the window is full. An account nobody has
+/// measured (`None`) is not penalised — it is unknown, not empty.
+///
+/// This only ORDERS candidates that are all still eligible. An account that refuses is removed by
+/// [`RejectReason::QuotaExhausted`](super::candidates::RejectReason) long before this.
+pub fn quota_penalty(utilization: Option<f64>) -> f64 {
+    let Some(used) = utilization.filter(|u| u.is_finite()) else {
+        return 0.0;
+    };
+    let span = 1.0 - QUOTA_NEAR_LIMIT;
+    if span <= 0.0 {
+        return f64::from(used > QUOTA_NEAR_LIMIT);
+    }
+    ((used - QUOTA_NEAR_LIMIT) / span).clamp(0.0, 1.0)
 }
 
 /// The seed of a decision: a stable hash of its id.
@@ -321,9 +342,11 @@ pub fn score(
             let (alpha, beta, n) = posteriors[i];
             let arm_seed = seed ^ stable_hash(&[&class, &facts.provider_id, &facts.model]);
             let draw = beta_draw(alpha, beta, arm_seed);
+            let quota_norm = quota_penalty(facts.quota_utilization);
             let utility = draw
                 - settings.cost_weight * cost_norm[i]
-                - settings.latency_weight * latency_norm[i];
+                - settings.latency_weight * latency_norm[i]
+                - settings.quota_weight * quota_norm;
             Scored {
                 candidate: facts.clone(),
                 alpha,
@@ -333,6 +356,7 @@ pub fn score(
                 p_top1: top1[i],
                 cost_norm: cost_norm[i],
                 latency_norm: latency_norm[i],
+                quota_norm,
                 utility,
                 arm_mean_cost_usd: stored(facts).and_then(ArmStats::mean_cost_usd),
                 est_turn_cost_usd: facts.estimated_turn_cost_usd(signature),
@@ -401,6 +425,8 @@ mod tests {
             healthy: Some(true),
             allowed_for_project: true,
             sandboxed: false,
+            quota_exhausted: None,
+            quota_utilization: None,
         }
     }
 
@@ -420,6 +446,78 @@ mod tests {
         RoutingSettings {
             exploration_epsilon: epsilon,
             ..RoutingSettings::default()
+        }
+    }
+
+    /// QUOTA: the penalty is flat up to [`QUOTA_NEAR_LIMIT`] and only then rises, and an
+    /// unmeasured account is never treated as an empty one.
+    #[test]
+    fn the_quota_penalty_starts_only_past_the_named_threshold() {
+        assert_eq!(quota_penalty(None), 0.0, "unknown is not empty");
+        assert_eq!(quota_penalty(Some(0.0)), 0.0);
+        assert_eq!(
+            quota_penalty(Some(QUOTA_NEAR_LIMIT)),
+            0.0,
+            "at the threshold"
+        );
+        assert_eq!(quota_penalty(Some(1.0)), 1.0, "a full window");
+        // Halfway between the threshold and full.
+        let mid = QUOTA_NEAR_LIMIT + (1.0 - QUOTA_NEAR_LIMIT) / 2.0;
+        assert!((quota_penalty(Some(mid)) - 0.5).abs() < 1e-9);
+        // Monotonic, and clamped on both sides.
+        assert!(quota_penalty(Some(0.95)) < quota_penalty(Some(0.99)));
+        assert_eq!(quota_penalty(Some(2.0)), 1.0, "clamped above");
+        assert_eq!(quota_penalty(Some(-1.0)), 0.0, "clamped below");
+        assert_eq!(quota_penalty(Some(f64::NAN)), 0.0, "never a NaN utility");
+    }
+
+    /// QUOTA: between two pairs the learning cannot separate, the account that is NOT near its
+    /// limit is preferred — a soft preference, which `quota_weight: 0` switches off entirely.
+    /// The near-limit account stays a CANDIDATE: only `RejectReason::QuotaExhausted` removes one.
+    #[test]
+    fn an_account_near_its_limit_is_preferred_last_but_still_scored() {
+        let sig = signature(TaskClass::Simple);
+        let mut near = facts("near", "m", Some(1.0));
+        near.quota_utilization = Some(0.97); // the recorded seven_day of the real fixture
+        let mut fresh = facts("fresh", "m", Some(1.0));
+        fresh.quota_utilization = Some(0.10);
+        // Same arm statistics on both, so only the quota term can separate them.
+        let arms = vec![arm(&sig, &near, 8.0, 2.0), arm(&sig, &fresh, 8.0, 2.0)];
+        let pool = vec![near.clone(), fresh.clone()];
+        let hints = PriorHints::new();
+
+        let s = RoutingSettings {
+            exploration_epsilon: 0.0,
+            cost_weight: 0.0,
+            latency_weight: 0.0,
+            ..RoutingSettings::default()
+        };
+        let out = score(&sig, &pool, &arms, &hints, &s, 7);
+        let by = |p: &str| out.iter().find(|x| x.candidate.provider_id == p).unwrap();
+        assert_eq!(out.len(), 2, "the near-limit account is still a candidate");
+        assert!(
+            (by("near").quota_norm - 0.7).abs() < 1e-9,
+            "0.97 of the way past 0.9"
+        );
+        assert_eq!(by("fresh").quota_norm, 0.0, "below the threshold");
+        assert!(
+            by("near").utility < by("near").draw,
+            "the penalty lowered the near-limit utility"
+        );
+        assert_eq!(
+            by("fresh").utility,
+            by("fresh").draw,
+            "an account far from its limit pays nothing"
+        );
+
+        // The knob is what decides: at 0 the term vanishes and the two utilities are the draws.
+        let off = RoutingSettings {
+            quota_weight: 0.0,
+            ..s.clone()
+        };
+        let out = score(&sig, &pool, &arms, &hints, &off, 7);
+        for x in &out {
+            assert_eq!(x.utility, x.draw, "quota_weight 0 disables the preference");
         }
     }
 

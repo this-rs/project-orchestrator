@@ -86,9 +86,13 @@ diagrams:
     owner: theotime
     status: verified
     file: docs/diagrams/po-provider-settings.mmd
+    # Arbitrage QUOTA : les ROUTES du quota (/api/chat/providers/{id}/quota, human-only comme les
+    # autres mutations de provider) vivent ici ; le REGISTRE lui-meme est dans po-chat-provider
+    # (src/chat/provider/quota.rs) et sa lecture par Auto est decrite dans po-cognitive-routing.
     covers:
       - "backend:src/api/provider_handlers.rs"
       - "backend:src/api/network_tools_handlers.rs"
+      - "backend:src/api/quota_handlers.rs"
   - name: po-chat-provider
     owner: theotime
     status: verified
@@ -96,7 +100,7 @@ diagrams:
     # Resolveur backend seulement : le registre des providers et la table de prix sont dans nexus (A1).
     # Arbitrage : src/chat/provider/cognitive/** (routage cognitif, R2) appartient a po-cognitive-routing.
     covers:
-      - "backend:src/chat/provider/{catalog,circuit_breaker,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,nexus_tools,oneshot,outage,policy,resolver,settings,store}.rs"
+      - "backend:src/chat/provider/{catalog,circuit_breaker,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,nexus_tools,oneshot,outage,policy,quota,resolver,settings,store}.rs"
       - "backend:src/chat/provider/limits/**"
       - "backend:src/chat/deferred_tools.rs"
   - name: po-cognitive-routing

@@ -190,6 +190,15 @@ pub fn turn_reward(
     success.then_some(1.0)
 }
 
+/// Whether a turn that ended in error blames the PROVIDER'S MODEL, for the reward (QUOTA): it does
+/// when the error has a typed provider cause, unless that cause is a refusal of the ACCOUNT (a
+/// rate limit, an exhausted quota, no credit). Such a turn says the instance is out for a while,
+/// not that the arm answers badly: the router excludes the instance until its reset (see
+/// [`super::candidates::RejectReason::QuotaExhausted`]), it does not unlearn the model.
+pub fn provider_fault(error_code: Option<&str>, quota_refusal: bool) -> bool {
+    error_code.is_some() && !quota_refusal
+}
+
 /// A request to decide.
 #[derive(Debug, Clone)]
 pub struct DecideRequest {
@@ -348,6 +357,34 @@ mod tests {
             turn_reward(Some("error"), "error_during_execution", true, true),
             Some(0.0)
         );
+    }
+
+    #[test]
+    fn a_turn_the_account_refused_is_not_the_models_failure() {
+        // R0: a rate limit or an exhausted quota used to read as `provider_error` and cost the
+        // arm a full penalty, so the bandit unlearned a model that was merely out of quota.
+        assert!(!provider_fault(Some("rate_limited"), true));
+        assert_eq!(
+            turn_reward(
+                Some("error"),
+                "error_during_execution",
+                true,
+                provider_fault(Some("rate_limited"), true)
+            ),
+            None
+        );
+        // A genuine provider failure still costs the arm.
+        assert!(provider_fault(Some("protocol"), false));
+        assert_eq!(
+            turn_reward(
+                Some("error"),
+                "error_during_execution",
+                true,
+                provider_fault(Some("protocol"), false)
+            ),
+            Some(0.0)
+        );
+        assert!(!provider_fault(None, false));
     }
 
     #[test]

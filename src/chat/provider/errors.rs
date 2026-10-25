@@ -35,6 +35,10 @@ pub struct OpenFailure {
     /// Delay asked by the provider before retrying, in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
+    /// When the provider serves again (epoch ms), when it said so (QUOTA): the interface shows
+    /// it in the person's time zone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<u64>,
     /// Models the conversation can open on instead, without the vault (Auto
     /// refused on a locked vault). Empty: nothing to offer but unlocking.
     /// `Some` (maybe empty) only for that refusal: the client tells it from a
@@ -139,6 +143,12 @@ impl OpenFailure {
             body.insert(
                 "retry_after_ms".to_string(),
                 serde_json::Value::from(retry_after_ms),
+            );
+        }
+        if let Some(resets_at_ms) = self.resets_at_ms {
+            body.insert(
+                "resets_at_ms".to_string(),
+                serde_json::Value::from(resets_at_ms),
             );
         }
         if let Some(fallbacks) = &self.fallbacks {
@@ -303,6 +313,21 @@ pub fn cause_of(err: &ProviderError) -> Option<String> {
     }
 }
 
+/// The message of a provider whose quota is used up until `resets_at_ms` (QUOTA): the instant it
+/// serves again, in UTC (the interface gets the instant itself, `resets_at_ms`, and shows it in the
+/// person's time zone), and what the person can do. Nothing is switched for them.
+pub fn quota_exhausted_message(resets_at_ms: u64) -> String {
+    let at = i64::try_from(resets_at_ms)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| resets_at_ms.to_string());
+    format!(
+        "The provider's quota is used up: it serves again at {at}. Wait for it, or choose another \
+         provider or model yourself; nothing is switched for you."
+    )
+}
+
 /// Maps a provider error met while opening (or resuming) a session.
 ///
 /// `unauthorized` answers 502, not 401: a 401 would log the user out of the
@@ -310,6 +335,7 @@ pub fn cause_of(err: &ProviderError) -> Option<String> {
 pub fn open_failure(err: &ProviderError, provider_id: Option<&str>) -> OpenFailure {
     let mut action: Option<String> = None;
     let mut retry_after_ms: Option<u64> = None;
+    let mut resets_at_ms: Option<u64> = None;
     let (status, code, message): (u16, &'static str, String) = match err {
         ProviderError::CliNotFound { .. } => (
             424,
@@ -359,13 +385,17 @@ pub fn open_failure(err: &ProviderError, provider_id: Option<&str>) -> OpenFailu
         }
         ProviderError::RateLimited {
             retry_after_ms: delay,
-            ..
+            resets_at_ms: resets,
         } => {
             retry_after_ms = *delay;
+            resets_at_ms = *resets;
             (
                 429,
                 err.kind(),
-                "The provider is rate limiting requests. Try again later.".to_string(),
+                match resets {
+                    Some(at) => quota_exhausted_message(*at),
+                    None => "The provider is rate limiting requests. Try again later.".to_string(),
+                },
             )
         }
         ProviderError::Overloaded => (
@@ -421,6 +451,7 @@ pub fn open_failure(err: &ProviderError, provider_id: Option<&str>) -> OpenFailu
         action,
         retryable: err.retryable(),
         retry_after_ms,
+        resets_at_ms,
         fallbacks: None,
         consent_scope: None,
         candidates: None,
@@ -481,6 +512,7 @@ impl SessionLimitReached {
             action: Some("close_a_session".to_string()),
             retryable: true,
             retry_after_ms: Some(30_000),
+            resets_at_ms: None,
             fallbacks: None,
             consent_scope: None,
             candidates: None,
@@ -605,6 +637,7 @@ pub fn resolve_failure(err: &ResolveError) -> OpenFailure {
         action: None,
         retryable,
         retry_after_ms: None,
+        resets_at_ms: None,
         fallbacks: None,
         consent_scope: match err {
             ResolveError::NotAllowed(_) => Some("project"),
@@ -882,6 +915,41 @@ mod tests {
             "context_too_small",
         );
         assert_eq!(bare.message, "The model's context window is too small.");
+    }
+
+    /// QUOTA, explicit choice: a refusal that names its reset says WHEN the provider serves again
+    /// and that nothing is switched; the instant itself travels for the interface to localize.
+    #[test]
+    fn a_rate_limit_with_a_reset_names_the_hour_and_never_offers_a_silent_switch() {
+        let failure = assert_mapped(
+            ProviderError::RateLimited {
+                retry_after_ms: None,
+                resets_at_ms: Some(1_792_828_800_000),
+            },
+            429,
+            "rate_limited",
+        );
+        assert!(
+            failure.message.contains("2026-10-24 08:00 UTC"),
+            "{}",
+            failure.message
+        );
+        assert!(failure.message.contains("nothing is switched for you"));
+        assert_eq!(failure.resets_at_ms, Some(1_792_828_800_000));
+        assert_eq!(
+            failure.to_json()["resets_at_ms"],
+            serde_json::json!(1_792_828_800_000_u64)
+        );
+        // Without a reset, the old message and no `resets_at_ms` key.
+        let bare = open_failure(
+            &ProviderError::RateLimited {
+                retry_after_ms: None,
+                resets_at_ms: None,
+            },
+            None,
+        );
+        assert!(bare.to_json().get("resets_at_ms").is_none());
+        assert!(!bare.message.contains("UTC"));
     }
 
     #[test]

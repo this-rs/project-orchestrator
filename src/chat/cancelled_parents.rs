@@ -82,6 +82,7 @@ impl ParentCancelled {
             action: None,
             retryable: false,
             retry_after_ms: None,
+            resets_at_ms: None,
             fallbacks: None,
             consent_scope: None,
             candidates: None,
