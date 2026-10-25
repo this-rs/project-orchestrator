@@ -4,7 +4,7 @@ use crate::neo4j::models::{
     ConstraintNode, ConstraintType, DecisionNode, DecisionStatus, PlanNode, PlanStatus, StepNode,
     StepStatus, TaskNode, TaskStatus,
 };
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -40,6 +40,10 @@ pub struct CreateTaskRequest {
     pub steps: Option<Vec<CreateStepRequest>>,
     /// Estimated complexity (1-10)
     pub estimated_complexity: Option<u32>,
+    /// Due date (a YYYY-MM-DD calendar day).
+    pub due_date: Option<NaiveDate>,
+    /// Estimated duration in minutes.
+    pub estimated_minutes: Option<u32>,
 }
 
 /// Request to create a new step
@@ -91,6 +95,10 @@ pub struct UpdateTaskRequest {
     pub actual_complexity: Option<u32>,
     #[serde(default)]
     pub estimated_complexity: Option<u32>,
+    #[serde(default)]
+    pub due_date: Option<NaiveDate>,
+    #[serde(default)]
+    pub estimated_minutes: Option<u32>,
     /// Optional session_id for auto-linking: when status changes to in_progress,
     /// creates ASSOCIATED_WITH between this session and the task + its parent plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -376,6 +384,8 @@ impl TaskNode {
             estimated_complexity: None,
             actual_complexity: None,
             created_at: now,
+            due_date: None,
+            estimated_minutes: None,
             updated_at: Some(now),
             started_at: None,
             completed_at: None,
@@ -412,6 +422,8 @@ impl TaskNode {
             estimated_complexity,
             actual_complexity: None,
             created_at: now,
+            due_date: None,
+            estimated_minutes: None,
             updated_at: Some(now),
             started_at: None,
             completed_at: None,
@@ -566,7 +578,7 @@ mod tests {
 
     #[test]
     fn test_task_node_new_full() {
-        let task = TaskNode::new_full(
+        let mut task = TaskNode::new_full(
             Some("Feature X".to_string()),
             "Implement feature X with tests".to_string(),
             Some(8),
@@ -575,6 +587,8 @@ mod tests {
             vec!["src/main.rs".to_string(), "src/lib.rs".to_string()],
             Some(5),
         );
+        task.due_date = Some(NaiveDate::from_ymd_opt(2026, 1, 15).unwrap());
+        task.estimated_minutes = Some(45);
 
         assert_eq!(task.title, Some("Feature X".to_string()));
         assert_eq!(task.priority, Some(8));
@@ -583,6 +597,11 @@ mod tests {
         assert_eq!(task.acceptance_criteria.len(), 2);
         assert_eq!(task.affected_files.len(), 2);
         assert_eq!(task.estimated_complexity, Some(5));
+        assert_eq!(
+            task.due_date,
+            Some(NaiveDate::from_ymd_opt(2026, 1, 15).unwrap())
+        );
+        assert_eq!(task.estimated_minutes, Some(45));
     }
 
     #[test]
@@ -614,7 +633,7 @@ mod tests {
 
     #[test]
     fn test_task_node_serialization() {
-        let task = TaskNode::new_full(
+        let mut task = TaskNode::new_full(
             Some("Test".to_string()),
             "Description".to_string(),
             Some(5),
@@ -623,6 +642,8 @@ mod tests {
             vec!["file.rs".to_string()],
             Some(3),
         );
+        task.due_date = Some(NaiveDate::from_ymd_opt(2026, 6, 30).unwrap());
+        task.estimated_minutes = Some(90);
 
         let json = serde_json::to_string(&task).unwrap();
         let deserialized: TaskNode = serde_json::from_str(&json).unwrap();
@@ -630,6 +651,8 @@ mod tests {
         assert_eq!(task.id, deserialized.id);
         assert_eq!(task.tags, deserialized.tags);
         assert_eq!(task.estimated_complexity, deserialized.estimated_complexity);
+        assert_eq!(task.due_date, deserialized.due_date);
+        assert_eq!(task.estimated_minutes, deserialized.estimated_minutes);
     }
 
     // =========================================================================
@@ -817,6 +840,8 @@ mod tests {
             depends_on: None,
             steps: None,
             estimated_complexity: Some(4),
+            due_date: Some(NaiveDate::from_ymd_opt(2026, 1, 15).unwrap()),
+            estimated_minutes: Some(45),
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -824,6 +849,8 @@ mod tests {
 
         assert_eq!(request.title, deserialized.title);
         assert_eq!(request.tags, deserialized.tags);
+        assert_eq!(request.due_date, deserialized.due_date);
+        assert_eq!(request.estimated_minutes, deserialized.estimated_minutes);
     }
 
     #[test]
