@@ -53,8 +53,8 @@ use super::agent_e2e_tests::{
 };
 use super::agent_runtime::ProviderSource;
 use super::config::{ChatConfig, ProviderPath};
-use super::provider::settings::{process_origin, AcpCommand, InstanceRecord};
 use super::manager::ChatManager;
+use super::provider::settings::{process_origin, AcpCommand, InstanceRecord};
 use super::types::ChatEvent;
 use crate::documents::store::DocumentStore;
 use crate::events::nats_broker_test::TestBroker;
@@ -5042,21 +5042,27 @@ async fn run_acp_column() -> Measures {
 
     // Minimal native (FakeOpenAi) script: probe + one turn.
     let native_script = json!([
-        sse_route("Call the ping tool now", vec![
-            delta(json!({"tool_calls": [{"index": 0, "id": "rp1",
+        sse_route(
+            "Call the ping tool now",
+            vec![
+                delta(json!({"tool_calls": [{"index": 0, "id": "rp1",
                 "function": {"name": "ping", "arguments": "{}"}}]})),
-            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
-            json!("[DONE]"),
-        ]),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                json!("[DONE]"),
+            ]
+        ),
         json!({"method": "GET", "path": "/v1/models", "status": 200,
                "body": {"object": "list", "data": [{"id": "m", "context_length": 32000}]}}),
-        sse_route("hi there", vec![
-            delta(json!({"content": "hello from native"})),
-            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
-            json!({"choices": [], "usage": {"prompt_tokens": 10,
+        sse_route(
+            "hi there",
+            vec![
+                delta(json!({"content": "hello from native"})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 10,
                 "completion_tokens": 3, "total_tokens": 13}}),
-            json!("[DONE]"),
-        ]),
+                json!("[DONE]"),
+            ]
+        ),
     ]);
     let fake = FakeOpenAi::start(native_script);
 
@@ -5122,12 +5128,7 @@ async fn run_acp_column() -> Measures {
     let sid = created.session_id;
     let mut rx = manager.subscribe(&sid).await.unwrap();
     loop {
-        match tokio::time::timeout(
-            Duration::from_secs(20),
-            rx.recv(),
-        )
-        .await
-        {
+        match tokio::time::timeout(Duration::from_secs(20), rx.recv()).await {
             Ok(Ok(ChatEvent::Result { .. })) => break,
             Ok(Ok(_)) => continue,
             Ok(Err(_)) | Err(_) => panic!("run_acp_column: timed out waiting for native Result"),
@@ -5145,12 +5146,7 @@ async fn run_acp_column() -> Measures {
 
     // Wait for ACP answer.
     loop {
-        match tokio::time::timeout(
-            Duration::from_secs(20),
-            rx.recv(),
-        )
-        .await
-        {
+        match tokio::time::timeout(Duration::from_secs(20), rx.recv()).await {
             Ok(Ok(ChatEvent::Result { .. })) => break,
             Ok(Ok(_)) => continue,
             Ok(Err(_)) | Err(_) => panic!("run_acp_column: timed out waiting for ACP Result"),
@@ -5250,21 +5246,27 @@ async fn run_codex_column() -> Measures {
 
     // Minimal native (FakeOpenAi) script: probe + one turn.
     let native_script = json!([
-        sse_route("Call the ping tool now", vec![
-            delta(json!({"tool_calls": [{"index": 0, "id": "cp1",
+        sse_route(
+            "Call the ping tool now",
+            vec![
+                delta(json!({"tool_calls": [{"index": 0, "id": "cp1",
                 "function": {"name": "ping", "arguments": "{}"}}]})),
-            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
-            json!("[DONE]"),
-        ]),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                json!("[DONE]"),
+            ]
+        ),
         json!({"method": "GET", "path": "/v1/models", "status": 200,
                "body": {"object": "list", "data": [{"id": "m", "context_length": 32000}]}}),
-        sse_route("hi there", vec![
-            delta(json!({"content": "hello from native (codex relay)"})),
-            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
-            json!({"choices": [], "usage": {"prompt_tokens": 10,
+        sse_route(
+            "hi there",
+            vec![
+                delta(json!({"content": "hello from native (codex relay)"})),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 10,
                 "completion_tokens": 5, "total_tokens": 15}}),
-            json!("[DONE]"),
-        ]),
+                json!("[DONE]"),
+            ]
+        ),
     ]);
     let fake = FakeOpenAi::start(native_script);
 
@@ -5313,12 +5315,7 @@ async fn run_codex_column() -> Measures {
     let sid = created.session_id;
     let mut rx = manager.subscribe(&sid).await.unwrap();
     loop {
-        match tokio::time::timeout(
-            Duration::from_secs(20),
-            rx.recv(),
-        )
-        .await
-        {
+        match tokio::time::timeout(Duration::from_secs(20), rx.recv()).await {
             Ok(Ok(ChatEvent::Result { .. })) => break,
             Ok(Ok(_)) => continue,
             Ok(Err(_)) | Err(_) => panic!("run_codex_column: timed out waiting for native Result"),
@@ -5336,12 +5333,7 @@ async fn run_codex_column() -> Measures {
 
     // Wait for Codex answer.
     loop {
-        match tokio::time::timeout(
-            Duration::from_secs(20),
-            rx.recv(),
-        )
-        .await
-        {
+        match tokio::time::timeout(Duration::from_secs(20), rx.recv()).await {
             Ok(Ok(ChatEvent::Result { .. })) => break,
             Ok(Ok(_)) => continue,
             Ok(Err(_)) | Err(_) => panic!("run_codex_column: timed out waiting for Codex Result"),

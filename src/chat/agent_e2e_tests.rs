@@ -13800,7 +13800,8 @@ mod codex_switch {
             fake_codex
                 .recorded()
                 .iter()
-                .any(|e| e["kind"] == "in" && e["params"].to_string().contains("<conversation_relay")),
+                .any(|e| e["kind"] == "in"
+                    && e["params"].to_string().contains("<conversation_relay")),
             "fake_codex received the relayed native history in the switch request"
         );
     }
