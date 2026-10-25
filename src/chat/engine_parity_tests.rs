@@ -75,14 +75,17 @@ enum Engine {
     /// same `fake_claude`, the same transcript (M2).
     ClaudeCodeAgent,
     Native,
-    /// Codex provider (harness `codex`). `fake_codex` does not exist in the nexus
-    /// repository; all functions are declared `not_measured` (YARDSTICK, task 87eb345e).
+    /// Codex provider (harness `codex`). `fake_codex` exists in the nexus repository
+    /// (`src/bin/fake_codex.rs`), but it is transcript-based: each function of the
+    /// parity scenario would need its own JSONL transcript. Per-function verdicts are
+    /// declared in [`EXPECTED`]; functions with no transcript declare `not_measured`
+    /// (ISO4, task 87eb345e).
     Codex,
     /// opencode harness. `fake_opencode` does not exist; all functions declared
     /// `not_measured` (YARDSTICK, task 87eb345e).
     OpenCode,
-    /// ACP harness. `fake_acp` exists but the full scenario has not yet been adapted to
-    /// this harness; all functions declared `not_measured` (YARDSTICK, task 87eb345e).
+    /// ACP harness. `fake_acp` exists in the nexus repository. Per-function verdicts
+    /// are declared in [`EXPECTED`]; known harness gaps are `gap (harnais)` (ISO4).
     Acp,
 }
 
@@ -312,44 +315,99 @@ const FUNCTIONS: &[(&str, &str)] = &[
 /// listed here fails the test; an entry here that the scenario no longer
 /// measures fails it too (update this list and regenerate the table).
 const EXPECTED: &[(Engine, &str, Expect)] = &[
-    (
-        Engine::ClaudeCode,
-        "nexus_tools",
-        Expect::NotMeasured { why: CLI_TOOLS },
-    ),
-    (
-        Engine::ClaudeCodeAgent,
-        "nexus_tools",
-        Expect::NotMeasured { why: CLI_TOOLS },
-    ),
-    (
-        Engine::ClaudeCode,
-        "tool_search",
-        Expect::NotMeasured {
-            why: CLI_TOOL_SEARCH,
-        },
-    ),
-    (
-        Engine::ClaudeCodeAgent,
-        "tool_search",
-        Expect::NotMeasured {
-            why: CLI_TOOL_SEARCH,
-        },
-    ),
-    (
-        Engine::ClaudeCode,
-        "anthropic_messages",
-        Expect::NotMeasured {
-            why: CLI_PROMPT_CACHE,
-        },
-    ),
-    (
-        Engine::ClaudeCodeAgent,
-        "anthropic_messages",
-        Expect::NotMeasured {
-            why: CLI_PROMPT_CACHE,
-        },
-    ),
+    // ── Claude Code (both engines) ────────────────────────────────────────
+    (Engine::ClaudeCode, "nexus_tools", Expect::NotMeasured { why: CLI_TOOLS }),
+    (Engine::ClaudeCodeAgent, "nexus_tools", Expect::NotMeasured { why: CLI_TOOLS }),
+    (Engine::ClaudeCode, "tool_search", Expect::NotMeasured { why: CLI_TOOL_SEARCH }),
+    (Engine::ClaudeCodeAgent, "tool_search", Expect::NotMeasured { why: CLI_TOOL_SEARCH }),
+    (Engine::ClaudeCode, "anthropic_messages", Expect::NotMeasured { why: CLI_PROMPT_CACHE }),
+    (Engine::ClaudeCodeAgent, "anthropic_messages", Expect::NotMeasured { why: CLI_PROMPT_CACHE }),
+    // Native/anthropic_messages: ok with correct fakes (header_values["anthropic-version"] is
+    // captured by fake_openai ≥ pin 0587011). Old fakes (08/10) silently dropped that header,
+    // causing a false gap; no EXPECTED entry is needed here.
+    // ── Codex — known harness gaps (A40 hooks, A12 images, no bg-tasks) ──
+    (Engine::Codex, "hooks.before_tool", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_HOOKS }),
+    (Engine::Codex, "hooks.after_tool", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_HOOKS }),
+    (Engine::Codex, "hooks.before_compaction", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_HOOKS }),
+    (Engine::Codex, "hooks.session_start", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_HOOKS }),
+    (Engine::Codex, "hooks.user_prompt_submit", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_HOOKS }),
+    (Engine::Codex, "hooks.stop", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_HOOKS }),
+    (Engine::Codex, "hooks.subagent_stop", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_HOOKS }),
+    (Engine::Codex, "hooks.notification", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_HOOKS }),
+    (Engine::Codex, "background_tasks", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_NO_BG }),
+    (Engine::Codex, "cancel_task", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_NO_BG }),
+    (Engine::Codex, "images", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "Codex v1 n'accepte pas les blocs image (A12)" }),
+    (Engine::Codex, "anthropic_messages", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "Codex utilise son propre moteur LLM, pas l'API Anthropic Messages" }),
+    (Engine::Codex, "ask_user_question", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "requestUserInput est expérimental en v1 ; le backend le synthétise mais ne peut pas l'interroger via Codex" }),
+    // ── Codex — not_measured (transcript-based fake_codex needs per-function JSONL) ──
+    (Engine::Codex, "compaction", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "compaction.manual", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "message_queue", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "auto_continue", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "nats.send", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "nats.interrupt", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "nats.permission_response", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "nats.cancel_tools", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "resume", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "set_model", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "cancel_tools", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "permissions.once", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "permissions.session", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "permissions.always", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "tool_timing", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "po_tools", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "tool_search", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "nexus_tools", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "tool_result.huge", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "enrichment", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "refs", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "session_record", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "session_limits", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    (Engine::Codex, "subagents", Expect::NotMeasured { why: "collabToolCall (sous-agents Codex) NOT VERIFIED dans la suite nexus ; transcript nécessaire" }),
+    (Engine::Codex, "system_init.degraded", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
+    // ── ACP — known harness gaps ─────────────────────────────────────────
+    (Engine::Acp, "hooks.before_tool", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
+    (Engine::Acp, "hooks.after_tool", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
+    (Engine::Acp, "hooks.before_compaction", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
+    (Engine::Acp, "hooks.session_start", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
+    (Engine::Acp, "hooks.user_prompt_submit", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
+    (Engine::Acp, "hooks.stop", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
+    (Engine::Acp, "hooks.subagent_stop", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
+    (Engine::Acp, "hooks.notification", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
+    (Engine::Acp, "nexus_tools", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "ACP utilise son propre environnement d'outils ; nexus-tools n'est pas joint à une session ACP" }),
+    (Engine::Acp, "anthropic_messages", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "ACP utilise son propre modèle LLM, pas l'API Anthropic Messages" }),
+    (Engine::Acp, "ask_user_question", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "ACP n'a pas de mécanisme natif de question utilisateur ; le backend le synthétise (§5)" }),
+    (Engine::Acp, "compaction.manual", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "/compact n'est pas transmis à un agent ACP : la compaction manuelle n'a pas de canal côté harnais" }),
+    // ── ACP — ok (verified by separate tests, #924) ──────────────────────
+    // `provider_switch.relay`: verified by `a_conversation_moves_from_*_to_acp_*` (#924).
+    // `enrichment`: verified by `an_acp_session_receives_the_po_system_prompt_as_the_leading_block` (#924).
+    // ── ACP — not_measured (fake_acp transcript-based, specific scenario not yet adapted) ──
+    (Engine::Acp, "compaction", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "message_queue", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "auto_continue", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "nats.send", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "nats.interrupt", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "nats.permission_response", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "nats.cancel_tools", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "resume", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "set_model", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "cancel_tools", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "permissions.once", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "permissions.session", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "permissions.always", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "tool_timing", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "po_tools", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "tool_search", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "tool_result.huge", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "refs", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "session_record", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "background_tasks", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "cancel_task", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "images", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "subagents", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "system_init.degraded", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    (Engine::Acp, "session_limits", Expect::NotMeasured { why: ACP_TRANSCRIPT }),
+    // ── opencode — all not_measured (no fake_opencode) ───────────────────
 ];
 
 /// Why `nexus_tools` is not measured on Claude Code, whatever its engine.
@@ -367,20 +425,33 @@ const CLI_PROMPT_CACHE: &str =
                                 de cache : fake_claude rejoue un transcript, la requête au modèle \
                                 n'est pas visible du harnais";
 
-/// Why every function is `not_measured` on Codex (YARDSTICK, task 87eb345e).
-const CODEX_NOT_MEASURED: &str =
-    "fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire \
-     faux déterministe (YARDSTICK, tâche 87eb345e)";
+/// Why all Codex hooks are a harness gap (A40).
+const CODEX_HOOKS: &str = "Codex v1 n'a pas d'exécutable relais pour les hooks (A40) ; \
+     `SessionSpec::hooks` est ignoré avec `provider_notice { hooks_not_supported }`";
 
-/// Why every function is `not_measured` on opencode (YARDSTICK, task 87eb345e).
+/// Why Codex background tasks / cancel_task are a harness gap.
+const CODEX_NO_BG: &str = "`tool_cancel` et `background_tasks` ne sont pas supportés par Codex ; \
+     `interrupt` est le seul mécanisme de coupe-circuit";
+
+/// Why a Codex function is not_measured: fake_codex needs a per-function JSONL transcript.
+/// Transcripts for these functions have not yet been written (manques à remonter nexus, ISO4).
+const CODEX_TRANSCRIPT: &str =
+    "fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; \
+     cette fonction exige un transcript dédié non encore écrit (ISO4)";
+
+/// Why all ACP hooks are a harness gap.
+const ACP_HOOKS: &str =
+    "L'harnais ACP envoie `provider_notice { hooks_not_supported }` à l'ouverture ; \
+     `SessionSpec::hooks` est ignoré";
+
+/// Why an ACP function is not_measured: fake_acp transcript not yet adapted to full scenario.
+const ACP_TRANSCRIPT: &str = "fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; \
+     le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4)";
+
+/// Why every function is `not_measured` on opencode (no fake_opencode).
 const OPENCODE_NOT_MEASURED: &str =
     "fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans \
      binaire faux déterministe (YARDSTICK, tâche 87eb345e)";
-
-/// Why every function is `not_measured` on ACP (YARDSTICK, task 87eb345e).
-const ACP_NOT_MEASURED: &str =
-    "fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; \
-     chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e)";
 
 /// The verdicts of one engine, with what was seen (diagnostics, not in the table).
 #[derive(Default)]
@@ -429,19 +500,17 @@ fn expected(engine: Engine, function: &str) -> Option<Expect> {
     {
         return Some(x);
     }
-    // New harnesses for which the scenario has not yet been adapted: every function is
-    // declared `not_measured` rather than listing 30 × 3 identical entries in EXPECTED.
+    // opencode: no fake_opencode exists yet — every function is not_measured by default.
+    // Codex and ACP: all per-function verdicts are in EXPECTED (see entries above).
     match engine {
-        Engine::Codex => Some(Expect::NotMeasured {
-            why: CODEX_NOT_MEASURED,
-        }),
         Engine::OpenCode => Some(Expect::NotMeasured {
             why: OPENCODE_NOT_MEASURED,
         }),
-        Engine::Acp => Some(Expect::NotMeasured {
-            why: ACP_NOT_MEASURED,
-        }),
-        Engine::ClaudeCode | Engine::ClaudeCodeAgent | Engine::Native => None,
+        Engine::Codex
+        | Engine::Acp
+        | Engine::ClaudeCode
+        | Engine::ClaudeCodeAgent
+        | Engine::Native => None,
     }
 }
 
@@ -542,12 +611,12 @@ fn render(run: &Run<'_>) -> String {
          moteur agent à travers la façade Claude Code de nexus (`CHAT_PROVIDER_PATH=agent`) ;\n\
          - **natif** : moteur agent, instance OpenAI-compatible sur `fake_openai`, outils \
          project-orchestrator sur `fake_mcp`, outils de base sur le vrai `nexus-tools` ;\n\
-         - **Codex** : harnais Codex — `fake_codex` absent du dépôt nexus, toutes les \
-         fonctions `not_measured` (YARDSTICK, tâche 87eb345e) ;\n\
+         - **Codex** : harnais Codex — `fake_codex` présent dans `nexus/src/bin/fake_codex.rs`, \
+         replay de transcripts JSONL ; verdicts par fonction déclarés dans `EXPECTED` (ISO4) ;\n\
          - **opencode** : harnais opencode — `fake_opencode` absent, toutes les fonctions \
          `not_measured` (YARDSTICK, tâche 87eb345e) ;\n\
-         - **ACP** : harnais ACP — `fake_acp` présent mais le scénario complet n'a pas encore \
-         été adapté, toutes les fonctions `not_measured` (YARDSTICK, tâche 87eb345e).\n\n\
+         - **ACP** : harnais ACP — `fake_acp` présent dans `nexus/src/bin/fake_acp.rs`, \
+         replay de transcripts JSONL ; verdicts par fonction déclarés dans `EXPECTED` (ISO4).\n\n\
          `ok` : mesuré et conforme. `gap (cause, tâche)` : mesuré absent, cause `harnais` \
          (le backend ou le harnais nexus ne le fait pas) ou `modèle` (le modèle ne le peut pas), \
          fermé par la tâche PO nommée (plan 5ad54c48 « Parité totale », ou e87abcc2 « Claude Code devient optionnel » pour une tâche M…). `not_measured` : les faux binaires ne \

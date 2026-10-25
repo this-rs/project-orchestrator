@@ -8,24 +8,24 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 - **Claude Code** : moteur historique (`CHAT_PROVIDER_PATH=legacy`) sur `fake_claude`, le faux CLI du dépôt nexus ;
 - **Claude Code (moteur agent)** : le même CLI et le même transcript, piloté par le moteur agent à travers la façade Claude Code de nexus (`CHAT_PROVIDER_PATH=agent`) ;
 - **natif** : moteur agent, instance OpenAI-compatible sur `fake_openai`, outils project-orchestrator sur `fake_mcp`, outils de base sur le vrai `nexus-tools` ;
-- **Codex** : harnais Codex — `fake_codex` absent du dépôt nexus, toutes les fonctions `not_measured` (YARDSTICK, tâche 87eb345e) ;
+- **Codex** : harnais Codex — `fake_codex` présent dans `nexus/src/bin/fake_codex.rs`, replay de transcripts JSONL ; verdicts par fonction déclarés dans `EXPECTED` (ISO4) ;
 - **opencode** : harnais opencode — `fake_opencode` absent, toutes les fonctions `not_measured` (YARDSTICK, tâche 87eb345e) ;
-- **ACP** : harnais ACP — `fake_acp` présent mais le scénario complet n'a pas encore été adapté, toutes les fonctions `not_measured` (YARDSTICK, tâche 87eb345e).
+- **ACP** : harnais ACP — `fake_acp` présent dans `nexus/src/bin/fake_acp.rs`, replay de transcripts JSONL ; verdicts par fonction déclarés dans `EXPECTED` (ISO4).
 
 `ok` : mesuré et conforme. `gap (cause, tâche)` : mesuré absent, cause `harnais` (le backend ou le harnais nexus ne le fait pas) ou `modèle` (le modèle ne le peut pas), fermé par la tâche PO nommée (plan 5ad54c48 « Parité totale », ou e87abcc2 « Claude Code devient optionnel » pour une tâche M…). `not_measured` : les faux binaires ne permettent pas de l'exercer sur ce moteur (raison ci-dessous). Un écart non déclaré, ou un écart déclaré qui disparaît, fait échouer le test.
 
 | Fonction | Ce qui est vérifié | Claude Code | Claude Code (moteur agent) | natif | Codex | opencode | ACP |
 |---|---|---|---|---|---|---|---|
-| `hooks.before_tool` | le hook PreToolUse du graphe est consulté avant un outil | ok | ok | ok | not_measured | not_measured | not_measured |
-| `hooks.after_tool` | le hook PostToolUse du graphe répond après un Grep bruyant (find_references) | ok | ok | ok | not_measured | not_measured | not_measured |
-| `hooks.before_compaction` | le hook PreCompact du graphe nomme le projet dans les instructions du résumé (Claude Code : `systemMessage`, le champ que lit le CLI) | ok | ok | ok | not_measured | not_measured | not_measured |
-| `hooks.session_start` | le hook SessionStart du graphe est consulté à l'ouverture de la session (contract v7) | ok | ok | ok | not_measured | not_measured | not_measured |
-| `hooks.user_prompt_submit` | le hook UserPromptSubmit du graphe est consulté avant chaque tour (contract v7) | ok | ok | ok | not_measured | not_measured | not_measured |
-| `hooks.stop` | le hook Stop du graphe est consulté avant la fin du tour ; un block fait continuer le tour avec la raison (contract v7) | ok | ok | ok | not_measured | not_measured | not_measured |
-| `hooks.subagent_stop` | le hook SubagentStop du graphe est consulté quand un sous-agent s'arrête (contract v7) | ok | ok | ok | not_measured | not_measured | not_measured |
-| `hooks.notification` | le hook Notification du graphe est appelé quand une permission est attendue (contract v7) | ok | ok | ok | not_measured | not_measured | not_measured |
+| `hooks.before_tool` | le hook PreToolUse du graphe est consulté avant un outil | ok | ok | ok | gap (harnais, ISO4) | not_measured | gap (harnais, ISO4) |
+| `hooks.after_tool` | le hook PostToolUse du graphe répond après un Grep bruyant (find_references) | ok | ok | ok | gap (harnais, ISO4) | not_measured | gap (harnais, ISO4) |
+| `hooks.before_compaction` | le hook PreCompact du graphe nomme le projet dans les instructions du résumé (Claude Code : `systemMessage`, le champ que lit le CLI) | ok | ok | ok | gap (harnais, ISO4) | not_measured | gap (harnais, ISO4) |
+| `hooks.session_start` | le hook SessionStart du graphe est consulté à l'ouverture de la session (contract v7) | ok | ok | ok | gap (harnais, ISO4) | not_measured | gap (harnais, ISO4) |
+| `hooks.user_prompt_submit` | le hook UserPromptSubmit du graphe est consulté avant chaque tour (contract v7) | ok | ok | ok | gap (harnais, ISO4) | not_measured | gap (harnais, ISO4) |
+| `hooks.stop` | le hook Stop du graphe est consulté avant la fin du tour ; un block fait continuer le tour avec la raison (contract v7) | ok | ok | ok | gap (harnais, ISO4) | not_measured | gap (harnais, ISO4) |
+| `hooks.subagent_stop` | le hook SubagentStop du graphe est consulté quand un sous-agent s'arrête (contract v7) | ok | ok | ok | gap (harnais, ISO4) | not_measured | gap (harnais, ISO4) |
+| `hooks.notification` | le hook Notification du graphe est appelé quand une permission est attendue (contract v7) | ok | ok | ok | gap (harnais, ISO4) | not_measured | gap (harnais, ISO4) |
 | `compaction` | compaction_started et compact_boundary sur le fil | ok | ok | ok | not_measured | not_measured | not_measured |
-| `compaction.manual` | `/compact <instructions>` envoyé depuis le chat : Claude Code reçoit la commande telle quelle (le CLI compacte, compact_boundary trigger manual) ; le natif compacte hors tour (AgentSession::compact), les instructions et le hook PreCompact dans la requête de résumé, aucun tour envoyé au modèle, compaction_started / compact_boundary trigger manual sur le fil (ISO3) | ok | ok | ok | not_measured | not_measured | not_measured |
+| `compaction.manual` | `/compact <instructions>` envoyé depuis le chat : Claude Code reçoit la commande telle quelle (le CLI compacte, compact_boundary trigger manual) ; le natif compacte hors tour (AgentSession::compact), les instructions et le hook PreCompact dans la requête de résumé, aucun tour envoyé au modèle, compaction_started / compact_boundary trigger manual sur le fil (ISO3) | ok | ok | ok | not_measured | not_measured | gap (harnais, ISO4) |
 | `message_queue` | un message envoyé pendant un tour l'interrompt et passe ensuite | ok | ok | ok | not_measured | not_measured | not_measured |
 | `auto_continue` | un tour arrêté sur sa limite est continué (auto_continue) | ok | ok | ok | not_measured | not_measured | not_measured |
 | `nats.send` | un message d'une autre instance (NATS) est joué ici | ok | ok | ok | not_measured | not_measured | not_measured |
@@ -41,27 +41,52 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | `tool_timing` | un outil qui a attendu une permission porte tool_timing persisté : prise en charge, attente, exécution, fin | ok | ok | ok | not_measured | not_measured | not_measured |
 | `po_tools` | les outils project-orchestrator (MCP) sont donnés et appelables | ok | ok | ok | not_measured | not_measured | not_measured |
 | `tool_search` | un outil différé n'est pas envoyé ; ToolSearch le charge, il est ajouté EN FIN de liste et appelable dans le même tour (CTX2) | not_measured | not_measured | ok | not_measured | not_measured | not_measured |
-| `nexus_tools` | Read / Edit / Bash s'exécutent sur le projet | not_measured | not_measured | ok | not_measured | not_measured | not_measured |
+| `nexus_tools` | Read / Edit / Bash s'exécutent sur le projet | not_measured | not_measured | ok | not_measured | not_measured | gap (harnais, ISO4) |
 | `tool_result.huge` | un résultat d'outil MCP d'environ 1 Mo ne tue pas le tour : seul un avis borné (moins de 8 Ko) atteint le fil et le modèle, le tour se clôt et le suivant démarre ; natif : le mégaoctet est gardé sur disque, au chemin que l'avis nomme (Claude Code : ce que fait le CLI est relevé, puis rejoué par fake_claude) | ok | ok | ok | not_measured | not_measured | not_measured |
-| `enrichment` | le contexte du graphe précède le message du tour | ok | ok | ok | not_measured | not_measured | not_measured |
+| `enrichment` | le contexte du graphe précède le message du tour | ok | ok | ok | not_measured | not_measured | ok |
 | `refs` | une référence #kind:id atteint le modèle en pointeur po-context | ok | ok | ok | not_measured | not_measured | not_measured |
-| `provider_switch.relay` | la bascule vers ce moteur relaie la conversation sur le même fil (provider_switched) | ok | ok | ok | not_measured | not_measured | not_measured |
-| `images` | une image jointe atteint le provider en bloc image | ok | ok | ok | not_measured | not_measured | not_measured |
+| `provider_switch.relay` | la bascule vers ce moteur relaie la conversation sur le même fil (provider_switched) | ok | ok | ok | ok | not_measured | ok |
+| `images` | une image jointe atteint le provider en bloc image | ok | ok | ok | gap (harnais, ISO4) | not_measured | not_measured |
 | `session_record` | le dossier de session porte message_count, total_cost_usd et un titre | ok | ok | ok | not_measured | not_measured | not_measured |
-| `background_tasks` | une tâche d'arrière-plan est suivie (active_tasks_update) | ok | ok | ok | not_measured | not_measured | not_measured |
-| `cancel_task` | cancel_task arrête une tâche d'arrière-plan | ok | ok | ok | not_measured | not_measured | not_measured |
-| `ask_user_question` | une question du modèle s'affiche (ask_user_question) et la réponse de l'utilisateur lui revient au tour suivant | ok | ok | ok | not_measured | not_measured | not_measured |
+| `background_tasks` | une tâche d'arrière-plan est suivie (active_tasks_update) | ok | ok | ok | gap (harnais, ISO4) | not_measured | not_measured |
+| `cancel_task` | cancel_task arrête une tâche d'arrière-plan | ok | ok | ok | gap (harnais, ISO4) | not_measured | not_measured |
+| `ask_user_question` | une question du modèle s'affiche (ask_user_question) et la réponse de l'utilisateur lui revient au tour suivant | ok | ok | ok | gap (harnais, ISO4) | not_measured | gap (harnais, ISO4) |
 | `subagents` | un sous-agent (Agent / Task) travaille et sa réponse revient en résultat ; sur le natif, une session enfant qui ne peut pas re-déléguer | ok | ok | ok | not_measured | not_measured | not_measured |
 | `system_init.degraded` | system_init n'annonce comme manquant qu'une limite du modèle (liste fermée) | ok | ok | ok | not_measured | not_measured | not_measured |
 | `session_limits` | sans réglage, aucune limite de durée par tour ni budget de session (ISO5) : le CLI ne reçoit pas --max-budget-usd, une session du moteur agent s'ouvre et reprend sans turn_timeout_ms ni max_tokens | ok | ok | ok | not_measured | not_measured | not_measured |
-| `anthropic_messages` | une instance `anthropic` (clé au coffre) : le harnais natif parle lui-même l'API Messages, et la requête reçue par le modèle porte les trois points cache_control — dernier outil, système, dernier tour (CTX5) | not_measured | not_measured | ok | not_measured | not_measured | not_measured |
+| `anthropic_messages` | une instance `anthropic` (clé au coffre) : le harnais natif parle lui-même l'API Messages, et la requête reçue par le modèle porte les trois points cache_control — dernier outil, système, dernier tour (CTX5) | not_measured | not_measured | ok | gap (harnais, ISO4) | not_measured | gap (harnais, ISO4) |
 
-`ok` : Claude Code 36/39, Claude Code (moteur agent) 36/39, natif 39/39, Codex 0/39, opencode 0/39, ACP 0/39.
+`ok` : Claude Code 36/39, Claude Code (moteur agent) 36/39, natif 39/39, Codex 1/39, opencode 0/39, ACP 2/39.
 
 ## Écarts déclarés
 
 | Moteur | Fonction | Cause | Tâche | Ce qui manque |
 |---|---|---|---|---|
+| Codex | `hooks.before_tool` | harnais | ISO4 | Codex v1 n'a pas d'exécutable relais pour les hooks (A40) ; `SessionSpec::hooks` est ignoré avec `provider_notice { hooks_not_supported }` |
+| Codex | `hooks.after_tool` | harnais | ISO4 | Codex v1 n'a pas d'exécutable relais pour les hooks (A40) ; `SessionSpec::hooks` est ignoré avec `provider_notice { hooks_not_supported }` |
+| Codex | `hooks.before_compaction` | harnais | ISO4 | Codex v1 n'a pas d'exécutable relais pour les hooks (A40) ; `SessionSpec::hooks` est ignoré avec `provider_notice { hooks_not_supported }` |
+| Codex | `hooks.session_start` | harnais | ISO4 | Codex v1 n'a pas d'exécutable relais pour les hooks (A40) ; `SessionSpec::hooks` est ignoré avec `provider_notice { hooks_not_supported }` |
+| Codex | `hooks.user_prompt_submit` | harnais | ISO4 | Codex v1 n'a pas d'exécutable relais pour les hooks (A40) ; `SessionSpec::hooks` est ignoré avec `provider_notice { hooks_not_supported }` |
+| Codex | `hooks.stop` | harnais | ISO4 | Codex v1 n'a pas d'exécutable relais pour les hooks (A40) ; `SessionSpec::hooks` est ignoré avec `provider_notice { hooks_not_supported }` |
+| Codex | `hooks.subagent_stop` | harnais | ISO4 | Codex v1 n'a pas d'exécutable relais pour les hooks (A40) ; `SessionSpec::hooks` est ignoré avec `provider_notice { hooks_not_supported }` |
+| Codex | `hooks.notification` | harnais | ISO4 | Codex v1 n'a pas d'exécutable relais pour les hooks (A40) ; `SessionSpec::hooks` est ignoré avec `provider_notice { hooks_not_supported }` |
+| Codex | `images` | harnais | ISO4 | Codex v1 n'accepte pas les blocs image (A12) |
+| Codex | `background_tasks` | harnais | ISO4 | `tool_cancel` et `background_tasks` ne sont pas supportés par Codex ; `interrupt` est le seul mécanisme de coupe-circuit |
+| Codex | `cancel_task` | harnais | ISO4 | `tool_cancel` et `background_tasks` ne sont pas supportés par Codex ; `interrupt` est le seul mécanisme de coupe-circuit |
+| Codex | `ask_user_question` | harnais | ISO4 | requestUserInput est expérimental en v1 ; le backend le synthétise mais ne peut pas l'interroger via Codex |
+| Codex | `anthropic_messages` | harnais | ISO4 | Codex utilise son propre moteur LLM, pas l'API Anthropic Messages |
+| ACP | `hooks.before_tool` | harnais | ISO4 | L'harnais ACP envoie `provider_notice { hooks_not_supported }` à l'ouverture ; `SessionSpec::hooks` est ignoré |
+| ACP | `hooks.after_tool` | harnais | ISO4 | L'harnais ACP envoie `provider_notice { hooks_not_supported }` à l'ouverture ; `SessionSpec::hooks` est ignoré |
+| ACP | `hooks.before_compaction` | harnais | ISO4 | L'harnais ACP envoie `provider_notice { hooks_not_supported }` à l'ouverture ; `SessionSpec::hooks` est ignoré |
+| ACP | `hooks.session_start` | harnais | ISO4 | L'harnais ACP envoie `provider_notice { hooks_not_supported }` à l'ouverture ; `SessionSpec::hooks` est ignoré |
+| ACP | `hooks.user_prompt_submit` | harnais | ISO4 | L'harnais ACP envoie `provider_notice { hooks_not_supported }` à l'ouverture ; `SessionSpec::hooks` est ignoré |
+| ACP | `hooks.stop` | harnais | ISO4 | L'harnais ACP envoie `provider_notice { hooks_not_supported }` à l'ouverture ; `SessionSpec::hooks` est ignoré |
+| ACP | `hooks.subagent_stop` | harnais | ISO4 | L'harnais ACP envoie `provider_notice { hooks_not_supported }` à l'ouverture ; `SessionSpec::hooks` est ignoré |
+| ACP | `hooks.notification` | harnais | ISO4 | L'harnais ACP envoie `provider_notice { hooks_not_supported }` à l'ouverture ; `SessionSpec::hooks` est ignoré |
+| ACP | `compaction.manual` | harnais | ISO4 | /compact n'est pas transmis à un agent ACP : la compaction manuelle n'a pas de canal côté harnais |
+| ACP | `nexus_tools` | harnais | ISO4 | ACP utilise son propre environnement d'outils ; nexus-tools n'est pas joint à une session ACP |
+| ACP | `ask_user_question` | harnais | ISO4 | ACP n'a pas de mécanisme natif de question utilisateur ; le backend le synthétise (§5) |
+| ACP | `anthropic_messages` | harnais | ISO4 | ACP utilise son propre modèle LLM, pas l'API Anthropic Messages |
 
 ## Non mesuré
 
@@ -73,45 +98,31 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | Claude Code (moteur agent) | `tool_search` | les outils différés et ToolSearch sont internes au CLI Claude : la liste d'outils qu'il envoie au modèle n'est pas visible du harnais, et fake_claude rejoue un transcript |
 | Claude Code (moteur agent) | `nexus_tools` | Read / Edit / Bash sont les outils internes du CLI Claude : fake_claude rejoue un transcript et n'exécute aucun outil |
 | Claude Code (moteur agent) | `anthropic_messages` | le CLI Claude parle lui-même l'API Messages et pose ses propres points de cache : fake_claude rejoue un transcript, la requête au modèle n'est pas visible du harnais |
-| Codex | `hooks.before_tool` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `hooks.after_tool` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `hooks.before_compaction` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `hooks.session_start` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `hooks.user_prompt_submit` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `hooks.stop` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `hooks.subagent_stop` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `hooks.notification` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `compaction` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `compaction.manual` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `message_queue` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `auto_continue` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `nats.send` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `nats.interrupt` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `nats.permission_response` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `nats.cancel_tools` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `resume` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `set_model` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `cancel_tools` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `permissions.once` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `permissions.session` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `permissions.always` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `tool_timing` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `po_tools` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `tool_search` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `nexus_tools` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `tool_result.huge` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `enrichment` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `refs` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `provider_switch.relay` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `images` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `session_record` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `background_tasks` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `cancel_task` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `ask_user_question` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `subagents` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `system_init.degraded` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `session_limits` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| Codex | `anthropic_messages` | fake_codex n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
+| Codex | `compaction` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `compaction.manual` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `message_queue` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `auto_continue` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `nats.send` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `nats.interrupt` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `nats.permission_response` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `nats.cancel_tools` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `resume` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `set_model` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `cancel_tools` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `permissions.once` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `permissions.session` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `permissions.always` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `tool_timing` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `po_tools` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `tool_search` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `nexus_tools` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `tool_result.huge` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `enrichment` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `refs` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `session_record` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `subagents` | collabToolCall (sous-agents Codex) NOT VERIFIED dans la suite nexus ; transcript nécessaire |
+| Codex | `system_init.degraded` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
+| Codex | `session_limits` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
 | opencode | `hooks.before_tool` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `hooks.after_tool` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `hooks.before_compaction` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
@@ -151,45 +162,31 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | opencode | `system_init.degraded` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `session_limits` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `anthropic_messages` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
-| ACP | `hooks.before_tool` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `hooks.after_tool` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `hooks.before_compaction` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `hooks.session_start` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `hooks.user_prompt_submit` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `hooks.stop` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `hooks.subagent_stop` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `hooks.notification` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `compaction` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `compaction.manual` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `message_queue` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `auto_continue` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `nats.send` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `nats.interrupt` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `nats.permission_response` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `nats.cancel_tools` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `resume` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `set_model` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `cancel_tools` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `permissions.once` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `permissions.session` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `permissions.always` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `tool_timing` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `po_tools` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `tool_search` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `nexus_tools` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `tool_result.huge` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `enrichment` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `refs` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `provider_switch.relay` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `images` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `session_record` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `background_tasks` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `cancel_task` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `ask_user_question` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `subagents` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `system_init.degraded` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `session_limits` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
-| ACP | `anthropic_messages` | fake_acp existe mais le scénario complet n'a pas encore été adapté à l'harnais ACP ; chaque fonction sera mesurée au fur et à mesure (YARDSTICK, tâche 87eb345e) |
+| ACP | `compaction` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `message_queue` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `auto_continue` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `nats.send` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `nats.interrupt` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `nats.permission_response` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `nats.cancel_tools` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `resume` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `set_model` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `cancel_tools` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `permissions.once` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `permissions.session` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `permissions.always` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `tool_timing` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `po_tools` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `tool_search` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `tool_result.huge` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `refs` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `images` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `session_record` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `background_tasks` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `cancel_task` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `subagents` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `system_init.degraded` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `session_limits` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
 
 ## À re-mesurer à chaque montée du CLI Claude Code
 

@@ -1073,6 +1073,9 @@ pub struct ChatManager {
     /// `with_acp_commands`); the default reads `CHAT_PROVIDER_ACP_COMMANDS` and keeps
     /// nexus' default `HOME` under the user's data directory.
     pub(crate) acp: super::provider::native_factory::AcpSetup,
+    /// Codex program and home override for tests (`with_codex_program`, `with_codex_home`);
+    /// the default uses the `codex` binary on `PATH` and nexus' default `CODEX_HOME`.
+    pub(crate) codex: super::provider::native_factory::CodexSetup,
     /// How far the anchor resolver drives the context (`PO_ANCHOR_CONTEXT`, default `shadow`).
     pub(crate) anchor_mode: super::anchor_resolver::AnchorContextMode,
     /// What the turns of every session share in anchor mode (resolutions, shadow runs).
@@ -3735,6 +3738,7 @@ impl ChatManager {
             session_pool: Arc::new(super::session_pool::SessionPool::from_env()),
             cancelled_parents: Default::default(),
             team_msg_rate: Default::default(),
+            codex: Default::default(),
         }
     }
 
@@ -3845,6 +3849,7 @@ impl ChatManager {
             session_pool: Arc::new(super::session_pool::SessionPool::from_env()),
             cancelled_parents: Default::default(),
             team_msg_rate: Default::default(),
+            codex: Default::default(),
         }
     }
 
@@ -3892,6 +3897,21 @@ impl ChatManager {
         commands: std::collections::BTreeMap<String, super::provider::settings::AcpCommand>,
     ) -> Self {
         self.acp.commands = Some(commands);
+        self
+    }
+
+    /// Override the `codex` binary path for tests (`fake_codex`), so that tests neither
+    /// need `codex` on `PATH` nor depend on a real Codex login.
+    pub fn with_codex_program(mut self, program: impl Into<std::path::PathBuf>) -> Self {
+        self.codex.program = Some(program.into());
+        self
+    }
+
+    /// Override the `CODEX_HOME` root for tests: each instance gets
+    /// `<root>/<instance-id>`, so no two instances collide and nothing is written in
+    /// the user's real Codex data directory.
+    pub fn with_codex_home(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.codex.home = Some(root.into());
         self
     }
 
@@ -16434,6 +16454,7 @@ impl ChatManager {
             self.vault.clone(),
             self.native_transcripts.as_deref(),
             &self.acp,
+            &self.codex,
             &deferred,
         )
         .map_err(anyhow::Error::new)?;
