@@ -521,6 +521,7 @@ pub(crate) const MEGA_TOOL_ACTIONS: &[(&str, &str, &str)] = &[
     ("protocol", "simulate", "simulate_protocol"),
     ("protocol", "get_run_tree", "get_protocol_run_tree"),
     ("protocol", "get_run_children", "get_protocol_run_children"),
+    ("protocol", "validate_all", "validate_all_protocols"),
 
     // Persona (Living Personas)
     ("persona", "create", "create_persona"),
@@ -6091,6 +6092,17 @@ impl ToolHandler {
                     body["plan_id"] = v.clone();
                 }
                 let result = http.post("/api/protocols/simulate", &body).await?;
+                Ok(Some(result))
+            }
+
+            "validate_all_protocols" => {
+                let mut query_params = String::new();
+                if let Some(project_id) = args.get("project_id").and_then(|v| v.as_str()) {
+                    query_params = format!("?project_id={}", project_id);
+                }
+                let result = http
+                    .get(&format!("/api/protocols/validate{}", query_params))
+                    .await?;
                 Ok(Some(result))
             }
 

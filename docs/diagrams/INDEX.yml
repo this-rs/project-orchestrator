@@ -289,8 +289,16 @@ diagrams:
   - name: po-protocols
     owner: theotime
     status: planned
+    # validate.rs couvert par po-protocol-validation (verified)
     covers:
-      - "backend:src/protocol/**"
+      - "backend:src/protocol/{mod,models,engine,generator,hooks,routing,runner,runner_tests,seed,seed_runner}.rs"
+      - "backend:src/protocol/executor/**"
+  - name: po-protocol-validation
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-protocol-validation.mmd
+    covers:
+      - "backend:src/protocol/validate.rs"
   - name: po-runner-orchestrator
     owner: theotime
     status: verified

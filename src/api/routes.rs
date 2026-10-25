@@ -1597,6 +1597,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(protocol_handlers::route_protocols),
         )
         .route(
+            "/api/protocols/validate",
+            get(protocol_handlers::validate_all_protocols),
+        )
+        .route(
             "/api/protocols/compose",
             post(protocol_handlers::compose_protocol),
         )
