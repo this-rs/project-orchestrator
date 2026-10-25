@@ -200,6 +200,10 @@ diagrams:
       - "frontend:src/components/chat/{ChatPanel,ChatInput,ActivityBar,ChatMessages,ChatMessageBubble,ChatSessionContext,PermissionRequestBlock,PermissionSettingsPanel,SessionList}.tsx"
       - "frontend:src/components/chat/{messageQueue,inputAction,runningActivity,chatUrlState,sessionListUtils,sessionActivity}.ts"
       - "frontend:src/components/chat/tools/**"
+      - "frontend:src/components/chat/{SecretRequestTray,ExecPlaceConfirmTray}.tsx"
+      - "frontend:src/atoms/execConfirm.ts"
+      - "frontend:src/services/executionPlace.ts"
+      - "frontend:src/utils/executionPlace.ts"
   - name: po-frontend-shell
     owner: theotime
     status: planned
