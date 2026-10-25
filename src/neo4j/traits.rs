@@ -910,6 +910,22 @@ pub trait GraphStore: Send + Sync {
     async fn get_plan_id_for_task(&self, task_id: Uuid) -> Result<Option<Uuid>>;
 
     // ========================================================================
+    // Day plan operations
+    // ========================================================================
+
+    /// Read one user's ordered day plan as `(task_id, order)` pairs.
+    async fn get_day_plan(&self, user_id: Uuid, date: &str) -> Result<Vec<(Uuid, u32)>>;
+
+    /// Replace the whole day plan (idempotent). Position in `ids` = order.
+    async fn set_day_plan(&self, user_id: Uuid, date: &str, ids: &[Uuid]) -> Result<()>;
+
+    /// Append one task to the end of the day plan (no-op when already present).
+    async fn add_to_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> Result<()>;
+
+    /// Remove one task from the day plan (no-op when absent).
+    async fn remove_from_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> Result<()>;
+
+    // ========================================================================
     // Step operations
     // ========================================================================
 

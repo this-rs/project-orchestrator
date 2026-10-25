@@ -1131,6 +1131,31 @@ impl GraphStore for Neo4jClient {
     }
 
     // ========================================================================
+    // Day plan operations
+    // ========================================================================
+
+    async fn get_day_plan(&self, user_id: Uuid, date: &str) -> anyhow::Result<Vec<(Uuid, u32)>> {
+        self.get_day_plan(user_id, date).await
+    }
+
+    async fn set_day_plan(&self, user_id: Uuid, date: &str, ids: &[Uuid]) -> anyhow::Result<()> {
+        self.set_day_plan(user_id, date, ids).await
+    }
+
+    async fn add_to_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> anyhow::Result<()> {
+        self.add_to_day(user_id, date, task_id).await
+    }
+
+    async fn remove_from_day(
+        &self,
+        user_id: Uuid,
+        date: &str,
+        task_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.remove_from_day(user_id, date, task_id).await
+    }
+
+    // ========================================================================
     // Step operations
     // ========================================================================
 

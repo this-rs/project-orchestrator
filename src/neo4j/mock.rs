@@ -69,6 +69,9 @@ pub struct MockGraphStore {
     pub workspaces: RwLock<HashMap<Uuid, WorkspaceNode>>,
     pub plans: RwLock<HashMap<Uuid, PlanNode>>,
     pub tasks: RwLock<HashMap<Uuid, TaskNode>>,
+    /// Day plans: (user_id, date) -> ordered (task_id, order) entries.
+    #[allow(clippy::type_complexity)]
+    pub day_plans: RwLock<HashMap<(Uuid, String), Vec<(Uuid, u32)>>>,
     pub steps: RwLock<HashMap<Uuid, StepNode>>,
     pub decisions: RwLock<HashMap<Uuid, DecisionNode>>,
     /// Sharing policy per project (what `Project.sharing_policy` holds in Neo4j).
@@ -371,6 +374,7 @@ impl MockGraphStore {
             workspaces: RwLock::new(HashMap::new()),
             plans: RwLock::new(HashMap::new()),
             tasks: RwLock::new(HashMap::new()),
+            day_plans: RwLock::new(HashMap::new()),
             steps: RwLock::new(HashMap::new()),
             decisions: RwLock::new(HashMap::new()),
             sharing_policies: RwLock::new(HashMap::new()),
@@ -4618,6 +4622,58 @@ impl GraphStore for MockGraphStore {
             .iter()
             .find(|(_, tasks)| tasks.contains(&task_id))
             .map(|(plan_id, _)| *plan_id))
+    }
+
+    // ========================================================================
+    // Day plan operations
+    // ========================================================================
+
+    async fn get_day_plan(&self, user_id: Uuid, date: &str) -> Result<Vec<(Uuid, u32)>> {
+        Ok(self
+            .day_plans
+            .read()
+            .await
+            .get(&(user_id, date.to_string()))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn set_day_plan(&self, user_id: Uuid, date: &str, ids: &[Uuid]) -> Result<()> {
+        let entries: Vec<(Uuid, u32)> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, i as u32))
+            .collect();
+        self.day_plans
+            .write()
+            .await
+            .insert((user_id, date.to_string()), entries);
+        Ok(())
+    }
+
+    async fn add_to_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> Result<()> {
+        let mut plans = self.day_plans.write().await;
+        let key = (user_id, date.to_string());
+        let entries = plans.entry(key).or_default();
+        if !entries.iter().any(|(id, _)| *id == task_id) {
+            // Mirror the Neo4j `coalesce(max(order) + 1, 0)`: first entry is 0.
+            let next_order = entries
+                .iter()
+                .map(|(_, o)| *o)
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(0);
+            entries.push((task_id, next_order));
+        }
+        Ok(())
+    }
+
+    async fn remove_from_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> Result<()> {
+        let mut plans = self.day_plans.write().await;
+        if let Some(entries) = plans.get_mut(&(user_id, date.to_string())) {
+            entries.retain(|(id, _)| *id != task_id);
+        }
+        Ok(())
     }
 
     // ========================================================================
