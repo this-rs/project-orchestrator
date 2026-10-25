@@ -22,6 +22,7 @@ use std::collections::BTreeSet;
 
 use project_orchestrator::chat::prompt::TOOL_REFERENCE;
 use project_orchestrator::chat::prompt_sections::{extract_tool_reference, ToolRefGroupId};
+use project_orchestrator::mcp::tools::all_tools;
 
 /// Tool names carrying a `## <name>` section in `TOOL_REFERENCE`.
 ///
@@ -141,5 +142,70 @@ fn every_group_renders_tool_documentation() {
         empty.is_empty(),
         "tool groups rendering no documentation beyond the preamble: {}",
         empty.join(", ")
+    );
+}
+
+/// The section of one tool: from its `## <tool>` header to the next `## ` header.
+///
+/// `### ` subsections (protocol, skill) belong to their tool's section.
+fn section_of(tool_reference: &str, tool: &str) -> Option<String> {
+    let header = format!("## {tool}");
+    let mut lines = tool_reference
+        .lines()
+        .skip_while(|l| l.trim_end() != header);
+    let first = lines.next()?;
+    let mut section = String::from(first);
+    section.push('\n');
+    for line in lines {
+        if line.starts_with("## ") {
+            break;
+        }
+        section.push_str(line);
+        section.push('\n');
+    }
+    Some(section)
+}
+
+/// Every action the schema accepts must have a row in its tool's section.
+///
+/// The section used to repeat the schema's `action` enum in a prose sentence
+/// (`Manage projects. Actions: list, create, …`), a third copy of the same list —
+/// after the JSON `enum` and the table's `| Action |` column. That sentence was
+/// removed (≈1,5 K tokens re-sent at every turn). This test is what makes the removal
+/// safe: the TABLE is the copy that survives, so it has to be exhaustive. If a row is
+/// missing, the action is now documented nowhere in the prompt.
+#[test]
+fn every_action_has_a_row_in_its_tool_reference_section() {
+    let mut missing: Vec<String> = Vec::new();
+    for tool in all_tools() {
+        let Some(section) = section_of(TOOL_REFERENCE, &tool.name) else {
+            missing.push(format!("{}: no section", tool.name));
+            continue;
+        };
+        let actions: Vec<String> = tool
+            .input_schema
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("action"))
+            .and_then(|a| a.get("enum"))
+            .and_then(|e| e.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(!actions.is_empty(), "{}: empty action enum", tool.name);
+        for action in actions {
+            let row = format!("| {action} |");
+            if !section.lines().any(|l| l.starts_with(&row)) {
+                missing.push(format!("{}.{action}", tool.name));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "these actions are in the schema's enum but have no row in TOOL_REFERENCE, so the \
+         prompt would document them nowhere: {missing:?}"
     );
 }
