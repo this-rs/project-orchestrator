@@ -308,8 +308,15 @@ pub fn build_native_provider(
     vault: Option<Arc<VaultService>>,
 ) -> Result<Arc<dyn AgentProvider>, ProviderError> {
     // A one-shot or a probe has no conversation to load tools into: nothing deferred.
-    build_provider_with_handle(record, vault, None, &AcpSetup::default(), &[])
-        .map(|(provider, _)| provider)
+    build_provider_with_handle(
+        record,
+        vault,
+        None,
+        &AcpSetup::default(),
+        &CodexSetup::default(),
+        &[],
+    )
+    .map(|(provider, _)| provider)
 }
 
 /// Where the ACP instances of a server come from: the declared commands and the root
@@ -325,6 +332,18 @@ pub struct AcpSetup {
     pub commands: Option<std::collections::BTreeMap<String, super::settings::AcpCommand>>,
 }
 
+/// How Codex instances are built for tests: the default uses the `codex` binary
+/// found on `PATH` and nexus' default `CODEX_HOME`; a test supplies its own program
+/// path (`fake_codex`) and a temporary home, so that it neither mutates `PATH` nor
+/// writes in the user's real Codex data directory.
+#[derive(Debug, Clone, Default)]
+pub struct CodexSetup {
+    /// The `codex` binary to run. `None` = look up `codex` on `PATH` (production).
+    pub program: Option<std::path::PathBuf>,
+    /// Root of `CODEX_HOME` for each instance: `<root>/<instance>`. `None` = nexus default.
+    pub home: Option<std::path::PathBuf>,
+}
+
 /// A provider and, for a native record, its concrete harness.
 pub type BuiltProvider = (Arc<dyn AgentProvider>, Option<Arc<NativeProvider>>);
 
@@ -332,17 +351,18 @@ pub type BuiltProvider = (Arc<dyn AgentProvider>, Option<Arc<NativeProvider>>);
 /// it can run a capability probe (the trait has no such method).
 /// `transcripts`: where the native sessions keep their conversations
 /// ([`build_native_for_sessions`]). `acp`: the declared ACP agents and where their
-/// `HOME`s live ([`AcpSetup`]).
+/// `HOME`s live ([`AcpSetup`]). `codex`: program override for tests ([`CodexSetup`]).
 /// `deferred_tools`: what the native harness withholds behind `ToolSearch` (CTX2).
 pub fn build_provider_with_handle(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
     transcripts: Option<&std::path::Path>,
     acp: &AcpSetup,
+    codex: &CodexSetup,
     deferred_tools: &[String],
 ) -> Result<BuiltProvider, ProviderError> {
     match record.kind.as_str() {
-        "codex" => build_codex(record, vault).map(|p| (p, None)),
+        "codex" => build_codex(record, vault, codex).map(|p| (p, None)),
         "acp" => build_acp(record, acp).map(|p| (p, None)),
         super::settings::KIND_CLAUDE_CODE_REMOTE => {
             build_remote_claude(record, vault).map(|p| (p, None))
@@ -365,9 +385,11 @@ fn cost_basis_of(record: &InstanceRecord) -> CostBasis {
 
 /// Codex: the program is `codex` found on the server's PATH (never a path from an
 /// API body), with its own persistent home per instance.
+/// Tests may override `program` (to `fake_codex`) and `home` via [`CodexSetup`].
 fn build_codex(
     record: &InstanceRecord,
     vault: Option<Arc<VaultService>>,
+    setup: &CodexSetup,
 ) -> Result<Arc<dyn AgentProvider>, ProviderError> {
     use nexus_claude::providers::codex::{CodexConfig, CodexProvider};
     super::settings::parse_credential_ref(
@@ -379,6 +401,12 @@ fn build_codex(
     config.default_model = record.default_model.clone();
     config.cost_basis = cost_basis_of(record);
     config.credential = CredentialRef::from_str(&record.credential_ref)?;
+    if let Some(program) = &setup.program {
+        config.program = program.clone();
+    }
+    if let Some(home_root) = &setup.home {
+        config.codex_home = home_root.join(&record.id);
+    }
     let resolver: Arc<dyn CredentialResolver> = match vault {
         Some(vault) => Arc::new(VaultCredentialResolver::new(vault)),
         None => Arc::new(EnvCredentialResolver),

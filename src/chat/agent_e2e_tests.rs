@@ -13575,6 +13575,274 @@ mod openclaw_delegation {
     }
 }
 
+/// ISO4: `provider_switch.relay` on fake_codex (nexus src/bin/fake_codex.rs).
+/// Two symmetric switch tests — native ↔ Codex — using the existing `plain.jsonl`
+/// transcript (prelude + one text turn returning "Hello from codex").
+///
+/// These tests prove only the relay contract: the session thread keeps its id and the
+/// destination provider receives the conversation history.  They do NOT run the full
+/// parity scenario; every other Codex cell in the matrix that needs a dedicated
+/// transcript is declared `not_measured` in EXPECTED (ISO4).
+mod codex_switch {
+    use super::super::provider::settings::process_origin;
+    use super::*;
+
+    /// Shell wrapper around `fake_codex` that hard-codes `FAKE_CODEX_TRANSCRIPT`
+    /// so the backend never touches the test's process environment.
+    /// Also owns a `codex-homes/` directory with a fake `auth.json` so that
+    /// the health preflight (`logged_in()`) passes without a real Codex login.
+    struct FakeCodex {
+        _dir: tempfile::TempDir,
+        script: std::path::PathBuf,
+        /// Root passed to `with_codex_home`: each instance home is `<root>/<instance-id>`.
+        home_root: std::path::PathBuf,
+        /// Path where `fake_codex` records every incoming request (FAKE_CODEX_RECORD).
+        record: std::path::PathBuf,
+    }
+
+    impl FakeCodex {
+        fn new() -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            // Fake CODEX_HOME root: `home_root/<instance>/auth.json` must exist so
+            // `logged_in()` returns true and the health preflight passes.
+            let home_root = dir.path().join("codex-homes");
+            // Write a fully-inlined transcript so the test does not depend on
+            // the nexus source tree being at a fixed relative path (CARGO_MANIFEST_DIR
+            // differs between the main backend worktree and a git worktree under _wt/).
+            let transcript = dir.path().join("plain.jsonl");
+            std::fs::write(
+                &transcript,
+                concat!(
+                    // ── prelude ──────────────────────────────────────────────
+                    "{\"op\":\"expect\",\"method\":\"initialize\",\"reply\":{\"userAgent\":\"fake_codex/0.130.0\",\"codexHome\":\"/fake/codex-home\",\"platformFamily\":\"unix\",\"platformOs\":\"macos\"}}\n",
+                    "{\"op\":\"expect_notification\",\"method\":\"initialized\"}\n",
+                    "{\"op\":\"expect\",\"method\":\"thread/start\",\"reply\":{\"thread\":{\"id\":\"thr_fake1\",\"preview\":\"\",\"modelProvider\":\"openai\",\"createdAt\":1730910000},\"model\":\"gpt-fake\"}}\n",
+                    "{\"op\":\"notify\",\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"thr_fake1\",\"preview\":\"\",\"modelProvider\":\"openai\",\"createdAt\":1730910000}}}\n",
+                    // ── turn1_start ──────────────────────────────────────────
+                    "{\"op\":\"expect\",\"method\":\"turn/start\",\"reply\":{\"turn\":{\"id\":\"turn_1\",\"status\":\"inProgress\",\"items\":[],\"error\":null}}}\n",
+                    "{\"op\":\"notify\",\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_fake1\",\"turn\":{\"id\":\"turn_1\",\"status\":\"inProgress\",\"items\":[],\"error\":null}}}\n",
+                    // ── turn1_text (delta → "Hello from codex") ─────────────
+                    "{\"op\":\"notify\",\"method\":\"item/started\",\"params\":{\"threadId\":\"thr_fake1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_1\",\"text\":\"\"}}}\n",
+                    "{\"op\":\"notify\",\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thr_fake1\",\"turnId\":\"turn_1\",\"itemId\":\"msg_1\",\"delta\":\"Hello \"}}\n",
+                    "{\"op\":\"notify\",\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thr_fake1\",\"turnId\":\"turn_1\",\"itemId\":\"msg_1\",\"delta\":\"from codex\"}}\n",
+                    "{\"op\":\"notify\",\"method\":\"item/completed\",\"params\":{\"threadId\":\"thr_fake1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_1\",\"text\":\"Hello from codex\"}}}\n",
+                    // ── turn1_end ────────────────────────────────────────────
+                    "{\"op\":\"notify\",\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"thr_fake1\",\"turnId\":\"turn_1\",\"tokenUsage\":{\"total\":{\"totalTokens\":180,\"inputTokens\":120,\"cachedInputTokens\":20,\"outputTokens\":60,\"reasoningOutputTokens\":10},\"last\":{\"totalTokens\":180,\"inputTokens\":120,\"cachedInputTokens\":20,\"outputTokens\":60,\"reasoningOutputTokens\":10},\"modelContextWindow\":272000}}}\n",
+                    "{\"op\":\"notify\",\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_fake1\",\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\",\"items\":[],\"error\":null}}}\n",
+                ),
+            )
+            .unwrap();
+            // Create a fake `auth.json` under `home_root/iso4-codex/auth.json` so that
+            // `logged_in()` returns `true` and the health preflight (`create_session`
+            // calls `health()` before opening) does not fail with `auth_required`.
+            // The content is irrelevant — only its existence is checked.
+            let instance_home = home_root.join("iso4-codex");
+            std::fs::create_dir_all(&instance_home).unwrap();
+            std::fs::write(instance_home.join("auth.json"), b"{}").unwrap();
+            let record = dir.path().join("fake-codex-record.jsonl");
+            let fake = fake_bin("fake_codex");
+            let script = dir.path().join("fake-codex-wrapper.sh");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nFAKE_CODEX_TRANSCRIPT='{}' FAKE_CODEX_RECORD='{}' \
+                     FAKE_CODEX_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
+                    transcript.display(),
+                    record.display(),
+                    fake.display(),
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            Self {
+                _dir: dir,
+                script,
+                home_root,
+                record,
+            }
+        }
+
+        fn script(&self) -> &std::path::Path {
+            &self.script
+        }
+
+        /// Root for `with_codex_home`: each instance's home is `<root>/<instance-id>`.
+        fn home_root(&self) -> &std::path::Path {
+            &self.home_root
+        }
+
+        /// Every request recorded by `fake_codex` (FAKE_CODEX_RECORD).
+        fn recorded(&self) -> Vec<Value> {
+            std::fs::read_to_string(&self.record)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .collect()
+        }
+    }
+
+    async fn store_codex_instance(graph: &MockGraphStore, id: &str) -> String {
+        let origin = process_origin("codex", None);
+        store_instance(
+            graph,
+            &InstanceRecord {
+                id: id.into(),
+                kind: "codex".into(),
+                label: "Codex ISO4".into(),
+                origin: origin.clone(),
+                default_model: Some("gpt-fake".into()),
+                cost_source: "unknown".into(),
+                credential_ref: "none".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        origin
+    }
+
+    /// Poll the graph until `found` returns `Some`, or return `None` after 5 s.
+    async fn persisted<T>(
+        graph: &MockGraphStore,
+        sid: &str,
+        found: impl Fn(&ChatEvent) -> Option<T>,
+    ) -> Option<T> {
+        let uuid = Uuid::parse_str(sid).unwrap();
+        for _ in 0..100 {
+            let hit = graph
+                .get_chat_events(uuid, 0, 200)
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|r| serde_json::from_str::<ChatEvent>(&r.data).ok())
+                .find_map(|e| found(&e));
+            if hit.is_some() {
+                return hit;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        None
+    }
+
+    /// A native (`fake_openai`) instance and a Codex instance on one manager.
+    async fn native_and_codex(
+        fake_codex: &FakeCodex,
+    ) -> (ChatManager, Arc<MockGraphStore>, FakeOpenAi) {
+        let fake = FakeOpenAi::start(script());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let codex_origin = store_codex_instance(&graph, "iso4-codex").await;
+        consent(&graph, "proj", "iso4-codex", &codex_origin).await;
+        let mgr = manager(graph.clone(), true)
+            .with_codex_program(fake_codex.script())
+            .with_codex_home(fake_codex.home_root());
+        (mgr, graph, fake)
+    }
+
+    /// Opens a session on `id` and waits for the Codex answer; returns the session id.
+    async fn open_codex(manager: &ChatManager, id: &str) -> String {
+        let created = manager
+            .create_session(&request(Some(id), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("the codex session on {id} must open: {e:#}"));
+        let sid = created.session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        next_event(
+            &mut rx,
+            |e| matches!(e, ChatEvent::AssistantText { content, .. } if content.contains("Hello from codex")),
+        )
+        .await;
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+        sid
+    }
+
+    /// ISO4 — native → Codex: the thread keeps its id and the Codex side answers.
+    #[tokio::test]
+    async fn a_conversation_moves_from_the_native_harness_to_codex() {
+        let fake_codex = FakeCodex::new();
+        let (manager, graph, _fake) = native_and_codex(&fake_codex).await;
+
+        // Open on native first.
+        let created = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap_or_else(|e| panic!("the native session must open: {e:#}"));
+        let sid = created.session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        next_event(&mut rx, |e| matches!(e, ChatEvent::Result { .. })).await;
+
+        // Switch to Codex.
+        let moved = manager
+            .switch_session_provider(&sid, "iso4-codex", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("the switch to Codex failed: {e:#}"));
+        assert_eq!(moved.session_id, sid, "the SAME thread continues");
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.provider_id.as_deref(), Some("iso4-codex"));
+        let said = persisted(&graph, &sid, |e| match e {
+            ChatEvent::AssistantText { content, .. } if content.contains("Hello from codex") => {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+        assert!(said.is_some(), "Codex answered after the switch");
+        // ISO4: verify that fake_codex received the relayed native history.
+        assert!(
+            fake_codex
+                .recorded()
+                .iter()
+                .any(|e| e["kind"] == "in"
+                    && e["params"].to_string().contains("<conversation_relay")),
+            "fake_codex received the relayed native history in the switch request"
+        );
+    }
+
+    /// ISO4 — Codex → native: the thread keeps its id and the native side receives the
+    /// relayed Codex history.
+    #[tokio::test]
+    async fn a_conversation_moves_from_codex_to_the_native_harness() {
+        let fake_codex = FakeCodex::new();
+        let (manager, graph, fake) = native_and_codex(&fake_codex).await;
+
+        // Open on Codex first.
+        let sid = open_codex(&manager, "iso4-codex").await;
+
+        // Switch to native.
+        let moved = manager
+            .switch_session_provider(&sid, "local", None, "hi there again", None)
+            .await
+            .unwrap_or_else(|e| panic!("the switch to the native harness failed: {e:#}"));
+        assert_eq!(moved.session_id, sid, "the SAME thread continues");
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.provider_id.as_deref(), Some("local"));
+        let said = persisted(&graph, &sid, |e| match e {
+            ChatEvent::AssistantText { content, .. } if content.contains("fake model") => Some(()),
+            _ => None,
+        })
+        .await;
+        assert!(said.is_some(), "the native model answered after the switch");
+        assert!(
+            fake.chat_requests()
+                .iter()
+                .any(|r| r.to_string().contains("<conversation_relay")),
+            "the native model received the relayed Codex history"
+        );
+    }
+}
+
 // ============================================================================
 // Sub-agents of a native session (P18): the child's ceiling, the cap of live children
 // under parallel calls, the child closed whatever the end. Scripted provider, no fakes.
