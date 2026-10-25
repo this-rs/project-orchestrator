@@ -22,6 +22,8 @@ pub enum EntityType {
     Plan,
     /// Unit of work within a plan — emitters: handlers.rs (Created, Updated, Deleted, StatusChanged)
     Task,
+    /// A user's ordered per-day task list — emitters: handlers.rs (Updated, Linked, Unlinked)
+    DayPlan,
     /// Atomic sub-step within a task — emitters: handlers.rs (Updated, Deleted)
     Step,
     /// Architectural decision record — emitters: handlers.rs (Created, Linked via AFFECTS)
@@ -356,6 +358,7 @@ mod tests {
             EntityType::Project,
             EntityType::Plan,
             EntityType::Task,
+            EntityType::DayPlan,
             EntityType::Step,
             EntityType::Decision,
             EntityType::Constraint,
@@ -494,10 +497,11 @@ mod tests {
     #[test]
     fn test_entity_type_has_30_variants() {
         // Ensure we don't accidentally add/remove variants
-        let all: [EntityType; 31] = [
+        let all: [EntityType; 32] = [
             EntityType::Project,
             EntityType::Plan,
             EntityType::Task,
+            EntityType::DayPlan,
             EntityType::Step,
             EntityType::Decision,
             EntityType::Constraint,
@@ -527,7 +531,7 @@ mod tests {
             EntityType::Learning,
             EntityType::AttentionChanged,
         ];
-        assert_eq!(all.len(), 31);
+        assert_eq!(all.len(), 32);
     }
 
     // ================================================================

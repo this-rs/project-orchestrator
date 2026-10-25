@@ -135,7 +135,8 @@ pub fn classify_events(e: &EventsEntity) -> Classification {
         | EventsEntity::Resource
         | EventsEntity::Component
         | EventsEntity::ProtocolRun
-        | EventsEntity::Episode => Excluded(LATER),
+        | EventsEntity::Episode
+        | EventsEntity::DayPlan => Excluded(LATER),
         EventsEntity::FeatureGraph | EventsEntity::TopologyRule => Excluded(CODE_INTEL),
         EventsEntity::Runner
         | EventsEntity::Alert
@@ -205,10 +206,11 @@ mod tests {
             .collect()
     }
 
-    const EVENTS_ALL: [EventsEntity; 31] = [
+    const EVENTS_ALL: [EventsEntity; 32] = [
         EventsEntity::Project,
         EventsEntity::Plan,
         EventsEntity::Task,
+        EventsEntity::DayPlan,
         EventsEntity::Step,
         EventsEntity::Decision,
         EventsEntity::Constraint,

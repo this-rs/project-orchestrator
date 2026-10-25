@@ -772,6 +772,15 @@ fn protected_routes() -> Router<OrchestratorState> {
                 .patch(handlers::update_task)
                 .delete(handlers::delete_task),
         )
+        // Day plan — a user's ordered per-day task list, server-side and shared.
+        .route(
+            "/api/day-plan",
+            get(handlers::get_day_plan).put(handlers::set_day_plan),
+        )
+        .route(
+            "/api/day-plan/tasks/{task_id}",
+            post(handlers::add_to_day).delete(handlers::remove_from_day),
+        )
         // Task ↔ Session linking
         .route(
             "/api/tasks/{task_id}/sessions",

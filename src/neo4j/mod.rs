@@ -10,6 +10,7 @@ mod code;
 mod commit;
 mod constraint;
 pub mod data_migrations;
+mod day_plan;
 mod decision;
 pub mod document;
 mod environment;

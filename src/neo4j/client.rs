@@ -463,6 +463,8 @@ impl Neo4jClient {
             "CREATE CONSTRAINT protocol_run_id IF NOT EXISTS FOR (r:ProtocolRun) REQUIRE r.id IS UNIQUE",
             // Living Personas
             "CREATE CONSTRAINT persona_id IF NOT EXISTS FOR (p:Persona) REQUIRE p.id IS UNIQUE",
+            // Day plan: one node per user per day — the natural key its MERGE uses.
+            "CREATE CONSTRAINT day_plan_key IF NOT EXISTS FOR (dp:DayPlan) REQUIRE (dp.user_id, dp.date) IS UNIQUE",
         ];
 
         let indexes = vec![

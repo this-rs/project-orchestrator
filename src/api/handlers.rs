@@ -4,6 +4,7 @@ use crate::api::{
     workspace_handlers::{MilestonePlanSummary, MilestoneStepSummary, MilestoneTaskSummary},
     PaginatedResponse, PaginationParams, PriorityFilter, SearchFilter, StatusFilter, TagsFilter,
 };
+use crate::auth::extractor::AuthUser;
 use crate::chat::ChatManager;
 use crate::events::{EventEmitter, HybridEmitter, NatsEmitter};
 use crate::graph::algorithms::add_thermal_noise;
@@ -776,6 +777,159 @@ pub async fn update_task(
             None,
         );
     }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Query parameters for the day-plan routes.
+///
+/// `date` is `YYYY-MM-DD`. It is required by `GET` (read a specific day) and
+/// optional elsewhere (POST/DELETE default to today).
+#[derive(Debug, Deserialize)]
+pub struct DayPlanQuery {
+    pub date: Option<String>,
+}
+
+/// Body for `PUT /api/day-plan`: replace the whole day with an ordered id list.
+#[derive(Debug, Deserialize)]
+pub struct SetDayPlanRequest {
+    pub date: String,
+    pub ids: Vec<String>,
+}
+
+/// One entry of a day plan (the task id and its position).
+#[derive(Debug, Serialize)]
+pub struct DayPlanTaskEntry {
+    pub id: Uuid,
+    pub order: u32,
+}
+
+/// Response for `GET /api/day-plan`.
+#[derive(Debug, Serialize)]
+pub struct DayPlanResponse {
+    pub date: String,
+    pub tasks: Vec<DayPlanTaskEntry>,
+}
+
+/// `YYYY-MM-DD` in UTC, the key of the implicit "today" day plan.
+fn today_yyyy_mm_dd() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
+}
+
+/// Validate the `YYYY-MM-DD` shape before it becomes a graph key.
+fn validate_date(date: &str) -> Result<(), AppError> {
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map(|_| ())
+        .map_err(|_| AppError::BadRequest(format!("invalid date '{date}', expected YYYY-MM-DD")))
+}
+
+/// Resolve the date for a day-plan route: validate when present, fall back to
+/// today (or refuse) when absent.
+fn resolve_date(date: Option<String>, required: bool) -> Result<String, AppError> {
+    match date {
+        Some(d) => {
+            validate_date(&d)?;
+            Ok(d)
+        }
+        None if required => Err(AppError::BadRequest(
+            "missing 'date' query parameter (YYYY-MM-DD)".to_string(),
+        )),
+        None => Ok(today_yyyy_mm_dd()),
+    }
+}
+
+/// Parse the ordered id list of `PUT /api/day-plan`.
+fn parse_task_ids(ids: &[String]) -> Result<Vec<Uuid>, AppError> {
+    ids.iter()
+        .map(|s| {
+            s.parse::<Uuid>()
+                .map_err(|_| AppError::BadRequest(format!("invalid task id '{s}'")))
+        })
+        .collect()
+}
+
+/// GET /api/day-plan?date=YYYY-MM-DD — the authenticated user's ordered day plan.
+pub async fn get_day_plan(
+    State(state): State<OrchestratorState>,
+    user: AuthUser,
+    Query(query): Query<DayPlanQuery>,
+) -> Result<Json<DayPlanResponse>, AppError> {
+    let date = resolve_date(query.date, true)?;
+    let entries = state
+        .orchestrator
+        .neo4j()
+        .get_day_plan(user.user_id, &date)
+        .await?;
+    let tasks = entries
+        .into_iter()
+        .map(|(id, order)| DayPlanTaskEntry { id, order })
+        .collect();
+    Ok(Json(DayPlanResponse { date, tasks }))
+}
+
+/// PUT /api/day-plan — replace the whole day plan (idempotent).
+pub async fn set_day_plan(
+    State(state): State<OrchestratorState>,
+    user: AuthUser,
+    Json(req): Json<SetDayPlanRequest>,
+) -> Result<StatusCode, AppError> {
+    validate_date(&req.date)?;
+    let ids = parse_task_ids(&req.ids)?;
+    let date = req.date.clone();
+    state
+        .orchestrator
+        .neo4j()
+        .set_day_plan(user.user_id, &date, &ids)
+        .await?;
+    let payload = serde_json::json!({ "date": date.clone(), "task_ids": ids });
+    state
+        .event_bus
+        .emit_updated(crate::events::EntityType::DayPlan, &date, payload, None);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/day-plan/tasks/{id} — append a task to today's plan (or `?date=`).
+pub async fn add_to_day(
+    State(state): State<OrchestratorState>,
+    user: AuthUser,
+    Query(query): Query<DayPlanQuery>,
+    Path(task_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    let date = resolve_date(query.date, false)?;
+    state
+        .orchestrator
+        .neo4j()
+        .add_to_day(user.user_id, &date, task_id)
+        .await?;
+    state.event_bus.emit_linked(
+        crate::events::EntityType::DayPlan,
+        &date,
+        crate::events::EntityType::Task,
+        &task_id.to_string(),
+        None,
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// DELETE /api/day-plan/tasks/{id} — remove a task from today's plan (or `?date=`).
+pub async fn remove_from_day(
+    State(state): State<OrchestratorState>,
+    user: AuthUser,
+    Query(query): Query<DayPlanQuery>,
+    Path(task_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    let date = resolve_date(query.date, false)?;
+    state
+        .orchestrator
+        .neo4j()
+        .remove_from_day(user.user_id, &date, task_id)
+        .await?;
+    state.event_bus.emit_unlinked(
+        crate::events::EntityType::DayPlan,
+        &date,
+        crate::events::EntityType::Task,
+        &task_id.to_string(),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -11946,6 +12100,226 @@ pub(crate) mod tests {
         let resp = oneshot_req(app, req).await;
         let json = resp_json(resp).await;
         assert_eq!(json["running"], false);
+    }
+
+    // ================================================================
+    // Day plan
+    // ================================================================
+
+    const DAY_PLAN_USER: &str = "11111111-1111-1111-1111-111111111111";
+
+    /// A bearer token signed for ONE fixed user, so a day-plan round-trip
+    /// through the router hits the same `(user_id, date)` key. The generic
+    /// `test_bearer_token` mints a fresh UUID per call, which would scatter the
+    /// writes across different users.
+    fn day_plan_token() -> String {
+        let user_id: Uuid = DAY_PLAN_USER.parse().unwrap();
+        let token = crate::auth::jwt::encode_jwt(
+            user_id,
+            "dayplan@ffs.holdings",
+            "Day Plan",
+            "test-secret-key-minimum-32-chars!!",
+            28800,
+        )
+        .expect("test token encoding should succeed");
+        format!("Bearer {token}")
+    }
+
+    fn dp_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("authorization", day_plan_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn dp_put_json(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("authorization", day_plan_token())
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn dp_post(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", day_plan_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn dp_delete(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .header("authorization", day_plan_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// The pure store logic (through the in-memory mock, which mirrors the
+    /// Neo4j semantics): replace / append / remove / read round-trips.
+    #[tokio::test]
+    async fn day_plan_store_round_trip() {
+        use crate::neo4j::GraphStore;
+
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let user = Uuid::new_v4();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+
+        assert!(store
+            .get_day_plan(user, "2026-01-15")
+            .await
+            .unwrap()
+            .is_empty());
+
+        store
+            .set_day_plan(user, "2026-01-15", &[a, b])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_day_plan(user, "2026-01-15").await.unwrap(),
+            vec![(a, 0), (b, 1)]
+        );
+
+        // Append puts the task at the end; re-adding an existing task is a no-op.
+        store.add_to_day(user, "2026-01-15", c).await.unwrap();
+        store.add_to_day(user, "2026-01-15", a).await.unwrap();
+        assert_eq!(
+            store.get_day_plan(user, "2026-01-15").await.unwrap(),
+            vec![(a, 0), (b, 1), (c, 2)]
+        );
+
+        // Remove drops the entry (and its order).
+        store.remove_from_day(user, "2026-01-15", b).await.unwrap();
+        assert_eq!(
+            store.get_day_plan(user, "2026-01-15").await.unwrap(),
+            vec![(a, 0), (c, 2)]
+        );
+
+        // Replace with an empty list clears the day.
+        store.set_day_plan(user, "2026-01-15", &[]).await.unwrap();
+        assert!(store
+            .get_day_plan(user, "2026-01-15")
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Isolation: another user or another date sees nothing.
+        assert!(store
+            .get_day_plan(Uuid::new_v4(), "2026-01-15")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .get_day_plan(user, "2026-01-16")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The four routes wired together: PUT then GET returns the ordered list,
+    /// POST appends, DELETE removes.
+    #[tokio::test]
+    async fn day_plan_http_round_trip() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (app, _bus) = test_app_parts(graph).await;
+
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+
+        // PUT the plan.
+        let resp = app
+            .clone()
+            .oneshot(dp_put_json(
+                "/api/day-plan",
+                serde_json::json!({ "date": "2026-01-15", "ids": [a, b] }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+
+        // GET it back, in order.
+        let resp = app
+            .clone()
+            .oneshot(dp_get("/api/day-plan?date=2026-01-15"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = resp_json(resp).await;
+        assert_eq!(json["date"], "2026-01-15");
+        let tasks = json["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0]["id"], a.to_string());
+        assert_eq!(tasks[0]["order"].as_u64().unwrap(), 0);
+        assert_eq!(tasks[1]["id"], b.to_string());
+        assert_eq!(tasks[1]["order"].as_u64().unwrap(), 1);
+
+        // POST appends; a second POST of the same task is a no-op.
+        let c = Uuid::new_v4();
+        let resp = app
+            .clone()
+            .oneshot(dp_post(&format!("/api/day-plan/tasks/{c}?date=2026-01-15")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+        let resp = app
+            .clone()
+            .oneshot(dp_post(&format!("/api/day-plan/tasks/{c}?date=2026-01-15")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+        let json = resp_json(
+            app.clone()
+                .oneshot(dp_get("/api/day-plan?date=2026-01-15"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(json["tasks"].as_array().unwrap().len(), 3);
+
+        // DELETE removes it.
+        let resp = app
+            .clone()
+            .oneshot(dp_delete(&format!(
+                "/api/day-plan/tasks/{b}?date=2026-01-15"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+        let json = resp_json(
+            app.oneshot(dp_get("/api/day-plan?date=2026-01-15"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let tasks = json["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0]["id"], a.to_string());
+        assert_eq!(tasks[1]["id"], c.to_string());
+    }
+
+    /// GET requires a date; an invalid one is a 400, not a silent default.
+    #[tokio::test]
+    async fn day_plan_requires_a_valid_date() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (app, _bus) = test_app_parts(graph).await;
+
+        let resp = app.clone().oneshot(dp_get("/api/day-plan")).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+
+        let resp = app
+            .clone()
+            .oneshot(dp_get("/api/day-plan?date=not-a-date"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
     }
 }
 
