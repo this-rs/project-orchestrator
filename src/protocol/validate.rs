@@ -329,3 +329,155 @@ mod tests {
         assert!(violations.is_empty());
     }
 }
+
+/// Tests against real Neo4j graph — run with `cargo test --lib protocol::validate::real_graph -- --ignored`
+#[cfg(test)]
+mod real_graph {
+    use super::*;
+
+    /// Validate ALL stored protocols against the real Neo4j graph.
+    ///
+    /// PYSR-4 criterion 4: prove that existing protocols pass structural validation.
+    ///
+    /// Run manually with:
+    /// ```sh
+    /// PARITY_NEO4J_URI=bolt://localhost:7687 \
+    /// PARITY_NEO4J_USER=neo4j \
+    /// PARITY_NEO4J_PASSWORD=<password> \
+    /// cargo test --lib protocol::validate::real_graph::all_stored_protocols_pass -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore]
+    async fn all_stored_protocols_pass() {
+        use crate::neo4j::client::Neo4jClient;
+
+        // Read Neo4j connection from environment (never print credentials)
+        let required = std::env::var("HARNESS_NEO4J_REQUIRED").is_ok();
+        let Ok(uri) = std::env::var("PARITY_NEO4J_URI") else {
+            assert!(
+                !required,
+                "HARNESS_NEO4J_REQUIRED is set but PARITY_NEO4J_URI is not"
+            );
+            eprintln!("Skipping: PARITY_NEO4J_URI not set");
+            return;
+        };
+        let user = std::env::var("PARITY_NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
+        let pass = std::env::var("PARITY_NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
+
+        // Connect with timeout
+        let connect = Neo4jClient::new(&uri, &user, &pass);
+        let client = match tokio::time::timeout(std::time::Duration::from_secs(30), connect).await {
+            Ok(Ok(c)) => c,
+            _ => {
+                assert!(
+                    !required,
+                    "HARNESS_NEO4J_REQUIRED is set but no Neo4j answers at {uri}"
+                );
+                eprintln!("Skipping: no Neo4j at {uri}");
+                return;
+            }
+        };
+
+        // List all projects
+        let projects = client.list_projects().await.expect("list_projects");
+        eprintln!("Found {} projects", projects.len());
+
+        let mut total_protocols = 0;
+        let mut invalid_protocols: Vec<(String, uuid::Uuid, uuid::Uuid, Vec<ProtocolViolation>)> =
+            Vec::new();
+
+        for project in &projects {
+            // List protocols for this project (limit 1000 should be enough)
+            let (protocols, _) = client
+                .list_protocols(project.id, None, 1000, 0)
+                .await
+                .expect("list_protocols");
+
+            for protocol in protocols {
+                total_protocols += 1;
+
+                // Get states and transitions
+                let states = client
+                    .get_protocol_states(protocol.id)
+                    .await
+                    .expect("get_protocol_states");
+                let transitions = client
+                    .get_protocol_transitions(protocol.id)
+                    .await
+                    .expect("get_protocol_transitions");
+
+                // Convert to validatable types
+                let validatable_states: Vec<ValidatableState<'_>> = states
+                    .iter()
+                    .map(|s| ValidatableState {
+                        name: s.name.as_str(),
+                        state_type: s.state_type,
+                    })
+                    .collect();
+
+                let validatable_transitions: Vec<ValidatableTransition<'_>> = transitions
+                    .iter()
+                    .map(|t| {
+                        let from_name = states
+                            .iter()
+                            .find(|s| s.id == t.from_state)
+                            .map(|s| s.name.as_str())
+                            .unwrap_or("?");
+                        let to_name = states
+                            .iter()
+                            .find(|s| s.id == t.to_state)
+                            .map(|s| s.name.as_str())
+                            .unwrap_or("?");
+                        ValidatableTransition {
+                            from_state: from_name,
+                            to_state: to_name,
+                            trigger: t.trigger.as_str(),
+                        }
+                    })
+                    .collect();
+
+                // Validate
+                let violations =
+                    validate_protocol_structure(&validatable_states, &validatable_transitions);
+
+                if !violations.is_empty() {
+                    invalid_protocols.push((
+                        protocol.name.clone(),
+                        protocol.id,
+                        project.id,
+                        violations,
+                    ));
+                }
+            }
+        }
+
+        // Print results
+        eprintln!("\n=== PYSR-4 Protocol Validation Results ===");
+        eprintln!("Total protocols validated: {}", total_protocols);
+        eprintln!(
+            "Valid: {}, Invalid: {}",
+            total_protocols - invalid_protocols.len(),
+            invalid_protocols.len()
+        );
+
+        if invalid_protocols.is_empty() {
+            eprintln!(
+                "\n✓ All {}/{} protocols are structurally valid",
+                total_protocols, total_protocols
+            );
+        } else {
+            eprintln!("\n✗ Invalid protocols:");
+            for (name, id, project_id, violations) in &invalid_protocols {
+                eprintln!("  - {} (id: {}, project: {})", name, id, project_id);
+                for v in violations {
+                    eprintln!("    • {}", v);
+                }
+            }
+            panic!(
+                "{} of {} protocols have structural violations",
+                invalid_protocols.len(),
+                total_protocols
+            );
+        }
+    }
+}
