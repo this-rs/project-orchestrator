@@ -979,6 +979,11 @@ pub struct ChatManager {
     pub(crate) graph: Arc<dyn GraphStore>,
     #[allow(dead_code)]
     pub(crate) search: Arc<dyn SearchStore>,
+    /// The server's embedding provider, when one is configured. Handed to
+    /// `KnowledgeInjectionStage` so that knowledge retrieval can add a dense
+    /// (cosine) channel to BM25. `None` is a supported state, not a failure:
+    /// retrieval then stays lexical-only, exactly as it was before.
+    pub(crate) embeddings: Option<Arc<dyn crate::embeddings::EmbeddingProvider>>,
     pub(crate) config: ChatConfig,
     pub(crate) active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
     /// Sessions of the provider-neutral path (`CHAT_PROVIDER_PATH=agent`).
@@ -3608,6 +3613,7 @@ impl ChatManager {
         reasoning_engine: Option<&Arc<crate::reasoning::ReasoningTreeEngine>>,
         trajectory_collector: Option<&std::sync::Arc<neural_routing_runtime::TrajectoryCollector>>,
         mcp_registry: Option<&crate::mcp_federation::registry::SharedRegistry>,
+        embeddings: Option<&Arc<dyn crate::embeddings::EmbeddingProvider>>,
     ) -> Arc<super::enrichment::EnrichmentPipeline> {
         let mut pipeline = super::enrichment::EnrichmentPipeline::new(
             super::enrichment::EnrichmentConfig::from_env(),
@@ -3625,6 +3631,13 @@ impl ChatManager {
         )));
         pipeline.add_parallel_stage(Box::new(super::stages::PersonaStage::new(graph.clone())));
         let ki_stage = super::stages::KnowledgeInjectionStage::new(graph.clone(), search.clone());
+        // Hybrid retrieval (BM25 ∪ dense cosine). With no provider the stage keeps
+        // its lexical-only behaviour, unchanged.
+        let ki_stage = if let Some(provider) = embeddings {
+            ki_stage.with_embeddings(provider.clone())
+        } else {
+            ki_stage
+        };
         let ki_stage = if let Some(tc) = trajectory_collector {
             ki_stage.with_collector(tc.clone())
         } else {
@@ -3670,7 +3683,7 @@ impl ChatManager {
             auto_update_app: config.auto_update_app,
         }));
         let enrichment_pipeline =
-            Self::build_enrichment_pipeline(&graph, &search, None, None, None);
+            Self::build_enrichment_pipeline(&graph, &search, None, None, None, None);
         let agent_runtime = Arc::new(
             super::agent_runtime::AgentRuntime::new(graph.clone())
                 .declaring_read_only_mcp_tools(config.read_only_mcp_tools.clone()),
@@ -3685,6 +3698,7 @@ impl ChatManager {
             search,
             config,
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
+            embeddings: None,
             agent_runtime,
             provider_source,
             builtin_cli_path,
@@ -3781,7 +3795,7 @@ impl ChatManager {
             }
         });
         let enrichment_pipeline =
-            Self::build_enrichment_pipeline(&graph, &search, None, None, None);
+            Self::build_enrichment_pipeline(&graph, &search, None, None, None, None);
         let agent_runtime = Arc::new(
             super::agent_runtime::AgentRuntime::new(graph.clone())
                 .declaring_read_only_mcp_tools(config.read_only_mcp_tools.clone()),
@@ -3796,6 +3810,7 @@ impl ChatManager {
             search,
             config,
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
+            embeddings: None,
             agent_runtime,
             provider_source,
             builtin_cli_path,
@@ -4470,6 +4485,36 @@ impl ChatManager {
             Some(&engine),
             tc_guard.as_ref(),
             Some(&self.mcp_registry),
+            self.embeddings.as_ref(),
+        );
+        drop(tc_guard);
+        self
+    }
+
+    /// Attach the server's embedding provider to the knowledge injection stage.
+    ///
+    /// Rebuilds the enrichment pipeline so `KnowledgeInjectionStage` retrieves
+    /// notes and decisions through **both** channels: BM25 (exact symbols, slugs,
+    /// error codes) and dense cosine over the precomputed note embeddings
+    /// (paraphrase, a question sharing no keyword with the note), fused by
+    /// Reciprocal Rank Fusion. Only the query is embedded — one short string per
+    /// turn — and inside the stage's existing per-query timeout.
+    ///
+    /// Omitting this call costs recall, not correctness: retrieval then stays
+    /// BM25-only, exactly as it was before the dense channel existed.
+    pub fn with_embeddings(
+        mut self,
+        provider: Arc<dyn crate::embeddings::EmbeddingProvider>,
+    ) -> Self {
+        self.embeddings = Some(provider.clone());
+        let tc_guard = self.trajectory_collector.read().unwrap();
+        self.enrichment_pipeline = Self::build_enrichment_pipeline(
+            &self.graph,
+            &self.search,
+            self.reasoning_engine.as_ref(),
+            tc_guard.as_ref(),
+            Some(&self.mcp_registry),
+            Some(&provider),
         );
         drop(tc_guard);
         self

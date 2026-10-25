@@ -1,23 +1,50 @@
 //! Knowledge Auto-Injection Stage for the Chat Enrichment Pipeline.
 //!
-//! Enriches the user message with relevant knowledge from four sources,
+//! Enriches the user message with relevant knowledge from these sources,
 //! queried in parallel with individual timeouts:
 //!
-//! 1. **BM25 text search on notes** (MeiliSearch) — top-N notes matching the message
-//! 2. **BM25 text search on decisions** (MeiliSearch) — top-N decisions matching the message
+//! 1. **Hybrid note retrieval** — BM25 text search (MeiliSearch) ∪ dense cosine
+//!    search over the note embeddings (Neo4j HNSW index), fused by Reciprocal
+//!    Rank Fusion. See [`reciprocal_rank_fusion`].
+//! 2. **Hybrid decision retrieval** — same two channels over the decisions
 //! 3. **Propagated notes** (Neo4j graph traversal) — notes linked to files mentioned in the message
 //! 4. **Entity context notes** (Neo4j) — notes directly attached to detected entities
 //!
 //! Results are deduplicated by note_id/decision_id (keeping highest score)
 //! and truncated to a character budget (~3000 chars ≈ 750 tokens).
 //!
+//! # Hybrid retrieval: why both channels
+//!
+//! BM25 alone is lexical: it is unbeatable on exact tokens (a symbol name, a
+//! slug, an error code the user pasted) and blind to paraphrase — a general
+//! question retrieves whatever shares a word with it, which is how unrelated
+//! notes end up in the prompt. Dense cosine over the precomputed note
+//! embeddings is the opposite trade: it reaches a conceptually close note that
+//! shares no token with the question, and it is unreliable on rare identifiers.
+//!
+//! The two channels are fused by Reciprocal Rank Fusion, which combines *ranks*
+//! (not scores) and therefore needs no calibration between BM25's unbounded
+//! scores and cosine's [−1, 1]. A note both channels rank high wins, which is
+//! exactly the "relevant and matching" case.
+//!
 //! # Design choices
 //!
-//! - Uses MeiliSearch BM25 instead of vector search because `ChatManager` does not
-//!   hold an `EmbeddingProvider`. BM25 is fast (<50ms) and works with raw text queries.
+//! - Only the *query* is embedded (one short string, `embed_query_chars` chars
+//!   at most). Corpus embeddings are precomputed and already in Neo4j — nothing
+//!   here walks the corpus.
+//! - The dense channel needs an [`EmbeddingProvider`]; `ChatManager` hands one
+//!   over when the server has one configured (`with_embeddings`). Without it,
+//!   retrieval stays BM25-only and behaves exactly as it did before: same
+//!   queries, same scores, same ordering. No regression, by construction.
+//! - A note the dense channel found *on its own* is injected only if its cosine
+//!   clears [`KnowledgeInjectionConfig::dense_min_similarity`]: an embedder
+//!   always returns its nearest neighbours, even when the nearest one is
+//!   unrelated, so the floor is what keeps unrelated notes out of the prompt.
 //! - Entity extraction reuses [`crate::chat::entity_extractor::extract_entities`]
 //!   which detects file paths, backtick identifiers, and code keyword patterns.
-//! - Graceful degradation: each query has a 200ms timeout; failures are logged and skipped.
+//! - Graceful degradation: each query has a 200ms timeout; failures are logged
+//!   and skipped. A timed-out or failed embedding simply drops the dense
+//!   channel — the turn falls back to BM25 instead of losing knowledge.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,6 +60,7 @@ use crate::chat::enrichment::{
 };
 use crate::chat::entity_extractor::{self, EntityType as ChatEntityType, ExtractedEntity};
 use crate::chat::stages::intent_weights::IntentWeightMap;
+use crate::embeddings::EmbeddingProvider;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
 use crate::neurons::intent::{IntentDetector, QueryIntentMode};
@@ -62,6 +90,22 @@ pub struct KnowledgeInjectionConfig {
     pub query_timeout_ms: u64,
     /// Maximum total character budget for the rendered section (default: 3000).
     pub max_content_chars: usize,
+    /// Cosine similarity a note must reach to enter the dense channel
+    /// (default: 0.80).
+    ///
+    /// A vector index always yields its nearest neighbours, so without a floor
+    /// an unrelated note becomes the "best" hit of a question nothing answers.
+    /// 0.80 sits above the cosine of unrelated prose for the sentence-embedding
+    /// models this server ships with (multilingual-e5 / nomic-embed), and below
+    /// what a genuinely related note scores. Raising it makes the dense channel
+    /// more conservative, lowering it more adventurous.
+    pub dense_min_similarity: f64,
+    /// How many characters of the user message are embedded (default: 1000).
+    ///
+    /// The message can be a long paste; embedding all of it would cost latency
+    /// for no gain (the models truncate around 512 tokens anyway). The head of
+    /// a message carries its subject.
+    pub embed_query_chars: usize,
 }
 
 impl Default for KnowledgeInjectionConfig {
@@ -75,6 +119,8 @@ impl Default for KnowledgeInjectionConfig {
             max_entity_queries: 3,
             query_timeout_ms: 200,
             max_content_chars: 3000,
+            dense_min_similarity: 0.80,
+            embed_query_chars: 1000,
         }
     }
 }
@@ -97,6 +143,7 @@ pub fn scaffolding_config(level: u8) -> KnowledgeInjectionConfig {
             max_entity_queries: 5,
             query_timeout_ms: 300,
             max_content_chars: 5000,
+            ..KnowledgeInjectionConfig::default()
         },
         1 => KnowledgeInjectionConfig {
             max_notes: 6,
@@ -107,6 +154,7 @@ pub fn scaffolding_config(level: u8) -> KnowledgeInjectionConfig {
             max_entity_queries: 4,
             query_timeout_ms: 250,
             max_content_chars: 4000,
+            ..KnowledgeInjectionConfig::default()
         },
         2 => KnowledgeInjectionConfig::default(), // L2 = default behavior
         3 => KnowledgeInjectionConfig {
@@ -118,6 +166,7 @@ pub fn scaffolding_config(level: u8) -> KnowledgeInjectionConfig {
             max_entity_queries: 2,
             query_timeout_ms: 150,
             max_content_chars: 2000,
+            ..KnowledgeInjectionConfig::default()
         },
         _ => KnowledgeInjectionConfig {
             // L4+ = minimal
@@ -129,6 +178,7 @@ pub fn scaffolding_config(level: u8) -> KnowledgeInjectionConfig {
             max_entity_queries: 1,
             query_timeout_ms: 100,
             max_content_chars: 1500,
+            ..KnowledgeInjectionConfig::default()
         },
     }
 }
@@ -180,6 +230,65 @@ pub struct KnowledgeInjectionStage {
     config: KnowledgeInjectionConfig,
     /// Trajectory collector for decision capture (fire-and-forget).
     collector: Option<Arc<neural_routing_runtime::TrajectoryCollector>>,
+    /// The embedder that turns the user message into a query vector for the
+    /// dense channel. `None` (no provider configured on this server, or a build
+    /// without `local-embeddings`) makes retrieval BM25-only — the historical
+    /// behaviour, byte for byte.
+    embeddings: Option<Arc<dyn EmbeddingProvider>>,
+}
+
+/// What the dense channel found for one turn: notes and decisions with their
+/// cosine similarity to the embedded query.
+struct DenseHits {
+    notes: Vec<(crate::notes::Note, f64)>,
+    decisions: Vec<(crate::neo4j::models::DecisionNode, f64)>,
+}
+
+/// Reciprocal Rank Fusion constant.
+///
+/// Cormack, Clarke & Büttcher (2009) use 60 and report that the result is
+/// insensitive to it: it only damps how much the very first ranks dominate.
+const RRF_K: f64 = 60.0;
+
+/// Fuse ranked candidate lists by Reciprocal Rank Fusion.
+///
+/// Each channel contributes `1 / (RRF_K + rank)` (rank starting at 1) for every
+/// candidate it lists, and a candidate's score is the sum over the channels that
+/// list it. Summing ranks rather than scores is what makes this work here: BM25
+/// scores are unbounded and differ per query, cosine lives in [−1, 1], and no
+/// affine map between them is meaningful — ranks are comparable by construction.
+/// A candidate both channels rank highly therefore beats one only a single
+/// channel likes, which is the case worth promoting.
+///
+/// The result is rescaled so the best fused candidate scores `anchor`, keeping
+/// the head of the list on the scale the other sources use (an entity note is
+/// 0.8, a workspace guideline 0.6, a referenced note 1.0) — consensus changes
+/// the *order*, not the currency.
+///
+/// Returns `(id, score)` sorted by descending score, ties broken by id so the
+/// order is deterministic (a `HashMap` iteration is not).
+fn reciprocal_rank_fusion(channels: &[&[String]], anchor: f64) -> Vec<(String, f64)> {
+    let mut fused: HashMap<&str, f64> = HashMap::new();
+    for channel in channels {
+        for (index, id) in channel.iter().enumerate() {
+            let contribution = 1.0 / (RRF_K + (index as f64) + 1.0);
+            *fused.entry(id.as_str()).or_insert(0.0) += contribution;
+        }
+    }
+    let peak = fused.values().copied().fold(0.0_f64, f64::max);
+    if peak <= 0.0 {
+        return Vec::new();
+    }
+    let mut out: Vec<(String, f64)> = fused
+        .into_iter()
+        .map(|(id, score)| (id.to_string(), score * anchor / peak))
+        .collect();
+    out.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    out
 }
 
 /// Time constant (days) of the recency factor: at equal relevance, fresher
@@ -324,6 +433,7 @@ impl KnowledgeInjectionStage {
             search,
             config: KnowledgeInjectionConfig::default(),
             collector: None,
+            embeddings: None,
         }
     }
 
@@ -338,6 +448,7 @@ impl KnowledgeInjectionStage {
             search,
             config,
             collector: None,
+            embeddings: None,
         }
     }
 
@@ -347,6 +458,16 @@ impl KnowledgeInjectionStage {
         collector: Arc<neural_routing_runtime::TrajectoryCollector>,
     ) -> Self {
         self.collector = Some(collector);
+        self
+    }
+
+    /// Attach the embedding provider that powers the dense retrieval channel.
+    ///
+    /// Without it the stage stays BM25-only. With it, notes and decisions also
+    /// come from the cosine search over the precomputed embeddings, fused with
+    /// BM25 by Reciprocal Rank Fusion (see [`reciprocal_rank_fusion`]).
+    pub fn with_embeddings(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
+        self.embeddings = Some(provider);
         self
     }
 
@@ -735,6 +856,58 @@ impl KnowledgeInjectionStage {
             ws_notes
         };
 
+        // ── Query 7: dense (semantic) notes + decisions ───────────────────
+        // One embedding for the whole turn, shared by both dense searches: the
+        // query is embedded once, never the corpus (corpus vectors are already
+        // in Neo4j). `None` means the dense channel is off for this turn — no
+        // provider, or an embedder that failed — and the merge below then leaves
+        // the BM25 results untouched.
+        let dense_future = {
+            let provider = self.embeddings.clone();
+            let graph = self.graph.clone();
+            let message = message.to_string();
+            let embed_query_chars = config.embed_query_chars;
+            let max_notes = config.max_notes;
+            let max_decisions = config.max_decisions;
+            let project_id = _project_id;
+            async move {
+                let provider = provider?;
+                let head: String = message.chars().take(embed_query_chars).collect();
+                let embedding = match provider.embed_text(&head).await {
+                    Ok(embedding) => embedding,
+                    Err(e) => {
+                        debug!(
+                            error = %e,
+                            "[knowledge_injection] query embedding failed; dense channel off this turn"
+                        );
+                        return None;
+                    }
+                };
+                let notes = match graph
+                    .vector_search_notes(&embedding, max_notes, project_id, None, None)
+                    .await
+                {
+                    Ok(notes) => notes,
+                    Err(e) => {
+                        debug!(error = %e, "[knowledge_injection] dense note search failed");
+                        Vec::new()
+                    }
+                };
+                let owner = project_id.map(|id| id.to_string());
+                let decisions = match graph
+                    .search_decisions_by_vector(&embedding, max_decisions, owner.as_deref())
+                    .await
+                {
+                    Ok(decisions) => decisions,
+                    Err(e) => {
+                        debug!(error = %e, "[knowledge_injection] dense decision search failed");
+                        Vec::new()
+                    }
+                };
+                Some(DenseHits { notes, decisions })
+            }
+        };
+
         // ── Execute all queries in parallel with timeouts ────────────────
         let (
             notes_result,
@@ -743,6 +916,7 @@ impl KnowledgeInjectionStage {
             uuid_result,
             discussed_result,
             workspace_result,
+            dense_result,
         ) = tokio::join!(
             timeout(query_timeout, notes_future),
             timeout(query_timeout, decisions_future),
@@ -750,33 +924,127 @@ impl KnowledgeInjectionStage {
             timeout(query_timeout, uuid_lookup_future),
             timeout(query_timeout, discussed_future),
             timeout(query_timeout, workspace_notes_future),
+            timeout(query_timeout, dense_future),
         );
+
+        // The dense channel, when it answered in time. `Err` = timed out (the
+        // embedder did not fit in the budget): fall back to BM25, never fail.
+        let dense: Option<DenseHits> = match dense_result {
+            Ok(hits) => hits,
+            Err(_) => {
+                debug!("[knowledge_injection] Dense retrieval timed out; BM25 only");
+                None
+            }
+        };
 
         // ── Collect & deduplicate notes ─────────────────────────────────
         let mut note_map: HashMap<String, ScoredNote> = HashMap::new();
 
-        // BM25 notes
+        // ── The two retrieval channels, in rank order ───────────────────
+        // `payloads` holds each candidate's own record with the score of the
+        // channel that found it; the fused list below decides the order and the
+        // score that finally sticks.
+        let mut payloads: HashMap<String, ScoredNote> = HashMap::new();
+        let mut bm25_ranked: Vec<String> = Vec::new();
+        let mut bm25_top_score = 0.0_f64;
+
         if let Ok(hits) = notes_result {
-            for hit in hits {
-                let note = ScoredNote {
-                    id: hit.document.id.clone(),
+            for (rank, hit) in hits.into_iter().enumerate() {
+                let id = hit.document.id.clone();
+                if rank == 0 {
+                    bm25_top_score = hit.score;
+                }
+                bm25_ranked.push(id.clone());
+                payloads.entry(id.clone()).or_insert(ScoredNote {
+                    id,
                     note_type: hit.document.note_type.clone(),
                     importance: hit.document.importance.clone(),
                     content: hit.document.content.clone(),
                     score: hit.score,
                     source: "bm25_search",
-                };
-                note_map
-                    .entry(note.id.clone())
-                    .and_modify(|existing| {
-                        if note.score > existing.score {
-                            *existing = note.clone();
-                        }
-                    })
-                    .or_insert(note);
+                });
             }
         } else {
             debug!("[knowledge_injection] Notes BM25 search timed out");
+        }
+
+        // Dense channel: keep only what clears the cosine floor. A vector index
+        // always returns neighbours, so the floor — not the index — is what
+        // decides whether a note is related at all.
+        let mut dense_ranked: Vec<String> = Vec::new();
+        let mut dense_dropped = 0usize;
+        if let Some(ref dense) = dense {
+            for (note, cosine) in &dense.notes {
+                if *cosine < config.dense_min_similarity {
+                    dense_dropped += 1;
+                    continue;
+                }
+                let id = note.id.to_string();
+                dense_ranked.push(id.clone());
+                payloads.entry(id.clone()).or_insert(ScoredNote {
+                    id,
+                    note_type: format!("{:?}", note.note_type),
+                    importance: format!("{:?}", note.importance),
+                    content: note.content.clone(),
+                    score: *cosine,
+                    source: "dense_search",
+                });
+            }
+            debug!(
+                "[knowledge_injection] dense channel: {} notes kept (cosine >= {}), {} below the floor",
+                dense_ranked.len(),
+                config.dense_min_similarity,
+                dense_dropped
+            );
+        }
+
+        // Merge: fused when the dense channel answered, plain BM25 otherwise.
+        // Without a dense channel the loop below reproduces the historical
+        // behaviour exactly (raw BM25 score, source "bm25_search").
+        if dense.is_some() {
+            // The head of the fused list keeps the scale the best BM25 hit had,
+            // so consensus reorders the notes without changing what a score of
+            // 0.8 means next to an entity note or a 1.0 reference. With no BM25
+            // hit at all, 1.0 is the only sensible anchor.
+            let anchor = if bm25_top_score > 0.0 {
+                bm25_top_score
+            } else {
+                1.0
+            };
+            let channels: Vec<&[String]> = vec![&bm25_ranked, &dense_ranked];
+            for (id, score) in reciprocal_rank_fusion(&channels, anchor) {
+                let Some(mut payload) = payloads.get(&id).cloned() else {
+                    continue;
+                };
+                payload.score = score;
+                // The label stays truthful: "hybrid_search" only when both
+                // channels found the note (the case worth knowing about).
+                payload.source = match (bm25_ranked.contains(&id), dense_ranked.contains(&id)) {
+                    (true, true) => "hybrid_search",
+                    (true, false) => "bm25_search",
+                    (false, true) => "dense_search",
+                    (false, false) => continue,
+                };
+                note_map
+                    .entry(id)
+                    .and_modify(|existing| {
+                        if payload.score > existing.score {
+                            *existing = payload.clone();
+                        }
+                    })
+                    .or_insert(payload);
+            }
+        } else {
+            for payload in payloads.into_values() {
+                note_map
+                    .entry(payload.id.clone())
+                    .and_modify(|existing| {
+                        if payload.score > existing.score {
+                            *existing = payload.clone();
+                        }
+                    })
+                    .or_insert(payload);
+            }
         }
 
         // Entity notes (direct + propagated) + predictions
@@ -876,28 +1144,75 @@ impl KnowledgeInjectionStage {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Collect BM25 decisions and merge with UUID decisions
+        // Collect decisions: BM25 ∪ dense, fused when the dense channel
+        // answered — same two channels and same fusion as the notes above.
+        let mut bm25_decisions_ranked: Vec<String> = Vec::new();
+        let mut decision_payloads: HashMap<String, ScoredDecision> = HashMap::new();
         if let Ok(docs) = decisions_result {
             for (i, doc) in docs.into_iter().enumerate() {
-                let decision = ScoredDecision {
-                    id: doc.id.clone(),
-                    description: doc.description,
-                    rationale: doc.rationale,
-                    // BM25 decisions don't have a score in the response,
-                    // use position-based scoring (first result = highest relevance)
-                    score: 1.0 - (i as f64 * 0.1),
-                };
-                decision_map
-                    .entry(decision.id.clone())
-                    .and_modify(|existing| {
-                        if decision.score > existing.score {
-                            *existing = decision.clone();
-                        }
-                    })
-                    .or_insert(decision);
+                let id = doc.id.clone();
+                bm25_decisions_ranked.push(id.clone());
+                decision_payloads
+                    .entry(id.clone())
+                    .or_insert(ScoredDecision {
+                        id,
+                        description: doc.description,
+                        rationale: doc.rationale,
+                        // BM25 decisions don't have a score in the response,
+                        // use position-based scoring (first result = highest relevance)
+                        score: 1.0 - (i as f64 * 0.1),
+                    });
             }
         } else {
             debug!("[knowledge_injection] Decisions BM25 search timed out");
+        }
+
+        let mut dense_decisions_ranked: Vec<String> = Vec::new();
+        if let Some(ref dense) = dense {
+            for (decision, cosine) in &dense.decisions {
+                if *cosine < config.dense_min_similarity {
+                    continue;
+                }
+                let id = decision.id.to_string();
+                dense_decisions_ranked.push(id.clone());
+                decision_payloads
+                    .entry(id.clone())
+                    .or_insert(ScoredDecision {
+                        id,
+                        description: decision.description.clone(),
+                        rationale: decision.rationale.clone(),
+                        score: *cosine,
+                    });
+            }
+        }
+
+        if dense.is_some() {
+            let channels: Vec<&[String]> = vec![&bm25_decisions_ranked, &dense_decisions_ranked];
+            for (id, score) in reciprocal_rank_fusion(&channels, 1.0) {
+                let Some(mut payload) = decision_payloads.get(&id).cloned() else {
+                    continue;
+                };
+                payload.score = score;
+                decision_map
+                    .entry(id)
+                    .and_modify(|existing| {
+                        if payload.score > existing.score {
+                            *existing = payload.clone();
+                        }
+                    })
+                    .or_insert(payload);
+            }
+        } else {
+            for payload in decision_payloads.into_values() {
+                decision_map
+                    .entry(payload.id.clone())
+                    .and_modify(|existing| {
+                        if payload.score > existing.score {
+                            *existing = payload.clone();
+                        }
+                    })
+                    .or_insert(payload);
+            }
         }
 
         let decisions: Vec<ScoredDecision> = decision_map.into_values().collect();
@@ -1503,6 +1818,7 @@ mod tests {
             search: Arc::new(crate::meilisearch::mock::MockSearchStore::new()),
             config: KnowledgeInjectionConfig::default(),
             collector: None,
+            embeddings: None,
         };
         // all five notes of the file are candidates (no per-entity cut)
         let config = KnowledgeInjectionConfig {
@@ -2203,6 +2519,7 @@ mod tests {
             search,
             config,
             collector: None,
+            embeddings: None,
         }
     }
 
@@ -2452,6 +2769,7 @@ mod tests {
             search: search as Arc<dyn crate::meilisearch::traits::SearchStore>,
             config: KnowledgeInjectionConfig::default(),
             collector: None,
+            embeddings: None,
         }
     }
 
@@ -2616,5 +2934,403 @@ mod tests {
             notes[0].id, "guideline-1",
             "Guideline should rank first for planning intent"
         );
+    }
+
+    // ========================================================================
+    // Hybrid retrieval: BM25 ∪ dense cosine, fused by RRF
+    // ========================================================================
+
+    /// A deterministic stand-in for a learned sentence embedder.
+    ///
+    /// The point of a real embedder is that *paraphrases* land close: "how is the
+    /// mind aware of itself" and "consciousness is not computable" share no token
+    /// yet mean the same thing. A hash-based mock cannot express that (two
+    /// different strings are orthogonal by construction), so these tests use a
+    /// hand-written concept table instead: every keyword maps to a concept, the
+    /// vector counts the concepts present, and cosine then measures "same
+    /// subject", not "same letters".
+    struct ConceptProvider;
+
+    /// `(keyword, concept index)`. The lowercase keyword is looked for as a
+    /// substring of the lowercased text.
+    const CONCEPTS: &[(&str, usize)] = &[
+        // 0 — philosophy of mind
+        ("consciousness", 0),
+        ("mind", 0),
+        ("awareness", 0),
+        ("soul", 0),
+        // 1 — symbolic regression / parity harness (the unrelated corpus)
+        ("pysr", 1),
+        ("regression", 1),
+        ("parity", 1),
+        ("harness", 1),
+        // 2 — lexical retrieval
+        ("bm25", 2),
+        ("keyword", 2),
+        // 3 — the exact symbol, so a lexical query is semantically central too
+        ("gather_resolver_symbols", 3),
+    ];
+
+    /// Number of distinct concepts, i.e. the embedding width.
+    const CONCEPT_COUNT: usize = 4;
+
+    impl ConceptProvider {
+        fn embed(&self, text: &str) -> Vec<f32> {
+            let lowered = text.to_lowercase();
+            let mut vector = vec![0.0_f32; CONCEPT_COUNT];
+            for (keyword, concept) in CONCEPTS {
+                if lowered.contains(keyword) {
+                    vector[*concept] += 1.0;
+                }
+            }
+            vector
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for ConceptProvider {
+        async fn embed_text(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(self.embed(text))
+        }
+
+        async fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|t| self.embed(t)).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            CONCEPT_COUNT
+        }
+
+        fn model_name(&self) -> &str {
+            "concept-test"
+        }
+    }
+
+    /// A graph + search index holding the same notes, with precomputed
+    /// embeddings (as the production backfill does) and BM25 documents.
+    struct Corpus {
+        graph: Arc<crate::neo4j::mock::MockGraphStore>,
+        search: Arc<crate::meilisearch::mock::MockSearchStore>,
+        project: Uuid,
+        ids: Vec<(String, Uuid)>,
+    }
+
+    const PROJECT_SLUG: &str = "nexus-sdk";
+
+    async fn corpus(contents: &[&str]) -> Corpus {
+        use crate::meilisearch::indexes::NoteDocument;
+        use crate::notes::{Note, NoteType};
+
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let search = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let project = Uuid::new_v4();
+        let provider = ConceptProvider;
+        let mut ids = Vec::new();
+
+        for content in contents {
+            let note = Note::new(
+                Some(project),
+                NoteType::Guideline,
+                (*content).to_string(),
+                "test".to_string(),
+            );
+            graph.create_note(&note).await.unwrap();
+            // The embeddings the note backfill would have written.
+            graph
+                .set_note_embedding(note.id, &provider.embed(content), provider.model_name())
+                .await
+                .unwrap();
+            search
+                .index_note(&NoteDocument {
+                    id: note.id.to_string(),
+                    project_id: project.to_string(),
+                    project_slug: PROJECT_SLUG.to_string(),
+                    note_type: "guideline".to_string(),
+                    status: "active".to_string(),
+                    importance: "high".to_string(),
+                    scope_type: "project".to_string(),
+                    scope_path: String::new(),
+                    content: (*content).to_string(),
+                    tags: vec![],
+                    anchor_entities: vec![],
+                    created_at: chrono::Utc::now().timestamp(),
+                    created_by: "test".to_string(),
+                    staleness_score: 0.0,
+                })
+                .await
+                .unwrap();
+            ids.push(((*content).to_string(), note.id));
+        }
+
+        Corpus {
+            graph,
+            search,
+            project,
+            ids,
+        }
+    }
+
+    impl Corpus {
+        fn id_of(&self, content: &str) -> String {
+            self.ids
+                .iter()
+                .find(|(c, _)| c == content)
+                .map(|(_, id)| id.to_string())
+                .expect("content not in the corpus")
+        }
+    }
+
+    /// The stage under test, with or without the dense channel.
+    fn hybrid_stage(
+        corpus: &Corpus,
+        embeddings: Option<Arc<dyn EmbeddingProvider>>,
+    ) -> KnowledgeInjectionStage {
+        KnowledgeInjectionStage {
+            graph: corpus.graph.clone() as Arc<dyn GraphStore>,
+            search: corpus.search.clone() as Arc<dyn SearchStore>,
+            config: KnowledgeInjectionConfig::default(),
+            collector: None,
+            embeddings,
+        }
+    }
+
+    /// Run one turn's knowledge retrieval, as `execute` does.
+    async fn retrieve(
+        stage: &KnowledgeInjectionStage,
+        corpus: &Corpus,
+        message: &str,
+    ) -> (Vec<ScoredNote>, Vec<ScoredDecision>) {
+        let entities = entity_extractor::extract_entities(message);
+        let uuids = KnowledgeInjectionStage::extract_uuids(message);
+        let (notes, decisions, _, _) = stage
+            .query_knowledge_with_config(
+                message,
+                Some(PROJECT_SLUG),
+                Some(corpus.project),
+                &entities,
+                &uuids,
+                &stage.config,
+                false,
+            )
+            .await;
+        (notes, decisions)
+    }
+
+    // ── (a) BM25 keeps its exact-token power ────────────────────────────
+
+    #[tokio::test]
+    async fn a_lexical_query_still_finds_the_exact_symbol_through_bm25() {
+        let symbol = "gather_resolver_symbols";
+        let symbol_note = format!("{symbol} walks the call graph and returns every resolver entry");
+        let corpus = corpus(&[&symbol_note, "Consciousness is not computable"]).await;
+        let stage = hybrid_stage(&corpus, None);
+
+        let (notes, _) = retrieve(&stage, &corpus, symbol).await;
+
+        let hit = notes
+            .iter()
+            .find(|n| n.id == corpus.id_of(&symbol_note))
+            .expect("BM25 must still find a note that contains the exact symbol");
+        assert_eq!(hit.source, "bm25_search");
+        // The lexical hit is not accompanied by the philosophical note: a query
+        // made of one identifier says nothing about consciousness.
+        assert!(
+            !notes
+                .iter()
+                .any(|n| n.id == corpus.id_of("Consciousness is not computable")),
+            "an unrelated note was injected for a purely lexical query: {:?}",
+            notes.iter().map(|n| &n.content).collect::<Vec<_>>()
+        );
+    }
+
+    // ── (b) the dense channel reaches a paraphrase ──────────────────────
+
+    #[tokio::test]
+    async fn a_semantic_query_reaches_a_note_that_shares_no_keyword_with_it() {
+        let philosophical = "Consciousness is not computable";
+        let unrelated = "PySR regression of symbolic expression trees";
+        let corpus = corpus(&[philosophical, unrelated]).await;
+
+        // Wording deliberately shares no token with the note: "mind" and
+        // "awareness" are only synonyms of "consciousness".
+        let question = "how is the mind aware of itself?";
+
+        // Control: BM25 alone finds nothing — that is the bug being fixed.
+        let bm25_only = hybrid_stage(&corpus, None);
+        let (notes, _) = retrieve(&bm25_only, &corpus, question).await;
+        assert!(
+            notes.is_empty(),
+            "precondition: BM25 cannot answer this question, got {:?}",
+            notes.iter().map(|n| &n.content).collect::<Vec<_>>()
+        );
+
+        // With the dense channel the conceptually close note comes back, and
+        // the unrelated one does not.
+        let hybrid = hybrid_stage(&corpus, Some(Arc::new(ConceptProvider)));
+        let (notes, _) = retrieve(&hybrid, &corpus, question).await;
+
+        assert_eq!(
+            notes.len(),
+            1,
+            "expected exactly the related note: {notes:?}"
+        );
+        assert_eq!(notes[0].id, corpus.id_of(philosophical));
+        assert_eq!(notes[0].source, "dense_search");
+    }
+
+    // ── (c) no embedder -> BM25-only, byte for byte ─────────────────────
+
+    #[tokio::test]
+    async fn without_an_embedder_retrieval_is_unchanged_bm25() {
+        let content = "gather_resolver_symbols is the resolver entry point";
+        let corpus = corpus(&[content]).await;
+        let stage = hybrid_stage(&corpus, None);
+
+        let (notes, _) = retrieve(&stage, &corpus, "gather_resolver_symbols").await;
+
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, corpus.id_of(content));
+        // Untouched: same source and the raw index score (the mock scores a
+        // substring match at 0.5), not a fused rank.
+        assert_eq!(notes[0].source, "bm25_search");
+        assert_eq!(notes[0].score, 0.5, "BM25 score must not be rewritten");
+    }
+
+    // ── (d) unrelated notes stay out ────────────────────────────────────
+
+    #[tokio::test]
+    async fn unrelated_notes_are_not_injected_when_nothing_is_close() {
+        // A corpus about one subject only...
+        let corpus = corpus(&[
+            "PySR regression of symbolic expression trees",
+            "the parity harness drives the CLI twice",
+        ])
+        .await;
+        // ...and a question about another.
+        let stage = hybrid_stage(&corpus, Some(Arc::new(ConceptProvider)));
+        let (notes, _) =
+            retrieve(&stage, &corpus, "what does it mean for a mind to be aware?").await;
+
+        assert!(
+            notes.is_empty(),
+            "the dense channel injected notes whose cosine is below the floor: {:?}",
+            notes.iter().map(|n| &n.content).collect::<Vec<_>>()
+        );
+    }
+
+    // ── consensus: a note both channels rank wins ───────────────────────
+
+    #[tokio::test]
+    async fn a_note_both_channels_find_outranks_one_a_single_channel_finds() {
+        // "gather_resolver_symbols" matches lexically AND is the symbol concept,
+        // so both channels rank it. The second note matches the message lexically
+        // but shares no concept with it.
+        let both = "gather_resolver_symbols is the resolver entry point";
+        let lexical_only = "gather_resolver_symbols appears in the parity harness";
+        let corpus = corpus(&[both, lexical_only]).await;
+        let stage = hybrid_stage(&corpus, Some(Arc::new(ConceptProvider)));
+
+        let (notes, _) = retrieve(&stage, &corpus, "gather_resolver_symbols").await;
+
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_eq!(
+            notes[0].id,
+            corpus.id_of(both),
+            "the note found by both channels must lead: {:?}",
+            notes
+                .iter()
+                .map(|n| (&n.content, n.score, n.source))
+                .collect::<Vec<_>>()
+        );
+        // The label says which channels actually found it: the leader is
+        // "hybrid_search" (both), the other one is a lexical hit only.
+        assert_eq!(notes[0].source, "hybrid_search");
+        assert_eq!(notes[1].id, corpus.id_of(lexical_only));
+        assert_eq!(notes[1].source, "bm25_search");
+    }
+
+    // ── the fusion itself ───────────────────────────────────────────────
+
+    #[test]
+    fn rrf_promotes_consensus_and_respects_the_anchor() {
+        let bm25 = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let dense = vec!["c".to_string(), "d".to_string()];
+
+        let fused = reciprocal_rank_fusion(&[&bm25, &dense], 2.0);
+
+        // "c" is the only candidate both channels rank: it wins.
+        assert_eq!(fused[0].0, "c");
+        // The head keeps the caller's scale (whatever the best BM25 score was).
+        assert!((fused[0].1 - 2.0).abs() < 1e-12, "{fused:?}");
+        // Everything fused is below the anchor.
+        assert!(fused.iter().skip(1).all(|(_, s)| *s < 2.0));
+        assert_eq!(fused.len(), 4, "a ∪ b ∪ c ∪ d: {fused:?}");
+    }
+
+    #[test]
+    fn rrf_is_deterministic_and_handles_degenerate_input() {
+        let one = vec!["x".to_string(), "y".to_string()];
+        let other = vec!["y".to_string(), "x".to_string()];
+        // Symmetric evidence: the tie must be broken the same way every call.
+        let first = reciprocal_rank_fusion(&[&one, &other], 1.0);
+        let second = reciprocal_rank_fusion(&[&one, &other], 1.0);
+        assert_eq!(first, second);
+        assert_eq!(first[0].1, first[1].1);
+        assert_eq!(first[0].0, "x", "ties are broken by id, ascending");
+
+        // No channel, or empty channels: nothing to fuse.
+        assert!(reciprocal_rank_fusion(&[], 1.0).is_empty());
+        let empty: Vec<String> = Vec::new();
+        assert!(reciprocal_rank_fusion(&[&empty, &empty], 1.0).is_empty());
+    }
+
+    // ── a provider that finds no decision loses none ─────────────────────
+
+    #[tokio::test]
+    async fn the_dense_channel_never_costs_a_decision_found_by_bm25() {
+        use crate::meilisearch::indexes::DecisionDocument;
+
+        let corpus = corpus(&["unrelated to the question"]).await;
+        // The index says it is a hit; the graph is the source of truth
+        // (`keep_current_decisions` re-reads every candidate).
+        let task = Uuid::new_v4();
+        let mut parent = crate::test_helpers::test_task();
+        parent.id = task;
+        corpus
+            .graph
+            .create_task(Uuid::new_v4(), &parent)
+            .await
+            .unwrap();
+        let decision = crate::test_helpers::test_decision(
+            "gather_resolver_symbols returns the entries",
+            "the resolver needs one walk",
+        );
+        corpus.graph.create_decision(task, &decision).await.unwrap();
+        corpus
+            .search
+            .index_decision(&DecisionDocument {
+                id: decision.id.to_string(),
+                description: decision.description.clone(),
+                rationale: decision.rationale.clone(),
+                task_id: String::new(),
+                agent: "test".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                tags: vec![],
+                project_id: Some(corpus.project.to_string()),
+                project_slug: Some(PROJECT_SLUG.to_string()),
+            })
+            .await
+            .unwrap();
+
+        let stage = hybrid_stage(&corpus, Some(Arc::new(ConceptProvider)));
+        let (_, decisions) = retrieve(&stage, &corpus, "gather_resolver_symbols").await;
+
+        assert_eq!(
+            decisions.len(),
+            1,
+            "the dense channel found no decision (the mock has no decision index) \
+             and must not swallow the BM25 one"
+        );
+        assert!(decisions[0].description.contains("gather_resolver_symbols"));
     }
 }
