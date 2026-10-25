@@ -448,6 +448,10 @@ pub struct ChatRequest {
     /// Token budget of the session (`SessionLimits::max_tokens`). Internal.
     #[serde(skip)]
     pub max_tokens: Option<u64>,
+    /// Spend cap of the session in USD (`SessionLimits::max_cost_usd`): a delegation's own
+    /// budget (PYSR-3). `None` = none. Internal.
+    #[serde(skip)]
+    pub max_cost_usd: Option<f64>,
     /// Class of the task being executed (`simple`, `complex`, ...), which the
     /// model policy reads. Internal.
     #[serde(skip)]

@@ -3144,6 +3144,7 @@ mod tests {
             run_provider: None,
             run_model: None,
             max_tokens: None,
+            max_cost_usd: None,
             task_class: None,
             permission_mode: Some("default".into()),
             add_dirs: None,

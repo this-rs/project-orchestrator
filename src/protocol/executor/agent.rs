@@ -321,6 +321,7 @@ fn agent_session_request(
         run_provider: None,
         run_model: None,
         max_tokens: None,
+        max_cost_usd: None,
         task_class: None,
         permission_mode: Some("bypassPermissions".to_string()),
         add_dirs: None,
